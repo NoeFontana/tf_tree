@@ -112,6 +112,14 @@ the ability to query at arbitrary times, or runs a ROS node to serve transforms
 during training. This replaces all three and asks nobody to migrate anything,
 which is also why it is the part that shipped first.
 
+**Running it inside a loop instead?** `just control-loop` is the other half of
+this page — `cargo run --release -p tf_tree --features shm --example control_loop`.
+It is a 1 kHz controller against a 200 Hz estimate, showing the four things a
+runtime consumer has to get right (compile the plan once, hoist the guard,
+extrapolate on purpose and read how far it reached, treat a contended slot as
+data) and printing the tail a deadline is set against. The offline path above
+asks nobody to change their robot; this one is what happens when they do.
+
 **Numbers belong where they can be reproduced**, not in this section.
 `just bench-report` measures your host and writes
 `report/{results.json,index.html}`; the standing figures and their caveats are in
@@ -244,10 +252,13 @@ published — `cargo add tf_tree`. The Python wheel starts at 0.0.2 because the
 
 The gaps, named — because "with gaps" on its own is not a status:
 
-- **Phase 2** — the daemon and recorder surface (§9–§10) and §11.3's fault
-  injection are absent. §3.5's ownership migration has the protocol and not the
-  trigger: kill the arena's owner and lookups keep being served, but no new
-  process can join.
+- **Phase 2** — the daemon and recorder surface (§9–§10) are absent, and
+  §11.3's fault injection is a separate gap still being worked. §3.5's ownership
+  migration **landed on 2026-08-28**: kill the arena's owner and a surviving
+  read-write participant inherits the role, so new processes can join again. Its
+  trigger is caller-driven — `Tree::owner_lost()` is a non-blocking check a
+  survivor makes in its own loop, and nothing makes it for you, because there is
+  no daemon.
 - **Phase 4** — everything except §5.9's affinity knobs and §6.3's replay rows.
   `at_with_derivatives`, both headers, the header-only C++ wrapper with its
   CMake package, and **both halves of the ingest bridge** — the `rclcpp` package

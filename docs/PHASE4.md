@@ -1953,7 +1953,7 @@ Replay a recorded bag through the bridge, then compare `tf_tree` lookups against
 
 | Benchmark | Report |
 |---|---|
-| `tft_plan_at` vs native Rust, depth 3 | ratio (target < 1.05) |
+| `tft_plan_at` vs native Rust, depth 3 | **R1, R2, R3 and a control — gate 1's ladder at `[profile.embedder]`, by `just abi-cost`.** This cell read *ratio (target < 1.05)*, the single quotient [`0023`](./decisions/0023-the-gate-that-could-not-gate.md) withdrew and gate 1 below replaced; both readings taken against it — 1.020× **PASS**, then 1.34–1.46× **FAIL** — are retracted in §0.0 |
 | `catch_unwind` overhead, happy path | ns delta |
 | C++ `at<Eigen::Isometry3d>` vs C ABI | ns delta |
 | Eigen batch write, n = 4096 | ns/sample vs native |
@@ -2022,6 +2022,24 @@ Replay a recorded bag through the bridge, then compare `tf_tree` lookups against
    line gated nothing for two compounding reasons, both recorded in §0.0: the
    profile erased the boundary, and the single quotient's denominator moved 43%
    on an unrelated edit to the same binary.*
+
+   **What gates today, and where its numbers live.** `just abi-cost` runs the
+   ladder at `[profile.embedder]`, and it is the only invocation of
+   `examples/abi_cost.rs` in the workspace — no other recipe and no workflow
+   runs it — so this criterion is gated locally and not in CI. Its readings are
+   registered in [`docs/benchmarks/EVIDENCE.md`](./benchmarks/EVIDENCE.md)'s
+   `abi_cost` row, the register `just evidence-audit` enforces and which exists
+   because this example was executed by nothing for months while this section
+   recorded its stale number as a PASS. §0.0's subsection above records R1 at
+   **1.025–1.038×** against the provisional 1.10, with the control at
+   **0.992–1.002**. The 1.25 that register carries is the *three-edge* rung the
+   recipe still gates, not the §11.1 R3 the paragraph above leaves reported and
+   ungated; the example prints that distinction beside the number
+   (`crates/tf_tree_c/examples/abi_cost.rs:617-628`). **No reading against the
+   withdrawn single ratio is a current statement about the ABI** — neither the
+   **1.020×, PASS** this gate carried for months nor the 1.34–1.46× FAIL that
+   replaced it, which is why §0.0 records criterion 1 in that form as NOT
+   EVALUABLE.
 2. C++ wrapper within **2%** of the C ABI (it is inline code; anything more means it is not).
 3. Bridge steady-state CPU **below one `tf2` consumer's** — the whole architectural claim is that this cost is paid once instead of N times.
 4. Zero ASan/UBSan findings across the C and C++ suites.

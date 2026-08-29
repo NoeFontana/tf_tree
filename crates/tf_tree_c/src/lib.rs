@@ -167,7 +167,45 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// `struct_size` names the `0.4` layout has no such field — its bytes end where
 /// the field begins, and `read_options` zero-fills the rest. So a `0.4` caller
 /// provably cannot receive it, rather than merely being expected not to.
-pub const TFT_ABI_VERSION_MINOR: u32 = 5;
+///
+/// `5` → `6`: one appended entry point, [`tft_plan_create_in_domain`]
+/// (`docs/decisions/0038`). It is `3` → `4`'s case exactly — a new *symbol*, so
+/// the minor has to move or a caller compiled against this header links a `0.5`
+/// library, passes `tft_check_abi`, and then fails at the loader. Nothing
+/// moved, changed type or changed meaning: [`tft_plan_create`] keeps its
+/// signature and its meaning, which `0038` defines as this function with
+/// `domain = 0`.
+///
+/// **What a `0.5` caller can observe is a refusal arriving earlier**, and only
+/// on an arena where it was already receiving that refusal. On a tree whose
+/// dynamic edges carry a non-zero domain, `tft_plan_create` used to return
+/// `TFT_OK` and then answer [`TFT_ERR_TIME_DOMAIN`] to every lookup for the
+/// life of the plan; it now returns that same code from the plan call. No
+/// program that got an answer before stops getting one — there was no such
+/// program, which is the defect `0038` exists to fix — and the alternative
+/// (leaving the check to the hot loop) throws away the frame names.
+///
+/// `6` → `7`: one appended entry point, [`tft_plan_at_extrapolating`], with
+/// the two values it needs — [`tft_extrap_policy`] and [`tft_extrapolated`]
+/// (`docs/decisions/0039`). A new *symbol*, so `3` → `4`'s argument applies
+/// unchanged: the minor is what a caller compares to find out whether the
+/// symbols its header declares are present in the library it linked, and
+/// without the bump a caller compiled against this header links a `0.6`
+/// library, passes [`tft_check_abi`], and then fails at the loader.
+///
+/// **No existing declaration moves, and no status code is added.** The
+/// refusal a caller can now ask *not* to receive, [`TFT_ERR_EXTRAPOLATION`],
+/// has been in this header since 1.0 — which is what keeps this bump smaller
+/// than `4` → `5`'s: there is no code an older caller could be handed and
+/// could not name. [`tft_plan_at`] keeps its signature and its meaning; it
+/// refuses, as it always has, and this function with [`TFT_EXTRAP_ERROR`] is
+/// that same refusal with a distance attached on success.
+///
+/// **A `0.6` caller can observe nothing at all.** Unlike `5` → `6`, which
+/// moved a refusal earlier on arenas that were already failing, nothing here
+/// changes the behaviour of any call that existed before: the new policy is
+/// reachable only through a symbol an older caller cannot name.
+pub const TFT_ABI_VERSION_MINOR: u32 = 7;
 
 /// The library's major ABI version.
 #[no_mangle]
@@ -384,6 +422,18 @@ pub struct tft_plan {
     /// C idiom into a use-after-free, so the plan holds a refcounted share and
     /// `tft_tree_free` merely drops one reference.
     share: Arc<TreeShare>,
+    /// The time domain every evaluate call on this handle asks the engine
+    /// about — `docs/decisions/0038`.
+    ///
+    /// **On the handle rather than on each call**, for three reasons in that
+    /// record's order: the ABI is frozen, so a per-call tag would mean a new
+    /// spelling of three functions instead of one; a domain is a property of a
+    /// route through the tree rather than of an instant, so it cannot
+    /// legitimately vary between two queries on one plan; and plan time is
+    /// where the *frame names* are still in hand, so the mismatch can name the
+    /// route that disagreed. Set and validated by
+    /// [`tft_plan_create_in_domain`]; [`tft_plan_create`] sets `0`.
+    domain: u8,
 }
 
 /// The tree, shared between its own handle and every plan compiled from it.
@@ -559,6 +609,15 @@ pub unsafe extern "C" fn tft_tree_free(tree: *mut tft_tree) {
 /// path (D3). A C caller should compile once and evaluate many times, exactly as
 /// a Rust one would.
 ///
+/// **This is [`tft_plan_create_in_domain`] with `domain = 0`**, which is the tag
+/// a real-time tree publishes in and therefore the right call for most arenas.
+/// On an arena whose dynamic edges carry any other tag — a simulated tree, which
+/// `docs/PHASE4.md` §5.5 tells an operator to configure — it now returns
+/// [`TFT_ERR_TIME_DOMAIN`] here instead of on every lookup afterwards. That is
+/// the same refusal moved earlier, not a new one: before `docs/decisions/0038`
+/// such a plan compiled and then failed every single evaluate call, with no
+/// argument a C caller could pass to say otherwise.
+///
 /// # Safety
 ///
 /// `tree` must be a live handle. `target` and `source` must be NUL-terminated
@@ -568,6 +627,72 @@ pub unsafe extern "C" fn tft_plan_create(
     tree: *const tft_tree,
     target: *const c_char,
     source: *const c_char,
+    out: *mut *mut tft_plan,
+) -> tft_status {
+    // SAFETY: every pointer is forwarded unchanged under the identical
+    // contract, and `0` is the domain this entry point has always meant.
+    unsafe { tft_plan_create_in_domain(tree, target, source, 0, out) }
+}
+
+/// Compile a plan for `target <- source` that will be queried in time domain
+/// `domain`.
+///
+/// The domain a binding could not name (`docs/decisions/0038`).
+/// [`tf_tree::Domain`] is an **open trait** — `SystemDomain` through
+/// `SteadyDomain` hold `0`–`3` and a driver
+/// with a PTP-disciplined clock declares its own tag from `4` upwards
+/// (`docs/API.md` §2.5) — so a foreign caller can neither enumerate the domains
+/// it may be asked about nor name the type it would have to instantiate. It
+/// carries the tag as data instead, and the engine's tagged entry points do the
+/// comparison they always did.
+///
+/// Pass the integer the publisher configured. `0` is [`tft_plan_create`].
+///
+/// # The check is here, and it is not removed from the lookup
+///
+/// A mismatch is reported once, at plan time, while the frame *names* are still
+/// in hand — instead of on every lookup in a hot loop, where the engine can
+/// only say which two integers disagreed. Every evaluate entry point still
+/// passes this handle's tag to the engine on every call and the engine still
+/// compares it: there is no "already checked" fast path, which would be the
+/// footgun `0038` exists to remove rather than a smaller version of it.
+///
+/// # Errors
+///
+/// Everything [`tft_plan_create`] returns, plus [`TFT_ERR_TIME_DOMAIN`] when
+/// this route has a dynamic edge and that edge's tag is not `domain`. `*out` is
+/// not written and no handle is created.
+///
+/// **That condition is the engine's, spelled the same way**, and the equality
+/// matters more than it looks. `0038` §4 says the check moves rather than
+/// changes: `Plan::check_domain_tag` fires on `has_dynamic() && domain !=
+/// self.domain`, so anything refused here is refused by every lookup and
+/// anything accepted here is accepted by every lookup. Neither direction is
+/// free to drift.
+///
+/// * Refuse *more* than the engine and a **static** route becomes unreadable —
+///   `tf_tree::Plan::domain` reports `0` for a route with no dynamic edge on
+///   it, so a bare `domain != plan.domain()` would reject `base -> sensor` for
+///   any caller holding one non-zero tag across a whole arena, a lookup the
+///   engine serves and a route the caller cannot know is static in advance.
+/// * Refuse *less* and the diagnostic silently degrades: a route whose dynamic
+///   edges are tag `0`, asked about in domain `1`, would compile and then fail
+///   every evaluate call with only two integers to show for it. `plan.domain()`
+///   cannot tell "all static" from "dynamic, tag 0" on its own — this asks
+///   [`tf_tree::Plan::steps`] whether any [`tf_tree::Step::Dyn`] is present,
+///   which is the same question `has_dynamic` answers, and pays for it once per
+///   plan rather than once per lookup.
+///
+/// # Safety
+///
+/// As [`tft_plan_create`]: `tree` must be a live handle, `target` and `source`
+/// NUL-terminated UTF-8, and `out` NULL or a writable `*mut tft_plan`.
+#[no_mangle]
+pub unsafe extern "C" fn tft_plan_create_in_domain(
+    tree: *const tft_tree,
+    target: *const c_char,
+    source: *const c_char,
+    domain: u8,
     out: *mut *mut tft_plan,
 ) -> tft_status {
     guard(|| {
@@ -601,10 +726,42 @@ pub unsafe extern "C" fn tft_plan_create(
         };
         match h.share.tree.plan(tf, sf) {
             Ok(plan) => {
+                // The whole point of validating here rather than per lookup:
+                // `t` and `s` are the names the caller typed, and after this
+                // function returns nothing on either side of the ABI has them.
+                //
+                // `Plan::has_dynamic` is private, and `plan.domain()` alone
+                // cannot stand in for it — it is `0` both for "all static" and
+                // for "dynamic, tag 0". So reconstruct the engine's own
+                // predicate from `steps()`, which is public and whose `Step`
+                // is deliberately not `#[non_exhaustive]` for exactly this
+                // ("which edges does this plan sample?"). Scanning at most
+                // MAX_DEPTH steps once per plan is off the hot path; getting
+                // the condition merely *close* is not, in either direction —
+                // see this function's *Errors*.
+                let has_dynamic = plan
+                    .steps()
+                    .iter()
+                    .any(|s| matches!(s, tf_tree::Step::Dyn { .. }));
+                if has_dynamic && plan.domain() != domain {
+                    set_error(
+                        TFT_ERR_TIME_DOMAIN,
+                        &format!(
+                            "plan {t} <- {s} runs over edges in time domain \
+                             {} and was asked for domain {domain}; a lookup \
+                             would refuse every stamp. Pass the publisher's \
+                             domain to tft_plan_create_in_domain (docs/PHASE4.md 5.5)",
+                            plan.domain()
+                        ),
+                        |_| {},
+                    );
+                    return TFT_ERR_TIME_DOMAIN;
+                }
                 let p = Box::new(tft_plan {
                     magic: MAGIC_PLAN,
                     plan,
                     share: Arc::clone(&h.share),
+                    domain,
                 });
                 // SAFETY: `out` is non-null and the caller contracts it writable.
                 unsafe { core::ptr::write(out, Box::into_raw(p)) };
@@ -642,6 +799,17 @@ pub unsafe extern "C" fn tft_plan_free(plan: *mut tft_plan) {
 /// Evaluate `plan` at `stamp`, writing the result into `out` in `layout`.
 ///
 /// `out` must have room for at least `tft_layout_size(layout)` bytes.
+///
+/// **On a hot path, prefer [`tft_plan_at_many`].** The C signature has nowhere
+/// to keep a `Guard` between calls, so this one builds a fresh one per lookup
+/// and the batch entry point pays it once per call instead: 261 ns/element
+/// against 302 on the depth-3 fixture at n = 256 (`docs/decisions/0022`, whose
+/// implementation plan asks for this pointer in both headers — batching is the
+/// whole of the available win, and a reader who never finds `tft_plan_at_many`
+/// is the only way that decision goes wrong).
+///
+/// The plan is evaluated in the domain it was compiled for
+/// ([`tft_plan_create_in_domain`]); the tag is on the handle, not on this call.
 ///
 /// # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
 ///
@@ -682,12 +850,17 @@ pub unsafe extern "C" fn tft_plan_at(
         let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), n) };
 
         let g = h.share.tree.guard();
-        let t = Stamp::<SystemDomain>::from_nanos(stamp);
+        // **`_tagged`, and the tag is the handle's** (`docs/decisions/0038`).
+        // The typed form would hard-code `SystemDomain::TAG`, which is what made
+        // every lookup on a simulated arena fail permanently: `Domain` is an
+        // open trait, so there is no type this file can name that stands for
+        // the caller's domain. The check itself is unchanged — same condition,
+        // same `TimeDomainMismatch` — only where the tag comes from.
         // Two evaluations, chosen once from the layout. A twist layout cannot
         // be served by `plan.at`, and a pose layout must not pay for the
         // adjoint chain `at_with_derivatives` runs per plan step.
         if layout::carries_twist(layout) {
-            match h.plan.at_with_derivatives(&g, t) {
+            match h.plan.at_with_derivatives_tagged(&g, stamp, h.domain) {
                 Ok(s) => {
                     layout::write_twist6(&s.pose, &s.twist, dst);
                     TFT_OK
@@ -695,7 +868,7 @@ pub unsafe extern "C" fn tft_plan_at(
                 Err(e) => record_lookup(e),
             }
         } else {
-            match h.plan.at(&g, t) {
+            match h.plan.at_tagged(&g, stamp, h.domain) {
                 Ok(iso) => {
                     layout::write(&iso, layout, dst);
                     TFT_OK
@@ -762,9 +935,11 @@ pub unsafe extern "C" fn tft_test_plan_at_unguarded(
     let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), n) };
 
     let g = h.share.tree.guard();
-    let t = Stamp::<SystemDomain>::from_nanos(stamp);
+    // Tagged, as `tft_plan_at` is: this body must stay that body with nothing
+    // but the guard removed, or the subtraction it exists for measures two
+    // differences instead of one.
     if layout::carries_twist(layout) {
-        match h.plan.at_with_derivatives(&g, t) {
+        match h.plan.at_with_derivatives_tagged(&g, stamp, h.domain) {
             Ok(s) => {
                 layout::write_twist6(&s.pose, &s.twist, dst);
                 TFT_OK
@@ -772,7 +947,7 @@ pub unsafe extern "C" fn tft_test_plan_at_unguarded(
             Err(e) => record_lookup(e),
         }
     } else {
-        match h.plan.at(&g, t) {
+        match h.plan.at_tagged(&g, stamp, h.domain) {
             Ok(iso) => {
                 layout::write(&iso, layout, dst);
                 TFT_OK
@@ -906,14 +1081,11 @@ pub unsafe extern "C" fn tft_plan_at_many(
             // rewrites on the way are bit-identical to the ones already there
             // (that is what the cursor being a *hint* means), so the buffer ends
             // in the state the doc comment describes either way.
-            if twist_batch(&h.plan, &g, ts, dst, stride, payload) {
+            if twist_batch(&h.plan, &g, ts, h.domain, dst, stride, payload) {
                 return TFT_OK;
             }
             for (i, &t) in ts.iter().enumerate() {
-                match h
-                    .plan
-                    .at_with_derivatives(&g, Stamp::<SystemDomain>::from_nanos(t))
-                {
+                match h.plan.at_with_derivatives_tagged(&g, t, h.domain) {
                     Ok(s) => {
                         let off = i * stride;
                         layout::write_twist6(&s.pose, &s.twist, &mut dst[off..off + payload]);
@@ -923,7 +1095,7 @@ pub unsafe extern "C" fn tft_plan_at_many(
             }
         } else {
             for (i, &t) in ts.iter().enumerate() {
-                match h.plan.at(&g, Stamp::<SystemDomain>::from_nanos(t)) {
+                match h.plan.at_tagged(&g, t, h.domain) {
                     Ok(iso) => {
                         let off = i * stride;
                         layout::write(&iso, layout, &mut dst[off..off + payload]);
@@ -971,6 +1143,10 @@ pub unsafe extern "C" fn tft_plan_at_many(
 ///   instead of once per stamp, which is 1/`CHUNK` of the searches the scalar
 ///   loop paid.
 ///
+/// `domain` is the plan handle's tag, passed through to `at_many_into_tagged`
+/// so the batch path checks the same domain the scalar one does
+/// (`docs/decisions/0038`).
+///
 /// `CHUNK` is deliberately small. The buffer is a plain array, so its zeroing
 /// is paid even by a batch of one: 32 rows is 3.3 KiB of stack and leaves under
 /// one probe per element of restart cost, where 512 would save a rounding error
@@ -979,6 +1155,7 @@ fn twist_batch(
     plan: &tf_tree::Plan,
     g: &tf_tree::Guard<'_>,
     stamps: &[i64],
+    domain: u8,
     dst: &mut [u8],
     stride: usize,
     payload: usize,
@@ -1004,7 +1181,7 @@ fn twist_batch(
             core::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f64>(), dst.len() / 8)
         };
         return plan
-            .at_many_into::<SystemDomain>(g, stamps, tf_tree::Layout::QuatTwist, rows)
+            .at_many_into_tagged(g, stamps, domain, tf_tree::Layout::QuatTwist, rows)
             .is_ok();
     }
 
@@ -1012,7 +1189,7 @@ fn twist_batch(
     for (c, part) in stamps.chunks(CHUNK).enumerate() {
         let rows = &mut scratch[..part.len() * ROW];
         if plan
-            .at_many_into::<SystemDomain>(g, part, tf_tree::Layout::QuatTwist, rows)
+            .at_many_into_tagged(g, part, domain, tf_tree::Layout::QuatTwist, rows)
             .is_err()
         {
             return false;
@@ -1058,6 +1235,242 @@ fn note_batch_failure(i: usize, t: i64, e: tf_tree::LookupError) -> tft_status {
 #[no_mangle]
 pub extern "C" fn tft_layout_size(layout: tft_layout) -> usize {
     layout::payload_bytes(layout).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Extrapolation — `docs/decisions/0039`
+// ---------------------------------------------------------------------------
+
+/// What to do when the requested stamp is newer than every published sample on
+/// the route.
+///
+/// A `uint32_t` typedef with named constants rather than a C `enum`, matching
+/// [`tft_layout`] exactly — §3.6 needs the width of every ABI value stated, and
+/// a C `enum`'s underlying type is the implementation's business. Every entry
+/// point that takes one **rejects a discriminant it does not define** with
+/// [`TFT_ERR_BAD_ENUM`], for [`layout::payload_bytes`]'s reason: an unknown
+/// policy from a newer header must be an error, never a silent fallback to the
+/// one this build happens to think is safest.
+pub type tft_extrap_policy = u32;
+
+/// Refuse: the lookup returns [`TFT_ERR_EXTRAPOLATION`] and writes nothing.
+///
+/// `0`, so a zeroed struct or a forgotten initialiser produces the refusal
+/// rather than an invented pose. It is also `tf_tree::ExtrapPolicy`'s own
+/// `Default`, and what [`tft_plan_at`] has always done.
+pub const TFT_EXTRAP_ERROR: tft_extrap_policy = 0;
+/// Hold the newest sample constant — `tf2`'s behaviour under some settings.
+///
+/// The honest primitive for a latched or displayed value. It is not the silent
+/// staleness `tf2` is criticised for, because [`tft_extrapolated::by_ns`] comes
+/// back in the same call and the caller had to pass somewhere to put it.
+pub const TFT_EXTRAP_HOLD: tft_extrap_policy = 1;
+/// Extend the constant screw twist implied by the two newest samples.
+///
+/// What a controller running faster than its state estimate wants
+/// (`docs/decisions/0039` *Context*). Falls back to [`TFT_EXTRAP_HOLD`] on an
+/// edge that retains a single sample: there is no twist to extend.
+pub const TFT_EXTRAP_CONSTANT_TWIST: tft_extrap_policy = 2;
+
+/// `policy` as the engine's enum, or `None` for a discriminant this build does
+/// not define.
+///
+/// `None` rather than a default for the reason [`layout::payload_bytes`] gives:
+/// a caller compiled against a newer header must be refused, not quietly served
+/// a different policy than the one it named — and the two policies differ in
+/// what the answer *is*, not in how it is formatted.
+fn extrap_policy(policy: tft_extrap_policy) -> Option<tf_tree::ExtrapPolicy> {
+    Some(match policy {
+        TFT_EXTRAP_ERROR => tf_tree::ExtrapPolicy::Error,
+        TFT_EXTRAP_HOLD => tf_tree::ExtrapPolicy::Hold,
+        TFT_EXTRAP_CONSTANT_TWIST => tf_tree::ExtrapPolicy::ConstantTwist,
+        _ => return None,
+    })
+}
+
+/// How far past the route's newest common sample an answer was extrapolated.
+///
+/// **The caller has to pass one of these to get a pose at all**, and that is
+/// the whole design rather than an out-parameter that happened to be
+/// convenient (`docs/decisions/0039` §1). In Rust the property is a type with
+/// no pose-only accessor; C has no such enforcement, so the closest honest
+/// analogue is a *required* out-parameter — [`tft_plan_at_extrapolating`]
+/// returns [`TFT_ERR_NULL_ARG`] when `info` is NULL and writes nothing. There
+/// is deliberately no second spelling of that call without this argument, so
+/// "forgot to check the staleness" is not reachable by omission; it takes a
+/// caller who read `by_ns` and ignored it.
+///
+/// `struct_size` is §3.6's append mechanism, and it is checked exactly as
+/// [`tft_error`]'s is: set it to `sizeof(tft_extrapolated)` before the call or
+/// the call returns [`TFT_ERR_BAD_STRUCT_SIZE`]. It is written back on success,
+/// so the struct a caller passes twice needs setting once per *object*, not
+/// once per call.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct tft_extrapolated {
+    /// `sizeof(tft_extrapolated)` at the time this build was compiled — §3.6.
+    pub struct_size: u32,
+    /// Nanoseconds past the newest stamp that **every** dynamic edge on this
+    /// plan has data for.
+    ///
+    /// `0` means every edge bracketed the query: the answer was interpolated
+    /// between published samples, not invented past them, and the policy did
+    /// not come into it. A positive value is the worst case over the route,
+    /// because the edge that runs out of data first is what bounds how invented
+    /// a composed answer is (`docs/decisions/0039` §3).
+    pub by_ns: i64,
+    /// The dynamic edge whose newest stamp is [`Self::by_ns`] behind the query,
+    /// or [`TFT_INVALID_ID`] when `by_ns` is `0`.
+    ///
+    /// **The sentinel is this side's, and it is deliberately sharper than the
+    /// Rust value it mirrors.** `tf_tree::Extrapolated::edge` carries a real
+    /// `EdgeId` documented as *meaningless when `by_ns == 0`*; a C caller
+    /// handed `0` there would be looking at a plausible edge id for an answer
+    /// that was never extrapolated. [`TFT_INVALID_ID`] is what the rest of this
+    /// header already means by "this field does not apply" ([`tft_error`]), so
+    /// the sentence is checkable rather than only documented.
+    pub edge: u32,
+}
+
+/// [`tft_plan_at`], permitting extrapolation past the newest sample under
+/// `policy`, and reporting how far the answer was extrapolated.
+///
+/// The capability existed in the engine's sampler from the beginning and was
+/// reachable from no shipped surface until `docs/decisions/0039`; this is the C
+/// half of reaching it. A controller running at 1 kHz against a 100 Hz state
+/// estimate is *always* asking for a stamp past the newest sample, and the
+/// honest answer is a bounded prediction with its bound attached — not a
+/// refusal, and not a silent stale pose.
+///
+/// **`info` is required.** That is the property the whole surface is for: the
+/// distance is handed back in the same call as the pose, so a caller cannot get
+/// one without the other. Passing NULL is [`TFT_ERR_NULL_ARG`] and nothing is
+/// written, in either buffer.
+///
+/// [`tft_plan_at`] is untouched, still refuses, and remains what a caller that
+/// must not act on invented data should call. This function with
+/// [`TFT_EXTRAP_ERROR`] is that same refusal with a distance attached on
+/// success.
+///
+/// The plan is evaluated in the domain it was compiled for
+/// ([`tft_plan_create_in_domain`]); the tag is on the handle, not on this call.
+///
+/// # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is not accepted here
+///
+/// Asking for that layout is asking for derivatives, and the engine has no
+/// extrapolating form of `at_with_derivatives` — `docs/decisions/0039` adds one
+/// pose-returning method and deliberately no second one. So the layout is
+/// refused with [`TFT_ERR_BAD_ENUM`] and nothing is written, exactly as
+/// [`tft_publisher_push`] refuses the write-only `TFT_LAYOUT_AFFINE12_ROW_F32`:
+/// the discriminant is defined, and this entry point does not take it. The
+/// alternative — emitting a twist evaluated under `ExtrapPolicy::Error` beside
+/// a pose extrapolated under the caller's — would put two different policies in
+/// one thirteen-`f64` row.
+///
+/// # Errors
+///
+/// Everything [`tft_plan_at`] returns. Under [`TFT_EXTRAP_ERROR`] a stamp past
+/// the newest sample is [`TFT_ERR_EXTRAPOLATION`]; under the other two it is
+/// not, and `info->by_ns` says how far. [`TFT_ERR_BAD_STRUCT_SIZE`] if
+/// `info->struct_size` is not `sizeof(tft_extrapolated)`.
+///
+/// # Safety
+///
+/// `plan` must be a handle from [`tft_plan_create`] that has not been freed.
+/// `out` must point to at least `tft_layout_size(layout)` writable bytes.
+/// `info` must point to a writable `tft_extrapolated` whose `struct_size` this
+/// caller has set.
+#[no_mangle]
+pub unsafe extern "C" fn tft_plan_at_extrapolating(
+    plan: *const tft_plan,
+    stamp: i64,
+    policy: tft_extrap_policy,
+    layout: tft_layout,
+    out: *mut c_void,
+    info: *mut tft_extrapolated,
+) -> tft_status {
+    guard(|| {
+        // SAFETY: validated below before any field access.
+        if !unsafe { check_plan(plan) } {
+            return bad_handle("tft_plan");
+        }
+        if out.is_null() {
+            return null_arg("out");
+        }
+        // The argument this entry point exists to make unavoidable. Checked
+        // beside `out` rather than after the evaluation, so a caller who forgot
+        // it gets the refusal instead of a pose it cannot judge.
+        if info.is_null() {
+            return null_arg("info");
+        }
+        let Some(policy) = extrap_policy(policy) else {
+            return bad_enum("policy");
+        };
+        let Some(n) = layout::payload_bytes(layout) else {
+            return bad_enum("layout");
+        };
+        if layout::carries_twist(layout) {
+            set_error(
+                TFT_ERR_BAD_ENUM,
+                "TFT_LAYOUT_QVEC7_WXYZ_TWIST6 has no extrapolating form: the \
+                 engine returns a pose here, not a pose and a twist",
+                |_| {},
+            );
+            return TFT_ERR_BAD_ENUM;
+        }
+        // SAFETY: `info` is non-null and the caller contracts it points at a
+        // `tft_extrapolated` with `struct_size` set. `read_unaligned` for
+        // `magic_check!`'s reason — a caller's struct need not be aligned to
+        // *our* idea of the type's alignment for this read to be the one that
+        // catches the mistake.
+        let declared = unsafe { core::ptr::addr_of!((*info).struct_size).read_unaligned() };
+        if declared as usize != core::mem::size_of::<tft_extrapolated>() {
+            set_error(
+                TFT_ERR_BAD_STRUCT_SIZE,
+                "info->struct_size is not sizeof(tft_extrapolated)",
+                |_| {},
+            );
+            return TFT_ERR_BAD_STRUCT_SIZE;
+        }
+        // SAFETY: `check_plan` confirmed the magic word, so this points at a
+        // live `tft_plan` constructed by `tft_plan_create`.
+        let h = unsafe { &*plan };
+        // SAFETY: the caller contracts that `out` has `n` writable bytes, and
+        // `n` is exactly what `tft_layout_size` reports for this layout.
+        let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), n) };
+
+        let g = h.share.tree.guard();
+        // `_tagged`, and the tag is the handle's — `docs/decisions/0038`. There
+        // is no type this file can name that stands for the caller's domain,
+        // because `Domain` is an open trait.
+        match h.plan.at_extrapolating_tagged(&g, stamp, h.domain, policy) {
+            Ok(x) => {
+                layout::write(&x.pose, layout, dst);
+                // Written after the pose, and only on success: a caller that
+                // got a status other than `TFT_OK` has nothing in `out` to
+                // judge, so a distance describing it would be describing
+                // nothing.
+                //
+                // See `tft_extrapolated::edge` for why `by_ns == 0` reports
+                // the sentinel rather than the engine's argmin edge.
+                let e = tft_extrapolated {
+                    struct_size: core::mem::size_of::<tft_extrapolated>() as u32,
+                    by_ns: x.by_ns,
+                    edge: if x.by_ns == 0 {
+                        TFT_INVALID_ID
+                    } else {
+                        x.edge.get()
+                    },
+                };
+                // SAFETY: `info` is non-null, the caller contracts it writable,
+                // and its `struct_size` matched this build's exactly — so the
+                // whole struct is inside the caller's allocation.
+                unsafe { core::ptr::write(info, e) };
+                TFT_OK
+            }
+            Err(e) => record_lookup(e),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,6 +1630,84 @@ pub unsafe extern "C" fn tft_test_lerpslerp_tree_create(out: *mut *mut tft_tree)
         }
         // Held for the life of the tree, exactly as `tft_test_tree_create`
         // does: a released claim would let a lookup race a reaper.
+        core::mem::forget(w);
+        let h = Box::new(tft_tree {
+            magic: MAGIC_TREE,
+            share: Arc::new(TreeShare {
+                tree: Arc::new(tree),
+            }),
+        });
+        // SAFETY: `out` is non-null and the caller contracts it writable.
+        unsafe { core::ptr::write(out, Box::into_raw(h)) };
+        TFT_OK
+    })
+}
+
+/// Build a fixture tree whose dynamic edge is published in time domain
+/// `domain`: `map -> odom` (ScLerp, 32 samples 10 ms apart) plus a static
+/// `odom -> sensor`.
+///
+/// A fourth fixture, because the arena `docs/decisions/0038` exists for cannot
+/// be built from any of the others: [`tft_test_tree_create`] and its two
+/// siblings publish in tag `0`, so every plan over them agrees with
+/// [`tft_plan_create`] by default and the mismatch never arises. This is the
+/// shape `ros/tf_tree_ros`'s `use_sim_time` warning tells an operator to
+/// configure, and before `0038` it was unreadable from C by construction.
+///
+/// **The static edge is not decoration.** `Plan::domain()` reports `0` for a
+/// route with no dynamic edge on it, so `odom -> sensor` is what proves
+/// [`tft_test_domain_tree_create`]'s tag does not leak into a plan-time refusal
+/// of a static lookup — the one case
+/// [`tft_plan_create_in_domain`] deliberately accepts.
+///
+/// # Safety
+///
+/// `out` must be NULL or point to a writable `*mut tft_tree`.
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub unsafe extern "C" fn tft_test_domain_tree_create(
+    domain: u8,
+    out: *mut *mut tft_tree,
+) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("out");
+        }
+        let cfg = tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(64)).domain(domain);
+        let mount = tf_tree::exp_se3([0.2, -0.1, 0.4, -0.3, 0.15, 0.05]);
+        let Ok(tree) = tf_tree::TreeBuilder::new()
+            .dynamic_edge("map", "odom", cfg)
+            .static_edge("odom", "sensor", &mount)
+            .build()
+        else {
+            return TFT_ERR_INTERNAL;
+        };
+        let (Ok(p), Ok(c)) = (tree.frame("map"), tree.frame("odom")) else {
+            return TFT_ERR_INTERNAL;
+        };
+        let Ok(w) = tree.claim(c, p) else {
+            return TFT_ERR_INTERNAL;
+        };
+        for i in 0..32i64 {
+            let f = i as f64;
+            if w.push(
+                i * 10_000_000,
+                &tf_tree::exp_se3([
+                    0.004 * f,
+                    -0.003 * f,
+                    0.002 * f,
+                    0.05 * f,
+                    -0.02 * f,
+                    0.01 * f,
+                ]),
+            )
+            .is_err()
+            {
+                return TFT_ERR_INTERNAL;
+            }
+        }
+        // Held for the life of the tree, as the other fixtures do: a released
+        // claim would let a lookup race a reaper.
         core::mem::forget(w);
         let h = Box::new(tft_tree {
             magic: MAGIC_TREE,

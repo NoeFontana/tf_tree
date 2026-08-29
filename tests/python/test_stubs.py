@@ -30,12 +30,40 @@ PACKAGE_ONLY = {"open"}
 
 
 def _stub_names() -> set[str]:
+    """Every top-level name the stub declares — classes, functions **and
+    annotated assignments**.
+
+    The third kind arrived with `0038`'s four domain tags. They are module-level
+    ints (the domain trait is open, so an enum would be a closed set standing in
+    for an open one), and a bare `SIM_DOMAIN: int` is an `ast.AnnAssign` rather
+    than a `FunctionDef` — so before this collected them, adding one to the
+    module and forgetting the stub was invisible to every test here, and adding
+    one to the *stub* and forgetting the module was equally invisible. That is
+    the exact rot this file exists to catch, in the one node type it did not
+    look at.
+
+    A plain `ast.Assign` is not collected: `X = Y` in a stub is a type alias
+    (`Layout`, `F32Layout`), which is not a runtime attribute of the extension
+    and would make `test_the_stub_declares_nothing_the_module_lacks` fail on
+    three names that are correctly absent.
+
+    Underscore-prefixed names are dropped, because `_public` drops them on the
+    other side of every comparison: the stub declares `__version__: int` and the
+    module has it, but `_public(_core)` skips it deliberately (see
+    `__init__.py`'s note on why the dunder stays out of `__all__`), so keeping
+    it here would report it as a stub entry with no implementation.
+
+    Mutant: drop `SIM_DOMAIN: int` from `_core.pyi` => `AssertionError: these
+    exist in the module but not in _core.pyi: ['SIM_DOMAIN']`.
+    """
     tree = ast.parse(STUB.read_text())
     names = set()
     for node in tree.body:
         if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
             names.add(node.name)
-    return names
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return {n for n in names if not n.startswith("_")}
 
 
 def _stub_members(cls: str) -> set[str]:

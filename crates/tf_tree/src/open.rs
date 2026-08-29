@@ -17,30 +17,6 @@
 //! - **Created** — this process brought the arena into existence, so it owes
 //!   the service: bind the socket and answer handshakes for as long as it
 //!   lives.
-//! - **TookOver** — **refused**, with [`OpenError::TakeoverUnsupported`]. It
-//!   shared the `Created` arm until `docs/decisions/0028` plan step 9, and that
-//!   arm `memfd_create`s a *fresh* segment: an heir running it would own a new,
-//!   empty arena under the rendezvous name every survivor is still mapped to
-//!   the original through — forking the tree rather than inheriting it. The arm
-//!   cannot be taught to adopt instead, either, because nothing in scope at it
-//!   names the arena this process already holds: no fd, no socket path, no
-//!   [`Rendezvous`] of the session's own.
-//!
-//! # What this module does not do yet
-//!
-//! §3.5 takeover — a *participant* noticing the owner died and promoting itself
-//! — is not here, and **it is not a second pass through [`tf_tree_ipc::Open`]
-//! with a builder declaring it is already attached**, which is what this
-//! paragraph used to say — and that builder is now deleted
-//! (`docs/decisions/0037`).
-//! `docs/decisions/0028` open question 3 settled that the heir keeps its
-//! existing slot, byte and arena record: the participant slot is baked into
-//! every claim and every topology guard it already holds — A3 encodes claim
-//! ownership as `participant_slot + 1` — so an heir that registered a second
-//! time would arrange for its own live claims to be reaped. What §3.5 needs is
-//! a watcher on the client socket plus a narrower operation on the session that
-//! already exists — take byte 0, unlink, bind, serve — which is why the
-//! outcome above has no adopting arm to route to and refuses instead.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -429,26 +405,240 @@ pub(crate) type JoinedSession = tf_tree_ipc::Session<tf_tree_ipc::Attached>;
 /// that dropping them is the observable effect.
 pub(crate) enum Attachment {
     /// This process joined somebody else's arena.
+    ///
+    /// **`rendezvous` is not held for `Drop`, unlike its two siblings**, and is
+    /// what [`0037`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0037-a-takeover-is-not-a-second-open.md)
+    /// question 1 found missing: a survivor inheriting the owner role has to
+    /// bind *this* rendezvous, and nothing in scope at the old takeover arm
+    /// named it. `session` and `socket` lose their underscores for the same
+    /// reason — the session takes byte 0 and the socket is how this process
+    /// learns the owner died (`Tree::owner_lost`).
     Joined {
-        _session: JoinedSession,
-        _socket: std::os::fd::OwnedFd,
+        session: JoinedSession,
+        socket: std::os::fd::OwnedFd,
+        rendezvous: Rendezvous,
     },
     /// This process owns the arena and serves it.
+    ///
+    /// **`_server` is declared before `_session`, and the order is the
+    /// correctness property — do not reorder these two fields.** Rust drops an
+    /// enum variant's fields in declaration order (RFC 1857), and
+    /// [`OwnerThread`]'s own `Drop` stops the serving thread, so declaring it
+    /// first means serving stops *before* the session releases the ownership
+    /// byte. The reverse order leaves a window in which a successor takes
+    /// ownership and binds while this process is still answering handshakes from
+    /// the old socket — two servers on one path, with clients split between
+    /// them.
+    ///
+    /// This used to be an explicit `impl Drop for Attachment` calling
+    /// `server.stop()`. That impl made the whole enum un-destructurable, which
+    /// is what `Tree::inherit_ownership` needs to do to hand a surviving session
+    /// its new role — and it was redundant besides, since `OwnerThread::drop`
+    /// already routes through the same `stop()`. The guarantee is the same one,
+    /// expressed structurally instead of imperatively.
     Owner {
+        _server: OwnerThread,
         _session: JoinedSession,
-        server: OwnerThread,
     },
 }
 
-impl Drop for Attachment {
-    fn drop(&mut self) {
-        // Stop serving *before* the session drops, so the socket is gone by the
-        // time the ownership byte is released. The reverse order leaves a window
-        // where a successor can take ownership and bind while this process is
-        // still answering handshakes from the old socket — two servers, one
-        // path, and clients split between them.
-        if let Attachment::Owner { server, .. } = self {
-            server.stop();
+/// Every `docs/PHASE2.md` §11.3 crash point compiled into **this crate**.
+///
+/// The companion to [`tf_tree_core::crash::SITES`], which is scoped to that
+/// crate for the same reason: §11.3's table spans three crates, and a harness
+/// that arms a site at random (§11.4) must read the literals from wherever they
+/// are placed rather than re-spelling them, because a typo silently arms nothing
+/// and the run then looks clean.
+///
+/// One entry today. The `attach.*`, `open.*`, `hangup.*` and `reclaim.*` rows are
+/// still unplaced.
+#[cfg(feature = "crash-points")]
+pub const CRASH_SITES: &[&str] = &["takeover.after_ownership_lock_before_bind"];
+
+/// How [`Tree::inherit_ownership`] resolved (§3.5).
+///
+/// Anything but [`Inheritance::Inherited`] means this process is **not** the
+/// owner and should keep behaving as a plain participant. It is never a reason
+/// to stop reading: lookups are unaffected by ownership in every one of these
+/// states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Inheritance {
+    /// This process is now the owner and is serving the rendezvous.
+    Inherited,
+    /// The owner is alive. Nothing was attempted.
+    OwnerAlive,
+    /// Another survivor won the ownership byte and is binding.
+    ///
+    /// Not an error, and **this process kept its slot** — which is the property
+    /// the deleted takeover arm could not provide, because it went looking for a
+    /// byte instead of keeping the one it held
+    /// ([`0037`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
+    /// **What §3.5 says next, and what this crate does not yet provide.** The
+    /// spec has the loser "retry connect with backoff"; there is no API here
+    /// that does. The loser keeps its slot, its byte and its mapping, so it
+    /// keeps *reading* with nothing lost — but its attach socket still points at
+    /// the dead owner and stays hung up forever, so `Tree::owner_lost` goes on
+    /// answering `true` and the recommended loop will re-attempt the lock every
+    /// cycle for the life of the process. **A loser should stop calling**, and
+    /// the reason it cannot simply latch is that if the *new* owner also dies it
+    /// ought to be able to inherit then. Reattaching a survivor to a new owner
+    /// is a protocol addition, so it is a decision record rather than a patch;
+    /// `docs/PHASE2.md` §0.0's §3.5 row carries it as owed.
+    Contended,
+    /// This tree is a read-only attachment, so it cannot serve.
+    ///
+    /// An owner writes the participant table on every grant, and a `PROT_READ`
+    /// mapping cannot — which is D18 working, not failing. A read-only consumer
+    /// keeps reading from the arena it has; some read-write participant must be
+    /// the heir.
+    ReadOnly,
+    /// This tree has no owner to inherit from: a heap tree, a frozen `.tft`, an
+    /// `attach_shared` over an inherited fd, or a tree this process already owns.
+    NotApplicable,
+}
+
+impl Tree {
+    /// Inherit the owner role from a departed owner, and begin serving (§3.5).
+    ///
+    /// **Ownership is a role, not a property of the arena.** The arena is the
+    /// memfd and lives as long as any mapping does; the owner is merely whichever
+    /// participant holds byte 0 and the listening socket. When the owner dies the
+    /// kernel releases byte 0, and any surviving read-write participant may take
+    /// it — the heir is chosen by an uncontended `F_OFD_SETLK` with no message
+    /// exchanged and no quorum, which is why this is inheritance rather than the
+    /// election D16 rejects.
+    ///
+    /// # What this closes
+    ///
+    /// Until this existed, owner death was **terminal for new joiners**. Lookups
+    /// kept working for every already-attached process exactly as §3.5 promises,
+    /// but a new process could not join at all: it won the ownership byte, met
+    /// §3.4's split-brain check against the survivors' held participant bytes,
+    /// backed off, and timed out with `ArenaHeldButUnreachable` for as long as
+    /// any survivor lived. That is the shape a supervised robot has every time it
+    /// restarts one node, and `docs/PHASE2.md` §0.0 recorded it, measured with
+    /// `shm_torture`.
+    ///
+    /// # The trigger is the caller's, on purpose
+    ///
+    /// This does nothing until somebody calls it. Pair it with
+    /// [`Tree::owner_lost`], which is a non-blocking `poll` of the attach
+    /// socket:
+    ///
+    /// ```ignore
+    /// if tree.owner_lost() {
+    ///     let _ = tree.inherit_ownership()?;   // Contended is fine: somebody won
+    /// }
+    /// ```
+    ///
+    /// There is no background thread and no daemon, because
+    /// [`0019`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md)
+    /// holds that every process a user is *required* to run is a place adoption
+    /// dies — and a thread per attachment is the library-shaped version of the
+    /// same cost. A survivor that never calls this simply never becomes owner,
+    /// and the arena stays ownerless exactly as it does today.
+    ///
+    /// # Lookups do not pause
+    ///
+    /// Not during the poll, not during the lock, not during the bind. `Plan::at`
+    /// touches the mapping and nothing else; ownership lives entirely in the
+    /// control plane. That is the answer to the first question any integrator
+    /// asks about owner death, and it is unchanged by this method existing.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::Rendezvous`] if the `fcntl` fails, or whatever binding the
+    /// rendezvous socket fails with. **On every error path this process keeps its
+    /// participant slot, its byte and its mapping**, and gives back the ownership
+    /// byte if it had taken one — so a failed inheritance leaves a plain
+    /// participant and lets another survivor try, rather than an arena with an
+    /// owner that is not serving.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub fn inherit_ownership(&mut self) -> Result<Inheritance, OpenError> {
+        if !matches!(self.attachment_ref(), Some(Attachment::Joined { .. })) {
+            return Ok(Inheritance::NotApplicable);
+        }
+        if !self.owner_lost() {
+            return Ok(Inheritance::OwnerAlive);
+        }
+        if !self.is_writable() {
+            return Ok(Inheritance::ReadOnly);
+        }
+        // Taken out so `spawn_owner_server` can borrow `self` immutably below.
+        // **Every exit from here on puts it back.** Dropping it would release
+        // this process's participant byte and close the socket, which is the
+        // one thing worse than failing to inherit.
+        let (mut session, socket, rendezvous) = match self.take_attachment() {
+            Some(Attachment::Joined {
+                session,
+                socket,
+                rendezvous,
+            }) => (session, socket, rendezvous),
+            other => {
+                self.put_attachment(other);
+                return Ok(Inheritance::NotApplicable);
+            }
+        };
+
+        // Taken on the description that already holds our participant byte, so
+        // the slot cannot move and nothing needs verifying — `0037`'s whole
+        // argument for this being a method rather than a second `open()`.
+        let acquired = match session.take_over_ownership() {
+            Ok(v) => v,
+            Err(e) => {
+                self.put_attachment(Some(Attachment::Joined {
+                    session,
+                    socket,
+                    rendezvous,
+                }));
+                return Err(OpenError::Rendezvous(e));
+            }
+        };
+        if !acquired {
+            self.put_attachment(Some(Attachment::Joined {
+                session,
+                socket,
+                rendezvous,
+            }));
+            return Ok(Inheritance::Contended);
+        }
+
+        // `docs/PHASE2.md` §11.3: **`takeover.after_ownership_lock_before_bind`**.
+        // The row's repair claim is "ownership released; another participant
+        // takes over; joiners retry", and this is the instruction it names — byte
+        // 0 held, nothing listening. A process killed here has its byte released
+        // by the kernel with no cooperation, which is what makes that claim true
+        // rather than hopeful, and `a_killed_heir_leaves_the_role_for_the_next_survivor`
+        // is what executes it.
+        #[cfg(feature = "crash-points")]
+        tf_tree_core::crash::maybe_abort(CRASH_SITES[0]);
+
+        match spawn_owner_server(&rendezvous, self) {
+            Ok(server) => {
+                // The old socket goes with the old owner. It is already hung up —
+                // that is what brought us here — and holding it would keep a
+                // descriptor open on a connection to a dead process.
+                drop(socket);
+                self.put_attachment(Some(Attachment::Owner {
+                    _server: server,
+                    _session: session,
+                }));
+                Ok(Inheritance::Inherited)
+            }
+            Err(e) => {
+                // Hand the role back rather than hold a byte we cannot serve
+                // behind. A survivor that owns byte 0 and is not listening is
+                // exactly the state that makes an arena unjoinable, which is the
+                // failure this method exists to end.
+                let _ = session.release_ownership();
+                self.put_attachment(Some(Attachment::Joined {
+                    session,
+                    socket,
+                    rendezvous,
+                }));
+                Err(e)
+            }
         }
     }
 }
@@ -578,47 +768,6 @@ pub enum OpenError {
     /// lock file by anything entitled to see them.
     #[error("this process's participant lock byte and its arena participant record are different slots; the arena was not published")]
     ParticipantSlotDiverged,
-
-    /// The rendezvous resolved to [`OpenOutcome::TookOver`], and §3.5 takeover
-    /// is not wired (`docs/decisions/0028` plan step 9).
-    ///
-    /// **A refusal rather than the arena this used to build.** `TookOver`
-    /// shared the `Created` arm, which calls [`TreeBuilder::build_shared`] — a
-    /// `memfd_create` of a *fresh* segment. An heir taking that path would hold
-    /// a new, empty arena under the rendezvous name while every survivor stayed
-    /// mapped to the old one: `docs/PHASE2.md` §3.5 makes ownership a role
-    /// rather than a property of the arena, so a takeover that swaps the arena
-    /// has forked the tree instead of inheriting it. Adopting is not available
-    /// at that point in [`Open::open`] — no fd, no socket path, no
-    /// [`Rendezvous`] of the session's own is in scope — so the arm refuses and
-    /// the caller keeps whatever it already had.
-    ///
-    /// The session is dropped before this is returned, so the ownership byte is
-    /// released: a refused takeover leaves the rendezvous as it found it.
-    ///
-    /// # Nothing reaches this any more, and the arm stays
-    ///
-    /// `tf_tree_ipc::Open` had the only producer of [`OpenOutcome::TookOver`],
-    /// and issue #275 deleted it: two rounds of trying to make it safe produced
-    /// five executed unsound states, and the reason is structural — a takeover
-    /// cannot be an `Open::open` call at all (`docs/decisions/0037`). So this
-    /// variant is unconstructible today, and the `#[cfg(test)]` seam that used
-    /// to drive it went with the builder it drove — **which retires
-    /// `docs/decisions/0028` plan step 9's verification**, the unit test that
-    /// this arm returns an error rather than a `Tree`. The refusal remains and
-    /// can no longer be exercised; `0037` records that as a cost rather than
-    /// absorbing it, and it is owed again the day `TookOver` has a producer.
-    ///
-    /// **The arm is kept rather than replaced with `unreachable!`.** `TookOver`
-    /// is a `pub` variant of a published crate's enum; a future §3.5 gives it a
-    /// producer, and the day it does, this refusal is the thing standing between
-    /// an heir and a `build_shared` that forks the tree. A panic would be the
-    /// wrong shape for that, and deleting the arm would make the match
-    /// non-exhaustive at exactly the wrong moment.
-    #[error(
-        "the rendezvous resolved to a takeover, and takeover is not wired (docs/PHASE2.md §3.5)"
-    )]
-    TakeoverUnsupported,
 }
 
 impl From<IpcError> for OpenError {
@@ -911,7 +1060,7 @@ impl Open {
     /// returns either `Ok` (no retry) or [`OpenError::NoLayoutToCreate`], which
     /// `is_retryable` classifies as terminal, so a second attempt never finds it
     /// missing where the first found it present. That was **wrong**. On the
-    /// same arm — `Created`, and `Created | TookOver` when this was written —
+    /// same arm — `Created` —
     /// `spawn_owner_server` returns
     /// `OpenError::Rendezvous(IpcError::ArenaAbsent)` when `tree.shared_fd()` is
     /// `None`, and `is_retryable` calls that **retryable** — so `await_open`
@@ -998,7 +1147,7 @@ impl Open {
                 // first is how the owner learns we died (D17), the second is
                 // what holds our participant byte. Parking them in the `Tree`
                 // ties both to the lifetime a caller actually manages.
-                tree.hold_attachment(session, attached.socket);
+                tree.hold_attachment(session, attached.socket, rv);
                 Ok(tree)
             }
             OpenOutcome::Created => {
@@ -1061,37 +1210,6 @@ impl Open {
                 let server = spawn_owner_server(&rv, &tree)?;
                 tree.hold_ownership(session, server);
                 Ok(tree)
-            }
-            OpenOutcome::TookOver => {
-                // **Split from `Created`, which is the whole of
-                // `docs/decisions/0028` plan step 9.** That arm `build_shared`s
-                // a *fresh* segment, so an heir routed through it would inherit
-                // the *role* and lose the *arena* — the one thing §3.5 says a
-                // takeover must not do. Nothing here can adopt instead: the
-                // session carries no fd and no socket path, and the arena this
-                // process already holds is not in scope at all.
-                //
-                // Drop the session explicitly, mirroring the `Joined` refusal
-                // above. **Explicitness, not necessity:** `session` is a local
-                // of this function, so the `Err` return drops it either way.
-                //
-                // **The three mutant results this comment used to cite are
-                // retired**, and saying so is the point: they were run against a
-                // unit test that reached this arm through a `#[cfg(test)]` seam,
-                // and #275 deleted the seam with the builder it drove
-                // (`docs/decisions/0037`). Nothing can construct `TookOver` now,
-                // so nothing can exercise this arm, and a comment claiming
-                // otherwise would read as tested when it is not.
-                //
-                // What the retired test pinned, and what still has to be true
-                // the day `TookOver` gets a producer: the session is gone *by
-                // the time the caller sees the error*. It holds the ownership
-                // byte, and a return that kept it would leave the rendezvous
-                // owned by a process with no arena behind it, with every
-                // subsequent joiner waiting out its timeout on
-                // `ArenaHeldButUnreachable`.
-                drop(session);
-                Err(OpenError::TakeoverUnsupported)
             }
         }
     }

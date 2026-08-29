@@ -108,6 +108,20 @@ Name resolution against the arena is `Described`, a `Display` wrapper, not a
 field. Across an FFI boundary the *code* is the contract and the message is a
 diagnostic.
 
+**Three layers, and only the middle one is new** ([`0040`](./decisions/0040-the-error-that-cannot-be-returned.md)):
+
+| Layer | Knows | Says |
+|---|---|---|
+| the type and its discriminant | nothing | the contract — this is what a caller matches on, in Rust and across FFI |
+| `Display` on the error itself | what the error carries | `edge 3: stamp 5 ns is outside its window [1, 4] ns` |
+| `Described`, from `Tree::describe` | the arena | `odom -> base_link: ...`, plus a sample of the frames that do exist |
+
+The middle layer is why an error can *leave a function*: `core::error::Error`
+requires `Display`, and without it nothing `?`-chains into `anyhow::Error` or
+`Box<dyn Error>`. It resolves no names — it has no arena — so it does not
+encroach on `Described`, and where the two would overlap `Described` delegates
+rather than restating.
+
 **NORMATIVE for every surface, including the shim:** exception and error
 *types* are a compatibility promise. Message *text* is not, and no surface may
 document text that a downstream caller could be tempted to match on.
@@ -767,6 +781,8 @@ All of these run at tier 1 or tier 2 frequency, so R2 is not in tension:
 |---|---|---|
 | `at_with_derivatives` absent from Python | Rust and C have it since Phase 4 (`tft_plan_at_with_derivatives`, unstable tier); `PHASE4.md` §0 scoped Python out | **Phase 5**, as `Layout::QuatTwist` — see below |
 | `Publisher` holds an extended borrow by hand | `tf_tree_py/src/tree.rs` | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) |
+| ~~`at_extrapolating` takes no `layout=` and has no `_into` form~~ | `tf_tree_py` | **Closed.** `at_extrapolating(.., layout=)` and `at_extrapolating_into(stamps, policy, poses, by_ns, layout=)` ship. R2 makes `_into` NORMATIVE for a batch entry point and justifies it with *this* caller — "half the call at n = 64, and n = 64 is the control loop" — so extrapolation was the one path the rule was written about and the one that did not obey it. `quat_twist` is refused here as it is in C: there is no extrapolating `at_with_derivatives`, so the twist would be computed under `error` beside a pose computed under the caller's policy |
+| Python cannot declare a static edge, a per-edge capacity, a rate, or a domain | `tf_tree.build(edges, capacity, interp)` makes every edge dynamic under one capacity | **Open.** A sensor mount published as a dynamic edge is the latched-topic behaviour `PROJECT.md` §2 lists as a problem `tf_tree` solves, so a Python-built tree cannot reach one of the engine's headline wins. Needs a builder mirroring `TreeBuilder`, which is new public API and therefore a decision record |
 
 **`at_with_derivatives` ships as a layout, not a method.** `Layout::QuatTwist`
 is a contiguous `(N, 13)` write of `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`.
@@ -848,6 +864,41 @@ this verbatim.
 
 **Layout by type** (`layout_of<T>`, `raw_writable<T>`) is R4's strongest form
 and is the model for any future typed binding.
+
+### 4.1 The two capabilities the bindings could not reach — NORMATIVE (doc)
+
+Both were implemented in the engine, tested, and callable from Rust only. They
+are recorded here because the *shape* each took generalises to any future
+capability that has to cross this boundary.
+
+**The time domain** ([`0038`](./decisions/0038-the-domain-a-binding-cannot-name.md)).
+`Domain` is an open trait whose tag is a `const`, so a binding cannot name the
+type `at::<D>` needs and must carry the tag as data. Every query site in both
+bindings hardcoded `SystemDomain`, which made any arena not on tag 0 unreadable
+from C, C++ and Python — while `ros/tf_tree_ros` warns an operator to configure
+one under `use_sim_time`. The tag lives on the **plan handle**, not on the call:
+the ABI is frozen so a new creation entry point costs one declaration where a new
+call would cost three; a domain is a property of a route rather than of an
+instant; and validating at plan time is where the frame *names* are still in hand,
+so the diagnostic says which route disagreed rather than which two integers did.
+
+**Extrapolation** ([`0039`](./decisions/0039-extrapolation-you-cannot-fail-to-notice.md)).
+`Plan::at_extrapolating` returns a value with no pose-only accessor, so a caller
+cannot read the pose without the distance it was extrapolated by. **C cannot
+enforce that, so the analogue is a required out-parameter**: a null `info` is
+`TFT_ERR_NULL_ARG`, nothing is written, and there is deliberately no second
+spelling of the call without it. Two places where C is *sharper* than the Rust it
+mirrors, both because C has no way to say "meaningless": `edge` is
+`TFT_INVALID_ID` when `by_ns == 0`, since a plausible edge id attached to an
+answer nothing invented would be logged as fact; and the twist-carrying layout is
+refused rather than served under `Error`, which would put two extrapolation
+policies in one 13-`f64` row.
+
+**In Python the batch distance is an `(N,)` array and not a scalar**, and that is
+the same property a third time. A batch straddling the newest sample holds
+interpolated and extrapolated elements together, so collapsing it is either a
+`max` that marks fresh elements stale or a `min` that marks stale ones fresh —
+and the second is exactly the failure `0039` exists to prevent.
 
 ---
 
@@ -1079,3 +1130,87 @@ Applied to the shim in `PHASE7.md` §7, and to anything after it.
    a type carrying a lifetime that a user will want to store?
 8. **Losses.** Does the benchmark table have a row where this surface is
    *worse* than the alternative it replaces? If not, it is not finished.
+
+## 8. The real-time envelope — NORMATIVE
+
+The project's one-line pitch is *"fast enough to sit inside a control loop"*, and
+until this section existed **nothing stated what that means**. A mean latency does
+not answer it. A control loop is a deadline, so what it needs is the worst case
+and the list of things that cannot happen on the query path — and it needs each
+claim attached to whatever re-derives it, per `docs/benchmarks/EVIDENCE.md`'s
+rule that a maintained claim owes an executor.
+
+### 8.1 What the query path does not do
+
+For `Plan::at`, `Plan::at_many_into`, `Plan::at_with_derivatives` and
+`Plan::at_extrapolating`, evaluated under a `Guard` the caller already holds:
+
+| Does not | Why, and what checks it |
+|---|---|
+| **Allocate** | The plan is a fixed `[Step; MAX_DEPTH]` by value and every batch form has an `_into` writing into caller memory (R2). Checked: `crates/tf_tree_bench/tests/zero_alloc.rs` counts allocations through a wrapping global allocator across a lookup loop, and again over a 1537-frame tree across ring wraparound |
+| **Take a lock** | Reads are seqlock reads. A reader never blocks a writer and a writer never waits for a reader; there is no mutex on the path at any depth |
+| **Read a clock** | `tf_tree_core` is `no_std` and has no clock to read. The query's stamp is the caller's, always (R3) |
+| **Resolve a name** | Frames are interned to integer ids at compile time (R1, D3). No hashing, no string comparison, no arena name-store access |
+| **Make a syscall** | Nothing above needs one. The arena is already mapped; evaluation touches that mapping and nothing else |
+| **Branch on the transport** | The same code runs against a heap arena, a `MAP_SHARED` memfd and a frozen `.tft`; `docs/PHASE5.md` §2.1 makes that NORMATIVE and the relocation gate tests it |
+
+### 8.2 The worst case is bounded, and here is the bound
+
+**A reader that meets a slot mid-write retries `SEQ_RETRY_LIMIT` (64) times and
+then returns `LookupError::SlotContended`.** It does not spin indefinitely and it
+does not block. That is the property that makes the read path usable from a
+`SCHED_FIFO` thread: a writer preempted inside its two-store publish window
+cannot hold a higher-priority reader past a fixed bound, so there is no unbounded
+priority inversion to reason about. The reader is handed an error naming the
+edge, and deciding what a control loop does about a contended slot is the
+caller's — which is the point of returning rather than waiting.
+
+`docs/decisions/0018` is the same principle stated for waits: no blocking wait,
+futex or notification primitive lives in the arena.
+
+**What is *not* on this path, and must not be put there:** `Tree::lookup`
+resolves names and consults the plan cache (tier 1 — R1 says so, and it is never
+the example in a hot loop); `Tree::reparent` takes the topology lock with a
+bounded spin (A2, `0029`); `Publisher::push` reads the wall clock on a countdown
+(`0036`'s receipt-time sampler, every `sample_every` pushes — priced at ~1 ns
+amortised by `just push-sampler-cost`). None of the three is a query.
+
+### 8.3 Page faults are the residual, and they are the embedder's to remove
+
+The arena is a `memfd`. An untouched page costs a minor fault on first touch,
+which inside a control cycle is a deadline miss rather than a slowdown. Two
+things address it and a third does not exist:
+
+- **Per-edge population at take-up** (`docs/PHASE2.md` §7.1, `0024`) faults the
+  pages an edge uses when the edge is claimed, not when it is first read.
+- **`mlockall(MCL_CURRENT | MCL_FUTURE)` in the embedding process** is what pins
+  the mapping, and it is the *application's* call, not this library's — a library
+  that locks memory on its caller's behalf is deciding an `RLIMIT_MEMLOCK` budget
+  it cannot see. `TFT016` reports the limit against the arena size so the failure
+  is found before the control loop meets it.
+- **There is no `LockPolicy` and no `mlock` call in this codebase.** `MLOCK_ONFAULT`
+  would not prefault, so it adds nothing over §7.1; and on a swapless host — which
+  is what a real-time robot runs — the pages are not reclaimable anyway.
+
+### 8.4 What this section does not claim
+
+Stated because the rest of it reads like a guarantee and only part of it is one:
+
+- **No number here is a latency guarantee.** `docs/PHASE1.md` §11.3's latency
+  criteria need dedicated core-pinned hardware and are recorded UNAVAILABLE on
+  every host this project has measured on. The published figures in
+  `docs/benchmarks/` are medians on a shared-tenancy VM.
+- **"No syscall" and "no lock" are read from the code, not enforced by a test.**
+  Only the allocation claim has an executor (`crates/tf_tree_bench/tests/zero_alloc.rs`).
+  A test that asserted the other two would be worth having and does not exist.
+- **The tail now has a reading, and a reading is not a gate.** `just control-loop`
+  runs `crates/tf_tree/examples/control_loop.rs` — two queries under one guard at
+  1 kHz against a 200 Hz estimate, under a concurrent writer — and reports p50 /
+  p99 / p99.9 / max. It exists because this section previously stated an envelope
+  that nothing executed at all. It is *not* §11.3's criterion: the host is
+  unpinned, there is no real-time scheduler, and two clock reads bracket a
+  sub-microsecond operation, so every one of those inflates the result. Read it
+  for shape, and read §11.3 for the number.
+- **`PHASE4.md` §1's operational exit criterion is still open**: no node has run
+  this on real hardware for two weeks. Every claim above is a claim about the
+  code, and none of them is that claim.

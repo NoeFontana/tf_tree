@@ -15,6 +15,15 @@ an array pointing into it would be a data race by construction. "Zero-copy"
 here means no *intermediate* allocation — results are written once, into their
 final home. Use :meth:`Plan.at_into` to supply that home yourself.
 
+**A query carries a time domain, and it defaults to zero.** Edges are stamped
+with the clock that produced them (``SYSTEM_DOMAIN``, ``SENSOR_DOMAIN``,
+``SIM_DOMAIN``, ``STEADY_DOMAIN``, or an integer a driver declared for itself),
+and a stamp from one clock cannot address an edge sampled on another. So a tree
+under ``use_sim_time`` is read with ``tree.plan(target, source,
+domain=tf_tree.SIM_DOMAIN)``; the default is ``SYSTEM_DOMAIN``, which is right
+for a wall-clock arena and refused — loudly, at ``plan()`` — for any other. It
+is *not* ``tf_tree.open(domain=...)``, which selects which arena to attach to.
+
 **Identifying a build.** A benchmark number or a bug report has to say which
 build produced it, and three values do that::
 
@@ -35,6 +44,10 @@ get right.
 """
 
 from ._core import (
+    SENSOR_DOMAIN,
+    SIM_DOMAIN,
+    STEADY_DOMAIN,
+    SYSTEM_DOMAIN,
     BufferError,
     DerivativesUnavailableError,
     DisconnectedError,
@@ -70,6 +83,10 @@ from ._core import (
 )
 
 __all__ = [
+    "SENSOR_DOMAIN",
+    "SIM_DOMAIN",
+    "STEADY_DOMAIN",
+    "SYSTEM_DOMAIN",
     "BufferError",
     "DerivativesUnavailableError",
     "DisconnectedError",

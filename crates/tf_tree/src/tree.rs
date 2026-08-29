@@ -1923,11 +1923,23 @@ impl Tree {
     /// ```
     ///
     /// And the consumer this method exists for — `docs/decisions/0019` §2b's
-    /// startup sequence. **`text`, not `rust`, and that is the record's own
-    /// deliberate choice**: the three calls yield `OpenError`, `AwaitError` and
-    /// [`LookupError`], and `LookupError` implements neither `Display` nor
-    /// `Error`, so no single `?`-chain unifies them — not even into
-    /// `Box<dyn Error>`. It also needs a live arena and `--features shm`.
+    /// startup sequence. **Still `text` rather than `rust`, but for one reason
+    /// now instead of two.**
+    ///
+    /// The reason that is gone: this comment used to say the three calls yield
+    /// `OpenError`, `AwaitError` and [`LookupError`], and that `LookupError`
+    /// implements neither `Display` nor `Error`, so *"no single `?`-chain
+    /// unifies them — not even into `Box<dyn Error>`"*. Since
+    /// [`0040`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0040-the-error-that-cannot-be-returned.md)
+    /// all three implement both, and the `?`-chain below is exactly the shape a
+    /// consumer can now write. `LookupError`'s own rustdoc carries a compiling
+    /// doctest of it.
+    ///
+    /// The reason that remains: it needs a live arena and `--features shm`, and
+    /// `just test` runs doctests on **default** features — so as `rust` this
+    /// would not compile there, and as `no_run` behind a `cfg_attr` it would be
+    /// a doctest no recipe executes. `docs/benchmarks/EVIDENCE.md` is about
+    /// exactly that failure class, so it stays honest text.
     ///
     /// ```text
     /// // Two waits, because they are two different absences.
@@ -2647,6 +2659,31 @@ impl Tree {
         source: &str,
         stamp: Stamp<D>,
     ) -> Result<Iso3, LookupError> {
+        self.lookup_tagged(target, source, stamp.nanos(), D::TAG)
+    }
+
+    /// [`Self::lookup`], with the query's domain carried as a runtime tag.
+    ///
+    /// The convenience tier's tagged sibling, for the reason
+    /// `docs/decisions/0038-the-domain-a-binding-cannot-name.md` gives: [`Domain`]
+    /// is an open trait, so a foreign binding cannot name the type the typed
+    /// form needs and carries the tag as data instead. The check, the cache and
+    /// the evaluation are all [`Self::lookup`]'s, unchanged.
+    ///
+    /// A Rust caller wants [`Self::lookup`], where a domain mistake is a compile
+    /// error — and, before either, wants [`Self::plan`], because this tier
+    /// resolves the topology on every call (`docs/API.md` §1 R1).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::lookup`].
+    pub fn lookup_tagged(
+        &self,
+        target: &str,
+        source: &str,
+        nanos: i64,
+        domain: u8,
+    ) -> Result<Iso3, LookupError> {
         if self.detached() {
             return Err(LookupError::ChildDetached);
         }
@@ -2663,7 +2700,7 @@ impl Tree {
         // inner one is the evaluation, which it never answers for.
         cache::with_plan(self, t, s, generation, |plan| {
             let g = self.guard();
-            plan.at(&g, stamp)
+            plan.at_tagged(&g, nanos, domain)
         })
         .0?
     }
@@ -2961,11 +2998,83 @@ impl Tree {
         &mut self,
         session: crate::open::JoinedSession,
         socket: std::os::fd::OwnedFd,
+        rendezvous: tf_tree_ipc::Rendezvous,
     ) {
         self.attachment = Some(crate::open::Attachment::Joined {
-            _session: session,
-            _socket: socket,
+            session,
+            socket,
+            rendezvous,
         });
+    }
+
+    /// Whether the process that owns this arena has gone away (§3.5).
+    ///
+    /// A participant holds its attach socket for the lifetime of the attachment
+    /// and the owner reads that socket's closure as death (D17). This is the
+    /// same fact from the other end — the owner's death closes it too, and the
+    /// kernel reports `POLLHUP` in microseconds, exactly and with no timeout to
+    /// tune.
+    ///
+    /// **Nothing watched this before**, which is why §3.5 never ran even while a
+    /// takeover path existed: `docs/PHASE2.md` §0.0 records that the trigger
+    /// never existed either. A survivor calls this when convenient — in its own
+    /// loop, between control cycles — and there is deliberately no background
+    /// thread and no daemon doing it, per
+    /// [`0019`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md).
+    /// The cost is one non-blocking `poll` of one descriptor.
+    ///
+    /// **`false` for anything that is not a joined rendezvous attachment**: a
+    /// heap tree, a frozen `.tft`, a tree this process already owns, or an
+    /// `attach_shared` over an inherited fd. None of them has an owner that can
+    /// die out from under it, and the owner cannot lose itself.
+    ///
+    /// **It answers "the owner that served *this* attachment is gone", which is
+    /// not the same as "the arena has no owner".** A hangup is a one-way door:
+    /// once another survivor inherits, this keeps answering `true`, because the
+    /// socket it reads is still the dead owner's. So it is a trigger to *try*
+    /// inheriting once, not a standing question — see
+    /// [`crate::Inheritance::Contended`] for what a survivor that loses the race is
+    /// left holding.
+    ///
+    /// Lookups are unaffected either way — `Plan::at` touches the mapping and
+    /// nothing else, and this is entirely control plane.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    #[must_use]
+    pub fn owner_lost(&self) -> bool {
+        use std::os::fd::AsFd;
+        match &self.attachment {
+            Some(crate::open::Attachment::Joined { socket, .. }) => {
+                // A `poll` failure is not a hangup. Reporting one would send a
+                // survivor to take ownership of an arena whose owner is alive
+                // and serving, which is the split-brain §3.4 exists to prevent.
+                tf_tree_ipc::peer_hung_up(socket.as_fd()).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Borrow the parked attachment, for `crate::open`'s §3.5 seam.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn attachment_ref(&self) -> Option<&crate::open::Attachment> {
+        self.attachment.as_ref()
+    }
+
+    /// Take the parked attachment out.
+    ///
+    /// **The caller owes a matching [`Tree::put_attachment`] on every path**,
+    /// including error paths: what is taken here holds this process's
+    /// participant lock byte and its attach socket, and dropping it releases
+    /// both. It exists so `Tree::inherit_ownership` can hand `&self` to
+    /// `spawn_owner_server` while it owns the session.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn take_attachment(&mut self) -> Option<crate::open::Attachment> {
+        self.attachment.take()
+    }
+
+    /// Put back what [`Tree::take_attachment`] removed.
+    #[cfg(all(feature = "shm", target_os = "linux"))]
+    pub(crate) fn put_attachment(&mut self, a: Option<crate::open::Attachment>) {
+        self.attachment = a;
     }
 
     /// Park the owner's session and serving thread.
@@ -2985,8 +3094,8 @@ impl Tree {
         server: crate::open::OwnerThread,
     ) {
         self.attachment = Some(crate::open::Attachment::Owner {
+            _server: server,
             _session: session,
-            server,
         });
     }
 
@@ -4250,7 +4359,32 @@ impl fmt::Display for Described<'_> {
                 "frame {} has a parent but no edge records the link",
                 tree.frame_name(child),
             ),
-            other => write!(f, "{other:?}"),
+            // Two more that name an edge, and they reached the catch-all until
+            // a review caught it. `docs/decisions/0040`'s comment claimed every
+            // remaining variant "carries no frame or edge this wrapper could
+            // name"; these two carry one, so they were rendering the core's
+            // `edge 3` from the one layer whose whole purpose is resolving it.
+            LookupError::DerivativesUnavailable { edge, interp } => write!(
+                f,
+                "{} interpolates under policy {interp}, which has no derivative to report",
+                tree.edge_name(edge),
+            ),
+            LookupError::NoSegment { edge } => write!(
+                f,
+                "{} has no bracketing segment at that stamp, so there is no twist",
+                tree.edge_name(edge),
+            ),
+            // **The arms above are the ones that resolve a *name*, which is the
+            // whole reason this wrapper exists. Everything else delegates.**
+            //
+            // This read `write!(f, "{other:?}")` until `docs/decisions/0040`,
+            // and `Debug` is the wrong register for an operator: it rendered
+            // `BufferTooSmall { need: 48, got: 16 }` where the core now writes
+            // "output buffer too small: need 48 elements, got 16". The three
+            // that reach here — `BufferTooSmall`, `WrongElementType` and
+            // `ChildDetached` — carry no frame or edge, so there is nothing for
+            // this wrapper to add and the message belongs in one place.
+            other => write!(f, "{other}"),
         }
     }
 }

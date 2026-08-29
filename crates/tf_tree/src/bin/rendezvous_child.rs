@@ -25,6 +25,10 @@
 //! join-claiming -> "claimed <edge>", then parks holding it
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
 //! hold-topo <lock> -> "holding-topo", then parks holding A2's topology byte
+//! join-heir     -> "joined <slot>", then on stdin:  (arm §11.3's takeover
+//!                  crash point with TF_TREE_CRASH_AT to kill it mid-inherit)
+//!                  "<owner_lost> <inheritance> <slot>", then parks —
+//!                  serving, if it inherited (§3.5)
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -286,6 +290,33 @@ fn main() {
         // `false` covers both "the record was cleared" and "the record is still
         // LIVE and its process is gone", and telling those two apart is the
         // whole question.
+        // §3.5's survivor. Joins, then on a poke reports whether the owner is
+        // gone and what inheriting produced, then parks — **holding the tree**,
+        // because if it inherited then this process is now the server and
+        // dropping the tree would stop it.
+        "join-heir" => {
+            let mut tree = tf_tree::Open::new()
+                .mode(AttachMode::ReadWrite)
+                .create(CreatePolicy::Never)
+                .open()
+                .expect("join");
+            // The slot is printed on both lines so the parent can assert it did
+            // not move across the takeover — the invariant the whole shape rests
+            // on, and the one the deleted arm could not hold.
+            say(&format!("joined {}", tree.participant_slot()));
+
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).expect("read");
+            let lost = tree.owner_lost();
+            let outcome = match tree.inherit_ownership() {
+                Ok(o) => format!("{o:?}"),
+                Err(e) => format!("error {e}"),
+            };
+            say(&format!("{lost} {outcome} {}", tree.participant_slot()));
+            loop {
+                std::thread::park();
+            }
+        }
         #[cfg(feature = "unstable")]
         "join-rw-report" => {
             let tree = tf_tree::Open::new()

@@ -68,6 +68,15 @@ float64 as `[qw qx qy qz tx ty tz]`; `"affine32"` is `(12,)` / `(N, 12)`
 float64, `"quat"` with the body twist `[wx wy wz vx vy vz]` appended.
 """
 
+ExtrapPolicy = Literal["error", "hold", "constant_twist"]
+"""What `Plan.at_extrapolating` does past the newest published sample.
+
+`"error"` refuses (what `at` does); `"hold"` returns the newest pose; and
+`"constant_twist"` extends the screw the two newest samples imply. A closed
+set, unlike the domain tags: this one is dispatched on inside the engine rather
+than declared by a driver, so a string vocabulary is complete by construction.
+"""
+
 class Plan:
     """A compiled lookup path. Build with `Tree.plan`."""
 
@@ -197,6 +206,92 @@ class Plan:
         on; the reconstruction error is bounded by construction.
         """
 
+    @overload
+    def at_extrapolating(
+        self, stamps: int, policy: ExtrapPolicy, /, *, layout: Layout | None = ...
+    ) -> tuple[NDArray[np.float64], int]:
+        """One stamp in; `((4, 4)` float64, `by_ns` as an `int)` out."""
+
+    @overload
+    def at_extrapolating(
+        self,
+        stamps: NDArray[np.int64],
+        policy: ExtrapPolicy,
+        /,
+        *,
+        layout: Layout | None = ...,
+    ) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
+        """`(N,)` stamps in; `((N, 4, 4)` float64, `(N,)` int64) out.
+
+        `by_ns` is an **array**, one distance per stamp. The distance is
+        `max(0, stamp - newest_common)`, so a batch straddling the newest
+        sample has interpolated elements (`0`) and extrapolated ones in the
+        same call; a scalar would be a `max` that marks fresh elements stale or
+        a `min` that marks stale ones fresh.
+        """
+
+    @overload
+    def at_extrapolating(
+        self,
+        stamps: int | NDArray[np.int64],
+        policy: ExtrapPolicy,
+        /,
+        *,
+        layout: Layout | None = ...,
+    ) -> tuple[NDArray[np.float64], int | NDArray[np.int64]]:
+        """Evaluate past the newest sample, and learn how far past that was.
+
+        `at` refuses a stamp newer than every published sample. A controller
+        running faster than its state estimate is always asking for one, and
+        the honest answer is a bounded prediction with its bound attached.
+
+        Returns `(poses, by_ns)`, and **there is no spelling that returns the
+        pose alone**: the danger in extrapolation is a pose that looks fresh,
+        so ignoring the distance takes a deliberate `[0]`.
+
+        `policy` is required — extrapolation is opt-in per query. `"error"` is
+        what `at` does, with the distance attached on success; `"hold"` is the
+        newest pose, for a latched or displayed value; `"constant_twist"`
+        extends the screw the two newest samples imply, which is what a control
+        loop wants. Raises `ExtrapolationError` under `"error"`.
+
+        `mat4` by default and `quat` with `layout=`; an f32 or twist layout is
+        refused. The edge that ran out of data is not carried — this
+        binding resolves edge ids to names before a caller sees them, and doing
+        that per query would be an arena walk on this path. `Plan.edges()` and
+        `tf_tree doctor` are where the per-edge breakdown lives.
+
+        The batch is a loop over the scalar form under one guard, not the
+        engine's batch fold, which carries no policy.
+        """
+
+    def at_extrapolating_into(
+        self,
+        stamps: int | NDArray[np.int64],
+        policy: ExtrapPolicy,
+        poses: object,
+        by_ns: object,
+        /,
+        *,
+        layout: Layout | None = ...,
+    ) -> None:
+        """`at_extrapolating` writing into two caller-provided arrays.
+
+        `poses` takes the shape the allocating form would have returned —
+        `(4, 4)` or `(layout_elems,)` for a scalar stamp, `(N, 4, 4)` or
+        `(N, layout_elems)` for an array — and `by_ns` is `()`-shaped or
+        `(N,)` int64.
+
+        Allocate both once, outside the loop. `docs/API.md` R2 makes an `_into`
+        form NORMATIVE for every batch entry point and justifies it with this
+        caller: the allocation is half the call at n = 64, and n = 64 is the
+        control loop.
+
+        **A failure part-way leaves the buffers part-written**, the same
+        contract `at_into` carries. A caller who needs all-or-nothing uses the
+        allocating form and pays the allocation for it.
+        """
+
     def latest(self) -> NDArray[np.float64]:
         """The most recent transform on this path, as `(4, 4)`."""
 
@@ -237,21 +332,44 @@ class Publisher:
 class Tree:
     """A transform tree. Obtain with `tf_tree.open()` or `tf_tree.build()`."""
 
-    def plan(self, target: str, source: str, /) -> Plan:
+    def plan(self, target: str, source: str, /, *, domain: int = ...) -> Plan:
         """Compile a path from `source` to `target`.
 
         Compile once and reuse: the path walk and per-edge metadata lookup
         happen here, not per sample.
+
+        `domain` is the **time domain** every query on the returned plan will
+        carry — `SYSTEM_DOMAIN` (the default, `0`), `SENSOR_DOMAIN`,
+        `SIM_DOMAIN`, `STEADY_DOMAIN`, or an integer from `4` up that a driver
+        declared for its own clock. A tree under `use_sim_time` is read with
+        `domain=tf_tree.SIM_DOMAIN`.
+
+        A disagreement with the path's own domain raises `TfTreeError` **here**,
+        naming both frames, rather than on every `at()` — a domain is a property
+        of a route, not of an instant, so it cannot legitimately vary between
+        two queries on one plan.
+
+        The default is `0` and not the path's own domain, deliberately:
+        defaulting to the path's would make a mistaken caller silently correct
+        as well as a correct one.
+
+        Not `open(domain=...)`, which selects which *arena* to attach to.
         """
 
     def publisher(self, child: str, parent: str, /) -> Publisher:
         """Claim `child`'s edge. Argument order is **(child, parent)**."""
 
-    def lookup(self, target: str, source: str, stamp_ns: int, /) -> NDArray[np.float64]:
+    def lookup(
+        self, target: str, source: str, stamp_ns: int, /, *, domain: int = ...
+    ) -> NDArray[np.float64]:
         """One transform, without compiling a plan first.
 
         The plan is cached per *thread*. Prefer `tree.plan(...)` in a loop —
         this pays a cache probe per call and a compiled plan pays nothing.
+
+        `domain` is `plan`'s, with the same default and the same meaning. It is
+        checked per call here rather than once, because there is no handle to
+        hang the check on.
         """
 
     def freeze(
@@ -428,6 +546,11 @@ def open_arena(
     `mode="rw"`** and is refused otherwise, so a read-only consumer still
     cannot bring an arena into existence.
 
+    `domain` here is the **rendezvous** domain — which arena to attach to,
+    `$ROS_DOMAIN_ID`'s analogue — and is not `Tree.plan`'s `domain`, which is
+    the time-domain tag of the edges inside it. Two unrelated numbers that share
+    a word; this one selects the arena, that one selects the clock.
+
     `capacity` and `interp` describe the edges being created; both are
     `build`'s, with the same defaults. Without `create` they describe nothing —
     but `interp` is still validated, so a misspelling raises here exactly as it
@@ -511,6 +634,29 @@ def from_ros(stamp: object, /) -> int:
 
 def has_shared_memory() -> bool:
     """Whether this build can share a tree between processes."""
+
+SYSTEM_DOMAIN: int
+"""Wall clock — `CLOCK_REALTIME`, ROS `/clock` off. Tag `0`, and the default.
+
+The four names exist so a caller writes one rather than a magic number. They
+are plain `int`s and not an enum because the domain trait is **open**: tags
+from `4` up belong to whoever declares them, so a closed set standing in for an
+open one would either make a driver's own tag unrepresentable or hand it back
+as an `int` that compares equal to nothing in the enum.
+"""
+
+SENSOR_DOMAIN: int
+"""A sensor's own oscillator, undisciplined against the host. Tag `1`."""
+
+SIM_DOMAIN: int
+"""Simulated time — ROS `use_sim_time`, `/clock`. Tag `2`.
+
+The tag a simulated tree is given so a consumer can tell it from a real-time
+one. Reading such a tree needs `plan(..., domain=tf_tree.SIM_DOMAIN)`.
+"""
+
+STEADY_DOMAIN: int
+"""A monotonic clock — `CLOCK_MONOTONIC`, boot-relative, never stepped. Tag `3`."""
 
 __version__: str
 """This extension's version, compiled in from the crate manifest.

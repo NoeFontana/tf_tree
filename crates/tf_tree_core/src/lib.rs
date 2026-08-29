@@ -103,8 +103,13 @@
 
 extern crate alloc;
 
-// proptest and loom require `std`; the crate itself stays `no_std + alloc`.
-#[cfg(test)]
+// proptest and loom require `std`; so does `crash`'s environment-variable read
+// (`docs/PHASE2.md` §11.3). The crate itself stays `no_std + alloc`: this is an
+// `extern crate` under a `cfg`, not a `std` *feature* — a feature unifies across
+// the graph, so one crate turning it on would make everybody's `tf_tree_core`
+// link `std`, and `#![no_std]` above would be decided by somebody else's
+// dependency.
+#[cfg(any(test, feature = "crash-points"))]
 extern crate std;
 
 // **The crates.io front page, wired to the doctest harness.** `README.md` has
@@ -120,6 +125,7 @@ mod readme {}
 pub mod buffer;
 /// Consumer-side diagnostic counters (`docs/PHASE5.md` §5).
 pub mod counters;
+pub mod crash;
 pub mod edge;
 pub mod error;
 pub mod frame;
@@ -159,10 +165,11 @@ pub use participant::{ParticipantError, ParticipantRecord, ParticipantTable};
 
 #[cfg(not(loom))]
 pub use plan::{
-    compile, AdaptiveScratch, Domain, EdgeMeta, ErrBound, Guard, InterpPolicy, Plan, Query, Sample,
-    SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,
-    MAX_KNOTS,
+    compile, AdaptiveScratch, Domain, EdgeMeta, ErrBound, Extrapolated, Guard, InterpPolicy, Plan,
+    Query, Sample, SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain,
+    MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
 };
+pub use sample::ExtrapPolicy;
 
 /// Maximum length of a **compiled** plan: the number of [`plan::Step`] slots a
 /// [`plan::Plan`] carries, counted *after* constant folding.
@@ -218,3 +225,10 @@ mod loom_tests;
 
 #[cfg(all(test, not(loom)))]
 mod tests;
+
+// `docs/PHASE2.md` §11.3's crash points: the child-process abort tests are
+// `#[cfg(feature = "crash-points")]`, the recovery assertions beside them are
+// not — the state a crash leaves is repairable by code that ships in every
+// build, so `cargo test -p tf_tree_core` must exercise the repair.
+#[cfg(all(test, not(loom)))]
+mod crash_tests;

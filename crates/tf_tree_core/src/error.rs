@@ -6,6 +6,7 @@
 //! it can be returned from the wait-free read path. **Every variant that can
 //! name an edge does name one** (decision D11).
 
+use core::fmt;
 use core::num::NonZeroU32;
 
 /// Stable identity of a frame.
@@ -68,6 +69,40 @@ impl EdgeId {
 ///
 /// `Copy`, allocation-free, `no_std`. Returned by the sample/read path and by
 /// plan compilation and evaluation ([`crate::plan`]).
+///
+/// # It composes like any other Rust error
+///
+/// `Display` and [`core::error::Error`] are implemented, so this propagates with
+/// `?` into `anyhow::Error`, `Box<dyn Error>`, or a caller's own enum
+/// ([`0040`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0040-the-error-that-cannot-be-returned.md)).
+/// Until that record, none of this crate's errors implemented either trait, and
+/// a consumer's first function could not be `-> anyhow::Result<_>`.
+///
+/// ```
+/// use tf_tree_core::{EdgeId, LookupError};
+///
+/// fn newest_pose(fail: bool) -> Result<f64, Box<dyn std::error::Error>> {
+///     if fail {
+///         // The `?` is what needs `Error`, and `Error` is what needs `Display`.
+///         Err(LookupError::NoData { edge: EdgeId(3) })?;
+///     }
+///     Ok(1.0)
+/// }
+///
+/// let e = newest_pose(true).unwrap_err();
+/// // Identifiers, not names: this type has no arena to resolve against.
+/// assert!(e.to_string().contains('3'));
+/// ```
+///
+/// # Identifiers here, names from `Tree::describe`
+///
+/// The message above says `edge 3`, not `odom -> base_link`. Resolving a name
+/// needs the arena, and an error returned from the wait-free read path cannot
+/// carry one (D11, `docs/API.md` R5). `tf_tree::Tree::describe` holds a `&Tree`
+/// and is the layer that names things; prefer it wherever a tree is in hand.
+///
+/// **The message text is a diagnostic and not a compatibility promise.** The
+/// *type* and its discriminant are what a caller may depend on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LookupError {
@@ -357,3 +392,211 @@ pub enum TopologyError {
         frame: u32,
     },
 }
+
+// ---------------------------------------------------------------------------
+// `Display` and `core::error::Error` — decision 0040
+// ---------------------------------------------------------------------------
+//
+// **These print identifiers, never names.** Name resolution against the arena is
+// `tf_tree::Tree::describe`, which holds a `&Tree` and can say
+// `odom -> base_link` where this can only say `edge 3` (`docs/API.md` R5, D11).
+// Nothing here allocates, holds a `String`, or changes a layout: `Display` writes
+// into the caller's formatter, so every error stays `Copy` and every one of them
+// is still returnable from the wait-free read path.
+//
+// **Why they exist at all.** Without `core::error::Error` an error cannot be
+// `?`-chained into `anyhow::Error` or even `Box<dyn Error>`, and this crate's own
+// documentation cited that as the reason `docs/decisions/0019` §2b's startup
+// sequence — attach, wait for frames, plan — is published as a `text` block
+// rather than as compiling Rust. That is the first code a consumer writes.
+//
+// **`core::error::Error`, not `std::error::Error`**, so the crate stays `no_std`.
+// It has been in `core` since Rust 1.81 and the MSRV is 1.87; a floor below that
+// would break the crate rather than merely this convenience.
+//
+// **The message text is not a compatibility promise** (`docs/API.md` R5,
+// NORMATIVE). The *type* is the contract and the discriminant is what an FFI
+// caller matches on; these strings are diagnostics and may change in any release.
+//
+// Every match below is exhaustive on purpose. These enums are `#[non_exhaustive]`
+// to the outside world, but inside the defining crate that grants no catch-all —
+// so a variant added later fails to compile here instead of quietly rendering as
+// something generic.
+
+impl fmt::Display for LookupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            LookupError::UnknownFrame { hash } => {
+                write!(f, "unknown frame (name hash {hash:#018x})")
+            }
+            LookupError::Disconnected {
+                target,
+                source,
+                cut_at,
+            } => write!(
+                f,
+                "frames {} and {} are not connected; the walk stops at frame {}",
+                target.get(),
+                source.get(),
+                cut_at.get(),
+            ),
+            LookupError::TreeTooDeep { depth } => {
+                write!(f, "path is {depth} edges deep, past this build's bound")
+            }
+            LookupError::NoData { edge } => {
+                write!(f, "edge {} has no published samples", edge.0)
+            }
+            LookupError::Extrapolation {
+                edge,
+                requested,
+                oldest,
+                newest,
+            } => write!(
+                f,
+                "edge {}: stamp {requested} ns is outside its window [{oldest}, {newest}] ns",
+                edge.0,
+            ),
+            LookupError::SlotRecycled { edge } => write!(
+                f,
+                "edge {}: the ring lapped the reader mid-read (the window moved past the sample being read)",
+                edge.0,
+            ),
+            LookupError::SlotContended { edge } => write!(
+                f,
+                "edge {}: a sample slot stayed mid-write past the retry limit",
+                edge.0,
+            ),
+            LookupError::TopologyChanged { plan, current } => write!(
+                f,
+                "plan is stale: compiled at topology generation {plan}, current is {current} (re-plan)",
+            ),
+            LookupError::TimeDomainMismatch { expected, got } => write!(
+                f,
+                "time-domain mismatch: plan expects domain {expected}, query supplied {got}",
+            ),
+            LookupError::MixedTimeDomains {
+                edge,
+                expected,
+                got,
+            } => write!(
+                f,
+                "path crosses time domains: edge {} is in domain {got}, the rest of the path is in domain {expected}",
+                edge.0,
+            ),
+            LookupError::UnknownEdge { edge } => {
+                write!(f, "edge {} names no usable edge in this tree", edge.0)
+            }
+            LookupError::FrameOutOfRange { frame } => {
+                write!(f, "frame id {} is out of range for this tree", frame.get())
+            }
+            LookupError::BufferTooSmall { need, got } => write!(
+                f,
+                "output buffer too small: need {need} elements, got {got}",
+            ),
+            LookupError::WrongElementType => write!(
+                f,
+                "wrong output element type for this layout (an f32 layout needs an f32 buffer, and the reverse)",
+            ),
+            LookupError::ChildDetached => write!(
+                f,
+                "this handle was inherited across a fork and is poisoned in the child",
+            ),
+            LookupError::MissingEdge { child } => write!(
+                f,
+                "frame {} has a parent but no edge records the link",
+                child.get(),
+            ),
+            LookupError::DerivativesUnavailable { edge, interp } => write!(
+                f,
+                "edge {} interpolates under policy {interp}, which has no derivative to report",
+                edge.0,
+            ),
+            LookupError::NoSegment { edge } => write!(
+                f,
+                "edge {} has no bracketing segment at that stamp, so there is no twist",
+                edge.0,
+            ),
+        }
+    }
+}
+
+impl fmt::Display for PushError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            PushError::NonMonotonicStamp { last, got } => write!(
+                f,
+                "stamp {got} ns is not newer than the last published {last} ns",
+            ),
+            PushError::ClaimRevoked { edge } => write!(
+                f,
+                "edge {}: this publisher's claim was revoked, so the push was refused",
+                edge.0,
+            ),
+            PushError::ChildDetached => write!(
+                f,
+                "this publisher was inherited across a fork and is poisoned in the child",
+            ),
+        }
+    }
+}
+
+impl fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            ClaimError::EdgeAlreadyClaimed { owner_slot } => write!(
+                f,
+                "the edge is already claimed by participant slot {owner_slot} (one writer per edge)",
+            ),
+        }
+    }
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            FrameError::FrameHashCollision { hash } => write!(
+                f,
+                "frame name collides with a different interned name (hash {hash:#018x})",
+            ),
+            FrameError::CapacityExceeded => {
+                write!(f, "the frame table is full; raise the frame headroom")
+            }
+            FrameError::InternContended => write!(
+                f,
+                "interning contended past its retry budget; another process may have died mid-intern",
+            ),
+            FrameError::ChildDetached => write!(
+                f,
+                "this handle was inherited across a fork and is poisoned in the child",
+            ),
+            FrameError::ReadOnly => write!(
+                f,
+                "this tree is a read-only attachment and cannot intern a new frame",
+            ),
+        }
+    }
+}
+
+impl fmt::Display for TopologyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            TopologyError::WouldCreateCycle { child } => write!(
+                f,
+                "attaching frame {} under that parent would create a cycle",
+                child.get(),
+            ),
+            TopologyError::CapacityExceeded => {
+                write!(f, "the edge table is full; raise the edge headroom")
+            }
+            TopologyError::UnknownFrame { frame } => {
+                write!(f, "frame index {frame} is out of range for this arena",)
+            }
+        }
+    }
+}
+
+impl core::error::Error for LookupError {}
+impl core::error::Error for PushError {}
+impl core::error::Error for ClaimError {}
+impl core::error::Error for FrameError {}
+impl core::error::Error for TopologyError {}

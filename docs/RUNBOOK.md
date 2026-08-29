@@ -482,27 +482,119 @@ participant, D18)*. `tf_tree participants` shows the same slot as `live` with th
 dead parent's pid beside it, which is the corroborating view — the byte really is
 held, by a description the parent no longer owns.
 
+### The arena's owner died
+
+Existing participants are fine — lookups keep being served from a segment whose
+owner is gone, which is what [`PHASE2.md`](./PHASE2.md) §3.5 promises and has
+always delivered. The question is whether anything can *join* it again.
+
+**Since 2026-08-28 it can, and the recovery is one call rather than a fleet
+restart.** A surviving **read-write** participant inherits the owner role: it
+notices the hangup with `Tree::owner_lost()` and promotes itself with
+`Tree::inherit_ownership()`, which takes the ownership byte on the file
+description its session already holds and binds the rendezvous socket over the
+**existing** segment. Nothing is copied, nothing is re-created, no lookup pauses,
+and every survivor keeps its slot. This section used to be headed *"…and nothing
+new can join"* and told you to stop every attached process; that was true until
+2026-08-27, when §3.5's first takeover half was deleted as unsound (#275,
+[`0037`](./decisions/0037-a-takeover-is-not-a-second-open.md)), and it is kept
+here rather than overwritten because a fleet that has not adopted the call below
+is still in exactly that state.
+
+```rust
+// In a read-write participant's own loop — between control cycles is fine.
+if tree.owner_lost() {
+    match tree.inherit_ownership()? {
+        tf_tree::Inheritance::Inherited => { /* this process is now serving */ }
+        tf_tree::Inheritance::Contended => { /* another survivor won; keep going */ }
+        _ => {}
+    }
+}
+```
+
+**The catch, and it decides whether your fleet can recover at all: nothing calls
+this for you.** There is no background thread and no daemon watching the socket
+— that is [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)
+holding that every process a user is *required* to run is a place adoption dies
+— so **a survivor that never calls `owner_lost()` never becomes owner**, and the
+arena stays ownerless exactly as it did before this shipped. Three things to
+check when owner death has wedged a live system:
+
+- **Is any survivor read-write?** `inherit_ownership()` answers
+  `Inheritance::ReadOnly` on a read-only attachment and does nothing else. An
+  owner writes the participant table on every grant and a `PROT_READ` mapping
+  cannot, which is D18 working rather than failing — so **a fleet of read-only
+  consumers cannot rescue itself.** Read-only is the consumer default:
+  `tf_tree::open()` and `Open::new()` both start at `AttachMode::ReadOnly`
+  (`crates/tf_tree/src/open.rs:886`) and you get read-write only by asking for it.
+  If every survivor is a consumer, the recovery below (stop everything) is still
+  the only one you have. Pinned by
+  `a_read_only_survivor_reports_that_it_cannot_inherit`
+  (`crates/tf_tree/tests/rendezvous.rs`), which also shows the consumer reading
+  straight through the owner's death.
+- **Does that survivor call it?** A publisher built against a release before
+  2026-08-28, or one that simply never polls, is indistinguishable from one that
+  cannot. `tf_tree participants` shows you who is attached; it cannot show you
+  who is looking.
+- **Did it try and fail?** Every error path inside `inherit_ownership()` restores
+  the attachment and hands the ownership byte back, so a failed inheritance
+  leaves a plain participant rather than a byte-0 holder with nothing listening.
+  That failure is recoverable — another survivor, or the same one on its next
+  pass, can take it.
+
+**When no survivor can or will inherit, the older remedy still applies: stop
+every attached participant** and start again. It is written out under
+`ArenaHeldButUnreachable` below, and two notes belong here:
+
+- **`SIGTERM` is enough to stop one.** The kernel releases the lock byte and
+  drops the mapping whatever kills the process, so no handler is needed to free
+  the segment. It is still not a *clean* exit — nothing installs a handler and
+  the default disposition skips every destructor — so it leaks the arena record
+  of any participant you stop while the arena survives (the `TFT014` row below).
+- **`CreatePolicy::Always` abandons the arena rather than recovering it.** It
+  creates a *second* one beside the first, leaving the survivors publishing into
+  a segment nobody else can reach — the "two processes see different data" state.
+  Its full consequences are under `ArenaHeldButUnreachable` below; read them
+  before reaching for it, and reach for inheritance first.
+
 ### `ArenaHeldButUnreachable`
 
 Somebody holds a live arena and nothing is serving it, so
 [`PHASE2.md`](./PHASE2.md) §3.4's split-brain check refuses to create a second
-one. A stopped or wedged participant is one cause. **On this build the ordinary
-cause is not a fault at all**: the owner exited and a perfectly healthy survivor
-still has the arena mapped. §0.0 states why — §3.5's takeover is implemented but
-nothing triggers it, because no participant watches its client socket for `HUP`.
-So the survivor never promotes itself, and every process that tries to open the
-rendezvous meets the check and times out, **for as long as any survivor lives**.
+one. A stopped or wedged participant is one cause. **The ordinary cause is not a
+fault at all**: the owner exited and a perfectly healthy survivor still has the
+arena mapped, so every process that tries to open the rendezvous meets the check
+and times out for as long as any survivor lives. See *The arena's owner died*
+above.
 
 ```bash
 tf_tree participants   # the holders, by slot and pid — reads the lock file, never maps the arena
 ```
 
-**The recovery is to stop every participant**, read-only consumers and any
-`tf_tree top --attach` included. Each process's lock byte is released by the
-kernel when it dies, and the segment is freed when its last mapping drops (§3.9),
-so once the last one is gone the next `open()` creates cleanly. Restarting the
-publisher alone does not help: it is not the survivor, so it takes the same
-split-brain path everything else does.
+**Reach for inheritance before you reach for a restart.** Since 2026-08-28 a
+surviving **read-write** participant can end this state by itself, without
+stopping anything: `Tree::owner_lost()` sees the hangup and
+`Tree::inherit_ownership()` binds the rendezvous over the segment that is already
+there, after which the joiner that was timing out simply succeeds. **What it
+needs is a survivor that is read-write *and* actually calls it** — there is no
+daemon polling on anyone's behalf
+([`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)), and a
+read-only consumer is told `Inheritance::ReadOnly` and cannot serve (D18). A
+fleet of consumers, or one that predates the call, is in the pre-2026-08-28
+state, and for it the paragraph below is still the whole recovery. **This section
+used to say the survivor could never promote itself and that stopping everything
+was the only path**; that was accurate while §3.5's first takeover half was
+deleted (#275,
+[`0037`](./decisions/0037-a-takeover-is-not-a-second-open.md)) and while its
+trigger did not exist, and it is corrected rather than removed because it is
+still the right advice for a deployment with no read-write heir.
+
+**When there is no heir, the recovery is to stop every participant**, read-only
+consumers and any `tf_tree top --attach` included. Each process's lock byte is
+released by the kernel when it dies, and the segment is freed when its last
+mapping drops (§3.9), so once the last one is gone the next `open()` creates
+cleanly. Restarting the publisher alone does not help: it is not the survivor, so
+it takes the same split-brain path everything else does.
 
 If a holder must keep running and its arena is written off, the escape hatch is
 **`CreatePolicy::Always`** — [`PHASE2.md`](./PHASE2.md) §3.4 calls it
@@ -611,9 +703,11 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
   forced creator took byte **1** against arena record **0** and the facade
   compared the two before publishing. `0035` moved the refusal one layer down, to
   the acquire, and `ParticipantSlotDiverged` is now unreachable from the create
-  path — the guard stays where it was, as an assertion, and its remaining
-  producers are the takeover arm and hand-rolled `tf_tree_ipc::Open` +
-  `TreeBuilder::build_shared` construction (`0035`, *Consequences*).
+  path — the guard stays where it was, as an assertion, and its one remaining
+  producer is hand-rolled `tf_tree_ipc::Open` + `TreeBuilder::build_shared`
+  construction. `0035`'s *Consequences* named a second, the takeover arm; #275
+  deleted that arm, so the hand-rolled route is now the only one
+  (`PHASE2.md` §0.0).
 
   **Do not retry**: a second forced create against the same holder is refused
   identically. Stop the process still holding byte 0 (`tf_tree participants`
@@ -721,7 +815,7 @@ Almost certainly a bug — topology should be near-static after startup.
 | `inconsistent-rate` | A frame published at a wildly varying rate | Often benign (a genuinely event-driven publisher), sometimes a struggling node. Compare against the rate you expect |
 | `unreachable` | Frames not reachable from the main root | A subtree is detached — usually a missing static declaration or a publisher that has not started |
 | `out-of-order` (`TFT018`) | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
-| `TFT014` — *slot N pid P, byte free* | A participant record nothing will reassign: the process is gone and the kernel has released its lock byte, but its arena record still says `LIVE` (or `RESERVED`) | **Three things reclaim it, and none of them is `doctor`.** The owner's slot assigner collects it when a grant walks past that index; the owner's socket-hangup callback collects it when a participant's connection closes; and **any read-write participant can sweep the whole table with `Tree::reap_participants()`**, which is the only one that reaches the *owner's own* slot. So the usual response to this finding is to attach a read-write consumer and sweep — not to stop the fleet. Count how many the finding says are spent (`N of 64`); at 64 every further attach fails `NoParticipantSlots` until something collects. **Two cases still have no repair**: a slot whose byte is *held* by a fork inheritor (that is the separate fork finding, and the kernel's answer is *held* — see [`0030`](./decisions/0030-the-atfork-handler-and-inherited-descriptors.md)), and an arena whose owner has died, since §3.5 takeover is unwired and no new process can join it. For those, stopping every attached process so the segment is freed is still the recovery — and `SIGTERM` is not one, because nothing installs a handler and the default disposition skips every destructor. `tf_tree participants` shows the same slots as `stale`. See [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) |
+| `TFT014` — *slot N pid P, byte free* | A participant record nothing will reassign: the process is gone and the kernel has released its lock byte, but its arena record still says `LIVE` (or `RESERVED`) | **Three things reclaim it, and none of them is `doctor`.** The owner's slot assigner collects it when a grant walks past that index; the owner's socket-hangup callback collects it when a participant's connection closes; and **any read-write participant can sweep the whole table with `Tree::reap_participants()`**, which is the only one that reaches the *owner's own* slot. So the usual response to this finding is to attach a read-write consumer and sweep — not to stop the fleet. Count how many the finding says are spent (`N of 64`); at 64 every further attach fails `NoParticipantSlots` until something collects. **Two cases still have no repair**: a slot whose byte is *held* by a fork inheritor (that is the separate fork finding, and the kernel's answer is *held* — see [`0030`](./decisions/0030-the-atfork-handler-and-inherited-descriptors.md)), and an arena whose owner has died **with no read-write survivor that calls `Tree::inherit_ownership`** — §3.5's inheritance shipped on 2026-08-28, but it is caller-driven and a read-only survivor is refused with `Inheritance::ReadOnly`, so an all-consumer fleet still cannot be joined (see *The arena's owner died*). For those, stopping every attached process so the segment is freed is still the recovery — and `SIGTERM` is not one, because nothing installs a handler and the default disposition skips every destructor. `tf_tree participants` shows the same slots as `stale`. See [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) |
 | `TFT014` — *slot N pid P, byte still HELD* | The **fork** case: a forked child inherited the parent's open file descriptions, so the lock byte is still held on behalf of a process that no longer exists. Reported for a read-only parent too, where there is no arena record at all — the finding then reads *the record is FREE (no arena record: a read-only participant, D18)*. **It is not reported for a participant in another PID namespace** ([`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md)): that used to render the identical sentence about a healthy process, so if a build predating `0033` shows you this for a containerised worker, check the namespace before acting on it | Different fault, different fix — **do not go looking for a reaper**, and nothing may run one: the kernel's own answer for this slot is *held*, and overruling it with a `/proc` guess is what would evict a running participant. Stop the child, and start workers with a start method that inherits no descriptors — `multiprocessing`'s `spawn` (Python defaults to `fork` on Linux), or fork+exec. The byte comes back on its own when the last inheritor exits. Same root cause as *The tree works in the parent and everything fails in a forked child*, above |
 | `TFT014` — *slot N pid P, byte not probed* | The same record-left-behind shape, seen by a run that read **no lock file**: `--from-bag`, or the built-in fixture. The verdict is a `/proc` inference alone | Read it as a weaker claim than the `byte free` row, not a different fault. To get the kernel's answer, run `doctor --attach` against the live domain — that is the only source that opens the rendezvous |
 | `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena — which, `doctor` having no recording source, is the only outcome either of them has on a deployment |

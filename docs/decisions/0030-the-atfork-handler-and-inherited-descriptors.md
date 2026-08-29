@@ -4,6 +4,46 @@
 **Owner:** @NoeFontana
 **Implementation:** none.
 
+**Read this before proposing a design: the sketch in *What this record has to
+settle* is refuted, and the scope of the defect is smaller than *The defect*
+below implies.** Both come from open question 1's prototype (2026-08-22); both
+are stated here rather than only 200 lines down, because a reader who stops at
+the top of this record re-proposes the array and over-states the leak.
+
+- **The obvious `[AtomicI32; N]` fd registry — "appended at registration and
+  *read* in the handler" — does not work, and it was refuted by running it, not
+  by argument.** The registry is buildable, so this record does not close as
+  *rejected*; the bare array is not the thing to build. **Three failure modes,
+  each reproduced** (question 1 carries the numbers): *(a)* read-don't-clear is
+  wrong under nested `fork` — the child reuses the numbers the handler freed,
+  forks again, and the grandchild's handler closes 3 of 3 of the child's own
+  descriptions, so the handler must `swap`, not `load`; *(b)* the child's own
+  owning handles close the numbers the handler already took — deterministic,
+  exit 42 in 3 runs of 3, and an early `return` in `Drop::drop` does not help
+  because `OwnedFd` drop glue still closes the field; *(c)* `fork` copies the
+  descriptor table **before** the address space (395 of 574 forks saw the skew,
+  0 the converse), so a number that was foreign at `t_files` can be a registered
+  tree fd by `t_mm` and the child closes it — 89 in 300 000 forks at 63.7
+  registrations/fork, and **0 in 60 000** with a static registry. The buildable
+  design is the **five rules** in question 1, and rule (v) changes the type of
+  every fd-holding field in the seam, which is where the cost is.
+- **Scope correction to *The defect, as `0028` established it*.** The leak is
+  **one participant slot per dead-parent-with-surviving-inheritor event, not one
+  per forked child.** A `fork` child never registers: registration happens on the
+  attach path and nowhere else — `Open::open` (`tf_tree_ipc/src/open.rs:346`) is
+  the only caller of `register_at` (`:542`) and `register_creator` (`:516`) — a
+  fork does not attach, and the child's `Tree` is poisoned by the counter
+  `fork.rs` bumps in the child handler. The child inherits the *same* open file
+  description, so while the parent lives the byte it holds is the parent's own
+  and correct. So a `multiprocessing` pool of 64 workers under a live parent
+  consumes **zero** extra slots out of `MAX_PARTICIPANTS = 64`; what the pool
+  changes is the *duration* of a single stuck slot once the parent dies —
+  "deferred to the last inheritor's exit" below is the accurate half. The
+  correction narrows the blast radius; it does not make the defect benign: *The
+  defect* is that one held byte says *alive* for a process that provably cannot
+  participate, and `0028` piece 2 decides liveness from the byte and nothing
+  else, so a multiplicity of one is enough.
+
 ## Context
 
 Split out of [`0028`](./0028-the-slot-a-killed-participant-keeps.md) as its

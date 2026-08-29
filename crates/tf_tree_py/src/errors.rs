@@ -500,10 +500,11 @@ pub(crate) fn open_err(edges: &[(String, String)], capacity: u32, e: OpenError) 
              mapped. The engine's reason, raw: {inner:?}"
         )),
         // `Rendezvous`, `NoLayoutToCreate`, `ReadOnlyCannotCreate`,
-        // `ArenaAlreadyLive`, `TakeoverUnsupported` — prose already, and the
-        // last of them cannot arrive here at all besides: it needs a
-        // `#[cfg(test)]` field of `tf_tree::Open`, which only that crate's own
-        // test target can set. `IpcError`'s `Display` is the one place that
+        // `ArenaAlreadyLive` — prose already. (`TakeoverUnsupported` was a fifth
+        // until `0037` question 3 deleted it along with `OpenOutcome::TookOver`:
+        // a takeover is not an outcome of `open()`, so neither the variant nor
+        // its refusal had anything to describe.) `IpcError`'s `Display` is the
+        // one place that
         // knows what a runtime directory or a refused handshake means.
         // Re-spelling it here would be a second copy that stops agreeing with
         // the first.
@@ -807,13 +808,22 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
             edge_label_in(tree, &view, edge)
         )),
         // The two time-domain refusals (D9). Domains are stamped as small
-        // integers in the arena and the Python surface has no name for them
-        // yet, so the number is reported as a domain *tag* rather than
-        // pretending to be a clock name.
+        // integers in the arena, and the four built-in tags now have Python
+        // names (`tf_tree.SIM_DOMAIN` and its three siblings); a user-declared
+        // one is the integer its declarer chose, from `4` up, so the number is
+        // still what the message quotes rather than a clock name it cannot know.
+        //
+        // **The sentence carries the remedy now** (`0038` §3). Before the
+        // `domain=` keyword existed this arm described a wall: every Python
+        // query constructed a tag-`0` stamp, so on a sim or sensor arena it
+        // fired on every call for the life of the process and there was no
+        // argument a caller could pass to stop it. Naming the keyword is what
+        // turns it back into a mistake somebody can fix.
         LookupError::TimeDomainMismatch { expected, got } => TfTreeError::new_err(format!(
             "this plan was compiled for time domain {expected}; the query \
              supplied a stamp in domain {got}. A stamp from one clock cannot \
-             address an edge sampled on another"
+             address an edge sampled on another — compile the plan in the \
+             arena's domain with tree.plan(target, source, domain={expected})"
         )),
         LookupError::MixedTimeDomains {
             edge,
@@ -884,6 +894,26 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
              program; please report it with this line: {other:?}"
         )),
     }
+}
+
+/// The plan-time domain refusal (`docs/decisions/0038` §2's "checked *there*").
+///
+/// **The same exception type the per-query arm raises**, which `docs/API.md` R5
+/// makes the contract: a caller catching `TfTreeError` for a domain mistake must
+/// not have to catch a second class depending on *when* the engine noticed. Only
+/// the prose differs, and it differs because it can — this is the one moment
+/// both frame names are still strings, so the message names the route that
+/// disagreed instead of only the two integers that did. That is `0038`'s third
+/// reason for putting the tag on the handle rather than on the call.
+pub(crate) fn plan_domain_err(target: &str, source: &str, expected: u8, got: u8) -> PyErr {
+    TfTreeError::new_err(format!(
+        "the path {source:?} -> {target:?} is sampled in time domain {expected}, \
+         and this plan was asked for domain {got}. A stamp from one clock \
+         cannot address an edge sampled on another; pass \
+         domain={expected} to tree.plan(). The four built-in tags are \
+         tf_tree.SYSTEM_DOMAIN, SENSOR_DOMAIN, SIM_DOMAIN and STEADY_DOMAIN, \
+         and a domain declared beyond them is the integer its declarer chose"
+    ))
 }
 
 /// Name a stored [`InterpPolicy`] discriminant the way `interp=` spells it.

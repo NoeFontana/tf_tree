@@ -77,14 +77,22 @@
 //! attributes anyway; the Rust function is an implementation detail of the
 //! module they are attached to.
 //!
-//! **The two are functions rather than module constants, and that is forced
-//! rather than chosen.** `tests/python/test_stubs.py` is what keeps the
-//! hand-written `.pyi` from rotting, and it compares this module's public names
-//! against the stub's `ClassDef`s and `FunctionDef`s. A module-level
-//! `FORMAT_VERSION: int` is an *assignment* in the stub, invisible to that
-//! comparison — it would be the one name in the whole surface that nothing
-//! checks exists. `has_shared_memory` is the precedent already here: a
+//! **The two are functions rather than module constants, and that was once
+//! forced.** `tests/python/test_stubs.py` is what keeps the hand-written `.pyi`
+//! from rotting, and it used to compare this module's public names against only
+//! the stub's `ClassDef`s and `FunctionDef`s. A module-level
+//! `FORMAT_VERSION: int` is an *assignment* in the stub, and was invisible to
+//! that comparison — it would have been the one name in the whole surface that
+//! nothing checked existed. `has_shared_memory` is the precedent: a
 //! compile-time-constant fact about the build, exposed as a nullary function.
+//!
+//! **`0038` needed four genuine constants, so that comparison grew instead**
+//! (see [`SYSTEM_DOMAIN`]): the stub check now collects module-level annotated
+//! assignments too, which is where `__version__` already lived. These three stay
+//! functions — a shape a caller has depended on since 0.0.1 is not worth
+//! churning for symmetry, and `arena_layout_hash` is a *fact about this build*
+//! rather than a name for a number in the format, which is what the four domain
+//! tags are.
 //!
 //! `__version__` is exempt because that check skips underscore-prefixed names
 //! on both sides, and it keeps the dunder spelling because it is what a user
@@ -226,6 +234,44 @@ fn from_ros(stamp: &Bound<'_, PyAny>) -> PyResult<i64> {
     from_parts(field("sec")?, field("nanosec")?)
 }
 
+/// The wall-clock domain: `CLOCK_REALTIME`, ROS `/clock` off, tag `0`.
+///
+/// The first of the four names `docs/decisions/0038-the-domain-a-binding-cannot-name.md`
+/// exports so a caller writes a name rather than a magic number. Pass one to
+/// `tree.plan(target, source, domain=...)` or `tree.lookup(..., domain=...)`.
+///
+/// # Why these are `int`s and not an `enum`
+///
+/// `tf_tree::Domain` is an **open trait**: its tag is `u8` and tags from `4` up
+/// belong to whoever declares them (`docs/API.md` §2.5 — "a driver with a
+/// PTP-disciplined clock declares `struct PtpDomain;` rather than pretending to
+/// be one of these"). An `enum` — even an `IntEnum` — would be a closed set
+/// standing in for an open one, so the PTP driver's tag would either be
+/// unrepresentable or arrive as a bare `int` that does not compare equal to
+/// anything in it. Four names and a plain integer for the rest is the shape the
+/// trait actually has.
+///
+/// **Not [`open_arena`]'s `domain=`**, which is the `u32`
+/// rendezvous namespace — which arena to attach to, not which clock stamps the
+/// edges inside it. `tf_tree.Tree.plan`'s doc has the distinction in full.
+pub const SYSTEM_DOMAIN: u8 = <tf_tree::SystemDomain as tf_tree::Domain>::TAG;
+
+/// A sensor's own clock — a lidar or camera stamping from its own oscillator,
+/// undisciplined against the host. Tag `1`; see [`SYSTEM_DOMAIN`].
+pub const SENSOR_DOMAIN: u8 = <tf_tree::SensorDomain as tf_tree::Domain>::TAG;
+
+/// Simulated time — ROS `use_sim_time`, `/clock`. Tag `2`; see [`SYSTEM_DOMAIN`].
+///
+/// **This is the tag the record was written for.** `ros/tf_tree_ros` tells an
+/// operator to give a simulated tree its own domain, and until `0038` doing so
+/// made the arena unreadable from Python: every query here constructed a tag-`0`
+/// stamp and there was no argument that said otherwise.
+pub const SIM_DOMAIN: u8 = <tf_tree::SimDomain as tf_tree::Domain>::TAG;
+
+/// A monotonic clock — `CLOCK_MONOTONIC`, boot-relative and never stepped.
+/// Tag `3`; see [`SYSTEM_DOMAIN`].
+pub const STEADY_DOMAIN: u8 = <tf_tree::SteadyDomain as tf_tree::Domain>::TAG;
+
 /// Whether this build can share a tree between processes.
 ///
 /// Compile-time on the Rust side (`shm` + Linux), so a caller does not have to
@@ -284,6 +330,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_parts, m)?)?;
     m.add_function(wrap_pyfunction!(from_ros, m)?)?;
     m.add_function(wrap_pyfunction!(has_shared_memory, m)?)?;
+    // Plain module-level ints, not a class and not an enum: the trait they name
+    // tags in is open, so four names plus a bare integer for a fifth is the only
+    // shape that does not lie about it. See [`SYSTEM_DOMAIN`].
+    m.add("SYSTEM_DOMAIN", SYSTEM_DOMAIN)?;
+    m.add("SENSOR_DOMAIN", SENSOR_DOMAIN)?;
+    m.add("SIM_DOMAIN", SIM_DOMAIN)?;
+    m.add("STEADY_DOMAIN", STEADY_DOMAIN)?;
     m.add_function(wrap_pyfunction!(tree::build, m)?)?;
     m.add_function(wrap_pyfunction!(tree::push, m)?)?;
     m.add_function(wrap_pyfunction!(tree::open_arena, m)?)?;

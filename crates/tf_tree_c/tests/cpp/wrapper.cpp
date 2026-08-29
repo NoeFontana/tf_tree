@@ -21,6 +21,7 @@
 extern "C" {
 tft_status tft_test_publishable_tree_create(tft_tree** out);
 tft_status tft_test_tree_create(tft_tree** out);
+tft_status tft_test_domain_tree_create(std::uint8_t domain, tft_tree** out);
 }
 
 // **A linker-level shim that records where the C ABI was told to write.**
@@ -704,6 +705,118 @@ static void check_errors()
 }
 
 // ---------------------------------------------------------------------------
+// Time domains — docs/decisions/0038
+// ---------------------------------------------------------------------------
+
+/// `Tree::plan_in_domain` is the only way a C++ caller can read a simulated
+/// tree.
+///
+/// `docs/PHASE4.md` §5.5 tells an operator to give such a tree its own domain,
+/// and until `0038` doing so made the arena unreadable from here: `Tree::plan`
+/// means domain 0, so every `at()` came back `TFT_ERR_TIME_DOMAIN` with no
+/// argument this header could pass. Both arms are the test — the tag the
+/// publisher configured reads a transform, and the default one is refused with
+/// the code §5.5 defines, at plan time rather than on every lookup.
+static void check_domain()
+{
+    tft_tree* raw = nullptr;
+    CHECK(tft_test_domain_tree_create(1, &raw) == TFT_OK, "fixture");
+    tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
+
+    auto plan_r = tree.plan_in_domain("map", "odom", 1);
+    CHECK_R(plan_r, "plan_in_domain map <- odom");
+    tf_tree::Plan plan = std::move(VALUE_OF(plan_r));
+
+    auto q_r = plan.at<tf_tree::Quat7>(150000000);
+    CHECK_R(q_r, "at<Quat7> on a tag-1 arena");
+    const tf_tree::Quat7 q = VALUE_OF(q_r);
+    CHECK(q.tx > 0.7 && q.tx < 0.8, "a tagged plan reads a transform");
+
+    // A static route has no domain to disagree with, in either wrapper.
+    auto st_r = tree.plan_in_domain("odom", "sensor", 7);
+    CHECK_R(st_r, "a static route takes any domain");
+    (void)VALUE_OF(st_r);
+
+#ifdef TF_TREE_NO_EXCEPTIONS
+    auto bad = tree.plan("map", "odom");
+    CHECK(!bad, "domain 0 cannot read a tag-1 arena");
+    CHECK(bad.error().code() == TFT_ERR_TIME_DOMAIN, "and says which agreement broke");
+#else
+    bool threw = false;
+    try {
+        (void)tree.plan("map", "odom");
+    } catch (const tf_tree::Error& e) {
+        threw = true;
+        CHECK(e.code() == TFT_ERR_TIME_DOMAIN, "and says which agreement broke");
+    }
+    CHECK(threw, "domain 0 cannot read a tag-1 arena");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Extrapolation — docs/decisions/0039
+// ---------------------------------------------------------------------------
+
+/// `Plan::at_extrapolating` hands back the pose and the distance as one value.
+///
+/// The property the record is for survives into C++ better than into C: there
+/// is no member of `Extrapolated<T>` that yields the pose alone, so a caller
+/// who wanted only the pose has to write `.pose` and see the sibling field
+/// beside it. The C entry point can only *ask* for somewhere to put the
+/// distance; this holds the two together.
+///
+/// The third comparison is what earns the check. `Error` refusing and `Hold`
+/// answering would both pass against a wrapper that ignored its policy
+/// argument and always held; only `ConstantTwist != Hold` at the same stamp
+/// says the argument reached the engine.
+static void check_extrapolation()
+{
+    tft_tree* raw = nullptr;
+    CHECK(tft_test_domain_tree_create(1, &raw) == TFT_OK, "fixture");
+    tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
+
+    auto plan_r = tree.plan_in_domain("map", "sensor", 1);
+    CHECK_R(plan_r, "plan_in_domain map <- sensor");
+    tf_tree::Plan plan = std::move(VALUE_OF(plan_r));
+
+    // The fixture publishes 32 samples 10 ms apart, so 310 ms is the newest and
+    // 400 ms is 90 ms past it.
+    auto hold_r = plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_HOLD);
+    CHECK_R(hold_r, "Hold answers past the newest sample");
+    const tf_tree::Extrapolated<tf_tree::Quat7> hold = VALUE_OF(hold_r);
+    CHECK(hold.by_ns == 90000000, "the distance comes back with the pose");
+    CHECK(hold.edge != TFT_INVALID_ID, "and names the edge that ran out of data");
+
+    auto twist_r =
+        plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_CONSTANT_TWIST);
+    CHECK_R(twist_r, "ConstantTwist answers past the newest sample");
+    const tf_tree::Extrapolated<tf_tree::Quat7> twist = VALUE_OF(twist_r);
+    CHECK(twist.by_ns == hold.by_ns, "the distance does not depend on the policy");
+    CHECK(twist.pose.tx != hold.pose.tx,
+          "ConstantTwist must differ from Hold, or the policy is being ignored");
+
+    // Inside the window the answer is interpolated, and says so.
+    auto near_r = plan.at_extrapolating<tf_tree::Quat7>(150000000, TFT_EXTRAP_HOLD);
+    CHECK_R(near_r, "an in-window stamp answers under any policy");
+    CHECK(VALUE_OF(near_r).by_ns == 0, "and reports that nothing was invented");
+
+#ifdef TF_TREE_NO_EXCEPTIONS
+    auto refused = plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_ERROR);
+    CHECK(!refused, "TFT_EXTRAP_ERROR refuses, exactly as at() does");
+    CHECK(refused.error().code() == TFT_ERR_EXTRAPOLATION, "and says which refusal");
+#else
+    bool threw = false;
+    try {
+        (void)plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_ERROR);
+    } catch (const tf_tree::Error& e) {
+        threw = true;
+        CHECK(e.code() == TFT_ERR_EXTRAPOLATION, "and says which refusal");
+    }
+    CHECK(threw, "TFT_EXTRAP_ERROR refuses, exactly as at() does");
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Publishing
 // ---------------------------------------------------------------------------
 
@@ -822,6 +935,8 @@ int main()
     check_eigen_storage_premise();
 #endif
     check_read_path();
+    check_domain();
+    check_extrapolation();
 #if defined(TF_TREE_WRAP_PLAN_AT) && defined(TF_TREE_HAS_EIGEN)
     check_at_writes_into_the_returned_object();
 #endif

@@ -50,6 +50,12 @@ struct Kid(Child, Option<BufReader<std::process::ChildStdout>>);
 
 impl Kid {
     fn spawn(dir: &PathBuf, args: &[&str]) -> Kid {
+        Kid::spawn_with_env(dir, args, &[])
+    }
+
+    /// [`Self::spawn`] with extra environment — `TF_TREE_CRASH_AT`, which is how
+    /// `docs/PHASE2.md` §11.3 arms a named crash point in a child.
+    fn spawn_with_env(dir: &PathBuf, args: &[&str], env: &[(&str, &str)]) -> Kid {
         // The bin target carries the crate's name, not the file's: this crate is
         // published, and `--features shm` installs whatever is here into the
         // user's `bin/`. The manifest argues it; the source stays
@@ -60,10 +66,24 @@ impl Kid {
             .env("TF_TREE_RUNTIME_DIR", dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .envs(env.iter().copied())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn the rendezvous child helper");
         Kid(child, None)
+    }
+
+    /// Wait for a child that is expected to die on its own, and report how.
+    ///
+    /// Only `a_killed_heir_leaves_the_role_for_the_next_survivor` calls this,
+    /// and it is the only test that has a child which dies by itself — every
+    /// other one either parks until [`Kid::kill`] or answers on stdout. Gated on
+    /// the same feature as that test, because without it the crash point is
+    /// compiled out, no child dies, and this becomes dead code that fails
+    /// `just shm-check`'s `--features shm` clippy row.
+    #[cfg(feature = "crash-points")]
+    fn wait(&mut self) -> std::process::ExitStatus {
+        self.0.wait().expect("wait for the child")
     }
 
     /// The child's next line. It flushes before it parks, so this returning is
@@ -826,11 +846,13 @@ fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
 /// turn this policy into a documented operator procedure.
 ///
 /// **#201's second path — the takeover arm — is closed by deletion.** It took
-/// the first free byte through `register_any`; both are gone, and
-/// `OpenOutcome::TookOver` now has no producer. `0028` question 3 is why: the
-/// heir keeps its existing slot, byte and arena record, and §3.5 cannot be
-/// wired as a second `Open::open` call. `docs/decisions/0037` records the five
-/// unsound states two rounds of repair produced before that landed. What is pinned below is therefore the
+/// the first free byte through `register_any`; both are gone, and so is
+/// `OpenOutcome::TookOver`, which `0037` question 3 answers `no` to: a takeover
+/// is not an outcome of `open()`. `0028` question 3 is why the arm could not be
+/// repaired — the heir keeps its existing slot, byte and arena record, and §3.5
+/// cannot be wired as a second `Open::open` call. `0037` records the five
+/// unsound states two rounds of repair produced before that landed, and §3.5
+/// now ships as `Session::take_over_ownership`. What is pinned below is therefore the
 /// *consequence* of the remaining divergence, on a staged instance of it, and
 /// not its reachability.
 ///
@@ -4044,4 +4066,350 @@ fn the_topology_byte_is_retried_before_contention_is_reported() {
         "reparent gave up after {waited:?}, under 8 contended fcntl round trips \
          ({floor:?}): the retry budget is gone"
     );
+}
+
+/// **§3.5, end to end: owner death stops being terminal for new joiners.**
+///
+/// This is the failure `docs/PHASE2.md` §0.0 records, measured with
+/// `shm_torture` and true for the whole life of the project: kill the arena's
+/// owner and lookups keep working for everyone already attached, exactly as
+/// §3.5 promises — but **no new process can ever join**. A joiner wins the
+/// ownership byte, meets §3.4's split-brain check against the surviving
+/// participants' held bytes, backs off, and times out with
+/// `ArenaHeldButUnreachable` for as long as any survivor lives. That is the
+/// shape a supervised robot has every time it restarts one node.
+///
+/// The takeover half was deleted by #275
+/// ([`0037`](../../docs/decisions/0037-a-takeover-is-not-a-second-open.md)),
+/// because the declaration it rested on — *"I already hold the arena at slot
+/// n"* — cannot be verified from a new file description: `F_OFD_GETLK` answers
+/// *does anyone else hold this byte*, so a caller holding it on another
+/// description and a live peer holding it are indistinguishable. The
+/// replacement is a method on the `Session` that already holds the byte, where
+/// the invariant is structural rather than checked.
+///
+/// **The test asserts the failure before it asserts the repair**, because a
+/// test that only shows the joiner succeeding at the end would pass just as
+/// well against a build where the owner never really died.
+///
+/// **Mutant:** make `Tree::inherit_ownership` return `Ok(Inheritance::OwnerAlive)`
+/// unconditionally. Applied: `left: "true OwnerAlive", right: "true Inherited"`.
+/// Note *which* half of that line moves — `owner_lost` still answers `true`,
+/// because the hangup is a kernel fact and the mutation is downstream of it. The
+/// test therefore fails at the inheritance and not at the trigger, which is the
+/// discrimination it is for: a build that sees the death and does nothing is the
+/// pre-#275 world, and it is the one this test has to reject.
+#[test]
+fn a_survivor_inherits_ownership_and_the_arena_becomes_joinable_again() {
+    use tf_tree::{AttachMode, Stamp};
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("inherit-ownership");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(
+        owner.line().starts_with("owning"),
+        "the owner did not come up"
+    );
+
+    // A survivor, attached before the owner dies. It holds a participant byte,
+    // which is precisely what turns later joiners away.
+    let mut heir = Kid::spawn(&dir.0, &["join-heir"]);
+    assert!(
+        heir.line().starts_with("joined "),
+        "the survivor did not attach"
+    );
+
+    owner.kill();
+
+    let joiner = || {
+        tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(CreatePolicy::Never)
+            .timeout(std::time::Duration::from_millis(200))
+    };
+
+    // The documented failure, reproduced. Nothing is serving, and the heir's
+    // held byte makes the arena look occupied to everyone outside it.
+    let err = joiner()
+        .open()
+        .err()
+        .expect("with the owner dead and nothing serving, a joiner must be turned away");
+    assert!(
+        matches!(
+            err,
+            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. })
+        ),
+        "expected the pre-§3.5 wedge, got {err:?}"
+    );
+
+    // The repair: the survivor notices and inherits. `owner_lost` is the trigger
+    // that never existed — nothing watched the client socket, so no participant
+    // ever reached the takeover path even while one was implemented.
+    heir.poke();
+    let report = heir.line();
+    assert!(
+        report.starts_with("true Inherited "),
+        "the survivor did not see the hangup, or did not inherit: {report}"
+    );
+
+    // And now the thing that could not happen before: a new process joins the
+    // same arena, under a new owner, and reads what the dead owner published.
+    let tree = joiner()
+        .open()
+        .expect("after inheritance a new process must be able to join");
+    let g = tree.guard();
+    let target = tree.frame("map").unwrap();
+    let source = tree.frame("base").unwrap();
+    let plan = tree.plan(target, source).unwrap();
+    let iso = plan
+        .at(&g, Stamp::<tf_tree::SystemDomain>::from_nanos(1_500))
+        .unwrap();
+    let expected = tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]);
+    assert_eq!(
+        iso.to_bits(),
+        expected.to_bits(),
+        "the inherited arena served different bytes than the dead owner wrote"
+    );
+}
+
+/// **Two survivors race for the vacant owner role, and the loser keeps its slot.**
+///
+/// [`0037`](../../docs/decisions/0037-a-takeover-is-not-a-second-open.md)
+/// question 2. There is no arbitration protocol here and there is deliberately
+/// none: both survivors call the same method, the kernel grants byte 0 to
+/// exactly one uncontended `F_OFD_SETLK`, and the other is told so. What makes
+/// that safe is the thing the deleted arm could not do — the lock is taken on
+/// **the file description the session already holds**, so a loser's participant
+/// slot cannot move, because nothing went looking for a byte in the first place.
+///
+/// The old arm's five unsound states were all versions of that going wrong: it
+/// handed back the first *free* byte, or a byte over a free slot, or an
+/// out-of-range one. This test is the assertion those failures would have
+/// tripped: **both survivors report the same slot before and after**, whichever
+/// one won.
+///
+/// **Mutant:** in `Session::take_over_ownership`, return `Ok(true)` on
+/// `LockAttempt::Contended` as well — i.e. let both survivors believe they are
+/// the owner. Applied: the outcome pair becomes `Inherited`/`Inherited` and the
+/// `exactly one` assertion fails, which is the split-brain §3.4 exists to
+/// prevent, reached from the other direction.
+#[test]
+fn two_survivors_race_and_exactly_one_inherits() {
+    use tf_tree::AttachMode;
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("inherit-race");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    let mut a = Kid::spawn(&dir.0, &["join-heir"]);
+    let a_joined = a.line();
+    let mut b = Kid::spawn(&dir.0, &["join-heir"]);
+    let b_joined = b.line();
+    let slot_of = |line: &str| line.split_whitespace().nth(1).unwrap_or("?").to_string();
+    let (a_slot, b_slot) = (slot_of(&a_joined), slot_of(&b_joined));
+    assert_ne!(a_slot, b_slot, "two participants were given one slot");
+
+    owner.kill();
+
+    a.poke();
+    b.poke();
+    let (ra, rb) = (a.line(), b.line());
+
+    let outcome = |r: &str| r.split_whitespace().nth(1).unwrap_or("?").to_string();
+    let after = |r: &str| r.split_whitespace().nth(2).unwrap_or("?").to_string();
+    let (oa, ob) = (outcome(&ra), outcome(&rb));
+
+    // Both saw the hangup — the trigger is a kernel fact, not a race.
+    assert!(
+        ra.starts_with("true "),
+        "survivor A missed the hangup: {ra}"
+    );
+    assert!(
+        rb.starts_with("true "),
+        "survivor B missed the hangup: {rb}"
+    );
+
+    // Exactly one inherited. The other is `Contended`, which is not an error:
+    // it means somebody else is mid-bind, and §3.5 says reconnect with backoff.
+    let inherited = [&oa, &ob].iter().filter(|o| ***o == *"Inherited").count();
+    assert_eq!(
+        inherited, 1,
+        "expected exactly one heir, got A={oa} B={ob} (two would be split brain)"
+    );
+    assert_eq!(
+        [&oa, &ob].iter().filter(|o| ***o == *"Contended").count(),
+        1,
+        "the loser must be told it lost, not handed an error: A={oa} B={ob}"
+    );
+
+    // The invariant: neither survivor's slot moved, winner or loser.
+    assert_eq!(
+        after(&ra),
+        a_slot,
+        "survivor A's slot moved: {a_joined} -> {ra}"
+    );
+    assert_eq!(
+        after(&rb),
+        b_slot,
+        "survivor B's slot moved: {b_joined} -> {rb}"
+    );
+
+    // And the arena is joinable again, which is the point of any of it.
+    tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("after a contested inheritance the arena must still be joinable");
+}
+
+/// **A fleet of read-only consumers cannot rescue itself, and that is D18
+/// working rather than failing.**
+///
+/// An owner writes the participant table on every grant, so serving needs a
+/// writable mapping. A `PROT_READ` attachment — the consumer default, and the
+/// only real security boundary this design has — therefore cannot be an heir.
+/// `Tree::inherit_ownership` says so as data rather than as an error, because a
+/// read-only consumer meeting a dead owner has not done anything wrong: it keeps
+/// reading the arena it has, exactly as §3.5 promises, and some read-write
+/// participant must be the one to inherit.
+///
+/// This is the operational shape behind `docs/RUNBOOK.md`'s owner-death remedy:
+/// the recovery needs a survivor that is *both* attached and writable, and a
+/// deployment of nothing but `tf_tree top --attach` and read-only nodes has none.
+///
+/// **Mutant:** drop the `is_writable` guard from `inherit_ownership`. Applied:
+/// the read-only tree reports `Inherited` instead of `ReadOnly` — it takes the
+/// ownership byte it cannot serve behind, which is the state that makes an arena
+/// unjoinable and the exact failure the guard exists to prevent.
+#[test]
+fn a_read_only_survivor_reports_that_it_cannot_inherit() {
+    use tf_tree::{AttachMode, Inheritance};
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("inherit-read-only");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    // This process is the read-only survivor.
+    let mut ro = tf_tree::Open::new()
+        .mode(AttachMode::ReadOnly)
+        .create(CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("a read-only consumer must be able to join");
+    assert!(!ro.is_writable(), "the attachment was not read-only");
+
+    // While the owner lives, nothing is attempted at all.
+    assert_eq!(ro.inherit_ownership().unwrap(), Inheritance::OwnerAlive);
+
+    owner.kill();
+
+    // The owner's death is visible to a read-only consumer too — the socket is
+    // the liveness signal regardless of the mapping's protection (D17).
+    assert!(ro.owner_lost(), "a read-only attachment missed the hangup");
+    assert_eq!(
+        ro.inherit_ownership().unwrap(),
+        Inheritance::ReadOnly,
+        "a PROT_READ attachment must refuse the role rather than take a byte it cannot serve behind"
+    );
+
+    // And the promise that survives all of it: lookups do not stop.
+    let g = ro.guard();
+    let target = ro.frame("map").unwrap();
+    let source = ro.frame("base").unwrap();
+    let plan = ro.plan(target, source).unwrap();
+    let iso = plan
+        .at(
+            &g,
+            tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(1_500),
+        )
+        .expect("a dead owner must not stop a reader");
+    assert_eq!(
+        iso.to_bits(),
+        tf_tree::exp_se3([1.0, 2.0, 3.0, 0.1, 0.2, 0.3]).to_bits()
+    );
+}
+
+/// **`docs/PHASE2.md` §11.3, `takeover.after_ownership_lock_before_bind`: the
+/// crash-matrix row §3.5 owes.**
+///
+/// D15 is that no mutation protocol lands without a named crash point and a walk
+/// through the matrix, and §3.5's acquisition is a mutation protocol: between
+/// taking byte 0 and binding the socket, a process is the owner and is not
+/// serving — which is exactly the state that makes an arena unjoinable, and the
+/// state a survivor's inheritance exists to end.
+///
+/// §11.3's repair claim for this row is *"ownership released; another
+/// participant takes over; joiners retry"*, and what makes it true rather than
+/// hopeful is that the byte is an OFD lock: the kernel releases it at process
+/// death with no cooperation from the corpse, and `inherit_ownership` never
+/// registers anything a dead heir would have to clean up.
+///
+/// So: two survivors, the first killed *inside* the window by
+/// `TF_TREE_CRASH_AT`, and the assertion that the second still inherits and the
+/// arena is joinable afterwards. The crash is real — `abort()`, not a `panic!`,
+/// so no destructor runs and nothing gives the byte back politely.
+///
+/// **Mutant:** none is offered, because the honest one is the crash point's
+/// *placement*, and moving it after `spawn_owner_server` makes this test pass
+/// for a different reason (the heir dies owning *and* serving, and the socket's
+/// closure is what the survivor then sees). What this pins is the row's repair,
+/// not the placement; the placement is argued at the call site.
+#[cfg(feature = "crash-points")]
+#[test]
+fn a_killed_heir_leaves_the_role_for_the_next_survivor() {
+    use tf_tree::AttachMode;
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("inherit-crash");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    // The doomed heir: armed to abort with byte 0 held and nothing listening.
+    let mut doomed = Kid::spawn_with_env(
+        &dir.0,
+        &["join-heir"],
+        &[(
+            "TF_TREE_CRASH_AT",
+            "takeover.after_ownership_lock_before_bind:1",
+        )],
+    );
+    assert!(doomed.line().starts_with("joined "));
+
+    let mut heir = Kid::spawn(&dir.0, &["join-heir"]);
+    assert!(heir.line().starts_with("joined "));
+
+    owner.kill();
+
+    // The doomed one goes first and dies holding the role.
+    doomed.poke();
+    let status = doomed.wait();
+    assert_eq!(
+        status.code(),
+        None,
+        "the armed heir exited normally instead of aborting: {status:?}"
+    );
+
+    // The repair: the next survivor takes the role the corpse was holding.
+    heir.poke();
+    let report = heir.line();
+    assert!(
+        report.starts_with("true Inherited "),
+        "the kernel did not release the dead heir's ownership byte, or the \
+         survivor could not take it: {report}"
+    );
+
+    // And joiners retry successfully, which is the row's last clause.
+    tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("after the heir's death and the next survivor's takeover, a joiner must succeed");
 }

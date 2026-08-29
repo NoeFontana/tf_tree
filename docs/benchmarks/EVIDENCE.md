@@ -57,6 +57,7 @@ gated; each backs prose that should read as "was measured", not "is".
 | `heap_vs_shared` | heap vs `MAP_SHARED` vs attached RO (51.1/51.3/51.2 ns). **Its stamp is an exact grid hit — see the file header; superseded for the mapping question by `just abi-split`** | tf2.md ×2 |
 | `step_cost` | per-edge fold cost | tf2.md ×2 |
 | `interp_cost` | interpolation policy costs | (uncited) |
+| `interp_accuracy` | what `ScLerp` buys over `LerpSlerp` by publish rate — position only (both SLERP the rotation), chord-vs-arc, lever × θ²/8. **D5's owed measurement.** `just interp-accuracy` | `docs/PROJECT.md` §5 D5 |
 | `adjoint_cost` | adjoint chain cost for derivatives | PHASE4 |
 | `deriv_cost` | `sample_with_derivatives` cost | PHASE4 |
 | `autovec_probe` | SLP/autovectorisation of the fold — `0016`'s amendment | 0016 |
@@ -68,7 +69,9 @@ gated; each backs prose that should read as "was measured", not "is".
 | `query_mix` (bench) | mixed query workload | (uncited) |
 | `at_many` (bench) | batch-fold throughput | (uncited; the *method* `Plan::at_many` is cited widely — different thing) |
 | `read_scaling` (bench) | PHASE1 §11.3's read-scaling curve | xtask bench-gate names it as a manual follow-up |
+| `control_loop` (`tf_tree`) | the runtime path as a node writes it, and a tail reading for `docs/API.md` §8: two queries under one guard at 1 kHz against a 200 Hz estimate, under a concurrent writer. **Host-specific and cited as a claim nowhere** — unpinned, no RT scheduler, and two clock reads around a sub-microsecond operation, so it reads high and says so. Run with `just control-loop` | API.md §8.4, as the thing that stopped being absent |
 | `gen_zstd_conformance` | generates the ingest conformance corpus | (uncited, generator) |
+| `gen_domain_fixture` | generates `testdata/frozen/sensor_domain.tft`, the only non-zero-domain arena Python can reach — [`0038`](../decisions/0038-the-domain-a-binding-cannot-name.md) step 4's verification is unwritable without it | (uncited, generator; the fixture it writes is held to account by `crates/tf_tree/tests/frozen.rs`) |
 
 **The criterion benches are compiled but never executed by anything.**
 `cargo xtask bench-gate` runs `cargo bench -p tf_tree_bench --no-run` — it links

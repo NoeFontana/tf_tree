@@ -82,6 +82,23 @@ miri-soft-float = ["libm/force-soft-floats", "tf_tree_math/miri-soft-float"]
 # same shape as `tf_tree_c`'s `test-hooks`, which exists so `abi_cost.rs` can
 # measure the `catch_unwind` boundary. `just embed-cost-check` is its gate.
 bench-probe = []
+# **Fault injection, `docs/PHASE2.md` §11.3 — default-off, and nothing shipped
+# turns it on.** It places the named abort sites §11.3 requires (`crash::SITES`)
+# in this crate's mutation protocols, armed at run time by
+# `TF_TREE_CRASH_AT=<name>:<nth_hit>`. With the feature off `crash_point!`
+# expands to nothing, so a default build has no call, no branch and no atomic
+# load on the push path.
+#
+# **It has no `[dependencies]` entry because what it needs is `std`, and it takes
+# that for itself**: reading an environment variable needs `std`, so
+# `lib.rs` carries `#[cfg(any(test, feature = "crash-points"))] extern crate
+# std;` — the same shape the crate already used to give its test suite `std`
+# without becoming a `std` crate. Deliberately *not* a `std` feature: a feature
+# is unified across the graph, so one crate in a workspace build turning it on
+# would silently make everybody's `tf_tree_core` link `std`, and the `no_std`
+# guarantee this crate exists to keep would be decided by somebody else's
+# dependency. `#![no_std]` in `lib.rs` stays unconditional.
+crash-points = []
 
 [dependencies]
 tf_tree_math.workspace = true

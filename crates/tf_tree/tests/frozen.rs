@@ -627,3 +627,79 @@ fn the_manifest_is_cbor_and_names_the_frames() {
     // The source path round-trips as a text string.
     assert!(m.windows(9).any(|w| w == b"\x68bag.mcap"));
 }
+
+/// **The committed tag-1 fixture still reads, and still carries tag 1.**
+///
+/// `testdata/frozen/sensor_domain.tft` exists so `0038` step 4's verification can
+/// be written at all: Python cannot construct an arena whose edges carry a
+/// non-zero time domain, so before this file every Python query site could have
+/// been reverted to the pre-`0038` `Stamp::<SystemDomain>` spelling with the
+/// suite staying green. `testdata/frozen/README.md` and
+/// `crates/tf_tree/examples/gen_domain_fixture.rs` carry the argument.
+///
+/// This test is what stops the fixture going stale silently. A `.tft` is
+/// version- and layout-checked on open, so a `FORMAT_VERSION` or `layout_hash`
+/// change makes the file unreadable — and it would be unreadable *in a Python
+/// test run*, which is not where a Rust format change should first be noticed.
+/// Here it fails in `just test`, naming the regenerator.
+///
+/// **Properties, not bytes.** Two freezes of one tree are never byte-identical:
+/// the header carries `created_unix_ns`, `creator_pid`, `boot_id` and
+/// `instance_uuid`. A `memcmp` gate would fail on every run and teach people to
+/// delete it.
+#[test]
+fn the_committed_sensor_domain_fixture_reads_and_is_still_tag_one() {
+    use tf_tree::{Domain, SensorDomain};
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/frozen/sensor_domain.tft")
+        .canonicalize()
+        .expect(
+            "testdata/frozen/sensor_domain.tft is missing; regenerate it with \
+                 `cargo run -p tf_tree --features shm --example gen_domain_fixture`",
+        );
+
+    let tree = Tree::open_frozen(&path).expect(
+        "the committed fixture no longer opens; if FORMAT_VERSION or the layout changed, \
+         regenerate it with `cargo run -p tf_tree --features shm --example \
+         gen_domain_fixture` and commit the result",
+    );
+
+    let map = tree.frame("map").unwrap();
+    let base = tree.frame("base_link").unwrap();
+    let lidar = tree.frame("lidar").unwrap();
+    let plan = tree.plan(map, base).unwrap();
+
+    // The property the whole fixture exists for.
+    assert_eq!(
+        plan.domain(),
+        SensorDomain::TAG,
+        "the fixture stopped carrying a non-zero domain, which makes every Python \
+         domain assertion vacuous rather than failing"
+    );
+
+    let g = tree.guard();
+    // Tag 1 answers...
+    let want = plan
+        .at(&g, Stamp::<SensorDomain>::from_nanos(75_000_000))
+        .expect("the fixture's own domain must answer");
+    // ...and the tagged spelling agrees with it, which is what the bindings call.
+    assert_eq!(plan.at_tagged(&g, 75_000_000, SensorDomain::TAG), Ok(want));
+    // ...and tag 0 does not, which is what makes a mis-tagged binding observable.
+    assert_eq!(
+        plan.at(&g, Stamp::<SystemDomain>::from_nanos(75_000_000)),
+        Err(tf_tree::LookupError::TimeDomainMismatch {
+            expected: 1,
+            got: 0
+        }),
+        "a tag-0 query answered a tag-1 plan"
+    );
+
+    // A route through the static edge, so the Python batch calls have something
+    // to fold that is more than one step.
+    let through_static = tree.plan(map, lidar).unwrap();
+    assert_eq!(through_static.domain(), SensorDomain::TAG);
+    through_static
+        .at(&g, Stamp::<SensorDomain>::from_nanos(75_000_000))
+        .expect("the composed route must answer at the same stamp");
+}

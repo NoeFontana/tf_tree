@@ -15,27 +15,49 @@ crates/
 ├── tf_tree_arena/         no_std+alloc pointer-free arena + layout math
 ├── tf_tree_core/          no_std+alloc engine: interning, topology, buffers, plans
 ├── tf_tree/               std facade: builder, plan-cached lookup, Display errors
+├── tf_tree_ipc/           rendezvous, lock file, fd passing
+├── tf_tree_bridge/        ROS-independent half of the /tf ingest bridge
+├── tf_tree_ingest/        MCAP bag ingestion
+├── tf_tree_py/            PyO3 bindings; excluded from the cargo workspace
+├── tf_tree_c/             C ABI + header-only C++ wrapper
+├── tf_tree_tf2_sys/       tf2 side of the differential harness; excluded
 ├── tf_tree_bench/         criterion benches + tf2 differential harness
 └── tf_tree_cli/           binary `tf_tree` (alias `tft`)
+ros/                       ament_cmake packages; not cargo crates (`just ros-build`)
 xtask/                     loom / miri / bench-gate runners
-docs/PROJECT.md            overview, roadmap, decision log D1–D20 (§5)
-docs/PHASE1.md             normative Phase 1 spec (the contract for current work)
+docs/PROJECT.md            overview, roadmap, decision log D1–D22 (§5)
+docs/PHASE1.md             normative Phase 1 spec (implemented whole)
 docs/PHASE2.md             normative Phase 2 spec; §1 = Phase 1 amendments A1–A8
 docs/decisions/            architectural decision records (process, kept for new decisions)
 ```
+
+`CLAUDE.md`'s *Project shape* is the same tree annotated with each crate's
+unsafe and dependency budget. Five crates publish (`tf_tree`, `tf_tree_core`,
+`tf_tree_math`, `tf_tree_arena`, `tf_tree_ipc`); the rest carry
+`publish = false` with the reason in their manifest.
 
 `docs/PROJECT.md` and `docs/PHASE1.md` are the contract — read them in that
 order before proposing a change. `docs/PHASE2.md` §1 lists amendments A1–A8 to
 Phase 1, **all of which are now applied**; read them before altering a
 concurrency protocol, because they are why several orderings look the way they
-do. §0.0 is the live status table, and
-[`docs/decisions/0005`](./docs/decisions/0005-the-shared-memory-seam.md) scopes
-what is left (fd passing, liveness, reaping).
+do. §0.0 is the live status table and outranks this file.
+
+This section used to say that
+[`docs/decisions/0005`](./docs/decisions/0005-the-shared-memory-seam.md) scoped
+"what is left (fd passing, liveness, reaping)". All three landed under `0005`.
+What §0.0 still carries open is the daemon and tooling surface (§9, §10), the
+long-running fault harness (§11.3, §11.4), and **ownership migration (§3.5),
+which is not implemented and has no path today** — the takeover half was deleted
+in #275 and [`0037`](./docs/decisions/0037-a-takeover-is-not-a-second-open.md)
+records why a second `open()` cannot be it. Read §0.0's row, not this list.
 
 `tf_tree_core` is the source of truth. `tf_tree_math` and `tf_tree_arena` are
 separately publishable and separately testable — keeping the math crate free of
 `unsafe` and of the arena is what lets its property tests run under Miri in
-seconds. Python bindings are Phase 3 and are not in this workspace yet.
+seconds. Phase 3 is implemented: the Python bindings live in `crates/tf_tree_py`
+and are *excluded* from the cargo workspace, because they link libpython — so
+`cargo build --workspace` never sees them and `just py-test` / `just py-lint`
+are their gate.
 
 ## Prerequisites
 
@@ -48,9 +70,10 @@ seconds. Python bindings are Phase 3 and are not in this workspace yet.
 ## Quickstart
 
 ```sh
-just build            # cargo build --workspace
-just test             # cargo nextest + doctests
-just lint             # cargo fmt --check + clippy -D warnings + cargo-deny
+just build            # cargo build --workspace --all-targets
+just test             # cargo nextest + doctests + ingest-check
+just lint             # fmt --check + eight clippy -D warnings passes, behind five gates
+just audit            # cargo deny check (NOT part of `just lint`)
 just fmt              # auto-format + clippy --fix
 just loom             # concurrency model checking
 just miri             # UB checking (arena + core + the facade's one unsafe)
@@ -80,12 +103,22 @@ system, or release process starts as a **decision document** in
 Bug fixes, behavior-preserving refactors, and dependency bumps do not need a
 decision document — just open a PR.
 
+## Changelog entries
+
+`CHANGELOG.md`'s `[Unreleased]` section says **what changed, whether it breaks
+anything, the PR number, and where the argument lives** — a decision record, a
+spec section, or the module the reasoning is written on. It does not reproduce
+that argument, restate a record's measured numbers, or re-litigate a trade-off
+that already has a home; every argument keeps exactly one. A fact with no other
+home stays in the entry, or moves to the document that should own it.
+
 ## Pull-request checklist
 
 - [ ] `just lint` is clean.
 - [ ] `just test` passes (and `just loom` / `just miri` if you touched the
       concurrency or arena code).
 - [ ] `just audit` is clean (or the failure is explained in the PR).
+- [ ] The `CHANGELOG.md` entry links its argument rather than repeating it.
 - [ ] Public Rust items have doc comments (`missing_docs` is a warn lint, and CI
       builds docs with `-D warnings`).
 - [ ] Every `unsafe` block has a `// SAFETY:` comment; `unsafe` stays within its

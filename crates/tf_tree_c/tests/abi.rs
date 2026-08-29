@@ -245,6 +245,39 @@ fn tft_error_layout_is_what_the_header_promises() {
     );
 }
 
+/// `tft_extrapolated` gets [`tft_error`]'s treatment, for [`tft_error`]'s
+/// reason: `struct_size` at offset 0, or the check
+/// [`tft_plan_at_extrapolating`] makes before it writes is reading some other
+/// field's bytes.
+///
+/// It is a *callee-filled* struct like `tft_error`, so the size check is what
+/// makes §3.6's append mechanism real here — a future field can only be added
+/// safely if this build can tell an older caller's struct from its own.
+#[test]
+fn tft_extrapolated_layout_is_what_the_header_promises() {
+    assert_eq!(
+        core::mem::size_of::<tft_extrapolated>() % 8,
+        0,
+        "no tail padding surprises"
+    );
+    // SAFETY: three integers with no niche and no validity invariant, so an
+    // all-zero bit pattern is a valid value of this type.
+    let e: tft_extrapolated = unsafe { core::mem::zeroed() };
+    let base = core::ptr::addr_of!(e) as usize;
+    assert_eq!(
+        core::ptr::addr_of!(e.struct_size) as usize - base,
+        0,
+        "struct_size must be first — the size check reads it before anything else"
+    );
+    // The three policy discriminants are on the wire: a caller compares against
+    // a literal it compiled against, so moving one is a major ABI break rather
+    // than a rename.
+    assert_eq!(
+        (TFT_EXTRAP_ERROR, TFT_EXTRAP_HOLD, TFT_EXTRAP_CONSTANT_TWIST),
+        (0, 1, 2)
+    );
+}
+
 /// **§3.6's rule is enforced, not merely reportable.**
 ///
 /// "Major must match exactly; the runtime minor may be ≥ the compiled-against

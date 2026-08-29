@@ -313,6 +313,10 @@ pub fn counters_compiled_in() -> bool {
 #[cfg(all(feature = "shm", target_os = "linux"))]
 mod open;
 #[cfg(all(feature = "shm", target_os = "linux"))]
+pub use open::Inheritance;
+#[cfg(all(feature = "crash-points", feature = "shm", target_os = "linux"))]
+pub use open::CRASH_SITES;
+#[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::{open, CreatePolicy, Open, OpenError};
 
 /// Test scaffolding for `docs/decisions/0028` plan step 2's reclamation
@@ -342,9 +346,16 @@ pub mod unstable;
 pub use tf_tree_core::edge::Publisher;
 pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
 pub use tf_tree_core::plan::{
-    AdaptiveScratch, Domain, ErrBound, Guard, InterpPolicy, Plan, Query, Sample, SensorDomain,
-    SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH, MAX_KNOTS,
+    AdaptiveScratch, Domain, ErrBound, Extrapolated, Guard, InterpPolicy, Plan, Query, Sample,
+    SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,
+    MAX_KNOTS,
 };
+// **`ExtrapPolicy` was unnameable from this crate until `0039`.** All three of
+// its variants were implemented and tested in the sampler and every fold site
+// passed the `Error` literal, so `Hold` and `ConstantTwist` were dead from every
+// shipped surface. `Plan::at_extrapolating` is what reaches them, and
+// `Extrapolated` above is what stops a held pose passing for a fresh one.
+pub use tf_tree_core::sample::ExtrapPolicy;
 pub use tf_tree_core::{
     ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH, MAX_PATH_EDGES,
 };

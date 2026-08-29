@@ -37,6 +37,7 @@
 extern "C" {
 #endif
 extern tft_status tft_test_publishable_tree_create(tft_tree **out);
+extern tft_status tft_test_domain_tree_create(uint8_t domain, tft_tree **out);
 #ifdef __cplusplus
 }
 #endif
@@ -91,6 +92,12 @@ static void check_null_is_never_dereferenced(void)
     CHECK(tft_plan_at(NULL, 0, TFT_LAYOUT_MAT4_ROW, buf) == TFT_ERR_BAD_HANDLE,
           "a NULL plan must be a bad handle, not a segfault");
     CHECK(tft_last_error(NULL) == TFT_ERR_NULL_ARG, "NULL out");
+    /* The new spelling validates before it dereferences, as the old one does. */
+    CHECK(tft_plan_create_in_domain(NULL, "a", "b", 0, NULL) == TFT_ERR_BAD_HANDLE,
+          "a NULL tree must be a bad handle, not a segfault");
+    CHECK(tft_plan_at_extrapolating(NULL, 0, TFT_EXTRAP_HOLD, TFT_LAYOUT_MAT4_ROW,
+                                    buf, NULL) == TFT_ERR_BAD_HANDLE,
+          "a NULL plan must be a bad handle, not a segfault");
     /* Freeing NULL is documented as a no-op. If it is not, this crashes. */
     tft_tree_free(NULL);
     tft_plan_free(NULL);
@@ -400,12 +407,144 @@ static void check_bridge_prefix(void)
 }
 #endif /* TFT_HAVE_BRIDGE */
 
+/*
+ * The domain a binding could not name — docs/decisions/0038.
+ *
+ * `docs/PHASE4.md` §5.5 tells an operator to give a simulated tree its own time
+ * domain, and until this entry point existed following that advice made the
+ * arena unreadable from C: every query site hard-coded tag 0, so every lookup
+ * returned TFT_ERR_TIME_DOMAIN forever. It is checked from *here*, and not only
+ * from Rust, because the new declaration is the whole delta and a header nobody
+ * compiles is not a checked header.
+ */
+static void check_domain(void)
+{
+    tft_tree *tree = NULL;
+    tft_plan *plan = NULL;
+    double out[7];
+
+    CHECK(tft_test_domain_tree_create(1, &tree) == TFT_OK, why());
+    if (tree == NULL) {
+        return;
+    }
+
+    /* All a C caller could say before: the tag-0 assumption, refused at plan
+     * time now rather than on every lookup afterwards. */
+    CHECK(tft_plan_create(tree, "map", "odom", &plan) == TFT_ERR_TIME_DOMAIN,
+          "domain 0 cannot read a tag-1 arena");
+    CHECK(plan == NULL, "a refused plan hands back no handle");
+
+    /* And what it can say now. */
+    CHECK(tft_plan_create_in_domain(tree, "map", "odom", 1, &plan) == TFT_OK, why());
+    CHECK(tft_plan_at(plan, 150000000, TFT_LAYOUT_QVEC7_WXYZ, out) == TFT_OK, why());
+    /* 15 knots of 0.05 m, interpolated: a real pose, not a zeroed buffer. */
+    CHECK(out[4] > 0.7 && out[4] < 0.8, "a tagged plan reads a transform");
+    tft_plan_free(plan);
+
+    /* A route with no dynamic edge on it has no domain to disagree with. */
+    plan = NULL;
+    CHECK(tft_plan_create_in_domain(tree, "odom", "sensor", 7, &plan) == TFT_OK, why());
+    CHECK(tft_plan_at(plan, 150000000, TFT_LAYOUT_QVEC7_WXYZ, out) == TFT_OK, why());
+    tft_plan_free(plan);
+
+    tft_tree_free(tree);
+}
+
+/*
+ * Extrapolation you cannot fail to notice — docs/decisions/0039.
+ *
+ * The whole surface is here because the header is the delta: a policy typedef,
+ * three constants, a struct and one entry point. `tft_extrapolated *info` is
+ * required, and that is the C analogue of a Rust return type with no pose-only
+ * accessor — a caller cannot obtain the pose without somewhere to put the
+ * distance.
+ *
+ * The three policies are checked at one stamp, and the third comparison is the
+ * one that earns the check: a library that ignored `policy` and always held
+ * would satisfy every other line here.
+ */
+static void check_extrapolation(void)
+{
+    tft_tree *tree = NULL;
+    tft_plan *plan = NULL;
+    tft_extrapolated info;
+    double held[7];
+    double twisted[7];
+    double newest[7];
+
+    CHECK(tft_test_domain_tree_create(1, &tree) == TFT_OK, why());
+    if (tree == NULL) {
+        return;
+    }
+    CHECK(tft_plan_create_in_domain(tree, "map", "sensor", 1, &plan) == TFT_OK, why());
+    if (plan == NULL) {
+        tft_tree_free(tree);
+        return;
+    }
+
+    /* The fixture publishes 32 samples 10 ms apart, so 310 ms is the newest and
+     * 400 ms is 90 ms past it. */
+    memset(&info, 0, sizeof info);
+    info.struct_size = (uint32_t)sizeof info;
+    CHECK(tft_plan_at_extrapolating(plan, 400000000, TFT_EXTRAP_ERROR,
+                                    TFT_LAYOUT_QVEC7_WXYZ, held, &info)
+              == TFT_ERR_EXTRAPOLATION,
+          "TFT_EXTRAP_ERROR refuses, exactly as tft_plan_at does");
+
+    info.struct_size = (uint32_t)sizeof info;
+    CHECK(tft_plan_at_extrapolating(plan, 400000000, TFT_EXTRAP_HOLD,
+                                    TFT_LAYOUT_QVEC7_WXYZ, held, &info) == TFT_OK,
+          why());
+    CHECK(info.by_ns == 90000000, "the distance is measured from the newest common stamp");
+    CHECK(info.edge != TFT_INVALID_ID, "an extrapolated answer names the stale edge");
+    CHECK(tft_plan_at(plan, 310000000, TFT_LAYOUT_QVEC7_WXYZ, newest) == TFT_OK, why());
+    CHECK(memcmp(held, newest, sizeof newest) == 0, "Hold is the newest pose");
+
+    info.struct_size = (uint32_t)sizeof info;
+    CHECK(tft_plan_at_extrapolating(plan, 400000000, TFT_EXTRAP_CONSTANT_TWIST,
+                                    TFT_LAYOUT_QVEC7_WXYZ, twisted, &info) == TFT_OK,
+          why());
+    CHECK(info.by_ns == 90000000, "the distance does not depend on the policy");
+    CHECK(memcmp(twisted, held, sizeof held) != 0,
+          "ConstantTwist must differ from Hold, or the policy is being ignored");
+
+    /* Inside the window nothing is extrapolated, whatever was asked for. */
+    info.struct_size = (uint32_t)sizeof info;
+    CHECK(tft_plan_at_extrapolating(plan, 150000000, TFT_EXTRAP_HOLD,
+                                    TFT_LAYOUT_QVEC7_WXYZ, held, &info) == TFT_OK,
+          why());
+    CHECK(info.by_ns == 0, "an in-window stamp is interpolated, not invented");
+    CHECK(info.edge == TFT_INVALID_ID, "and has no stale edge to name");
+
+    /* The distance is not optional and the struct size is not optional. */
+    CHECK(tft_plan_at_extrapolating(plan, 400000000, TFT_EXTRAP_HOLD,
+                                    TFT_LAYOUT_QVEC7_WXYZ, held, NULL)
+              == TFT_ERR_NULL_ARG,
+          "there is no pose-only spelling of this call");
+    info.struct_size = 4;
+    CHECK(tft_plan_at_extrapolating(plan, 400000000, TFT_EXTRAP_HOLD,
+                                    TFT_LAYOUT_QVEC7_WXYZ, held, &info)
+              == TFT_ERR_BAD_STRUCT_SIZE,
+          "a struct_size this build does not know is refused");
+
+    /* An undefined policy is an error, never a silent fallback to Error. */
+    info.struct_size = (uint32_t)sizeof info;
+    CHECK(tft_plan_at_extrapolating(plan, 400000000, 3, TFT_LAYOUT_QVEC7_WXYZ,
+                                    held, &info) == TFT_ERR_BAD_ENUM,
+          "an undefined policy is not quietly TFT_EXTRAP_ERROR");
+
+    tft_plan_free(plan);
+    tft_tree_free(tree);
+}
+
 int main(void)
 {
     check_version_and_constants();
     check_null_is_never_dereferenced();
     check_struct_size_gate();
     check_round_trip();
+    check_domain();
+    check_extrapolation();
 #if defined(TFT_HAVE_BRIDGE)
     check_bridge();
     check_bridge_prefix();

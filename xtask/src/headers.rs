@@ -206,9 +206,32 @@ const STABLE: &[&str] = &[
     "tft_tree_open",
     "tft_tree_free",
     "tft_plan_create",
+    // `docs/decisions/0038`. **Stable, and for the same reason
+    // `tft_stamp_from_parts` is**: it is the only way a C caller can read an
+    // arena whose dynamic edges are not tag `0`, and `docs/PHASE4.md` §5.5
+    // tells operators to configure exactly such an arena. A caller who has to
+    // define `TFT_ENABLE_UNSTABLE` to follow the project's own deployment
+    // advice will instead write the lookup that fails.
+    "tft_plan_create_in_domain",
     "tft_plan_free",
     "tft_plan_at",
     "tft_plan_at_many",
+    // Extrapolation — `docs/decisions/0039`. **Stable, and on
+    // `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`'s argument rather than
+    // `TFT_ERR_BAD_CONFIG`'s**: the policy and the struct are pure *inputs and
+    // outputs of a frozen entry point*, so a caller who cannot name them
+    // cannot call it. And the entry point itself belongs here for
+    // `tft_plan_create_in_domain`'s reason — it is the only way a C caller can
+    // ask for the bounded prediction a control loop running faster than its
+    // state estimate needs, and a caller who has to define
+    // `TFT_ENABLE_UNSTABLE` for that will instead hold the last pose by hand,
+    // which is the failure `0039` exists to prevent.
+    "tft_extrap_policy",
+    "TFT_EXTRAP_ERROR",
+    "TFT_EXTRAP_HOLD",
+    "TFT_EXTRAP_CONSTANT_TWIST",
+    "tft_extrapolated",
+    "tft_plan_at_extrapolating",
     // Publishing — §3.2.
     "tft_tree_claim",
     "tft_publisher_push",
@@ -301,6 +324,11 @@ const TIER_TYPES: &[&str] = &[
     "tft_status",
     "tft_error",
     "tft_layout",
+    // `docs/decisions/0039`'s two: a `uint32_t` typedef and a POD struct,
+    // neither of which has an `extern "C" fn` of its own for
+    // `check_partition`'s stale half to find.
+    "tft_extrap_policy",
+    "tft_extrapolated",
     "tft_bridge_topic",
     "tft_bridge_authority",
     "tft_bridge_on_clock_reset",
@@ -331,6 +359,10 @@ const OPAQUE: &[&str] = &[
 /// Compiled only under `--features test-hooks`; never in a shipped header.
 const TEST_ONLY: &[&str] = &[
     "tft_test_tree_create",
+    // The tag-1 fixture `docs/decisions/0038` step 3 is verified against. A
+    // fourth fixture because the other three publish in domain `0`, where the
+    // mismatch it exists to exercise cannot arise.
+    "tft_test_domain_tree_create",
     "tft_test_publishable_tree_create",
     "tft_test_lerpslerp_tree_create",
     "tft_test_panic",

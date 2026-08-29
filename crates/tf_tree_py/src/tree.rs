@@ -7,7 +7,9 @@ use pyo3::types::PyAnyMethods;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree};
+use tf_tree::{
+    Capacity, EdgeCfg, ExtrapPolicy, InterpPolicy, Layout, OwnedWriter, Stamp, SystemDomain, Tree,
+};
 
 #[cfg(target_os = "linux")]
 use crate::errors::open_err;
@@ -15,8 +17,8 @@ use crate::errors::open_err;
 use tf_tree::AttachMode;
 
 use crate::errors::{
-    build_err, claim_err, edge_label_of, lookup_err, push_err, push_msg, resolve_frame,
-    unknown_frame_err, BufferError, TfTreeError,
+    build_err, claim_err, edge_label_of, lookup_err, plan_domain_err, push_err, push_msg,
+    resolve_frame, unknown_frame_err, BufferError, TfTreeError,
 };
 
 /// Releasing the GIL costs a measured 40 ns; a depth-3 lookup costs ~193 ns
@@ -135,6 +137,66 @@ fn layout_from_str(name: &str) -> PyResult<Layout> {
     }
 }
 
+/// Parse the `policy` argument of [`PyPlan::at_extrapolating`] into the core's
+/// [`ExtrapPolicy`].
+///
+/// **Strings, not the four integer constants `0038` exported for domains**, and
+/// the two cases are genuinely different. A domain tag is an *open* set — the
+/// trait invites a driver to declare its own from `4` up — so a closed
+/// vocabulary there would have to leave a hole. `ExtrapPolicy` is a closed set
+/// this crate dispatches on, so the vocabulary is complete by construction, and
+/// a string keyword is what this binding already uses for every other closed
+/// choice (`layout=`, `interp=`).
+///
+/// No default and no inference, for `layout_from_str`'s reason one axis over:
+/// the three policies differ in what the answer *is*, not in how it is
+/// written, so an unrecognised spelling is refused rather than guessed at.
+fn extrap_from_str(name: &str) -> PyResult<ExtrapPolicy> {
+    match name {
+        "error" => Ok(ExtrapPolicy::Error),
+        "hold" => Ok(ExtrapPolicy::Hold),
+        "constant_twist" => Ok(ExtrapPolicy::ConstantTwist),
+        other => Err(PyValueError::new_err(format!(
+            "unknown extrapolation policy {other:?}; expected 'error' (refuse, \
+             what at() does), 'hold' (the newest pose) or 'constant_twist' \
+             (extend the screw the two newest samples imply)"
+        ))),
+    }
+}
+
+/// Write one extrapolated pose in `layout`, refusing the twist-carrying one.
+///
+/// **`QuatTwist` is refused, and the C ABI refuses it for the same reason.**
+/// There is no extrapolating `at_with_derivatives`, so a twist beside an
+/// extrapolated pose would be computed under `ExtrapPolicy::Error` while the
+/// pose beside it was computed under the caller's — two policies in one
+/// 13-`f64` row, which is not a row anybody can interpret.
+fn write_pose_unchecked(pose: &tf_tree::Iso3, layout: Layout, dst: &mut [f64]) {
+    match layout {
+        Layout::Quat => tf_tree::write_quat(pose, dst),
+        // `write_extrapolated` has already refused everything else, and it is
+        // called once per *call* rather than once per element — this runs inside
+        // the fold, under `detach`, where a `PyResult` cannot be constructed.
+        _ => tf_tree::write_mat4(pose, dst),
+    }
+}
+
+fn write_extrapolated(pose: &tf_tree::Iso3, layout: Layout, dst: &mut [f64]) -> PyResult<()> {
+    match layout {
+        Layout::Mat4 => tf_tree::write_mat4(pose, dst),
+        Layout::Quat => tf_tree::write_quat(pose, dst),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "layout {other:?} cannot carry an extrapolated pose: an f32 layout \
+                 needs at_extrapolating's f32 sibling, and a twist layout would pair \
+                 a twist computed under 'error' with a pose computed under your \
+                 policy. Use 'mat4' or 'quat'."
+            )))
+        }
+    }
+    Ok(())
+}
+
 /// A transform tree.
 #[pyclass(name = "Tree", module = "tf_tree", frozen)]
 pub struct PyTree {
@@ -162,6 +224,23 @@ pub struct PyTree {
     pub(crate) inner: Arc<Tree>,
 }
 
+/// Whether this plan samples anything at evaluation time.
+///
+/// `Plan::has_dynamic` is private to `tf_tree_core`, and it is the condition
+/// `Plan::check_domain_tag` runs on. `docs/decisions/0038` §4 is explicit that
+/// the check *moves* to plan time without changing when it fires, so this
+/// reproduces the predicate from the public `steps()` rather than approximating
+/// it with `Plan::domain() != domain` alone. The difference is a whole class of
+/// plan: an all-static path has no domain of its own — `Plan::domain()` answers
+/// `0` for one, and the core folds it without consulting a clock — so refusing
+/// `plan("a", "b", domain=SIM_DOMAIN)` over one would be a *new* refusal
+/// smuggled in beside an earlier one.
+fn samples_anything(plan: &tf_tree::Plan) -> bool {
+    plan.steps()
+        .iter()
+        .any(|s| matches!(s, tf_tree::Step::Dyn { .. }))
+}
+
 /// Reject a `float` stamp with the measurement that justifies it (§3).
 ///
 /// This is the most-questioned decision in the API, so the exception carries
@@ -185,8 +264,39 @@ impl PyTree {
     ///
     /// Compiling once and reusing is the whole point: the path walk and the
     /// per-edge metadata lookup happen here, not per sample.
-    #[pyo3(signature = (target, source, /))]
-    fn plan(slf: &Bound<'_, PyTree>, target: &str, source: &str) -> PyResult<PyPlan> {
+    ///
+    /// # `domain=`
+    ///
+    /// The time domain the *queries* on this plan will be in
+    /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`). `tf_tree::Domain`
+    /// is an open trait and its tag is a `const`, so Python cannot name the type
+    /// a Rust caller would instantiate; it carries the tag as data instead, and
+    /// [`SYSTEM_DOMAIN`](crate::SYSTEM_DOMAIN) and its three siblings are the
+    /// names for the four built-in tags. A user-declared domain is just the
+    /// integer it chose, from `4` up (`docs/API.md` §2.5).
+    ///
+    /// **The default stays `0` rather than the plan's own domain**, which is the
+    /// tempting one-line version and is wrong: it would make a mistaken caller
+    /// silently correct too, deleting the check for the population D9 exists to
+    /// protect (`0038`'s *Rationale*). On a sim or sensor arena the default is
+    /// wrong, and loudly so — which is the point.
+    ///
+    /// **Not [`open_arena`]'s `domain=`.** That one is the `u32` *rendezvous*
+    /// domain — which arena to attach to, `$ROS_DOMAIN_ID`'s analogue — and this
+    /// one is the `u8` time-domain tag of the edges inside it. They are
+    /// unrelated numbers that share a word; the arena's own docs call the first
+    /// a namespace and `docs/API.md` R3 calls the second a clock.
+    ///
+    /// # Checked here, not per query
+    ///
+    /// A mismatch is refused at plan time, with both frame names still in hand,
+    /// rather than on every `at()` in the hot loop — a domain is a property of a
+    /// route through the tree, not of an instant, so it cannot legitimately vary
+    /// between two queries on one plan. The core still re-checks on every call
+    /// (`0038` §4: the check moves, it does not disappear); nothing here is an
+    /// "I already checked" fast path.
+    #[pyo3(signature = (target, source, /, *, domain = 0))]
+    fn plan(slf: &Bound<'_, PyTree>, target: &str, source: &str, domain: u8) -> PyResult<PyPlan> {
         let this = slf.get();
         // [`resolve_frame`], not `Tree::frame`: compiling a plan is a read, and
         // `Tree::frame` interns. A typo here used to declare the typo — see that
@@ -197,8 +307,16 @@ impl PyTree {
             .inner
             .plan(t, s)
             .map_err(|e| lookup_err(&this.inner, e))?;
+        // The one place a domain disagreement is cheap to report *and* nameable:
+        // `target` and `source` are still strings here. Guarded on
+        // [`samples_anything`] so this fires exactly where the core's own
+        // `check_domain_tag` fires and not one call earlier.
+        if samples_anything(&plan) && plan.domain() != domain {
+            return Err(plan_domain_err(target, source, plan.domain(), domain));
+        }
         Ok(PyPlan {
             plan: Box::new(plan),
+            domain,
             // The refcount that makes the borrow real.
             tree: slf.clone().unbind(),
         })
@@ -373,17 +491,32 @@ impl PyTree {
     ///
     /// Prefer `tree.plan(...)` in a loop: this pays a cache probe per call, and
     /// a plan compiled once pays nothing.
-    #[pyo3(signature = (target, source, stamp_ns, /))]
+    ///
+    /// # `domain=`
+    ///
+    /// [`PyTree::plan`]'s, with the same default and the same meaning, and
+    /// keyword-only for the same reason. It is here because this entry point
+    /// hard-coded tag `0` exactly as the plan path did, and a convenience tier
+    /// that cannot reach a sim arena is a second half of the same defect
+    /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`) — not a
+    /// smaller one, since this is the tier a notebook reaches for first.
+    ///
+    /// The check cannot move to plan time here: there is no handle to hang it
+    /// on, the plan being cached rather than returned. So it stays where the
+    /// core does it, per call, and the refusal names two tags rather than a
+    /// route.
+    #[pyo3(signature = (target, source, stamp_ns, /, *, domain = 0))]
     fn lookup<'py>(
         &self,
         py: Python<'py>,
         target: &str,
         source: &str,
         stamp_ns: i64,
+        domain: u8,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let iso = self
             .inner
-            .lookup(target, source, Stamp::<SystemDomain>::from_nanos(stamp_ns))
+            .lookup_tagged(target, source, stamp_ns, domain)
             // **The one arm that has to be caught at the call site**, because it
             // is the one whose identity the error cannot carry:
             // `LookupError::UnknownFrame` holds a BLAKE3 prefix, BLAKE3 does not
@@ -463,6 +596,22 @@ type Knots<'py> = (Bound<'py, PyArray1<i64>>, Bound<'py, PyArray3<f64>>);
 #[pyclass(name = "Plan", module = "tf_tree", frozen)]
 pub struct PyPlan {
     plan: Box<tf_tree::Plan>,
+    /// The time-domain tag every query through this handle carries
+    /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`).
+    ///
+    /// Fixed at [`PyTree::plan`] and validated there against
+    /// [`tf_tree::Plan::domain`], so by the time it reaches a `*_tagged` core
+    /// method it already agrees with the route — which is what makes the
+    /// per-query check the core still performs a predictable-branch no-op rather
+    /// than a diagnostic anybody reads.
+    ///
+    /// **It costs the pyclass eight bytes, not one** — measured, because the
+    /// "it lands in the padding" guess is wrong here: the two pointers beside it
+    /// pack to 16 with none to spare, so `align(8)` rounds 17 up to 24. That is
+    /// a `tree.plan(...)` — a setup call that already allocates a 4 KiB `Plan`
+    /// behind the `Box` above — and nothing per sample, which is the only reason
+    /// it is affordable. See this type's own note on what may be added here.
+    domain: u8,
     /// A **reference-counted handle** to the tree this plan reads through.
     ///
     /// An earlier version held a `*const Tree` and a doc comment asserting it
@@ -594,7 +743,7 @@ impl PyPlan {
         let g = self.tree().guard();
         let iso = self
             .plan
-            .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
+            .at_tagged(&g, stamp, self.domain)
             .map_err(|e| lookup_err(self.tree(), e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated by us, so nothing else holds a reference and
@@ -750,7 +899,7 @@ impl PyPlan {
             let g = self.tree().guard();
             let iso = self
                 .plan
-                .at(&g, Stamp::<SystemDomain>::from_nanos(stamp))
+                .at_tagged(&g, stamp, self.domain)
                 .map_err(|e| lookup_err(self.tree(), e))?;
             // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
             // slice is exactly 16 writable f64. Aliasing remains the caller's
@@ -791,6 +940,259 @@ impl PyPlan {
         };
         let n = stamps.len();
         self.fill(py, stamps, arr, n)
+    }
+
+    /// Evaluate past the newest sample under an explicit policy, and get back
+    /// how far past it that was.
+    ///
+    /// `at()` refuses a stamp newer than every published sample on the route,
+    /// which is right for a caller that must not act on invented data and
+    /// wrong for a controller running at 1 kHz against a 100 Hz state
+    /// estimate — that one is *always* asking past the newest sample, and the
+    /// honest answer is a bounded prediction with its bound attached
+    /// (`docs/decisions/0039`).
+    ///
+    /// Returns `(poses, by_ns)`. **There is no spelling that returns the pose
+    /// alone**, which is the whole design rather than an inconvenience: the
+    /// danger in extrapolation is a pose that looks fresh, so the distance
+    /// comes back in the same value and ignoring it takes a deliberate `[0]`.
+    ///
+    /// `policy` is `"error"` (refuse — what `at` does, with a distance
+    /// attached on success), `"hold"` (the newest pose, for a latched or
+    /// displayed value) or `"constant_twist"` (extend the screw the two newest
+    /// samples imply, which is what a controller wants). It is **required**:
+    /// extrapolation is opt-in per query, and a default would make it
+    /// something a caller could get without asking.
+    ///
+    /// `at` is untouched and still refuses. This is a second entry point, not
+    /// a mode on the first.
+    ///
+    /// # `by_ns` is per stamp, and in a batch that means an array
+    ///
+    /// | `stamps` | `poses` | `by_ns` |
+    /// | --- | --- | --- |
+    /// | `int` | `(4, 4)` float64 | `int` |
+    /// | `(N,)` int64 | `(N, 4, 4)` float64 | `(N,)` **int64 array** |
+    ///
+    /// **A scalar `by_ns` for a batch would be wrong, not merely coarse.** The
+    /// distance is `max(0, stamp - newest_common)`, so it is a function of the
+    /// stamp; a batch that straddles the newest sample has interpolated
+    /// elements (`0`) and extrapolated ones in the same call. Collapsing that
+    /// to one number means either a `max`, which marks fresh elements stale,
+    /// or a `min`, which marks stale ones fresh — and the second is exactly
+    /// the failure this surface exists to prevent. The array costs 8 bytes per
+    /// element beside a 128-byte pose, and `by_ns.max()` is the one-liner a
+    /// caller who genuinely wants the scalar writes.
+    ///
+    /// # What it does not carry, and where the breakdown lives
+    ///
+    /// The Rust `Extrapolated` also names the **edge** that ran out of data
+    /// first. That is an `EdgeId`, and this binding has never handed one to
+    /// Python — `crates/tf_tree_py/src/errors.rs` resolves every id to
+    /// `edge "parent" -> "child"` before a caller sees it, and doing that
+    /// resolution per query would be an arena walk on the path this method
+    /// exists for. `Plan.edges()` is the route's dynamic edges and
+    /// `tf_tree doctor` is the per-edge breakdown; `0039` points at the same
+    /// two for the same reason.
+    ///
+    /// Only the default `mat4` layout. The Rust method this mirrors returns
+    /// one pose type, and the `layout=` dispatch belongs to the batch fold,
+    /// which carries no policy.
+    ///
+    /// # Cost
+    ///
+    /// The batch is a loop over the scalar form under one `Guard`, not the
+    /// engine's batch fold: `Plan::at_many_into` passes `ExtrapPolicy::Error`
+    /// and `0039` §4 deliberately did not thread a runtime policy through it,
+    /// because that would leave the match live on `at`'s hot path. So this
+    /// pays an `O(log n)` bracket search per stamp per step rather than riding
+    /// the monotone cursor, plus one `newest_stamp` load per dynamic edge per
+    /// stamp for the distance.
+    #[pyo3(signature = (stamps, policy, /, *, layout = None))]
+    fn at_extrapolating<'py>(
+        &self,
+        py: Python<'py>,
+        stamps: &Bound<'py, PyAny>,
+        policy: &str,
+        layout: Option<&str>,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let policy = extrap_from_str(policy)?;
+        let layout = match layout {
+            Some(name) => layout_from_str(name)?,
+            None => Layout::Mat4,
+        };
+        // `at`'s dispatch, to the letter: `PyInt` first because a failed
+        // `cast::<PyArray1<i64>>` builds and throws away a `DowncastError`, and
+        // the array cast is *fallen through* rather than `else`-d so a `float`
+        // still meets `stamp_from_any`'s `TypeError` with the 238 ns ULP in it
+        // (§3) instead of a complaint about array dtypes.
+        if !stamps.is_instance_of::<pyo3::types::PyInt>() {
+            if let Ok(arr) = stamps.cast::<PyArray1<i64>>() {
+                return self.extrapolate_batch(py, arr, policy, layout);
+            }
+        }
+        let stamp = stamp_from_any(stamps)?;
+        let g = self.tree().guard();
+        let x = self
+            .plan
+            .at_extrapolating_tagged(&g, stamp, self.domain, policy)
+            .map_err(|e| lookup_err(self.tree(), e))?;
+        // `mat4` keeps `at`'s `(4, 4)` shape; every other layout is the flat
+        // `(elems,)` row `at(.., layout=..)` already returns, so the two methods
+        // agree on shape for the same `layout` argument.
+        let out = if layout == Layout::Mat4 {
+            let a = PyArray2::<f64>::zeros(py, [4, 4], false);
+            // SAFETY: freshly allocated here, so nothing else holds a reference
+            // and the slice is exactly 16 contiguous f64.
+            write_extrapolated(&x.pose, layout, unsafe { a.as_slice_mut()? })?;
+            a.into_any()
+        } else {
+            let a = PyArray1::<f64>::zeros(py, [layout.elems()], false);
+            // SAFETY: as above, `layout.elems()` contiguous f64.
+            write_extrapolated(&x.pose, layout, unsafe { a.as_slice_mut()? })?;
+            a.into_any()
+        };
+        Ok((out, x.by_ns.into_pyobject(py)?.into_any()))
+    }
+
+    /// [`PyPlan::at_extrapolating`] writing into caller memory.
+    ///
+    /// **`docs/API.md` R2 makes this NORMATIVE, not optional**: *"every batch
+    /// entry point has an `_into` form writing into caller memory"*, and its
+    /// justification is this exact caller — the allocation *"is noise at
+    /// n = 65536 and half the call at n = 64, and n = 64 is the control loop"*.
+    /// `at_extrapolating` is the method a controller reaches for, so shipping it
+    /// without this was the rule broken on the one path the rule was written
+    /// about.
+    ///
+    /// `poses` takes the shape `at_extrapolating` would have returned —
+    /// `(4, 4)` or `(elems,)` for a scalar stamp, `(N, 4, 4)` or `(N, elems)`
+    /// for an array — and `by_ns` is `()`-shaped or `(N,)` `int64`.
+    ///
+    /// # A partial write is possible, and that is the trade
+    ///
+    /// The allocating form fills arrays it owns, so a failure part-way drops
+    /// them and the caller sees only the exception. Here the buffers are the
+    /// caller's, so a `LookupError` on element *k* leaves `0..k` written and the
+    /// rest as they were. That is the same contract `at_into` carries and the
+    /// reason both exist: a caller who wants all-or-nothing uses the allocating
+    /// form and pays the allocation for it.
+    #[pyo3(signature = (stamps, policy, poses, by_ns, /, *, layout = None))]
+    fn at_extrapolating_into(
+        &self,
+        py: Python<'_>,
+        stamps: &Bound<'_, PyAny>,
+        policy: &str,
+        poses: &Bound<'_, PyAny>,
+        by_ns: &Bound<'_, PyAny>,
+        layout: Option<&str>,
+    ) -> PyResult<()> {
+        let policy = extrap_from_str(policy)?;
+        let layout = match layout {
+            Some(name) => layout_from_str(name)?,
+            None => Layout::Mat4,
+        };
+        // Refuse the layout before touching either buffer, for the same reason
+        // `extrapolate_batch` does: the fold cannot refuse per element.
+        write_extrapolated(&tf_tree::Iso3::IDENTITY, layout, &mut [0.0; 16])?;
+        let e = layout.elems();
+
+        // `at`'s stamp dispatch, to the letter — see `at_extrapolating`.
+        let src_arr = if stamps.is_instance_of::<pyo3::types::PyInt>() {
+            None
+        } else {
+            stamps.cast::<PyArray1<i64>>().ok()
+        };
+        let scalar = src_arr.is_none();
+        let src_owned = match &src_arr {
+            Some(arr) => {
+                if !arr.is_c_contiguous() {
+                    return Err(BufferError::new_err(
+                        "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
+                         explicitly if you meant to copy",
+                    ));
+                }
+                [0i64]
+            }
+            None => [stamp_from_any(stamps)?],
+        };
+        // SAFETY: checked C-contiguous above; the borrow is held across the
+        // fold below for §6.2's reason.
+        let src: &[i64] = match &src_arr {
+            Some(a) => unsafe { a.as_slice()? },
+            None => &src_owned,
+        };
+        let n = src.len();
+
+        let want_poses: &[usize] = if scalar {
+            if layout == Layout::Mat4 {
+                &[4, 4]
+            } else {
+                &[e]
+            }
+        } else if layout == Layout::Mat4 {
+            &[n, 4, 4]
+        } else {
+            &[n, e]
+        };
+        let want_dist: &[usize] = if scalar { &[] } else { &[n] };
+
+        let pose_arr = poses.cast::<numpy::PyArrayDyn<f64>>().map_err(|_| {
+            BufferError::new_err("poses must be a C-contiguous, writable float64 array")
+        })?;
+        check_out(pose_arr.as_untyped(), want_poses)?;
+        let dist_arr = by_ns.cast::<numpy::PyArrayDyn<i64>>().map_err(|_| {
+            BufferError::new_err("by_ns must be a C-contiguous, writable int64 array")
+        })?;
+        check_out(dist_arr.as_untyped(), want_dist)?;
+
+        // **Refuse a `by_ns` that aliases `stamps`, before either mutable slice
+        // exists.** This is the only `_into` form on this binding whose input
+        // and one of whose outputs are both `int64`, so it is the only one where
+        // `f(stamps=a, .., by_ns=a)` type-checks all the way down: `check_out`
+        // wants `(N,) int64` and `a` *is* one. The fold would then hold `&[i64]`
+        // and `&mut [i64]` over one allocation — undefined behaviour reached
+        // from safe Python. Every other `_into` is safe from this by dtype
+        // alone, which is why no existing helper checks for it.
+        //
+        // Both buffers are C-contiguous by `check_out`, so comparing byte ranges
+        // is the whole of the question — and it catches a *view* of the same
+        // memory, which comparing array identity would not.
+        if let Some(a) = &src_arr {
+            let (s, d) = (a.data() as usize, dist_arr.data() as usize);
+            let len = core::mem::size_of_val(src);
+            if s < d + len && d < s + len {
+                return Err(BufferError::new_err(
+                    "by_ns must not alias stamps: they are both int64 and this call \
+                     writes one while reading the other. Pass a separate array.",
+                ));
+            }
+        }
+
+        // SAFETY: `check_out` proved both C-contiguous, correctly shaped and
+        // writable, and the range check above rules out `by_ns` aliasing
+        // `stamps`; aliasing beyond that stays the caller's, as `as_slice_mut`
+        // documents.
+        let (pd, dd) = unsafe { (pose_arr.as_slice_mut()?, dist_arr.as_slice_mut()?) };
+
+        let plan = *self.plan;
+        let tree = self.tree();
+        let domain = self.domain;
+        let mut run = move || -> Result<(), tf_tree::LookupError> {
+            let g = tree.guard();
+            for (i, &t) in src.iter().enumerate() {
+                let x = plan.at_extrapolating_tagged(&g, t, domain, policy)?;
+                write_pose_unchecked(&x.pose, layout, &mut pd[i * e..(i + 1) * e]);
+                dd[i] = x.by_ns;
+            }
+            Ok(())
+        };
+        let res = if release_the_gil(n, self.plan.len()) {
+            py.detach(run)
+        } else {
+            run()
+        };
+        res.map_err(|err| lookup_err(self.tree(), err))
     }
 
     /// The most recent transform on this path.
@@ -836,14 +1238,24 @@ impl PyPlan {
                 "lin and ang must be finite and positive",
             ));
         }
+        // **`SystemDomain` here is storage, not the query.** `at_adaptive_tagged`
+        // keeps a type parameter and it means something different there: `D`
+        // fixes the element type of `scratch` and of the returned stamp slice
+        // and is read by nothing in the fold, while `self.domain` is what is
+        // checked. `0038` weighs this against the three alternatives — a second
+        // public marker domain, a `repr(transparent)` slice cast, or deleting
+        // `Stamp<D>` from the typed return — and carrying one documented phantom
+        // is the smallest. The stamps become plain integers eight lines below,
+        // so the phantom never reaches Python.
         let mut scratch = tf_tree::AdaptiveScratch::<SystemDomain>::new();
         let tol = tf_tree::ErrBound::new(ang, lin);
         let g = self.tree().guard();
         let (stamps, poses) = self
             .plan
-            .at_adaptive(
+            .at_adaptive_tagged(
                 &g,
                 (Stamp::from_nanos(start_ns), Stamp::from_nanos(end_ns)),
+                self.domain,
                 tol,
                 &mut scratch,
             )
@@ -935,13 +1347,19 @@ impl PyPlan {
 
         let plan = *self.plan;
         let tree = self.tree();
+        // Read out beside `plan` and `tree` above rather than through `self`
+        // inside the closure: one load, on the near side of a `detach` whose
+        // body must touch no Python object at all (§6.2).
+        let domain = self.domain;
 
         let mut run = || {
             let g = tree.guard();
-            // Raw nanoseconds: `at_many_into` takes `&[i64]` precisely so this
-            // path does not have to allocate a `Vec<Stamp>` — which would be
-            // the intermediate buffer `at_into` exists to avoid.
-            plan.at_many_into::<SystemDomain>(&g, src, Layout::Mat4, dst)
+            // Raw nanoseconds: `at_many_into_tagged` takes `&[i64]` precisely so
+            // this path does not have to allocate a `Vec<Stamp>` — which would
+            // be the intermediate buffer `at_into` exists to avoid. The batch
+            // forms never had a use for their type parameter beyond the domain
+            // check (`0038` §1), so the tagged spelling loses nothing.
+            plan.at_many_into_tagged(&g, src, domain, Layout::Mat4, dst)
         };
         let res = if release_the_gil(n, self.plan.len()) {
             // `detach` is PyO3 0.29's name for what was `allow_threads`.
@@ -951,6 +1369,86 @@ impl PyPlan {
             run()
         };
         res.map_err(|e| lookup_err(tree, e))
+    }
+
+    /// [`PyPlan::at_extrapolating`]'s array half: `(N, 4, 4)` poses and `(N,)`
+    /// distances, allocated here and filled together.
+    ///
+    /// Both arrays are ours until this returns, so a failure part-way through
+    /// drops them and the caller sees only the exception — the partial-write
+    /// question `at_into` has to answer does not arise, because there is no
+    /// caller buffer to half-fill.
+    fn extrapolate_batch<'py>(
+        &self,
+        py: Python<'py>,
+        stamps: &Bound<'py, PyArray1<i64>>,
+        policy: ExtrapPolicy,
+        layout: Layout,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        if !stamps.is_c_contiguous() {
+            return Err(BufferError::new_err(
+                "stamps must be C-contiguous; pass np.ascontiguousarray(...) \
+                 explicitly if you meant to copy",
+            ));
+        }
+        // **Refuse the layout once, here, before anything is allocated.** The
+        // fold below runs under `detach` where no `PyResult` can be built, so
+        // `write_pose_unchecked` cannot refuse per element — this is the check
+        // that makes "unchecked" true rather than hopeful.
+        write_extrapolated(&tf_tree::Iso3::IDENTITY, layout, &mut [0.0; 16])?;
+
+        let n = stamps.len();
+        let e = layout.elems();
+        // `(N, 4, 4)` for `mat4`, `(N, elems)` otherwise — the same pair of
+        // shapes `at` returns for the same `layout`.
+        let poses = if layout == Layout::Mat4 {
+            PyArray3::<f64>::zeros(py, [n, 4, 4], false).into_any()
+        } else {
+            PyArray2::<f64>::zeros(py, [n, e], false).into_any()
+        };
+        let dist = PyArray1::<i64>::zeros(py, [n], false);
+        {
+            // SAFETY: `stamps` was checked C-contiguous above; `poses` and
+            // `dist` were just allocated here, so nothing else holds a
+            // reference to either and both are contiguous by construction. The
+            // borrows are held across the `detach` below for §6.2's reason —
+            // NumPy refuses to resize an array while a buffer is exported.
+            let flat = poses.cast::<numpy::PyArrayDyn<f64>>()?;
+            let (src, pd, dd) = unsafe {
+                (
+                    stamps.as_slice()?,
+                    flat.as_slice_mut()?,
+                    dist.as_slice_mut()?,
+                )
+            };
+            let plan = *self.plan;
+            let tree = self.tree();
+            // Read out beside `plan` and `tree` rather than through `self`
+            // inside the closure: `detach`'s body must touch no Python object
+            // at all (§6.2).
+            let domain = self.domain;
+            let mut run = move || -> Result<(), tf_tree::LookupError> {
+                let g = tree.guard();
+                for (i, &t) in src.iter().enumerate() {
+                    let x = plan.at_extrapolating_tagged(&g, t, domain, policy)?;
+                    write_pose_unchecked(&x.pose, layout, &mut pd[i * e..(i + 1) * e]);
+                    dd[i] = x.by_ns;
+                }
+                Ok(())
+            };
+            // The same threshold `at` uses. It under-counts this path — a
+            // distance costs one `newest_stamp` load per dynamic edge per
+            // stamp on top of the fold — so it errs towards releasing the GIL
+            // for work that is longer than it estimated, which is the harmless
+            // direction.
+            let res = if release_the_gil(n, self.plan.len()) {
+                py.detach(run)
+            } else {
+                run()
+            };
+            res.map_err(|e| lookup_err(tree, e))?;
+        }
+        Ok((poses.into_any(), dist.into_any()))
     }
 
     /// [`PyPlan::at`]'s `layout=` path: allocate the right shape and fill it.
@@ -1117,9 +1615,10 @@ impl PyPlan {
     ) -> PyResult<()> {
         let plan = *self.plan;
         let tree = self.tree();
+        let domain = self.domain;
         let mut run = || {
             let g = tree.guard();
-            plan.at_many_into::<SystemDomain>(&g, src, layout, dst)
+            plan.at_many_into_tagged(&g, src, domain, layout, dst)
         };
         let res = if release_the_gil(src.len(), self.plan.len()) {
             py.detach(run)
@@ -1139,9 +1638,10 @@ impl PyPlan {
     ) -> PyResult<()> {
         let plan = *self.plan;
         let tree = self.tree();
+        let domain = self.domain;
         let mut run = || {
             let g = tree.guard();
-            plan.at_many_into_f32::<SystemDomain>(&g, src, layout, dst)
+            plan.at_many_into_f32_tagged(&g, src, domain, layout, dst)
         };
         let res = if release_the_gil(src.len(), self.plan.len()) {
             py.detach(run)
@@ -1618,6 +2118,13 @@ pub fn push(
 /// transform tree, which a `PROT_READ` mapping enforces with the MMU. And a
 /// notebook started before the robot must fail loudly rather than create an
 /// empty arena the real publisher then refuses to join.
+///
+/// **`domain=` here is the rendezvous domain**, a `u32` naming which arena to
+/// attach to (`$ROS_DOMAIN_ID`'s analogue). It is *not* `tf_tree.Tree.plan`'s
+/// `domain=`, which is the `u8` time-domain tag of the edges inside that arena
+/// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`). Two unrelated
+/// numbers that share a word, and the pair is spelled out in both places
+/// because a caller who conflates them gets an empty arena rather than an error.
 ///
 /// # Creating
 ///

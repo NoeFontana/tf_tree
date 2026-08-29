@@ -56,6 +56,7 @@
 
 use tf_tree_arena::{pack_topo, unpack_topo, TOPO_BLOCKS};
 
+use crate::crash::crash_point;
 use crate::error::{FrameId, TopologyError};
 use crate::sync::{fence, spin, AtomicI64, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
@@ -482,6 +483,18 @@ impl<'a> TopologyView<'a> {
         }
 
         recompute_depths(dst, mf);
+
+        // §11.3 `topo.after_copy_before_publish`: "inactive block dirty, word
+        // unchanged -> **no observable effect** (A1)". The whole of the inactive
+        // block — parent, `edge_of_child`, and the depths `recompute_depths`
+        // just rewrote — is the mutated topology, and the topology word still
+        // names the *old* active block, so nothing a reader can address has
+        // changed. It sits before the publishing store rather than before the
+        // fence because the fence orders those block stores against that store
+        // and nothing else; A1's own writer pseudo-code puts them together
+        // (`fence(Release)` / `topo.store(pack(gen + 1, next), Release)`) with
+        // "copy ... apply mutation; recompute depths" on the line above.
+        crash_point!("topo.after_copy_before_publish");
 
         // Publish. The Release fence orders every block store above before the
         // single publishing store, which is the only thing a reader observes.

@@ -18,7 +18,7 @@
 //!
 //!     // 5. Serve.
 //!     ...
-//!     return Created            // TookOver has no producer; see its doc
+//!     return Created
 //! }
 //! on timeout -> Err(ArenaHeldButUnreachable { holder_slots, identities })
 //! ```
@@ -146,34 +146,6 @@ pub enum OpenOutcome {
     /// owner that died leaves behind, it holds no state, and §3.9 makes it the
     /// job of whoever wins ownership to remove it.
     Created,
-    /// This process already had the arena mapped and has now inherited the
-    /// owner role: unlink the stale socket, bind, and serve its *existing* fd.
-    /// It must not create a second arena (§3.4 step 3, §3.5).
-    ///
-    /// # Nothing produces this, and that is a decision rather than a gap
-    ///
-    /// [`Open`] had an arm that did, reached by a `already_attached` builder.
-    /// Issue #201 found it handing back the first *free* participant byte while
-    /// the caller's arena record was elsewhere, and every liveness predicate
-    /// indexes the two with one integer. Two attempts to repair it in place
-    /// produced five distinct unsound states — a session over an unheld byte, an
-    /// out-of-range slot, a serving owner overriding the declaration, a
-    /// declaration naming a *peer's* slot (`F_OFD_GETLK` reports conflicts and
-    /// cannot name a holder — `lockfile`'s module doc), and a stranded owner
-    /// grant — so the arm was deleted instead.
-    ///
-    /// The decision behind that is older than the defect:
-    /// `docs/decisions/0028` question 3, resolved 2026-08-20, holds that a heir
-    /// keeps the slot, byte and arena record it already has and that **§3.5
-    /// cannot be wired as a second `Open::open` call**. A builder that declares
-    /// "I am already attached at slot n" is unverifiable from a new file
-    /// description, which is what that resolution implies and what the attempts
-    /// demonstrated.
-    ///
-    /// The variant stays because §3.5 is the protocol's vocabulary and a heir
-    /// still has to be *describable*; `docs/decisions/0037` is where the shape
-    /// that could produce it is being worked out.
-    TookOver,
 }
 
 /// Whether a server is reachable at the socket path, and what it gave us.
@@ -599,8 +571,7 @@ pub struct Session<A = ()> {
 
 impl<A> Session<A> {
     /// How `open()` resolved, and therefore what the caller owes: nothing for
-    /// [`OpenOutcome::Joined`], create-and-bind for [`OpenOutcome::Created`],
-    /// bind-only for [`OpenOutcome::TookOver`].
+    /// [`OpenOutcome::Joined`], create-and-bind for [`OpenOutcome::Created`].
     #[must_use]
     pub fn outcome(&self) -> OpenOutcome {
         self.outcome
@@ -643,10 +614,73 @@ impl<A> Session<A> {
         Ok(())
     }
 
+    /// Inherit the owner role, keeping this session's slot, byte and arena
+    /// (§3.5). Returns whether this process is now the owner.
+    ///
+    /// The other half of [`Self::release_ownership`], and the answer to
+    /// [`0037`]'s question 5: with no way for a survivor to *become* owner, that
+    /// method was one end of a pair whose other end did not exist, and the
+    /// rendezvous stayed ownerless until every participant left.
+    ///
+    /// # Why this is a method and not another `open()`
+    ///
+    /// **The declaration a takeover rests on is "I already hold the arena at
+    /// slot *n*", and no new file description can verify it.** `Open::open`
+    /// builds its own [`LockFile`], and from a fresh description `F_OFD_GETLK`
+    /// answers *does anyone **else** hold this byte* — so a caller holding byte
+    /// *n* on another description and a live **peer** holding byte *n* are
+    /// indistinguishable, and accepting the declaration hands the caller a
+    /// session naming the peer's slot. Two rounds of repair against that shape
+    /// produced five executed unsound states, four of them introduced while
+    /// fixing the one before ([`0037`] lists them).
+    ///
+    /// Here there is nothing to verify. The lock is taken on **the description
+    /// this session already holds**, so the slot, the participant byte and the
+    /// arena record do not move and cannot disagree — the invariant is
+    /// structural rather than checked. That is the property `0028` question 3
+    /// was reaching for.
+    ///
+    /// # What the caller still owes
+    ///
+    /// Acquiring byte 0 makes this process the owner; it does not make it a
+    /// *server*. The caller must then bind the rendezvous socket and serve its
+    /// existing segment — see `tf_tree::Tree::inherit_ownership`, which is the
+    /// facade seam that has the arena, the fd and the rendezvous in scope.
+    /// **Lookups are unaffected throughout**: `Plan::at` touches the mapping and
+    /// nothing else, and ownership lives entirely in the control plane (§3.5).
+    ///
+    /// # Racing survivors
+    ///
+    /// [`0037`]'s question 2. Both call this; one gets the byte and the other
+    /// receives `Ok(false)` and remains a plain participant **with its slot
+    /// intact** — which falls out of taking the lock on the existing
+    /// description, and is exactly what the deleted arm could not do.
+    /// `Ok(false)` is not an error: it means somebody else is mid-bind.
+    ///
+    /// Calling this while already the owner is a no-op returning `Ok(true)`.
+    ///
+    /// [`0037`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0037-a-takeover-is-not-a-second-open.md
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::LockFailed`] for any `fcntl` failure that is not contention.
+    pub fn take_over_ownership(&mut self) -> Result<bool, IpcError> {
+        if self.owner {
+            return Ok(true);
+        }
+        match self.lock.try_take_ownership()? {
+            LockAttempt::Acquired => {
+                self.owner = true;
+                Ok(true)
+            }
+            LockAttempt::Contended => Ok(false),
+        }
+    }
+
     /// Take what the §3.7 handshake yielded, if this session joined one.
     ///
-    /// `None` for [`OpenOutcome::Created`] and [`OpenOutcome::TookOver`]: both
-    /// already have the arena and never ran a handshake.
+    /// `None` for [`OpenOutcome::Created`], which already has the arena and
+    /// never ran a handshake.
     ///
     /// Taking rather than borrowing, because the payload owns file descriptors —
     /// the segment and the connection whose closure tells the owner this

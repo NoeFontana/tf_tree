@@ -2857,3 +2857,535 @@ fn err_bound_new_assigns_rotation_first() {
         "the second argument is the translation bound"
     );
 }
+
+// ---- the packed search cursor past 2^32 ---------------------------------
+
+/// One more than the largest value `Guard`'s packed 32-bit cursor represents.
+const CURSOR_BLOCK: u64 = 1 << 32;
+
+/// [`Guard`](crate::plan::Guard) packs a per-step search cursor and its edge tag
+/// into one `u64`, so the cursor it stores is the low 32 bits of a logical
+/// index. `head` is monotone for the life of the arena and never masked, so past
+/// 2^32 pushes every stored hint is smaller than `lo_logical` and a plain clamp
+/// pins it to the *oldest* retained sample forever. `rebase_hint` lifts it back.
+///
+/// The window is strictly narrower than 2^32 (`retained = capacity - 1` with
+/// `capacity: u32`), so a truncated index has exactly one preimage in it — and
+/// the case that needs the correction is the window straddling a multiple of
+/// 2^32, where that preimage lies in the block *below* `newest`'s.
+///
+/// **Mutant:** return `lifted` unconditionally, deleting the `lifted > newest`
+/// arm. Applied — see the assertion message: the straddling case then answers
+/// `3 * 2^32 - 4`, which is 2^32 past the newest sample the ring holds.
+#[test]
+fn a_truncated_cursor_is_lifted_back_onto_the_live_window() {
+    use crate::sample::rebase_hint;
+
+    // Below 2^32 nothing is truncated and nothing may change: a hint at or above
+    // the window is returned as-is, and one below it stays below so the caller's
+    // clamp still pins it to `lo_logical` exactly as before this existed.
+    assert_eq!(rebase_hint(15, 10, 20), 15, "in-window hint is untouched");
+    assert_eq!(
+        rebase_hint(3, 10, 20),
+        3,
+        "a low hint stays low, then clamps"
+    );
+    assert_eq!(
+        rebase_hint(99, 10, 20),
+        99,
+        "the caller clamps the high end"
+    );
+
+    // A window wholly inside one block above 2^32: the true index is recovered
+    // by restoring `newest`'s block base.
+    let (lo, newest) = (CURSOR_BLOCK + 10, CURSOR_BLOCK + 20);
+    let truth = CURSOR_BLOCK + 15;
+    assert_eq!(
+        rebase_hint(truth & (CURSOR_BLOCK - 1), lo, newest),
+        truth,
+        "a hint truncated inside one block is lifted back into it"
+    );
+
+    // A window straddling a multiple of 2^32. The true index is in the block
+    // *below* `newest`'s, so restoring `newest`'s base overshoots by exactly one
+    // block and the correction subtracts it.
+    let (lo, newest) = (2 * CURSOR_BLOCK - 6, 2 * CURSOR_BLOCK + 3);
+    let truth = 2 * CURSOR_BLOCK - 4;
+    assert_eq!(
+        rebase_hint(truth & (CURSOR_BLOCK - 1), lo, newest),
+        truth,
+        "a straddling window's lower block must not be lifted a block too far"
+    );
+
+    // Every index in that straddling window round-trips through truncation.
+    for truth in lo..=newest {
+        assert_eq!(
+            rebase_hint(truth & (CURSOR_BLOCK - 1), lo, newest),
+            truth,
+            "index {truth} did not survive truncation and rebasing"
+        );
+    }
+}
+
+/// The behavioural half: a ring whose monotone head has passed 2^32 must answer
+/// a hinted sample exactly as the unhinted search does, from the truncated
+/// cursor a `Guard` would actually have stored.
+///
+/// This is what `rebase_hint` protects — before it, the hint was pinned to the
+/// oldest retained sample on every call and the resumed gallop walked the whole
+/// window from the far end. The answer was right either way, which is why no
+/// existing test could see it; what this pins is that making the hint *usable*
+/// again did not make any answer wrong.
+///
+/// **Mutant:** in `rebase_hint`, return `lo_logical` instead of the lift. The
+/// results still match (a hint can never change a result), which is the point of
+/// the unit test above — this test guards the other direction.
+#[test]
+fn a_ring_past_two_to_the_thirty_two_samples_from_a_truncated_cursor() {
+    let hr = HeapRing::new(64);
+    // Place the ring so its window straddles a multiple of 2^32, the case the
+    // lift has to correct rather than merely restore.
+    // `push` asserts the heartbeat tracks the head (`0014`), so both move.
+    hr.head
+        .store(2 * CURSOR_BLOCK - 32, crate::sync::Ordering::Release);
+    hr.heartbeat
+        .store(2 * CURSOR_BLOCK - 32, crate::sync::Ordering::Release);
+    let ring = hr.ring();
+    for i in 0..64u64 {
+        ring.push(i as i64 * 100, &pose(i)).unwrap();
+    }
+
+    let (lo, newest) = ring.window_for_test();
+    assert!(
+        lo < 2 * CURSOR_BLOCK,
+        "the window must straddle the boundary"
+    );
+    assert!(
+        newest >= 2 * CURSOR_BLOCK,
+        "the window must straddle the boundary"
+    );
+
+    for t in [50i64, 100, 1234, 4321, 6300] {
+        let want = ring.sample::<ScLerp>(t, ExtrapPolicy::Error);
+        for truth in [lo, lo + 7, (lo + newest) / 2, newest] {
+            let mut cursor = truth & (CURSOR_BLOCK - 1);
+            let got = ring.sample_from::<ScLerp>(t, ExtrapPolicy::Error, &mut cursor);
+            assert_eq!(
+                got, want,
+                "t={t} from a truncated cursor (true index {truth})"
+            );
+        }
+    }
+}
+
+/// The tagged query surface must be the typed one with the domain arriving as
+/// data — same condition, same error, same answer — because
+/// [`Domain`](crate::plan::Domain) is an open trait and a foreign binding
+/// therefore cannot dispatch to `at::<D>` at all
+/// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`).
+///
+/// Every C, C++ and Python query site hardcoded `Stamp::<SystemDomain>` before
+/// this existed, so an arena whose edges carry any other tag — which
+/// `ros/tf_tree_ros/src/bridge_node.cpp` actively tells an operator to configure
+/// under `use_sim_time` — was unreadable from those three languages by
+/// construction.
+///
+/// **Mutant:** make `at_tagged` pass `self.domain` instead of its `domain`
+/// argument, i.e. let the binding inherit the plan's own tag. Applied: the four
+/// mismatch assertions below fail with `Ok(..)`, because every wrong tag is then
+/// silently correct — which is the one-line "fix" `0038`'s Rationale rejects.
+#[test]
+fn a_tagged_query_is_the_typed_query_with_the_domain_as_data() {
+    use crate::plan::{Domain, SimDomain, SteadyDomain};
+
+    let arena = rate_chain_arena([0, 0, 0, 0]);
+    let view = ArenaView::new(&arena);
+    let expected = seed_rate_chain(&view);
+    let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
+    let plan = compile_chain(&view, root, leaf);
+    let g = Guard::new(ArenaView::new(&arena));
+
+    // The plan's own tag is answered, and answered with the same pose the typed
+    // form returns. Without this the test could pass by refusing everything.
+    assert_eq!(plan.domain(), SystemDomain::TAG);
+    assert_eq!(
+        plan.at_tagged(&g, 1, SystemDomain::TAG),
+        plan.at(&g, Stamp::<SystemDomain>::from_nanos(1)),
+        "the tagged form disagreed with the typed form on the plan's own domain"
+    );
+    assert_eq!(
+        plan.at_tagged(&g, 1, SystemDomain::TAG),
+        Ok(expected),
+        "the control query was not answered"
+    );
+
+    // Every other built-in tag is refused, identically to the typed form.
+    assert_eq!(
+        plan.at_tagged(&g, 1, SensorDomain::TAG),
+        plan.at(&g, Stamp::<SensorDomain>::from_nanos(1))
+    );
+    assert_eq!(
+        plan.at_tagged(&g, 1, SimDomain::TAG),
+        plan.at(&g, Stamp::<SimDomain>::from_nanos(1))
+    );
+    assert_eq!(
+        plan.at_tagged(&g, 1, SteadyDomain::TAG),
+        plan.at(&g, Stamp::<SteadyDomain>::from_nanos(1))
+    );
+    assert_eq!(
+        plan.at_tagged(&g, 1, SensorDomain::TAG),
+        Err(LookupError::TimeDomainMismatch {
+            expected: 0,
+            got: 1
+        })
+    );
+
+    // A user-declared tag — the case that motivates the whole surface, since no
+    // binding can name a type it has never seen — is refused by tag, not by
+    // failing to compile.
+    assert_eq!(
+        plan.at_tagged(&g, 1, 7),
+        Err(LookupError::TimeDomainMismatch {
+            expected: 0,
+            got: 7
+        }),
+        "a user domain must be refused by the same check, not by a panic"
+    );
+
+    // The derivative and batch shapes carry the same check.
+    assert_eq!(
+        plan.at_with_derivatives_tagged(&g, 1, SensorDomain::TAG)
+            .err(),
+        Some(LookupError::TimeDomainMismatch {
+            expected: 0,
+            got: 1
+        })
+    );
+    let mut out = [0.0f64; 16];
+    assert_eq!(
+        plan.at_many_into_tagged(&g, &[1], SensorDomain::TAG, Layout::Mat4, &mut out),
+        Err(LookupError::TimeDomainMismatch {
+            expected: 0,
+            got: 1
+        })
+    );
+    let mut out32 = [0.0f32; 12];
+    assert_eq!(
+        plan.at_many_into_f32_tagged(&g, &[1], SensorDomain::TAG, Layout::Affine32, &mut out32),
+        Err(LookupError::TimeDomainMismatch {
+            expected: 0,
+            got: 1
+        })
+    );
+}
+
+/// `ExtrapPolicy`'s three variants were all implemented, all tested at the
+/// sampler, and reachable from no shipped surface: every fold site passed the
+/// `Error` literal and the facade did not re-export the type
+/// (`docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md`).
+/// `Plan::at_extrapolating` is what reaches them.
+///
+/// **The third assertion is the one that earns the test.** Asserting that `Hold`
+/// and `ConstantTwist` each return *something* would pass against a
+/// `fold_at_policy` that ignored its argument and served `Hold` for both. What
+/// distinguishes them is that a moving body's held pose and its
+/// constant-twist extension are different poses at the same stamp, and only the
+/// second keeps moving.
+///
+/// **Mutant:** `fold_at_policy` passes `ExtrapPolicy::Hold` instead of its
+/// `policy` argument. Applied: the run stops at the *first* `at_extrapolating`
+/// assertion — `ExtrapPolicy::Error` returns the held pose instead of refusing —
+/// so the `ConstantTwist` assertion at the end is never reached under this
+/// mutant. It is reached, and needed, under the narrower mutant of passing
+/// `Hold` only where `ConstantTwist` was asked for.
+#[test]
+fn extrapolation_is_selectable_and_reports_how_far_it_reached() {
+    let arena = rate_chain_arena([0, 0, 0, 0]);
+    let view = ArenaView::new(&arena);
+    seed_rate_chain(&view);
+    let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
+    let plan = compile_chain(&view, root, leaf);
+    let g = Guard::new(ArenaView::new(&arena));
+
+    // `latest_common` is the newest stamp every dynamic edge can answer for, so
+    // it is the point past which any answer is invented.
+    let common = plan.newest_common_for_test(&g).unwrap().unwrap().0;
+    let past = common + 5_000_000; // 5 ms beyond it
+
+    // The default refuses, and refusing stays the default: `Plan::at` is
+    // untouched by this surface.
+    assert!(matches!(
+        plan.at(&g, Stamp::<SystemDomain>::from_nanos(past)),
+        Err(LookupError::Extrapolation { .. })
+    ));
+    assert!(matches!(
+        plan.at_extrapolating(
+            &g,
+            Stamp::<SystemDomain>::from_nanos(past),
+            ExtrapPolicy::Error
+        ),
+        Err(LookupError::Extrapolation { .. })
+    ));
+
+    // Inside the window, every policy agrees with `at` and reports zero
+    // distance — the control that stops the assertions below passing against a
+    // plan that extrapolated everything.
+    let inside = plan
+        .at_extrapolating(
+            &g,
+            Stamp::<SystemDomain>::from_nanos(common),
+            ExtrapPolicy::Hold,
+        )
+        .unwrap();
+    assert_eq!(
+        inside.by_ns, 0,
+        "a bracketed query was reported as extrapolated"
+    );
+    assert_eq!(
+        Ok(inside.pose),
+        plan.at(&g, Stamp::<SystemDomain>::from_nanos(common))
+    );
+
+    let held = plan
+        .at_extrapolating(
+            &g,
+            Stamp::<SystemDomain>::from_nanos(past),
+            ExtrapPolicy::Hold,
+        )
+        .unwrap();
+    let extended = plan
+        .at_extrapolating(
+            &g,
+            Stamp::<SystemDomain>::from_nanos(past),
+            ExtrapPolicy::ConstantTwist,
+        )
+        .unwrap();
+
+    // Both report the same distance: it is a property of the data, not of the
+    // policy, and it is what makes a held pose impossible to mistake for fresh.
+    assert_eq!(held.by_ns, 5_000_000);
+    assert_eq!(extended.by_ns, 5_000_000);
+
+    // `Hold` really holds: its answer is the pose at `latest_common`.
+    assert_eq!(
+        held.pose, inside.pose,
+        "Hold did not hold the newest sample"
+    );
+
+    // ...and `ConstantTwist` really extends. This is the assertion a
+    // policy-ignoring fold cannot satisfy.
+    assert_ne!(
+        extended.pose, held.pose,
+        "ConstantTwist returned the held pose, so the policy was ignored"
+    );
+}
+
+// ---- errors that compose (decision 0040) --------------------------------
+
+/// Every variant of every error enum renders as prose and names what it carries.
+///
+/// The point is coverage rather than wording: `docs/API.md` R5 is NORMATIVE that
+/// message *text* is not a compatibility promise, so this asserts that a message
+/// exists, that it is not the `Debug` spelling, and that the identifier the
+/// variant carries appears in it — never that a particular sentence does.
+///
+/// **The match in `error.rs` is exhaustive, so a variant added later fails to
+/// compile there rather than falling into a generic arm.** This test is the
+/// other half: it pins that each arm actually *says* something, which a
+/// compiling `write!(f, "")` would not.
+///
+/// **Mutant:** make `LookupError::WrongElementType`'s arm `write!(f, "")`.
+/// Applied: `every LookupError variant renders: WrongElementType produced
+/// nothing` — the case a catch-all `Debug` arm would have hidden, since `Debug`
+/// is never empty.
+#[test]
+fn every_error_variant_renders_as_prose_naming_what_it_carries() {
+    use alloc::format;
+
+    use crate::error::TopologyError;
+
+    let edge = EdgeId(3);
+    let frame = FrameId::new(7).unwrap();
+
+    let lookups = alloc::vec![
+        LookupError::UnknownFrame { hash: 0xdead_beef },
+        LookupError::Disconnected {
+            target: frame,
+            source: frame,
+            cut_at: frame
+        },
+        LookupError::TreeTooDeep { depth: 99 },
+        LookupError::NoData { edge },
+        LookupError::Extrapolation {
+            edge,
+            requested: 5,
+            oldest: 1,
+            newest: 4
+        },
+        LookupError::SlotRecycled { edge },
+        LookupError::SlotContended { edge },
+        LookupError::TopologyChanged {
+            plan: 1,
+            current: 2
+        },
+        LookupError::TimeDomainMismatch {
+            expected: 1,
+            got: 0
+        },
+        LookupError::MixedTimeDomains {
+            edge,
+            expected: 1,
+            got: 0
+        },
+        LookupError::UnknownEdge { edge },
+        LookupError::FrameOutOfRange { frame },
+        LookupError::BufferTooSmall { need: 48, got: 16 },
+        LookupError::WrongElementType,
+        LookupError::ChildDetached,
+        LookupError::MissingEdge { child: frame },
+        LookupError::DerivativesUnavailable { edge, interp: 1 },
+        LookupError::NoSegment { edge },
+    ];
+    for e in &lookups {
+        let shown = format!("{e}");
+        assert!(
+            !shown.is_empty(),
+            "every LookupError variant renders: {e:?} produced nothing"
+        );
+        assert_ne!(
+            shown,
+            format!("{e:?}"),
+            "a variant fell through to Debug instead of prose"
+        );
+    }
+
+    // The identifier each variant carries has to survive into the message —
+    // that is what makes the error actionable without an arena (D11).
+    assert!(format!("{}", LookupError::NoData { edge }).contains('3'));
+    assert!(format!("{}", LookupError::FrameOutOfRange { frame }).contains('7'));
+    assert!(format!("{}", LookupError::BufferTooSmall { need: 48, got: 16 }).contains("48"));
+
+    for e in [
+        PushError::NonMonotonicStamp { last: 9, got: 4 },
+        PushError::ClaimRevoked { edge },
+        PushError::ChildDetached,
+    ] {
+        assert!(!format!("{e}").is_empty());
+        assert_ne!(format!("{e}"), format!("{e:?}"));
+    }
+    for e in [
+        FrameError::FrameHashCollision { hash: 1 },
+        FrameError::CapacityExceeded,
+        FrameError::InternContended,
+        FrameError::ChildDetached,
+        FrameError::ReadOnly,
+    ] {
+        assert!(!format!("{e}").is_empty());
+        assert_ne!(format!("{e}"), format!("{e:?}"));
+    }
+    for e in [
+        TopologyError::WouldCreateCycle { child: frame },
+        TopologyError::CapacityExceeded,
+        TopologyError::UnknownFrame { frame: 4 },
+    ] {
+        assert!(!format!("{e}").is_empty());
+        assert_ne!(format!("{e}"), format!("{e:?}"));
+    }
+    let c = ClaimError::EdgeAlreadyClaimed { owner_slot: 5 };
+    assert!(format!("{c}").contains('5'));
+}
+
+/// The thing this crate's own documentation said could not be done.
+///
+/// `Tree::await_frames`' example was published as a ```text``` block, and its
+/// comment gave the reason: *"the three calls yield `OpenError`, `AwaitError` and
+/// `LookupError`, and `LookupError` implements neither `Display` nor `Error`, so
+/// no single `?`-chain unifies them — not even into `Box<dyn Error>`."*
+///
+/// So this is that `?`-chain, compiled. It is the acceptance test for
+/// `docs/decisions/0040`: not that a message is nice, but that an error can
+/// *leave a function* the way every other Rust library's can.
+///
+/// **Mutant:** delete `impl core::error::Error for LookupError`. Applied: does
+/// not compile — `the trait bound LookupError: core::error::Error is not
+/// satisfied`, on the `?`. A compile failure is the strongest form this
+/// assertion can take, which is why the test is shaped as a function that must
+/// type-check rather than as an assertion about a value.
+#[test]
+fn an_error_can_leave_a_function_as_box_dyn_error() {
+    use alloc::boxed::Box;
+
+    fn fallible(fail: bool) -> Result<Iso3, Box<dyn core::error::Error>> {
+        if fail {
+            // The `?` is the whole test: it needs `Error`, which needs `Display`.
+            Err(LookupError::NoData { edge: EdgeId(3) })?;
+        }
+        Ok(Iso3::IDENTITY)
+    }
+
+    assert!(fallible(false).is_ok());
+    let boxed = fallible(true).unwrap_err();
+    assert!(
+        alloc::format!("{boxed}").contains('3'),
+        "the boxed error lost the edge it names: {boxed}"
+    );
+
+    // Two *different* error types through one `?`-chain, which is the shape the
+    // startup sequence needs and the one the doc comment called impossible.
+    fn two_kinds(which: u8) -> Result<(), Box<dyn core::error::Error>> {
+        match which {
+            0 => Err(FrameError::CapacityExceeded)?,
+            _ => Err(LookupError::ChildDetached)?,
+        }
+    }
+    assert!(two_kinds(0).is_err());
+    assert!(two_kinds(1).is_err());
+}
+
+/// `Extrapolated::by_ns` must not wrap when the query and the data are more
+/// than `i64::MAX` nanoseconds apart.
+///
+/// A plain `nanos - common` panics in a checked build — on the wait-free read
+/// path — and wraps in a release one. Wrapped negative it clamps to `0`, which
+/// reports *"not extrapolated"* for the most extrapolated answer the type can
+/// hold: the exact confusion `Extrapolated` exists to prevent, arrived at from
+/// the other side. `sample::span_ns` carries the same argument for the same
+/// reason one layer down.
+///
+/// **Mutant:** restore `(nanos - common).max(0)`. Applied: the release build
+/// asserts with `left: 0, right: 9223372036854775807`, and the debug build
+/// panics with `attempt to subtract with overflow` inside `Plan::at_extrapolating`.
+#[test]
+fn an_extrapolation_distance_saturates_instead_of_wrapping() {
+    let arena = rate_chain_arena([0, 0, 0, 0]);
+    let view = ArenaView::new(&arena);
+    // Seed the chain near the bottom of the range, then query near the top.
+    for i in 1..=4u32 {
+        let edge = EdgeId(i);
+        let (epoch, owner) = claim(view.claim(edge).unwrap(), 7).unwrap();
+        let w = Publisher::new(
+            view.ring(edge).unwrap(),
+            view.claim(edge).unwrap(),
+            epoch,
+            owner,
+        );
+        w.push(i64::MIN + 1, &pose(u64::from(i))).unwrap();
+        w.push(i64::MIN + 2, &pose(u64::from(i) + 1)).unwrap();
+    }
+    let (root, leaf) = (view.intern("f0").unwrap(), view.intern("f4").unwrap());
+    let plan = compile_chain(&view, root, leaf);
+    let g = Guard::new(ArenaView::new(&arena));
+
+    let far = plan
+        .at_extrapolating(
+            &g,
+            Stamp::<SystemDomain>::from_nanos(i64::MAX),
+            ExtrapPolicy::Hold,
+        )
+        .expect("Hold answers past the newest sample");
+    assert_eq!(
+        far.by_ns,
+        i64::MAX,
+        "a distance wider than i64 must saturate, never wrap to look fresh"
+    );
+}

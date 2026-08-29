@@ -1175,3 +1175,615 @@ fn a_private_arena_reports_no_instance_uuid_rather_than_zeros() {
         "nothing may be written when there is no uuid"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Time domains — `docs/decisions/0038`
+// ---------------------------------------------------------------------------
+
+/// A fixture whose dynamic edge publishes in a caller-chosen time domain:
+/// `map -> odom` dynamic, `odom -> sensor` static.
+struct DomainTree(*mut tft_tree);
+
+impl DomainTree {
+    fn new(domain: u8) -> DomainTree {
+        let mut p: *mut tft_tree = ptr::null_mut();
+        // SAFETY: `p` is a live local.
+        let rc = unsafe { tft_test_domain_tree_create(domain, &mut p) };
+        assert_eq!(rc, TFT_OK);
+        assert!(!p.is_null());
+        DomainTree(p)
+    }
+}
+
+impl Drop for DomainTree {
+    fn drop(&mut self) {
+        // SAFETY: created above, freed exactly once.
+        unsafe { tft_tree_free(self.0) };
+    }
+}
+
+/// Plan `target <- source` in `domain`, returning the status and the handle.
+///
+/// The handle is returned even on failure so the caller can assert it was left
+/// alone: a refused plan must not hand back something a C caller will later
+/// free.
+fn plan_in(
+    tree: *mut tft_tree,
+    target: &str,
+    source: &str,
+    domain: u8,
+) -> (tft_status, *mut tft_plan) {
+    let t = std::ffi::CString::new(target).unwrap();
+    let s = std::ffi::CString::new(source).unwrap();
+    let mut p: *mut tft_plan = ptr::null_mut();
+    // SAFETY: live handle, both strings NUL-terminated, `p` a live local.
+    let rc = unsafe { tft_plan_create_in_domain(tree, t.as_ptr(), s.as_ptr(), domain, &mut p) };
+    (rc, p)
+}
+
+/// **The arena the project tells operators to build is readable from C.**
+///
+/// `ros/tf_tree_ros/src/bridge_node.cpp` warns an operator running
+/// `use_sim_time` to give the simulated tree its own domain (`docs/PHASE4.md`
+/// §5.5). Before `docs/decisions/0038` following that advice made the arena
+/// unreadable from C, C++ and Python by construction: every query site
+/// constructed a `Stamp<SystemDomain>`, so `Plan::check_domain` compared tag `0`
+/// against the arena's and refused — permanently, with no argument the caller
+/// could pass.
+///
+/// Both halves are the test. Domain 1 reads a transform; domain 0 — which is
+/// what `tft_plan_create` means and all a C caller *could* say before — is
+/// refused with the code §5.5 already defined.
+///
+/// Mutant: route `tft_plan_at` back through the typed `Plan::at` (hard-coding
+/// `SystemDomain::TAG`) ⇒ the domain-1 lookup below returns
+/// `TFT_ERR_TIME_DOMAIN`. Confirmed by running it, not by reading it.
+#[test]
+fn a_plan_in_a_non_default_domain_reads_a_transform() {
+    let tree = DomainTree::new(1);
+
+    // What a caller could say before this decision, and what it gets.
+    let (rc, p) = plan_in(tree.0, "map", "odom", 0);
+    assert_eq!(
+        rc, TFT_ERR_TIME_DOMAIN,
+        "domain 0 cannot read a tag-1 arena"
+    );
+    assert!(p.is_null(), "a refused plan hands back no handle to free");
+    let e = fetch_error();
+    assert_eq!(e.code, TFT_ERR_TIME_DOMAIN);
+    let msg = String::from_utf8_lossy(
+        &e.message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned();
+    // The reason the check is at plan time and not in the hot loop: the frame
+    // names are still in hand here and are gone by the first lookup.
+    assert!(msg.contains("map"), "the message names the route: {msg}");
+    assert!(msg.contains("odom"), "the message names the route: {msg}");
+
+    // The same refusal through the frozen spelling, which `0038` defines as
+    // this call with `domain = 0`.
+    let t = std::ffi::CString::new("map").unwrap();
+    let s = std::ffi::CString::new("odom").unwrap();
+    let mut legacy: *mut tft_plan = ptr::null_mut();
+    // SAFETY: live handle, NUL-terminated names, `legacy` a live local.
+    let rc = unsafe { tft_plan_create(tree.0, t.as_ptr(), s.as_ptr(), &mut legacy) };
+    assert_eq!(rc, TFT_ERR_TIME_DOMAIN, "tft_plan_create is domain 0");
+    assert!(legacy.is_null());
+
+    // And what the decision adds: the tag the publisher actually configured.
+    let (rc, raw) = plan_in(tree.0, "map", "odom", 1);
+    assert_eq!(rc, TFT_OK, "domain 1 is what this arena publishes in");
+    let plan = Plan(raw);
+
+    let mut out = [0u8; 128];
+    // SAFETY: live plan; `out` is 128 bytes and MAT4_ROW needs exactly that.
+    let rc = unsafe {
+        tft_plan_at(
+            plan.0,
+            150_000_000,
+            TFT_LAYOUT_MAT4_ROW,
+            out.as_mut_ptr().cast(),
+        )
+    };
+    assert_eq!(rc, TFT_OK, "a tagged plan evaluates");
+    // A real transform, not arbitrary bytes: bottom row [0 0 0 1], and the
+    // translation is the fixture's at t = 0.15 s (15 samples of 0.05 m each,
+    // interpolated: x is between the 15th and 16th knot).
+    assert_eq!(read_f64(&out, 12), 0.0);
+    assert_eq!(read_f64(&out, 13), 0.0);
+    assert_eq!(read_f64(&out, 14), 0.0);
+    assert_eq!(read_f64(&out, 15), 1.0);
+    assert!(
+        read_f64(&out, 3) > 0.7 && read_f64(&out, 3) < 0.8,
+        "x at t=0.15s is between the 15th and 16th knot, got {}",
+        read_f64(&out, 3)
+    );
+
+    // The batch and derivative paths carry the same tag: three entry points
+    // route through the handle, and a test that only drove the scalar one would
+    // leave two of them able to regress silently.
+    let stamps = [100_000_000i64, 150_000_000, 200_000_000];
+    let mut rows = [0f64; 3 * 13];
+    // SAFETY: live plan; three stamps; `rows` is 3 x 13 f64, tightly packed.
+    let rc = unsafe {
+        tft_plan_at_many(
+            plan.0,
+            stamps.as_ptr(),
+            3,
+            TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+            rows.as_mut_ptr().cast(),
+            0,
+        )
+    };
+    assert_eq!(rc, TFT_OK, "the batch fold takes the handle's tag too");
+
+    let mut row = [0f64; 13];
+    let mut twist = [0f64; 6];
+    // SAFETY: live plan; 13 f64 of pose+twist and 6 f64 of twist.
+    let rc = unsafe {
+        tft_plan_at_with_derivatives(
+            plan.0,
+            150_000_000,
+            TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+            row.as_mut_ptr().cast(),
+            twist.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, TFT_OK, "so does the unstable derivatives entry point");
+    assert_eq!(
+        row[7..],
+        twist[..],
+        "the tail of the row is the twist it wrote separately"
+    );
+}
+
+/// **A static route accepts any domain**, because the engine accepts it too.
+///
+/// `Plan::check_domain_tag` fires only when the plan has a dynamic edge, so a
+/// lookup over `odom -> sensor` succeeds whatever tag it is asked in. Refusing
+/// it at plan time would be a refusal the lookup would never have made — and a
+/// caller holding one domain for a whole arena cannot know which of its routes
+/// happen to be static.
+///
+/// Mutant: replace the plan-time predicate with a bare
+/// `plan.domain() != domain` ⇒ the `1` and `7` arms below return
+/// `TFT_ERR_TIME_DOMAIN`. Confirmed by running it.
+#[test]
+fn a_static_route_is_readable_from_any_domain() {
+    let tree = DomainTree::new(1);
+    for domain in [0u8, 1, 7] {
+        let (rc, raw) = plan_in(tree.0, "odom", "sensor", domain);
+        assert_eq!(rc, TFT_OK, "a static route has no domain to disagree with");
+        let plan = Plan(raw);
+        let mut out = [0u8; 128];
+        // SAFETY: live plan; `out` is 128 bytes, MAT4_ROW's exact payload.
+        let rc = unsafe {
+            tft_plan_at(
+                plan.0,
+                150_000_000,
+                TFT_LAYOUT_MAT4_ROW,
+                out.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(rc, TFT_OK, "and it evaluates in domain {domain}");
+    }
+}
+
+/// **A tag-0 dynamic route is refused at plan time too, not only at lookup.**
+///
+/// The other half of `a_static_route_is_readable_from_any_domain`, and the one
+/// a `plan.domain()`-only predicate gets wrong. `Plan::domain` reports `0` for
+/// both "no dynamic edge" and "dynamic edge in domain 0", so a check written
+/// against it alone has to let this case through and leave the engine to refuse
+/// every evaluate call — with `TimeDomainMismatch { expected: 0, got: 7 }` and
+/// no frame names, which is the diagnostic `docs/decisions/0038` moved the
+/// check to recover. Asking `Plan::steps` for a `Step::Dyn` separates the two.
+///
+/// Mutant: drop the `has_dynamic &&` conjunct's *other* direction — i.e. gate
+/// the refusal on `plan.domain() != 0` instead — ⇒ `TFT_OK` here, and the
+/// message assertions below never run.
+#[test]
+fn a_tag_zero_dynamic_route_is_refused_before_the_first_lookup() {
+    // `Tree::new()`'s fixture publishes in domain 0 and `map <- sensor` crosses
+    // its dynamic edges, so this is a genuine mismatch the engine would refuse.
+    let tree = Tree::new();
+    let (rc, p) = plan_in(tree.0, "map", "sensor", 7);
+    assert_eq!(
+        rc, TFT_ERR_TIME_DOMAIN,
+        "a dynamic tag-0 route cannot be read in domain 7"
+    );
+    assert!(p.is_null(), "a refused plan hands back no handle to free");
+
+    let e = fetch_error();
+    assert_eq!(e.code, TFT_ERR_TIME_DOMAIN);
+    let msg = String::from_utf8_lossy(
+        &e.message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned();
+    assert!(msg.contains("map"), "the message names the route: {msg}");
+    assert!(msg.contains("sensor"), "the message names the route: {msg}");
+
+    // And the refusal is the engine's, not a stricter one invented here: the
+    // same fixture, the same route, in the domain it actually publishes in.
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 0);
+    assert_eq!(rc, TFT_OK);
+    drop(Plan(raw));
+}
+
+/// **The tag-0 arenas everything already used are untouched.**
+///
+/// `tft_plan_create` is `tft_plan_create_in_domain` with `domain = 0`, so the
+/// fixture every other test in this file drives must behave identically through
+/// either spelling — same status, same bytes. This is the half of the ABI
+/// promise a new parameter is most likely to break.
+#[test]
+fn the_default_domain_is_what_tft_plan_create_always_meant() {
+    let tree = Tree::new();
+    let old = tree.plan("map", "sensor");
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 0);
+    assert_eq!(rc, TFT_OK);
+    let new = Plan(raw);
+
+    let (mut a, mut b) = ([0u8; 128], [0u8; 128]);
+    // SAFETY: two live plans over the same route; each buffer is MAT4_ROW-sized.
+    unsafe {
+        assert_eq!(
+            tft_plan_at(
+                old.0,
+                250_000_000,
+                TFT_LAYOUT_MAT4_ROW,
+                a.as_mut_ptr().cast()
+            ),
+            TFT_OK
+        );
+        assert_eq!(
+            tft_plan_at(
+                new.0,
+                250_000_000,
+                TFT_LAYOUT_MAT4_ROW,
+                b.as_mut_ptr().cast()
+            ),
+            TFT_OK
+        );
+    }
+    assert_eq!(a, b, "the two spellings are one entry point");
+}
+
+// ---------------------------------------------------------------------------
+// Extrapolation — `docs/decisions/0039`
+// ---------------------------------------------------------------------------
+
+/// The fixture's newest sample: `tft_test_domain_tree_create` pushes 32 samples
+/// 10 ms apart starting at zero, so `map -> odom` has data over `0..=310 ms`.
+const NEWEST_NS: i64 = 310_000_000;
+/// A stamp past the newest sample by a round 90 ms — the case a control loop
+/// running faster than its state estimate is in on every tick.
+const PAST_NS: i64 = 400_000_000;
+
+/// A blank [`tft_extrapolated`] with `struct_size` set, as a C caller writes it.
+fn extrap_out() -> tft_extrapolated {
+    // SAFETY: `tft_extrapolated` is a POD of three integers with no niche and
+    // no validity invariant, so an all-zero bit pattern is a valid value of it.
+    let mut e: tft_extrapolated = unsafe { core::mem::zeroed() };
+    e.struct_size = core::mem::size_of::<tft_extrapolated>() as u32;
+    e
+}
+
+/// Evaluate `plan` at `stamp` under `policy` into `MAT4_ROW`.
+fn at_extrapolating(
+    plan: *const tft_plan,
+    stamp: i64,
+    policy: tft_extrap_policy,
+) -> (tft_status, [u8; 128], tft_extrapolated) {
+    let mut out = [0u8; 128];
+    let mut info = extrap_out();
+    // SAFETY: live plan; `out` is 128 bytes, MAT4_ROW's exact payload; `info`
+    // is a live local with `struct_size` set.
+    let rc = unsafe {
+        tft_plan_at_extrapolating(
+            plan,
+            stamp,
+            policy,
+            TFT_LAYOUT_MAT4_ROW,
+            out.as_mut_ptr().cast(),
+            &mut info,
+        )
+    };
+    (rc, out, info)
+}
+
+/// **All three policies, and the third assertion is what earns the test.**
+///
+/// `docs/decisions/0039` step 3 asks for exactly this shape: a query past the
+/// newest sample is `Err(Extrapolation)` under `Error`, the newest pose with a
+/// positive `by_ns` under `Hold`, and a *different* pose with the same `by_ns`
+/// under `ConstantTwist`. Without the last one a binding that ignored its
+/// `policy` argument and always held would pass every other assertion here.
+///
+/// The route is `map <- sensor`, which folds the fixture's static
+/// `odom -> sensor` on top of its dynamic `map -> odom`: a static step
+/// contributes no sample and must therefore contribute nothing to `by_ns`
+/// either, which is what makes the 90 ms below the *dynamic* edge's distance
+/// rather than a number that happens to be right.
+///
+/// Mutant: make this entry point pass `ExtrapPolicy::Hold` whatever it was
+/// given ⇒ `the two policies must differ ...` fails, and so does the `Error`
+/// arm. Run, not reasoned about.
+#[test]
+fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+
+    // `Error` refuses, and writes neither buffer. This is `tft_plan_at`'s
+    // behaviour with a distance attached on success and nothing changed on
+    // failure.
+    let (rc, out, info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_ERROR);
+    assert_eq!(
+        rc, TFT_ERR_EXTRAPOLATION,
+        "Error refuses a stamp past newest"
+    );
+    assert_eq!(out, [0u8; 128], "a refused call writes no pose");
+    assert_eq!(info.by_ns, 0, "and no distance");
+    let e = fetch_error();
+    assert_eq!(e.code, TFT_ERR_EXTRAPOLATION);
+    assert_eq!(
+        e.newest, NEWEST_NS,
+        "the detail names the window that ended"
+    );
+
+    // `Hold` answers with the newest pose. Compared against `tft_plan_at` at
+    // the newest stamp rather than against a hand-written matrix: "held" means
+    // "the pose the plan gives at `newest`", and asserting it against the
+    // engine's own answer there is what makes that a definition rather than a
+    // second implementation of it.
+    let (rc, held, info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_HOLD);
+    assert_eq!(rc, TFT_OK, "Hold answers past the newest sample");
+    assert_eq!(
+        info.by_ns,
+        PAST_NS - NEWEST_NS,
+        "the distance is measured from the newest common stamp"
+    );
+    assert_ne!(
+        info.edge, TFT_INVALID_ID,
+        "an extrapolated answer names the edge that ran out of data"
+    );
+    let mut newest = [0u8; 128];
+    // SAFETY: live plan; `newest` is MAT4_ROW's exact payload.
+    let rc = unsafe {
+        tft_plan_at(
+            plan.0,
+            NEWEST_NS,
+            TFT_LAYOUT_MAT4_ROW,
+            newest.as_mut_ptr().cast(),
+        )
+    };
+    assert_eq!(rc, TFT_OK);
+    assert_eq!(held, newest, "Hold is the pose at the newest sample");
+
+    // `ConstantTwist` extends the screw the two newest samples imply, so it is
+    // *not* the held pose — and it is measured at the same stamp, so the two
+    // differ in the policy and in nothing else.
+    let (rc, twisted, twist_info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_CONSTANT_TWIST);
+    assert_eq!(rc, TFT_OK, "ConstantTwist answers past the newest sample");
+    assert_eq!(
+        twist_info.by_ns, info.by_ns,
+        "the distance is a property of the arena, not of the policy"
+    );
+    assert_eq!(twist_info.edge, info.edge, "and so is the edge it names");
+    assert_ne!(
+        twisted, held,
+        "the two policies must differ, or the argument is being ignored"
+    );
+    // Still a rigid transform, not a corrupted one: bottom row [0 0 0 1].
+    assert_eq!(read_f64(&twisted, 12), 0.0);
+    assert_eq!(read_f64(&twisted, 13), 0.0);
+    assert_eq!(read_f64(&twisted, 14), 0.0);
+    assert_eq!(read_f64(&twisted, 15), 1.0);
+    // It kept going the way the samples were going: the fixture's translation
+    // grows monotonically with the stamp, so extending the screw past the last
+    // sample must land further along than holding it does.
+    assert!(
+        read_f64(&twisted, 3) > read_f64(&held, 3),
+        "ConstantTwist did not extend the motion: {} against {}",
+        read_f64(&twisted, 3),
+        read_f64(&held, 3)
+    );
+}
+
+/// **`by_ns == 0` is the interpolated case, and it is reported as one.**
+///
+/// A stamp inside every edge's window is not extrapolation whatever policy was
+/// asked for, so the three policies must agree there and the distance must be
+/// zero. This is the half of the surface that says "the answer you got is
+/// fresh" — without it, a caller could not tell an extrapolating call that did
+/// not need to extrapolate from one that did.
+///
+/// The `edge` sentinel is the C side's sharpening of the Rust value it mirrors:
+/// `Extrapolated::edge` is documented *meaningless when `by_ns == 0`*, and a
+/// plausible edge id for an answer nothing invented is exactly the kind of
+/// meaningless a diagnostic gets logged as fact. `TFT_INVALID_ID` is what the
+/// rest of this header already means by "does not apply".
+///
+/// Mutant: pass `x.edge.get()` through unconditionally ⇒ `an interpolated
+/// answer has no stale edge to name` fails with `edge` = the fixture's dynamic
+/// edge id.
+#[test]
+fn an_in_window_stamp_reports_no_extrapolation_under_any_policy() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+
+    let mut plain = [0u8; 128];
+    // SAFETY: live plan; `plain` is MAT4_ROW's exact payload.
+    let rc = unsafe {
+        tft_plan_at(
+            plan.0,
+            150_000_000,
+            TFT_LAYOUT_MAT4_ROW,
+            plain.as_mut_ptr().cast(),
+        )
+    };
+    assert_eq!(rc, TFT_OK);
+
+    for policy in [TFT_EXTRAP_ERROR, TFT_EXTRAP_HOLD, TFT_EXTRAP_CONSTANT_TWIST] {
+        let (rc, out, info) = at_extrapolating(plan.0, 150_000_000, policy);
+        assert_eq!(rc, TFT_OK, "policy {policy} inside the window");
+        assert_eq!(
+            out, plain,
+            "policy {policy} must not change an interpolated answer"
+        );
+        assert_eq!(info.by_ns, 0, "policy {policy} extrapolated nothing");
+        assert_eq!(
+            info.edge, TFT_INVALID_ID,
+            "an interpolated answer has no stale edge to name"
+        );
+    }
+}
+
+/// **The distance is not optional, and that is the whole design.**
+///
+/// `docs/decisions/0039` §1: the Rust return type has no accessor yielding the
+/// pose alone. C cannot enforce that in the type system, so the closest honest
+/// analogue is a required out-parameter — there is no second spelling of this
+/// call without it, and NULL is refused before anything is evaluated.
+///
+/// Mutant: treat a NULL `info` as "the caller does not want it" and skip the
+/// write ⇒ the first assertion fails with `TFT_OK`, and the property the whole
+/// surface exists for is gone.
+#[test]
+fn the_extrapolation_distance_cannot_be_declined() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+    let mut out = [0u8; 128];
+
+    // SAFETY: live plan and a valid `out`; `info` is deliberately NULL, which
+    // is the case under test.
+    let rc = unsafe {
+        tft_plan_at_extrapolating(
+            plan.0,
+            PAST_NS,
+            TFT_EXTRAP_HOLD,
+            TFT_LAYOUT_MAT4_ROW,
+            out.as_mut_ptr().cast(),
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, TFT_ERR_NULL_ARG, "there is no pose-only spelling");
+    assert_eq!(
+        out, [0u8; 128],
+        "and nothing was written on the way to saying so"
+    );
+
+    // A caller that forgot `struct_size` is refused rather than served: §3.6's
+    // append mechanism only works if the size is checked, and this is the
+    // check `tft_error` already makes.
+    let mut info = extrap_out();
+    info.struct_size = 4;
+    // SAFETY: live plan, valid `out`, live `info` — with a deliberately wrong
+    // `struct_size`, which is the case under test.
+    let rc = unsafe {
+        tft_plan_at_extrapolating(
+            plan.0,
+            PAST_NS,
+            TFT_EXTRAP_HOLD,
+            TFT_LAYOUT_MAT4_ROW,
+            out.as_mut_ptr().cast(),
+            &mut info,
+        )
+    };
+    assert_eq!(rc, TFT_ERR_BAD_STRUCT_SIZE);
+    assert_eq!(
+        out, [0u8; 128],
+        "nothing is written for a struct we cannot fill"
+    );
+}
+
+/// **Two enum arguments, two refusals, and neither is a silent fallback.**
+///
+/// A policy discriminant this build does not define is `TFT_ERR_BAD_ENUM`
+/// rather than a quiet `TFT_EXTRAP_ERROR`: the policies differ in what the
+/// answer *is*, so serving a different one than the caller named is a wrong
+/// pose, not a wrong format.
+///
+/// `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is refused for a different reason — it is a
+/// layout this build defines and this entry point does not take, exactly as
+/// `tft_publisher_push` refuses the write-only `AFFINE12_ROW_F32`. The engine
+/// has no extrapolating `at_with_derivatives`, and emitting a twist under
+/// `Error` beside a pose under the caller's policy would put two answers in
+/// one thirteen-`f64` row.
+#[test]
+fn an_unknown_policy_and_the_twist_layout_are_both_refused() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "sensor", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+
+    let (rc, out, _) = at_extrapolating(plan.0, PAST_NS, 3);
+    assert_eq!(rc, TFT_ERR_BAD_ENUM, "an undefined policy is not Error");
+    assert_eq!(out, [0u8; 128]);
+
+    let mut row = [0u8; 104];
+    let mut info = extrap_out();
+    // SAFETY: live plan; `row` is the twist layout's exact payload; `info` is a
+    // live local with `struct_size` set.
+    let rc = unsafe {
+        tft_plan_at_extrapolating(
+            plan.0,
+            PAST_NS,
+            TFT_EXTRAP_HOLD,
+            TFT_LAYOUT_QVEC7_WXYZ_TWIST6,
+            row.as_mut_ptr().cast(),
+            &mut info,
+        )
+    };
+    assert_eq!(rc, TFT_ERR_BAD_ENUM, "there is no extrapolating twist");
+    assert_eq!(row, [0u8; 104], "and nothing was written");
+    let e = fetch_error();
+    let msg = String::from_utf8_lossy(
+        &e.message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned();
+    assert!(
+        msg.contains("TWIST6"),
+        "the message says which layout, not just 'an enum': {msg}"
+    );
+}
+
+/// **The handle's time domain reaches this entry point too.**
+///
+/// `docs/decisions/0038` put the tag on the plan handle and routed the three
+/// evaluate entry points through the tagged core methods. A fourth evaluate
+/// entry point that reconstructed `SystemDomain` would be that defect again,
+/// one call over, and it would be invisible on every tag-0 arena.
+///
+/// Mutant: call `at_extrapolating` (the typed form, hard-coding
+/// `SystemDomain::TAG`) instead of `at_extrapolating_tagged` ⇒ `TFT_ERR_TIME_DOMAIN`
+/// here.
+#[test]
+fn extrapolating_carries_the_plans_time_domain() {
+    let tree = DomainTree::new(1);
+    let (rc, raw) = plan_in(tree.0, "map", "odom", 1);
+    assert_eq!(rc, TFT_OK);
+    let plan = Plan(raw);
+
+    let (rc, _, info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_CONSTANT_TWIST);
+    assert_eq!(rc, TFT_OK, "a tag-1 plan extrapolates in domain 1");
+    assert_eq!(info.by_ns, PAST_NS - NEWEST_NS);
+}

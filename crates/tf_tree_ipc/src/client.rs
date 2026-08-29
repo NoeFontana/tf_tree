@@ -23,7 +23,8 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rustix::fd::OwnedFd;
+use rustix::event::{PollFd, PollFlags};
+use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::net::{
     connect, recvmsg, sendmsg, socket_with, AddressFamily, RecvAncillaryBuffer,
     RecvAncillaryMessage, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
@@ -43,6 +44,52 @@ pub struct Attached {
     /// The connection. **Hold it for the lifetime of the attachment**; dropping
     /// it tells the owner this participant is gone.
     pub socket: OwnedFd,
+}
+
+/// Whether the peer of `socket` has closed it — the owner's death signal (D17).
+///
+/// A participant holds its attach socket for the lifetime of the attachment, so
+/// the owner sees `EPOLLHUP` in microseconds when the participant dies. This is
+/// the same fact read from the other end: the *participant* learns that the
+/// owner is gone, which is §3.5's trigger and the thing that has never existed —
+/// `docs/PHASE2.md` §0.0 records that nothing watches the client socket, so no
+/// participant ever reached the takeover path even while one was implemented.
+///
+/// **Non-blocking, and it must stay that way.** A zero timeout makes this a
+/// predicate a caller can evaluate inside its own loop rather than a wait it has
+/// to schedule around, which is what keeps §3.5 free of a background thread and
+/// of `docs/decisions/0019`'s "every process a user is *required* to run is a
+/// place adoption dies". `POLLHUP` and `POLLERR` are both reported regardless of
+/// the requested events, so nothing is requested.
+///
+/// A hangup is a one-way door: once the writing end is gone it stays gone, so a
+/// `true` here never goes back to `false` and a caller may cache it.
+///
+/// # Errors
+///
+/// [`IpcError::HandshakeIo`] if `poll` itself fails. `EINTR` is reported as *no
+/// hangup* rather than as an error: a signal arriving during a zero-timeout poll
+/// says nothing about the peer, and the caller's next call answers the question
+/// (`crates/tf_tree_ipc/src/server.rs` carries the same reading for the serve
+/// loop, #260).
+pub fn peer_hung_up(socket: BorrowedFd<'_>) -> Result<bool, IpcError> {
+    let mut fds = [PollFd::new(&socket, PollFlags::empty())];
+    match rustix::event::poll(
+        &mut fds,
+        Some(&rustix::fs::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    ) {
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(fds[0]
+            .revents()
+            .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)),
+        Err(rustix::io::Errno::INTR) => Ok(false),
+        Err(e) => Err(IpcError::HandshakeIo {
+            raw_os_error: e.raw_os_error(),
+        }),
+    }
 }
 
 /// Perform the §3.7 handshake against `sock_path`.

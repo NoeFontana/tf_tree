@@ -265,13 +265,32 @@ would take is a second gated row at `[profile.embedder]` with its own floor unde
 profiles against one baseline. Nothing is drafted yet; this section is the
 measurement such a record would rest on.
 
-**The C ABI's 52% is the finding here, and it contradicts a gate.**
-[`PHASE4.md`](../PHASE4.md) §7 gate 1 records `tft_plan_at` at **1.020× native
+**The C ABI's 52% is the finding here, and it contradicted a gate.**
+[`PHASE4.md`](../PHASE4.md) §7 gate 1 recorded `tft_plan_at` at **1.020× native
 Rust**, and that measurement is `examples/abi_cost.rs` — Rust calling the ABI
 *from inside the same build*, where the linker still sees across the call. A C++
 caller against `libtf_tree_c.so` does not, and pays 52% on the same host and the
 same fixture. Both numbers are real; they are answers to different questions, and
-§7 gate 1 does not currently say which one it is asking.
+§7 gate 1 did not say which one it was asking.
+
+> **Amended 2026-08-28: the 1.020× is not what gates, and neither is the
+> 1.34–1.46× that replaced it further down.** This paragraph, the FAIL below and
+> item 3 of the guidance were all written against a §7 gate 1 that was a single
+> quotient — `tft_plan_at` over a native Rust arm. `docs/PHASE4.md` §0.0's §7
+> row now records that criterion **NOT EVALUABLE**: its denominator moved 43%
+> on an edit that did not touch the ABI at all (a second `Tree::guard()` call
+> site stops LLVM specialising the hoisted comparand — §7's ladder, where
+> the native arm goes 133 ns → ~190 ns while **the ABI arm does not move**), so
+> neither 1.020× nor 1.34–1.46× is a statement about the ABI. What gates today is
+> [`0023`](../decisions/0023-the-gate-that-could-not-gate.md)'s re-cut, run by
+> `just abi-cost` and recorded in [`EVIDENCE.md`](./EVIDENCE.md)'s `abi_cost`
+> row: **four quotients on one interleaved ladder** at `[profile.embedder]` — R1
+> the ABI < 1.10 (measured **1.025–1.038**), R2 the panic guard < 1.05, R3 the
+> per-call guard < 1.25, and a control at 1 ± 0.02 — all PASS, and the recipe
+> exits non-zero when they do not. The durable number is the decomposition rather
+> than any ratio: because every rung shares one build, **the ABI's own cost is
+> about +6 ns**. None of this touches the 52% measured in this section, which is
+> a C++ caller against a *shared* arena and is a different configuration.
 
 #### Where the 52% actually goes: the C ABI's per-call work
 
@@ -328,6 +347,11 @@ because **the example is executed by no recipe and no workflow**; it appeared in
 one `justfile` comment. `just abi-cost` now runs it. There is no configuration
 in which the ABI currently costs 2% on this path.
 
+**The 1.34–1.46× is itself superseded** — see the amendment above. It is what
+the one-quotient gate read *before* `0023` interleaved the ladder, and the swing
+was in the comparand, not the ABI. The half of this paragraph that stands is the
+process failure: a benchmark no recipe runs is a benchmark nobody sanity-checks.
+
 `docs/PHASE4.md` §7 records the failing gate; `docs/decisions/0022` carried the
 open question and has since closed it. **Its answer is the first item of the
 guidance below, not a new API**: `tft_plan_at_many` pays one guard per batch and
@@ -361,14 +385,31 @@ The conclusion survives both, but it now rests on a run that interpolates.
 2. **Do not switch link mode expecting a win.** Static and shared measure within
    0.4%, so LTO across the `.so` is not where this is recovered. That sentence
    used to say the opposite here.
-3. Note that a private (non-`shm`) arena does not pay this at all: §7 gate 1's
-   1.020× is the honest figure for that configuration.
+3. Note that a private (non-`shm`) arena does not pay anything like this. On
+   `abi_cost.rs`'s three-edge heap tree at `[profile.embedder]`, `0023`'s pinned
+   ladder prices the whole C ABI as **R1 = 1.025–1.038×**, which `docs/PHASE4.md`
+   §7 reads as **~6–9 ns on a ~245 ns lookup**. This item used to call §7 gate
+   1's 1.020× "the honest figure for that configuration"; that citation is
+   withdrawn with the quotient itself, per the amendment above, and the +6 ns
+   decomposition is what replaces it. Do not quote §7's 189.1 / 194.8 ladder
+   here instead: that table is retained history, a `release`-profile reading of
+   the pre-pin shape, and its own section says not to compare it against the
+   current numbers.
 
-The structural fix is for the C tier to be able to hold a guard across calls, the
-way the Rust tier does — [`docs/API.md`](../API.md) §1 R2 says the hot tier never
-allocates, locks or converts, and a per-call guard on a shared arena is the tier
-failing its own rule. That is new public API, so it is a decision record and not
-a patch. Until it exists, the C++ arm should be read as "what a C++ embedder gets
+**The structural argument that used to close this subsection is withdrawn, and
+by the record it was written for.** It read that a per-call guard on a shared
+arena is [`docs/API.md`](../API.md) §1 R2's hot tier failing its own rule — the
+tier that never allocates, locks or converts — so the fix is new public API
+letting the C tier hold a guard across calls.
+[`0022`](../decisions/0022-the-per-call-guard-and-the-unwatched-gate.md)
+*Decision* item 4 withdrew it: `Guard::new` allocates nothing, takes no lock and
+waits for nothing, because since A1 collapsed the topology seqlock into one
+packed word, pinning a generation is a **single acquire load** and the rest of
+the constructor zeroes a cursor array. The cost is real and measured, but R2
+names allocating, locking, resolving a name and converting a representation, and
+that constructor does none of them. What stands is
+the decision recorded above — batch, and the `tft_guard` handle is declined —
+and, unchanged, that the C++ arm should be read as "what a C++ embedder gets
 today", not as "what the engine costs".
 
 ### Where the win comes from
