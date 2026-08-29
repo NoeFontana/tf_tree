@@ -82,10 +82,10 @@ robot is redeployed, and `doctor --from-bag` needs no features at all:
 TAG=$(curl -fsSL https://api.github.com/repos/NoeFontana/tf_tree/releases/latest \
       | grep -m1 '"tag_name"' | cut -d'"' -f4)
 curl -fsSL "https://github.com/NoeFontana/tf_tree/releases/download/${TAG}/tf_tree-${TAG}-x86_64-unknown-linux-musl.tar.gz" | tar xz
-cd "tf_tree-${TAG}-x86_64-unknown-linux-musl"
+tft=./tf_tree-${TAG}-x86_64-unknown-linux-musl/tf_tree   # stay where your recording is
 
-./tf_tree doctor --from-bag drive.mcap                # what is wrong with this /tf traffic
-./tf_tree freeze --from-bag drive.mcap -o drive.tft   # keep the answer
+$tft doctor --from-bag drive.mcap                # what is wrong with this /tf traffic
+$tft freeze --from-bag drive.mcap -o drive.tft   # keep the answer
 ```
 
 Both released builds carry `--features shm`, so the same binary also attaches to

@@ -34,6 +34,12 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release.yml"
+      # **`justfile`, because all the packaging logic lives in
+      # `just release-archive`.** Without this line an edit to that recipe — a
+      # tar flag, the staging layout, the version check — matched nothing here,
+      # no other workflow invokes it, and the break was first met on the tag
+      # push. That is exactly the outcome the trigger above exists to prevent.
+      - "justfile"
       - "**/Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -203,10 +209,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
-      - uses: actions/setup-python@v7
-        with:
-          # The recipe reads `[workspace.package] version` with `tomllib`.
-          python-version: "3.13"
 
       # **blake3 needs a C compiler on aarch64 and cannot find one for musl.**
       # Its NEON path is C, and `cc-rs` looks for `aarch64-linux-musl-gcc`,
@@ -233,7 +235,13 @@ jobs:
           t="${{ matrix.target }}"
           # cc-rs reads `CC_<target with underscores>`.
           echo "CC_${t//-/_}=musl-gcc" >> "$GITHUB_ENV"
-          musl-gcc --version | head -1
+          # Not `musl-gcc --version | head -1`: under `pipefail` a `head` that
+          # exits first sends SIGPIPE to the producer and the pipeline reports
+          # 141, which as the last command in this step would fail it. The
+          # `dry-run` job's comment below records that exact bug biting a
+          # `tar | grep -q`, so the pattern is one this repository has already
+          # decided against.
+          musl-gcc --version 2>&1 | sed -n 1p
 
       # One recipe, not a transcription of it (`CLAUDE.md`). It builds with
       # `--features shm`, executes the result and compares `--version` against
@@ -245,9 +253,16 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.target }}
+          # **Scoped to this row's target, not `*.tar.gz`.** The recipe already
+          # clears the whole staging directory before it builds, so this is the
+          # second of two guards against the same failure: an archive left by a
+          # previous run — a `target/` restored by the cache above, or a second
+          # target built locally — being uploaded as an asset for a version it
+          # does not belong to, which `github-release`'s count check would catch
+          # only *after* the irreversible crates.io publish.
           path: |
-            target/release-staging/*.tar.gz
-            target/release-staging/*.tar.gz.sha256
+            target/release-staging/tf_tree-*-${{ matrix.target }}.tar.gz
+            target/release-staging/tf_tree-*-${{ matrix.target }}.tar.gz.sha256
           # A release that silently ships nothing is worse than one that fails.
           if-no-files-found: error
 
@@ -444,7 +459,13 @@ jobs:
           # The count tracks the matrix above. Hard-coded on purpose: the
           # failure being guarded is a row that silently stopped producing an
           # artifact, and a check derived from whatever turned up cannot see it.
-          n=$(ls -1 *.tar.gz 2>/dev/null | wc -l)
+          # **`find`, not `ls *.tar.gz`.** Under `set -euo pipefail` the glob
+          # form aborts the script at this assignment when the directory is
+          # empty — `ls` fails on the unexpanded pattern, `pipefail` propagates
+          # it, `set -e` exits — so the one case this check exists for, a row
+          # that silently produced nothing, was the case it reported nothing
+          # about. Verified: exit 2, no annotation.
+          n=$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)
           if [ "$n" -ne 4 ]; then
             echo "::error::expected 4 archives from the binaries matrix, found ${n}" >&2
             exit 1
@@ -502,7 +523,29 @@ jobs:
           ```
           EOF
           } | sed "s/<version>/${tag}/g" > NOTES.md
-          cat NOTES.md
+
+          # **GitHub rejects a release body over 125 000 characters**, and this
+          # one is assembled from a changelog section that only grows: the
+          # current `## [Unreleased]` is already 61 918 bytes. Meeting the cap
+          # would return HTTP 422 *after* the irreversible crates.io publish,
+          # and a re-run would rebuild the same oversized body every time — so
+          # the recoverability this job is ordered for would not exist. Truncate
+          # instead, and say so in the body rather than silently dropping half a
+          # changelog.
+          limit=120000
+          if [ "$(wc -c < NOTES.md)" -gt "$limit" ]; then
+            head -c "$limit" NOTES.md > NOTES.trunc
+            {
+              # Cut back to the last blank line so the truncation does not land
+              # mid-sentence or inside a fenced code block.
+              sed -e :a -e '$!{N;ba' -e '}' -e 's/\n[^\n]*$//' NOTES.trunc
+              printf '\n\n---\n\n**This release body was truncated at %s bytes.** The full entry for this release is in [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n' \
+                "$limit" "$GITHUB_REPOSITORY" "$tag"
+            } > NOTES.md
+            rm -f NOTES.trunc
+            echo "::warning::release notes truncated to ${limit} bytes"
+          fi
+          wc -c NOTES.md
 
       # `gh` is preinstalled on the runner, so this needs no action and no
       # third-party token — `github.token` with `contents: write` is enough.
@@ -524,6 +567,14 @@ jobs:
             gh release edit "$tag" --notes-file NOTES.md
             gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS --clobber
           else
+            # **`--draft`, then publish once the assets are up.** `gh release
+            # create` creates a *published* release and then uploads the five
+            # assets sequentially; during that window `releases/latest` resolves
+            # the new tag while the download URL 404s — and that URL is exactly
+            # what `README.md`'s two-line install snippet curls. Creating as a
+            # draft and clearing the flag afterwards makes the release atomic
+            # from a reader's point of view.
+            #
             # `--verify-tag` refuses to invent a release for a tag that is not
             # on the remote, which is the one mistake this step could make
             # silently.
@@ -531,7 +582,9 @@ jobs:
               --title "$tag" \
               --notes-file NOTES.md \
               --verify-tag \
+              --draft \
               dist/*.tar.gz dist/SHA256SUMS
+            gh release edit "$tag" --draft=false
           fi
           gh release view "$tag" --json assets \
             --jq '.assets[] | "\(.name)  \(.size) bytes"'
