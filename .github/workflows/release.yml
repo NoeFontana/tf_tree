@@ -506,16 +506,32 @@ jobs:
 
       # `gh` is preinstalled on the runner, so this needs no action and no
       # third-party token — `github.token` with `contents: write` is enough.
-      - name: create the release
+      #
+      # **Written to be re-runnable.** `gh release create` fails on a release
+      # that already exists, which is precisely the state a re-run lands in when
+      # a first attempt created the release and then failed uploading an asset —
+      # and the reason `publish` runs *before* this job is that this is the half
+      # that should be recoverable. Creating when absent and clobbering when
+      # present makes a second click finish the job instead of jamming it.
+      - name: create the release, or complete a half-finished one
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/}"
-          gh release create "$tag" \
-            --title "$tag" \
-            --notes-file NOTES.md \
-            --verify-tag \
-            dist/*.tar.gz dist/SHA256SUMS
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release ${tag} exists; updating notes and re-uploading assets"
+            gh release edit "$tag" --notes-file NOTES.md
+            gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            # `--verify-tag` refuses to invent a release for a tag that is not
+            # on the remote, which is the one mistake this step could make
+            # silently.
+            gh release create "$tag" \
+              --title "$tag" \
+              --notes-file NOTES.md \
+              --verify-tag \
+              dist/*.tar.gz dist/SHA256SUMS
+          fi
           gh release view "$tag" --json assets \
             --jq '.assets[] | "\(.name)  \(.size) bytes"'
