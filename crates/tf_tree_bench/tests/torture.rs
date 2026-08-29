@@ -325,30 +325,40 @@ fn the_nightly_recipes_default_duration_parses() {
     assert!(!bad.status.success(), "`--duration soon` was accepted");
 }
 
-/// `--crash-points` is refused, naming the feature that does not exist.
+/// `--crash-points` is refused **by a build that cannot honour it**, and the
+/// refusal names why.
 ///
-/// `docs/PHASE2.md` §11.4 asks for crash-point injection in 10% of children and
-/// §0.0 records the `crash-points` feature as not implemented. Accepting the
-/// flag and running the SIGKILL test anyway would let a run report §11.3
-/// coverage the repository does not have — which is the same class of quiet
+/// This test used to assert an *unconditional* refusal, on the grounds that
+/// "§0.0 records the `crash-points` feature as not implemented". That was true
+/// when written; the feature and the sites have since shipped, and the §0.0 row
+/// it cited had gone stale with it. What survives is the part that was never
+/// about implementation status: **the children are this same executable**, so a
+/// site compiled out here is compiled out in every child, and accepting the flag
+/// would arm nothing while looking like it had. That is the same class of quiet
 /// dishonesty `bench_report`'s `--duration` refusal exists for.
 ///
-/// Mutant (applied, confirmed fatal): replace the `--crash-points` arm with
-/// `"--crash-points" => {}` — the run then reaches `--help`, exits 0, and the
-/// first assertion fails.
+/// This test binary is built **without** `crash-points` (`just
+/// shm-torture-self-test` does not pass it), so the refusal is what it can
+/// observe. The accepting path is `just shm-torture-crash-points`, which builds
+/// with the feature and prints how many children were armed and how many
+/// actually aborted — two numbers, because they differ.
+///
+/// **Mutant:** replace the `--crash-points` arm with `"--crash-points" => {}`.
+/// The run then reaches `--help`, exits 0, and the first assertion fails.
 #[test]
-fn crash_point_injection_is_refused_rather_than_approximated() {
+fn crash_point_injection_is_refused_by_a_build_that_cannot_arm_it() {
     let control = torture(&["--help"]);
     assert!(control.status.success(), "control: --help must exit 0");
 
     let out = torture(&["--crash-points", "--help"]);
     assert!(
         !out.status.success(),
-        "--crash-points was accepted; there is no crash-points feature to arm"
+        "--crash-points was accepted by a binary built without the feature, so it \
+         would have armed nothing in any child"
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("crash-points") && err.contains("not implemented"),
-        "the refusal must name the missing feature, got: {err}"
+        err.contains("crash-points") && err.contains("children are this same executable"),
+        "the refusal must say why this build cannot honour it, got: {err}"
     );
 }

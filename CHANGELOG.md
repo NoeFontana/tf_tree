@@ -35,6 +35,28 @@ is a bug.
 
 ### Added
 
+- **`shm_torture --crash-points`** — `docs/PHASE2.md` §11.4's *"a random crash
+  point armed in 10% of children"*, which §11.3 and §11.4 could not do for each
+  other until both existed. A random site from `tf_tree_core::crash::SITES` and
+  `tf_tree::CRASH_SITES` — read from the published lists, never re-spelled — is
+  armed in about a tenth of children, so a soak kills processes **at named
+  instructions** and then checks the same invariants.
+
+  Measured at 40 s / 10 children / 2 Hz: **11 armed, 4 aborted at four distinct
+  sites** (`attach.after_slot_assigned_before_publish`, `push.after_seq_odd`,
+  `push.after_data_before_seq_even`, `claim.after_cas`), 0 violations, clean
+  recovery. The first of those is worth noting: §11.3 records that its ~12 ns
+  window cannot be reached without fault injection, so a torture run now
+  *produces* the state §11.2's collector tests stage.
+
+  **The run reports armed and aborted separately**, because they differ — an
+  armed child the driver's `SIGKILL` reached first never got to its site, and
+  `armed N, aborted 0` exercised nothing. The flag is **refused** by a build
+  without the feature: the children are the same executable, so a compiled-out
+  site would arm nothing while looking like it had. That refusal replaces an
+  older unconditional one whose stated reason ("there is nothing to arm") had
+  expired.
+
 - **`doctor --exit-code[=error|warn]`.** Bare `--exit-code` still means `error`,
   so no existing invocation changes. The `warn` tier is what was missing.
 
