@@ -472,7 +472,9 @@ jobs:
           fi
           sha256sum -c ./*.tar.gz.sha256
           # One aggregate file, which is what a user checking a single download
-          # actually wants; the per-archive files stay as they are.
+          # actually wants. The per-archive `.sha256` files are then removed so
+          # they are not uploaded beside it — `SHA256SUMS` carries every line
+          # they did.
           cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
           rm -f ./*.tar.gz.sha256
           cat SHA256SUMS
@@ -525,8 +527,9 @@ jobs:
           } | sed "s/<version>/${tag}/g" > NOTES.md
 
           # **GitHub rejects a release body over 125 000 characters**, and this
-          # one is assembled from a changelog section that only grows: the
-          # current `## [Unreleased]` is already 61 918 bytes. Meeting the cap
+          # one is assembled from a changelog section that only grows — the
+          # section for `v0.0.5` rendered at 71 141 bytes, over half the cap, and
+          # a release section is only ever appended to before its tag. Meeting it
           # would return HTTP 422 *after* the irreversible crates.io publish,
           # and a re-run would rebuild the same oversized body every time — so
           # the recoverability this job is ordered for would not exist. Truncate

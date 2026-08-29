@@ -1281,9 +1281,15 @@ impl Plan {
     ///
     /// # The distance is not free, and is not on [`Self::at`]'s path
     ///
-    /// `by_ns` costs one `newest_stamp` load per dynamic edge, taken *after* the
-    /// fold and only here. Nothing is threaded through `fold_at` or the seqlock
-    /// read, so [`Self::at`]'s generated code is unmoved.
+    /// `by_ns` costs one `newest_stamp` load per dynamic edge, taken **before**
+    /// the fold and only here. Nothing is threaded through `fold_at` or the
+    /// seqlock read, so [`Self::at`]'s generated code is unmoved.
+    ///
+    /// The order is a soundness guarantee, not an implementation detail: a
+    /// `push` landing between the fold and a *later* walk would lift the common
+    /// horizon past `nanos` and report `by_ns == 0` — "not extrapolated" — for a
+    /// pose the fold genuinely invented. Measuring first inverts that error into
+    /// the safe direction. The implementation carries the full argument.
     ///
     /// # Errors
     ///

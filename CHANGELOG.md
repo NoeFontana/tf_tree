@@ -31,9 +31,50 @@ is a bug.
 
 ---
 
+## [Unreleased]
+
+### Fixed — documentation
+
+- **Public surface that shipped in 0.0.5 with no entry, and stale claims a
+  pre-release audit confirmed.** All are corrected in the 0.0.5 section itself
+  rather than only here, because a consumer on 0.0.5 reads that section; this
+  entry records that the corrections were made after the tag. `CHANGELOG.md`
+  ships in no artifact — `cargo package --list` shows none of the five carry it,
+  and PyPI's long description is `README.md` — so amending it costs no version.
+
+- **`Plan::at_extrapolating`'s rustdoc described the opposite ordering to the
+  code**, and that one *did* ship, to docs.rs. It said the `newest_stamp` walk is
+  taken "after the fold"; the implementation takes it **before**, and its own
+  comment says why the order is a soundness guarantee — measuring after would let
+  a `push` landing mid-fold report `by_ns == 0`, "not extrapolated", for a pose
+  the fold invented.
+
 ## [0.0.5] — 2026-08-29 (the entry paths that need no toolchain)
 
 ### Added
+
+- **`tf_tree_ipc::proc_self_pid` and `tf_tree_ipc::self_pid_ns_inode`** (#263) —
+  this process's pid as `/proc` reports it, and the inode of its PID namespace.
+  Re-exported at the crate root, so both are public API on a crate that
+  publishes. `TFT014` uses the namespace inode to stop calling a *namespaced*
+  participant a fork inheritor: two processes in different PID namespaces can
+  carry the same pid, and the check read the number without the namespace it is
+  meaningful in. **Recorded here after the 0.0.5 tag** — a pre-release audit
+  found both live on docs.rs with no entry.
+
+- **`tf_tree_core::crash::ENV_VAR` and `crash::maybe_abort`** — `docs/PHASE2.md`
+  §11.3's fault-injection sites, reachable because `pub mod crash` is ungated.
+  `maybe_abort` is a no-op unless the `crash-points` feature is on *and*
+  `TF_TREE_CRASH_AT` names the site, so a default build pays a feature check and
+  nothing else. Public on a published crate, so it is listed even though no
+  production path calls it. **Recorded here after the 0.0.5 tag.**
+
+- **Two cargo features on publishable crates**: `tf_tree/pure-hash` (and
+  `tf_tree_core/pure-hash`), which selects BLAKE3's portable Rust backend for
+  targets with no C toolchain — `just py-cross-check` is what compiles it — and
+  `tf_tree_core/crash-points`, which arms the sites above. Both are off by
+  default and neither changes a default build. **Recorded here after the 0.0.5
+  tag.**
 
 - **`IngestOptions::max_record_bytes` and `IngestError::RecordTooLarge`** —
   `docs/decisions/0010`, now **`ready`**. Both halves of that record were unbuilt:
@@ -927,9 +968,11 @@ is a bug.
   together, and collapsing it would mark one or the other wrongly.
 
   `docs/API.md` §4.1 records both shapes and why each took the form it did; §3.3
-  records the two parity gaps still open — Python's `at_extrapolating` has no
-  `layout=` or `_into` form, and Python still cannot declare a static edge, a
-  per-edge capacity, a rate or a domain.
+  recorded two parity gaps as open at the time this entry was written; **both
+  closed in this same release** and the sentence is corrected rather than left
+  standing. `Plan.at_extrapolating` takes `layout=` on all three overloads, and
+  `tf_tree.build` accepts topology-config text (`0041`), which is the form that
+  declares a static edge, a per-edge size, a rate and a per-edge domain.
 
 - **D5's owed measurement, taken at last** — `just interp-accuracy`
   (`crates/tf_tree_bench/examples/interp_accuracy.rs`). D5 ends *"do not make it
@@ -1101,8 +1144,8 @@ is a bug.
 - **`docs/decisions/README.md` carried an unresolved merge conflict on `main`,
   and all eighteen CI checks were green on it** (#266) — a `git rebase` on a
   dirty worktree whose autostash popped into a conflict *after* the rebase
-  reported success. `just no-conflict-markers` is the new gate, first in
-  `just lint`; the script says why it matches three markers and not four.
+  reported success. `just no-conflict-markers` is the new gate, second in
+  `just lint` (after `no-build-output`); the script says why it matches three markers and not four.
 
 - **`doctor`'s `TFT014` no longer calls a healthy participant in another PID
   namespace a fork inheritor and tells the operator to stop it** (#239,
@@ -1155,8 +1198,11 @@ is a bug.
   a cargo build-output signature whatever the directory is called.
 
 - **`CLAUDE.md` and `ci.yml` both said `just lint` runs six clippy passes; it
-  runs eight** — `pure-hash` (#243) added two and neither prose site was updated,
+  ran eight** — `pure-hash` (#243) added two and neither prose site was updated,
   including a comment that claimed to have counted rather than remembered.
+  **This entry then went stale the same way**: the count is now **ten**, and the
+  recipe has five dependencies rather than four. Counted, not remembered:
+  `awk '/^lint:/,/^[a-z-]+:$/' justfile | grep -cE '^\s+cargo clippy'`.
 
 ---
 

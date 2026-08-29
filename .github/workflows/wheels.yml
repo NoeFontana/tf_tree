@@ -203,6 +203,28 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+
+      # **The tag-versus-version check, which this workflow did not have.**
+      # `release.yml` refuses a tag whose number disagrees with the tree it
+      # points at; this file publishes to PyPI off the same `v*` tag and made no
+      # such check, and it depends on none of `release.yml`'s jobs — the two run
+      # independently. In practice `just artifact-versions` keeps
+      # `pyproject.toml` in step with the workspace, but nothing here *asserted*
+      # it, so a tag could put a wheel on PyPI whose version no gate had compared
+      # to the tag. PyPI does not permit re-uploading a version, so the check is
+      # worth its two seconds. `version` is the field maturin builds from.
+      - name: assert the tag matches the version being published
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          proj="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          echo "tag=${tag} pyproject=${proj}"
+          if [[ "$tag" != "$proj" ]]; then
+            echo "::error::tag v${tag} does not match pyproject.toml version ${proj}" >&2
+            exit 1
+          fi
+
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
