@@ -25,16 +25,34 @@ over the README, and over this file.
   `Tree::owner_lost` is the trigger, which had never existed at all. **It is
   caller-driven by design** ([`0019`](./docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md)):
   no background thread, no daemon, so a survivor that never calls it never
-  becomes owner and its arena stays ownerless. `OpenOutcome::TookOver` still has
-  **no producer** — inheritance is a method on an attached session, not an
-  `open()` outcome — and `0037` question 3 answers that the variant does not
-  survive, a removal not yet made. `PHASE2.md` §0.0's row is authoritative.
+  becomes owner and its arena stays ownerless. `OpenOutcome::TookOver` and
+  `OpenError::TakeoverUnsupported` are **deleted** — `0037` question 3 answered
+  that the variant does not survive, because inheritance is a method on an
+  attached session and not an `open()` outcome, and the removal has since been
+  made. `PHASE2.md` §0.0's row is authoritative.
+- **Recovery reaches C, C++ and Python since 2026-08-29**
+  ([`0044`](./docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)):
+  `inherit_ownership` takes `&self` — both bindings hold the tree in an `Arc`,
+  where `Arc::get_mut` fails as soon as a plan or publisher holds a clone —
+  and the *unstable* C header gains `tft_tree_open_named` (the only read-write
+  attachment C has ever had), `tft_tree_owner_lost`,
+  `tft_tree_inherit_ownership` and `tft_tree_reap_dead`. **`owner_lost` answers
+  "the arena has no owner", not "my socket is dead"**
+  ([`0043`](./docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md));
+  before that it was permanently `true` for every survivor but the winner. And
+  the owner's hangup callback now revokes a dead participant's **claims**, not
+  only its record, so a restarted publisher granted its predecessor's slot can
+  take its own edges back. **Two producers of a stale claim remain and have no
+  hangup**: a dead owner, and a `build_shared` participant with no socket.
 - **Phase 4: implemented except** §5.9 affinity knobs and §6.3 replay rows. C ABI
   and C++ wrapper frozen; ROS 2 ingest bridge done. §1's operational exit
   criterion is **open and not satisfiable by code**.
 - **Phase 5: partial.** `FORMAT_VERSION = 3` **landed** (`layout_hash`
   `0x3D10_4195`); frozen `.tft`, MCAP ingest, counters, `tf_tree top` done;
-  catalogue detects 17 of 19.
+  catalogue detects 17 of 19. **`TFT009` also reports the gap that has not
+  ended** — a publisher that stopped, which every rule in the catalogue was blind
+  to because they all measure *between retained stamps*, and a full ring of
+  perfectly spaced samples from three weeks ago reads healthy.
 - **Published** to crates.io and PyPI since 2026-08-17, on the `0.0.x` line —
   cargo treats every `0.0.x` as incompatible with every other, so *every release
   may break every other* and that is the whole promise. The number itself is not

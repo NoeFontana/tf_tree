@@ -1,8 +1,8 @@
 # 0039: extrapolation you cannot fail to notice
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #278, #283
 
 ## Context
 

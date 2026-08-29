@@ -1,8 +1,8 @@
 # 0044: recovery, in the languages a robot is written in
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #284, #285
 
 ## Context
 

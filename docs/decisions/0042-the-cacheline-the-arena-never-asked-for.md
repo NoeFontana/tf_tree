@@ -1,8 +1,8 @@
 # 0042: the cacheline the arena never asked for
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #280
 
 ## Context
 

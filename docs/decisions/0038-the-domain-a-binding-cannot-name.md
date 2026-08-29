@@ -1,8 +1,8 @@
 # 0038: the domain a binding cannot name
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #278
 
 ## Context
 

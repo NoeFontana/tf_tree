@@ -1,8 +1,8 @@
 # 0043: `owner_lost` is a question about the owner
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #281
 
 ## Context
 

@@ -1,8 +1,8 @@
 # 0041: Python declares a topology the way everything else does
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #279
 
 ## Context
 
