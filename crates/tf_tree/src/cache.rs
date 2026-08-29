@@ -101,13 +101,14 @@ struct Entry {
     ///
     /// # It costs nothing
     ///
-    /// `size_of::<Result<Plan, LookupError>>() == size_of::<Plan>() == 4160`:
+    /// `size_of::<Result<Plan, LookupError>>() == size_of::<Plan>() == 2064`:
     /// `Plan`'s `[Step; MAX_DEPTH]` has spare discriminant encodings, so the
     /// `Err` variant occupies a niche and `LookupError`'s 32 bytes land inside
-    /// the array. The slot, the table and the 66.0 KiB per thread are all
+    /// the array. The slot, the table and the 32.6 KiB per thread are all
     /// unchanged. [`tests::a_refusal_is_free_to_cache`] pins it, because a
     /// future `LookupError` variant that outgrew the niche would grow every
-    /// slot by 64 bytes silently.
+    /// slot by an alignment step silently. (2064 and 32.6 KiB were 4160 and
+    /// 66.0 before `0042` halved `Step`.)
     result: Result<Plan, LookupError>,
 }
 
@@ -222,12 +223,15 @@ fn index(key: Key) -> usize {
 /// inside its own run-to-run range. Widening [`Entry`] to hold a `Result` cost
 /// the hit path nothing, which is what the `&entry.result` match is for. A
 /// 4160-byte `memcpy` there would have cost ~40 ns against a 506 ns baseline —
+/// that being `Plan`'s size when this was measured; it is 2064 since `0042`, so
+/// the same argument now runs on half the bytes and holds by a wider margin —
 /// +8%, an order of magnitude outside the run-to-run range — so the control is
 /// not merely consistent with no copy, it excludes one.
 ///
 /// The **miss** path did move, and it is written down here because it was
 /// measured rather than because it matters: the three `Plan` copies `Tree::lookup`
-/// makes on a miss are 4160 bytes each where they were 4120, since the `Err`
+/// makes on a miss are 4160 bytes each where they were 4120 — figures from when
+/// this was measured, 2064 and 2024 since `0042` — since the `Err`
 /// variant's niche lives inside `steps` and the leading bytes can no longer be
 /// treated as padding. 120 bytes added to a path that already moves twelve
 /// kilobytes, on the arm #264 cut by more than half.
@@ -249,9 +253,13 @@ fn index(key: Key) -> usize {
 ///
 /// # Why a closure and not `-> Plan`
 ///
-/// `Plan` is `Copy` and **4160 bytes** (`size_of`, measured; `align_of` 64,
-/// which is what pads the 4184-byte `Entry` out to a 4224-byte slot, and the
-/// 16-slot table to 66.0 KiB per thread). Returning one hands the caller a copy,
+/// `Plan` is `Copy` and **2064 bytes** (`size_of`, measured; `align_of` 8, so
+/// the 24-byte `Key` costs 24 rather than hiding in padding, making `Entry`
+/// 2088 and the 16-slot table **32.6 KiB per thread**). Those were 4160, 64,
+/// 4224 and 66.0 KiB until
+/// [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md):
+/// the key used to disappear into `Plan`'s cacheline padding, which is why the
+/// slot shrank by less than `Plan` did. Returning one hands the caller a copy,
 /// and the caller is `Tree::lookup`, which only wants to call `Plan::at` on it.
 ///
 /// **Every byte count in the table below was measured at `MAX_DEPTH = 16`**,
@@ -339,8 +347,9 @@ pub(crate) fn with_plan<R>(
                     // `&entry.result`, and the `&` is the same load-bearing one
                     // the section above is about: matching through the
                     // reference yields a `&Plan` pointing into the slot, where
-                    // matching the value would lift all 4160 bytes out of it to
-                    // decide which variant it is.
+                    // matching the value would lift the whole `Plan` — 2064
+                    // bytes, and 4160 when this comment was written — out of it
+                    // just to decide which variant it is.
                     return match &entry.result {
                         Ok(plan) => (Ok(f(plan)), true),
                         Err(e) => (Err(*e), true),
@@ -489,10 +498,24 @@ mod tests {
             size_of::<Result<tf_tree_core::Plan, LookupError>>(),
             size_of::<tf_tree_core::Plan>(),
         );
+        // **Written against `Key`'s size, not against `Plan`'s alignment.** This
+        // read `size_of::<Plan>() + align_of::<Plan>()`, which was right only
+        // while `Plan` was `align(64)` and `Key` was 24 bytes — the key hid
+        // entirely inside the alignment padding, so the padding *was* the key's
+        // cost. `0042` dropped `Iso3`'s cacheline alignment and `Plan` became
+        // `align(8)`, at which point the two stopped coinciding and the formula
+        // was measuring nothing. This is the invariant either way: an `Entry` is
+        // a `Key`, rounded up to `Plan`'s alignment, and then the `Plan`.
+        let a = align_of::<tf_tree_core::Plan>();
+        let key_padded = size_of::<super::Key>().div_ceil(a) * a;
         assert_eq!(
             size_of::<super::Entry>(),
-            size_of::<tf_tree_core::Plan>() + align_of::<tf_tree_core::Plan>(),
-            "an Entry is a Key padded to Plan's alignment plus the Plan itself"
+            key_padded + size_of::<tf_tree_core::Plan>(),
+            "an Entry is a Key padded to Plan's alignment ({}) plus the Plan \
+             itself ({}); Entry is {}",
+            key_padded,
+            size_of::<tf_tree_core::Plan>(),
+            size_of::<super::Entry>(),
         );
     }
 

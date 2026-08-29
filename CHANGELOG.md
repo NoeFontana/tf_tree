@@ -44,6 +44,40 @@ is a bug.
 
 ### Changed — breaking
 
+- **`Iso3` is 56 bytes at `align(8)`, not a padded 64-byte cacheline**
+  ([`0042`](docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)). Its
+  `_pad` field is gone and `#[repr(C, align(64))]` is now `#[repr(C)]`. Anything
+  matching on the struct's fields or relying on `size_of::<Iso3>() == 64` will
+  notice; nothing in the arena does, because nothing in the arena ever held one.
+
+  **The public surface widens with it**: `_pad` was private and was the only
+  thing preventing `Iso3 { q, t }` and exhaustive destructuring from another
+  crate. Both are supported now, which makes `Iso3` consistent with `Vec3` and
+  `Quat` — plain `repr(C)` structs with public fields — and makes a future added
+  field breaking for a second reason. Accepted deliberately; `0042` carries the
+  argument for not reaching for `#[non_exhaustive]`.
+
+  The alignment existed *"so the Phase 2 shared-memory arena can store slots
+  without re-deriving layout"*. The arena re-derived it anyway — `PoseSlot` is
+  its own `align(64)` of atomics, which it has to be for the seqlock to be sound
+  — and an `Iso3` reaches it through `to_bits`/`from_bits`. So the alignment
+  bought the arena nothing and cost every in-memory use:
+
+  | | before | after |
+  |---|---|---|
+  | `Iso3` | 64 | **56** |
+  | `Step` | 128 | **64** |
+  | `Plan` | 4160 | **2064** |
+  | plan cache, per thread | 66.0 KiB | **32.6 KiB** |
+  | `(i64, Iso3)` | 128 | **64** |
+
+  No `FORMAT_VERSION` bump, no `layout_hash` change, no C ABI change. **This is
+  a footprint change and not a latency one** — `fast-path.md` §15 already
+  measured the alignment's effect on the fold at zero, `just bench-check` holds,
+  and the control-loop reading did not regress. What it buys is that a
+  perception node with eight threads holds 261 KiB of plan cache where it held
+  528.
+
 - **`tf_tree_core::edge::ClaimRecord::last_push_nanos` is now
   `clock_offset_nanos`, and holds `wall clock - stamp` rather than the wall
   clock** (#273, [`0036`](docs/decisions/0036-the-receipt-time-the-format-already-reserved.md)).

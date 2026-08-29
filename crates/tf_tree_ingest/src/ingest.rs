@@ -126,10 +126,18 @@ use crate::{FrameId, IngestError};
 /// Bytes one buffered sample costs during pass two: an `i64` stamp beside the
 /// canonical `[f64; 7]` pose.
 ///
-/// The pose is buffered in canonical order rather than as an [`Iso3`] on
-/// purpose: `Iso3` is `align(64)`, so a `(i64, Iso3)` pair occupies **128**
-/// bytes and would double the memory this module is trying to bound. The
-/// conversion happens at the push, one sample at a time.
+/// The pose is buffered in canonical order rather than as an [`Iso3`], and the
+/// reason it was written for has since gone away. It read: *"`Iso3` is
+/// `align(64)`, so a `(i64, Iso3)` pair occupies **128** bytes and would double
+/// the memory this module is trying to bound"* — true then, and
+/// [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)
+/// dropped that alignment, so the pair is **64** bytes now and this constant
+/// would be right either way.
+///
+/// The buffer stays `[f64; 7]` regardless: it is the canonical order the push
+/// takes, so buffering it avoids a conversion per sample rather than a padding
+/// per sample. That this module had already paid to route *around* the
+/// alignment is part of why `0042` removed it.
 const SAMPLE_BYTES: u64 = 8 + 7 * 8;
 
 /// Default `--max-memory` (§3.1): 4 GiB.

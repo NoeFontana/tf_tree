@@ -67,8 +67,10 @@ fn axis_angle(theta: f64, x: f64, y: f64, z: f64) -> Quat {
 /// Returned as the pair of endpoint poses a ring would hold for two adjacent
 /// samples, which is exactly what the sampler hands `Interp::eval`.
 fn segment(theta: f64, lever: f64) -> (Iso3, Iso3) {
-    // `Iso3::new`, not a struct literal: the type carries a private `_pad` that
-    // keeps it one cacheline, and that padding is not a consumer's to fill in.
+    // `Iso3::new` rather than a struct literal. The reason written here was that
+    // the type carried a private `_pad` a consumer could not fill; `0042`
+    // removed it, so the literal compiles now. `new` stays because it is the
+    // constructor the rest of this crate uses.
     let pose_at = |a: f64| {
         Iso3::new(
             axis_angle(a, 0.0, 0.0, 1.0),

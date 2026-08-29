@@ -445,11 +445,18 @@ fn t_sample_cursor(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
 /// unchanged, because it is O(`len`) and `MAX_DEPTH` sets only the declared
 /// size.)
 ///
-/// `Step` is **128 bytes**, not the 64 it looks like, because `Step::Static`
+/// **This harness proposed `0042`, and `0042` moved its baseline.** It read:
+/// *"`Step` is 128 bytes, not the 64 it looks like, because `Step::Static`
 /// carries an `Iso3` and `Iso3` is `#[repr(C, align(64))]` with an explicit
-/// 8-byte pad. The enum discriminant then rounds the whole thing to two cache
-/// lines. So a depth-6 fold walks 768 bytes — 12 cache lines — to read six
-/// discriminants and six edge ids.
+/// 8-byte pad … a depth-6 fold walks 768 bytes — 12 cache lines"*. Half of that
+/// has since been taken: `Iso3` lost its padding, `Step` is **64 bytes**, and a
+/// depth-6 fold walks **384 bytes — 6 cache lines**.
+///
+/// So the number this example prints is no longer the bound its old text
+/// claimed. What it now bounds is the *remaining* win — going from one 64-byte
+/// `Step` per edge to one `u32` — which is a quarter of the ground it was
+/// written to survey, and worth having for exactly that reason: it says whether
+/// the second half is worth taking now that the first is done.
 ///
 /// This models the shrunken form: one `u32` per step (tag + inverted + edge or
 /// static index), so 16 steps fit in a single 64-byte line, with static poses in
@@ -458,9 +465,17 @@ fn t_sample_cursor(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
 /// to [`t_fold_replica`], so the difference between the two is the walk and
 /// nothing else.
 ///
-/// **Harness-only, deliberately.** Bounding the win costs one function; changing
-/// `Iso3`'s layout would touch a `Pod` type that the C ABI and the Python
-/// zero-copy buffers both see. Measure first.
+/// **Harness-only, deliberately** — and its stated blocker turned out to be
+/// false, which is why the layout half landed first. It read that changing
+/// `Iso3`'s layout *"would touch a `Pod` type that the C ABI and the Python
+/// zero-copy buffers both see"*. Neither sees it: the C ABI takes `&Iso3` and
+/// writes element-wise into a caller's `tft_layout`, and the Python buffers are
+/// filled the same way. `0042` checked that before moving, and found nothing
+/// outside `tf_tree_math`'s own tests depending on the type's size at all.
+///
+/// The *remaining* change — one `u32` per step with a side array of statics — is
+/// still harness-only, and now for its own reason: it changes what `Plan` is
+/// rather than how wide it is, and `Plan` is `pub`.
 fn t_fold_compact(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps: &[i64]) -> f64 {
     const DYN: u32 = 1 << 31;
     const INV: u32 = 1 << 30;

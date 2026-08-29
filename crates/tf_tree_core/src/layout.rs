@@ -2,13 +2,22 @@
 //!
 //! # Why this exists
 //!
-//! [`crate::Plan::at_many`] writes `Iso3`, which is `#[repr(C, align(64))]` and
-//! therefore **64 bytes with 8 of padding**. Every layout a consumer actually
-//! wants has a different stride: a 4x4 `f64` matrix is 128, a `[qw qx qy qz tx
-//! ty tz]` row is 56, a 3x4 `f32` affine is 48. So `&mut [Iso3]` cannot alias
-//! any of them, and a caller wanting one has to allocate an `Iso3` buffer,
-//! evaluate into it, and then convert — two passes over the data and one
-//! allocation that exists only because the shapes disagree.
+//! [`crate::Plan::at_many`] writes `Iso3`. A 4x4 `f64` matrix is 128 bytes and a
+//! 3x4 `f32` affine is 48, so `&mut [Iso3]` aliases neither, and a caller
+//! wanting one would have to allocate an `Iso3` buffer, evaluate into it, and
+//! then convert — two passes over the data and one allocation that exists only
+//! because the shapes disagree.
+//!
+//! **One of the three now coincides, and this paragraph used to say none did.**
+//! Before [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)
+//! `Iso3` was a padded 64-byte cacheline and the argument held for every layout.
+//! It is now 56 bytes in exactly `[qw qx qy qz tx ty tz]` order — the same bytes
+//! [`Layout::Quat`](crate::layout::Layout) writes — so a `[Iso3]` and a
+//! `Quat`-layout buffer are the same memory. Nothing here changes because of
+//! that: the kernels still fold into the destination, which is what the `_into`
+//! forms are for. It is recorded because the *reason* has a hole in it now, and
+//! because it makes the `Quat` kernel a candidate for a straight copy — an
+//! optimisation with its own measurement, not smuggled into a layout change.
 //!
 //! These kernels fold **directly into the destination**. `docs/PHASE3.md` §5.2's
 //! "zero copies" is not a figure of speech: there is no intermediate buffer,
@@ -44,9 +53,10 @@ pub enum Layout {
     Mat4,
     /// `[qw, qx, qy, qz, tx, ty, tz]`, `f64`. 7 elements.
     ///
-    /// The engine's own representation minus the padding, so this is the
-    /// cheapest layout to emit and the one to prefer when the consumer does not
-    /// specifically need a matrix.
+    /// **Byte-for-byte the engine's own `Iso3`** since `0042` removed its
+    /// padding — same size, same order, same alignment — so this is the cheapest
+    /// layout to emit and the one to prefer when the consumer does not
+    /// specifically need a matrix. It read "minus the padding" until then.
     Quat,
     /// Row-major 3x4 affine, `f32`. 12 elements.
     ///

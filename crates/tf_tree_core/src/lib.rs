@@ -174,8 +174,11 @@ pub use sample::ExtrapPolicy;
 /// Maximum length of a **compiled** plan: the number of [`plan::Step`] slots a
 /// [`plan::Plan`] carries, counted *after* constant folding.
 ///
-/// A slot here costs **128 bytes** — `size_of::<Step>()`, measured; the
-/// discriminant forces a second cacheline past `Iso3`'s 64 — and every `Plan`
+/// A slot here costs **64 bytes** — `size_of::<Step>()`, measured: `Iso3`'s 56
+/// plus the discriminant, rounded to `Iso3`'s 8-byte alignment. It was **128**
+/// until [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md),
+/// when `Iso3` was a padded 64-byte cacheline and the discriminant forced a
+/// second one — and every `Plan`
 /// carries `MAX_DEPTH` of them by value whatever its real length, in the facade's
 /// 16-slot thread-local plan cache and behind every Python `Plan`. That is the
 /// slot this constant prices, and it is why it is not the walk's bound: see
@@ -198,8 +201,9 @@ pub const MAX_DEPTH: usize = 32;
 /// across both sides of the lowest common ancestor before folding.
 ///
 /// A slot here is a `u32` edge id in `compile`'s stack frame: **4 bytes**, paid
-/// once, on a call D3 already places off the hot path. 128 bytes against 4 is
-/// why one number cannot price both slots.
+/// once, on a call D3 already places off the hot path. 64 bytes against 4 is
+/// why one number cannot price both slots — it was 128 against 4 before
+/// `0042`, and the argument is the same shape at either figure.
 ///
 /// Exceeding it is [`LookupError::TreeTooDeep`]; so is a path that *fits* the
 /// walk but still folds to more than [`MAX_DEPTH`] steps. The two are told apart
