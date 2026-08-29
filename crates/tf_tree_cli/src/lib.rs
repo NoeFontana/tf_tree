@@ -111,6 +111,22 @@ struct Cli {
 
 /// `--color` for `tf_tree top`.
 ///
+/// The severity floor `--exit-code` gates on.
+///
+/// **A tier rather than a second flag**, so the existing spelling keeps working:
+/// bare `--exit-code` is `--exit-code error`, which is what every current
+/// invocation means. `warn` is *warn-and-above*, so an error still fails it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ExitSeverity {
+    /// Only error-severity findings fail. On a live arena that is `TFT006` and
+    /// `TFT012` — the two faults that make lookups fail outright.
+    Error,
+    /// Warn-severity findings fail too: a dynamic edge with no live writer, an
+    /// undersized ring, rate collapse, gaps, clock skew, a slot leak, an arena
+    /// at capacity. `--suppress` silences one a fleet has decided to live with.
+    Warn,
+}
+
 /// Three states rather than a `bool`, because the useful default is neither:
 /// colour belongs on a terminal and must be absent from the file an operator
 /// pipes into a bug report, and `--color true` is not a spelling anyone reaches
@@ -192,13 +208,32 @@ enum Command {
         /// "this check did not fire" from "this build has no such check".
         #[arg(long)]
         json: bool,
-        /// Exit non-zero if any unsuppressed error-severity check fired.
+        /// Exit non-zero if any unsuppressed check at this severity or above
+        /// fired. `--exit-code` alone means `--exit-code error`.
         ///
         /// Opt-in rather than always-on because `doctor` is run by hand far more
         /// often than by CI, and a diagnostic that returns 1 breaks `&&` in an
         /// operator's shell for no benefit. A gate asks for one.
-        #[arg(long)]
-        exit_code: bool,
+        ///
+        /// # Why `warn` is worth its own tier
+        ///
+        /// Six ids carry `Error`, and on a **live** arena four of them
+        /// structurally skip — so `--exit-code error` reduces to `TFT006`
+        /// (impossible stamps) and `TFT012` (cycle or disconnected subtree).
+        /// Those are the right *errors*: both make lookups fail outright. But
+        /// almost everything an operator is paged about is `Warn` — a dynamic
+        /// edge with no live writer, an undersized ring, rate collapse, gaps,
+        /// clock skew, a slot leak, an arena at 100% capacity — and all of it
+        /// exited 0.
+        ///
+        /// The capability was already there and only the exit code was missing:
+        /// `doctor --json | jq -e '.summary.warn == 0 and .summary.error == 0'`
+        /// gates on exactly that today, and `PHASE5.md` §6 names `--json` as the
+        /// CI mode. `Report::is_healthy` was written and unit-tested for this and
+        /// had no caller. `--suppress` is the escape hatch for a warn a
+        /// particular fleet has decided to live with.
+        #[arg(long, value_name = "SEVERITY", num_args = 0..=1, default_missing_value = "error")]
+        exit_code: Option<ExitSeverity>,
         /// Remove a check from the `--exit-code` gate, by id (`--suppress TFT013`).
         ///
         /// Repeatable. A suppressed check still runs and still prints — the flag
@@ -1244,7 +1279,7 @@ fn fmt_iso(iso: &Iso3) -> String {
 fn cmd_doctor(
     live: Live<'_>,
     json: bool,
-    exit_code: bool,
+    exit_code: Option<ExitSeverity>,
     suppress: &[String],
     from_bag: Option<&std::path::Path>,
     from_file: Option<&std::path::Path>,
@@ -1344,7 +1379,17 @@ fn cmd_doctor(
         print!("{}", catalogue::render_human(&report, &meta));
     }
 
-    if exit_code && report.has_error() {
+    let gate_fired = match exit_code {
+        None => false,
+        Some(ExitSeverity::Error) => report.has_error(),
+        // `!is_healthy()`, not `count_at(Warn) > 0`: the `warn` tier is
+        // *warn-and-above*, so an error still fails it. Writing it the other way
+        // would make `--exit-code warn` pass an arena with a cycle in it as long
+        // as nothing warned, which is the one shape a severity ladder must not
+        // have.
+        Some(ExitSeverity::Warn) => !report.is_healthy(),
+    };
+    if gate_fired {
         std::process::exit(1);
     }
     Ok(())
