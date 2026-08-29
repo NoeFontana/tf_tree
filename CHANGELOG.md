@@ -262,6 +262,31 @@ is a bug.
 
 ### Fixed
 
+- **`docs/decisions/0016` is withdrawn, and the alternative that replaced it is
+  measured to be slower.** Its *Decision* named "the `Interp::eval` inner loop
+  reached from `Plan::at_many`" as the site to vectorise; its own amendment
+  proves there is no loop across stamps there, so it could not be implemented as
+  written and the `draft → ready` gate could not be met.
+
+  `-C target-cpu=x86-64-v3` was accepted as the alternative to `pulp` — free in
+  the dependency budget, same four lanes. **Measured on `at_many`, it costs
+  8–14%**: `monotone_1024` goes 271.9–275.9 µs to 299.7–308.5 µs over four
+  alternating runs, criterion reporting +8.0% and +13.6% switching to the flag
+  and −9.6% and −9.3% switching back, every one at p = 0.00. That is the
+  amendment's own §4a finding — suppressing SLP made this code ~11% *faster* —
+  arriving from the other direction: this fold does not want wider lanes, because
+  the shuffles that feed them cost more than the arithmetic saves. The flag stays
+  permitted as a named contrast and is not adopted.
+
+- **`tf_tree_math`'s docs.rs front page claimed a Miri run that has never
+  happened.** `crates/tf_tree_math/src/lib.rs` read "its property tests run under
+  Miri in seconds". `just miri` selects `-p tf_tree_arena -p tf_tree_core`, and
+  building those two produces no `tf_tree_math` test target, so
+  `tests/proptests.rs` and `tests/slerp_public.rs` are interpreted by no recipe.
+  The crate's *library* code is reached as a callee of `tf_tree_core`'s tests,
+  which is what `forbid(unsafe_code)` makes cheap — corrected to say that, on a
+  crate that publishes.
+
 - **The "inverted composed window" recorded one commit ago was the wrong
   mechanism, and the error carried the refutation in its own shape.**
   `docs/PHASE2.md` §12.3 said "only the composed path can produce it … it

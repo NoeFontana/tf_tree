@@ -1,8 +1,97 @@
 # 0016: portable SIMD, and what it costs the dependency budget
 
-**Status:** draft
+**Status:** withdrawn
 **Owner:** @NoeFontana
-**Implementation:** none yet — the spike was reverted; see *Open questions*
+**Implementation:** none, and none is planned. **This record is withdrawn**
+(2026-08-29, by the owner). The spike was reverted and is not coming back; what
+the record established is kept below and in the *Withdrawal* section, which is
+the only part a reader needs.
+
+## Withdrawal (2026-08-29)
+
+**Withdrawn rather than taken to `ready`, and the reason is in the record's own
+amendment.** `0001`'s gate requires a *Decision* that is final and a plan
+detailed enough "that the implementer does not need to invent". This record's
+Decision names "the `Interp::eval` inner loop reached from `Plan::at_many`" as
+the site to vectorise, and its own Amendment §1 then proves that loop does not
+exist: there is no loop across stamps for anything to vectorise. A record whose
+Decision names an absent site cannot be implemented as written, and rewriting it
+would be writing a different record.
+
+**What the owner decided, and it is not "no SIMD".**
+
+* **`-C target-cpu=x86-64-v3` is the accepted alternative — and it is measurably
+  the wrong trade on this workload, so it is permitted and not adopted.** It
+  costs nothing in the dependency budget and needs no amendment to `CLAUDE.md`'s
+  "do not relitigate" line. Its price was thought to be only a binary that
+  `SIGILL`s on pre-AVX2 hardware. **Measured 2026-08-29 on `at_many`, it is also
+  slower**, on an AMD EPYC-Milan (Zen 3) host with AVX2, FMA and BMI2:
+
+  | `at_many` bench | baseline | `-C target-cpu=x86-64-v3` |
+  |---|---|---|
+  | `monotone_1024` | 271.9–275.9 µs | **299.7–308.5 µs** |
+  | `into_mat4_1024` | 271.8 µs | **297.9 µs** |
+  | `into_quat_1024` | 274.4 µs | **289.0 µs** |
+
+  Four alternating runs of `monotone_1024`, criterion's own paired comparison
+  reporting **+8.0% and +13.6% on switching to the flag and −9.6% and −9.3% on
+  switching back, every one at p = 0.00**. The intervals do not overlap, and the
+  alternation is what rules out the thermal drift an unpaired pair would have
+  been indistinguishable from.
+
+  **This is the amendment's own finding arriving from the other direction.**
+  §4a recorded that *suppressing* SLP vectorisation made this code ~11% faster;
+  widening the lanes costs 8–14%. Both say the same thing: the shuffle traffic
+  needed to feed wider vectors exceeds what the arithmetic saves here, so this
+  fold does not want more lanes. That is also the strongest available answer to
+  the `pulp` question, since `pulp` would have bought the same four lanes through
+  a dependency.
+
+  So the flag stays a *named contrast* available to whoever measures a workload
+  where it wins — never ambient: not in `.cargo/config.toml`, and **not** in
+  `wheels.yml`, whose `x86_64` manylinux and musllinux rows are the only machine
+  code this project ships to strangers.
+* **`pulp` is not rejected in principle; it is rejected on the evidence
+  available.** The owner's condition was "fine if we show it noticeably improves
+  performance", and the headline that motivated this record does not survive its
+  own amendment: the 31% was measured against a baseline that was never scalar —
+  it is 2-lane SLP with the shuffles already paid — which puts the gain nearer
+  ~12% of the step, on `at_many` only, against `tf_tree_math` going from 2
+  dependencies to 11. Reopening needs a measurement that clears that bar, not a
+  new argument.
+* **The unused `num-complex` transitive** was the owner's other objection and is
+  moot at this disposition. Nothing in `deny.toml` would have rejected it — its
+  `[bans]` names exactly three crates and has no rule about unused transitives —
+  so it was a budget-philosophy objection, and the budget stands unamended.
+
+**The one durable finding, which outlives the record.** Question 4 asked what
+replaces Miri's coverage of a wide path. Under `-C target-cpu` the answer is
+**nothing is lost**: Miri interprets MIR, `target-cpu` is a backend flag, and
+there is no `cfg(target_feature)`, `core::arch` or `std::arch` anywhere in
+`crates/*/src`, so the MIR Miri sees is identical and its UB coverage is
+unchanged. What `pulp` would have removed was interpretation of *its own*
+`unsafe`, and that dies with the dependency.
+
+**What the widened codegen does create is different in kind, and is not
+covered.** Every bit-identity harness this repository owns compares within one
+build — `crates/tf_tree/tests/batch.rs` compares batch against scalar in the
+*same* binary — so nothing here can observe arithmetic moving when the codegen
+moves. Anyone adopting the flag owes a **cross-build** differential, and it must
+carry a non-vacuity guard, because two identical codegens agree trivially: this
+record's own words about the spike were "without that guard the whole exercise is
+vacuous. Any implementation must keep it." Counting `%ymm` in the disassembly —
+zero at baseline, non-zero under the flag — is the guard that shows the two
+builds really differ.
+
+**Corrected on the way out.** `crates/tf_tree_math/src/lib.rs` claimed its
+"property tests run under Miri in seconds". They do not, and never have: `just
+miri` selects `-p tf_tree_arena -p tf_tree_core`, which builds no `tf_tree_math`
+test target, so `tests/proptests.rs` and `tests/slerp_public.rs` are interpreted
+by no recipe. The crate's *library* code is reached as a callee of
+`tf_tree_core`'s tests, which is what `forbid(unsafe_code)` makes cheap. That
+sentence was on a published crate's docs.rs front page.
+
+---
 
 ## Context
 
