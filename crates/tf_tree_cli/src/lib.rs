@@ -636,6 +636,21 @@ pub struct IngestArgs {
         default_value_t = tf_tree_ingest::DEFAULT_MAX_CHUNK_EXPANSION_RATIO
     )]
     pub max_chunk_expansion: u64,
+    /// Largest top-level record body the reader will allocate for, in MiB.
+    ///
+    /// A guard against a corrupt or hostile length read straight off disk, not a
+    /// statement about what a legitimate recording may contain. Raise it for a
+    /// recording with unusually large *attachments*, which are top-level records
+    /// too: the reader has no opcode-based skip, so one oversized attachment
+    /// stops the whole ingest rather than being passed over.
+    ///
+    /// Derived from the library constant so the two cannot drift.
+    #[arg(
+        long,
+        value_name = "MIB",
+        default_value_t = tf_tree_ingest::DEFAULT_MAX_RECORD_BYTES / (1024 * 1024)
+    )]
+    pub max_record_size: u64,
     /// Where to put §3.1's temporary run file. Defaults to the system temporary
     /// directory.
     ///
@@ -685,6 +700,7 @@ impl Default for IngestArgs {
             clock_reset_threshold: DEFAULT_CLOCK_RESET_THRESHOLD_MS,
             max_chunk_size: tf_tree_ingest::DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES / (1024 * 1024),
             max_chunk_expansion: tf_tree_ingest::DEFAULT_MAX_CHUNK_EXPANSION_RATIO,
+            max_record_size: tf_tree_ingest::DEFAULT_MAX_RECORD_BYTES / (1024 * 1024),
             spill_dir: None,
         }
     }
@@ -755,6 +771,9 @@ impl IngestArgs {
         if self.max_chunk_expansion != d.max_chunk_expansion {
             out.push("--max-chunk-expansion");
         }
+        if self.max_record_size != d.max_record_size {
+            out.push("--max-record-size");
+        }
         if self.spill_dir != d.spill_dir {
             out.push("--spill-dir");
         }
@@ -795,6 +814,8 @@ impl IngestArgs {
             // refuses every recording.
             max_chunk_uncompressed_bytes: self.max_chunk_size.saturating_mul(1024 * 1024),
             max_chunk_expansion_ratio: self.max_chunk_expansion,
+            // `saturating_mul` for the same reason as the chunk ceiling above.
+            max_record_bytes: self.max_record_size.saturating_mul(1024 * 1024),
             spill_dir: self.spill_dir.clone(),
         })
     }

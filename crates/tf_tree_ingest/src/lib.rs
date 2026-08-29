@@ -119,10 +119,10 @@ pub mod tft;
 pub use ingest::{
     fill, survey, Anomalies, ClockResetPolicy, EdgeSurvey, FillStats, Frames, IngestOptions,
     Survey, DEFAULT_FUTURE_HORIZON_NS, DEFAULT_MAX_CHUNK_EXPANSION_RATIO,
-    DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES, DEFAULT_MAX_MEMORY_BYTES,
+    DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_RECORD_BYTES,
 };
 pub use report::IngestReport;
-pub use source::{ChunkPolicy, OnBadChunk, TopicRoles};
+pub use source::{OnBadChunk, ReadPolicy, TopicRoles};
 
 /// An index into [`Frames`], which is how a `Copy` error names a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -159,6 +159,30 @@ pub enum IngestError {
     /// The file is not a well-formed MCAP.
     #[error("the file is not a well-formed MCAP recording")]
     Mcap,
+    /// A top-level record declared a body larger than the reader will allocate
+    /// for — [`IngestOptions::max_record_bytes`], `--max-record-size` at the CLI.
+    ///
+    /// **A variant of its own rather than [`IngestError::Mcap`], because the two
+    /// conditions want opposite things from the reader.** "Not a well-formed
+    /// MCAP" sends somebody hunting for corruption; this file may be perfectly
+    /// well formed and merely carry a record — an attachment, most likely —
+    /// bigger than a *policy* number the caller chose. Carrying `declared` is
+    /// what makes the remedy computable rather than guessable: the number to
+    /// pass to `--max-record-size` is in the error.
+    ///
+    /// `Copy` and `String`-free like every error in this workspace
+    /// (`docs/PROJECT.md` §5, D11).
+    #[error(
+        "a record declared {declared} bytes, over the {ceiling}-byte ceiling; \
+         raise --max-record-size"
+    )]
+    RecordTooLarge {
+        /// The length the record header declared.
+        declared: u64,
+        /// The ceiling it was measured against, so the message is self-contained
+        /// and a caller does not have to know which knob was in force.
+        ceiling: u64,
+    },
     /// The file is a SQLite database — almost certainly a rosbag2 `.db3` bag,
     /// which §3.3 lists as a source and which this crate does not read.
     ///
