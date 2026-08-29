@@ -585,6 +585,17 @@ typedef struct {
 } tft_bridge_stats;
 #endif
 
+/**
+ * How [`tft_tree_inherit_ownership`] resolved. Mirrors `tf_tree::Inheritance`.
+ *
+ * **A value you do not recognise means *this process is not the owner*.** The
+ * Rust enum is `#[non_exhaustive]`, so a future variant can appear here, and a
+ * `switch` that falls off its cases must treat that as "keep behaving as a
+ * plain participant" — which is never wrong, because inheriting is an
+ * escalation and not a requirement. Only `TFT_INHERITED` says otherwise.
+ */
+typedef uint8_t tft_inheritance;
+
 #if defined(TFT_HAVE_BRIDGE)
 /**
  * Which rung of §5.5's ladder concluded that the clock moved.
@@ -892,6 +903,33 @@ typedef int32_t tft_bridge_evidence;
  */
 #define TFT_BRIDGE_EVIDENCE_COMMON_MODE 2
 #endif
+
+/**
+ * This process is now the owner and is serving the rendezvous.
+ */
+#define TFT_INHERITED 0
+
+/**
+ * The owner is alive. Nothing was attempted.
+ */
+#define TFT_OWNER_ALIVE 1
+
+/**
+ * Another survivor won the ownership byte and is binding. This process kept
+ * its slot and keeps reading; it will be told again if that survivor dies too.
+ */
+#define TFT_CONTENDED 2
+
+/**
+ * A read-only attachment cannot serve, so it cannot be the heir (D18).
+ */
+#define TFT_READ_ONLY 3
+
+/**
+ * Nothing to inherit from: a heap tree, a frozen `.tft`, or a tree this
+ * process already owns.
+ */
+#define TFT_NOT_APPLICABLE 4
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
@@ -1400,6 +1438,132 @@ tft_status tft_tree_frame_name(const tft_tree *tree, uint32_t id, char *buf, siz
  * `tree` must be a live handle. `out` must point to 16 writable bytes.
  */
 tft_status tft_tree_instance_uuid(const tft_tree *tree, uint8_t *out);
+
+#if defined(TFT_HAVE_SHM)
+/**
+ * Join a shared arena by name, **read-write** if asked.
+ *
+ * **`tft_tree_open` is the whole of the frozen tier's opening surface, and it
+ * is `tf_tree::open()` — read-only, name from `$TF_TREE_ARENA`.** So until this
+ * existed a C or C++ consumer could only ever hold a read-only attachment, and
+ * [`tft_tree_inherit_ownership`] would answer `TFT_READ_ONLY` every time: an
+ * owner writes the participant table on every grant and a `PROT_READ` mapping
+ * cannot, which is D18 working. The recovery entry points beside this one are
+ * decoration without it, and that was found while writing their test rather
+ * than while writing their record
+ * ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+ *
+ * * `name` — NULL for the environment's default, exactly as `tft_tree_open`
+ *   resolves it. A named arena is what a robot with more than one tree has.
+ * * `read_write` — `false` is the consumer default and stays the right choice
+ *   for anything that only reads (D18: the MMU, not convention, is what stops a
+ *   consumer corrupting a robot's transform tree). Pass `true` only for a
+ *   process that publishes, reaps, or must be able to inherit the owner role.
+ *
+ * **It never creates.** `CreatePolicy::Never`, because creating needs a layout
+ * and there is no way to express one across this boundary — a C creator is
+ * `tft_bridge_create`, which brings its own topology. A missing arena is
+ * `TFT_ERR_ARENA_UNAVAILABLE`, not an empty tree.
+ *
+ * # Safety
+ *
+ * `name` must be NULL or a NUL-terminated string valid for the call; `out` must
+ * point to a writable `*mut tft_tree`.
+ */
+tft_status tft_tree_open_named(const char *name,
+                               bool read_write,
+                               tft_tree **out);
+#endif
+
+#if defined(TFT_HAVE_SHM)
+/**
+ * Has the process that owns this arena gone away (`docs/PHASE2.md` §3.5)?
+ *
+ * One non-blocking `poll` of the attach socket, plus — only once that reports a
+ * hangup — one `F_OFD_GETLK` on the ownership byte. So it answers *"the arena
+ * has no owner"*, not *"my socket is dead"*, and a survivor that did not
+ * inherit stops being told to try
+ * ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
+ * `false` for anything that is not a joined rendezvous attachment.
+ *
+ * Pair it with [`tft_tree_inherit_ownership`] in your own loop — there is no
+ * background thread and no daemon, per `0019`, so **nothing calls this for
+ * you**, and an arena whose survivors never call it stays ownerless.
+ *
+ * # Safety
+ *
+ * `tree` must be NULL or a live handle; `out` must be a writable `bool`.
+ */
+tft_status tft_tree_owner_lost(const tft_tree *tree,
+                               bool *out);
+#endif
+
+#if defined(TFT_HAVE_SHM)
+/**
+ * Inherit the owner role from a departed owner and begin serving
+ * (`docs/PHASE2.md` §3.5).
+ *
+ * **This is the call an all-C++/Python fleet did not have.** Until it existed,
+ * an arena whose owner was `SIGKILL`ed could not be rejoined by anything: the
+ * survivors keep their participant bytes, §3.4's split-brain check refuses
+ * every new create with `TFT_ERR_ARENA_UNAVAILABLE`, and the only thing that
+ * ends that state was a Rust method. The documented recovery was to stop every
+ * attached process
+ * ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+ *
+ * Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. **Anything
+ * but `TFT_INHERITED` means this process is not the owner, and none of them is
+ * a reason to stop reading** — lookups are unaffected by ownership in every one
+ * of these states, and unaffected *during* a takeover as well.
+ *
+ * On failure the process keeps its participant slot, its byte and its mapping,
+ * and gives back the ownership byte if it had taken one — so a failed attempt
+ * leaves a plain participant rather than an arena with an owner that is not
+ * serving.
+ *
+ * # Safety
+ *
+ * `tree` must be NULL or a live handle; `out` must be a writable
+ * `tft_inheritance`.
+ */
+tft_status tft_tree_inherit_ownership(const tft_tree *tree,
+                                      tft_inheritance *out);
+#endif
+
+#if defined(TFT_HAVE_SHM)
+/**
+ * Collect what dead participants left behind, and report how many records were
+ * freed.
+ *
+ * Both sweeps, summed: the claim leases no live process holds
+ * (`Tree::reap_dead`) and the participant records whose lock bytes the kernel has
+ * released (`Tree::reap_participants`). They differ in which arena table they
+ * walk, and a caller in C has no basis to choose between them — the Rust
+ * surface keeps them separate for a supervisor that does.
+ *
+ * **The name overlaps a narrower Rust one on purpose, and it is worth knowing
+ * which you have.** `tf_tree::Tree::reap_dead` is the *claim* sweep alone;
+ * this is that plus `reap_participants`. Two functions here would be two
+ * things a C caller has to learn the difference between in order to call both
+ * of them every time.
+ *
+ * **Most of the time there is nothing to do, and that is the design.** The
+ * owner's socket-hangup callback already revokes a dead participant's claims
+ * and frees its record, so an ordinary killed-and-restarted publisher needs no
+ * reaper. Two producers have no hangup for anyone to observe — a dead **owner**,
+ * and a `TreeBuilder::build_shared` participant with no socket — and this is
+ * their only collector.
+ *
+ * Returns `0` written to `out` for a read-only tree, a heap tree, or a tree
+ * with no rendezvous: none of them can prove a holder is gone, and none of them
+ * may write the arena.
+ *
+ * # Safety
+ *
+ * `tree` must be NULL or a live handle; `out` must be a writable `uint32_t`.
+ */
+tft_status tft_tree_reap_dead(const tft_tree *tree, uint32_t *out);
+#endif
 
 #ifdef __cplusplus
 }  /* extern "C" */

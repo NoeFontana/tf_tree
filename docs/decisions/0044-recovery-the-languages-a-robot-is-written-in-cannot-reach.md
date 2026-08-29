@@ -81,15 +81,41 @@ The stable ABI is frozen at 1.0 (`docs/PHASE4.md` §7), so these are declared in
 `tf_tree_unstable.h`, which is where a surface that may still move belongs:
 
 ```c
+tft_status tft_tree_open_named(const char *name, bool read_write, tft_tree **out);
 tft_status tft_tree_owner_lost(const tft_tree *tree, bool *out);
-tft_status tft_tree_inherit_ownership(tft_tree *tree, tft_inheritance *out);
+tft_status tft_tree_inherit_ownership(const tft_tree *tree, uint8_t *out);
 tft_status tft_tree_reap_dead(const tft_tree *tree, uint32_t *out);
 ```
 
-`tft_inheritance` mirrors `Inheritance`'s five variants as a `uint8_t` enum.
-`tft_tree_reap_dead` is `Tree::reap()` plus `Tree::reap_participants()`, summed —
-a binding caller wants "collect what the dead left", not a choice between two
-sweeps whose difference is which table they walk.
+`tft_tree_reap_dead` is `Tree::reap_dead()` plus `Tree::reap_participants()`,
+summed — a binding caller wants "collect what the dead left", not a choice
+between two sweeps whose difference is which arena table they walk.
+
+> **Amendment (2026-08-29), made while implementing: `tft_tree_open_named` was
+> not in this record and the other three are decoration without it.**
+> `tft_tree_open(tft_tree **out)` is the **entire** arena-opening surface of the
+> C ABI, and it is `tf_tree::open()` — read-only, with the name taken from
+> `$TF_TREE_ARENA`. `rg 'AttachMode::ReadWrite' crates/tf_tree_c/src/lib.rs`
+> returns nothing. So a C or C++ consumer could only ever hold a read-only
+> attachment, and `tft_tree_inherit_ownership` would answer `TFT_READ_ONLY`
+> every single time: an owner writes the participant table on every grant and a
+> `PROT_READ` mapping cannot, which is D18 working rather than failing.
+>
+> This record's Context said the recovery *methods* were unreachable. They were,
+> and so was the only state from which any of them does anything. Found by the C
+> test failing to compile against a signature that did not exist, which is where
+> it should be found.
+>
+> `tft_tree_open_named` never creates (`CreatePolicy::Never`): creating needs a
+> layout and there is no way to express one across this boundary — a C creator is
+> `tft_bridge_create`, which brings its own topology.
+>
+> **`tft_inheritance` is a `typedef uint8_t`, not an enum, and it is not tiered
+> as a symbol.** `xtask headers` tiers *functions*, and a bare type alias listed
+> there is rejected as naming no exported function while an unlisted one lands
+> in **both** generated headers — which §3.1 forbids, because the split is the
+> stability promise. Listing the five constants is what pulls the typedef into
+> the unstable header alone.
 
 ### 3. Python
 
@@ -158,9 +184,19 @@ caller cannot obtain is surface for its own sake.
    bench-check` against the committed baseline, reported rather than assumed.
 2. A test that a `Guard` may be outstanding across `inherit_ownership`, which is
    the §3.5 qualification this removes and does not compile before step 1.
-3. The three C entry points plus `tft_inheritance`, in the unstable header.
-   Verified by a C test that kills an owner and inherits from C — the thing that
-   fails today — and by `just c-header-check`.
+3. **`tft_tree_open_named`** plus the three recovery entry points and the five
+   `tft_inheritance` constants, in the unstable header. Verified by
+   `crates/tf_tree_c/tests/recovery.rs`, which spawns an owner process, joins it
+   **read-write from C**, kills it, and recovers — the thing that fails today,
+   and fails at the point where the symbols do not exist. Also by
+   `just c-header-check`.
+
+   One assertion in that test was wrong on the first run and the code was right:
+   after the owner dies, `tft_tree_reap_dead` collects **one** record — the dead
+   owner's own. Nothing hangs up on an owner, so its `LIVE` record over a
+   kernel-released byte is one of the exactly two states the hangup callback
+   cannot reach, and it is the case this entry point exists for. The test
+   asserts `1` and then `0` rather than "some number".
 4. The three Python methods. Verified by a pytest reproducing step 3 through
    Python.
 5. `docs/API.md` §3/§4, `docs/PHASE2.md` §3.5's qualification, and

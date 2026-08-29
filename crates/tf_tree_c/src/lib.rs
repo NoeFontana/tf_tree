@@ -100,6 +100,11 @@ pub use unstable::{
     tft_plan_at_with_derivatives, tft_tree_edge_count, tft_tree_frame_count, tft_tree_frame_name,
     tft_tree_instance_uuid, TFT_TWIST_BYTES,
 };
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use unstable::{
+    tft_tree_inherit_ownership, tft_tree_open_named, tft_tree_owner_lost, tft_tree_reap_dead,
+    TFT_CONTENDED, TFT_INHERITED, TFT_NOT_APPLICABLE, TFT_OWNER_ALIVE, TFT_READ_ONLY,
+};
 
 use error::{amend_error, guard, record_lookup, set_error};
 

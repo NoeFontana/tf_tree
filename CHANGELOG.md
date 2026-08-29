@@ -33,6 +33,41 @@ is a bug.
 
 ## [Unreleased]
 
+### Added
+
+- **Recovery from C, and a read-write attachment to recover *with*.**
+  [`0044`](docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md).
+  `docs/PHASE2.md` §3.5's ownership migration and the reapers were Rust-only, so
+  an all-C++/Python fleet whose arena owner was `SIGKILL`ed **could not rejoin
+  it**: survivors keep their participant bytes, §3.4's split-brain check refuses
+  every new create, and the documented recovery was to stop every attached
+  process. ROS 2 nodes are written in C++ and Python.
+
+  New in the **unstable** tier (`tf_tree_unstable.h`), because §3.5's protocol
+  is days old and the frozen header is a promise about a decade:
+  `tft_tree_open_named`, `tft_tree_owner_lost`, `tft_tree_inherit_ownership`,
+  `tft_tree_reap_dead`, and the five `TFT_INHERITED`…`TFT_NOT_APPLICABLE`
+  values.
+
+  **`tft_tree_open_named` was not in the record and the other three are
+  decoration without it.** `tft_tree_open(out)` was the entire arena-opening
+  surface of the C ABI and it is `tf_tree::open()` — read-only, name from the
+  environment — so a C consumer could only ever hold a `PROT_READ` mapping and
+  `tft_tree_inherit_ownership` would answer `TFT_READ_ONLY` every time. Found by
+  the C test failing to compile against a signature that did not exist.
+
+### Changed
+
+- **`Tree::inherit_ownership` takes `&self`.** A relaxation, so every existing
+  caller still compiles. It took `&mut self`, which both bindings cannot satisfy
+  — they hold the tree in an `Arc` and `Arc::get_mut` fails as soon as any plan
+  or publisher holds a clone — and which cost `docs/PHASE2.md` §3.5 a
+  caller-side qualification: the inheriting handle's own `Guard<'_>` could not
+  be outstanding across the call, so a control loop had to arrange recovery
+  between cycles. Both are gone. The attachment moved behind a `Mutex`, which
+  the read path never touches: `Plan::at` lives in `tf_tree_core` and cannot
+  name the field.
+
 ### Fixed
 
 - **An exact query returns the pose of the stamp it named, or refuses.**

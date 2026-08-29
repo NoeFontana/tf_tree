@@ -248,6 +248,21 @@ const UNSTABLE: &[&str] = &[
     "tft_tree_edge_count",
     "tft_tree_frame_name",
     "tft_tree_instance_uuid",
+    // Recovery — `docs/decisions/0044`. **Unstable on purpose, and the reason is
+    // the age of what they expose rather than the shape of the calls.** §3.5's
+    // ownership migration shipped on 2026-08-28 and has already produced one
+    // outcome its own record did not predict (`0043`'s three-outcome table);
+    // the stable header is a promise about a decade. `tft_tree_plan_in_domain`
+    // went into the frozen tier because it is a query shape, not a protocol.
+    "TFT_INHERITED",
+    "TFT_OWNER_ALIVE",
+    "TFT_CONTENDED",
+    "TFT_READ_ONLY",
+    "TFT_NOT_APPLICABLE",
+    "tft_tree_open_named",
+    "tft_tree_owner_lost",
+    "tft_tree_inherit_ownership",
+    "tft_tree_reap_dead",
     // The ROS 2 ingest-bridge seam — `docs/PHASE4.md` §5, compiled only under
     // `--features bridge` and therefore emitted inside `#if
     // defined(TFT_HAVE_BRIDGE)`. **Unstable on purpose**: §5 is the half of
