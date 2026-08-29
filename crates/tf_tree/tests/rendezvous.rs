@@ -4238,31 +4238,34 @@ fn two_survivors_race_and_exactly_one_inherits() {
         "expected exactly one heir, got A={oa} B={ob} (two would be split brain)"
     );
 
-    // **The loser has two correct answers, and which one it gives is the
-    // scheduler's business.** `0043` made `owner_lost` ask the kernel whether
-    // byte 0 is held before answering, so a survivor that polls *after* the
-    // winner took the byte reports `false OwnerAlive` and never attempts the
-    // lock at all; one that polls inside the window still sees the byte free,
-    // attempts, and is told `true Contended`. Both are the survivor correctly
-    // observing the state it found. Before `0043` only the second was reachable
-    // — and it was also permanent, which is that record's subject and
-    // `a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone`'s.
+    // **The other survivor has three correct answers, and which one it gives is
+    // the scheduler's business.** `0043` made `owner_lost` ask the kernel
+    // whether byte 0 is held before answering, and the child reports two values
+    // sampled at two instants — `owner_lost()` first, then whatever
+    // `inherit_ownership()` decided, which re-evaluates the same predicate. So:
     //
-    // What must hold either way: the loser is *told*, rather than handed an
-    // error, and it saw a hangup exactly when it acted on one.
-    let loser = if oa == "Inherited" {
-        (&ob, &rb)
-    } else {
-        (&oa, &ra)
-    };
+    // * `true Contended` — polled while the byte was free, attempted, lost the
+    //   race. The only outcome reachable before `0043`, and it was *permanent*,
+    //   which is that record's subject.
+    // * `false OwnerAlive` — polled after the winner took the byte; never
+    //   attempted the lock at all, which is the cost `0043` removes.
+    // * `true OwnerAlive` — polled while the byte was free, and the winner took
+    //   it in between. **This one is a consequence of `0043` that its record did
+    //   not predict**, and `ubuntu-24.04-arm` found it where x86-64 had not: two
+    //   observations at two instants, and a takeover fits between them.
+    //
+    // Pairing the two values was the mistake. They are not one observation, so
+    // what this asserts is only what is actually invariant: the survivor is
+    // *told* rather than handed an error, whichever instant it looked at.
+    let loser = if oa == "Inherited" { &ob } else { &oa };
     assert!(
-        (loser.0 == "Contended" && loser.1.starts_with("true "))
-            || (loser.0 == "OwnerAlive" && loser.1.starts_with("false ")),
-        "the survivor that did not inherit must be told so, and its hangup \
-         verdict must match what it did: A={ra} B={rb}"
+        loser == "Contended" || loser == "OwnerAlive",
+        "the survivor that did not inherit must be told so, not handed an \
+         error: A={ra} B={rb}"
     );
 
-    // The winner did see a hangup — the trigger is a kernel fact.
+    // The winner did see a hangup — for it the two instants cannot disagree,
+    // because it is the process that took the byte.
     let winner = if oa == "Inherited" { &ra } else { &rb };
     assert!(
         winner.starts_with("true "),

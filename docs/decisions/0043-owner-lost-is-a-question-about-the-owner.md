@@ -156,6 +156,25 @@ consults it does not stop it lying.
   cycle and `true` on the next, because the kernel frees the byte. The opposite
   error — a false `true` — is the one that sends two processes at one role, and
   this record removes rather than adds paths to it.
+- **A survivor that does not inherit now has *three* correct outcomes where it
+  had one, and the third was found by `ubuntu-24.04-arm` after this record was
+  written.** `inherit_ownership` re-evaluates `owner_lost` internally, so a
+  caller that polls and then inherits takes **two** observations at two instants,
+  and a takeover fits between them:
+
+  | poll | inherit | when |
+  |---|---|---|
+  | `true` | `Contended` | byte free at both instants; attempted and lost the race |
+  | `false` | `OwnerAlive` | byte already held at the poll; never attempted |
+  | `true` | `OwnerAlive` | byte free at the poll, taken before the attempt |
+
+  Before this record only the first was reachable, because the socket poll gave
+  the same answer twice. All three are the survivor correctly describing what it
+  found, and none of them costs an `F_OFD_SETLK` after the first cycle.
+  `two_survivors_race_and_exactly_one_inherits` had been amended to accept the
+  first two and to require the poll and the outcome to *agree* — which is not an
+  invariant, since they are not one observation. The x86-64 host never produced
+  the third; the aarch64 runner did on the first run.
 - **`Inheritance::Contended` gets rarer, and this was found by a test failing
   rather than by writing it down here first.** A survivor that evaluates
   `owner_lost` *after* the winner has taken byte 0 now sees a held byte, answers
