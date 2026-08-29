@@ -25,9 +25,9 @@
 //! join-claiming -> "claimed <edge>", then parks holding it
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
 //! hold-topo <lock> -> "holding-topo", then parks holding A2's topology byte
-//! join-heir     -> "joined <slot>", then on stdin:  (arm §11.3's takeover
-//!                  crash point with TF_TREE_CRASH_AT to kill it mid-inherit)
-//!                  "<owner_lost> <inheritance> <slot>", then parks —
+//! join-heir     -> "joined <slot>", then one line per stdin poke:  (arm
+//!                  §11.3's takeover crash point with TF_TREE_CRASH_AT to kill
+//!                  it mid-inherit) "<owner_lost> <inheritance> <slot>" —
 //!                  serving, if it inherited (§3.5)
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
@@ -305,14 +305,23 @@ fn main() {
             // on, and the one the deleted arm could not hold.
             say(&format!("joined {}", tree.participant_slot()));
 
+            // One report per poke, rather than one and then `park`. A loser
+            // needs to be asked twice — once for the race it lost, once for
+            // whether it is *still* being told the owner is gone
+            // (`docs/decisions/0043`) — and the winner keeps serving across a
+            // blocking read exactly as it did across a `park`, because what
+            // serves is the tree this scope holds.
+            let stdin = std::io::stdin();
             let mut line = String::new();
-            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).expect("read");
-            let lost = tree.owner_lost();
-            let outcome = match tree.inherit_ownership() {
-                Ok(o) => format!("{o:?}"),
-                Err(e) => format!("error {e}"),
-            };
-            say(&format!("{lost} {outcome} {}", tree.participant_slot()));
+            while std::io::BufRead::read_line(&mut stdin.lock(), &mut line).unwrap_or(0) > 0 {
+                line.clear();
+                let lost = tree.owner_lost();
+                let outcome = match tree.inherit_ownership() {
+                    Ok(o) => format!("{o:?}"),
+                    Err(e) => format!("error {e}"),
+                };
+                say(&format!("{lost} {outcome} {}", tree.participant_slot()));
+            }
             loop {
                 std::thread::park();
             }

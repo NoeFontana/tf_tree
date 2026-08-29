@@ -33,6 +33,41 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Tree::owner_lost` answers a question about the owner, not about this
+  process's socket** ([`0043`](docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
+  It polled only the attach socket, which points at the dead owner and stays hung
+  up for the life of the process — so after any takeover **every survivor but the
+  winner was told `true` forever**, and `docs/PHASE2.md` §3.5's recommended loop
+  re-attempted an `F_OFD_SETLK` on byte 0 every control cycle. On a fleet of *N*
+  read-write survivors that is *N−1* processes doing a syscall per cycle, in the
+  loop this library exists to keep quiet, to be told each time that somebody else
+  owns the arena. A hangup is now followed by `F_OFD_GETLK` on byte 0 of the lock
+  file the session already holds, so *role taken or mid-bind* separates from
+  *role vacant*. **The healthy path is unchanged** — one non-blocking `poll` that
+  answers `false`, no probe — and a survivor that stopped calling **starts again
+  by itself** if the new owner dies too, which is why latching was never the fix.
+  `docs/RUNBOOK.md` says to delete any latch written to work around the old
+  behaviour.
+
+  Two things it does **not** do. §3.5's literal *"retry connect with backoff"* is
+  still not implemented: it needs a new wire message, because §3.5 requirement 2
+  forbids a survivor from registering a second time, and its only remaining
+  benefit is that the new owner learns of that participant's death promptly —
+  the byte-keyed collectors still reclaim its slot, a grant or a sweep later.
+  And one *correct* behaviour changed observably: a survivor that evaluates
+  `owner_lost` after the winner took byte 0 now reports
+  `Inheritance::OwnerAlive` where it reported `Contended`, having never attempted
+  the lock. `Contended` remains reachable for a genuine tie.
+
+### Added
+
+- **`tf_tree_ipc::Session::ownership_held`** — does anyone *else* hold the
+  ownership byte, from `F_OFD_GETLK` on the description the session already
+  holds. The second half of the question above. A description never conflicts
+  with itself, so an owner asking gets `false`; it is not "am I the owner".
+
 ### Changed — documentation
 
 - **`README.md` is restructured around evaluating and installing the project**,
