@@ -570,9 +570,22 @@ impl Tree {
     /// byte if it had taken one — so a failed inheritance leaves a plain
     /// participant and lets another survivor try, rather than an arena with an
     /// owner that is not serving.
+    ///
+    /// # It takes `&self`, and that is what makes it reachable at all
+    ///
+    /// It took `&mut self` until 2026-08-29, which cost two things
+    /// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+    /// `docs/PHASE2.md` §3.5 had to carry a caller-side qualification — the
+    /// inheriting handle's own `Guard<'_>` could not be outstanding across the
+    /// call, so a control loop had to arrange recovery *between* cycles. And
+    /// **both bindings could not call it at all**: `tft_tree` holds an
+    /// `Arc<TreeShare>` and `PyTree` the `Arc<Tree>` that `Tree::claim_owned`
+    /// requires, and `Arc::get_mut` fails the moment any plan or publisher holds
+    /// a clone — which, in a binding, is always. So §3.5's recovery was
+    /// unreachable from the languages a robot's nodes are written in.
     #[cfg(all(feature = "shm", target_os = "linux"))]
-    pub fn inherit_ownership(&mut self) -> Result<Inheritance, OpenError> {
-        if !matches!(self.attachment_ref(), Some(Attachment::Joined { .. })) {
+    pub fn inherit_ownership(&self) -> Result<Inheritance, OpenError> {
+        if !self.is_joined() {
             return Ok(Inheritance::NotApplicable);
         }
         if !self.owner_lost() {

@@ -2448,6 +2448,58 @@ fn a_reaper_does_not_reap_its_own_live_claim() {
     );
 }
 
+/// **A `Guard` may be outstanding across `inherit_ownership`**, which is the one
+/// caller-side qualification `docs/PHASE2.md` §3.5 carried and
+/// [`0044`](../../../docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)
+/// removes.
+///
+/// §3.5 said: *"`inherit_ownership` takes `&mut self`, so the inheriting
+/// handle's own `Guard<'_>` cannot be outstanding across the call."* That is a
+/// real cost to a control loop, which holds one guard per cycle covering every
+/// query it makes — recovery had to be arranged for *between* cycles rather than
+/// wherever it was convenient. The attachment lives behind a `Mutex` now, so the
+/// method takes `&self` and the borrow no longer conflicts.
+///
+/// **This is a compile-time property, so the test is that it builds**; the
+/// assertions only stop it being optimised into nothing.
+///
+/// **Mutant, run:** revert `inherit_ownership` to `&mut self`. This file stops
+/// compiling — `E0596`, because the binding is not `mut`; add `mut` to it and
+/// the error becomes `E0502: cannot borrow tree as mutable because it is also
+/// borrowed as immutable`, which is the conflict §3.5 was describing. Both were
+/// produced, because the note first claimed `E0502` and the compiler says
+/// `E0596` first.
+#[test]
+fn a_guard_may_be_held_across_inheriting_ownership() {
+    use tf_tree::{AttachMode, Inheritance};
+    use tf_tree_ipc::CreatePolicy;
+
+    let scratch = Scratch::new("guard-across");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    let tree = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Never)
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("join the owner's arena");
+
+    owner.kill();
+
+    // The guard is taken *before* the call and used *after* it. That is the
+    // shape a control loop has, and it is what `&mut self` forbade.
+    let g = tree.guard();
+    let outcome = tree.inherit_ownership().expect("inherit");
+    assert_eq!(
+        outcome,
+        Inheritance::Inherited,
+        "the sole read-write survivor should have taken the vacant role"
+    );
+    assert!(tree.frame("map").is_ok(), "the arena went away");
+    drop(g);
+}
+
 /// **A killed publisher's claims are revoked by the owner, with nobody calling
 /// a reaper.**
 ///
@@ -4503,7 +4555,7 @@ fn a_read_only_survivor_reports_that_it_cannot_inherit() {
     assert!(owner.line().starts_with("owning"));
 
     // This process is the read-only survivor.
-    let mut ro = tf_tree::Open::new()
+    let ro = tf_tree::Open::new()
         .mode(AttachMode::ReadOnly)
         .create(CreatePolicy::Never)
         .timeout(std::time::Duration::from_millis(500))
