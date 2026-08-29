@@ -287,6 +287,17 @@ is a bug.
   which is what `forbid(unsafe_code)` makes cheap — corrected to say that, on a
   crate that publishes.
 
+- **The non-vacuity guard `0016`'s withdrawal recommended could never pass.** It
+  said to count `%ymm` in the disassembly and require zero at baseline. A
+  baseline `target/release/owner_migration` — no `-C target-cpu` — contains
+  **3 463**, and per-symbol attribution accounts for all of them in `blake3`'s
+  hand-written kernels (`_blake3_hash_many_avx2` 1 475,
+  `_blake3_hash_many_avx512` 1 008, `_blake3_xof_many_avx512` 980), which
+  `blake3` dispatches to at runtime and which `-C target-cpu` never selects. The
+  guard now counts `%ymm` **per symbol**, over only the functions the
+  differential evaluates — the same `objdump | awk` attribution that measured
+  the 3 463.
+
 - **The "inverted composed window" recorded one commit ago was the wrong
   mechanism, and the error carried the refutation in its own shape.**
   `docs/PHASE2.md` §12.3 said "only the composed path can produce it … it
