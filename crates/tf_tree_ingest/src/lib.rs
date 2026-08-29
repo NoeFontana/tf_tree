@@ -113,6 +113,41 @@ pub fn compression_compiled_in() -> bool {
 pub mod fixture;
 
 /// Writing a `.tft` from a recording (`docs/PHASE5.md` §2 + §3).
+/// BLAKE3 of a recording's bytes, read in 1 MiB chunks.
+///
+/// **At the crate root rather than in [`tft`], and not behind its `cfg`.** The
+/// digest is what makes a `.tft` traceable to the recording it came from (§2.3),
+/// so it was written where the freeze is — but it is plain `std::fs` and
+/// `blake3` with nothing platform-specific in it, and `tf_tree_py`'s
+/// `ingest_bag` reports it on every platform the wheel builds for, including
+/// the ones with no frozen backend at all (`docs/decisions/0046`). Gating it
+/// behind `shm` would have left the binding either without a digest or with a
+/// second copy of this loop, which is the spelling `CLAUDE.md` forbids.
+///
+/// Streaming rather than reading the file in, for the same reason the reader
+/// streams: a recording is allowed to be larger than memory.
+///
+/// # Errors
+///
+/// [`IngestError::Io`] carrying the `errno`, for a file that cannot be read.
+pub fn digest_file(path: &std::path::Path) -> Result<[u8; 32], IngestError> {
+    use std::io::Read as _;
+    let io = |e: &std::io::Error| IngestError::Io {
+        raw_os_error: e.raw_os_error().unwrap_or(0),
+    };
+    let mut f = std::fs::File::open(path).map_err(|e| io(&e))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| io(&e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod tft;
 

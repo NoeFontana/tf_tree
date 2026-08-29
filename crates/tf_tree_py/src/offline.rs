@@ -73,9 +73,7 @@ use crate::tree::PyTree;
 #[pyfunction]
 #[pyo3(signature = (path, /))]
 pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
-    Ok(PyTree {
-        inner: std::sync::Arc::new(open_frozen(&path)?),
-    })
+    Ok(PyTree::wrap(std::sync::Arc::new(open_frozen(&path)?)))
 }
 
 /// The interval over which a plan is answerable, or `None` when it is unbounded.
@@ -457,10 +455,13 @@ pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> PyResult<Vec<(String,
 /// Python at all: freeze a tree, reopen the file, and demand the *same* numbers
 /// out of the *same* calls.
 ///
-/// `source_digest` is all-zero. §2.3 defines it as BLAKE3 of the source
-/// recording, and a tree assembled in Python has none; inventing a digest of the
-/// arena bytes instead would put a value in a field that means something else,
-/// which is worse than the documented "there was no recording" zero.
+/// `source_digest` is the caller's, and is all-zero for a tree with no
+/// recording behind it. §2.3 defines it as BLAKE3 of the source recording, and a
+/// tree assembled in Python has none; inventing a digest of the arena bytes
+/// instead would put a value in a field that means something else, which is
+/// worse than the documented "there was no recording" zero. `Tree.freeze` passes
+/// the ingested recording's digest when there is one and that zero otherwise —
+/// see [`PyTree::source`](crate::tree::PyTree) and `docs/decisions/0046`.
 ///
 /// # The GIL is released for the copy
 ///
@@ -481,13 +482,14 @@ pub(crate) fn freeze_impl(
     tree: &Tree,
     path: &Path,
     source: Option<&str>,
+    source_digest: [u8; 32],
 ) -> PyResult<()> {
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
         .unwrap_or(0);
-    py.detach(|| tree.freeze_to(path, source, [0u8; 32], created))
+    py.detach(|| tree.freeze_to(path, source, source_digest, created))
         .map(|_| ())
         .map_err(|e| frozen_err(path, e))
 }
@@ -499,6 +501,7 @@ pub(crate) fn freeze_impl(
     _tree: &Tree,
     _path: &Path,
     _source: Option<&str>,
+    _source_digest: [u8; 32],
 ) -> PyResult<()> {
     Err(not_on_this_platform())
 }

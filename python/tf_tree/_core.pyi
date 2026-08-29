@@ -392,6 +392,26 @@ class Tree:
         the threads servicing your progress bar or socket.
         """
 
+    @property
+    def source(self) -> dict[str, object] | None:
+        """The recording this tree was ingested from, or `None`.
+
+        `None` for a tree built in Python or opened with `open_file` — neither
+        has a recording to name — **and `None` again once `publisher()` has been
+        called on it**, because from that moment the tree may hold samples the
+        recording does not and the digest would be asserting something false.
+
+        Keys: `path`, `digest` (BLAKE3 of the recording's bytes, hex),
+        `transforms`, `edges_without_samples`, `recording_start_ns` and
+        `recording_end_ns`.
+
+        **`recording_*`, not `span_*`.** These bound the *recording*; the
+        interval this tree can answer is at most that and usually narrower,
+        because a ring retains what fits. Use `span(target, source)` to plan
+        queries — taking the upper stamp from here and querying it is how this
+        distinction was found.
+        """
+
     def span(self, target: str, source: str, /) -> tuple[int, int] | None:
         """The interval, in nanoseconds, over which `plan(target, source)` answers.
 
@@ -625,6 +645,44 @@ def open_arena(
     beside a config. Without `create` they describe nothing — but `interp` is
     still validated, so a misspelling raises here exactly as it does in `build`
     rather than being silently discarded.
+    """
+
+def ingest_bag(
+    path: str | os.PathLike[str],
+    /,
+    *,
+    static_topics: list[str] | None = ...,
+    tf_topics: list[str] | None = ...,
+    tf_prefix: str | None = ...,
+    max_memory_mb: int | None = ...,
+    max_record_bytes: int | None = ...,
+) -> Tree:
+    """Read an MCAP recording into an in-memory `Tree` (`PHASE5.md` §3).
+
+    Returns the **same** `Tree` `open_file` returns, so `plan`, `at`, `span`,
+    `frames`, `edges` and `freeze` all work on it unchanged — there is no
+    parallel offline API to learn.
+
+    The tree carries the recording in `source`, and `freeze` writes that
+    recording's BLAKE3 digest into the `.tft`. So `ingest_bag(p).freeze(out)`
+    is the whole bag-to-index path and the resulting file is traceable to `p`
+    with nothing extra to remember; there is deliberately no `freeze_bag`
+    beside it.
+
+    `static_topics` and `tf_topics` override which topics carry transforms
+    (`/tf_static` and `/tf` by default); `tf_prefix` prepends to every frame
+    name; `max_memory_mb` bounds the sort buffers of the second pass, not the
+    arena, which is the output and cannot be capped; `max_record_bytes` raises
+    the 256 MiB ceiling on one top-level record.
+
+    Reading the recording also hashes it, which is one extra sequential pass —
+    a minority of an ingest that reads the same file at least twice and
+    decompresses it.
+
+    Raises `FileNotFoundError` (and its `OSError` siblings) for a path problem,
+    and `TfTreeError` for a file that is not a readable MCAP — including a
+    `.db3` rosbag2 bag, which is named as such with the `ros2 bag convert`
+    remedy rather than reported as a corrupt MCAP.
     """
 
 def open_file(path: str | os.PathLike[str], /) -> Tree:

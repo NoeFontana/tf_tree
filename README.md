@@ -96,6 +96,23 @@ would rather a glibc security fix reach this binary through your distribution
 than wait for a new release. Otherwise take musl. From a clone the equivalent is
 `cargo install --path crates/tf_tree_cli --features shm`.
 
+The same two steps run from Python, with no CLI and no clone — which is what
+`tf_tree_ingest` was made a library crate for
+([`0046`](./docs/decisions/0046-the-consumer-the-crate-boundary-was-drawn-for.md)):
+
+```python
+import tf_tree
+
+tree = tf_tree.ingest_bag("drive.mcap")   # returns the ordinary Tree
+tree.freeze("drive.tft")                  # records drive.mcap's BLAKE3 digest
+print(tree.source["transforms"], tree.source["digest"][:16])
+```
+
+`tree.source` is how a `.tft` stays traceable to the recording it came from, and
+`freeze` writes that digest for you — so there is no second `freeze_bag` call to
+remember. Taking a publisher on the tree drops it, because from that point the
+tree may hold samples the recording does not.
+
 `drive.tft` is a **frozen transform index**, and it is the arena itself written
 to disk. There are no pointers anywhere in the arena — every internal reference
 is an offset — so opening one is an `mmap`, with no parsing, no deserialization

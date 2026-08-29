@@ -273,6 +273,66 @@ is a bug.
   it is now asserted against `GLIBC_FLOOR`, so a toolchain bump fails the build
   and names the prose to update. Dropping the `tomllib` one-liner for `cargo
   pkgid` also removed an `actions/setup-python` step from all four rows.
+- **`tf_tree.ingest_bag`, `Tree.source`, and a `Tree.freeze` that records where
+  the tree came from** — `docs/decisions/0046`. `docs/PHASE5.md` §0.0's §3 row
+  says `tf_tree_ingest` is a library crate rather than part of the CLI
+  **"because §4's offline Python API needs the same logic and cannot depend on a
+  binary crate"**. That consumer had never been built: `grep -c tf_tree_ingest
+  crates/tf_tree_py/Cargo.toml` was `0`, so the crate boundary had been drawn,
+  and paid for, for a caller that did not exist. Python could open an index
+  somebody else produced and could not produce one.
+
+  `ingest_bag(path)` returns **the ordinary `Tree`** — the same type `open_file`
+  returns — so `plan`, `at`, `span`, `frames`, `edges` and `freeze` work on it
+  unchanged, which is §4.1's "no parallel offline API" holding structurally
+  rather than by promise. `Tree.source` is a `dict` (or `None`) carrying the
+  recording's `path`, its BLAKE3 `digest`, `transforms`,
+  `edges_without_samples`, and `recording_start_ns` / `recording_end_ns`.
+
+  **`Tree.freeze` now writes that digest**, so `ingest_bag(p).freeze(out)`
+  produces a `.tft` traceable to `p` with nothing extra to remember. It passed
+  an all-zero `source_digest` unconditionally before; zero stays correct for a
+  tree assembled in Python, which has no recording to name.
+
+  **There is no `freeze_bag`, and the first draft of this had one.**
+  `tf_tree_ingest::tft::freeze_bag` exists, so binding it is the obvious move,
+  and the draft argued that `ingest_bag(p).freeze(out)` "loses the recording's
+  identity". Reading the function refutes that: it is `digest_file` + `run` +
+  `freeze_to`, it streams the *digest* and not the tree, and `Tree::freeze_to`
+  already took `source_digest` as a parameter. The gap was entirely in the
+  binding's `Tree.freeze`. A top-level `freeze_bag` would therefore have been a
+  **second spelling** of the composition, differing only in whether provenance
+  got filled in — and differing *silently*, so the user writing the obvious two
+  calls would get an unattributable index and no diagnostic.
+
+  **`Tree.source` is dropped by `publisher()`.** A caller may ingest a
+  recording, add a computed calibration edge and freeze; the index would then
+  carry a digest asserting it is that file while holding samples the file does
+  not. `docs/PHASE5.md` §2.3 gives the field one job — answering *"was this
+  index built from that file"* without re-ingesting — and a false *yes* defeats
+  exactly the investigation it exists for, where the zero is the documented
+  "there was no recording". **A wrong digest is worse than an absent one.**
+
+  Five of `IngestOptions`' ten fields are keywords. `max_record_bytes` is among
+  them for `docs/decisions/0010`'s own stated reason — it was added so "the
+  person who meets it can raise it without forking the crate", which does not
+  hold for §4's audience if the knob is reachable only from Rust.
+
+  `tf_tree_ingest::digest_file` moves to the crate root and its `blake3`
+  dependency stops being optional, so a digest can be reported on platforms with
+  no frozen backend. That adds nothing to any build: `cargo tree -p
+  tf_tree_ingest --no-default-features` already listed blake3, because
+  `tf_tree_core` requires it (D14).
+
+  The wheel grows from 548 129 to 726 396 bytes (+174 KiB, +32.5 %). It is not
+  split: `numpy`, which the wheel already requires, installs 29.3 MiB — 42× the
+  whole wheel — so a second distribution would double a seven-row build matrix
+  to save a rounding error, and give every user a decision to get wrong.
+
+  Gated by `tests/python/test_ingest.py` against the committed conformance
+  recording, on both interpreters. Three of its assertions are mutation-verified
+  against the producer: removing the `publisher()` drop, hardcoding a zero
+  digest, and dropping the `max_record_bytes` wiring each fail exactly one test.
 
 - **Prebuilt `tf_tree` CLI binaries, attached to a GitHub Release** — four Linux
   targets, `{x86_64, aarch64}` × `{gnu, musl}`. `docs/PHASE5.md` §10 has always

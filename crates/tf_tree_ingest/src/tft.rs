@@ -17,7 +17,6 @@
 //! reading it in, for the same reason the reader streams: the recording is
 //! allowed to be larger than memory.
 
-use std::io::Read;
 use std::path::Path;
 
 use tf_tree::FrozenHeader;
@@ -39,7 +38,7 @@ pub fn freeze_bag(
     opts: &IngestOptions,
     frames: &mut crate::Frames,
 ) -> Result<(Ingested, FrozenHeader), IngestError> {
-    let digest = digest_file(source)?;
+    let digest = crate::digest_file(source)?;
     let ingested = crate::run(source, opts, frames)?;
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -49,22 +48,4 @@ pub fn freeze_bag(
         .freeze_to(out, Some(&source.display().to_string()), digest, created)
         .map_err(IngestError::Frozen)?;
     Ok((ingested, header))
-}
-
-/// BLAKE3 of a file's bytes, read in 1 MiB chunks.
-fn digest_file(path: &Path) -> Result<[u8; 32], IngestError> {
-    let io = |e: &std::io::Error| IngestError::Io {
-        raw_os_error: e.raw_os_error().unwrap_or(0),
-    };
-    let mut f = std::fs::File::open(path).map_err(|e| io(&e))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f.read(&mut buf).map_err(|e| io(&e))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(*hasher.finalize().as_bytes())
 }
