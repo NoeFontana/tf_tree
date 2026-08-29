@@ -139,6 +139,83 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: just test
 
+  # Prebuilt `tf_tree` binaries — `docs/PHASE5.md` §10's "release automation:
+  # cargo-dist or equivalent", and this is the equivalent.
+  #
+  # **§0.0 used to say this was not owed**, on the grounds that `tf_tree_cli` is
+  # `publish = false`. That argument does not hold: `publish = false` is about
+  # the crates.io *index*, and the manifest states its own reason is mechanical
+  # — three of its dependencies are path-only, so there is no version to publish
+  # against. Nothing in it says a user should not be handed a binary. Four tags
+  # have shipped to crates.io and PyPI with no GitHub Release at all, so the one
+  # audience the README puts first — somebody with a recording and no Rust
+  # toolchain — had `git clone && cargo install` as the only way in.
+  #
+  # **All four rows are native runners, and that is load-bearing.**
+  # `just release-archive` verifies an artifact by *executing* it, which a
+  # cross-build cannot do; `ubuntu-24.04-arm` is what makes the aarch64 rows
+  # checkable rather than merely built (`CLAUDE.md`: aarch64 CI became real on
+  # 2026-08-16).
+  #
+  # **Why gnu *and* musl.** Measured on the development host, the gnu build's
+  # floor is `GLIBC_2.34`: fine on ROS 2 Humble (22.04, glibc 2.35) and too high
+  # for 20.04 (2.31), a container built `FROM debian:bullseye`, or anything
+  # older. The musl rows are statically linked and have no floor at all. Neither
+  # row subsumes the other — musl's allocator is the slower of the two, and
+  # `tf_tree bench` is in this binary, so an operator taking a measurement wants
+  # the gnu build.
+  #
+  # Not gated on the tag: this job runs on the pull-request trigger too, for the
+  # reason in this file's header — a release path first run on the day it
+  # matters is one nobody has tested. Only the upload below is tag-only.
+  binaries:
+    name: cli ${{ matrix.target }}
+    needs: [verify]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # Report every row. With `publish` gated behind this job, fail-fast would
+      # cancel three builds to tell us about one, and the whole point of running
+      # before the upload is to learn everything that is broken in one pass.
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: actions/setup-python@v7
+        with:
+          # The recipe reads `[workspace.package] version` with `tomllib`.
+          python-version: "3.13"
+
+      # One recipe, not a transcription of it (`CLAUDE.md`). It builds with
+      # `--features shm`, executes the result and compares `--version` against
+      # the workspace number, packages deterministically, unpacks what it packed
+      # and runs *that* through the `tft` symlink, and writes the checksum.
+      - name: just release-archive ${{ matrix.target }}
+        run: just release-archive ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.target }}
+          path: |
+            target/release-staging/*.tar.gz
+            target/release-staging/*.tar.gz.sha256
+          # A release that silently ships nothing is worse than one that fails.
+          if-no-files-found: error
+
   # OIDC: no CARGO_REGISTRY_TOKEN in repository secrets. The token minted below
   # lives ~30 minutes and is revoked by the action's post step.
   #
@@ -157,7 +234,13 @@ jobs:
   # it. Configure the environment to be reachable only from `v*` tags.
   publish:
     name: publish to crates.io
-    needs: [verify]
+    # **`binaries` is in here for an ordering reason, not a data one** — this
+    # job consumes nothing it produces. A crates.io upload is irreversible and a
+    # cross-target build is the likeliest thing in this file to fail, so the
+    # build runs first: a broken musl row then costs a re-run instead of a burnt
+    # version number. It also means a `v*` tag can never leave five crates on
+    # the index with no binaries to go with them.
+    needs: [verify, binaries]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -281,3 +364,122 @@ jobs:
             echo "  ${c}: licences present, LICENSE-MIT ${bytes} bytes"
           done
           echo "all five tarballs carry LICENSE-MIT, LICENSE-APACHE, NOTICE and README.md"
+
+  # Create the GitHub Release and attach the binaries.
+  #
+  # **Nothing created a Release before this job existed.** A tag push creates a
+  # tag ref and nothing else; `v0.0.1` through `v0.0.4` are tags with no Release
+  # behind them, so the repository's Releases page has been empty for the whole
+  # of its published life. This is the job that changes that, and it is separate
+  # from `binaries` because the two answer to different permissions: that job
+  # needs none, this one needs `contents: write`.
+  #
+  # **It runs after `publish`, not beside it.** A Release advertising a version
+  # that is not on crates.io sends a user to `cargo add tf_tree` that fails. The
+  # ordering costs nothing — nobody is waiting on a release by the minute — and
+  # it means the Release page and the index cannot disagree in the direction
+  # that matters. The other direction (index ahead of Release) is recoverable by
+  # re-running this job; that is the asymmetry being bought.
+  github-release:
+    name: attach binaries to the GitHub Release
+    needs: [binaries, publish]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release, upload assets
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+
+      # **Verify what arrived, rather than trusting the transport.** Each row
+      # wrote its own `.sha256` beside its archive on the machine that built it,
+      # so checking them here covers the upload/download round trip. `-c` fails
+      # on a truncated or re-encoded artifact, which is the failure this catches
+      # and no other step would.
+      - name: verify every checksum, and that all four rows arrived
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          # The count tracks the matrix above. Hard-coded on purpose: the
+          # failure being guarded is a row that silently stopped producing an
+          # artifact, and a check derived from whatever turned up cannot see it.
+          n=$(ls -1 *.tar.gz 2>/dev/null | wc -l)
+          if [ "$n" -ne 4 ]; then
+            echo "::error::expected 4 archives from the binaries matrix, found ${n}" >&2
+            exit 1
+          fi
+          sha256sum -c ./*.tar.gz.sha256
+          # One aggregate file, which is what a user checking a single download
+          # actually wants; the per-archive files stay as they are.
+          cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+          rm -f ./*.tar.gz.sha256
+          cat SHA256SUMS
+
+      # Notes come from CHANGELOG.md, which the `verify` job has already
+      # asserted has a section for this tag carrying a real date. Deriving them
+      # here rather than hand-writing a release body is what keeps the two from
+      # drifting — the changelog is the maintained one.
+      - name: assemble the release notes
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          ver="${tag#v}"
+          {
+            awk -v v="$ver" '
+              $0 ~ "^## \\[" v "\\]" { p = 1; next }
+              p && /^## \[/ { exit }
+              p { print }
+            ' CHANGELOG.md
+            cat <<'EOF'
+
+          ## Prebuilt `tf_tree` CLI
+
+          No Rust toolchain and no clone. Pick the archive for your machine,
+          extract it, and the `tf_tree` binary (with `tft` beside it as an
+          alias) is ready to run:
+
+          ```sh
+          tar xzf tf_tree-<version>-x86_64-unknown-linux-musl.tar.gz
+          ./tf_tree-<version>-x86_64-unknown-linux-musl/tf_tree doctor --from-bag drive.mcap
+          ```
+
+          - **`-musl`** is statically linked and depends on no system library.
+            Use it inside a container, on Ubuntu 20.04, or wherever the glibc
+            build refuses to start.
+          - **`-gnu`** needs glibc 2.34 or newer (Ubuntu 22.04 / ROS 2 Humble
+            and later). Prefer it if you are running `tf_tree bench`, where
+            musl's allocator would be measuring itself.
+
+          Both are built with `--features shm`, so `--attach`, `tf_tree top`
+          and `tf_tree participants` can see a live arena.
+
+          Verify a download against `SHA256SUMS`:
+
+          ```sh
+          sha256sum -c --ignore-missing SHA256SUMS
+          ```
+          EOF
+          } | sed "s/<version>/${tag}/g" > NOTES.md
+          cat NOTES.md
+
+      # `gh` is preinstalled on the runner, so this needs no action and no
+      # third-party token — `github.token` with `contents: write` is enough.
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes-file NOTES.md \
+            --verify-tag \
+            dist/*.tar.gz dist/SHA256SUMS
+          gh release view "$tag" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size) bytes"'

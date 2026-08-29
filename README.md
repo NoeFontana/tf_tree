@@ -47,7 +47,7 @@ error.
 |---|---|---|
 | The Rust engine | `cargo add tf_tree` | crates.io |
 | The Python bindings | `pip install transform_tree`, then `import tf_tree` | PyPI |
-| The `tf_tree` CLI | `cargo install --path crates/tf_tree_cli --features shm`, from a clone | source; the CLI is `publish = false` |
+| The `tf_tree` CLI | a prebuilt Linux binary from [the latest release](https://github.com/NoeFontana/tf_tree/releases/latest), or `cargo install --path crates/tf_tree_cli --features shm` from a clone | GitHub Releases (`x86_64`/`aarch64`, gnu and static musl); the CLI is `publish = false`, so not crates.io |
 | C ABI, C++ header, ROS 2 bridge | `just c-abi-check`, `just cpp-check`, `just ros-build` | source |
 
 Three notes on that table, each of which surprises somebody:
@@ -62,7 +62,10 @@ Three notes on that table, each of which surprises somebody:
   it exits 0 with a warning naming `--features shm`. Adding that flag *does*
   install `tf_tree_rendezvous_child`, which is a test helper and not a tool —
   [the crate's own page](./crates/tf_tree/README.md) has the whole story. The
-  CLI is a separate, unpublished crate; build it from a checkout as above.
+  CLI is a separate, unpublished crate: take the prebuilt binary from the
+  releases page, or build it from a checkout. **`publish = false` is about the
+  crates.io index, not about whether it is shipped** — three of its dependencies
+  are path-only, so it has no version to publish against.
 
 **`0.0.x` promises nothing between releases.** Cargo treats every `0.0.x` as
 incompatible with every other, so pin exactly and expect a later release to
@@ -74,12 +77,23 @@ Point it at a recording you already have. No node joins anyone's launch file, no
 robot is redeployed, and `doctor --from-bag` needs no features at all:
 
 ```sh
-git clone https://github.com/NoeFontana/tf_tree && cd tf_tree
-cargo install --path crates/tf_tree_cli --features shm   # shm: `freeze` maps memory
+# No clone and no Rust toolchain. The musl build is static: it needs no system
+# library, so it runs on Ubuntu 20.04 and in a distroless container alike.
+TAG=$(curl -fsSL https://api.github.com/repos/NoeFontana/tf_tree/releases/latest \
+      | grep -m1 '"tag_name"' | cut -d'"' -f4)
+curl -fsSL "https://github.com/NoeFontana/tf_tree/releases/download/${TAG}/tf_tree-${TAG}-x86_64-unknown-linux-musl.tar.gz" | tar xz
+cd "tf_tree-${TAG}-x86_64-unknown-linux-musl"
 
-tf_tree doctor --from-bag drive.mcap                # what is wrong with this /tf traffic
-tf_tree freeze --from-bag drive.mcap -o drive.tft   # keep the answer
+./tf_tree doctor --from-bag drive.mcap                # what is wrong with this /tf traffic
+./tf_tree freeze --from-bag drive.mcap -o drive.tft   # keep the answer
 ```
+
+Both released builds carry `--features shm`, so the same binary also attaches to
+a robot that is already running (`--attach`, `tf_tree top`, `tf_tree
+participants`). Prefer the `-gnu` archive if you are running `tf_tree bench`,
+where musl's allocator would be measuring itself; it needs glibc 2.34 or newer,
+which is Ubuntu 22.04 / ROS 2 Humble and later. From a clone the equivalent is
+`cargo install --path crates/tf_tree_cli --features shm`.
 
 `drive.tft` is a **frozen transform index**, and it is the arena itself written
 to disk. There are no pointers anywhere in the arena — every internal reference
