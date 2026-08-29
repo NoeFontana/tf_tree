@@ -24,6 +24,8 @@
 //! own-claiming  -> "claimed <edge>", then parks holding it
 //! join-claiming -> "claimed <edge>", then parks holding it
 //! own-reap      -> "claimed", then on stdin: "reaped <n> still_ours <b>"
+//! join-reparent -> "joined", then on stdin: "reparented" | "refused <e>"
+//!                  (arm §11.3's topo.holding_lock to die inside the section)
 //! hold-topo <lock> -> "holding-topo", then parks holding A2's topology byte
 //! join-heir     -> "joined <slot>", then one line per stdin poke:  (arm
 //!                  §11.3's takeover crash point with TF_TREE_CRASH_AT to kill
@@ -265,6 +267,31 @@ fn main() {
         // The path is passed rather than resolved, so the parent decides which
         // rendezvous this is about and a mismatched runtime directory fails
         // loudly here instead of silently locking the wrong file.
+        // §11.3's `topo.holding_lock`: joins read-write and re-parents `cam`
+        // from `base` to `map`, which takes A2's topology byte and then CASes
+        // the arena word. Arm the site with `TF_TREE_CRASH_AT` to die inside
+        // that critical section.
+        "join-reparent" => {
+            let tree = tf_tree::Open::new()
+                .mode(AttachMode::ReadWrite)
+                .create(CreatePolicy::Never)
+                .timeout(std::time::Duration::from_millis(500))
+                .open()
+                .expect("join");
+            say("joined");
+
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).expect("read");
+            let cam = tree.frame("cam").unwrap();
+            let map = tree.frame("map").unwrap();
+            match tree.reparent(cam, map) {
+                Ok(()) => say("reparented"),
+                Err(e) => say(&format!("refused {e:?}")),
+            }
+            loop {
+                std::thread::park();
+            }
+        }
         "hold-topo" => {
             let path = std::env::args().nth(2).expect("lock file path");
             let lock = tf_tree_ipc::LockFile::open(std::path::Path::new(&path))

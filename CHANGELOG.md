@@ -33,6 +33,29 @@ is a bug.
 
 ## [Unreleased]
 
+### Added
+
+- **Three more of `docs/PHASE2.md` §11.3's crash points are placed and
+  executed**: `topo.holding_lock`, `open.after_ownership_lock_before_bind` and
+  `open.after_create_before_bind`. Seven of fourteen rows now have a site and a
+  test; `takeover.after_ownership_lock_before_bind` was the only one outside
+  `tf_tree_core` before this.
+
+  `topo.holding_lock` sits **before** `set_parent`, deliberately: after it, the
+  surviving state is indistinguishable from a completed reparent whose guard had
+  not dropped, and the test would pass on a build where A2's byte was never taken
+  at all.
+
+- **`reclaim.probe_then_reoccupied` is recorded as *not an abort site*, and that
+  is the finding rather than a shortfall.** Every other row names an instruction
+  a process can die at; this one names an **interleaving between two processes
+  that are both alive**. Killing either does not produce it. `crash_point!` is
+  the wrong tool, and placing one there would produce a test that passes without
+  ever reaching the state. The row's analysis — the `RESERVED` word carrying no
+  incarnation, bounded by the byte rather than the word — stands unchanged; what
+  is retracted is only its membership in a table of crash points. `loom` and
+  `shm_torture` are the mechanisms that can reach it.
+
 ### Fixed — documentation
 
 - **Six Python docstrings pointed where a wheel user cannot go.** PyO3 copies a

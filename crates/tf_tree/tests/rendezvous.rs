@@ -4619,6 +4619,145 @@ fn a_read_only_survivor_reports_that_it_cannot_inherit() {
 /// for a different reason (the heir dies owning *and* serving, and the socket's
 /// closure is what the survivor then sees). What this pins is the row's repair,
 /// not the placement; the placement is argued at the call site.
+/// **`docs/PHASE2.md` §11.3 `topo.holding_lock`** — a process killed inside A2's
+/// critical section leaves a byte the kernel gives back and a word the next
+/// acquirer steals.
+///
+/// The row's claim, in full: *"byte released by the kernel; word left stale and
+/// overwritten by the next acquirer"*. Both halves are asserted here, and the
+/// second is the one that needs a second process — a `SIGKILL`ed holder's own
+/// `Drop` never runs, so nothing releases the arena word politely.
+///
+/// **What makes the steal safe is A1, not this test.** `set_parent` has not run
+/// at the crash point, so there is no half-written topology; and even after it
+/// there is none, because A1 made the publish a single word store. Stealing
+/// therefore needs no rollback, which is why the repair is *"overwritten"*
+/// rather than *"repaired"*.
+///
+/// **Mutant:** none is offered for the site's placement, for
+/// `a_killed_heir_leaves_the_role_for_the_next_survivor`'s reason — moving it
+/// after `set_parent` makes this pass for a different reason (the topology is
+/// already mutated, so the survivor's own reparent is a no-op it cannot
+/// distinguish). The placement is argued at the call site; what this pins is the
+/// row's repair.
+#[cfg(feature = "crash-points")]
+#[test]
+fn a_killed_topology_holder_leaves_a_word_the_next_acquirer_steals() {
+    let dir = Scratch::new("topo-crash");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    assert!(owner.line().starts_with("owning"));
+
+    // Armed to abort with byte 1 held and the arena word naming it.
+    let mut doomed = Kid::spawn_with_env(
+        &dir.0,
+        &["join-reparent"],
+        &[("TF_TREE_CRASH_AT", "topo.holding_lock:1")],
+    );
+    assert_eq!(doomed.line(), "joined");
+
+    let mut heir = Kid::spawn(&dir.0, &["join-reparent"]);
+    assert_eq!(heir.line(), "joined");
+
+    doomed.poke();
+    let status = doomed.wait();
+    assert_eq!(
+        status.code(),
+        None,
+        "the armed holder exited normally instead of aborting: {status:?}"
+    );
+
+    // The repair: the next acquirer takes the byte the kernel released, finds
+    // the word naming a corpse, and steals it.
+    heir.poke();
+    let report = heir.line();
+    assert_eq!(
+        report, "reparented",
+        "the topology lock was not recovered from a killed holder: {report}"
+    );
+}
+
+/// **`docs/PHASE2.md` §11.3 `open.after_ownership_lock_before_bind` and
+/// `open.after_create_before_bind`** — the two states a creator can die in, and
+/// the reason neither leaves anything behind.
+///
+/// Both rows end the same way — *"the next `open()` finds nothing alive and
+/// creates fresh"* — and they differ in what exists when the process dies:
+///
+/// * **before create:** byte 0 held, no arena, no socket. The next `open()` sees
+///   a free byte, nothing to connect to, and no participant byte, so §3.4 step
+///   4's split-brain check does not fire.
+/// * **after create:** the arena exists and nothing is serving. The row's last
+///   clause is the interesting one — *"the orphan memfd is freed with its last
+///   mapping"* — and it is why `memfd` was chosen over `shm_open` (§3.9): the
+///   segment has no name in any filesystem, so a death here leaves no stale
+///   object for anybody to find or accidentally attach to.
+///
+/// Asserting *"created twice"* did not happen is not directly observable, so
+/// what is asserted is the observable consequence: the survivor's arena answers,
+/// and the frames it answers about are the ones **it** declared.
+///
+/// **Mutant, run — and it does not fail, it *hangs*.** Disarming by spelling the
+/// site wrongly (`TF_TREE_CRASH_AT=open.after_create:1`) makes the child create,
+/// serve, and **park**, so `Kid::wait` blocks forever and the test never reaches
+/// an assertion. The note here first predicted a failure at the first `line()`;
+/// that is wrong, and the distinction matters twice over. `Kid::wait` is
+/// documented as being for "a child that is expected to die on its own", and a
+/// disarmed site turns it into an unbounded wait — so a typo in a site name
+/// costs a hung suite rather than a red test, which is exactly the failure
+/// `crash::spec` disarms-on-malformed-input to avoid at the *other* end. Read a
+/// timing-out §11.3 test as a possibly-misspelled site before reading it as a
+/// broken repair.
+///
+/// **The project already knew this and said so, which is why the `just
+/// shm-rendezvous` recipe exists**: its comment reads *"without it the site is
+/// compiled out and the armed child never dies — which would leave
+/// `a_killed_heir_leaves_the_role_for_the_next_survivor` waiting on a `wait()`
+/// that never returns rather than failing."* The mutant here rediscovered that
+/// from the other end. Cited rather than re-derived, so the two do not drift.
+#[cfg(feature = "crash-points")]
+#[test]
+fn a_creator_killed_before_or_after_the_arena_exists_leaves_nothing_behind() {
+    for site in [
+        "open.after_ownership_lock_before_bind",
+        "open.after_create_before_bind",
+    ] {
+        let dir = Scratch::new("open-crash");
+
+        let mut doomed = Kid::spawn_with_env(
+            &dir.0,
+            &["own"],
+            &[("TF_TREE_CRASH_AT", &format!("{site}:1"))],
+        );
+        let status = doomed.wait();
+        assert_eq!(
+            status.code(),
+            None,
+            "the armed creator at {site} exited normally instead of aborting: {status:?}"
+        );
+
+        // The repair: a fresh creator finds nothing alive and creates.
+        let mut next = Kid::spawn(&dir.0, &["own"]);
+        assert!(
+            next.line().starts_with("owning"),
+            "after a creator died at {site}, the next one could not create"
+        );
+
+        // And the arena it created is *its own*: a joiner reads the frames this
+        // creator declared, which a half-created orphan could not answer for.
+        let joined = tf_tree::Open::new()
+            .mode(tf_tree::AttachMode::ReadWrite)
+            .create(tf_tree_ipc::CreatePolicy::Never)
+            .timeout(std::time::Duration::from_millis(500))
+            .open()
+            .unwrap_or_else(|e| panic!("a joiner could not reach the new arena after {site}: {e}"));
+        assert!(
+            joined.frame("cam").is_ok(),
+            "the surviving arena is not the one the second creator declared"
+        );
+    }
+}
+
 #[cfg(feature = "crash-points")]
 #[test]
 fn a_killed_heir_leaves_the_role_for_the_next_survivor() {
