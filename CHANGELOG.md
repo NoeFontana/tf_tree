@@ -220,6 +220,60 @@ is a bug.
   is retracted is only its membership in a table of crash points. `loom` and
   `shm_torture` are the mechanisms that can reach it.
 
+- **Nine defects in the release-archive path, from a review of the change that
+  added it.** None had shipped — no tag has been pushed since — but four of them
+  would first have been met on a tag, which is the failure mode
+  `.github/workflows/release.yml`'s own header exists to prevent.
+
+  - **The README quickstart could not work.** It extracted the archive and then
+    `cd`-ed into it, so `./tf_tree doctor --from-bag drive.mcap` looked for the
+    recording *inside the archive directory*. The first command the audience the
+    README opens with would run failed with "No such file or directory", and
+    `freeze -o drive.tft` would have written the answer into a directory the
+    reader is about to delete. The generated release notes had it right, which
+    made the README the inconsistent half of one change.
+  - **`justfile` was not in the workflow's `pull_request` paths filter**, while
+    every line of packaging logic had just moved into `just release-archive`.
+    An edit to that recipe triggered no workflow, and nothing else invokes it.
+  - **The builder's umask reached the archive** (above), so "reproducible" was
+    false between a developer's box and a runner.
+  - **`rm -rf "${stage}"` cleared only the per-target subdirectory** while the
+    upload glob is `release-staging/*.tar.gz`. A stale archive — a second target
+    built locally, or a `target/` restored by `Swatinem/rust-cache` — is matched
+    by that glob and uploaded as an asset for a version it does not belong to,
+    and the count check would then fail the release *after* the irreversible
+    crates.io publish.
+  - **The count check could not report its own case.** `n=$(ls -1 *.tar.gz
+    2>/dev/null | wc -l)` under `set -euo pipefail` aborts the script at the
+    assignment when the directory is empty, so the one situation it exists for —
+    a row that silently produced nothing — got exit 2 and no annotation.
+  - **`gh release create` published before uploading**, leaving a window where
+    `releases/latest` resolves the new tag and the download URL 404s. That URL
+    is what the README's install snippet curls. It now creates `--draft` and
+    clears the flag once the assets are up.
+  - **The release body had no length guard.** GitHub caps it at 125 000
+    characters and the body is assembled from a changelog section that only
+    grows — the current `## [Unreleased]` is 61 918 bytes. Meeting the cap
+    returns HTTP 422 *after* the publish, and a re-run rebuilds the same
+    oversized body, so the recoverability this job is ordered for would not have
+    existed. It truncates at a line boundary and links the changelog.
+  - **`musl-gcc --version | head -1`** is the SIGPIPE-under-`pipefail` pattern
+    this same file documents as having broken its own `dry-run` step.
+  - **The "verified by being run" guarantee was void under `binfmt_misc`.** A
+    registered qemu handler runs a cross-built aarch64 binary on x86_64, answers
+    `--version` correctly, and certifies an artifact nothing native checked. The
+    recipe now compares `uname -m` against the triple before building.
+
+  Three more are efficiency and drift rather than defects: the recipe built both
+  `[[bin]]` targets and discarded one, paying a second full LTO link of a 2.8 MB
+  binary on every row (`--bin tf_tree`); it hard-coded `./target/`, which is the
+  third gate in this repository that `CARGO_TARGET_DIR` silently disables
+  (`${CARGO_TARGET_DIR:-target}`); and the measured glibc floor was printed but
+  not gated, while the same number is quoted as a constant in three documents —
+  it is now asserted against `GLIBC_FLOOR`, so a toolchain bump fails the build
+  and names the prose to update. Dropping the `tomllib` one-liner for `cargo
+  pkgid` also removed an `actions/setup-python` step from all four rows.
+
 - **Prebuilt `tf_tree` CLI binaries, attached to a GitHub Release** — four Linux
   targets, `{x86_64, aarch64}` × `{gnu, musl}`. `docs/PHASE5.md` §10 has always
   asked for "release automation: `cargo-dist` or equivalent"; this is the
@@ -257,9 +311,16 @@ is a bug.
 
   The licence texts travel inside each archive, as Apache-2.0 §4(a) requires and
   as `release.yml` already asserts for the crates.io tarballs, and packaging is
-  byte-deterministic — pinned mtimes, pinned ownership, no gzip timestamp.
+  byte-deterministic — pinned mtimes, ownership, **modes** and no gzip
+  timestamp. The modes were missing on the first revision and the omission was
+  not cosmetic: `mkdir` and `cp` take permissions from the builder's umask, so
+  the same content packed under `umask 002` and `umask 022` produced two
+  different checksums, which is a developer's box against a GitHub runner. `tar
+  --mode='u=rwX,go=rX'` pins them from any input; the capital `X` grants execute
+  only where it is already set or the entry is a directory, so `tf_tree` comes
+  out `0755` and the licences `0644`.
 
-  **Two of the determinism checks were vacuous when written, and the recipe
+  **Three of the determinism checks were vacuous when written, and the recipe
   records it rather than quietly deleting the evidence.** Packing twice and
   comparing — the obvious check — passes with every determinism flag removed,
   because both packs land in the same second; and gzip zeroes its MTIME field for
