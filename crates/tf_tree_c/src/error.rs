@@ -509,6 +509,26 @@ pub(crate) fn record_lookup(err: LookupError) -> tft_status {
     }
 }
 
+/// Run `body` with a panic guard, returning `fallback` if it panics.
+///
+/// **The shape `guard` cannot cover.** [`guard`] returns [`tft_status`], so it
+/// fits only the entry points that report through one. §6's checklist asks for
+/// `catch_unwind` on *every* `extern "C"` boundary, and the ones returning a
+/// count, a size or nothing had no guard at all — not because they were judged
+/// safe, but because the helper did not fit them. Modern Rust aborts rather than
+/// unwinding across an `extern "C"` frame, so the hazard is a process abort in a
+/// C or C++ host rather than undefined behaviour; a diagnostic that reads a
+/// count is still the wrong place to take a robot down.
+///
+/// No error is recorded here: these entry points have no status to carry one,
+/// and setting the thread slot would leave a caller that never reads it with a
+/// stale error the *next* status-returning call would have to clear. `fallback`
+/// is chosen per site to be the value that reads as "nothing to report".
+#[inline]
+pub(crate) fn guard_value<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(fallback)
+}
+
 /// Run `body` with a panic guard, translating a panic into
 /// [`TFT_ERR_INTERNAL`] instead of aborting the process (§3.4).
 ///

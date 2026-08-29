@@ -226,6 +226,21 @@ fn a_panic_becomes_a_status_and_the_process_survives() {
     assert_eq!(tft_abi_version_major(), TFT_ABI_VERSION_MAJOR);
 }
 
+/// **The same claim for a boundary with no status to carry it** — §6's checkbox
+/// says *every* `extern "C"` boundary, and `guard` only fits the ones returning
+/// `tft_status`. `tft_tree_frame_count` and `tft_tree_edge_count` return a
+/// count, so until `guard_value` they had no guard at all.
+///
+/// Mutant: replace `guard_value`'s body with a bare call ⇒ this test aborts the
+/// suite instead of failing, which is the failure being prevented.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_panic_in_a_count_returning_boundary_returns_the_fallback() {
+    assert_eq!(tft_test_panic_value(), u32::MAX);
+    // Still usable afterwards, which is the real claim.
+    assert_eq!(tft_abi_version_major(), TFT_ABI_VERSION_MAJOR);
+}
+
 /// `tft_error` must stay `#[repr(C)]` and its size must match what the header
 /// declares, or `struct_size` validation is meaningless.
 #[test]

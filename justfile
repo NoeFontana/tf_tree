@@ -2988,3 +2988,14 @@ release-archive TARGET:
     ( cd "${staging}" && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
     echo "  packaged: ${staging}/${name}.tar.gz"
     cat "${staging}/${name}.tar.gz.sha256"
+
+# The CycloneDX SBOM `docs/PHASE5.md` §10 asks for, per release.
+#
+# Written from `cargo metadata` rather than by adding `cargo-cyclonedx`, for the
+# reason `release.yml` already gives for not using `cargo-dist`: a generated
+# artifact cannot carry the argument for its own shape. The script's docstring
+# carries this one — in particular why the graph is walked from the *shipped*
+# roots over `normal` edges only, so a dev-dependency never appears in a bill of
+# materials for something that does not contain it.
+sbom VERSION:
+    python3 scripts/sbom.py --version {{ VERSION }} -o target/tf_tree-{{ VERSION }}-sbom.cdx.json

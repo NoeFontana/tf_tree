@@ -162,18 +162,20 @@ pub unsafe extern "C" fn tft_plan_at_with_derivatives(
 /// `tree` must be NULL or a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn tft_tree_frame_count(tree: *const tft_tree) -> u32 {
-    // SAFETY: validated before any field access.
-    if !unsafe { crate::check_tree(tree) } {
-        return 0;
-    }
-    // SAFETY: `check_tree` confirmed the magic word.
-    let h = unsafe { &*tree };
-    h.share
-        .tree
-        .arena_view()
-        .header()
-        .frame_count
-        .load(core::sync::atomic::Ordering::Acquire)
+    crate::error::guard_value(0, || {
+        // SAFETY: validated before any field access.
+        if !unsafe { crate::check_tree(tree) } {
+            return 0;
+        }
+        // SAFETY: `check_tree` confirmed the magic word.
+        let h = unsafe { &*tree };
+        h.share
+            .tree
+            .arena_view()
+            .header()
+            .frame_count
+            .load(core::sync::atomic::Ordering::Acquire)
+    })
 }
 
 /// How many edges this tree has declared, including tombstoned ones.
@@ -201,22 +203,24 @@ pub unsafe extern "C" fn tft_tree_frame_count(tree: *const tft_tree) -> u32 {
 /// `tree` must be NULL or a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn tft_tree_edge_count(tree: *const tft_tree) -> u32 {
-    // SAFETY: validated before any field access.
-    if !unsafe { crate::check_tree(tree) } {
-        return 0;
-    }
-    // SAFETY: `check_tree` confirmed the magic word.
-    let h = unsafe { &*tree };
-    h.share
-        .tree
-        .arena_view()
-        .header()
-        .edge_count
-        .load(core::sync::atomic::Ordering::Acquire)
-        // Never underflows: a built arena always stores at least the sentinel,
-        // and `saturating_sub` makes an un-built one report 0 rather than wrap
-        // to 4 billion edges.
-        .saturating_sub(1)
+    crate::error::guard_value(0, || {
+        // SAFETY: validated before any field access.
+        if !unsafe { crate::check_tree(tree) } {
+            return 0;
+        }
+        // SAFETY: `check_tree` confirmed the magic word.
+        let h = unsafe { &*tree };
+        h.share
+            .tree
+            .arena_view()
+            .header()
+            .edge_count
+            .load(core::sync::atomic::Ordering::Acquire)
+            // Never underflows: a built arena always stores at least the sentinel,
+            // and `saturating_sub` makes an un-built one report 0 rather than wrap
+            // to 4 billion edges.
+            .saturating_sub(1)
+    })
 }
 
 /// Copy frame `id`'s name into `buf` as a NUL-terminated string.

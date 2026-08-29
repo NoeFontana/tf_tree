@@ -1512,6 +1512,30 @@ pub extern "C" fn tft_test_panic() -> tft_status {
     })
 }
 
+/// The same, for an entry point with **no status to report through**.
+///
+/// `tft_test_panic` proves [`guard`] converts a panic into `TFT_ERR_INTERNAL`.
+/// It cannot cover the boundaries that return a count or a size, because those
+/// have nowhere to put a status — and until `guard_value` existed they carried
+/// no guard at all, which is the gap §6's "on every `extern \"C\"` boundary"
+/// checkbox names. This is the shape of `tft_tree_frame_count` and
+/// `tft_tree_edge_count`: panic inside, and the caller sees the fallback rather
+/// than losing the process.
+///
+/// # Safety
+///
+/// Takes no pointers; safe to call, and `unsafe` only for signature symmetry.
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub extern "C" fn tft_test_panic_value() -> u32 {
+    crate::error::guard_value(u32::MAX, || {
+        #[allow(clippy::panic)]
+        {
+            panic!("deliberate panic from tft_test_panic_value");
+        }
+    })
+}
+
 /// Build an in-process fixture tree: `map -> odom -> base`, two dynamic ScLerp
 /// edges with 64 samples each 10 ms apart, plus a static `base -> sensor`.
 ///

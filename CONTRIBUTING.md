@@ -127,6 +127,38 @@ home stays in the entry, or moves to the document that should own it.
       `docs/PHASE2.md` section it implements, or a linked decision that is
       `ready` or `implemented`.
 
+## Releasing
+
+`release.yml` and `wheels.yml` both fire on a `v*` tag and publish irreversibly —
+crates.io and PyPI each refuse a re-upload of a version. The gates that matter
+run on the tag, but two things are the maintainer's:
+
+**Signed tags.** `docs/PHASE5.md` §10 lists this as the one open
+release-automation item. The workflow checks whether the tag object carries a
+signature and, by default, **warns**: the gate exists before a key does, and
+making it a refusal today would block a release on something only you can create.
+One-time setup:
+
+```sh
+# SSH signing needs no keyserver and reuses a key you already have.
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_ed25519.pub
+git config --global tag.gpgSign true       # sign every annotated tag
+```
+
+Then add the same public key to your GitHub account **as a signing key** (it is a
+separate list from authentication keys), and set the repository variable
+`REQUIRE_SIGNED_TAGS` to `true`. From that tag onward an unsigned tag is refused
+rather than warned about. `git verify-tag v0.0.6` checks locally; GitHub's
+"Verified" badge is what checks the signature against the key on the account,
+which a runner cannot do because it does not have your public key.
+
+**The SBOM** is generated for you — `scripts/sbom.py` from `cargo metadata`,
+attached to the release and covered by `SHA256SUMS`. `just sbom <version>` writes
+the same file locally. It walks the graph from the crates that actually ship over
+`normal` edges only, so a dev-dependency never appears in a bill of materials for
+something that does not contain it.
+
 ## License
 
 Contributions are dual-licensed under [Apache-2.0](./LICENSE-APACHE) and

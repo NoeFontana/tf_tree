@@ -2059,10 +2059,10 @@ Replay a recorded bag through the bridge, then compare `tf_tree` lookups against
 
 ## 9. Definition of done
 
-- [ ] `sample_with_derivatives` shipped, with the composition-identity proptests and the `DerivativesUnavailable` refusal for LerpSlerp
+- [x] `at_with_derivatives` shipped, with the composition-identity proptests and the `DerivativesUnavailable` refusal for LerpSlerp — **the box named `sample_with_derivatives`, which has never existed**; the shipped name is `Plan::at_with_derivatives` (`crates/tf_tree_core/src/plan.rs:1166`), with `at_with_derivatives_tagged` beside it and `LookupError::DerivativesUnavailable` at `error.rs:266`. §0.0's §2 row has read **Done** throughout
 - [ ] `tf_tree.h` frozen and reviewed by hand — not merely `cbindgen` output — with every entry justified
 - [ ] `tf_tree_unstable.h` gated behind `TFT_ENABLE_UNSTABLE`
-- [ ] `catch_unwind` on every `extern "C"` boundary, tested by a forced panic
+- [x] `catch_unwind` on every `extern "C"` boundary, tested by a forced panic — **and the second half of that was missing until it was checked.** `guard` returns `tft_status`, so it fits only the entry points that report through one; `tft_tree_frame_count` and `tft_tree_edge_count` return a count and therefore carried no guard at all. `error::guard_value` is the shape for them, `tft_test_panic_value` forces the panic, and `a_panic_in_a_count_returning_boundary_returns_the_fallback` is the test — mutation-verified: dropping the `catch_unwind` makes it abort the suite rather than fail. The remaining unguarded entry points return a compile-time constant, free a handle, or are the deliberately-named `tft_test_push_unguarded`
 - [ ] All five layouts byte-pattern tested; `QVEC7_XYZW` documented as the Eigen/Sophus path
 - [ ] `static_assert` guards for Eigen and Sophus with a working fallback
 - [ ] `find_package(tf_tree)` works from a clean `colcon` workspace with no manual cargo step

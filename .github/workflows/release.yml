@@ -129,6 +129,40 @@ jobs:
             exit 1
           fi
 
+      # **Signed tags — `docs/PHASE5.md` §10's one genuinely open release item.**
+      # This warns rather than fails, and the split is deliberate: the gate has
+      # to exist before a key does, or it never gets written; and turning it into
+      # a hard failure today would block the next release on a key only the
+      # maintainer can create. Set the repository variable `REQUIRE_SIGNED_TAGS`
+      # to `true` once `git config user.signingkey` is set and the public key is
+      # on the GitHub account, and it becomes a refusal from that tag onward.
+      # `CONTRIBUTING.md` carries the one-time setup.
+      #
+      # `git verify-tag` needs the tag object, which a depth-1 checkout of a tag
+      # ref has, and the signer's public key, which the runner does not — so this
+      # asserts the tag is *signed*, not that the signature is trusted. GitHub's
+      # own "Verified" badge is what checks the latter, against the key on the
+      # account.
+      - name: check the tag is signed
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          REQUIRE_SIGNED_TAGS: ${{ vars.REQUIRE_SIGNED_TAGS }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          # An annotated tag's object carries the signature; a lightweight tag
+          # has no object at all and can never be signed.
+          if git cat-file -t "$tag" 2>/dev/null | grep -qx tag \
+             && git cat-file tag "$tag" | grep -qE '^-----BEGIN (PGP|SSH) SIGNATURE-----'; then
+            echo "tag ${tag} carries a signature"
+            exit 0
+          fi
+          if [[ "${REQUIRE_SIGNED_TAGS:-}" == "true" ]]; then
+            echo "::error::tag ${tag} is not signed, and REQUIRE_SIGNED_TAGS is set. See CONTRIBUTING.md." >&2
+            exit 1
+          fi
+          echo "::warning::tag ${tag} is not signed (docs/PHASE5.md §10). Set the repository variable REQUIRE_SIGNED_TAGS=true to make this a refusal; CONTRIBUTING.md has the one-time key setup."
+
       # A tag publishes irreversibly, so the gates run again here rather than
       # being trusted from the pull request that produced the commit — a tag can
       # be pushed at a commit no pull request ever gated, and nothing about a tag
@@ -479,6 +513,27 @@ jobs:
           rm -f ./*.tar.gz.sha256
           cat SHA256SUMS
 
+      # **The SBOM `docs/PHASE5.md` §10 asks for.** Generated here rather than in
+      # the `binaries` matrix because it describes the release, not one target:
+      # the dependency graph is the same for all four archives, so producing it
+      # once beside them is the honest shape. It is deterministic — same graph,
+      # same bytes, same serial number — so two releases diff to their dependency
+      # change and nothing else.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: generate the SBOM
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          python3 scripts/sbom.py --version "${tag#v}" -o "dist/tf_tree-${tag}-sbom.cdx.json"
+          python3 -c "import json,sys; b=json.load(open(sys.argv[1])); print(f\"sbom: {len(b['components'])} shipped dependencies, serial {b['serialNumber']}\")" \
+            "dist/tf_tree-${tag}-sbom.cdx.json"
+          # Into SHA256SUMS as well, so every asset on the release is covered by
+          # the one file a user checks. The archives' lines came from the
+          # machines that built them; this one is added here because the SBOM is
+          # produced here.
+          ( cd dist && sha256sum "tf_tree-${tag}-sbom.cdx.json" >> SHA256SUMS && sort -k2 -o SHA256SUMS SHA256SUMS )
+          cat dist/SHA256SUMS
+
       # Notes come from CHANGELOG.md, which the `verify` job has already
       # asserted has a section for this tag carrying a real date. Deriving them
       # here rather than hand-writing a release body is what keeps the two from
@@ -568,7 +623,7 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release ${tag} exists; updating notes and re-uploading assets"
             gh release edit "$tag" --notes-file NOTES.md
-            gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS --clobber
+            gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS dist/*-sbom.cdx.json --clobber
             # **`--draft=false` here too, and its absence made this whole branch
             # a trap.** The state a re-run actually lands in is the one the
             # `else` arm creates and then fails to finish: a *draft* with some
@@ -593,7 +648,7 @@ jobs:
               --notes-file NOTES.md \
               --verify-tag \
               --draft \
-              dist/*.tar.gz dist/SHA256SUMS
+              dist/*.tar.gz dist/SHA256SUMS dist/*-sbom.cdx.json
             gh release edit "$tag" --draft=false
           fi
           gh release view "$tag" --json assets \
