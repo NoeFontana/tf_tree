@@ -1361,10 +1361,11 @@ fn live_wall_now(inp: &Inputs<'_>) -> Option<i64> {
 /// it could.
 ///
 /// The retained-gap half of `TFT009` runs on every source; the trailing-silence
-/// half needs a live arena and a comparable clock ([`live_wall_now`]). A check
-/// that quietly does half its work is indistinguishable from one that passed,
-/// which is the whole reason [`Status::Skipped`] carries a mandatory reason — and
-/// `TFT009` is not *skipped* here, so the disclosure has to be a note.
+/// half needs a live arena and a comparable clock (`live_wall_now`). A check that
+/// quietly does half its work is indistinguishable from one that passed, which is
+/// the whole reason [`crate::catalogue::Status::Skipped`] carries a mandatory
+/// reason — and `TFT009` is not *skipped* here, so the disclosure has to be a
+/// note.
 #[must_use]
 pub fn silence_coverage_note(clock: Clock, stream: PushStream) -> Option<String> {
     match (clock, stream) {

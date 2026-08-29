@@ -92,95 +92,61 @@ fn push_then_sample_exact_and_interpolated() {
     assert_eq!(mid.to_bits(), expect.to_bits());
 }
 
-/// **An exact query returns the pose of the stamp it named, or refuses.**
+/// **`revalidated` is the lap check, and it fires exactly at the bound.**
 ///
-/// `SampleRing::sample`'s `# Errors` promises `SlotRecycled` when "the ring
-/// lapped the reader mid-read", and the interpolating tail enforced it. Every
-/// arm that *short-circuits* did not: `Hold`, an exact hit on the **newest**
-/// stamp, and `constant_twist`'s single-sample case returned `read_slot`
-/// directly. So a reader descheduled long enough for the ring to lap got a
-/// complete, valid pose belonging to a **different stamp** — the seqlock catches
-/// a torn slot, not a recycled one — while naming an *interior* stamp four lines
-/// away was refused for exactly the same race.
+/// `SampleRing::sample`'s `# Errors` promises `SlotRecycled` when the ring
+/// lapped the reader mid-read. The interpolating tail enforced it; six arms that
+/// *short-circuit* did not — `Hold` in `sample` and `sample_from`, the exact hit
+/// on the newest stamp in both, `sample_with_twist_seeking`'s `Hold`, and
+/// `constant_twist`'s single-sample case — so a reader descheduled long enough
+/// for the ring to lap got a complete, valid pose belonging to a **different
+/// stamp**. The seqlock catches a torn slot, not a recycled one. All six now go
+/// through one helper, and this pins what that helper decides.
 ///
-/// The witness is the pose itself: `x == stamp`, so "the pose of the stamp I
-/// asked for" is a value the reader can check.
+/// The bound is `retained`, not `capacity`: `head - i == capacity` already means
+/// slot `i` is the one `push` is overwriting, so `retained == capacity - 1` is
+/// the last index still safe to have read.
 ///
-/// **Mutant, run:** revert `sample`'s exact-newest arm to a bare
-/// `self.read_slot((newest & self.mask) as usize)`. **8 runs of 8 fail** with a
-/// pose whose `x` names a different stamp; with the check restored, 8 of 8 pass
-/// the full 200 000 iterations.
-///
-/// **`CAP` is 8 and that is the measurement, not a guess.** At 64 the same
-/// mutant failed only 2 runs of 3 — a detector that misses one time in three is
-/// one a tired reader deletes as flaky. A short ring laps sooner, so the window
-/// between resolving `newest` from `head` and reading its slot is crossed far
-/// more often. Nothing about the defect depends on the capacity: a 64-slot ring
-/// — `Capacity::slots(64)`, what the ABI cost fixture uses — laps in 64 samples,
-/// which is one ordinary preemption at 1 kHz.
+/// **This is deterministic, and two stress harnesses were deleted to get here.**
+/// The first queried the exact newest stamp and demanded that stamp's pose back;
+/// it fails, and not because of this fix — `bracket` binary-searches `stamp_at`
+/// with `Relaxed` loads, one concurrent `push` overwrites the oldest retained
+/// slot, and the search can then land on an index that is *still in the window*
+/// (so the trailing check passes) whose stamps do not bracket the request. The
+/// second used `newest_stamp()` as its baseline, which is the same unguarded
+/// read: its head load and its stamp load race, so it can report a stamp from a
+/// later lap and make an honest answer look stale. A concurrent test of this
+/// needs a baseline that cannot over-report, and from outside the ring there is
+/// none. Both hazards are written up at [`crate::sample`]'s module docs; neither
+/// is smuggled into an assertion that would go red for the wrong reason.
 #[test]
-fn an_exact_query_never_returns_another_stamps_pose() {
-    use core::sync::atomic::{AtomicBool, AtomicI64, Ordering as O};
-
+fn revalidated_fires_exactly_at_the_retained_bound() {
     const CAP: usize = 8;
-    const ROUNDS: i64 = 200_000;
-
     let hr = HeapRing::new(CAP);
-    let at = |k: i64| Iso3 {
-        q: tf_tree_math::Quat::IDENTITY,
-        t: tf_tree_math::Vec3 {
-            x: k as f64,
-            y: 0.0,
-            z: 0.0,
-        },
-    };
+    let ring = hr.ring();
+    for k in 0..CAP as i64 {
+        ring.push(k, &pose(k as u64)).unwrap();
+    }
+    let retained = CAP as u64 - 1;
+    let head = CAP as u64;
 
-    let stop = AtomicBool::new(false);
-    let bad = AtomicI64::new(-1);
-    hr.ring().push(0, &at(0)).unwrap();
-
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            // Until told to stop: a writer that finishes first leaves a ring
-            // that cannot lap, which is the state where this race cannot happen.
-            let ring = hr.ring();
-            let mut k = 1i64;
-            while !stop.load(O::Relaxed) {
-                ring.push(k, &at(k)).unwrap();
-                k += 1;
-            }
-        });
-
-        let ring = hr.ring();
-        for _ in 0..ROUNDS {
-            let Some(newest) = ring.newest_stamp() else {
-                continue;
-            };
-            for policy in [ExtrapPolicy::Error, ExtrapPolicy::Hold] {
-                // `newest` may already be stale by now, which is the point: the
-                // ring is allowed to have lapped, and the only two acceptable
-                // answers are the right pose or a refusal.
-                match ring.sample::<LerpSlerp>(newest, policy) {
-                    Ok(p) if (p.t.x - newest as f64).abs() > 1e-9 => {
-                        bad.store(newest, O::Release);
-                        stop.store(true, O::Release);
-                    }
-                    _ => {}
-                }
-            }
-            if stop.load(O::Relaxed) {
-                break;
-            }
-        }
-        stop.store(true, O::Release);
-    });
-
-    let k = bad.load(O::Acquire);
+    // The newest index is always safe; the oldest still-retained one is the last
+    // safe one; one older than that is the slot `push` is overwriting.
+    assert!(ring.revalidated_for_test(head - 1, retained).is_ok());
+    assert!(ring.revalidated_for_test(head - retained, retained).is_ok());
     assert_eq!(
-        k, -1,
-        "an exact query for stamp {k} was answered with another stamp's pose: \
-         the ring lapped past the slot mid-read and the short-circuit arm \
-         returned it anyway, where the interpolating path returns SlotRecycled"
+        ring.revalidated_for_test(head - retained - 1, retained),
+        Err(LookupError::SlotRecycled { edge: EdgeId(0) }),
+        "the index `push` is overwriting must be refused, not returned"
+    );
+
+    // And one more push moves the bound by exactly one, which is what makes this
+    // a bound rather than a constant.
+    ring.push(CAP as i64, &pose(CAP as u64)).unwrap();
+    assert_eq!(
+        ring.revalidated_for_test(head - retained, retained),
+        Err(LookupError::SlotRecycled { edge: EdgeId(0) }),
+        "the slot that was the oldest safe one is now the one being overwritten"
     );
 }
 

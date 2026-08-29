@@ -6,7 +6,8 @@
 //! wrapped, and is a classic off-by-one source (`docs/PHASE1.md` §6.4). The trailing
 //! revalidation makes the read wait-free in practice — it fails only if the ring
 //! lapped the reader mid-read, which cannot happen within the buffer's time-slack
-//! under any sane configuration.
+//! under any sane configuration. **What it covers is narrower than that sentence
+//! reads**: see the two hazards below.
 //!
 //! The searched window is `[head - n, head - 1]` where `n = min(head,
 //! `[`SampleRing::retained`]`)` — and `retained` is `capacity - 1`, **not**
@@ -14,6 +15,34 @@
 //! sample `push` is writing right now, so including it means reading a slot
 //! mid-overwrite. Both the window and the trailing revalidation use the same
 //! bound; keep them in step.
+//!
+//! # Two hazards the trailing revalidation does **not** cover
+//!
+//! Both were found on 2026-08-29 while closing a third — six short-circuit arms
+//! that skipped the revalidation entirely — and both are older than that change.
+//! Neither is closed here, because closing either is a hot-path cost with its own
+//! measurement; they are written down so the next reader does not conclude the
+//! check is stronger than it is.
+//!
+//! **1. The search itself can be corrupted by one concurrent push.** `SampleRing::bracket`
+//! is a branchless binary search over `stamp_at`, which is a `Relaxed` load of an
+//! array the writer overwrites in place. The searched window's oldest index is
+//! `head - retained`, and `push` destroys logical `head - capacity` — one index
+//! below it — so **two** pushes during a search reach the window and the stamps
+//! stop being monotone inside it. A binary search over a non-monotone array
+//! returns an arbitrary index, and if that index is still *inside* the window the
+//! trailing `head - i > retained` check passes: the caller is handed a blend of
+//! two samples that do not bracket its request, with no error. Closing it means
+//! re-reading `t_i`/`t_j` after the trailing check and confirming they still
+//! bracket `t` — two extra `Relaxed` loads on the interpolating path.
+//!
+//! **2. [`SampleRing::newest_stamp`] can report a stamp from a later lap.** It
+//! loads `head`, then loads `stamps[(head - 1) & mask]`, with nothing between
+//! them: if the ring laps in that gap the slot holds a *newer* sample's stamp.
+//! So it is an estimate of the frontier, not a bound on it — which is why it is
+//! not usable as a baseline for judging whether some other read was stale, and
+//! why a test that tried failed for reasons that had nothing to do with what it
+//! was testing.
 //!
 //! This module is `unsafe`-free: it drives the [`SampleRing`] atomics through the
 //! safe `push`/`read_slot` surface exposed by [`crate::buffer`].
@@ -186,6 +215,12 @@ impl SampleRing<'_> {
     ///
     /// The bound is `retained`, not `capacity`: `head - i == capacity` already
     /// means slot `i` is the one `push` is overwriting.
+    /// [`Self::revalidated`] with no payload, for the test that pins its bound.
+    #[cfg(test)]
+    pub(crate) fn revalidated_for_test(&self, i: u64, retained: u64) -> Result<(), LookupError> {
+        self.revalidated(i, retained, ())
+    }
+
     #[inline(always)]
     fn revalidated<T>(&self, i: u64, retained: u64, v: T) -> Result<T, LookupError> {
         if self.head.load(Ordering::Acquire) - i > retained {
