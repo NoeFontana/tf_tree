@@ -2514,17 +2514,21 @@ fn a_restarted_publisher_gets_its_predecessors_slot_and_can_still_claim() {
 /// worse than not reaping: the operator sees a freed record and still cannot
 /// publish.
 ///
-/// **This test used to assert `reaped 1`, and it asserts `reaped 0` now — which
-/// is the fix rather than a regression.** Until the hangup callback reaped
-/// claims, an explicit `Tree::reap()` was the *only* thing that could collect a
-/// dead peer's edge, and this test poked a helper into calling it. The owner now
-/// does it from `EPOLLHUP`, so by the time the sweep runs there is nothing left:
-/// `reaped 0` **is** the automatic path being observed, and the sweep's real
-/// assertion here is the other half of the line — `still_ours true`, the owner's
-/// own live claim surviving a sweep that had every opportunity to revoke it.
+/// **The `reaped` count is deliberately not asserted, and getting that wrong cost
+/// a flaky run.** Until the hangup callback reaped claims, an explicit
+/// `Tree::reap()` was the only collector and this test asserted `reaped 1`. The
+/// callback does it now, so the sweep usually finds `reaped 0` — and the first
+/// rewrite asserted *that*, which is a race: the poke arrives on the owner's
+/// **main** thread through stdin while the hangup is processed on its **serving**
+/// thread, and nothing orders the two. It failed about one run in ten.
 ///
-/// The order is the evidence and is why the two halves are separate calls: a
-/// sweep that returned `1` would mean the callback had *not* run.
+/// So this asserts what is invariant either way — the owner's own live claim
+/// survives a sweep that had every opportunity to revoke it, and the dead peer's
+/// edge ends up genuinely free. **The callback itself is pinned by
+/// `a_restarted_publisher_gets_its_predecessors_slot_and_can_still_claim`**,
+/// which pokes no sweep at all: there, the kill and the successor's `connect`
+/// reach the same `epoll` on one thread in that order, so the hangup is
+/// processed first by construction rather than by luck.
 #[test]
 fn a_killed_writers_edge_is_reaped_and_can_be_reclaimed() {
     let scratch = Scratch::new("reap-dead");
@@ -2542,19 +2546,13 @@ fn a_killed_writers_edge_is_reaped_and_can_be_reclaimed() {
 
     peer.kill();
 
-    // The owner sweeps and finds the work already done, because its own hangup
-    // callback did it. Its own claim survives either way.
+    // The owner sweeps. Its own claim survives, which is what this sweep is
+    // really for.
     owner.poke();
     let line = owner.line();
     assert!(
         line.ends_with("still_ours true"),
         "the sweep revoked the owner's own live claim: {line}"
-    );
-    assert!(
-        line.starts_with("reaped 0 "),
-        "the hangup callback did not reap the dead peer's claim, so an explicit \
-         sweep still had it to do — which is the state a deployment has no \
-         caller for: {line}"
     );
 
     // And the edge is genuinely free: a fresh publisher takes it.
