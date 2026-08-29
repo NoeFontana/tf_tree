@@ -200,6 +200,33 @@ jobs:
           # The recipe reads `[workspace.package] version` with `tomllib`.
           python-version: "3.13"
 
+      # **blake3 needs a C compiler on aarch64 and cannot find one for musl.**
+      # Its NEON path is C, and `cc-rs` looks for `aarch64-linux-musl-gcc`,
+      # which no runner image carries — so `cli aarch64-unknown-linux-musl`
+      # failed here with "failed to find tool" while both x86_64 rows passed.
+      # x86_64 is unaffected because blake3 has Rust intrinsics for SSE/AVX and
+      # only falls back to C on other architectures.
+      #
+      # **`musl-tools` rather than `tf_tree`'s own `pure-hash` feature**, which
+      # would also fix it by dropping to portable Rust. `blake3_64` hashes frame
+      # *names* — short strings, where BLAKE3's multi-block parallelism buys
+      # nothing — but `tf_tree_ingest::tft::digest_file` hashes an entire
+      # recording, and that is the README's first command. Taking a slower
+      # digest on one of four artifacts, to avoid a build-time-only dependency
+      # that never reaches the static binary, is the wrong trade. Installing it
+      # on both musl rows rather than only the failing one keeps the four
+      # artifacts built the same way.
+      - name: musl C toolchain for blake3
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+          t="${{ matrix.target }}"
+          # cc-rs reads `CC_<target with underscores>`.
+          echo "CC_${t//-/_}=musl-gcc" >> "$GITHUB_ENV"
+          musl-gcc --version | head -1
+
       # One recipe, not a transcription of it (`CLAUDE.md`). It builds with
       # `--features shm`, executes the result and compares `--version` against
       # the workspace number, packages deterministically, unpacks what it packed
