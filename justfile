@@ -501,6 +501,19 @@ interp-accuracy:
 control-loop:
     cargo run --release -q -p tf_tree --features shm --example control_loop
 
+# **One arena, two processes** — the capability `README.md` leads with, runnable.
+#
+# `control-loop` above is the shape of a node's inner *loop*, and its reader is a
+# thread on purpose: that example is about latency, and a thread keeps the
+# measurement about the fold. This one is about the **seam** — what a publisher
+# declares, what a consumer opens, and how each finds the other from nothing but
+# a name. One target with an argv switch rather than two, so it stays one recipe.
+#
+# Reports; gates nothing. It does assert the consumer succeeded, so it fails
+# loudly if the seam breaks.
+two-processes:
+    cargo run --release -q -p tf_tree --features shm --example two_processes
+
 # **Is the C ABI's +101 ns on a shared arena the ABI, or the C++ caller?**
 #
 # Four candidates for that gap are eliminated by measurement — the memfd mapping

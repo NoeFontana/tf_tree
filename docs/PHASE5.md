@@ -861,12 +861,29 @@ Disabling it removes the fields, the increments, and the arena regions' *use* (t
 > in the multiprocess suite with `SIGSEGV` before the check existed.
 >
 > The resolution: a read-only participant silently records nothing. It cannot,
-> and refusing to run would be far worse than losing a diagnostic. `doctor`
-> reports what the *writable* participants recorded, which on a real robot is
-> the bridge and every publisher — the processes whose failures the counters are
-> mostly about. `ArenaView` carries a `writable` flag, default `false`, so
-> forgetting to opt in loses a counter and forgetting to opt out cannot crash
-> anything.
+> and refusing to run would be far worse than losing a diagnostic. `ArenaView`
+> carries a `writable` flag, default `false`, so forgetting to opt in loses a
+> counter and forgetting to opt out cannot crash anything.
+>
+> **The justification this paragraph gave for the loss does not hold for two of
+> the checks, and that is corrected here rather than overwritten (2026-08-29).**
+> It read: *"`doctor` reports what the writable participants recorded, which on a
+> real robot is the bridge and every publisher — the processes whose failures the
+> counters are mostly about."* An `EdgeCounter` is incremented by a **lookup**,
+> and a bridge does not look up; it publishes. `TFT010` is *"an edge whose
+> consumers keep asking outside its window"* and `TFT011` sizes a ring against
+> *consumer* lag — both are about the processes that read, and those are exactly
+> the ones D18 makes read-only by default. So on the ordinary deployment — one
+> publish-only publisher, N read-only consumers — the two consumer-facing checks
+> see nothing at all while consumers are hammering the arena.
+>
+> The design still stands: a `PROT_READ` mapping cannot write a counter, and the
+> `SIGSEGV` this paragraph opens with is why. What changes is the **disclosure**.
+> `no_counter_evidence`'s skip reason names the read-only cause and points at
+> `tf_tree participants` for the rw/ro split, so an operator is not sent looking
+> for a bag-shaped explanation of a deployment-shaped state. Giving a read-only
+> consumer a writable counters region is a different question — a second mapping
+> or a per-participant region — and it is a decision record, not an amendment.
 
 ### 5.6 Counters are captured in snapshots
 

@@ -35,6 +35,61 @@ is a bug.
 
 ### Added
 
+- **`just two-processes`** — the capability the README leads with, as something
+  you can run. `crates/tf_tree/examples/` held two files and neither showed a
+  second *process*: `control_loop.rs`'s reader is a thread, deliberately,
+  because that example is about latency and a thread keeps the measurement about
+  the fold. The only publisher/consumer pair in the repository was the test
+  harness, whose own README says it "is not a tool and nothing about it is
+  stable".
+
+  One target with a `--publish`/`--consume` switch, so it stays one recipe. It
+  shows the two things a newcomer gets wrong: `require_create(true)`, without
+  which a publisher racing a second copy of itself silently *joins* the other's
+  arena and publishes into a topology it did not declare; and `await_open`
+  rather than `open`, because launch order is not something a launch file
+  guarantees.
+
+### Fixed
+
+- **`doctor`'s zero-counter skip reason named three causes and missed the one a
+  running robot is usually in.** `Guard::drop` and `note_err` both early-return
+  on a non-writable view, so a **read-only** participant records nothing —
+  writing a counter is a write, and read-only is the consumer default (D18). On
+  the ordinary deployment (one publish-only publisher, N read-only consumers)
+  `TFT010` and `TFT011` see nothing *while consumers are hammering the arena*,
+  and the message closed with "a live arena reaches it before its first
+  consumer" — which reads as though the state ends when a consumer attaches. It
+  does not. The reason now names the read-only cause and points at
+  `tf_tree participants` for the rw/ro split.
+
+  The predicate was always right — it reads the evidence, not the source. What
+  was wrong was the prose, which sent an operator looking for a bag-shaped
+  explanation of a deployment-shaped state. `docs/PHASE5.md` §5.5's amendment
+  justified the design with "`doctor` reports what the *writable* participants
+  recorded … the bridge and every publisher"; a counter is incremented by a
+  **lookup** and a bridge does not look up, so that justification does not hold
+  for the two consumer-facing checks. Corrected in place rather than overwritten.
+
+### Changed — documentation
+
+- **`EdgeWriter::push` says that the stamp's domain is unchecked there.** The
+  read side takes `Stamp<D>` and refuses a mismatch; `push` takes a bare `i64`
+  and `PushError` has no variant for one, so an edge declared `domain(1)`
+  accepts wall-clock nanoseconds with `Ok(())`. What covers it and how far is
+  now written down: `TopologyConfig::check_domain` guards the ROS 2 ingest path
+  by comparing two *declarations*, and `TFT004` catches only the direction where
+  the arena's stamps still look like Unix time.
+
+  Making `push` generic over `D` is **not** the fix and the doc says so:
+  `Stamp::<SensorDomain>::from_nanos(wall_clock_nanos)` compiles either way.
+  `Stamp<D>` is an unchecked assertion at *both* ends — the read side compares
+  one assertion against a declaration, not a clock against a clock. Symmetry is
+  worth a decision record on its own terms, not as a claim that the clock
+  becomes checked.
+
+### Added
+
 - **Recovery from C, and a read-write attachment to recover *with*.**
   [`0044`](docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md).
   `docs/PHASE2.md` §3.5's ownership migration and the reapers were Rust-only, so

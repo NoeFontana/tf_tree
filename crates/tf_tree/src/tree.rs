@@ -955,6 +955,35 @@ impl EdgeWriter<'_> {
     /// the reason it is drawn out here: at 1 kHz raising `sample_every` divides
     /// only the 3%, and the counter is what anyone reclaiming that path would
     /// have to delete.
+    ///
+    /// # The stamp's **domain** is not checked here, and the read side's is
+    ///
+    /// `stamp` is a bare `i64`. The read side takes `Stamp<D>` and
+    /// [`Plan::at`](tf_tree_core::Plan::at) refuses a mismatch with
+    /// `TimeDomainMismatch`; there is no equivalent on this call and
+    /// [`PushError`] has no variant for one. So an edge declared
+    /// `EdgeCfg::domain(1)` accepts wall-clock nanoseconds with `Ok(())`, and
+    /// the tree is then wrong by the offset between two clocks — which
+    /// `docs/API.md` §5.2 says is not recoverable from one-way stamps and not
+    /// repairable afterwards.
+    ///
+    /// **What does cover it, and how far.** `TopologyConfig::check_domain`
+    /// refuses at startup any edge whose declared domain differs from the
+    /// bridge's own, so the ROS 2 ingest path is guarded — it compares two
+    /// *declarations*, never the clock a stamp came from. `TFT004` samples the
+    /// offset between an edge's stamps and the wall clock, so it catches a
+    /// publisher stamping wall-clock time on a **non-wall-clock** edge only in
+    /// the direction where the arena's stamps still look like Unix time. A
+    /// hand-written publisher on a sensor- or steady-domain edge is unguarded.
+    ///
+    /// **Making this generic over `D` would not fix it**, which is why it has
+    /// not been done: `Stamp::<SensorDomain>::from_nanos(wall_clock_nanos)`
+    /// compiles today and would compile after. `Stamp<D>` is an unchecked
+    /// assertion at *both* ends — the read side's check compares one assertion
+    /// against a declaration, not a clock against a clock. What a generic
+    /// `push` buys is symmetry and a visible call site, which is worth a
+    /// decision record and a breaking change on its own terms, not as a claim
+    /// that the clock becomes checked.
     pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
         #[cfg(all(feature = "shm", target_os = "linux"))]
         if self.detached() {
