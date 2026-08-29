@@ -35,6 +35,26 @@ is a bug.
 
 ### Fixed
 
+- **`TFT009` reports a publisher that has *stopped*, which no check could see.**
+  Every rule in the catalogue measured intervals *between retained stamps*, so a
+  publisher that died three weeks ago left a full ring of perfectly spaced
+  samples: the median period reads healthy, the largest gap is one period, and
+  `doctor` reported nothing — while the transform every consumer reads had been
+  frozen since. That is the most common fault in the field, and the only thing
+  in the project that saw it was `tf_tree top`, which needs two ticks to notice
+  a `head` that did not move.
+
+  A single snapshot compares the newest stamp against the reference clock
+  instead. Same id (so `doctor` and `top` agree), same `GAP_FACTOR`, same
+  per-edge median — the trailing gap is just the open end of the same
+  inter-arrival distribution, so nothing new is calibrated.
+
+  It runs only on a **live** arena with a **wall-comparable** clock: on a frozen
+  `.tft` or a bag the distance is the age of the recording, and firing there is
+  the false positive that makes an operator stop reading the report. When it
+  cannot run, `doctor`'s report metadata says so — a check that quietly does
+  half its work is indistinguishable from one that passed.
+
 - **A killed publisher's claims are revoked by the owner, so a restarted node
   can take its own edges back.** `docs/PHASE2.md` §3.9 says a dead
   participant's *"arena-side records"* are the owner's to reap; the hangup
