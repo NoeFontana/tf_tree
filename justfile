@@ -2756,3 +2756,180 @@ py-vs-tf2:
         rm -rf target/pywheel && mkdir -p target/pywheel; \
         python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
         PYTHONPATH=target/pywheel:$PYTHONPATH python3 crates/tf_tree_bench/python/tf2_ros_compare.py'
+
+# Build, verify and package the CLI for one target — `docs/PHASE5.md` §10's
+# "release automation: `cargo-dist` or equivalent".
+#
+# **Why a recipe and not twenty lines of YAML.** `release.yml` calls this once
+# per matrix row, which is the rule `CLAUDE.md` states for every other gate: CI
+# invokes the recipe rather than transcribing it, because a transcription
+# drifts. It also makes the artifact reproducible on a developer's machine
+# without pushing a tag, which is the only way to debug a packaging change.
+#
+# **Why not `cargo-dist` itself**, which §10 names first: it *generates* the
+# workflow from its own config and regenerates it on upgrade. Every other job in
+# this repository's workflows carries the argument for why it is shaped the way
+# it is, and a generated file cannot. "Or equivalent" is what this is.
+#
+# **The binary is executed before it is packaged, and this is the whole point of
+# the recipe.** A build that emits a file proves the linker ran, not that the
+# artifact works: a wrong-architecture cross-build, a truncated write and a
+# stale binary from a previous version all produce a plausible-looking file.
+# `--version` against the workspace number rejects all three. That check only
+# works where the target can execute, so this recipe refuses a target this host
+# cannot run rather than shipping an unverified archive — every row of
+# `release.yml`'s matrix is a native runner for exactly this reason.
+release-archive TARGET:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="{{ TARGET }}"
+    version="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+    name="tf_tree-v${version}-${target}"
+    stage="target/release-staging/${name}"
+
+    # `--features shm` and not the default set. `--attach`, `tf_tree top` and
+    # `tf_tree participants` are the subcommands somebody reaches for a
+    # prebuilt binary to run — they inspect a robot that is already running —
+    # and all three are behind that feature. Shipping the default build would
+    # hand an operator a binary that cannot see a live arena. `counters` and
+    # `compression` stay on as defaults; `compression` is why an ordinary
+    # rosbag2/Foxglove zstd recording opens at all.
+    rustup target add "${target}" >/dev/null 2>&1 || true
+    cargo build --locked --release -p tf_tree_cli --features shm --target "${target}"
+
+    bin="target/${target}/release/tf_tree"
+    [ -f "${bin}" ] || { echo "no binary at ${bin}" >&2; exit 1; }
+
+    # Refuse rather than skip. A silent skip here is how an unverified artifact
+    # reaches a release: the archive would still be built, still be uploaded,
+    # and nothing downstream could tell it apart from a checked one.
+    if ! "${bin}" --version >/dev/null 2>&1; then
+        echo "::error::${bin} does not execute on this host." >&2
+        echo "  This recipe verifies the artifact by running it, so it must run" >&2
+        echo "  on a native runner for ${target}. Cross-building would produce" >&2
+        echo "  an archive nothing has checked." >&2
+        exit 1
+    fi
+    got="$("${bin}" --version)"
+    want="tf_tree ${version}"
+    if [ "${got}" != "${want}" ]; then
+        echo "::error::${bin} reports '${got}', workspace version is '${want}'" >&2
+        exit 1
+    fi
+    echo "  verified: ${got} (${target})"
+
+    # The glibc floor is the fact that decides whether this artifact is usable
+    # on ROS 2 Humble (Ubuntu 22.04, glibc 2.35) — the largest ROS 2 install
+    # base, and older than every GitHub `ubuntu-latest` runner. Reported, not
+    # gated: the musl rows are the answer to a floor that is too high, and a
+    # gate here would only restate which row is which.
+    if command -v objdump >/dev/null 2>&1; then
+        floor="$(objdump -T "${bin}" 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 || true)"
+        echo "  glibc floor: ${floor:-none (static)}"
+    fi
+
+    rm -rf "${stage}"
+    mkdir -p "${stage}"
+    cp "${bin}" "${stage}/tf_tree"
+    # `tft` is a symlink, not a second binary. `src/bin/tft.rs` is four lines
+    # calling the same `tf_tree_cli::run()` and inspects no `argv[0]`, so the
+    # two are behaviourally identical — measured, the pair costs 2.27 MB
+    # compressed against 1.14 MB for one. The alias is documented, so leaving it
+    # out of the archive would be a papercut; shipping a second copy of the same
+    # 2.8 MB to provide it is the wrong way to avoid one.
+    ln -s tf_tree "${stage}/tft"
+    # Apache-2.0 §4(a) and the MIT licence both require the licence text to
+    # travel with a binary distribution, exactly as `release.yml` already
+    # asserts for the crates.io tarballs. `-L` because these are symlinks inside
+    # every crate directory; the copies at the repository root are the real
+    # files, and dereferencing is what makes that true wherever it is run from.
+    cp -L LICENSE-MIT LICENSE-APACHE NOTICE README.md "${stage}/"
+    for f in LICENSE-MIT LICENSE-APACHE; do
+        bytes=$(wc -c < "${stage}/${f}")
+        [ "${bytes}" -ge 1000 ] || { echo "::error::${f} is ${bytes} bytes" >&2; exit 1; }
+    done
+
+    # **Deterministic packaging, asserted below rather than hoped for.** Two
+    # runs of this recipe against one commit produced two different checksums
+    # before these flags existed — purely from tar's per-file mtimes and gzip's
+    # embedded timestamp, with a byte-identical binary inside — which makes the
+    # published `.sha256` unverifiable by anyone who rebuilds. `--sort=name`
+    # fixes entry order, `--mtime` pins every stamp to the commit's own date,
+    # the ownership flags erase the builder's uid, and `gzip -n` drops the
+    # timestamp-and-filename header gzip writes by default.
+    pack () {
+        tar --sort=name --format=gnu \
+            --owner=0 --group=0 --numeric-owner \
+            --mtime="@$(git log -1 --format=%ct)" \
+            -C target/release-staging -cf - "${name}" \
+            | gzip -n -9 > "$1"
+    }
+    pack "target/release-staging/${name}.tar.gz"
+
+    # **Two checks, and the obvious one does not work.** Packing twice and
+    # comparing is the first thing to reach for and it is vacuous: both packs
+    # run inside the same second, so a `date +%s` mtime and the timestamp gzip
+    # embeds without `-n` are *identical between them*, and the comparison
+    # passes on a build with every flag above removed. Measured, not reasoned —
+    # it passed. What follows tests the two mechanisms directly instead.
+    #
+    # 1. gzip's header carries MTIME in bytes 4..8. Read the field and require
+    #    zero. **`-n` is not what makes it zero here and the comment used to
+    #    say it was**: gzip zeroes MTIME for any input that is not a regular
+    #    file, so the pipe above already does it — measured, `printf x | gzip`
+    #    gives 0 and `gzip -c file` gives a live timestamp. The flag is
+    #    belt-and-braces for an edit that packs from a file instead, and this
+    #    assertion is what would catch that edit. It does not distinguish the
+    #    flag from the pipe, and is kept for the property, not the flag.
+    stamp="$(od -An -tu4 -j4 -N4 < "target/release-staging/${name}.tar.gz" | tr -d ' ')"
+    if [ "${stamp}" != "0" ]; then
+        echo "::error::gzip header carries MTIME ${stamp}; -n is not in effect" >&2
+        exit 1
+    fi
+    # 2. `--mtime` is what makes the *contents* independent of when the staging
+    #    directory happened to be written. Re-stamp every staged file to a
+    #    different date and repack: pinned, the bytes are identical; unpinned,
+    #    they are not. This is the differential the same-second comparison
+    #    could not produce.
+    find "${stage}" -exec touch -h -d '2001-09-09T01:46:40Z' {} +
+    pack "target/release-staging/${name}.repack"
+    a="$(sha256sum < "target/release-staging/${name}.tar.gz")"
+    b="$(sha256sum < "target/release-staging/${name}.repack")"
+    rm -f "target/release-staging/${name}.repack"
+    if [ "${a}" != "${b}" ]; then
+        echo "::error::packaging is not deterministic: staged mtimes reached the archive" >&2
+        exit 1
+    fi
+    # Ownership is pinned by the flags and not differentially tested here: this
+    # recipe cannot chown to a second uid without root, so the flag is asserted
+    # by reading tar's own listing rather than by varying the input. (It does
+    # fire — removing the flags was measured to fail this check.)
+    #
+    # **What is deliberately not gated: `--sort=name`.** Removing it was
+    # measured and the recipe still passed, because readdir returns this
+    # staging directory's five entries in a stable order within a run. Catching
+    # it needs two different filesystems, which is not something a recipe can
+    # arrange. Said here rather than left to look tested.
+    owners="$(tar tvzf "target/release-staging/${name}.tar.gz" | awk '{print $2}' | sort -u)"
+    if [ "${owners}" != "0/0" ]; then
+        echo "::error::archive records ownership '${owners}', expected 0/0" >&2
+        exit 1
+    fi
+
+    # Unpack what was just packed and run *that*, through the symlink. The
+    # archive is the artifact a user receives, and nothing above has yet proven
+    # the thing inside it survives a round trip — a dereferenced or dangling
+    # `tft`, or a tar that recorded the staging path rather than the binary,
+    # both pack without complaint.
+    check="target/release-staging/roundtrip"
+    rm -rf "${check}" && mkdir -p "${check}"
+    tar xzf "target/release-staging/${name}.tar.gz" -C "${check}"
+    [ -L "${check}/${name}/tft" ] || { echo "::error::tft is not a symlink in the archive" >&2; exit 1; }
+    unpacked="$("${check}/${name}/tft" --version)"
+    [ "${unpacked}" = "${want}" ] || { echo "::error::unpacked tft reports '${unpacked}'" >&2; exit 1; }
+    rm -rf "${check}"
+
+    ( cd target/release-staging && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+    echo "  packaged: target/release-staging/${name}.tar.gz"
+    cat "target/release-staging/${name}.tar.gz.sha256"

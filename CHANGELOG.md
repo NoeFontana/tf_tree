@@ -220,6 +220,62 @@ is a bug.
   is retracted is only its membership in a table of crash points. `loom` and
   `shm_torture` are the mechanisms that can reach it.
 
+- **Prebuilt `tf_tree` CLI binaries, attached to a GitHub Release** — four Linux
+  targets, `{x86_64, aarch64}` × `{gnu, musl}`. `docs/PHASE5.md` §10 has always
+  asked for "release automation: `cargo-dist` or equivalent"; this is the
+  equivalent, and until now the answer was that it "is not owed".
+
+  **That answer was a non-sequitur and §0.0 now says so.** It reasoned from
+  `tf_tree_cli` being `publish = false` — but that is a fact about the crates.io
+  *index*, and the crate's own manifest states the reason is mechanical: three of
+  its dependencies are path-only, so there is no version to publish against.
+  Nothing in it bears on whether a user should be handed a binary. What the
+  inference cost is measurable: `v0.0.1` through `v0.0.4` all shipped to
+  crates.io and PyPI, and the repository's Releases page was **empty** — a tag
+  push creates a tag ref and nothing else — so the audience the README opens
+  with, somebody holding a recording and no Rust toolchain, had `git clone &&
+  cargo install` as the only route to `doctor --from-bag`.
+
+  **Both libc flavours, because neither subsumes the other.** Measured, the gnu
+  build's floor is `GLIBC_2.34`: fine on ROS 2 Humble (Ubuntu 22.04, glibc 2.35),
+  too high for 20.04 or a `bullseye`-based container. The musl builds are static
+  and have no floor at all. The gnu rows earn their place on libc updates rather
+  than on speed: a dynamic build picks up a glibc security fix from the
+  distribution, a static one needs a new release to carry it. Both carry
+  `--features shm`, so `--attach`, `tf_tree top` and `tf_tree participants` work
+  against a live arena.
+
+  **The archive is verified by being run, not by having been built.** `just
+  release-archive <target>` executes the binary and compares `--version` to the
+  workspace number — a wrong-architecture cross-build, a truncated write and a
+  stale artifact from a previous version all produce a file that looks fine — and
+  then unpacks what it packed and runs *that* through the `tft` symlink. Every
+  matrix row is a native runner because that check cannot be done any other way,
+  and the recipe refuses a target it cannot execute rather than emitting an
+  unchecked archive. `tft` ships as a symlink rather than a second 2.8 MB copy of
+  an identical binary: measured, 1.14 MB compressed against 2.27 MB.
+
+  The licence texts travel inside each archive, as Apache-2.0 §4(a) requires and
+  as `release.yml` already asserts for the crates.io tarballs, and packaging is
+  byte-deterministic — pinned mtimes, pinned ownership, no gzip timestamp.
+
+  **Two of the determinism checks were vacuous when written, and the recipe
+  records it rather than quietly deleting the evidence.** Packing twice and
+  comparing — the obvious check — passes with every determinism flag removed,
+  because both packs land in the same second; and gzip zeroes its MTIME field for
+  *any* piped input, with or without `-n`, so an assertion on that field cannot
+  see the flag it was written for. Both were caught by mutating the producer and
+  observing the check still pass. What replaced the first is a real differential:
+  re-stamp the staged files to a different date and repack. `--sort=name` is
+  still not differentially tested — catching it needs two filesystems — and the
+  recipe says so instead of looking gated.
+
+  crates.io publication now waits on these builds. It consumes nothing they
+  produce; the ordering is there because an upload to crates.io is irreversible
+  and a four-target build is the likeliest step in that workflow to fail. The
+  Release itself is created after the publish succeeds, so it can never advertise
+  a version that `cargo add` cannot resolve.
+
 ### Fixed — documentation
 
 - **Six Python docstrings pointed where a wheel user cannot go.** PyO3 copies a
