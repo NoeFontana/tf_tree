@@ -423,6 +423,133 @@ impl PyTree {
         self.inner.is_writable()
     }
 
+    /// Has the process that owns this arena gone away
+    /// (`docs/PHASE2.md` §3.5)?
+    ///
+    /// One non-blocking `poll` of the attach socket, plus — only once that
+    /// reports a hangup — one `F_OFD_GETLK` on the ownership byte. So it answers
+    /// *"the arena has no owner"* rather than *"my socket is dead"*, and a
+    /// survivor that did not inherit stops being told to try
+    /// ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
+    ///
+    /// `False` for anything that is not a joined shared attachment: an
+    /// in-process tree, a frozen `.tft`, or a tree this process already owns.
+    /// None of them has an owner that can die out from under it.
+    ///
+    /// Pair it with [`inherit_ownership`](Self::inherit_ownership) in your own
+    /// loop. **Nothing calls it for you** — there is no background thread and no
+    /// daemon, per `0019` — so an arena whose survivors never ask stays
+    /// ownerless and wedges new joiners.
+    ///
+    /// ```python
+    /// if tree.owner_lost():
+    ///     tree.inherit_ownership()   # "Contended" is fine: somebody else won
+    /// ```
+    #[cfg(target_os = "linux")]
+    fn owner_lost(&self) -> bool {
+        self.inner.owner_lost()
+    }
+
+    /// Inherit the owner role from a departed owner and begin serving (§3.5).
+    ///
+    /// **This is the call a Python fleet did not have.** Until it existed, an
+    /// arena whose owner was `SIGKILL`ed could not be rejoined by anything
+    /// written in this language: the survivors keep their participant bytes,
+    /// §3.4's split-brain check refuses every new create, and the recovery was
+    /// to stop every attached process
+    /// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+    ///
+    /// Returns the outcome's name, which is what a Python caller branches on:
+    /// `"Inherited"`, `"OwnerAlive"`, `"Contended"`, `"ReadOnly"`,
+    /// `"NotApplicable"`. **Anything but `"Inherited"` means this process is not
+    /// the owner, and none of them is a reason to stop reading** — lookups are
+    /// unaffected by ownership in every one of these states, and during a
+    /// takeover as well.
+    ///
+    /// `"ReadOnly"` is the one to watch on a consumer fleet: an owner writes the
+    /// participant table on every grant and a read-only mapping cannot, so a
+    /// fleet of read-only consumers cannot rescue itself (D18). Open with
+    /// `mode="rw"` if a process must be able to inherit.
+    ///
+    /// # Errors
+    ///
+    /// [`TfTreeError`](crate::errors::TfTreeError) if the `fcntl` fails or the
+    /// rendezvous socket cannot be bound. On every failure this process keeps
+    /// its participant slot, its byte and its mapping, and gives back the
+    /// ownership byte if it had taken one — so a failed attempt leaves a plain
+    /// participant rather than an arena with an owner that is not serving.
+    #[cfg(target_os = "linux")]
+    fn inherit_ownership(&self) -> PyResult<&'static str> {
+        match self.inner.inherit_ownership() {
+            Ok(o) => Ok(match o {
+                tf_tree::Inheritance::Inherited => "Inherited",
+                tf_tree::Inheritance::OwnerAlive => "OwnerAlive",
+                tf_tree::Inheritance::Contended => "Contended",
+                tf_tree::Inheritance::ReadOnly => "ReadOnly",
+                // `Inheritance` is `#[non_exhaustive]`, so a variant added later
+                // lands here rather than failing to compile. "NotApplicable" is
+                // the safe reading: it is the one value that tells a caller to
+                // keep behaving as a plain participant, which is never wrong.
+                _ => "NotApplicable",
+            }),
+            Err(e) => Err(crate::errors::inherit_err(&e)),
+        }
+    }
+
+    /// Collect what dead participants left behind; returns how many records
+    /// were freed.
+    ///
+    /// Both sweeps, summed: the claim leases no live process holds, and the
+    /// participant records whose lock bytes the kernel has released. They differ
+    /// in which arena table they walk, and a caller here has no basis to choose
+    /// between them.
+    ///
+    /// **Most of the time there is nothing to do, and that is the design.** The
+    /// owner's socket-hangup callback already revokes a dead participant's
+    /// claims and frees its record, so an ordinary killed-and-restarted
+    /// publisher needs no reaper. Two producers have no hangup for anyone to
+    /// observe — a dead **owner**, and a participant that never joined through
+    /// the rendezvous — and this is their only collector.
+    ///
+    /// `0` for a read-only tree, an in-process tree, or one with no rendezvous:
+    /// none of them can prove a holder is gone, and none of them may write the
+    /// arena.
+    #[cfg(target_os = "linux")]
+    fn reap_dead(&self) -> usize {
+        self.inner.reap_dead() + self.inner.reap_participants()
+    }
+
+    // **The non-Linux arms, present rather than absent**, for the reason
+    // `open_arena` already records: a missing attribute makes a portable script
+    // fail with `AttributeError` at a line that has nothing to do with the
+    // reason. Unlike `open_arena` these do not raise, because there is a true
+    // answer off Linux and it is not an error — shared arenas are Linux-only
+    // (`memfd`, `MAP_SHARED`, OFD locks), so a tree here is in-process, has no
+    // owner that can die, and has nothing anybody's death left behind. That is
+    // exactly what these three values mean on Linux for an in-process tree, so
+    // the surface reads the same on every platform.
+
+    /// Always `False` off Linux: shared arenas are Linux-only, so there is no
+    /// owner that can go away. See the Linux definition for the general case.
+    #[cfg(not(target_os = "linux"))]
+    fn owner_lost(&self) -> bool {
+        false
+    }
+
+    /// Always `"NotApplicable"` off Linux: shared arenas are Linux-only, so
+    /// there is no owner role to inherit. See the Linux definition.
+    #[cfg(not(target_os = "linux"))]
+    fn inherit_ownership(&self) -> PyResult<&'static str> {
+        Ok("NotApplicable")
+    }
+
+    /// Always `0` off Linux: shared arenas are Linux-only, so no other process
+    /// can have left anything behind. See the Linux definition.
+    #[cfg(not(target_os = "linux"))]
+    fn reap_dead(&self) -> usize {
+        0
+    }
+
     /// Which arena instance this tree is attached to, as 32 hex characters.
     ///
     /// All-zero for an in-process tree. Two processes that resolved the same
@@ -2277,7 +2404,7 @@ pub fn push(
 /// — still has to ask.
 // **Linux-only, and it refuses rather than vanishing.** The whole shared-arena
 // surface — `Open`, `CreatePolicy`, `AttachMode` — is
-// `#[cfg(all(feature = "shm", target_os = "linux"))]` in the facade, and this
+// `#[cfg(target_os = "linux")]` in the facade, and this
 // crate always enables `shm`, so the *target* is what decides. The paired
 // `#[cfg(not(...))]` arm below keeps the attribute present on every platform
 // for the reason `offline.rs` already records: a missing attribute makes a

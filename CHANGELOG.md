@@ -49,6 +49,15 @@ is a bug.
   `tft_tree_reap_dead`, and the five `TFT_INHERITED`…`TFT_NOT_APPLICABLE`
   values.
 
+  New in Python: `Tree.owner_lost()`, `Tree.inherit_ownership()` — which returns
+  the outcome's **name** as a string, since that is what a Python caller
+  branches on — and `Tree.reap_dead()`. Python already had `open(mode="rw")`, so
+  it needed no equivalent of `tft_tree_open_named`. All three are present off
+  Linux too, answering `False` / `"NotApplicable"` / `0`: shared arenas are
+  Linux-only, so those are the true answers rather than a stub, and a portable
+  script does not meet an `AttributeError` at a line that has nothing to do with
+  the reason.
+
   **`tft_tree_open_named` was not in the record and the other three are
   decoration without it.** `tft_tree_open(out)` was the entire arena-opening
   surface of the C ABI and it is `tf_tree::open()` — read-only, name from the

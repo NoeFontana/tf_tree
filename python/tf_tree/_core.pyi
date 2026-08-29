@@ -485,6 +485,61 @@ class Tree:
     def is_writable(self) -> bool:
         """Whether this process may publish into this tree."""
 
+    def owner_lost(self) -> bool:
+        """Has the process that owns this arena gone away (`PHASE2` §3.5)?
+
+        One non-blocking `poll` of the attach socket, plus — only once that
+        reports a hangup — one `F_OFD_GETLK` on the ownership byte. So it
+        answers *"the arena has no owner"* rather than *"my socket is dead"*,
+        and a survivor that did not inherit stops being told to try.
+
+        `False` for anything that is not a joined shared attachment: an
+        in-process tree, a frozen `.tft`, or a tree this process already owns.
+        Always `False` off Linux, where shared arenas do not exist.
+
+        **Nothing calls it for you** — no background thread, no daemon — so an
+        arena whose survivors never ask stays ownerless and wedges new joiners.
+
+            if tree.owner_lost():
+                tree.inherit_ownership()   # "Contended" is fine: somebody won
+        """
+
+    def inherit_ownership(self) -> str:
+        """Inherit the owner role from a departed owner and begin serving.
+
+        Returns `"Inherited"`, `"OwnerAlive"`, `"Contended"`, `"ReadOnly"` or
+        `"NotApplicable"`. **Anything but `"Inherited"` means this process is
+        not the owner, and none of them is a reason to stop reading** — lookups
+        are unaffected by ownership in every one of these states, and during a
+        takeover as well.
+
+        `"ReadOnly"` is the one to watch on a consumer fleet: an owner writes
+        the participant table on every grant and a read-only mapping cannot, so
+        a fleet of read-only consumers cannot rescue itself. Open with
+        `mode="rw"` if a process must be able to inherit.
+
+        Raises `TfTreeError` if the `fcntl` fails or the rendezvous socket
+        cannot be bound. On every failure this process keeps its participant
+        slot, its byte and its mapping, so the arena is left ownerless rather
+        than with an owner that is not serving, and another survivor can try.
+        """
+
+    def reap_dead(self) -> int:
+        """Collect what dead participants left behind; how many were freed.
+
+        Both sweeps, summed: claim leases no live process holds, and participant
+        records whose lock bytes the kernel has released.
+
+        **Usually `0`, and that is the design.** The owner's socket-hangup
+        callback already revokes a dead participant's claims and frees its
+        record, so an ordinary killed-and-restarted publisher needs no reaper.
+        Two producers have no hangup for anyone to observe — a dead *owner*, and
+        a participant that never joined through the rendezvous — and this is
+        their only collector.
+
+        `0` for a read-only tree, an in-process tree, or one with no rendezvous.
+        """
+
 def build(
     edges: list[tuple[str, str]] | str,
     *,

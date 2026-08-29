@@ -594,6 +594,25 @@ fn nameless(tree: &Tree) -> &'static str {
 /// The message says what to do because the caller almost never typed `fork` —
 /// `multiprocessing` did, and its default start method on Linux is what put
 /// them here.
+/// A failed `inherit_ownership`, as prose plus what it did *not* cost.
+///
+/// **The reassurance is the point, not padding.** Every error path inside
+/// `Tree::inherit_ownership` restores the attachment and gives the ownership
+/// byte back, so a failure leaves a plain participant rather than an arena with
+/// an owner that is not serving. A caller who does not know that has no way to
+/// tell this from "the arena is now unusable", and would restart a fleet that
+/// is fine ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+#[cfg(target_os = "linux")]
+pub(crate) fn inherit_err(e: &tf_tree::OpenError) -> PyErr {
+    TfTreeError::new_err(format!(
+        "could not inherit the owner role: {e}. This process kept its participant \
+         slot, its lock byte and its mapping, and gave back the ownership byte if \
+         it had taken one — so the arena still has no owner rather than an owner \
+         that is not serving, and another survivor (or this one, next pass) can \
+         still take it. Reads are unaffected throughout"
+    ))
+}
+
 pub(crate) fn detached_err() -> PyErr {
     TfTreeError::new_err(DETACHED)
 }
