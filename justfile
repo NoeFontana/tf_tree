@@ -3035,3 +3035,17 @@ split-brain-soak RUNS="1000":
         if [ $((i % 50)) -eq 0 ]; then echo "  ${i}/{{ RUNS }} clean"; fi
     done
     echo "§11.2 scenario 9: {{ RUNS }} consecutive runs, no second instance_uuid"
+
+# `docs/PHASE2.md` §12.3 gate 4 — kill → re-claimable p99 under 10 ms.
+#
+# The gate had no artifact at all: `shm_torture` reports how many claims were
+# recovered, never how long recovery took. This measures the interval a
+# supervisor experiences between `SIGKILL`ing a publisher and another process
+# being able to take its edge.
+#
+# It refuses to print a verdict on a run where the edge was takeable on the
+# first attempt — that run measured process teardown, not reclaim, and it is
+# how the first revision of this harness reported a PASS. INVALID, not FAIL.
+reclaim-latency TRIALS="200":
+    cargo build --release --features shm -p tf_tree_bench --bin reclaim_latency
+    TRIALS={{ TRIALS }} ./target/release/reclaim_latency
