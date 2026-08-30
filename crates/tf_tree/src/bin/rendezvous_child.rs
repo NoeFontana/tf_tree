@@ -406,7 +406,6 @@ fn main() {
                 std::thread::park();
             }
         }
-        #[cfg(feature = "unstable")]
         // `docs/PHASE2.md` §11.2 scenarios 7 and 9. Both turn on one fact —
         // every process on one `(runtime_dir, domain, name)` must see the *same*
         // `instance_uuid` — so both are served by an arm that opens with the
@@ -451,6 +450,7 @@ fn main() {
                 Err(e) => say(&format!("refused {e:?}")),
             }
         }
+        #[cfg(feature = "unstable")]
         "join-rw-report" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)

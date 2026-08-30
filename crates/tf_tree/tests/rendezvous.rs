@@ -5129,7 +5129,9 @@ fn scenario_7_a_thundering_herd_produces_exactly_one_arena() {
     // spend the difference in the scheduler rather than in the window under
     // test. The count is stated here rather than silently reduced.
     const N: usize = 16;
-    let mut kids: Vec<Kid> = (0..N).map(|_| Kid::spawn(&scratch.0, &["open-uuid"])).collect();
+    let mut kids: Vec<Kid> = (0..N)
+        .map(|_| Kid::spawn(&scratch.0, &["open-uuid"]))
+        .collect();
 
     let mut uuids = std::collections::BTreeSet::new();
     let mut refusals = Vec::new();
@@ -5297,7 +5299,10 @@ fn scenario_11_two_domains_in_one_runtime_dir_are_separate_arenas() {
     // is the half that fails if the domain reaches the name but not the lock.
     let mut c = Kid::spawn_with_env(&scratch.0, &["open-uuid"], &[("TF_TREE_DOMAIN", "7")]);
     let uc = uuid_of(&mut c).expect("a second opener in domain 7");
-    assert_eq!(uc, ua, "domain 7's second opener must join domain 7's arena");
+    assert_eq!(
+        uc, ua,
+        "domain 7's second opener must join domain 7's arena"
+    );
 
     a.kill();
     b.kill();
