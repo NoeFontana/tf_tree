@@ -1373,6 +1373,7 @@ fn cmd_doctor(
         format_version: tf_tree::arena_format_version(),
         layout_hash: tf_tree::arena_layout_hash(),
         instance: instance_uuid(tree, &src),
+        runtime_dir: resolved_runtime_dir(),
         frames: snap.frames.len(),
         edges: snap.edges.len(),
         generated_unix_nanos: unix_nanos_now(),
@@ -1533,6 +1534,33 @@ fn host_facts() -> Option<hostfacts::HostFacts> {
 }
 
 /// The arena's instance uuid, which only a shared arena has.
+/// The rendezvous runtime directory this host resolves to, with its source.
+///
+/// `docs/PHASE2.md` §15 asks `doctor` to print this *and* to work without the
+/// arena. Those two are one requirement: the run where an operator most needs to
+/// know which directory was searched is the run where nothing was found in it.
+/// So this consults no tree and degrades to `None` rather than failing — a host
+/// with no resolvable runtime dir is a finding for the operator, not a reason to
+/// refuse the other eighteen checks.
+///
+/// The source is included because the four candidates
+/// (`$TF_TREE_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/tf_tree`, `/run/tf_tree`,
+/// `/tmp/tf_tree-<uid>`) fail differently: an unexpected *path* is usually an
+/// unexpected *reason*, and printing only the path leaves the operator to guess
+/// which rule produced it.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+fn resolved_runtime_dir() -> Option<String> {
+    let d = tf_tree_ipc::RuntimeDir::resolve().ok()?;
+    Some(format!("{} ({:?})", d.path().display(), d.source()))
+}
+
+/// See [`resolved_runtime_dir`]. Without `shm` there is no rendezvous to have a
+/// directory for, so there is nothing to resolve and nothing to report.
+#[cfg(not(all(feature = "shm", target_os = "linux")))]
+fn resolved_runtime_dir() -> Option<String> {
+    None
+}
+
 fn instance_uuid(tree: &Tree, src: &Source) -> Option<String> {
     let _ = (tree, src);
     #[cfg(all(feature = "shm", target_os = "linux"))]

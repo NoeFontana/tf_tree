@@ -473,6 +473,19 @@ pub struct Meta {
     pub layout_hash: u32,
     /// Instance uuid, hex, when the source is a shared arena.
     pub instance: Option<String>,
+    /// The rendezvous runtime directory this host resolves to, and how.
+    ///
+    /// **Reported whatever the source is, and `None` only when resolution
+    /// fails.** `docs/PHASE2.md` §15 asks `doctor` to print it *and* to work
+    /// without the arena, which is the combination that makes it worth
+    /// printing: an operator whose arena cannot be found needs to know which
+    /// directory was searched, and that is exactly the run where there is no
+    /// arena to read it from. It is a property of the host and the environment
+    /// (`$TF_TREE_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/tf_tree`, `/run/tf_tree`,
+    /// `/tmp/tf_tree-<uid>`), not of any tree, so it is resolved independently
+    /// of the source and a failure to resolve degrades to `None` rather than
+    /// failing the command.
+    pub runtime_dir: Option<String>,
     /// Frame count, for the one-line summary.
     pub frames: usize,
     /// Edge count.
@@ -522,6 +535,9 @@ pub fn render_human(report: &Report, meta: &Meta) -> String {
     let _ = writeln!(s, "tf_tree doctor ({})", meta.source);
     if let Some(uuid) = &meta.instance {
         let _ = writeln!(s, "  instance {uuid}");
+    }
+    if let Some(dir) = &meta.runtime_dir {
+        let _ = writeln!(s, "  runtime dir {dir}");
     }
     let _ = writeln!(
         s,
@@ -620,6 +636,7 @@ pub const JSON_SCHEMA: &str = "tf_tree.doctor/1";
 ///   "clock_source": string,
 ///   "source": "live arena" | "in-process fixture",
 ///   "counters_compiled_in": bool,
+///   "runtime_dir": string|null,       // resolved rendezvous dir, or null
 ///   "notes": [ string ],              // checks that ran with evidence missing
 ///   "arena": { "format_version": u32, "layout_hash": "0x........",
 ///              "instance": string|null, "frames": u32, "edges": u32,
@@ -678,6 +695,16 @@ pub fn render_json(report: &Report, meta: &Meta) -> String {
         let _ = writeln!(s, "    \"{}\"{comma}", json_escape(n));
     }
     let _ = writeln!(s, "  ],");
+    // A host fact, not an arena one, so it sits outside `"arena"` — the object
+    // below describes a segment, and this is true when there is no segment.
+    match &meta.runtime_dir {
+        Some(d) => {
+            let _ = writeln!(s, "  \"runtime_dir\": \"{}\",", json_escape(d));
+        }
+        None => {
+            let _ = writeln!(s, "  \"runtime_dir\": null,");
+        }
+    }
     let _ = writeln!(s, "  \"arena\": {{");
     let _ = writeln!(s, "    \"format_version\": {},", meta.format_version);
     let _ = writeln!(s, "    \"layout_hash\": \"0x{:08X}\",", meta.layout_hash);

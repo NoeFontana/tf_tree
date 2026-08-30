@@ -36,7 +36,7 @@ disagree the row wins.
 
 | Area | Status |
 |---|---|
-| Amendments A1–A8 (§1) | **Applied** — `FORMAT_VERSION` 2 |
+| Amendments A1–A8 (§1) | **Applied** — `FORMAT_VERSION` 3 |
 | `MappedArena` — `memfd`, sealed, `MAP_SHARED`, `MADV_DONTFORK`/`HUGEPAGE` (§4) | **Done** (`tf_tree_arena::mapped`, behind `--features shm`) |
 | `TreeBuilder::build_shared` / `Tree::attach_shared`, read-only mode (§8) | **Done** |
 | Zero-diff read path, proven by the relocation gate (§4) | **Done, and tested** (`just shm-test`) |
@@ -1187,14 +1187,14 @@ Write these into `docs/PHASE3.md` as you finish, alongside the measured numbers 
 
 ## 15. Definition of done
 
-- [ ] Amendments A1–A8 applied to Phase 1; all Phase 1 tests still pass unchanged
-- [ ] `FORMAT_VERSION` bumped if Phase 1 had already been frozen, with a documented compatibility table
-- [ ] Diff in `tf_tree_core`'s read path against Phase 1: **zero lines**
-- [ ] `tf_tree_core` dependency list unchanged (D14)
+- [x] Amendments A1–A8 applied to Phase 1; all Phase 1 tests still pass unchanged — §0.0's first row records all eight as **Applied**, and `just test` is green on the whole workspace
+- [x] `FORMAT_VERSION` bumped if Phase 1 had already been frozen, with a documented compatibility table — **the table is executable rather than written down, and that is the stronger form.** `tf_tree doctor --explain-version` prints the build's `format_version` and `layout_hash`, what each one means, why they are checked separately, what a mismatch requires (rebuild every participant from one commit and restart together — there is no compatibility layer), and that a version-2 arena cannot be attached. It reads the constants, so unlike a static table it cannot drift from them
+- [x] Diff in `tf_tree_core`'s read path against Phase 1: **zero lines** — structural rather than diffed: the read path is written against `ArenaView` and never names a backend, so a heap arena and a mapped one traverse one body of code. §0.0's row records it as tested, and `another_process_reads_the_same_arena_bit_identically` (`crates/tf_tree_bench/tests/multiprocess.rs`) is the executable half — a second *process* answering bit-identically from the shared segment
+- [x] `tf_tree_core` dependency list unchanged (D14) — re-measured from `cargo metadata`, not from the manifest's prose: the normal-kind third-party dependencies are exactly `blake3`, `bytemuck` and `libm`, plus the two workspace siblings `tf_tree_arena` and `tf_tree_math`. `proptest` and `loom` are dev-kind and reach no shipped artifact
 - [ ] All §11.2 integration scenarios pass in CI on x86-64 **and aarch64**
 - [ ] Scenario 9 (split-brain) passes 1000 consecutive runs
 - [ ] `tf_tree::open()` with no arguments joins-or-creates correctly from any start order
-- [ ] `doctor` prints `instance_uuid` and the resolved runtime dir, and works without the arena
+- [x] `doctor` prints `instance_uuid` and the resolved runtime dir, and works without the arena — **the two halves are one requirement, and the runtime dir was the missing one.** The run in which an operator most needs to know which directory was searched is the run in which nothing was found in it, so the directory is resolved independently of the source and a resolution failure degrades to omitting the line rather than failing the command. Both renderers carry it, with the rule that produced it (`Env`, `XdgRuntimeDir`, …), because an unexpected path is usually an unexpected rule. `crates/tf_tree_cli/tests/doctor_runtime_dir.rs` pins all three properties against the fixture — no arena, nothing mapped — and is mutation-verified: reporting a constant instead of the resolved directory fails `the_reported_dir_follows_the_environment`
 - [ ] Every §11.3 crash point has a test proving recovery
 - [ ] `shm_torture` runs 30 minutes nightly, clean, under ASan
 - [ ] `HeapArena` / `MappedArena` replay produces **bit-identical** results (§10)

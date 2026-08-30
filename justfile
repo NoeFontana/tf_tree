@@ -2176,6 +2176,11 @@ shm-check:
     # gated, and the one left out is the one that carries the *skip* proving
     # `TFT018`/`TFT019` do not pass vacuously on a `.tft`.
     cargo nextest run -p tf_tree_cli --features shm --test doctor_frozen
+    # **`doctor`'s resolved runtime directory (`docs/PHASE2.md` §15).** The
+    # directory is where the *rendezvous* looks, so without `shm` there is none
+    # and the field is correctly absent — which makes the whole file `#[cfg]`-ed
+    # out of `just test` and gated only here.
+    cargo nextest run -p tf_tree_cli --features shm --test doctor_runtime_dir
     # **The frozen `.tft` arena (`docs/PHASE5.md` §2), which needs a real
     # mapping and therefore `--features shm`.** Without these two lines the
     # branch that introduced it had its centrepiece — §2.1's bit-for-bit proof
