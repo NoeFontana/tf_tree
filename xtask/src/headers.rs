@@ -381,6 +381,10 @@ const TEST_ONLY: &[&str] = &[
     "tft_test_publishable_tree_create",
     "tft_test_lerpslerp_tree_create",
     "tft_test_panic",
+    // The same claim for a boundary with no `tft_status` to carry it:
+    // `guard` cannot wrap an entry point that returns a count, so
+    // `guard_value` does, and this forces the panic that proves it.
+    "tft_test_panic_value",
     "tft_guarded_noop",
     "tft_test_push_unguarded",
     // `docs/PHASE4.md` §7 gate criterion 1's R2 rung: the same body as

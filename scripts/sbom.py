@@ -131,7 +131,10 @@ def main() -> int:
     else:
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(text)
-        print(f"sbom: {len(components)} shipped dependencies -> {args.out}", file=sys.stderr)
+        print(
+            f"sbom: {len(components)} shipped dependencies -> {args.out}",
+            file=sys.stderr,
+        )
     return 0
 
 

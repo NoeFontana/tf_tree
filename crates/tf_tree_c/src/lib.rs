@@ -1514,8 +1514,9 @@ pub extern "C" fn tft_test_panic() -> tft_status {
 
 /// The same, for an entry point with **no status to report through**.
 ///
-/// `tft_test_panic` proves [`guard`] converts a panic into `TFT_ERR_INTERNAL`.
-/// It cannot cover the boundaries that return a count or a size, because those
+/// `tft_test_panic` proves the crate's status-returning guard converts a panic
+/// into `TFT_ERR_INTERNAL`. That guard cannot cover boundaries returning a count
+/// or a size, because those
 /// have nowhere to put a status — and until `guard_value` existed they carried
 /// no guard at all, which is the gap §6's "on every `extern \"C\"` boundary"
 /// checkbox names. This is the shape of `tft_tree_frame_count` and
