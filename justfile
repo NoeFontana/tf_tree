@@ -3004,3 +3004,30 @@ release-archive TARGET:
 # materials for something that does not contain it.
 sbom VERSION:
     python3 scripts/sbom.py --version {{ VERSION }} -o target/tf_tree-{{ VERSION }}-sbom.cdx.json
+
+# `docs/PHASE2.md` §11.2 scenario 9, a thousand times — §15's box 6.
+#
+# §11.2 calls the split-brain race "the single most important race in the
+# phase" and asks for it in a loop of a thousand. That does not belong in
+# `just test`: one run is the regression gate, and a thousand is a soak whose
+# value is the *tail* — the one interleaving in a few hundred where a newcomer
+# arrives inside the window between the owner's death and a survivor noticing.
+#
+# The child's open timeout is an argument for this recipe's sake: the ownerless
+# arm waits the timeout out before refusing, so at the 5 s default a thousand
+# runs would be eighty-three minutes of sleeping rather than of racing.
+split-brain-soak RUNS="1000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --quiet -p tf_tree --features shm,unstable --tests
+    echo "running §11.2 scenario 9 x {{ RUNS }}"
+    for i in $(seq 1 {{ RUNS }}); do
+        if ! cargo nextest run -p tf_tree --features shm,unstable \
+             --test rendezvous -E 'test(/scenario_9_/)' >/tmp/tf-split-brain.log 2>&1; then
+            echo "::error::split-brain FAILED on run ${i} of {{ RUNS }}" >&2
+            cat /tmp/tf-split-brain.log >&2
+            exit 1
+        fi
+        if [ $((i % 50)) -eq 0 ]; then echo "  ${i}/{{ RUNS }} clean"; fi
+    done
+    echo "§11.2 scenario 9: {{ RUNS }} consecutive runs, no second instance_uuid"

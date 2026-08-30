@@ -5086,3 +5086,265 @@ fn a_killed_heir_leaves_the_role_for_the_next_survivor() {
         .open()
         .expect("after the heir's death and the next survivor's takeover, a joiner must succeed");
 }
+
+// ---------------------------------------------------------------------------
+// `docs/PHASE2.md` §11.2 — the required integration scenarios.
+//
+// §11.2 asks for a `tf_tree_test_harness` that "spawns real child processes
+// (not threads), coordinates via pipes, and asserts on arena state". That is
+// `Scratch` + `Kid` above, which already does exactly those three things, so
+// the scenarios are written against it rather than against a second harness
+// beside it — a second one would be a second spelling of this file's
+// infrastructure (`docs/PROJECT.md` §6).
+// ---------------------------------------------------------------------------
+
+/// Read a `uuid <hex>` line from an `open-uuid` child, or its refusal.
+///
+/// Returns `Ok(uuid)` or `Err(the refusal text)`. Both are outcomes the
+/// scenarios below distinguish; only a *second arena* is a failure.
+fn uuid_of(kid: &mut Kid) -> Result<String, String> {
+    let line = kid.line();
+    match line.strip_prefix("uuid ") {
+        Some(u) => Ok(u.to_string()),
+        None => Err(line),
+    }
+}
+
+/// **§11.2 scenario 7 — the thundering herd.** N processes call `open()` at once
+/// with no arena present. Exactly one creates, the rest join, and **all of them
+/// see the same `instance_uuid`**.
+///
+/// The uuid comparison is the assertion, not a count of who created: a design
+/// that let two processes each create an arena would still report "one created"
+/// from each of their own points of view, and only the uuids disagree.
+///
+/// §15's box is "`tf_tree::open()` with no arguments joins-or-creates correctly
+/// from **any start order**". The order here is "as close to simultaneous as
+/// spawning allows", which is the order no sequential test covers.
+#[test]
+fn scenario_7_a_thundering_herd_produces_exactly_one_arena() {
+    let scratch = Scratch::new("herd");
+    // Sixteen rather than §11.2's thirty-two: the race is between the *first*
+    // few to reach step 4, and thirty-two processes on a four-core runner
+    // spend the difference in the scheduler rather than in the window under
+    // test. The count is stated here rather than silently reduced.
+    const N: usize = 16;
+    let mut kids: Vec<Kid> = (0..N).map(|_| Kid::spawn(&scratch.0, &["open-uuid"])).collect();
+
+    let mut uuids = std::collections::BTreeSet::new();
+    let mut refusals = Vec::new();
+    for kid in &mut kids {
+        match uuid_of(kid) {
+            Ok(u) => {
+                uuids.insert(u);
+            }
+            Err(e) => refusals.push(e),
+        }
+    }
+    assert!(
+        refusals.is_empty(),
+        "no opener should be refused when the arena is simply absent: {refusals:?}"
+    );
+    assert_eq!(
+        uuids.len(),
+        1,
+        "every process must see one arena; got {} distinct instance_uuids: {uuids:?}",
+        uuids.len()
+    );
+    for kid in &mut kids {
+        kid.kill();
+    }
+}
+
+/// **§11.2 scenario 9 — the split-brain attempt**, and the most important
+/// assertion in the phase: *"Two distinct `instance_uuid`s on one
+/// `(runtime_dir, domain, name)` is a hard test failure."*
+///
+/// **Both halves are here, and the first one is not what §11.2 predicts.** The
+/// scenario says the newcomer "must block on §3.4 step 4 and then join the
+/// existing arena". It is *refused* instead — `ArenaHeldButUnreachable`,
+/// naming the survivor's slot — and that is Phase 2 working as designed rather
+/// than a failure: ownership migration is caller-driven
+/// ([`0019`](../../../docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md)),
+/// so until some survivor calls `owner_lost()` nobody serves the rendezvous and
+/// there is nothing to join. §0.0's ownership-migration row states exactly this
+/// — *"an arena whose survivors never call it stays ownerless and wedges new
+/// joiners"* — so the scenario's own prediction is the one written before the
+/// trigger became caller-driven.
+///
+/// So the test asserts what actually protects the arena: **refused is fine,
+/// joined is fine, a second uuid never is.** Then it pokes the survivor into
+/// inheriting and shows the second half — the newcomer joins, and the uuid is
+/// still the original one.
+#[test]
+fn scenario_9_a_split_brain_attempt_never_produces_a_second_arena() {
+    let scratch = Scratch::new("split-brain");
+    let mut owner = Kid::spawn(&scratch.0, &["open-uuid"]);
+    let first = uuid_of(&mut owner).expect("the owner opens");
+
+    // A survivor that *can* inherit, which is what makes the second half
+    // reachable. It holds a participant byte either way, so the newcomer below
+    // meets §3.4 step 4 rather than an empty directory.
+    let mut survivor = Kid::spawn(&scratch.0, &["join-heir"]);
+    let joined = survivor.line();
+    assert!(joined.starts_with("joined "), "survivor: {joined}");
+
+    // Kill and race a newcomer into the window before the hangup is noticed.
+    // A short timeout: the ownerless arm waits it out before refusing, and
+    // `just split-brain-soak` runs this a thousand times.
+    owner.kill();
+    let mut racer = Kid::spawn(&scratch.0, &["open-uuid", "400"]);
+    match uuid_of(&mut racer) {
+        Ok(u) => assert_eq!(u, first, "a racer that opens must join, not create"),
+        Err(refusal) => assert!(
+            refusal.starts_with("refused"),
+            "a racer must join or be refused, not fail some third way: {refusal}"
+        ),
+    }
+
+    // Second half: once a survivor inherits, the arena is joinable again — and
+    // it is still the *same* arena.
+    survivor.poke();
+    let inherited = survivor.line();
+    assert!(
+        inherited.contains("Inherited"),
+        "the survivor must take the role: {inherited}"
+    );
+    let mut newcomer = Kid::spawn(&scratch.0, &["open-uuid"]);
+    let after = uuid_of(&mut newcomer).expect("a newcomer joins the inherited arena");
+    assert_eq!(
+        after, first,
+        "inheritance must preserve the arena; a new uuid here is the split brain"
+    );
+
+    survivor.kill();
+    racer.kill();
+    newcomer.kill();
+}
+
+/// **§11.2 scenario 10 — the stuck participant.** `SIGSTOP` the only
+/// participant, then open from a fresh process: it must be refused with
+/// `ArenaHeldButUnreachable` **naming the stuck slot**, never create a second
+/// arena. `SIGCONT`, and a subsequent open succeeds.
+///
+/// This is the scenario that distinguishes *stuck* from *dead*, which §5.1
+/// makes a kernel question: a `SIGSTOP`ped process still holds its lock byte,
+/// so the refusal is correct and reaping it would be the corrupting direction.
+#[test]
+fn scenario_10_a_stuck_participant_refuses_a_second_arena_and_recovers() {
+    let scratch = Scratch::new("stuck");
+    let mut held = Kid::spawn(&scratch.0, &["open-uuid"]);
+    let first = uuid_of(&mut held).expect("the holder opens");
+    let pid = held.0.id();
+
+    std::process::Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .status()
+        .expect("SIGSTOP");
+    await_stopped(pid);
+
+    // Refused, and the message names the slot the operator has to deal with.
+    let mut blocked = Kid::spawn(&scratch.0, &["open-uuid", "400"]);
+    let refusal = uuid_of(&mut blocked).expect_err("a stuck holder must refuse a create");
+    assert!(
+        refusal.contains("ArenaHeldButUnreachable"),
+        "the refusal must be the one RUNBOOK.md documents: {refusal}"
+    );
+    assert!(
+        refusal.contains("first_slot"),
+        "the refusal must name the stuck slot: {refusal}"
+    );
+
+    std::process::Command::new("kill")
+        .args(["-CONT", &pid.to_string()])
+        .status()
+        .expect("SIGCONT");
+
+    // And the arena is the same one afterwards — a stuck participant delays a
+    // joiner, it does not fork the arena.
+    let mut after = Kid::spawn(&scratch.0, &["open-uuid"]);
+    let seen = uuid_of(&mut after).expect("open succeeds once the holder runs again");
+    assert_eq!(seen, first, "recovery must join the original arena");
+
+    held.kill();
+    blocked.kill();
+    after.kill();
+}
+
+/// **§11.2 scenario 11 — domain isolation.** Two arenas under different domains
+/// never observe each other.
+///
+/// The runtime-dir half of the scenario is covered by every other test in this
+/// file by construction: `Scratch` gives each one its own
+/// `TF_TREE_RUNTIME_DIR`, and two tests running concurrently under nextest are
+/// exactly the "two arenas under different runtime dirs" case. What has no
+/// coverage is the *domain* half, where the directory is shared and only the
+/// domain differs — the case where an isolation bug would actually show.
+#[test]
+fn scenario_11_two_domains_in_one_runtime_dir_are_separate_arenas() {
+    let scratch = Scratch::new("domains");
+    let mut a = Kid::spawn_with_env(&scratch.0, &["open-uuid"], &[("TF_TREE_DOMAIN", "7")]);
+    let mut b = Kid::spawn_with_env(&scratch.0, &["open-uuid"], &[("TF_TREE_DOMAIN", "9")]);
+
+    let ua = uuid_of(&mut a).expect("domain 7 opens");
+    let ub = uuid_of(&mut b).expect("domain 9 opens");
+    assert_ne!(
+        ua, ub,
+        "two domains in one runtime dir must be two arenas, not one"
+    );
+
+    // And a third process in domain 7 joins *that* arena, not the other — which
+    // is the half that fails if the domain reaches the name but not the lock.
+    let mut c = Kid::spawn_with_env(&scratch.0, &["open-uuid"], &[("TF_TREE_DOMAIN", "7")]);
+    let uc = uuid_of(&mut c).expect("a second opener in domain 7");
+    assert_eq!(uc, ua, "domain 7's second opener must join domain 7's arena");
+
+    a.kill();
+    b.kill();
+    c.kill();
+}
+
+/// **§11.2 scenario 6 — a full participant table.** 64 participants, then a
+/// 65th: `NoParticipantSlots`, *"and the message says how to raise the limit"*.
+///
+/// **Not the same scenario as 2b, which is why both exist.**
+/// [`slot_recycling_under_abnormal_exit`] fills the table with the *records of
+/// dead processes* and asserts every attach still succeeds — exhaustion by
+/// leak. This fills it with **live** ones and asserts the refusal, which is the
+/// case where the limit is the real answer and reclaiming nothing would help.
+/// A single mechanism satisfies one and must not satisfy the other.
+///
+/// The message assertion is the operator half and is the reason the scenario
+/// names it: `NoParticipantSlots` on its own tells somebody their robot stopped,
+/// not what to do about it.
+#[test]
+fn scenario_6_a_full_participant_table_refuses_the_next_attach_with_a_remedy() {
+    let scratch = Scratch::new("full-table");
+    // The owner takes slot 0, so 63 joiners fill the default 64-slot table.
+    let mut owner = Kid::spawn(&scratch.0, &["open-uuid"]);
+    let uuid = uuid_of(&mut owner).expect("the owner opens");
+
+    let limit = tf_tree_arena::DEFAULT_MAX_PARTICIPANTS as usize;
+    let mut joiners = Vec::new();
+    for i in 0..(limit - 1) {
+        let mut k = Kid::spawn(&scratch.0, &["open-uuid"]);
+        let got = uuid_of(&mut k)
+            .unwrap_or_else(|e| panic!("joiner {i} of {} was refused: {e}", limit - 1));
+        assert_eq!(got, uuid, "every joiner must be on the same arena");
+        joiners.push(k);
+    }
+
+    // The 65th.
+    let mut over = Kid::spawn(&scratch.0, &["open-uuid", "800"]);
+    let refusal = uuid_of(&mut over).expect_err("the table is full; this attach must be refused");
+    assert!(
+        refusal.contains("NoParticipantSlots"),
+        "the refusal must name the exhausted resource: {refusal}"
+    );
+
+    owner.kill();
+    for k in &mut joiners {
+        k.kill();
+    }
+    over.kill();
+}

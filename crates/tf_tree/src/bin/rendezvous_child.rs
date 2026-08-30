@@ -407,6 +407,50 @@ fn main() {
             }
         }
         #[cfg(feature = "unstable")]
+        // `docs/PHASE2.md` §11.2 scenarios 7 and 9. Both turn on one fact —
+        // every process on one `(runtime_dir, domain, name)` must see the *same*
+        // `instance_uuid` — so both are served by an arm that opens with the
+        // ordinary join-or-create policy and reports the uuid it got. Whether
+        // this process created or joined is deliberately not reported: the
+        // scenarios assert agreement, and a child that announced "I created"
+        // would invite a test that counts announcements instead of comparing
+        // uuids, which is the assertion that actually falsifies split-brain.
+        "open-uuid" => {
+            match tf_tree::Open::new()
+                .mode(AttachMode::ReadWrite)
+                .create(CreatePolicy::IfAbsent)
+                .layout_if_creating(layout())
+                // The timeout is an argument because §11.2 scenario 9 is
+                // specified to run "a thousand times in a loop", and the
+                // ownerless arm of it *waits out* the timeout before refusing:
+                // at five seconds a thousand runs is eighty-three minutes of
+                // sleeping. The default stays generous for the herd, which must
+                // not time out on a loaded runner.
+                .timeout(std::time::Duration::from_millis(
+                    std::env::args()
+                        .nth(2)
+                        .and_then(|a| a.parse::<u64>().ok())
+                        .unwrap_or(5_000),
+                ))
+                .open()
+            {
+                Ok(tree) => {
+                    let u = tree.instance_uuid();
+                    let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
+                    say(&format!("uuid {hex}"));
+                    // Park holding the tree: releasing it would free the byte
+                    // the next scenario step depends on.
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                // A refusal is a legitimate outcome for scenario 9 — what is
+                // never legitimate is a *second arena*. Reporting it as data
+                // lets the test distinguish the two, where an `expect` would
+                // collapse them into one failure.
+                Err(e) => say(&format!("refused {e:?}")),
+            }
+        }
         "join-rw-report" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
