@@ -2181,6 +2181,10 @@ shm-check:
     # and the field is correctly absent — which makes the whole file `#[cfg]`-ed
     # out of `just test` and gated only here.
     cargo nextest run -p tf_tree_cli --features shm --test doctor_runtime_dir
+    # **`docs/PHASE2.md` §10's NORMATIVE test** — one recording replayed into a
+    # heap arena and a mapped one, bit-identical `f64`. `shm`-only by nature:
+    # without it there is no mapped arena to be the second half of the pair.
+    cargo nextest run -p tf_tree_cli --features shm --test replay_bit_identity
     # **The frozen `.tft` arena (`docs/PHASE5.md` §2), which needs a real
     # mapping and therefore `--features shm`.** Without these two lines the
     # branch that introduced it had its centrepiece — §2.1's bit-for-bit proof

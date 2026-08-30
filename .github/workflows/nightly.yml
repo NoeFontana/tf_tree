@@ -82,7 +82,18 @@ jobs:
         # C/C++ checklist; the UBSan half of it lives where there is C++ to
         # check, in `just cpp-check`, which runs the header-only wrapper under
         # `-fsanitize=undefined`.
-        recipe: [tsan, shm-torture-asan]
+        include:
+          - { recipe: tsan, args: "" }
+          # **§15's box is "runs 30 minutes nightly, clean, under ASan"**, and
+          # the recipe's own default is 120 s — right for a local run, and not
+          # what the box asks of the nightly. Passed explicitly here rather than
+          # by moving the default, so `just shm-torture-asan` stays two minutes
+          # for somebody checking a change. Four children rather than
+          # `shm-torture`'s six: ASan's shadow memory and interceptors cost
+          # enough that six under it is a different amount of work than six
+          # without, and the 90-minute job budget has to cover a `-Zbuild-std`
+          # rebuild as well as the run.
+          - { recipe: shm-torture-asan, args: "--duration 30m --children 4 --kill-hz 4" }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -92,8 +103,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
-      - name: just ${{ matrix.recipe }}
-        run: just ${{ matrix.recipe }}
+      - name: just ${{ matrix.recipe }} ${{ matrix.args }}
+        run: just ${{ matrix.recipe }} ${{ matrix.args }}
 
   # **The `tf2::BufferCore` differential, which ran in no automated gate at all.**
   #

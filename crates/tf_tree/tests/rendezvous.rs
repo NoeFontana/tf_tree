@@ -5353,3 +5353,168 @@ fn scenario_6_a_full_participant_table_refuses_the_next_attach_with_a_remedy() {
     }
     over.kill();
 }
+
+/// **§11.2 scenario 1 — one owner, one writer, many read-only readers**, with
+/// *"zero divergence between readers"* as the assertion.
+///
+/// The readers each answer the same query and print it as raw bit patterns, so
+/// the comparison cannot round. Divergence between two readers of one segment
+/// would mean the mapping is not what it claims to be — a stale page, a partial
+/// map, or a seqlock read that returned torn data as if it were whole.
+///
+/// **Fourteen readers, not the sustained 60 s.** §11.2 also asks for 1 kHz for
+/// a minute; that is a soak, and the property this test pins — that N readers
+/// of one arena agree exactly — is falsified in the first round if it is
+/// falsifiable at all. `just shm-torture` is where sustained load lives, and it
+/// checks the same invariant continuously for thirty minutes.
+#[test]
+fn scenario_1_many_readers_of_one_arena_do_not_diverge() {
+    let scratch = Scratch::new("readers");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    let owned = owner.line();
+    let truth = owned
+        .strip_prefix("owning ")
+        .expect("the owner reports its own answer")
+        .to_string();
+
+    const READERS: usize = 14;
+    let mut kids: Vec<Kid> = (0..READERS)
+        .map(|_| Kid::spawn(&scratch.0, &["join"]))
+        .collect();
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (i, kid) in kids.iter_mut().enumerate() {
+        let line = kid.line();
+        let bits = line
+            .strip_prefix("joined ")
+            .unwrap_or_else(|| panic!("reader {i}: {line}"));
+        seen.insert(bits.to_string());
+    }
+    assert_eq!(
+        seen.len(),
+        1,
+        "{READERS} readers of one arena must agree exactly; got {seen:?}"
+    );
+    assert!(
+        seen.contains(&truth),
+        "the readers agreed with each other but not with the writer:\n  writer {truth}\n  readers {seen:?}"
+    );
+
+    owner.kill();
+    for k in &mut kids {
+        k.kill();
+    }
+}
+
+/// **§11.2 scenario 2 — attach/detach churn**, with *"participant slots must
+/// not leak"* as the assertion.
+///
+/// Slots are the resource this phase is most able to leak: a participant that
+/// exits abnormally leaves a record, and a record that no collector reclaims is
+/// a slot gone for the life of the segment. The falsifier is not that any
+/// individual attach fails but that the table **runs out** — so the test churns
+/// well past the table's capacity and then asserts an attach still succeeds.
+///
+/// Deliberately *concurrent* churn, which is what distinguishes it from
+/// [`slot_recycling_under_abnormal_exit`]: that one attaches and kills strictly
+/// one at a time, so the owner's hangup callback always has a quiet moment to
+/// run in. Here several die at once and the collectors race each other.
+#[test]
+fn scenario_2_attach_detach_churn_does_not_leak_participant_slots() {
+    let scratch = Scratch::new("churn");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    let _ = owner.line();
+
+    let limit = tf_tree_arena::DEFAULT_MAX_PARTICIPANTS as usize;
+    // Three tablefuls, eight at a time, so the collectors are always working
+    // against a live table rather than an idle one.
+    const BATCH: usize = 8;
+    let rounds = (limit * 3).div_ceil(BATCH);
+    for round in 0..rounds {
+        let mut batch: Vec<Kid> = (0..BATCH)
+            .map(|_| Kid::spawn(&scratch.0, &["join-rw"]))
+            .collect();
+        for (i, k) in batch.iter_mut().enumerate() {
+            let line = k.line();
+            assert!(
+                line.starts_with("joined"),
+                "round {round} joiner {i} was refused, so a slot leaked: {line}"
+            );
+        }
+        for k in &mut batch {
+            k.kill();
+        }
+    }
+
+    // The assertion: after 3x the table has churned through it, the table is
+    // still usable. A leak shows up here as `NoParticipantSlots`.
+    let mut after = Kid::spawn(&scratch.0, &["join-rw"]);
+    let line = after.line();
+    assert!(
+        line.starts_with("joined"),
+        "after {} attach/detach cycles the table must still grant a slot: {line}",
+        rounds * BATCH
+    );
+
+    owner.kill();
+    after.kill();
+}
+
+/// **§11.2 scenario 3 — the owner dies mid-run.** Existing participants
+/// continue, a new attach fails cleanly, and reaping still functions.
+///
+/// All three clauses are one property: the arena outlives the process that
+/// created it, and what stops working is *joining*, not *reading*. A reader
+/// that lost its data when the owner died would make every consumer's liveness
+/// depend on the publisher's, which is the coupling shared memory exists to
+/// remove.
+#[test]
+fn scenario_3_an_owner_dying_leaves_readers_working_and_joins_refused() {
+    let scratch = Scratch::new("owner-dies");
+    let mut owner = Kid::spawn(&scratch.0, &["own"]);
+    let truth = owner.line().strip_prefix("owning ").unwrap().to_string();
+
+    // A survivor that can both read and reap.
+    let mut survivor = Kid::spawn(&scratch.0, &["join-sweep"]);
+    let joined = survivor.line();
+    assert!(joined.starts_with("joined"), "survivor: {joined}");
+
+    owner.kill();
+
+    // 1. A new attach fails cleanly — a named refusal, not a hang or a crash.
+    let mut newcomer = Kid::spawn(&scratch.0, &["open-uuid", "400"]);
+    let refusal = uuid_of(&mut newcomer).expect_err("joining an ownerless arena must be refused");
+    assert!(
+        refusal.contains("ArenaHeldButUnreachable"),
+        "the refusal must be the documented one: {refusal}"
+    );
+
+    // 2. Reaping still functions — the survivor collects the dead owner's slot,
+    //    which is the one no hangup can reach because the owner had no socket
+    //    of its own to close. The sweeper waits on stdin before sweeping, so
+    //    the poke is what orders the sweep *after* the kill.
+    survivor.poke();
+    let swept = survivor.line();
+    let n: usize = swept
+        .strip_prefix("swept ")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("sweeper: {swept}"));
+    assert!(
+        n >= 1,
+        "the sweeper must reclaim the dead owner's slot, got {n}"
+    );
+
+    // 3. "Existing participants continue" is what the successful sweep above
+    //    *is*: `reap_participants` reads and writes the arena, so a survivor
+    //    that can still do it after the owner's death is a participant that
+    //    still works. There is deliberately no assertion here comparing the
+    //    survivor's data to `truth` — the sweeper reports its slot, not a
+    //    lookup, so such a check would compare a slot number against a bit
+    //    pattern and pass on the `||` arm that is always true. That is exactly
+    //    the vacuous shape this file's other tests are written against, and it
+    //    was in the first revision of this one.
+    let _ = &truth;
+
+    survivor.kill();
+    newcomer.kill();
+}
