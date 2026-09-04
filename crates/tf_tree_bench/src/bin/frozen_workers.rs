@@ -52,12 +52,40 @@
 //! criterion itself is stated over the Rust arm and this binary does not move
 //! it.
 //!
+//! # `--gate` — the caller says whether this run is a gate
+//!
+//! Printing `FAIL` and exiting 0 is the shape `docs/benchmarks/EVIDENCE.md`
+//! exists to prevent: a criterion nothing re-derives, wired into a job that
+//! goes green on a regression. This binary drove `nightly.yml`'s `gate4` job in
+//! exactly that state — `verdict` was a string in a `println!` and every path
+//! out of `drive` was `Ok(())` — so criterion 4 could regress from 1.024x to
+//! anything at all and the job would pass.
+//!
+//! **The exit status is not the binary's to guess**, because §12 gate 4 is
+//! stated over the Rust arm and the Python arm deliberately reports without
+//! gating (§12 gate 4's amendment: "giving the gate a second *gated* arm is a
+//! decision and needs a record"). So gating is a flag the caller passes:
+//! `just gate4` passes `--gate` and `just gate4-python` does not. Two
+//! combinations are refused at argument parse rather than left to a recipe's
+//! discipline:
+//!
+//! * `--gate --python` — that is the second gated arm the amendment defers, and
+//!   a flag pair is exactly how it would arrive without a record;
+//! * `--gate --no-touch` — the control measures unread mappings and is
+//!   *documented* to FAIL at 5.32x, so gating on it asserts a number nobody
+//!   claims.
+//!
+//! Under `--gate`, a run that cannot evaluate the criterion (no N = 1 row, no
+//! N = 16 row) **refuses** rather than returning 0 having printed why: a gate
+//! that cannot check its property must not look like one that checked it.
+//!
 //! # Usage
 //!
 //! ```text
 //! frozen_workers --build /tmp/x.tft --robots 64 --history 40
-//! frozen_workers --tft /tmp/x.tft --workers 1,16
+//! frozen_workers --tft /tmp/x.tft --workers 1,16 --gate
 //! frozen_workers --tft /tmp/x.tft --workers 1,16 --python .venv/bin/python
+//! frozen_workers --tft /tmp/x.tft --workers 1,16 --no-touch   # the control
 //! frozen_workers --worker /tmp/x.tft          # a child; not run by hand
 //! ```
 
@@ -74,6 +102,18 @@ use tf_tree_bench::workload::{Backing, QuerySpec, Topology, Workload};
 
 /// §12 gate 4's threshold.
 const GATE: f64 = 1.2;
+
+/// §12 gate 4's criterion, as one expression both the verdict line and the exit
+/// status are taken from.
+///
+/// A free function rather than an inline comparison so that
+/// `gate_arithmetic_is_not_vacuous` can drive it without spawning sixteen
+/// processes — `owner_migration.rs`'s `gate_4b_holds` is the same shape, for
+/// the same reason: a gate that has never been observed to fail is a gate
+/// nobody has tested.
+fn gate_4_holds(ratio: f64) -> bool {
+    ratio <= GATE
+}
 
 /// Worker counts the gate is stated over.
 const DEFAULT_WORKERS: &[usize] = &[1, 16];
@@ -102,6 +142,9 @@ fn main() -> Result<()> {
     let mut stamps = 64usize;
     let mut interpreter: Option<PathBuf> = None;
     let mut py_worker: Option<PathBuf> = None;
+    // **Whether this run is a gate is the caller's statement, not an inference
+    // from the arm.** See the `--gate` section of this file's header.
+    let mut gate = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -160,9 +203,12 @@ fn main() -> Result<()> {
                 ))
             }
             "--no-touch" => touch = false,
+            "--gate" => gate = true,
             other => bail!("unknown argument `{other}`"),
         }
     }
+
+    let sweep = Sweep { touch, stamps };
 
     let arm = match interpreter {
         None => {
@@ -186,10 +232,33 @@ fn main() -> Result<()> {
         },
     };
 
+    // **The two `--gate` combinations that are refused rather than obeyed.**
+    // Both are decisions this binary is not entitled to make, and both would
+    // arrive as a flag pair in a recipe rather than as a record.
+    if gate {
+        if let Arm::Python { .. } = arm {
+            bail!(
+                "--gate --python asks this binary to gate on the Python arm. PHASE5 \
+                 §12 gate 4 is stated over the Rust worker, and its amendment is explicit \
+                 that giving criterion 4 a second *gated* arm is a decision that needs a \
+                 decision record. Run `just gate4-python`, which reports the same \
+                 measurement and exits 0."
+            );
+        }
+        if !touch {
+            bail!(
+                "--gate --no-touch asks this binary to gate on the control. Workers that \
+                 map the .tft and never read it have no resident share of it, so the ratio \
+                 is arithmetic about process overhead — PHASE5 §12 gate 4 records the \
+                 control at 5.32x FAIL, deliberately. Drop --gate to run it."
+            );
+        }
+    }
+
     match mode {
         Mode::Build => build(&path, robots, history),
-        Mode::Worker => worker(&path, touch, stamps),
-        Mode::Drive => drive(&path, robots, history, &workers, touch, stamps, &arm),
+        Mode::Worker => worker(&path, sweep.touch, sweep.stamps),
+        Mode::Drive => drive(&path, robots, history, &workers, sweep, &arm, gate),
     }
 }
 
@@ -197,6 +266,20 @@ enum Mode {
     Build,
     Worker,
     Drive,
+}
+
+/// What every worker is asked to do, carried as one value.
+///
+/// The two travel together everywhere — the driver hands both to each child on
+/// its command line, and both belong to the *measurement* rather than to the
+/// verdict, which is why `gate` is not in here.
+#[derive(Clone, Copy)]
+struct Sweep {
+    /// Whether workers read the mapping they open. `false` is the control.
+    touch: bool,
+    /// Stamps swept per edge — how much of the arena a worker's working set
+    /// covers.
+    stamps: usize,
 }
 
 /// Which program the driver spawns as a worker.
@@ -366,9 +449,9 @@ fn drive(
     robots: usize,
     history: f64,
     workers: &[usize],
-    touch: bool,
-    stamps: usize,
+    sweep: Sweep,
     arm: &Arm,
+    gate: bool,
 ) -> Result<()> {
     // Checked before anything is built or spawned: a missing script otherwise
     // presents as sixteen tracebacks and a driver complaining about a `ready`
@@ -389,7 +472,7 @@ fn drive(
     let file_mib = std::fs::metadata(path)?.len() as f64 / (1024.0 * 1024.0);
     let me = std::env::current_exe().context("locating this executable")?;
 
-    if !touch {
+    if !sweep.touch {
         eprintln!(
             "WARNING --no-touch: workers map the .tft and never read it, so almost none of it \
              is resident and the ratio is not a measurement of sharing."
@@ -417,7 +500,7 @@ fn drive(
 
     let mut totals: Vec<(usize, f64)> = Vec::new();
     for &n in workers {
-        let (total_kib, reads) = spawn_and_measure(&me, path, n, touch, stamps, arm)?;
+        let (total_kib, reads) = spawn_and_measure(&me, path, n, sweep, arm)?;
         let mib = total_kib as f64 / 1024.0;
         println!(
             "  {n:>7}  {:>9.1} MiB  {:>9.2} MiB  {reads:>10}",
@@ -429,17 +512,29 @@ fn drive(
     println!();
 
     // The gate is stated against one worker, so it needs the N = 1 row.
+    //
+    // **Under `--gate` an unevaluable run is a refusal**, not a zero exit with
+    // an explanation printed above it: `just gate4` pins `--workers 1,16`, so
+    // arriving here at all means the criterion was not evaluated, and a job
+    // that goes green on that is the vacuity this flag exists to remove.
     let Some(&(_, one)) = totals.iter().find(|(n, _)| *n == 1) else {
         println!("  no N = 1 row, so the gate cannot be evaluated — include 1 in --workers");
+        if gate {
+            bail!("--gate was passed and the criterion was not evaluated: no N = 1 row");
+        }
         return Ok(());
     };
     let Some(&(_, sixteen)) = totals.iter().find(|(n, _)| *n == 16) else {
         println!("  no N = 16 row, so the gate cannot be evaluated — include 16 in --workers");
+        if gate {
+            bail!("--gate was passed and the criterion was not evaluated: no N = 16 row");
+        }
         return Ok(());
     };
 
     let ratio = sixteen / one;
-    let verdict = if ratio <= GATE { "PASS" } else { "FAIL" };
+    let holds = gate_4_holds(ratio);
+    let verdict = if holds { "PASS" } else { "FAIL" };
     println!(
         "  gate 4, {} worker: {sixteen:.1} MiB / {one:.1} MiB = {ratio:.3}x against {GATE}x \
          — {verdict}",
@@ -475,6 +570,20 @@ fn drive(
              modules, not of tf_tree."
         );
     }
+
+    // **This is the difference between a gate and a report**, and the caller
+    // chose which one this run is. `just gate4` passes `--gate`, so a
+    // regression of criterion 4 fails `nightly.yml`'s `gate4` job;
+    // `just gate4-python` does not, so it exits 0 on the FAIL it prints, which
+    // §12 gate 4's amendment states in as many words.
+    if gate && !holds {
+        bail!(
+            "PHASE5 §12 criterion 4 is not met on this host: {sixteen:.1} MiB / \
+             {one:.1} MiB = {ratio:.3}x against {GATE}x, with S = {shared:.1} MiB shared \
+             and p = {private:.2} MiB private per worker. This exits non-zero so the \
+             recipe is a gate rather than a report."
+        );
+    }
     Ok(())
 }
 
@@ -489,8 +598,7 @@ fn spawn_and_measure(
     me: &Path,
     tft: &Path,
     n: usize,
-    touch: bool,
-    stamps: usize,
+    sweep: Sweep,
     arm: &Arm,
 ) -> Result<(u64, u64)> {
     let mut kids = Vec::with_capacity(n);
@@ -517,8 +625,8 @@ fn spawn_and_measure(
                 (interpreter.as_path(), cmd)
             }
         };
-        cmd.arg("--stamps").arg(stamps.to_string());
-        if !touch {
+        cmd.arg("--stamps").arg(sweep.stamps.to_string());
+        if !sweep.touch {
             cmd.arg("--no-touch");
         }
         let child = cmd
@@ -588,4 +696,44 @@ fn spawn_and_measure(
         let _ = kid.wait();
     }
     Ok((total, reads))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{gate_4_holds, GATE};
+
+    /// **The negative control for the gate's arithmetic.**
+    ///
+    /// `owner_migration.rs` states the reason and it applies verbatim here: a
+    /// gate that has never been observed to fail is a gate nobody has tested.
+    /// Until `--gate` existed this file's verdict was a string in a `println!`,
+    /// so there was no expression to drive and nothing to assert about.
+    ///
+    /// The three ratios are the measured ones, cited rather than invented:
+    /// 1.024x is §12 gate 4's **MET** with a Rust worker, 1.806x is
+    /// `just gate4-python`'s reading on the same file, and 5.32x is the
+    /// `--no-touch` control.
+    #[test]
+    fn gate_arithmetic_is_not_vacuous() {
+        assert!(gate_4_holds(1.024), "the measured Rust arm must PASS");
+        assert!(!gate_4_holds(1.806), "the measured Python arm must FAIL");
+        assert!(!gate_4_holds(5.32), "the no-touch control must FAIL");
+    }
+
+    /// The boundary is closed, and which side is which is stated rather than
+    /// left to a reader of `<=`.
+    ///
+    /// No tolerance: these are exact `f64` literals compared against the same
+    /// `f64` constant the run compares against, so the question is which way
+    /// the comparison rounds at the boundary and not whether two measurements
+    /// agree. `GATE` itself passes; one ULP above it does not.
+    #[test]
+    fn the_threshold_is_inclusive_and_one_ulp_above_it_fails() {
+        assert!(gate_4_holds(GATE), "1.2x exactly is within 1.2x");
+        assert!(
+            !gate_4_holds(f64::from_bits(GATE.to_bits() + 1)),
+            "the next representable f64 above the threshold is outside it"
+        );
+    }
 }

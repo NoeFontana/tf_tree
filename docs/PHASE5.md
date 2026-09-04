@@ -1963,7 +1963,51 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
    Reproduced to three decimals across runs when it was taken; repeated runs
    on 2026-08-19, on a host carrying other work, spread over **1.023–1.026×**
    with `p` between 0.36 and 0.41 MiB. The third decimal moves; the verdict has
-   15 % of headroom.
+   15 % of headroom. Re-derived on 2026-09-04 at **1.024×** (235.6 / 230.0 MiB,
+   `p` = 0.37 MiB) by the run that gave the recipe an exit status.
+
+   > **Correction — until 2026-09-04 this criterion was measured and not
+   > gated, and the row above did not say so.**
+   >
+   > `frozen_workers.rs` computed the verdict, printed `PASS` or `FAIL`, and
+   > returned `Ok(())` on both: `grep -n 'process::exit\|ExitCode'` over the
+   > file returned one line, a `use std::process::{Command, Stdio}` for
+   > spawning workers, and nothing else. `nightly.yml`'s `gate4` job runs
+   > `just gate4` as its only step, so criterion 4 could have regressed to any
+   > value at all and that job would have been green — the same shape as the
+   > `abi_cost` failure `docs/benchmarks/EVIDENCE.md` was created to prevent,
+   > reappearing inside a job written to close it, and the same shape as
+   > [`0023`](./decisions/0023-the-gate-that-could-not-gate.md)'s subject. Every
+   > other gated artifact in the register already failed its process
+   > (`owner_migration.rs`, `reclaim_latency.rs`, `mp_bench.rs`,
+   > `abi_cost.rs`); this one did not.
+   >
+   > **The verdict now decides the exit status, and the caller decides whether
+   > this run is a gate.** `just gate4` passes `--gate` and fails the process on
+   > a FAIL; `just gate4-python` does not pass it and still exits 0, which the
+   > amendment below requires. `--gate` additionally *refuses* `--python` (the
+   > second gated arm the amendment defers, naming the record it would be
+   > making) and `--no-touch` (the control, documented below to FAIL at 5.32×),
+   > so neither can arrive as a flag pair in a recipe. A `--gate` run that
+   > cannot evaluate the criterion — no N = 1 or no N = 16 row — refuses
+   > instead of returning 0 with an explanation printed above it.
+   >
+   > **Nothing about the criterion, the harness or the 1.024× moves**, which is
+   > why this is a correction to a status claim rather than a decision record.
+   > What moves is that the number is now re-derived by something that can
+   > fail: `crates/tf_tree_bench/tests/gate4.rs` drives the shipped binary on a
+   > 2-robot fixture that genuinely misses `S ≥ 74p`, and asserts the same
+   > failing measurement exits non-zero with `--gate` and zero without it, so
+   > the distinction the amendment argues for is held by a test rather than by
+   > the discipline of whoever next edits the justfile.
+   >
+   > It also found a second, smaller instance of the same class: this crate's
+   > `[[bin]]` targets all carry `required-features = ["shm"]`, so
+   > `cargo nextest run --workspace` skips them whole and `just shm-check`'s
+   > `--lib` line does not reach them — **`owner_migration`'s
+   > `gate_arithmetic_is_not_vacuous`, which `EVIDENCE.md` cites as the reason
+   > that gate's verdict is known to be able to flip, had never been executed
+   > by any recipe.** `just shm-check` now runs `--bins`.
 
    Three things about this measurement, because each was a way of getting it
    wrong:
@@ -2165,6 +2209,18 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
    > gate should acquire a second worker arm — and if so which start method it
    > pins, and what corpus size that forces on the fixture — is a decision, and it
    > needs a record.
+   >
+   > **Since 2026-09-04 that sentence is enforced rather than observed.** When
+   > the Rust arm acquired an exit status (the correction under **MET** above),
+   > the cheapest possible mistake was to make the `FAIL` global — one `if` with
+   > no condition on the arm — which would have turned `just gate4-python` into
+   > a failing recipe and *decided* this question in a diff that looked like
+   > tidying up. So gating is a `--gate` flag the caller passes, `gate4-python`
+   > does not pass it, and the binary refuses `--gate --python` outright with a
+   > message naming this paragraph. Measured on the same seeded fixture on
+   > 2026-09-04: `just gate4` exited **1** at 5.380× and `just gate4-python`
+   > exited **0** at 7.021× (`p` = 13.31 MiB, consistent with the 13.44–13.86
+   > recorded above).
    >
    > **What it obliges.** Wherever 1.024× is cited as evidence for the wedge —
    > `README.md`, the §9 benchmark report, a talk — it is cited as *a Rust worker

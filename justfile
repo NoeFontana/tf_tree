@@ -601,12 +601,24 @@ attach-bench:
 # cached — but that is a property of a third-party action's cleanup routine, not
 # of this gate, and it is worth nothing locally.
 #
+# **`--gate` is what makes this recipe a gate, and it was missing.** Until it
+# existed the binary printed `PASS`/`FAIL` and returned `Ok(())` on both, so
+# `nightly.yml`'s `gate4` job — whose only step is this recipe — was green on
+# every possible reading of criterion 4. That is `docs/benchmarks/EVIDENCE.md`'s
+# founding failure (a recorded number nothing re-derives) in its other form: a
+# recipe that re-derives the number and then discards the verdict.
+#
+# The flag is on the *caller* rather than inferred by the binary, because
+# `gate4-python` below runs the same driver and must keep exiting 0 — see its
+# comment, and PHASE5 §12 gate 4's amendment. `--gate` refuses `--python` and
+# `--no-touch` outright, so the deferred decision cannot arrive as a flag pair.
+#
 # To iterate without re-freezing, run the binary directly:
 #   ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
 gate4:
     cargo build --release -q --features shm -p tf_tree_bench --bin frozen_workers
     rm -f target/gate4/workers.tft
-    ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
+    ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16 --gate
 
 # **The same measurement with a *Python* worker, because gate 4's verdict is a
 # function of the worker's language.**
@@ -633,6 +645,14 @@ gate4:
 # is a decision and needs a record, which the amendment says in as many words. A
 # recipe that quietly promoted a reported number to a gate would be deciding
 # that here.
+#
+# **The mechanism is the absent `--gate` flag, and it is now load-bearing rather
+# than incidental.** `just gate4` passes `--gate` and this recipe does not, and
+# the binary *refuses* `--gate --python` naming the record it would be making —
+# so the two arms cannot be collapsed by editing one line of this file.
+# `crates/tf_tree_bench/tests/gate4.rs` drives the same failing measurement
+# through both shapes and asserts the statuses differ, which is the assertion
+# that stops a later "consistency" cleanup from quietly deciding this.
 #
 # **Same fixture, same deletion, for `gate4`'s reason.** It writes and deletes
 # `target/gate4/workers.tft` — gate 4's own file, not a copy — so "on the same
@@ -2114,6 +2134,24 @@ shm-check:
     # `--lib` and not the whole package: the integration targets are named
     # individually, on purpose.
     cargo nextest run -p tf_tree_bench --features shm --lib
+    # **The `#[cfg(test)]` tests inside this crate's *binaries*, which ran in no
+    # recipe at all.** `--lib` above is the library target; every `[[bin]]` here
+    # carries `required-features = ["shm"]`, so `cargo nextest run --workspace`
+    # skips them whole and the line above does not reach them. Measured:
+    # `cargo nextest list -p tf_tree_bench --features shm --bins` listed five
+    # tests, all in `owner_migration`, and **not one of them had ever been run
+    # by a recipe** — including `gate_arithmetic_is_not_vacuous`, the negative
+    # control `docs/benchmarks/EVIDENCE.md`'s `owner_migration` row cites as the
+    # reason that gate's verdict is known to be able to flip. A cited negative
+    # control that nothing executes is the register's own founding failure one
+    # level down. `frozen_workers`'s two tests go the same way.
+    cargo nextest run -p tf_tree_bench --features shm --bins
+    # **PHASE5 §12 gate 4's exit status** — that `just gate4` fails on a FAIL and
+    # `just gate4-python` does not, driven through the shipped binary on a
+    # fixture small enough to genuinely miss `S >= 74p`. The line above covers
+    # the arithmetic; this covers the *process*, which is the half the nightly
+    # job reads. ~0.03 s.
+    cargo nextest run -p tf_tree_bench --features shm --test gate4
     # `abi-probe` = `bridge` + `tf_tree_c/test-hooks`, the only configuration in
     # which `abi_attached` compiles. Without this line the binary that measures
     # the C ABI boundary is linted by nothing — the same hole `just lint`'s
