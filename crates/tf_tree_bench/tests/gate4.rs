@@ -185,26 +185,38 @@ fn gating_the_no_touch_control_is_refused() {
     );
 }
 
-/// **A run that cannot evaluate the criterion refuses instead of exiting 0.**
-///
-/// `just gate4` pins `--workers 1,16`, so reaching this state at all means the
-/// criterion was not evaluated — and a job that goes green on that is the
-/// vacuity `--gate` exists to remove.
-#[test]
-fn a_run_that_cannot_evaluate_the_criterion_refuses_under_gate() {
-    let tft = scratch("unevaluable");
-    let mut args = vec![
-        "--tft".to_string(),
+/// The same tiny fixture, driven at one worker count rather than two.
+fn one_row(tft: &std::path::Path, workers: &str) -> Vec<String> {
+    vec![
+        "--tft".into(),
         tft.display().to_string(),
         "--robots".into(),
         "2".into(),
         "--history".into(),
         "0.5".into(),
         "--workers".into(),
-        "1".into(),
+        workers.into(),
         "--stamps".into(),
         "8".into(),
-    ];
+    ]
+}
+
+/// **A run that cannot evaluate the criterion refuses instead of exiting 0** —
+/// the missing-`N = 16` half.
+///
+/// `just gate4` pins `--workers 1,16`, so reaching this state at all means the
+/// criterion was not evaluated — and a job that goes green on that is the
+/// vacuity `--gate` exists to remove.
+///
+/// **The refusal is asserted by the row it names, not only by the exit code.**
+/// The driver has two of these arms, one per missing row, and an assertion on
+/// the status alone would be satisfied by either — so a dead arm would hide
+/// behind its live sibling, which is the defect this file exists to prevent one
+/// level up.
+#[test]
+fn a_run_with_no_n_16_row_refuses_under_gate() {
+    let tft = scratch("unevaluable_16");
+    let mut args = one_row(&tft, "1");
     args.push("--gate".into());
     let out = drive(&as_args(&args));
     assert!(
@@ -212,8 +224,50 @@ fn a_run_that_cannot_evaluate_the_criterion_refuses_under_gate() {
         "--gate with no N = 16 row must refuse; stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no N = 16 row"),
+        "the refusal must name the row that was missing, so this test cannot \
+         pass on the other arm's refusal; got:\n{stderr}"
+    );
 
     // Without --gate the same run is a report and says so on stdout.
+    let mut report = args.clone();
+    report.pop();
+    let out = drive(&as_args(&report));
+    assert!(out.status.success(), "without --gate it is a report");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("cannot be evaluated"),
+        "and it still says the criterion was not evaluated"
+    );
+}
+
+/// The same refusal, missing the **other** row.
+///
+/// This arm was live and had no automated witness: `--workers 16` alone reaches
+/// `no N = 1 row`, which is a different `bail!` from the one above and could
+/// have been deleted without any test noticing. The gate is stated against one
+/// worker (`total(16)/total(1)`), so this is the row the criterion is divided
+/// by — an unevaluable run here is the one most likely to look like a small
+/// configuration mistake in a recipe.
+#[test]
+fn a_run_with_no_n_1_row_refuses_under_gate() {
+    let tft = scratch("unevaluable_1");
+    let mut args = one_row(&tft, "16");
+    args.push("--gate".into());
+    let out = drive(&as_args(&args));
+    assert!(
+        !out.status.success(),
+        "--gate with no N = 1 row must refuse; stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no N = 1 row"),
+        "the refusal must name the row that was missing; got:\n{stderr}"
+    );
+
+    // And without `--gate` it is a report, on this arm too.
     let mut report = args.clone();
     report.pop();
     let out = drive(&as_args(&report));

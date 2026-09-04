@@ -813,10 +813,15 @@ Pair the rename with a stronger, testable claim:
 >
 > `just no-network` (`scripts/no-network.sh`) is the assertion, and
 > `.github/workflows/ci.yml`'s `shm` job runs it on both matrix rows.
-> Until 2026-09-04 there was none: a grep for `AF_UNIX|AF_INET|seccomp|strace`
-> across the repository returned five hits and every one was prose, including
+> Until 2026-09-04 there was none:
+> `git grep -n 'AF_UNIX|AF_INET|seccomp|strace' main` returned **17 matching
+> lines across 7 files, 9 of them outside `docs/`**, and every one was prose or
+> a comment rather than an assertion — including
 > `crates/tf_tree_cli/src/web.rs`'s design note, which had scoped an assertion
-> that did not exist. §13's box 4 had recorded this as owed since the section
+> that did not exist. **That count was first published as "five" here and in
+> two other files, and was wrong in all three**; the qualitative half (every
+> hit prose, none an assertion) was and is correct, and it is the half the
+> argument rests on. §13's box 4 had recorded this as owed since the section
 > was written, and no §0.0 row covered it, because §0.0 has rows for §1–§10 and
 > nothing for §11's test plan. **The word "full" is what moved**, and the
 > correction is stated rather than quietly applied: §11's row already said
@@ -858,8 +863,15 @@ Pair the rename with a stronger, testable claim:
 > unexercised branch is invisible to it. Nothing about a socket the library never
 > creates but *inherits* — `tf_tree_ipc` passes the rendezvous fd, and `socket(2)`
 > is the syscall this sentence names, not `connect(2)` or `sendto(2)` on a
-> received one. And nothing about a non-Linux target. `scripts/no-network.sh`
-> carries the full PROVES / DOES NOT PROVE header.
+> received one. Nothing about a non-Linux target. And **nothing about the
+> packages outside the traced set and outside the control** — `tf_tree_bench`,
+> `tf_tree_ingest`, `tf_tree_bridge`, `tf_tree_c` and `tf_tree_py` are traced by
+> nothing, which follows from the scoping above but is worth naming, because
+> "asserted in CI" over a five-crate subset reads like "asserted over the
+> repository" to somebody who has not opened the script.
+> `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header, and
+> since 2026-09-04 a RED TESTS block naming which refusals have been seeded and
+> observed to fire.
 
 ### 5.2 The two kinds of counter have opposite cost profiles
 
@@ -2058,10 +2070,23 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
    > It also found a second, smaller instance of the same class: this crate's
    > `[[bin]]` targets all carry `required-features = ["shm"]`, so
    > `cargo nextest run --workspace` skips them whole and `just shm-check`'s
-   > `--lib` line does not reach them — **`owner_migration`'s
+   > `--lib` line does not reach them — so `owner_migration`'s
    > `gate_arithmetic_is_not_vacuous`, which `EVIDENCE.md` cites as the reason
-   > that gate's verdict is known to be able to flip, had never been executed
-   > by any recipe.** `just shm-check` now runs `--bins`.
+   > that gate's verdict is known to be able to flip, was reachable only by a
+   > human typing `just shm-test`. **`just shm-check` now runs `--bins`, and
+   > `shm-check` is the recipe `ci.yml`'s `shm` job invokes.**
+   >
+   > **This paragraph said "had never been executed by any recipe" when it was
+   > first written, and that was false** — recorded here rather than rewritten,
+   > because the correction is the interesting half. `just shm-test` has run
+   > `cargo nextest run -p tf_tree_bench --features shm --bin owner_migration`
+   > since before this change, so those five tests did execute; what no
+   > workflow did was invoke that recipe (`grep -rn 'just shm-test' .github/`
+   > returns nothing, `just shm-check` is `.github/workflows/ci.yml:675`). The
+   > claim that survives measurement is about CI reach, not about execution,
+   > and it is weaker than the one first published. `frozen_workers`'s two
+   > arithmetic tests are the ones that had no recipe of either kind — they are
+   > new with `--gate`.
 
    Three things about this measurement, because each was a way of getting it
    wrong:
@@ -2297,7 +2322,7 @@ Criterion 4 is the wedge's central claim, and criterion 7 is what makes it belie
 - [ ] `FORMAT_VERSION = 3` shipped in a single commit, with Phase 6 regions reserved and `doctor --explain-version`
 - [ ] Publish-side observability derived, not counted — push path unchanged and benchmarked to prove it
 - [ ] Nothing in the codebase, CLI, or docs is called "telemetry"
-- [x] `socket(2)` restricted to `AF_UNIX`, asserted in CI — `just no-network`, in `ci.yml`'s `shm` job. Scoped to the library's suite per §11; the CLI's one `AF_INET` listener is the check's positive control rather than an exception inside it. §5.1's amendment states what it does and does not prove
+- [x] `socket(2)` restricted to `AF_UNIX`, asserted in CI — `just no-network`, in `ci.yml`'s `shm` job. Scoped to the library's suite per §11; the CLI's one `AF_INET` listener is the check's positive control rather than an exception inside it. **Read the scope with the tick, because it is not the repository**: the five published crates are traced, `tf_tree_cli` is traced as the control, and `tf_tree_bench`, `tf_tree_ingest`, `tf_tree_bridge`, `tf_tree_c` and `tf_tree_py` are traced by **nothing**. §5.1's amendment states what it does and does not prove
 - [ ] Error-path counters always on with no runtime switch; `counters` cargo feature is the only knob
 - [ ] Convenience path holds a long-lived per-thread `Guard`
 - [ ] `freeze --from-live` captures counters into the manifest

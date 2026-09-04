@@ -2035,13 +2035,21 @@ tsan:
 shm-test:
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
-    # **`owner_migration`'s unit tests and lint, which run in no other recipe.**
-    # The binary is `required-features = ["shm"]`, so `just lint`'s workspace
-    # pass compiles it out entirely; without these two lines the gate that states
-    # §12.3 4b would be linted by nothing and its non-vacuity test
-    # (`gate_arithmetic_is_not_vacuous`) executed nowhere. The measurement itself
-    # is `just owner-migration` — minutes long, and scheduler-sensitive, so it
-    # does not belong in a per-branch gate.
+    # **`owner_migration`'s unit tests and lint.** The binary is
+    # `required-features = ["shm"]`, so `just lint`'s workspace pass compiles it
+    # out entirely; without these two lines the gate that states §12.3 4b would
+    # be linted by nothing. The measurement itself is `just owner-migration` —
+    # minutes long, and scheduler-sensitive, so it does not belong in a
+    # per-branch gate.
+    #
+    # **This comment used to end "which run in no other recipe", and that
+    # stopped being true on 2026-09-04**, when `shm-check` grew a
+    # `--features shm --bins` line covering every `[[bin]]` in the crate. The
+    # duplication is deliberate and the two lines are not redundant: this one is
+    # the *only* place `owner_migration` is linted, and `shm-check`'s is the
+    # only place its tests are reached by a recipe a workflow invokes
+    # (`grep -rn 'just shm-test' .github/` returns nothing; `just shm-check` is
+    # `.github/workflows/ci.yml:675`).
     cargo clippy -p tf_tree_bench --features shm --bin owner_migration --all-targets -- -D warnings
     cargo nextest run -p tf_tree_bench --features shm --bin owner_migration
 
@@ -2134,17 +2142,26 @@ shm-check:
     # `--lib` and not the whole package: the integration targets are named
     # individually, on purpose.
     cargo nextest run -p tf_tree_bench --features shm --lib
-    # **The `#[cfg(test)]` tests inside this crate's *binaries*, which ran in no
-    # recipe at all.** `--lib` above is the library target; every `[[bin]]` here
-    # carries `required-features = ["shm"]`, so `cargo nextest run --workspace`
-    # skips them whole and the line above does not reach them. Measured:
-    # `cargo nextest list -p tf_tree_bench --features shm --bins` listed five
-    # tests, all in `owner_migration`, and **not one of them had ever been run
-    # by a recipe** — including `gate_arithmetic_is_not_vacuous`, the negative
-    # control `docs/benchmarks/EVIDENCE.md`'s `owner_migration` row cites as the
-    # reason that gate's verdict is known to be able to flip. A cited negative
-    # control that nothing executes is the register's own founding failure one
-    # level down. `frozen_workers`'s two tests go the same way.
+    # **The `#[cfg(test)]` tests inside this crate's *binaries*, which no recipe
+    # a workflow invokes reached.** `--lib` above is the library target; every
+    # `[[bin]]` here carries `required-features = ["shm"]`, so `cargo nextest
+    # run --workspace` skips them whole and the line above does not reach them.
+    #
+    # **CORRECTION (2026-09-04, same day):** the first version of this comment
+    # said "not one of them had ever been run by a recipe". That was false, and
+    # `just shm-test` (four recipes above this one, at the top of this Phase 2
+    # block) is the refutation — it has run
+    # `cargo nextest run -p tf_tree_bench --features shm --bin owner_migration`
+    # since before this line existed, so `owner_migration`'s five tests
+    # (`gate_arithmetic_is_not_vacuous` among them) did run. What was true, and
+    # is the reason for this line, is narrower and about CI reach rather than
+    # execution: `grep -rn 'just shm-test' .github/` returns nothing, while
+    # `just shm-check` is `.github/workflows/ci.yml:675` in the `shm` job. So
+    # the negative control `docs/benchmarks/EVIDENCE.md`'s `owner_migration`
+    # row cites — the reason that gate's verdict is known to be able to flip —
+    # was reachable only by a human typing `just shm-test`, and is now reached
+    # by the job. `frozen_workers`'s two tests are new with `--gate` and had no
+    # recipe of either kind; this line is the only one that runs them.
     cargo nextest run -p tf_tree_bench --features shm --bins
     # **PHASE5 §12 gate 4's exit status** — that `just gate4` fails on a FAIL and
     # `just gate4-python` does not, driven through the shipped binary on a
@@ -2319,10 +2336,30 @@ shm-check:
 # build spends its time in bounds checks and reaches a different, much narrower
 # set of interleavings.
 #
-# **What this does NOT cover** is §11.3's crash-point injection — there is no
-# `crash-points` feature to arm (§0.0 records it as not implemented), and the
-# binary *refuses* `--crash-points` rather than running the SIGKILL test and
-# calling it §11.3 coverage. §11.4's "under ASan" half is `just shm-torture-asan`.
+# **What this does NOT cover** is §11.3's crash-point injection, and the reason
+# is now the build rather than the absence of a mechanism.
+# `just shm-torture-crash-points` below is the recipe that does cover it — it
+# builds `--features shm,crash-points` and arms a random site from
+# `tf_tree_core::crash::SITES` and `tf_tree::CRASH_SITES` in about a tenth of
+# children — and it runs in `.github/workflows/nightly.yml`'s `crash-points`
+# job. This recipe builds `--features shm`, so the sites are compiled out of the
+# driver and therefore out of every child (they are the same executable), and
+# the binary *refuses* `--crash-points` on this build rather than running the
+# SIGKILL test and calling it §11.3 coverage. Verified 2026-09-04:
+# `cargo build --release --features shm -p tf_tree_bench --bin shm_torture` then
+# `./target/release/shm_torture --crash-points --duration 2s --children 2`
+# exits 1 with *"--crash-points needs this binary built with the `crash-points`
+# feature"*.
+#
+# **This comment used to say "there is no `crash-points` feature to arm (§0.0
+# records it as not implemented)", and both halves of that were false** —
+# `crates/tf_tree_bench/Cargo.toml` declares the feature (a passthrough to
+# `tf_tree/crash-points` and `tf_tree_core/crash-points`), and `docs/PHASE2.md`
+# §0.0's fault-injection row reads **Implemented**. The refusal half was and is
+# true. Corrected rather than deleted, because a comment that told a reader a
+# feature did not exist is what sends somebody to build it a second time.
+#
+# §11.4's "under ASan" half is `just shm-torture-asan`.
 shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
     cargo build --release --features shm -p tf_tree_bench --bin shm_torture
     ./target/release/shm_torture {{ARGS}}
@@ -2413,10 +2450,13 @@ shm-torture-self-test:
 # a robotics team makes a procurement decision on — "the `tf_tree` **library**
 # opens no network sockets. Ever." — and §5.1 itself says a promise in a README
 # is worth less than an assertion in CI. Until 2026-09-04 there was no
-# assertion: `grep -rn 'AF_UNIX|AF_INET|seccomp|strace'` over the repository
-# returned five hits and every one of them was prose, including the design note
-# in `crates/tf_tree_cli/src/web.rs` that scopes the assertion away from the
-# CLI.
+# assertion: `git grep -n 'AF_UNIX|AF_INET|seccomp|strace' main` returned **17
+# matching lines across 7 files, 9 of them outside `docs/`**, and every one of
+# them was prose or a comment rather than an assertion — including the design
+# note in `crates/tf_tree_cli/src/web.rs` that scopes the assertion away from
+# the CLI. **The figure was first published as "five hits" and was wrong**; it
+# is corrected here, in `scripts/no-network.sh` and in `docs/PHASE5.md` §5.1's
+# amendment together. Recount with the command rather than copying it.
 #
 # **Scoped to the library's own suite, which is §11's wording and not a
 # narrowing.** The five published crates are traced; `tf_tree_cli` is not,

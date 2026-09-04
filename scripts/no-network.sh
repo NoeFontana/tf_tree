@@ -6,8 +6,12 @@
 # backs — "the `tf_tree` **library** opens no network sockets. Ever." — is one a
 # robotics team makes a procurement decision on, and §5.1 says in as many words
 # that a promise in a README is worth less than an assertion in CI. Before this
-# script, `grep -rn 'AF_UNIX\|AF_INET\|seccomp\|strace'` over the whole
-# repository returned five hits and every one was prose.
+# script, `git grep -n 'AF_UNIX\|AF_INET\|seccomp\|strace' main` returned
+# **17 matching lines across 7 files, 9 of them outside `docs/`**, and every one
+# was prose or a comment — not one was an assertion. (The count is the corrected
+# one: "five hits" was published here, in `docs/PHASE5.md` §5.1's amendment and
+# in the justfile on 2026-09-04, and was wrong in all three. Recount with the
+# command, do not copy the figure.)
 #
 # ## PROVES
 #
@@ -61,6 +65,34 @@
 #     names the `tf_tree::rendezvous` binary rather than counting sockets. An
 #     earlier revision of this header claimed a bare count would catch it, and
 #     the run that was supposed to demonstrate that passed.
+#   * Anything about the packages that are not in `PACKAGES` below and are not
+#     the control: `tf_tree_bench`, `tf_tree_ingest`, `tf_tree_bridge`,
+#     `tf_tree_c` and `tf_tree_py` are traced by **nothing**. That is the same
+#     scoping as the `PACKAGES` list — the five published crates are what a
+#     downstream links — but it is worth naming, because "asserted in CI" over
+#     a five-crate subset reads like "asserted over the repository" to somebody
+#     who did not open this file.
+#
+# ## RED TESTS
+#
+# Every refusal below was seeded and observed to fire before it was trusted, on
+# 2026-09-04. Recorded here rather than in a commit message, because a check
+# nobody has seen fail is a check nobody has tested:
+#
+#   * A real `TcpListener::bind("127.0.0.1:0")` added as a library test — the
+#     one that matters — names the offending binary and the `socket(AF_INET,…)`
+#     line, EXIT=1.
+#   * `strace` absent from `PATH`; a stub `strace` that runs the program and
+#     truncates the log; a panicking library test; a `FEATURES` value that
+#     lists no binary; `shm` dropped from `FEATURES` (24 binaries, 23 sockets —
+#     **not** zero, which is why the floor names a binary); a stub `strace` that
+#     empties only the rendezvous log — one refusal each, EXIT=1. `FEATURES` is
+#     a constant below and deliberately not read from the environment, so the
+#     two feature-set arms are seeded by editing that line, not by exporting it.
+#   * **Two arms are live and were seeded by a reviewer rather than by the
+#     author**, and they are recorded here so the next reader knows which
+#     witnesses exist: the empty-`CLI_BIN` refusal (the control's test target
+#     renamed) and the control finding no `AF_INET`. Both fire.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -220,11 +252,21 @@ if [ "$(families "$rendezvous_trace" | grep -cx AF_UNIX || true)" -eq 0 ]; then
     echo "  none did not exercise it, and this scan is then about nothing." >&2
     exit 1
 fi
-if [ "$unix" -eq 0 ]; then
-    echo "no-network: REFUSING — no socket(2) was observed at all, so this run" >&2
-    echo "  asserts nothing." >&2
-    exit 1
-fi
+# **There was a third check here — `if [ "$unix" -eq 0 ]` — and it was DEAD.**
+# It could not fire: the two checks above already refuse unless
+# `rendezvous-*.strace` contributed at least one `AF_UNIX` line, and `$unix`
+# counts over every trace including that one, so `unix >= 1` is established
+# before it is reached. It is deleted rather than moved, because the rendezvous
+# floor is the strictly stronger statement (a named binary opened the socket,
+# not merely that *something* did) and a second check that can only fire where
+# the first already has is a check that cannot fail.
+#
+# **The case it was written for is still refused, measured rather than argued.**
+# Under a stub `strace` that passes `self_check` and truncates every other log —
+# so the run observes `0 socket(2) call(s), 0 AF_UNIX` — this script exits 1 at
+# *"rendezvous-….strace opened no AF_UNIX socket"*. Removed 2026-09-04, after a
+# review seeded every arm in this file and this was the one that would not go
+# red.
 
 # **The exception, asserted rather than assumed.**
 #

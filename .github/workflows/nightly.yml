@@ -99,10 +99,18 @@ jobs:
   # `a_run_that_validates_nothing_fails_instead_of_passing` exists to prevent
   # one level down.
   #
-  # 10 minutes covers the 5-minute run plus a release build of
-  # `tf_tree_bench --features shm,crash-points`, which no other job here
-  # produces; the margin above that is for a slow runner rather than for a
-  # longer run.
+  # **25 minutes, and the number is what the two steps below cost rather than
+  # what the soak costs.** The soak itself is 5 minutes. Around it are *two*
+  # release builds that cargo cannot share, because `crash-points` is a
+  # passthrough to `tf_tree/crash-points` and `tf_tree_core/crash-points`
+  # (`crates/tf_tree_bench/Cargo.toml`), so the feature set differs all the way
+  # down: `--features shm --release` for `just shm-torture-self-test`, and
+  # `--features shm,crash-points --release` for `just shm-torture-crash-points`.
+  # Neither is produced by any other job here, so a cold cache pays for both.
+  # The margin above that is for a slow runner, not for a longer run — a soak
+  # that needs more than 5 minutes is a change to the recipe's `*ARGS`, and this
+  # comment is what would have to move with it. (It read "10 minutes" beside a
+  # `timeout-minutes: 25` and accounted for one build; corrected 2026-09-04.)
   crash-points:
     name: shm_torture --crash-points (§11.3 sites)
     runs-on: ubuntu-latest
