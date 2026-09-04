@@ -105,7 +105,17 @@ pub const HOST_CRITICAL_FACTS: &[&str] = &[
     "kernel",
     "target",
     "counters_feature",
-    "transparent_hugepage",
+    // **Two THP knobs, and the arena's is the second one.**
+    // `transparent_hugepage/enabled` governs anonymous mappings;
+    // `transparent_hugepage/shmem_enabled` governs the `MAP_SHARED` `memfd`
+    // every harness in this crate that touches a shared arena is measuring, and
+    // the two default differently — `[madvise]` against `[never]` on the
+    // development host. Comparing only the first says two runs measured the same
+    // machine when the arena's huge-page eligibility changed underneath them;
+    // `crates/tf_tree_cli/src/hostfacts.rs` records what that cost `TFT016`. A
+    // run file written before this key existed reads `absent` and therefore as
+    // drift, which is the correct reading rather than a regression.
+    "transparent_hugepage_shmem",
 ];
 
 /// The provenance facts that make a comparison **impossible**, not merely

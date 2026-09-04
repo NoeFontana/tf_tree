@@ -493,6 +493,7 @@ mod tests {
                     })
                     .collect(),
             },
+            build: crate::report::Build::current(),
             fitness: Fitness::probe(1),
             warmup_discarded_s: 0.0,
             rows: vec![Row {
@@ -503,6 +504,7 @@ mod tests {
                 needs_n_cores: false,
                 status: Status::Measured,
                 reason: String::new(),
+                grounds: Vec::new(),
                 reproduce: "just bench-report",
                 tf_tree: vec![m],
                 tf2: Vec::new(),
