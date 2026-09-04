@@ -2341,15 +2341,28 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
 # children are this same executable: a site compiled out here is compiled out in
 # every child, and the flag would arm nothing while looking like it had.
 #
-# **Read the `§11.3:` line, not the exit status.** It reports children armed and
-# children that aborted at a site, and those differ — an armed child the driver's
-# `SIGKILL` reached first never got there. `armed N, aborted 0` is a run that
-# exercised nothing, which is why both numbers are printed. Measured on this
-# host at 40s/10 children/2 Hz: 11 armed, 4 aborted, at four distinct sites,
-# 0 violations.
+# **The `§11.3:` line is now in the exit status, and that sentence used to say
+# the opposite.** It read *"read the `§11.3:` line, not the exit status"* — it
+# reports children armed and children that aborted at a site, and those differ,
+# because an armed child the driver's `SIGKILL` reached first never got there.
+# That instruction was correct for a human running the recipe and useless the
+# moment it was wired into a workflow, because a job whose only step is `just
+# shm-torture-crash-points` reads the status and nothing else. So the binary
+# refuses a run with `armed 0` (nothing was armed: check the build) and,
+# separately, a run with `armed N, aborted 0` (nothing fired: raise `--duration`
+# or lower `--kill-hz`). Both bounds are "at least one" rather than a tuned
+# number, which is the smallest claim under which the run said anything.
+#
+# Measured on this host at 45s/10 children/2 Hz: 11–12 armed, 4–5 aborted, at
+# several distinct sites, 0 violations. Both refusals red-tested by seeding the
+# defect they name — arming disabled, and sites drawn at an `nth_hit` that never
+# fires — and each fails only its own arm.
 #
 # Longer and gentler than the plain soak on purpose: a high kill rate wins the
-# race against the site more often than not.
+# race against the site more often than not. **It runs nightly** in
+# `.github/workflows/nightly.yml`'s `crash-points` job; until 2026-09-04 it ran
+# in no workflow at all, so §11.4's crash-point clause was measured only by
+# whoever remembered to type this.
 shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
     cargo build --release --features shm,crash-points -p tf_tree_bench --bin shm_torture
     ./target/release/shm_torture --crash-points {{ARGS}}

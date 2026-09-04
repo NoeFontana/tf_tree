@@ -789,6 +789,56 @@ mod imp {
                 recovery.failures.len()
             );
         }
+        // **`--crash-points` reaching here having exercised nothing is a failure,
+        // for the reason the read floor above is a failure.**
+        //
+        // The `§11.3:` line already printed both numbers because they differ,
+        // and a reader was expected to look at it. `.github/workflows/nightly.yml`
+        // is not a reader: a job whose only step is `just
+        // shm-torture-crash-points` reads the exit status and nothing else, so
+        // wiring this recipe into CI while `armed 0, aborted 0` still exits 0
+        // would have installed exactly the vacuous-green shape that
+        // `a_run_that_validates_nothing_fails_instead_of_passing` exists to
+        // prevent one level down. The verdict now carries what the line says.
+        //
+        // **The two counts fail separately, because they are different
+        // defects.** `armed 0` means the *arming* never happened — the feature
+        // compiled out of the driver, an empty site list, a broken draw — and no
+        // amount of run time changes it. `armed N, aborted 0` means arming
+        // worked and no armed child ever reached its site: the driver's
+        // `SIGKILL` won every race, or the drawn sites are on paths this
+        // workload does not take. That one is a *tuning* statement and the
+        // message says so.
+        //
+        // **Neither bound is a tuned threshold**; both are "at least one", which
+        // is the smallest claim under which the run said anything. On the
+        // recipe's own defaults (5 min, 10 children, 2 Hz) this host draws on
+        // the order of sixty armed children and aborts a third of them, so a
+        // false red needs every one of ~60 independent draws to lose a race
+        // measured at ~36% — not a margin worth writing a number for.
+        if a.crash_points {
+            if armed == 0 {
+                bail!(
+                    "--crash-points armed 0 children over {rounds} rounds, so this run \
+                     exercised no §11.3 site at all and `0 violation(s)` says nothing \
+                     about crash consistency. The children are this same executable, \
+                     so check that the driver was built `--features shm,crash-points` \
+                     and that `tf_tree_core::crash::SITES` and `tf_tree::CRASH_SITES` \
+                     are non-empty in it."
+                );
+            }
+            if aborted == 0 {
+                bail!(
+                    "--crash-points armed {armed} child(ren) and none of them aborted \
+                     at its site, so no process was killed mid-protocol and this run \
+                     is a plain SIGKILL soak wearing §11.3's name. The driver's kills \
+                     reach an armed child before it gets there — raise --duration or \
+                     lower --kill-hz. This is the run the `§11.3:` line's second \
+                     number exists to distinguish; the exit status now carries it, \
+                     because a workflow reads only that."
+                );
+            }
+        }
         println!("shm_torture: PASS");
         Ok(())
     }
