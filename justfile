@@ -2405,6 +2405,47 @@ owner-migration *ARGS:
 shm-torture-self-test:
     cargo nextest run -p tf_tree_bench --features shm --release --test torture
 
+# **`docs/PHASE5.md` §5.1's NORMATIVE CI test, and §13's box 4** — the library
+# opens no network socket, asserted rather than promised.
+#
+# §5.1: *"run the full test suite under `strace` (or a seccomp filter) and
+# assert that `socket(2)` is called only with `AF_UNIX`"*. It backs the sentence
+# a robotics team makes a procurement decision on — "the `tf_tree` **library**
+# opens no network sockets. Ever." — and §5.1 itself says a promise in a README
+# is worth less than an assertion in CI. Until 2026-09-04 there was no
+# assertion: `grep -rn 'AF_UNIX|AF_INET|seccomp|strace'` over the repository
+# returned five hits and every one of them was prose, including the design note
+# in `crates/tf_tree_cli/src/web.rs` that scopes the assertion away from the
+# CLI.
+#
+# **Scoped to the library's own suite, which is §11's wording and not a
+# narrowing.** The five published crates are traced; `tf_tree_cli` is not,
+# because `tf_tree top --web` is an `AF_INET` listener by construction. The
+# scope is a package list rather than an exception list inside the scanner: an
+# assertion that has learned to ignore an `AF_INET` socket has stopped being
+# this assertion.
+#
+# **It refuses rather than skips**, three ways, and each is red-tested: no
+# `strace` on the host; a `strace` that cannot see a `socket(2)` it is shown on
+# purpose (the script opens a real `AF_INET` socket through bash's `/dev/tcp`
+# on every run and requires the scanner to catch it); and a traced binary that
+# exits non-zero, whose remaining tests never ran. It also refuses a run in
+# which **no** socket was observed at all — the rendezvous is the one socket the
+# library is supposed to have, and without it "no non-`AF_UNIX` socket" is true
+# of an empty set.
+#
+# `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header. The
+# shortest thing it does not prove: a code path no test takes, and a socket the
+# library never creates but *inherits* — `tf_tree_ipc` passes the rendezvous fd,
+# and `socket(2)` is the syscall §5.1 names.
+#
+# ~25 s of tracing on this host over 26 test binaries and ~1 200 `socket(2)`
+# calls, on top of building them. `--test-threads 1` because these binaries run
+# outside nextest, which gives each test its own process: six rendezvous tests
+# share a runtime directory and only that isolates them.
+no-network:
+    ./scripts/no-network.sh
+
 # **§11.4's "run it under ASan"**, on a short run.
 #
 # ASan works across `fork`/`exec`, so the children are instrumented too — which

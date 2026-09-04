@@ -651,7 +651,10 @@ jobs:
         # near-TSO would hide exactly the bugs they prevent.
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # 20 until `just no-network` joined it: that recipe builds `tf_tree_cli`'s
+    # test targets for its positive control, which nothing else in this job
+    # needs, and then traces 26 binaries single-threaded.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -673,6 +676,32 @@ jobs:
         run: |
           just shm-check
           just shm-rendezvous
+
+      # **`docs/PHASE5.md` §5.1's NORMATIVE assertion, and §13's box 4.** It
+      # lives on this job rather than on a job of its own because it needs
+      # exactly what this one already has: a Linux runner and the `shm` feature
+      # compiled in. Without `shm` the Phase 2 rendezvous — the one socket the
+      # library is *supposed* to open — is not built, and the recipe refuses a
+      # run in which it was never traced rather than reporting a green scan over
+      # a suite that opened nothing.
+      #
+      # `strace` is installed explicitly rather than assumed. It is present on
+      # today's `ubuntu-latest` image, which is precisely the reason to name it:
+      # an image that dropped it would turn this assertion into a refusal on
+      # every run, and the refusal is correct but the diagnosis would be a
+      # runner change rather than a code one. `apt-get` here is environment
+      # setup, the same shape as the `c-surface` job's `clang`, and the check
+      # itself is the recipe.
+      #
+      # Both matrix rows run it. aarch64 is not corroboration here the way it is
+      # for the ordering claims: `socket(2)`'s family argument is not an
+      # architecture question. What the second row buys is that the *assertion*
+      # keeps working under the runner this project actually ships on, and it
+      # costs ~25 s.
+      - name: install strace
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq strace
+      - name: just no-network
+        run: just no-network
 
   # Spelled as the recipe rather than as its body. It is one line either way,
   # and it is the *argument* half of the weak-memory defence — the aarch64 rows
