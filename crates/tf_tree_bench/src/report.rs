@@ -233,8 +233,9 @@ impl Build {
 /// repository provides a DDS round trip (false since `ros/tf_tree_bench_ros`
 /// and `just dds-bench`), one said this harness builds only synthetic fixtures
 /// (false since `src/bin/frozen_workers.rs`, in this crate, builds a ~338 MiB
-/// `.tft`), and one demanded a core count that `Report::validate`'s own memory
-/// exemption says that row does not need.
+/// `.tft`), and one — in its `reproduce:` command rather than its reason, which
+/// is the same prose wearing a different field name — demanded a core count
+/// that `Report::validate`'s own memory exemption says that row does not need.
 ///
 /// So the decisive half of a reason is moved out of the prose and into this
 /// enum, and [`Report::validate`] re-derives it on every run. The prose stays,
