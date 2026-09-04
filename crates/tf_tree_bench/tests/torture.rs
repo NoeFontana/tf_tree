@@ -290,6 +290,121 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
         kills > 5,
         "only {kills} children were killed, so no recovery path was exercised.\n{stdout}"
     );
+
+    // **§3.5, and eight seconds is chosen so exactly one owner kill lands.**
+    // The first is scheduled `OWNER_KILL_FIRST` (4 s) in, which is early enough
+    // that this case covers the arm and late enough that the 3 s
+    // `--readers-only` case above never reaches it and keeps meaning what it
+    // meant.
+    //
+    // Asserted on the *printed* line rather than on the exit status, for the
+    // reason the binary prints it: a run with the arm silently disabled exits 0
+    // too. `a_run_that_never_inherits_the_owner_role_fails_naming_it` is the
+    // red half — these three assertions all pass on a build where nothing
+    // inherits *if* that test does not exist, because a green run says nothing
+    // about a check that cannot fail.
+    assert!(
+        stdout.contains("§3.5 owner kill 1:"),
+        "the run never killed the rendezvous owner, so PHASE2 §3.5 was not exercised \
+         at all.\n{stdout}"
+    );
+    assert!(
+        stdout.contains("a fresh process joined"),
+        "the owner was killed and no fresh process could join afterwards — or the run \
+         did not check. An ownerless arena is exactly what refuses a new joiner, so this \
+         is the assertion that says the role was inherited.\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("0 survivor(s) inherited"),
+        "a migration recovered with no survivor recording an inheritance: something is \
+         serving and §3.5's caller-driven trigger is not why.\n{stdout}"
+    );
+}
+
+/// **A run in which nothing inherits the owner role FAILS, naming §3.5.**
+///
+/// The red half of the three §3.5 assertions in the test above, and the
+/// counterpart of `--readers-only` one level down: `--no-inherit` makes every
+/// child skip `Tree::owner_lost`, which is the one thing §3.5 requires a
+/// survivor to do. Nothing inherits, the arena goes ownerless the moment the
+/// owner is killed, and no fresh process can join it again — which is precisely
+/// the state that existed between 2026-08-27 and 2026-08-28 and that
+/// `docs/decisions/0037` exists to end.
+///
+/// **What it is written against is a green run, not a red one.** Every
+/// assertion about a migration in this file is satisfiable by a harness that
+/// stopped killing the owner, or that reports a migration it never checked; this
+/// case is what makes those assertions falsifiable.
+///
+/// Measured (2026-09-04): the run prints `NO fresh process joined within 10s`
+/// for the first kill and exits 1. It costs the recovery deadline — the harness
+/// waits the full ten seconds before concluding, because a migration that has
+/// not happened is indistinguishable from a slow one until the deadline passes,
+/// and shortening the deadline to shorten the test would trade a real property
+/// for a fast one.
+///
+/// Mutant (applied, confirmed fatal): delete the `if !failed.is_empty()` bail in
+/// `drive` — the run then reports the failure in its output and exits 0, and the
+/// first assertion fails.
+#[test]
+fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
+    let out = torture(&[
+        "--duration",
+        "6s",
+        "--children",
+        "3",
+        "--kill-hz",
+        "4",
+        "--seed",
+        "999",
+        "--no-inherit",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a run in which no survivor ever called `owner_lost` passed. The owner was killed \
+         and the arena is ownerless, so this run proved nothing about §3.5.\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("ownership migration did not happen"),
+        "the run failed for some other reason; the failure must name §3.5.\n{stdout}\n{stderr}"
+    );
+    // The specific diagnosis, not just the verdict. A run that failed on the
+    // read floor instead would satisfy the assertion above while saying nothing
+    // about the owner, and the read floor *does* trip on this configuration —
+    // which is why the migration check bails first.
+    assert!(
+        stdout.contains("NO fresh process joined"),
+        "the failure must say that no fresh process could join, which is the property \
+         §3.5 restores and the one an internal flag cannot observe.\n{stdout}"
+    );
+}
+
+/// `--crash-site` is refused without `--crash-points`.
+///
+/// The probe forces one §11.3 site in every child so a person can answer "can
+/// this workload reach site X at all", which is what the binary's reachability
+/// table states as a measurement. Accepting it in a build that compiled the
+/// sites out would report every site unreachable while arming none of them —
+/// the same flag-that-arms-nothing failure `--crash-points` already refuses one
+/// level up, in the shape that would be *read as evidence*.
+///
+/// **Mutant:** drop the `crash_site.is_some() && !crash_points` guard. The run
+/// then reaches `--help`, exits 0, and the first assertion fails.
+#[test]
+fn a_forced_crash_site_is_refused_without_the_flag_that_arms_it() {
+    let out = torture(&["--crash-site", "claim.after_cas", "--help"]);
+    assert!(
+        !out.status.success(),
+        "--crash-site was accepted without --crash-points, so the probe would have armed \
+         nothing while reporting a reachability result"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--crash-site needs --crash-points"),
+        "the refusal must name what is missing, got: {err}"
+    );
 }
 
 /// **The arguments `just shm-torture` passes by default actually parse.**
