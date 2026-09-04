@@ -254,6 +254,14 @@ impl Build {
 /// resolves the recipe a `MeasuredElsewhere` row names against the real
 /// `justfile`, so a row that points at a recipe nobody wrote fails; and
 /// `MeasurementRefused` is at least paired with a row that carries no numbers.
+/// **The first mitigation was narrower than this paragraph said until
+/// 2026-09-04**: the test read each row's `reproduce` field and not its
+/// `reason`, and three recipes are named in no `reproduce` field at all —
+/// `just dds-bench`, in both `total_rss_n_consumers`' and
+/// `publish_to_visible`'s reasons, and `just bench-check` and
+/// `just bench-baseline-update` in `embedding_cross_crate`'s. It reads both
+/// now. It still says nothing about whether the recipe measures what the row
+/// claims it measures.
 /// **A row whose ground is `NoInstrument` is exactly as trustworthy as the
 /// person who wrote it**, which is why it is spelled out as its own variant
 /// rather than folded into the others: it is greppable, and it is the shortest
@@ -328,8 +336,17 @@ impl Ground {
         }
     }
 
-    /// The JSON/HTML spelling, so a reader of `results.json` sees the ground and
-    /// not only the prose.
+    /// The stable spelling of the ground, for [`Report::validate`]'s refusal
+    /// messages and for the test that seeds a stale ground and greps for it.
+    ///
+    /// **It is not in `results.json` or `index.html`, and this doc comment
+    /// claimed it was until 2026-09-04.** It read "the JSON/HTML spelling, so a
+    /// reader of `results.json` sees the ground and not only the prose", in the
+    /// same commit that decided *not* to emit it: `to_json` writes the schema
+    /// `SCHEMA` names and adding a key to it is a consumer-visible change that
+    /// rides a schema bump, which this change did not take. `grep -c ground
+    /// target/bench-report/results.json` answers 0. If the ground is wanted in
+    /// the artifact, that is the bump — not a quiet extra field.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1260,6 +1277,20 @@ impl Report {
     /// it; recording that it is missing is worth more than a rule that reads as
     /// though it were there.
     ///
+    /// **Bullet 2's N is one number for the whole report, and three rows rest
+    /// on it.** `warmup_discarded_s` is [`Options::warmup`], and `Options::warmup`
+    /// reaches exactly one measurement: `measure_lookup_latency`, in this
+    /// process, for the `lookup_latency` row. The other two rows the rule
+    /// governs are timed elsewhere and never see it —
+    /// `embedding_cross_crate` loads a pair `just embed-cost` produced in a
+    /// separate process, and `lookup_ratio_vs_tf2` is timed by
+    /// `crate::ratio::measure`, which discards its own warm-up on its own
+    /// schedule. So for those two the figure is a **report-level declaration**
+    /// rather than that row's discarded window: the rule catches `--warmup 0s`
+    /// and a non-finite N, and it does not establish that the row's own
+    /// warm-up was stated. A per-row warm-up is what would, and it is not
+    /// built.
+    ///
     /// **Bullet 5 is a claim about a repository, and a running binary cannot
     /// see one.** The half that is mechanical is that every row names a command
     /// that re-derives it, which is enforced here for all three statuses; that
@@ -1889,50 +1920,98 @@ fn frozen_row_reason(attempt: &str) -> String {
 /// Only a *measurement* failure propagates — a missing fixture frame, say. An
 /// unmeasurable row is not an error; it is a row.
 pub fn assemble(opts: &Options) -> Result<Report> {
-    let fitness = Fitness::probe(opts.consumers);
-    let build = Build::current();
+    assemble_on(
+        opts,
+        Fitness::probe(opts.consumers),
+        Build::current(),
+        std::env::var("ROS_DISTRO").is_ok(),
+    )
+}
+
+/// [`assemble`] with the host verdict, the build and the ROS environment handed
+/// in rather than probed.
+///
+/// **This seam exists because the all-clear host was unreachable from a test,
+/// and a defect lived there.** `assemble` probes; every committed test therefore
+/// ran on whatever host it ran on, and this repository's development host has
+/// four physical cores, so `fitness.core_reason` was always `Some` and the
+/// N-way rows always had at least one obstacle to name. On a host with none —
+/// ROS installed, at least `consumers + 1` physical cores, quiet, non-SMT,
+/// performance governor — `host_grounds` came out **empty**, the three N-way
+/// rows were `Status::Unavailable` resting on nothing, and
+/// [`Report::validate`]'s own new refusal rejected the whole report so
+/// `bench_report` wrote nothing at all. The fix is that every N-way row now
+/// states a ground that does not depend on the host — [`Ground::MeasuredElsewhere`]
+/// for the two whose named recipe takes the number, [`Ground::NoInstrument`]
+/// for `publish_to_visible`, whose reason says nobody takes it — and the seam
+/// is what lets `tests::a_host_with_no_obstacle_still_grounds_every_n_way_row`
+/// pin it.
+///
+/// Not `pub`: the `build` argument must agree with the `cfg!`s the binary was
+/// compiled under, because the `#[cfg]`-selected arms of [`ratio_row`] and the
+/// differential row are chosen at compile time and cannot be talked out of it.
+///
+/// # Errors
+///
+/// As [`assemble`].
+fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) -> Result<Report> {
     let n = opts.consumers;
 
-    let no_ros = std::env::var("ROS_DISTRO").is_err() && !build.tf2_linked;
+    let no_ros = !ros_env && !build.tf2_linked;
     let ros_reason = if no_ros {
         "there is no ROS 2 in this build or environment, so the tf2 column cannot be \
          measured at all"
     } else {
         ""
     };
-    // The reason an *N-way, cross-engine* row is missing here. Built from the
-    // two independent verdicts, and only from the ones that actually failed —
-    // a reason listing an obstacle the host does not have reads as padding and
-    // teaches a reader to skip the reasons entirely.
-    // The grounds under `host_reason`, assembled from the same three verdicts
-    // and in the same order, so the prose and the machine-checkable half cannot
-    // drift apart: each `parts.push` below has exactly one `host_grounds.push`
-    // beside it.
+    // The reason an *N-way, cross-engine* row is missing here, and the host
+    // obstacles under it. Each `parts.push` below has exactly one
+    // `host_grounds.push` beside it, so the prose and the machine-checkable
+    // half cannot drift apart.
+    //
+    // **`host_grounds` is CONDITIONAL and can legitimately be empty, and every
+    // row below must therefore add a ground of its own.** That is the defect
+    // this block shipped with: these were the whole ground list, so on a host
+    // with no obstacle at all the three N-way rows were `unavailable` resting
+    // on nothing and `Report::validate` rejected the entire report. The
+    // permanent gap is not a host obstacle — `bench_report` is one process, it
+    // stands up no consumers and links no second engine, so **no configuration
+    // of it measures an N-way cross-engine row on any host** — so it leads the
+    // reason unconditionally, and each row states the ground that goes with it:
+    // `MeasuredElsewhere` where the recipe the row names really does take the
+    // number, `NoInstrument` where nothing takes it at all. Those are different
+    // claims and `publish_to_visible` is the row that makes the second one, so
+    // seeding `MeasuredElsewhere` into this shared vector would have quietly
+    // published an over-claim on exactly the row whose reason says the number
+    // does not exist.
     let mut host_grounds: Vec<Ground> = Vec::new();
     let host_reason = {
-        let mut parts: Vec<&str> = Vec::new();
+        let mut parts: Vec<String> = vec![format!(
+            "this tool is a single process: it stands up none of the {n} consumers this \
+             row compares and links no second engine, so the row is not measured here in \
+             any build or on any host — the command below is what measures it"
+        )];
         if !ros_reason.is_empty() {
-            parts.push(ros_reason);
+            parts.push(ros_reason.to_owned());
             host_grounds.push(Ground::Tf2NotLinked);
         }
-        let core_line;
         if let Some(c) = fitness.core_reason.as_deref() {
-            core_line = format!("the host has {c}");
-            parts.push(&core_line);
+            parts.push(format!("the host also has {c}"));
             host_grounds.push(Ground::HostCores);
         }
-        let timing_line;
         if !fitness.fair_for_timing {
-            timing_line = fitness.reason_line();
-            parts.push(&timing_line);
+            parts.push(fitness.reason_line());
             host_grounds.push(Ground::HostFitness);
         }
-        if parts.is_empty() {
-            format!("no obstacle was found for a {n}-consumer comparison on this host")
-        } else {
-            parts.join("; ")
-        }
+        parts.join("; ")
     };
+
+    // The two rows whose recipe really does take the number the row is about.
+    // Non-empty on every host by construction: the seed is the standing gap,
+    // and `host_grounds` is whatever this host adds to it.
+    let n_way_grounds: Vec<Ground> = std::iter::once(Ground::MeasuredElsewhere)
+        .chain(host_grounds.iter().copied())
+        .collect();
 
     let mut rows = Vec::new();
 
@@ -1946,7 +2025,7 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             "just mp-bench (tf_tree) / just mp-bench-tf2 (both, in the ROS container)",
         )
         .n_way()
-        .on(&host_grounds),
+        .on(&n_way_grounds),
     );
 
     // **This row's reason was false in the build the container runs, and the
@@ -2035,6 +2114,37 @@ pub fn assemble(opts: &Options) -> Result<Report> {
     }
     rows.push(lookup);
 
+    // Built before the row so the prose and the ground list are written side by
+    // side: the `shm` clause and `Ground::FrozenBackendNotCompiled` are one
+    // claim, and `validate` re-derives the second.
+    let (ptv_reason, ptv_grounds) = {
+        let mut r = format!(
+            "{host_reason}. One further gap, and it is not the one this reason used to \
+             name: nothing in this repository times publish-to-visible end to end. `just \
+             dds-bench` is a real DDS round trip — one publisher, N tf2_ros listeners, \
+             §5.2's QoS — but `dds_report` reports `svc`, the engine call itself, so its \
+             number answers a different question"
+        );
+        // **`NoInstrument`, and deliberately not `MeasuredElsewhere`.** This
+        // row's own reason says nothing in this repository times
+        // publish-to-visible end to end; `just mp-bench` measures service
+        // latency, which the reason says answers a different question. Calling
+        // that "measured elsewhere" would be the over-claim the `Ground` type
+        // exists to stop, in the type meant to stop it. It is unconditional, so
+        // this row's ground list is non-empty on every host without the seed
+        // the other two N-way rows take.
+        let mut g = vec![Ground::NoInstrument];
+        g.extend(host_grounds.iter().copied());
+        if !build.frozen_backend {
+            r.push_str(
+                ". A cross-process publish additionally goes through the shared-memory \
+                 backend, and this binary was compiled without `--features shm`",
+            );
+            g.push(Ground::FrozenBackendNotCompiled);
+        }
+        (r, g)
+    };
+
     rows.push(
         Row::unavailable(
             "publish_to_visible",
@@ -2048,22 +2158,22 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             // describes it at length. What is genuinely missing is the
             // *instrument*: `dds_report`'s `svc` column times the engine call,
             // not the publish timestamp to the moment a consumer can see it.
-            format!(
-                "{host_reason}. Two further gaps, and neither is the one this reason used \
-             to name: this row needs the `shm` feature and a second process per consumer, \
-             which `bench_report` does not have; and nothing in this repository times \
-             publish-to-visible end to end. `just dds-bench` is a real DDS round trip — \
-             one publisher, N tf2_ros listeners, §5.2's QoS — but `dds_report` reports \
-             `svc`, the engine call itself, so its number answers a different question"
-            ),
+            // **"Two further gaps" was one of them by 2026-09-04, and the count
+            // is corrected here rather than quietly dropped.** The sentence read
+            // "this row needs the `shm` feature and a second process per
+            // consumer, which `bench_report` does not have; and nothing in this
+            // repository times publish-to-visible end to end" — and the process
+            // count is now the first clause of `host_reason` itself, so quoting
+            // it again as a *further* gap counted one obstacle twice. What is
+            // left over is the instrument, plus the `shm` feature where the
+            // build lacks it — and that half is conditional now, because
+            // `just bench-report-shm` compiles a binary the old unconditional
+            // sentence was false in.
+            ptv_reason,
             "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
         )
         .n_way()
-        .on(&{
-            let mut g = host_grounds.clone();
-            g.push(Ground::NoInstrument);
-            g
-        }),
+        .on(&ptv_grounds),
     );
 
     rows.push(
@@ -2076,17 +2186,32 @@ pub fn assemble(opts: &Options) -> Result<Report> {
             // recorded it on, not to whatever host is running this binary — quoting
             // somebody else's number as if it came from here is the exact move §9.3
             // exists to stop.
-            format!(
-                "{host_reason}. That a short host produces a bent curve rather than a slow \
-             one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from \
-             1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at \
-             5.35-5.62x on the 4-physical-core development host, which is what an \
-             oversubscribed 8-thread row looks like"
-            ),
+            //
+            // **And it is stated only where it applies.** The sentence is
+            // evidence that a *short* host bends this curve; on a host wide
+            // enough for the comparison it describes somebody else's machine
+            // while the row's actual gap is the process count above, which is
+            // the same "reason that is not this row's reason" the amendment
+            // below `Ground` was written against.
+            {
+                // Moves `host_reason`: this is its last reader, and clippy's
+                // `redundant_clone` is right that a clone here would be one.
+                let mut r = host_reason;
+                if fitness.core_reason.is_some() {
+                    r.push_str(
+                        ". That a short host produces a bent curve rather than a slow one \
+                         is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate \
+                         (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 \
+                         as FAILING at 5.35-5.62x on the 4-physical-core development host, \
+                         which is what an oversubscribed 8-thread row looks like",
+                    );
+                }
+                r
+            },
             "just tf2-scaling / just shm-scaling, on >= 16 physical cores",
         )
         .n_way()
-        .on(&host_grounds),
+        .on(&n_way_grounds),
     );
 
     rows.push(
@@ -3986,8 +4111,30 @@ mod tests {
             .expect_err("a fitness claim on a fit host must be refused");
         assert!(errs.iter().any(|e| e.contains("host_fitness")), "{errs:?}");
 
-        // `HostCores`, twice, because it has two ways to be false and only one
-        // of them is about the host. First: the host has the cores.
+        // `HostFitness` a second time, on a NON-timing axis, because the arm
+        // above cannot see which axis was asked: `skeleton`'s rows are
+        // `AbsoluteTiming`, so `axis(row.sensitivity).0` and `fair_for_timing`
+        // are the same value there and a mutant reading the fixed field passes.
+        // Here the host fails to time and passes the ratio axis, so a `Ratio`
+        // row blaming the host is stale — which is exactly `ratio_row`'s
+        // shipped shape: it sets `Ground::HostFitness` on a `Sensitivity::Ratio`
+        // row, and the whole argument for that row existing is that the ratio
+        // axis survives a host the timing axis does not.
+        let mut r = skeleton(false, false);
+        assert!(
+            !r.fitness.fair_for_timing && r.fitness.fair_for_ratios,
+            "the fixture must split the two axes or this arm tests nothing"
+        );
+        r.rows[0].sensitivity = Sensitivity::Ratio;
+        r.rows[0].grounds = vec![Ground::HostFitness];
+        let errs = r
+            .validate()
+            .expect_err("a fitness claim on an axis the host passes must be refused");
+        assert!(errs.iter().any(|e| e.contains("host_fitness")), "{errs:?}");
+
+        // `HostCores`, three times, because it is a conjunction of three
+        // conditions and only one of them is about the host. First: the host
+        // has the cores.
         let mut r = skeleton(false, false);
         r.rows[0].needs_n_cores = true;
         r.rows[0].grounds = vec![Ground::HostCores];
@@ -4009,6 +4156,25 @@ mod tests {
         let errs = r
             .validate()
             .expect_err("a memory row may not blame the core budget");
+        assert!(errs.iter().any(|e| e.contains("host_cores")), "{errs:?}");
+
+        // Third, and this conjunct was dead until 2026-09-04: the host is
+        // short, the row is on an axis the budget reaches, and the row does not
+        // run N consumers. `Fitness::core_reason` governs the N-way rows only —
+        // `validate`'s own `measured` arm says so with the identical
+        // `needs_n_cores && sensitivity != Memory` test — so a single-threaded,
+        // single-process row blaming the core count is blaming a check that
+        // never applied to it. Every other arm here seeds `needs_n_cores =
+        // true`, so deleting `&& row.needs_n_cores` from `Ground::holds` left
+        // the whole suite green.
+        let mut r = skeleton(false, false);
+        r.fitness.enough_cores = false;
+        r.rows[0].needs_n_cores = false;
+        r.rows[0].sensitivity = Sensitivity::AbsoluteTiming;
+        r.rows[0].grounds = vec![Ground::HostCores];
+        let errs = r
+            .validate()
+            .expect_err("a row that runs no consumers may not blame the core budget");
         assert!(errs.iter().any(|e| e.contains("host_cores")), "{errs:?}");
 
         // Non-degenerate: the identical row with the budget actually reaching it
@@ -4589,9 +4755,25 @@ mod tests {
                 t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
                     .to_owned()
             };
+            // The *leading* token needs its own trim, and this is why the
+            // reason scan below was vacuous when it was first added: a
+            // `reproduce:` field spells a command bare (`just mp-bench-tf2`),
+            // while a reason spells it in backticks (`` `just dds-bench` ``), so
+            // the token is `` `just `` and an equality test against "just"
+            // matches nothing. `word` cannot do this job — it strips leading
+            // dashes too, and `--bench` is one of the things being matched.
+            let cmd = |t: &str| {
+                t.trim_matches(|c: char| {
+                    matches!(
+                        c,
+                        '`' | '*' | '(' | ')' | ',' | '.' | ';' | ':' | '"' | '\''
+                    )
+                })
+                .to_owned()
+            };
             let tok: Vec<String> = plain.split_whitespace().map(String::from).collect();
             for (i, t) in tok.iter().enumerate() {
-                match t.as_str() {
+                match cmd(t).as_str() {
                     "just" => {
                         let name = word(tok.get(i + 1).map_or("", String::as_str));
                         assert!(
@@ -4600,7 +4782,7 @@ mod tests {
                         );
                         checked += 1;
                     }
-                    "cargo" if tok.get(i + 1).map(String::as_str) == Some("xtask") => {
+                    "cargo" if tok.get(i + 1).map(|t| cmd(t)).as_deref() == Some("xtask") => {
                         let name = word(tok.get(i + 2).map_or("", String::as_str));
                         assert!(
                             xtask.contains(&format!("Some(\"{name}\")")),
@@ -4635,6 +4817,18 @@ mod tests {
         let r = assemble(&opts).expect("assemble");
         for row in &r.rows {
             check(row.reproduce, row.id);
+            // **The reason, not only `reproduce:`.** The `Ground` type's docs
+            // offer this test as the one partial mitigation for
+            // `Ground::MeasuredElsewhere`, "resolves the recipe a
+            // `MeasuredElsewhere` row names" — and until 2026-09-04 it read
+            // `reproduce` alone, while three recipes appear in no `reproduce`
+            // field at all: `just dds-bench` (in `total_rss_n_consumers`' and
+            // `publish_to_visible`'s reasons) and `just bench-check` /
+            // `just bench-baseline-update` (in `embedding_cross_crate`'s).
+            // A recipe in a reason rots exactly as a
+            // recipe in a command does; it is the same prose wearing a
+            // different field name.
+            check(&row.reason, row.id);
         }
         let html = r.to_html();
         let block = html
@@ -4645,9 +4839,17 @@ mod tests {
 
         // Guards the parser itself: if `check` silently matched nothing, every
         // assertion above would be vacuous and this test would pass on a report
-        // naming only fictional commands.
+        // naming only fictional commands. **That is not hypothetical here**:
+        // the reason scan added above matched zero tokens on its first version,
+        // because a reason spells a recipe in backticks, and this floor was low
+        // enough to hide it. Measured on 2026-09-04 in the default build by
+        // raising this floor above the count and reading the message: **14**
+        // with neither the reason scan nor the leading-token trim, **15** with
+        // the trim alone, **23** with both. The floor is 20 rather than 23 so
+        // that deleting one sentence of prose is not a test failure, and it is
+        // above 15 so that losing the reason scan is.
         assert!(
-            checked >= 8,
+            checked >= 20,
             "only {checked} commands were checked — the scanner matched nothing"
         );
     }
@@ -4949,6 +5151,105 @@ CPU part\t: 0xd0c
     /// `Status::Measured` and a `p50_ns` metric before the `timing_status`
     /// match — this test fails on any host that does not pass the clock-fitness
     /// probe, which includes the one this was developed on.
+    /// The host with **no obstacle at all**, which no committed test could
+    /// reach before this one and where the branch that introduced `Ground` was
+    /// broken.
+    ///
+    /// `assemble` probes, and this repository's development host has four
+    /// physical cores, so `Fitness::core_reason` was always `Some` and the
+    /// three N-way rows always had an obstacle to name. On a host with none —
+    /// ROS installed, `consumers + 1` physical cores, quiet, no SMT,
+    /// `performance` governor, release build — `host_grounds` was assembled
+    /// from the obstacles that *fired*, came out empty, and
+    /// `Report::validate`'s own new "an unavailable row rests on a stated
+    /// ground" rule then rejected the entire report: `bench_report` would have
+    /// written nothing on the best host it could run on. The fix is the seeded
+    /// `Ground::MeasuredElsewhere` in `assemble_on`, which is the honest label
+    /// — this tool is one process and these three rows are measured by the
+    /// recipes they name.
+    #[test]
+    fn a_host_with_no_obstacle_still_grounds_every_n_way_row() {
+        const N: usize = 4;
+        let fitness = Fitness::assess(
+            N,
+            32,
+            Some(32),
+            0.0,
+            Some(vec!["performance".to_owned(); 32]),
+            false,
+            true,
+        );
+        // Non-degenerate: if any of these went false the test below would be
+        // passing for the ordinary reason rather than for the all-clear one.
+        assert!(fitness.fair_for_timing, "{:?}", fitness.reasons);
+        assert!(fitness.fair_for_ratios && fitness.fair_for_memory);
+        assert!(fitness.enough_cores && fitness.core_reason.is_none());
+
+        let opts = Options {
+            lookup_samples: 2_000,
+            differential_queries: 512,
+            warmup: Duration::from_millis(10),
+            consumers: N,
+            ..Options::default()
+        };
+        // `Build::current()` rather than a fabricated `Build`: `ratio_row`'s and
+        // the differential row's arms are `#[cfg]`-selected at compile time and
+        // cannot be talked out of the build they were compiled for, so a
+        // fabricated `tf2_linked = true` would make a *correct* ground read
+        // stale. The ROS flag is the one that has to be handed in, because it is
+        // read from the environment.
+        let r = assemble_on(&opts, fitness, Build::current(), true).expect("assemble");
+
+        // The ground each row must carry whatever the host is — and they are
+        // not the same ground. `publish_to_visible` may not say
+        // `MeasuredElsewhere`, because its own reason says nothing in this
+        // repository times publish-to-visible end to end.
+        for (id, standing) in [
+            ("cpu_per_consumer", Ground::MeasuredElsewhere),
+            ("scaling_curve", Ground::MeasuredElsewhere),
+            ("publish_to_visible", Ground::NoInstrument),
+        ] {
+            let row = r.rows.iter().find(|row| row.id == id).expect(id);
+            assert_eq!(row.status, Status::Unavailable, "row `{id}`");
+            assert!(
+                row.grounds.contains(&standing),
+                "row `{id}` is unavailable on an all-clear host carrying grounds {:?}",
+                row.grounds
+            );
+            // The prose half of the same defect: the reason for these rows used
+            // to be the literal sentence "no obstacle was found for a
+            // 4-consumer comparison on this host", printed as the explanation of
+            // why the row is missing.
+            assert!(
+                !row.reason.contains("no obstacle"),
+                "row `{id}` explains its absence with: {}",
+                row.reason
+            );
+            assert!(
+                row.reason.contains("single process"),
+                "row `{id}` does not name the standing gap: {}",
+                row.reason
+            );
+        }
+
+        // The over-claim half of the same rule: the row that has no instrument
+        // may not borrow the other two rows' standing ground.
+        let ptv = r
+            .rows
+            .iter()
+            .find(|row| row.id == "publish_to_visible")
+            .expect("publish_to_visible");
+        assert!(
+            !ptv.grounds.contains(&Ground::MeasuredElsewhere),
+            "`publish_to_visible` claims its number is measured elsewhere: {:?}",
+            ptv.grounds
+        );
+
+        // The whole point: the report a fit host produces is one this tool will
+        // write.
+        assert_eq!(r.validate(), Ok(()));
+    }
+
     #[test]
     fn the_assembled_report_passes_its_own_validation() {
         let opts = Options {
