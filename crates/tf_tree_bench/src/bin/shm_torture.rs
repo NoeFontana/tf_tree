@@ -8,31 +8,173 @@
 //!
 //! # What this covers, and what it does not — read this before quoting it
 //!
-//! §11.4 asks for four things. **Three are here:**
+//! §11.4 asks for four things, and **the first three are here:**
 //!
 //! * N processes doing random attach/detach/claim/reap/push/lookup — yes.
 //! * Random `SIGKILL` at 1–10 Hz — yes, and it is the whole point: a killed
 //!   process cannot clean up, so every claim, participant slot and lock byte it
 //!   held has to be recovered by somebody else with no cooperation from it.
-//! * Continuous invariant checking — yes, see `Invariant`.
+//!   **Since 2026-09-04 that includes the rendezvous owner** — see the section
+//!   below, and `kill_the_owner`.
+//! * A random crash point armed in ~10% of children — yes, under
+//!   `--crash-points`, which needs `--features crash-points`. See
+//!   `armed_site` and the reachability section below for which of §11.3's
+//!   thirteen sites this workload can actually reach, which is not all of them.
+//! * Continuous invariant checking — **two of §11.4's four clauses.** The
+//!   quaternion/NaN clause is checked on every read in every process
+//!   (`Invariant`); the two-writers clause is checked on every push by the
+//!   writer that holds the edge (`work`'s `two_writers` arm). The other two
+//!   are not: slot leakage is checked once, at teardown (`check_recovery`),
+//!   and "the arena hash is stable across quiescent points" is not implemented
+//!   at all — there is no safe accessor for the arena's bytes from a
+//!   `forbid(unsafe_code)` crate, so it needs a new public API and therefore a
+//!   decision record. `docs/PHASE2.md` §0.0's §11.4 row says so where a reader
+//!   will meet it.
 //!
-//! …with one boundary on the second bullet that is worth stating before anyone
-//! quotes this as "we kill anything, anywhere": **the killed processes are the
-//! joiners, never the rendezvous owner.** The driver creates and serves the
-//! arena and is not a candidate victim, because `docs/PHASE2.md` §3.5's takeover
-//! is not wired into `tf_tree::open` yet and a run that kills the owner spends
-//! the rest of its life in `ArenaHeldButUnreachable` proving nothing.
-//! `imp::attach_observer` carries the measurement and the one-line change that
-//! reverses this when §3.5 lands.
+//! **Three claims that stood in this header until 2026-09-04 were false, and
+//! are corrected rather than deleted**, because each one was a reason somebody
+//! could have given for not doing the work:
 //!
-//! **One is not**, and is not faked: "a random crash point armed in 10% of
-//! children". Crash points are `docs/PHASE2.md` §11.3's `crash-points` feature,
-//! which `docs/PHASE2.md` §0.0 records as **not implemented** — there is no
-//! `TF_TREE_CRASH_AT` to arm. `--crash-points` therefore *refuses* rather than
-//! silently running a weaker test, because the difference between the two
-//! matters: `SIGKILL` lands between instructions at a distribution the scheduler
-//! chooses, and crash points land at the eleven named mid-protocol states §11.3
-//! enumerates. This harness reaches the first and cannot reach the second.
+//! 1. *"the killed processes are the joiners, never the rendezvous owner … §3.5's
+//!    takeover is not wired into `tf_tree::open` yet"*. §3.5's ownership
+//!    migration landed on **2026-08-28** (`Tree::owner_lost`,
+//!    `Tree::inherit_ownership`, `Session::take_over_ownership`), and this
+//!    harness now kills the owner on a schedule and requires a survivor to
+//!    inherit.
+//! 2. *"Crash points are §11.3's `crash-points` feature, which §0.0 records as
+//!    **not implemented** — there is no `TF_TREE_CRASH_AT` to arm"*. The feature
+//!    and the variable shipped on **2026-08-29**; `--crash-points` has armed
+//!    them since. What survives from that paragraph is the part that was never
+//!    about implementation status, and it is kept below.
+//! 3. *"the eleven named mid-protocol states §11.3 enumerates"*. §11.3's table
+//!    has fourteen rows, **thirteen** of which carry a site; the fourteenth
+//!    (`reclaim.probe_then_reoccupied`) names an interleaving between two live
+//!    processes and is deliberately not an abort site.
+//!
+//! **`SIGKILL` is still not §11.3 coverage**, and that distinction has nothing
+//! to do with what is implemented: a signal lands wherever the scheduler puts
+//! it, which is a different and much shallower set of mid-protocol states than
+//! the named ones. A run without `--crash-points` must not be quoted as §11.3.
+//!
+//! # Which of §11.3's thirteen sites this workload can reach
+//!
+//! A site armed in a process that never executes the instruction is a draw
+//! spent on nothing, and `armed N, aborted 0` reads like a scheduling problem
+//! rather than a structural one. **Measured** 2026-09-04, not reasoned: each
+//! site was forced in every child with `--crash-site NAME[:nth]` over
+//! `--duration 12s --children 4 --kill-hz 1 --seed 777`. **Twelve of the
+//! thirteen fire; one does not.** The interesting split is not that one, though
+//! — it is that "fires" and "exercises the row's repair claim" are two different
+//! things:
+//!
+//! **The probe form is not uniform, and neither is where the answer is read.**
+//! This paragraph said "the run's own armed/fired line is the result" for all
+//! thirteen, and that was false for five of them — corrected here rather than
+//! deleted, because the sentence was making the stronger claim (*checkable from
+//! a run*) precisely where it did not hold:
+//!
+//! * **Eight are checkable from the run's own `§11.3:` line at `NAME:1`** —
+//!   `push.*` ×3, `claim.after_cas`, `takeover.*`, `reclaim.*`, `hangup.*`, and
+//!   the negative control `topo.holding_lock`, which is the one row that needs
+//!   no abort to be an answer. **Not the same eight as the first table below**:
+//!   this one is about where the answer is read and includes
+//!   `topo.holding_lock` while excluding `attach.*`; that one is about what the
+//!   site exercises. **The armed/aborted pair each of them prints is not
+//!   reproduced here.** It was, per site, and it should not have been: re-run
+//!   the same command at the same seed and the pair moves, because what a
+//!   `SIGKILL`-driven fleet reaches in twelve seconds is a scheduling outcome
+//!   and the seed fixes only the driver's draws. Run the loop below and read the
+//!   pairs off the runs you took; the *split* above is the claim.
+//! * **`attach.after_slot_assigned_before_publish` needs the bare `NAME` form**,
+//!   where the nth is drawn above 1 so the creating owner child survives its
+//!   first hit, and `fired:` names it. At `:1` every one of `spawn_owner`'s six
+//!   attempts aborts and the run bails with no `§11.3:` line at all. The
+//!   bare-form run then *fails* §3.5 — arming every child at an attach site
+//!   starves the migration — which is the probe being a probe, and the `fired:`
+//!   line is still what answers the question.
+//! * **Four are read off the child's `tf_tree_core: crash point <site> hit N,
+//!   aborting` on stderr**, because at `:1` they abort the owner child on all six
+//!   attempts and `drive` bails before §11.3's report exists:
+//!   `open.after_ownership_lock_before_bind`, `open.after_create_before_bind`,
+//!   `topo.after_copy_before_publish` and `intern.after_hash_cas_before_id_store`.
+//!   With the bare form the two `open.*` come up and arm every child and none
+//!   aborts — they are on the creation path only — so for those two the bare
+//!   form answers *unreachable in a child* and `:1` answers *reachable in the
+//!   creator*, and both halves are wanted.
+//!
+//! | Fires, in a live arena, and the state it leaves is met by live peers | Where |
+//! |---|---|
+//! | `push.after_seq_odd`, `push.after_data_before_seq_even`, `push.after_seq_even_before_head` | `work` publishes on 40% of its operations |
+//! | `claim.after_cas` | `work` claims |
+//! | `attach.after_slot_assigned_before_publish` | every join, and children re-join constantly. Probed with the **bare** form; see the split above |
+//! | `reclaim.after_probe_before_cas` | `work`'s `reap_participants` arm, added with the owner kill because a migration orphans the hangup collector (see `check_recovery`) |
+//! | `hangup.after_probe_before_cas` | the owner is a **child** now, so it is armed like any other, and a joiner hanging up drives its callback. It needed `reap_owner` as well: the owner is not a worker slot, so an owner that aborted mid-run was not counted and this site read `20 armed, 0 aborted` while it had in fact fired |
+//! | `takeover.after_ownership_lock_before_bind` | inside `Tree::inherit_ownership`, which every survivor calls |
+//!
+//! | Fires only in the **creating** owner child, and the row's claim is still what gets exercised | Where |
+//! |---|---|
+//! | `open.after_ownership_lock_before_bind`, `open.after_create_before_bind` | inside the `OpenOutcome::Created` arm. §11.3's rows for both are about what the *next* `open()` finds, and `spawn_owner`'s retry is that next `open()` — driven as a run rather than staged |
+//!
+//! | Fires only in the creating owner child, where the state the row names is **not produced** | Why |
+//! |---|---|
+//! | `topo.after_copy_before_publish` | `TreeBuilder::build_with` calls `set_parent`, so a creator armed here aborts. But the row is about "inactive block dirty, word unchanged → no observable effect (A1)" *in a live arena*, and this abort destroys the arena being built. `spawn_owner` retries and a fresh one is created; nothing observes the state |
+//! | `intern.after_hash_cas_before_id_store` | same shape: the owner child interns all five chain names at build time, so it is the first interner. The row is about the *next* interner spinning and recovering under A8, and there is no next interner of a name whose arena never existed |
+//!
+//! | Never fires | Why |
+//! |---|---|
+//! | `topo.holding_lock` | inside `Tree::reparent`, and nothing here reparents. The topology is a fixed four-edge chain and a participant that reparented it would destroy the property every other check reads. Confirmed by probe: every child armed, none aborted |
+//!
+//! So **"every §11.3 crash point recovers" is not a claim this binary can
+//! make**, at any duration: one site never fires and two fire somewhere the
+//! state they name cannot exist. That is a statement about this workload and not
+//! about the sites — every one of the thirteen has a targeted test in
+//! `tf_tree_core::crash_tests` or `tf_tree/tests/rendezvous.rs`, which is where
+//! §11.3's per-site coverage lives. The run prints the sites it armed and the
+//! sites that fired, so eight of these rows are checkable from a run's own
+//! output; the other five are checkable from the child's abort line on stderr,
+//! for the reason the split above gives.
+//!
+//! **A forced `--crash-site` can fail a run for the probe's own reasons.**
+//! Arming *every* child at `hangup.after_probe_before_cas:1` makes each new
+//! owner abort on the first participant hangup, so the role churns faster than
+//! the driver can follow it and the migration check fails. That is the probe
+//! being a probe; §11.4's configuration is a random site in a tenth of children,
+//! which is what `--crash-points` alone does.
+//!
+//! # Killing the owner (§3.5), and why the driver stopped being it
+//!
+//! The driver used to create and serve the arena, which made the owner
+//! structurally unkillable and left §12.3 gate 3's "the owner dies mid-run"
+//! unmet. It now spawns an **owner child** that creates and serves and does
+//! nothing else, joins with `CreatePolicy::Never` itself, and `SIGKILL`s
+//! whichever process currently holds the role every `--owner-kill-every`.
+//!
+//! Every child is a potential heir: `work` evaluates `Tree::owner_lost` in
+//! its own loop and calls `Tree::inherit_ownership` when it answers true, which
+//! is §3.5's caller-driven trigger used exactly as specified — there is no
+//! daemon and no background thread, so *the participants are the callers*. Two
+//! things are then required of every owner kill, and a run where either fails
+//! is a failed run rather than a quiet one:
+//!
+//! * **a fresh process can join again**, probed from the outside with a real
+//!   `Open::new().create(Never)`. That is the property that was broken between
+//!   2026-08-27 and 2026-08-28 and the whole point of §3.5: an ownerless arena
+//!   refuses a new joiner with `ArenaHeldButUnreachable` while every already
+//!   attached process keeps reading, so an internal flag would not have
+//!   detected it and this probe does; and
+//! * **some survivor recorded an inheritance**, which is what says the fresh
+//!   join succeeded because §3.5's trigger ran rather than because the role was
+//!   never vacant.
+//!
+//! `--no-inherit` is the negative control: children skip the `owner_lost` call,
+//! nothing inherits, and the run must **fail**. `tests/torture.rs` asserts that,
+//! for the same reason `--readers-only` exists one level down.
+//!
+//! The replacement for a killed owner **rejoins as an ordinary participant**,
+//! deliberately: the role is inherited, and a second process opening with
+//! `IfAbsent` after a migration would either join as a plain participant (doing
+//! nothing) or, worse, create a second arena and split the run in half. So the
+//! owner role exists exactly once, at startup, and is inherited from there on.
 //!
 //! §11.4 also says "run it under ASan ... and with `TF_TREE_PARANOID=1`".
 //! `just shm-torture-asan` is the first. There is no `TF_TREE_PARANOID`: this
@@ -74,15 +216,16 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(all(feature = "shm", target_os = "linux"))]
 mod imp {
-    use std::path::PathBuf;
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     use anyhow::{bail, Context, Result};
     use tf_tree::{
-        AttachMode, Capacity, EdgeCfg, EdgeId, Guard, InterpPolicy, Iso3, Plan, Stamp, Tree,
-        TreeBuilder,
+        AttachMode, Capacity, EdgeCfg, EdgeId, Guard, Inheritance, InterpPolicy, Iso3, Plan, Stamp,
+        Tree, TreeBuilder,
     };
     use tf_tree_ipc::CreatePolicy;
 
@@ -138,6 +281,36 @@ mod imp {
     /// unless every writer of that edge has been dead for longer than the ring
     /// covers — so all fourteen runs above hit the full 64 per round, 8x this.
     const MIN_EDGE_READS_PER_ROUND: u64 = 8;
+
+    /// How long after start-up the first owner kill lands, and how long a
+    /// migration is given before the run is failed.
+    ///
+    /// **Four seconds, so the rings are full when the role first goes vacant.**
+    /// An owner killed before any writer has published leaves nothing for the
+    /// data-plane half of the check to observe, and the run would then report
+    /// "reads did not stop" about an arena nobody was reading anyway.
+    ///
+    /// It is also what keeps the two shortest self-tests in `tests/torture.rs`
+    /// meaning what they meant: the 3 s `--readers-only` case never reaches an
+    /// owner kill, and the 8 s clean case reaches exactly one.
+    const OWNER_KILL_FIRST: Duration = Duration::from_secs(4);
+
+    /// Ten seconds, matching `owner_migration`'s deadline for the same probe.
+    ///
+    /// **This is not a latency budget.** `docs/PHASE2.md` §12.2's row measures
+    /// that, on an idle host, through `just owner-migration`, and reports 0.6–1.2
+    /// ms p50. This number is only "long enough that a loaded CI runner is not
+    /// the reason a run goes red", because the failure it is written against —
+    /// nothing inherited at all — never recovers however long it waits.
+    const OWNER_RECOVERY_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// How often the observer reads while a migration is in flight.
+    ///
+    /// **Throttled on purpose.** Each observation is a round, and the run-level
+    /// read floor is per round, so polling the fresh-join at 1 kHz *and*
+    /// observing at 1 kHz would add hundreds of near-empty rounds to a
+    /// millisecond-long event and drag the floor down with them.
+    const MIGRATION_OBSERVE_EVERY: Duration = Duration::from_millis(5);
 
     /// Frames in the torture topology.
     ///
@@ -261,6 +434,21 @@ mod imp {
         inject: bool,
         readers_only: bool,
         crash_points: bool,
+        /// How often the process that currently holds the rendezvous is
+        /// `SIGKILL`ed. `None` disables the arm (`--no-kill-owner`).
+        owner_kill_every: Option<Duration>,
+        /// The negative control for §3.5: children never call
+        /// `Tree::owner_lost`, so nothing inherits and the run must fail.
+        no_inherit: bool,
+        /// `--crash-site NAME`: arm **this** §11.3 site in every child instead
+        /// of drawing one at random in a tenth of them.
+        ///
+        /// A reachability probe, not §11.4's configuration: §11.4 asks for a
+        /// random site in 10% of children and that is what a soak runs. This
+        /// answers the different question *can this workload reach site X at
+        /// all*, which the header's reachability table states as a measurement
+        /// and which nobody could re-run before this existed.
+        crash_site: Option<String>,
     }
 
     /// `30m`, `120s`, `500ms`, `1h`, or a bare number of seconds.
@@ -297,7 +485,16 @@ mod imp {
             crash_points: false,
             inject: false,
             readers_only: false,
+            // **On by default**, and that is a deliberate choice about where
+            // the coverage lives rather than an oversight. `just shm-torture`
+            // takes no flag for it, so an arm that had to be asked for would be
+            // absent from the one command §13 names — which is how §12.3 gate 3
+            // came to be unmet for the life of the harness in the first place.
+            owner_kill_every: Some(Duration::from_secs(8)),
+            no_inherit: false,
+            crash_site: None,
         };
+        let mut help = false;
         let mut it = argv.into_iter();
         while let Some(arg) = it.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -323,6 +520,26 @@ mod imp {
                 // asserts the run *fails*. It measures the harness, never the
                 // arena, so it has no place in a real soak.
                 "--readers-only" => a.readers_only = true,
+                // **§3.5's owner death, on a schedule.** Slower than the child
+                // kills by design: a migration is a control-plane event whose
+                // recovery is milliseconds, and killing the owner faster than
+                // survivors can notice measures the poll interval rather than
+                // the protocol.
+                "--owner-kill-every" => {
+                    a.owner_kill_every = Some(parse_duration(&value("--owner-kill-every")?)?);
+                }
+                // Turns the arm off. Here so a bisect can separate a failure of
+                // the owner-kill arm from a failure of everything else, and so
+                // the pre-2026-09-04 topology is still runnable for comparison.
+                "--no-kill-owner" => a.owner_kill_every = None,
+                // **The negative control for §3.5**, and the counterpart of
+                // `--readers-only`. Children skip `Tree::owner_lost` entirely,
+                // so no survivor ever inherits, the arena goes ownerless on the
+                // first owner kill, and no fresh process can join again. The run
+                // is expected to FAIL; `tests/torture.rs` asserts that it does,
+                // and asserts on the message, because "the run failed" is also
+                // what a harness that fails unconditionally produces.
+                "--no-inherit" => a.no_inherit = true,
                 // **This used to refuse unconditionally**, on the grounds that
                 // "the `crash-points` feature and `TF_TREE_CRASH_AT` are
                 // recorded as not implemented in §0.0, so there is nothing to
@@ -348,25 +565,67 @@ mod imp {
                     }
                     a.crash_points = true;
                 }
-                "-h" | "--help" => {
-                    println!(
-                        "usage: shm_torture [--duration 30s] [--children 6] [--seed N] \
-                         [--kill-hz 4] [--inject-violation] [--readers-only] \
-                         [--crash-points]"
-                    );
-                    println!(
-                        "  --crash-points arms PHASE2 §11.3's fault injection in ~10% of \
-                         children (§11.4). Needs --features crash-points; without it the \
-                         sites are compiled out and the flag is refused rather than \
-                         silently arming nothing."
-                    );
-                    return Ok(());
+                // **Validated against the published list, never a literal.**
+                // The same argument `all_sites` carries one level down: a typo
+                // in a site name would arm nothing and the probe would report
+                // "unreachable" about a site it never armed, which is the
+                // conclusion this flag exists to make checkable.
+                // `NAME` or `NAME:nth`. The `nth` matters more than it looks:
+                // a site a process reaches exactly once — `open.*` in a creator,
+                // for instance — never fires at `:2`, and a probe that drew its
+                // hit count at random reported four sites unreachable that were
+                // not. Measured; see the header's reachability table.
+                "--crash-site" => {
+                    let spec = value("--crash-site")?;
+                    #[cfg(feature = "crash-points")]
+                    {
+                        let name = site_of(&spec);
+                        let sites = all_sites();
+                        if !sites.contains(&name) {
+                            bail!(
+                                "`{name}` is not a §11.3 crash site. The build carries: {}",
+                                sites.join(", ")
+                            );
+                        }
+                    }
+                    a.crash_site = Some(spec);
                 }
+                // **Recorded, not acted on.** This arm used to print and
+                // `return Ok(())` on the spot, and arguments are processed in
+                // order — so every validation below it was unreachable from any
+                // command line ending in `--help`. Those are exactly the checks
+                // that compare *two* flags and therefore cannot live inside an
+                // arm: `shm_torture --crash-site claim.after_cas --help` exited
+                // 0 having refused nothing, and the test written to red-test
+                // that refusal is what found it. The in-arm refusals — a bad
+                // `--duration`, `--crash-points` on a build without the feature
+                // — were always reachable, because they fire where they parse.
+                "-h" | "--help" => help = true,
                 other => bail!("unknown argument `{other}`"),
             }
         }
         if a.children == 0 {
             bail!("--children 0 leaves nobody to torture the arena");
+        }
+        if a.crash_site.is_some() && !a.crash_points {
+            bail!(
+                "--crash-site needs --crash-points: without it the sites are compiled out and \
+                 the probe would report every site unreachable while arming none of them."
+            );
+        }
+        // **A run with one child cannot exercise §3.5 and must say so rather
+        // than pass.** The owner is a child; killing it leaves `children - 1`
+        // survivors, and with none of them left there is nobody to inherit —
+        // the run would then report "nothing inherited" as a defect of the
+        // engine when it is a defect of the population.
+        if a.owner_kill_every.is_some() && a.children < 2 {
+            bail!(
+                "--children {} with the owner-kill arm on leaves no survivor to inherit: the \
+                 owner is a child, so the property would be untestable and the run would fail \
+                 for a reason that says nothing about the arena. Use --children 2 or more, or \
+                 --no-kill-owner.",
+                a.children
+            );
         }
         if !(0.1..=100.0).contains(&a.kill_hz) {
             bail!(
@@ -374,6 +633,29 @@ mod imp {
                    factor of ten either way",
                 a.kill_hz
             );
+        }
+        if help {
+            println!(
+                "usage: shm_torture [--duration 30s] [--children 6] [--seed N] \
+                 [--kill-hz 4] [--owner-kill-every 8s] [--no-kill-owner] \
+                 [--inject-violation] [--readers-only] [--no-inherit] \
+                 [--crash-points] [--crash-site NAME[:nth]]"
+            );
+            println!(
+                "  the rendezvous owner is a child and is SIGKILLed every \
+                 --owner-kill-every (PHASE2 §3.5). Each kill must be followed by a fresh \
+                 process joining the arena again and by a survivor recording an inheritance, \
+                 or the run fails. --no-inherit is the negative control and is expected \
+                 to fail."
+            );
+            println!(
+                "  --crash-points arms PHASE2 §11.3's fault injection in ~10% of children \
+                 (§11.4). Needs --features crash-points; without it the sites are compiled \
+                 out and the flag is refused rather than silently arming nothing. \
+                 --crash-site forces ONE site in EVERY child — a reachability probe, not \
+                 §11.4's configuration."
+            );
+            return Ok(());
         }
         drive(&a)
     }
@@ -398,6 +680,16 @@ mod imp {
         /// depends on whether the killer happened to pick slot 0 in the first
         /// second, and a self-test that passes by luck is not one.
         inject: bool,
+        /// The `TF_TREE_CRASH_AT` this child was started with, kept so a child
+        /// that aborts can be reported **by site name** rather than only
+        /// counted.
+        ///
+        /// Without it the run can say "4 of 11 armed children aborted" and
+        /// cannot say at which sites, so a site this workload never reaches is
+        /// indistinguishable from one whose race the driver's `SIGKILL` keeps
+        /// winning — and the module doc's reachability table would be
+        /// unfalsifiable from a run.
+        crash_at: Option<String>,
     }
 
     impl Drop for Kid {
@@ -407,23 +699,70 @@ mod imp {
         }
     }
 
+    /// What a `--crash-points` run knows about §11.3, kept in one place.
+    ///
+    /// **Four numbers and not two**, and each pair answers a question the other
+    /// cannot. `armed`/`aborted` separate "a site was armed" from "a site
+    /// fired" — an armed child the driver's `SIGKILL` reached first never got
+    /// there, and `armed N, aborted 0` is a run that exercised nothing. The two
+    /// name lists separate "this workload cannot reach that site" from "the
+    /// race went the other way", which counts alone cannot: see the
+    /// reachability table in this file's header for the three sites that are
+    /// structurally unreachable here.
+    #[derive(Default)]
+    struct CrashLedger {
+        armed: usize,
+        aborted: usize,
+        /// Site names armed, one entry per child armed.
+        armed_sites: Vec<String>,
+        /// Site names that actually aborted a process.
+        fired: Vec<String>,
+    }
+
+    impl CrashLedger {
+        fn record_abort(&mut self, spec: Option<&str>) {
+            self.aborted += 1;
+            if let Some(spec) = spec {
+                self.fired.push(site_of(spec).to_string());
+            }
+        }
+    }
+
     /// `armed_site` where the feature exists, `None` where it does not.
     ///
     /// The `cfg` lives here rather than at the two call sites, so a build with
     /// the feature off compiles the same control flow.
-    fn crash_spec(enabled: bool, rng: &mut Rng, armed: &mut usize) -> Option<String> {
+    fn crash_spec(
+        enabled: bool,
+        forced: Option<&str>,
+        rng: &mut Rng,
+        ledger: &mut CrashLedger,
+    ) -> Option<String> {
         #[cfg(feature = "crash-points")]
         {
             if enabled {
-                let spec = armed_site(rng);
-                if spec.is_some() {
-                    *armed += 1;
+                let spec = armed_site(rng, forced);
+                if let Some(spec) = spec.as_deref() {
+                    ledger.armed += 1;
+                    // The site, not the `site:nth` spec: two children armed at
+                    // the same site on different hit counts are one site's worth
+                    // of coverage, and the report is about coverage.
+                    ledger.armed_sites.push(site_of(spec).to_string());
                 }
                 return spec;
             }
         }
-        let _ = (enabled, rng, armed);
+        let _ = (enabled, forced, rng, ledger);
         None
+    }
+
+    /// The site name out of a `TF_TREE_CRASH_AT` spec (`<name>:<nth_hit>`).
+    ///
+    /// Split here rather than carried alongside, so there is one representation
+    /// of "which site" and nothing can drift from the string the child was
+    /// actually given.
+    fn site_of(spec: &str) -> &str {
+        spec.split_once(':').map_or(spec, |(name, _)| name)
     }
 
     /// Every §11.3 site this build carries, in one list.
@@ -450,7 +789,20 @@ mod imp {
     /// loops is almost always during start-up — so the states past the first
     /// would never be sampled.
     #[cfg(feature = "crash-points")]
-    fn armed_site(rng: &mut Rng) -> Option<String> {
+    fn armed_site(rng: &mut Rng, forced: Option<&str>) -> Option<String> {
+        // `--crash-site` arms every child at the named site: the question it
+        // asks is whether this workload reaches the site at all, and a tenth of
+        // children at a random site answers it only in expectation over a soak
+        // far longer than a probe.
+        if let Some(site) = forced {
+            // An explicit `NAME:nth` passes through unchanged; a bare `NAME`
+            // draws its hit count as the §11.4 path does.
+            if site.contains(':') {
+                return Some(site.to_string());
+            }
+            let nth = 1 + rng.below(4);
+            return Some(std::format!("{site}:{nth}"));
+        }
         if rng.below(10) != 0 {
             return None;
         }
@@ -460,12 +812,307 @@ mod imp {
         Some(std::format!("{site}:{nth}"))
     }
 
+    /// The runtime directory every process in this run shares.
+    ///
+    /// The driver creates it and passes it in `TF_TREE_RUNTIME_DIR`, which is
+    /// also what the rendezvous itself keys on, so there is no second spelling
+    /// of "where this run lives".
+    fn runtime_dir() -> PathBuf {
+        std::env::var_os("TF_TREE_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    /// Where the process that currently holds the rendezvous records its pid.
+    ///
+    /// # Why a file and not a pipe
+    ///
+    /// The driver has to know *which process to kill*, and after the first
+    /// migration the owner is whichever child happened to win byte 0 — a fact
+    /// that lives in the kernel and is not reported to anybody. A pipe per child
+    /// would work and would cost a reader thread per child plus a protocol that
+    /// has to survive the child being `SIGKILL`ed mid-line, which is the one
+    /// thing every process here is guaranteed to do.
+    ///
+    /// **The file is evidence, never the criterion.** What decides that a
+    /// migration succeeded is a *fresh process joining the arena*
+    /// ([`kill_the_owner`]); this only names the next victim and records that
+    /// §3.5's trigger, rather than luck, is why the join worked.
+    fn owner_pid_path(dir: &Path) -> PathBuf {
+        dir.join("owner.pid")
+    }
+
+    /// One line per successful inheritance, appended by the heir.
+    ///
+    /// Append-only rather than a counter file: two survivors can inherit in
+    /// sequence within one migration window (the first is killed, the second
+    /// takes over), and a counter that is read-modify-written by processes being
+    /// `SIGKILL`ed would lose exactly the events this run is about.
+    fn inherited_path(dir: &Path) -> PathBuf {
+        dir.join("inherited.log")
+    }
+
+    /// Where a child records **which owner it last attached under**, one file
+    /// per child pid holding one owner pid.
+    ///
+    /// # Why this exists, and why the driver cannot answer it instead
+    ///
+    /// `check_recovery`'s leak check has to separate a record the current
+    /// owner's hangup callback *could* have collected from one it could not.
+    /// `docs/decisions/0043`: a participant that attached under an owner which
+    /// has since died never registers with the new one, so that owner has no
+    /// socket to notice its death — the record is reachable only by a byte-keyed
+    /// collector. Which owner a child registered with is a fact only the child
+    /// has, and it re-attaches *often*: 2 000 operations is the cap on one
+    /// attachment, and a 2% detach-and-rejoin arm inside that loop is what
+    /// usually ends it first, so the mean is tens of operations rather than
+    /// thousands. **This comment quoted the cap as the rate**, which is wrong by
+    /// the ratio between them and in the direction that makes the sampling
+    /// problem below look smaller than it is. Either way "spawned before the
+    /// last migration" is not the same question and answers it far too widely —
+    /// a child spawned at the start and re-attached a moment ago is on the
+    /// current owner's socket like any other.
+    ///
+    /// One file per pid, `write` then `rename`, rather than an append log: the
+    /// question is "the *last* owner this pid attached under", which last-write-
+    /// wins answers directly and a log answers only after parsing.
+    fn attach_dir(dir: &Path) -> PathBuf {
+        dir.join("attached-under")
+    }
+
+    /// Record the owner this process is about to attach under.
+    ///
+    /// **Written before the `open()`, deliberately.** Written after, there is a
+    /// window in which a child holds a participant record and no file, and a
+    /// `SIGKILL` inside it would leave a record the driver judges on the strict
+    /// path having attached under an owner it cannot name. Written before, the
+    /// worst case is the opposite: the marker is read, the owner dies, and the
+    /// child attaches to the heir instead — so the file names a *dead* owner for
+    /// a record the new owner could in fact have collected. That direction costs
+    /// coverage on one record and cannot fail a healthy run, which is the
+    /// direction to be wrong in.
+    fn record_attachment(dir: &Path, under: Option<u32>) {
+        let d = attach_dir(dir);
+        let _ = std::fs::create_dir_all(&d);
+        let tmp = d.join(format!(".tmp.{}", std::process::id()));
+        let final_path = d.join(std::process::id().to_string());
+        if std::fs::write(&tmp, under.unwrap_or(0).to_string()).is_ok()
+            && std::fs::rename(&tmp, &final_path).is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// `(child pid, the owner pid it last attached under)` for every child that
+    /// recorded one.
+    fn attachments(dir: &Path) -> Vec<(u32, u32)> {
+        let Ok(entries) = std::fs::read_dir(attach_dir(dir)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            if let Ok(under) = text.trim().parse::<u32>() {
+                out.push((pid, under));
+            }
+        }
+        out
+    }
+
+    /// Publish this process as the owner, atomically.
+    ///
+    /// `write` then `rename`, so the driver never reads a half-written pid and
+    /// kills a process id that is a truncated prefix of somebody's.
+    fn publish_owner_pid(dir: &Path) {
+        let tmp = dir.join(format!("owner.pid.{}", std::process::id()));
+        if std::fs::write(&tmp, std::process::id().to_string()).is_ok()
+            && std::fs::rename(&tmp, owner_pid_path(dir)).is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    fn read_owner_pid(dir: &Path) -> Option<u32> {
+        std::fs::read_to_string(owner_pid_path(dir))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Record that this process inherited the role.
+    ///
+    /// One `write` of one short line to an `O_APPEND` descriptor, which Linux
+    /// serialises against other appenders — so concurrent heirs cannot interleave
+    /// a line, and a heir `SIGKILL`ed a microsecond later has either written its
+    /// line or not.
+    fn record_inheritance(dir: &Path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(inherited_path(dir))
+        {
+            let _ = writeln!(f, "{}", std::process::id());
+        }
+    }
+
+    fn inheritance_count(dir: &Path) -> usize {
+        std::fs::read_to_string(inherited_path(dir))
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    }
+
+    /// Every process that has ever inherited the role, from the same ledger.
+    ///
+    /// **This is the whole set, not a sample of it, and that distinction is the
+    /// reason this function exists.** The driver used to learn who had held the
+    /// role by re-reading the `owner.pid` marker once a round. That marker is
+    /// last-write-wins, and the role turns over far faster than a driver round:
+    /// polling it at 100 Hz through a healthy 20 s run at 5 children / 5 Hz
+    /// shows it naming dozens of distinct processes, while the ledger written by
+    /// those same processes carries every one of them and the run's own §3.5
+    /// summary counts only the handful that answered an owner *kill*, which is a
+    /// different question. A sampled exempt set is a set with holes in it, and
+    /// each hole is a record judged on `check_recovery`'s strict path that no
+    /// hangup callback could have collected: a healthy run failing with a
+    /// message accusing the engine. That is not a hypothesis; it is what the
+    /// sampled version did, intermittently, on a loaded host.
+    ///
+    /// Reading the ledger removes the sampling instead of compensating for it.
+    /// [`record_inheritance`] already appends one line per inheritance at the
+    /// moment it happens, so there is no second mechanism to keep in step — and
+    /// the ledger cannot miss a turnover the way a poll can, because the heir
+    /// writes it rather than an observer catching it.
+    ///
+    /// It does **not** name the process that created the arena: that one
+    /// publishes itself as owner without inheriting from anybody, so the caller
+    /// adds it.
+    fn inherited_pids(dir: &Path) -> Vec<u32> {
+        std::fs::read_to_string(inherited_path(dir))
+            .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The owner child: create the arena, serve the rendezvous, and park.
+    ///
+    /// **It does nothing else, and that is the point.** The obvious shortcut —
+    /// let the owner also publish, as this harness's driver used to — makes the
+    /// owner's death stop the data stream, so §3.5's "lookups do not pause"
+    /// would be measured against a writer's death rather than an owner's.
+    /// `owner_migration`'s header argues the same split for the same reason.
+    ///
+    /// It publishes its pid **before** reporting ready, so the driver never has
+    /// a window in which it knows an owner is up and does not know which process
+    /// it is.
+    fn owner_child() -> Result<()> {
+        let tree = tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(CreatePolicy::IfAbsent)
+            .layout_if_creating(layout())
+            .timeout(Duration::from_secs(5))
+            .open()
+            .context("the owner child could not create the torture arena")?;
+        publish_owner_pid(&runtime_dir());
+        println!("ready");
+        std::io::stdout().flush().ok();
+        // **Hold the tree.** Dropping it stops serving the rendezvous; the loop
+        // only keeps the binding alive. This process exists to be killed.
+        let _owner = tree;
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
+    /// Bring up the owner child and wait for it to report ready.
+    ///
+    /// # It retries, and the retry is coverage rather than robustness
+    ///
+    /// `open.after_create_before_bind` and `open.after_ownership_lock_before_bind`
+    /// live in the `OpenOutcome::Created` arm, which only a creating process
+    /// takes — so before there was an owner child they could not fire in this
+    /// harness at all. Now they can, and when one does the owner aborts before
+    /// printing `ready`. §11.3's rows for both say what must be true afterwards:
+    /// "the next `open()` proceeds", "next `open()` finds nothing alive and
+    /// creates fresh". This loop is that next `open()`, driven as a run instead
+    /// of staged in a test, and a retry that never succeeds is a failed run.
+    fn spawn_owner(
+        exe: &std::path::Path,
+        dir: &PathBuf,
+        rng: &mut Rng,
+        crash_points: bool,
+        crash_site: Option<&str>,
+        ledger: &mut CrashLedger,
+    ) -> Result<Kid> {
+        let mut last = String::new();
+        for attempt in 0..6 {
+            let crash_at = crash_spec(crash_points, crash_site, rng, ledger);
+            let mut cmd = Command::new(exe);
+            cmd.arg("child")
+                .arg("--role")
+                .arg("owner")
+                .env("TF_TREE_RUNTIME_DIR", dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            if let Some(spec) = crash_at.clone() {
+                cmd.env("TF_TREE_CRASH_AT", spec);
+            }
+            let mut proc = cmd.spawn().context("spawning the owner child")?;
+            let stdout = proc.stdout.take().context("owner child stdout")?;
+            let mut lines = BufReader::new(stdout);
+            let mut line = String::new();
+            let ready =
+                matches!(lines.read_line(&mut line), Ok(n) if n > 0) && line.trim() == "ready";
+            if ready {
+                return Ok(Kid {
+                    proc,
+                    seed: 0,
+                    inject: false,
+                    crash_at,
+                });
+            }
+            let status = proc.wait().ok();
+            #[cfg(unix)]
+            if let Some(st) = status {
+                use std::os::unix::process::ExitStatusExt as _;
+                if st.signal() == Some(libc::SIGABRT) {
+                    ledger.record_abort(crash_at.as_deref());
+                }
+            }
+            last = format!(
+                "attempt {}: the owner child exited before reporting ready ({:?}){}",
+                attempt + 1,
+                status,
+                crash_at
+                    .as_deref()
+                    .map(|c| format!(", armed at {c}"))
+                    .unwrap_or_default()
+            );
+            println!("shm_torture: {last}");
+        }
+        bail!(
+            "the owner child never came up after six attempts. {last}. Without an owner \
+             nothing serves the rendezvous and no child can join, so the run would validate \
+             nothing while printing that it validated nothing. If this is a \
+             `--crash-site` probe naming a site on the *creation* path \
+             (`open.*`, `topo.after_copy_before_publish`, `intern.*`), every attempt aborts \
+             by construction and that is the probe answering `reachable` rather than a \
+             defect: an ordinary `--crash-points` run redraws the site on each attempt."
+        )
+    }
+
     fn spawn(
         exe: &std::path::Path,
         dir: &PathBuf,
         seed: u64,
         inject: bool,
         readers_only: bool,
+        no_inherit: bool,
         crash_at: Option<String>,
     ) -> Result<Kid> {
         let mut cmd = Command::new(exe);
@@ -484,14 +1131,22 @@ mod imp {
         if readers_only {
             cmd.arg("--readers-only");
         }
+        if no_inherit {
+            cmd.arg("--no-inherit");
+        }
         // **Per child, not per run.** §11.4 asks for a random site in 10% of
         // children, and `crash::spec` parses the variable once per process, so
         // the environment is the only place this can go.
-        if let Some(spec) = crash_at {
+        if let Some(spec) = crash_at.as_deref() {
             cmd.env("TF_TREE_CRASH_AT", spec);
         }
         let proc = cmd.spawn().context("spawning a torture child")?;
-        Ok(Kid { proc, seed, inject })
+        Ok(Kid {
+            proc,
+            seed,
+            inject,
+            crash_at,
+        })
     }
 
     fn drive(a: &Args) -> Result<()> {
@@ -518,41 +1173,73 @@ mod imp {
             );
         }
 
-        // **The driver owns the rendezvous, and it comes up first.** Three
-        // roles, all load-bearing:
+        // How many children died at an armed §11.3 site, and how many were armed
+        // at all. Both, because "armed 4, none fired" and "armed 4, all fired"
+        // are different runs and only one of them exercised anything — and the
+        // site names beside them, because "armed and never reached" and "armed
+        // and lost the race" are also different runs.
+        let mut ledger = CrashLedger::default();
+
+        // **The owner is a child, and it comes up first.** It creates the arena
+        // and serves the rendezvous and does nothing else, so killing it is an
+        // owner's death rather than a writer's — which is the distinction §3.5
+        // is about and the one this harness could not draw while the driver
+        // owned the arena. See [`spawn_owner`] and [`attach_observer`].
+        let mut owner_kid = Some(spawn_owner(
+            &exe,
+            &dir,
+            &mut rng,
+            a.crash_points,
+            a.crash_site.as_deref(),
+            &mut ledger,
+        )?);
+
+        // **The one process that holds the role without having inherited it.**
+        // Every later owner appends itself to the inheritance ledger as it takes
+        // over ([`record_inheritance`]), so at teardown [`inherited_pids`]
+        // answers "who has held the rendezvous" completely; the creator is the
+        // one member that ledger cannot contain, and the driver spawned it, so
+        // it knows the pid exactly rather than reading it from anywhere.
         //
-        // 1. It serves the socket, so a child killed at any moment leaves a
-        //    rendezvous somebody still answers (see [`attach_observer`] for why
-        //    that cannot be a child).
-        // 2. It keeps the segment alive. Without it the last kill frees the
-        //    arena with its final mapping, and `check_recovery` has nothing to
-        //    check — which is exactly what an earlier revision did, printing a
-        //    green "PASS" whose recovery half had silently skipped every run.
-        // 3. It is a reader that is never killed, so §11.4's "invariants checked
-        //    continuously" does not depend on which child happened to survive.
+        // **This replaced a poll, and the poll was the defect.** The driver used
+        // to re-read the `owner.pid` marker each round and accumulate the pids it
+        // caught. `docs/decisions/0043` says an owner's own record is one no
+        // hangup callback collects, so that accumulated list is what
+        // [`check_recovery`] exempts from its strict path — and a role change the
+        // poll missed became a record judged strictly that nothing could have
+        // collected. The comment on the round-by-round read said exactly that
+        // consequence and treated it as a risk; it is not a risk, it is the
+        // common case, because the role turns over an order of magnitude faster
+        // than the driver's round.
+        let creating_owner_pid = owner_kid.as_ref().map(|k| k.proc.id());
+        // The driver keeps two of the three roles it had: it holds the segment
+        // alive for `check_recovery`, and it is the never-killed reader. It
+        // serves nothing and never inherits.
         let observer = attach_observer()?;
 
         // Kids are held in fixed slots, not a list, so "slot 0 injects" survives
         // slot 0 being killed and replaced.
         let mut kids: Vec<Option<Kid>> = Vec::with_capacity(a.children);
-        // How many children died at an armed §11.3 site, and how many were armed
-        // at all. Both, because "armed 4, none fired" and "armed 4, all fired"
-        // are different runs and only one of them exercised anything.
-        let mut aborted = 0usize;
-        let mut armed = 0usize;
 
         for i in 0..a.children {
             // Only *one* slot injects, and only when asked: a corrupt sample
             // from every writer would let a child detect its own corruption,
             // which proves nothing about what crosses a process boundary.
-            kids.push(Some(spawn(
+            let kid = spawn(
                 &exe,
                 &dir,
                 rng.next_u64(),
                 a.inject && i == 0,
                 a.readers_only,
-                crash_spec(a.crash_points, &mut rng, &mut armed),
-            )?));
+                a.no_inherit,
+                crash_spec(
+                    a.crash_points,
+                    a.crash_site.as_deref(),
+                    &mut rng,
+                    &mut ledger,
+                ),
+            )?;
+            kids.push(Some(kid));
         }
 
         let deadline = Instant::now() + a.duration;
@@ -568,7 +1255,14 @@ mod imp {
         // healthy for the first thirty seconds.
         let mut health = Health::default();
         let mut window = Health::default();
-
+        // §3.5. `None` when `--no-kill-owner`; otherwise the instant of the next
+        // owner kill, first one [`OWNER_KILL_FIRST`] in.
+        let mut next_owner_kill = a.owner_kill_every.map(|_| started + OWNER_KILL_FIRST);
+        let mut migrations: Vec<Migration> = Vec::new();
+        // The observer's read total on the round immediately before an owner
+        // kill. §3.5's "the data plane never pauses" is a claim *relative* to
+        // the data plane working, and a run whose children never publish
+        // (`--readers-only`) reads nothing before the kill either.
         while Instant::now() < deadline {
             // Jitter, so the kills do not land in phase with any loop a child
             // runs. An in-phase killer reaches one point in the protocol over
@@ -583,7 +1277,9 @@ mod imp {
             std::thread::sleep(interval.mul_f64(jitter).min(left));
 
             let mut round = RoundHealth::default();
-            reads.add(observe(&observer, &mut rng, &mut violations, &mut round));
+            let this_round = observe(&observer, &mut rng, &mut violations, &mut round);
+            let last_round_reads = this_round.total();
+            reads.add(this_round);
             health.add(round);
             window.add(round);
             if health.rounds % 100 == 0 {
@@ -591,23 +1287,62 @@ mod imp {
                 window = Health::default();
             }
             rounds += 1;
-            reap_finished(&mut kids, &mut violations, &mut aborted);
+            reap_finished(&mut kids, &mut violations, &mut ledger);
+            reap_owner(&mut owner_kid, &mut ledger);
             if !violations.is_empty() {
                 break;
             }
             for (slot, kid) in kids.iter_mut().enumerate() {
                 if kid.is_none() {
                     let seed = rng.next_u64();
-                    *kid = Some(spawn(
+                    let fresh = spawn(
                         &exe,
                         &dir,
                         seed,
                         a.inject && slot == 0,
                         a.readers_only,
-                        crash_spec(a.crash_points, &mut rng, &mut armed),
-                    )?);
+                        a.no_inherit,
+                        crash_spec(
+                            a.crash_points,
+                            a.crash_site.as_deref(),
+                            &mut rng,
+                            &mut ledger,
+                        ),
+                    )?;
+                    *kid = Some(fresh);
                 }
             }
+
+            // **§3.5's owner death, before the ordinary victim draw.** It is a
+            // separate event and not a lucky draw: the driver reads who holds
+            // the role, kills that process, and then requires the two things a
+            // migration owes. The ordinary kill below still runs on the same
+            // round, so an owner dying while the fleet is churning is the state
+            // under test rather than a quiet moment arranged for it.
+            if let (Some(every), Some(at)) = (a.owner_kill_every, next_owner_kill) {
+                if Instant::now() >= at {
+                    let m = kill_the_owner(
+                        &dir,
+                        &observer,
+                        &mut owner_kid,
+                        &mut kids,
+                        &mut rng,
+                        &mut violations,
+                        &mut health,
+                        migrations.len() + 1,
+                        last_round_reads > 0,
+                    );
+                    reads.add(m.reads);
+                    rounds += m.rounds;
+                    println!("{}", m.line());
+                    migrations.push(m);
+                    next_owner_kill = Some(Instant::now() + every);
+                    if !violations.is_empty() {
+                        break;
+                    }
+                }
+            }
+
             let victim = rng.below(a.children as u64) as usize;
             if let Some(kid) = kids[victim].as_mut() {
                 let _ = kid.proc.kill();
@@ -624,7 +1359,8 @@ mod imp {
         reads.add(observe(&observer, &mut rng, &mut violations, &mut round));
         health.add(round);
         rounds += 1;
-        reap_finished(&mut kids, &mut violations, &mut aborted);
+        reap_finished(&mut kids, &mut violations, &mut ledger);
+        reap_owner(&mut owner_kid, &mut ledger);
         // Kill every remaining child *before* the recovery check: "no claim is
         // held by a dead participant" is only a statement about a quiescent
         // arena, and a live writer would fail it correctly and uselessly.
@@ -636,16 +1372,216 @@ mod imp {
         // with nothing left for its own `reap_dead` to do. Killing the whole set
         // first leaves the claim word of every writer that held one at that
         // instant, which is the state §11.4's recovery clause is about.
+        //
+        // **Whoever holds the role now is held back from this batch**, and after
+        // a migration that is a worker slot: `kill_the_owner` sets `owner_kid`
+        // to `None` when it kills the original owner child, and the heir is an
+        // ordinary child in `kids`. Signalling it here would kill the hangup
+        // collector alongside the records it was about to collect — the exact
+        // failure the ordering exists to prevent, reintroduced by a migration.
+        // This paragraph claimed the owner was killed last while that was true
+        // only of a run that never migrated, which is to say only of
+        // `--no-kill-owner`.
+        let current_owner = read_owner_pid(&dir).or(creating_owner_pid);
+        // **Whether this run can pin the owner's hangup callback at all, decided
+        // from the ledger rather than from the flags.** The strict half of
+        // [`check_recovery`] rests on one premise: that the process serving the
+        // rendezvous when the workers were killed is still serving it while
+        // their hangups are processed. That is true when the role never moved —
+        // the creating owner child is parked, runs no operations, and cannot
+        // detach — and it is **usually false the moment the role migrates**,
+        // because the heir is an ordinary worker whose `work` loop ends on a
+        // detach-and-rejoin arm or on its operation cap, and once it detaches
+        // with every other child already dead nothing is left to inherit and the
+        // arena simply has no owner. Measured on this host by sampling
+        // `Tree::owner_lost` from the driver every 10 ms across the settle
+        // window: on `--no-kill-owner` the role is never vacant, and on the
+        // migrating default it is vacant for most of the window in the large
+        // majority of runs.
+        //
+        // `inherited_pids` empty is the exact statement of "the role never
+        // moved", and the second conjunct is what says the process holding it is
+        // the parked owner child this driver spawned and has not yet killed.
+        // Deriving it from `--no-kill-owner` instead would be a flag standing in
+        // for a fact: an armed §11.3 site can end the creating owner's life on a
+        // run that was never going to kill it.
+        let hangup_collector_pinned = inherited_pids(&dir).is_empty()
+            && owner_kid
+                .as_ref()
+                .is_some_and(|k| Some(k.proc.id()) == current_owner);
         for kid in kids.iter_mut().flatten() {
+            if Some(kid.proc.id()) == current_owner {
+                continue;
+            }
             let _ = kid.proc.kill();
         }
         for kid in kids.iter_mut().flatten() {
+            if Some(kid.proc.id()) == current_owner {
+                continue;
+            }
             let _ = kid.proc.wait();
         }
+        // **What a run that migrated cannot pin, and it is a limit rather than a
+        // caveat.** Two things are true of the heir and both cut the same way.
+        // It is an ordinary child, so `work`'s single `reap_participants` arm —
+        // one value out of a hundred, at roughly a kilohertz — has it sweeping
+        // the whole table several times a second, and the collector the leak
+        // check is aimed at and a sweeper that hides its absence are the same
+        // process. And its `work` loop *ends*, on a detach arm or on its
+        // operation cap, at which point nothing is left to inherit and the arena
+        // has no owner for the rest of the teardown. **This comment said 3%**,
+        // which is the share of operations that reap *something*: `reap_dead`
+        // takes two of those hundred values and the participant sweep takes one,
+        // and they are different collectors.
+        //
+        // So `hangup_collector_pinned` above gates the strict verdict, and this
+        // arm gets the sweep-and-require half plus a note. Deleting the owner's
+        // hangup CAS from `crates/tf_tree/src/open.rs` is the mutant that shows
+        // the difference, and the honest statement of the result is a direction
+        // rather than a tally: `--no-kill-owner` fails on every seed it has been
+        // run at. **A count was written here and it should not have been** —
+        // re-running the migrating arm at a fixed seed gave a different number of
+        // failures each time, so the figure recorded which afternoon it was taken
+        // on. **`--no-kill-owner` is where that collector is pinned** — the owner
+        // is then the parked owner child, which runs no operations, sweeps
+        // nothing and cannot detach — and `tests/torture.rs` runs that
+        // configuration for exactly this reason.
+
+        // **The records no hangup callback can ever collect, named by pid.**
+        // Two kinds, and neither is a tolerance:
+        //
+        // * every process that has held the rendezvous. A process does not run
+        //   its own hangup callback, so an owner's own participant record is
+        //   left to a byte-keyed collector however it dies. That is the
+        //   *creating* owner plus [`inherited_pids`] — the ledger the heirs
+        //   wrote themselves, read whole, rather than the marker samples the
+        //   driver used to collect on its way past.
+        // * every worker that attached under an owner which has since died —
+        //   `docs/decisions/0043`'s residue: "that owner never learns this
+        //   process exists", so the surviving owner has no socket to notice.
+        //
+        // Everything else is the population the 2026-08-17 defect showed up in —
+        // every worker that attached under the owner still serving at teardown,
+        // which the kill batch above has just produced a fleet of. On a run
+        // whose owner never changed that population takes the strict path; on
+        // one that migrated `check_recovery` reports it and sweeps it, because
+        // there is usually no owner left to have been its collector.
+        //
+        // **A child that recorded no attachment at all is judged strictly**, and
+        // that is the deliberate direction: [`record_attachment`] writes before
+        // the `open()`, so a record with no file means the write itself failed.
+        // Reading the absence as an exemption would turn a broken ledger into a
+        // silently permissive check — the failure this whole partition exists to
+        // avoid — while reading it as a leak fails loudly and names the slot.
+        let mut unreachable_by_hangup: Vec<u32> = inherited_pids(&dir);
+        unreachable_by_hangup.extend(creating_owner_pid);
+        unreachable_by_hangup.extend(current_owner);
+        unreachable_by_hangup.extend(
+            attachments(&dir)
+                .into_iter()
+                .filter(|(_, under)| Some(*under) != current_owner)
+                .map(|(pid, _)| pid),
+        );
+        unreachable_by_hangup.sort_unstable();
+        unreachable_by_hangup.dedup();
+
+        // **The owner outlives the workers, and the order is a check rather than
+        // tidiness.** Whoever holds the role is running the hangup callback,
+        // which is one of the two collectors that reclaim a dead participant's
+        // record without being asked (`docs/decisions/0028` plan step 4) — and
+        // it is the one `check_recovery`'s leak check has always been written
+        // against. While the driver *was* the owner that collector ran in this
+        // process for the whole teardown and nobody had to think about it.
+        //
+        // **Measured, and the measurement is narrower than the fix.** The first
+        // version of this teardown killed the owner *before* `wait`ing the
+        // workers, and a `--no-kill-owner` run then failed naming several slots
+        // — a real regression of the check, produced by killing the collector
+        // ahead of the records it was going to collect. Reaping the workers
+        // first is what fixes that.
+        //
+        // The margin after it is a *scheduling* assumption, and the sleep is now
+        // followed by a bounded poll of the records the verdict is about; see
+        // below for why, which is not that the flat sleep was seen to fail.
+        //
+        // **On a run that migrated the heir is an ordinary worker, and the two
+        // passes above hold it back by pid so the ordering holds there too.**
+        // Until 2026-09-04 it did not: the heir was signalled with the rest of
+        // the fleet, the records it was about to collect were left behind, and
+        // [`check_recovery`] absorbed them by sweeping the whole participant
+        // table on any run that migrated — which is a permissive check wearing a
+        // strict one's message, on the path every default run takes. The sweep
+        // is now answerable for the records `docs/decisions/0043` names and for
+        // nothing else; see `unreachable_by_hangup` above.
+        //
+        // **The wait for that collector belongs HERE, while it is still alive.**
+        // `check_recovery` re-probes for two and a bit seconds before it calls a
+        // record leaked, and that retry cannot buy what its own comment used to
+        // claim: by then every process that could run a hangup callback has been
+        // reaped, so waiting longer waits on nobody. The margin that does buy
+        // something is the one taken *before* the owner is killed, and a flat
+        // 200 ms of it is a guess about scheduling. This replaces the guess with
+        // a *bounded poll* of the very set the strict verdict is about: the run
+        // continues as soon as the collector has done its work, and a genuine
+        // leak — which never clears — costs the failing run the deadline and
+        // nothing else.
+        //
+        // **This is not fixing an observed failure, and an earlier draft of this
+        // comment claimed it was.** That claim came from a build which had lost
+        // the 200 ms sleep entirely; the flat sleep passed every strict-arm run
+        // it was measured over on a deliberately loaded host. What the poll
+        // removes is the assumption, not a red run — and no pass tally is kept
+        // here, because a scheduling count taken on one host on one day reads
+        // as a property of the code.
+        //
+        // The poll runs only where there is something to wait for. On a run
+        // whose role migrated the arena usually has no owner at all by now, so
+        // polling would spend the deadline every time and buy nothing; that arm
+        // does not reach the strict verdict either (see `check_recovery`).
+        std::thread::sleep(Duration::from_millis(200));
+        if hangup_collector_pinned {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                let outstanding = dead_participant_slots(&observer).into_iter().any(|slot| {
+                    observer
+                        .arena_view()
+                        .participants()
+                        .identity(slot)
+                        .is_some_and(|(pid, _, _)| !unreachable_by_hangup.contains(&pid))
+                });
+                if !outstanding {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        // The owner last, wherever it lives — the original owner child on a run
+        // that never migrated, a worker slot on one that did.
+        if let Some(pid) = current_owner {
+            if owner_kid.as_ref().is_some_and(|k| k.proc.id() == pid) {
+                if let Some(kid) = owner_kid.as_mut() {
+                    let _ = kid.proc.kill();
+                    let _ = kid.proc.wait();
+                }
+            } else {
+                for slot in kids.iter_mut() {
+                    if slot.as_ref().is_some_and(|k| k.proc.id() == pid) {
+                        if let Some(kid) = slot.as_mut() {
+                            let _ = kid.proc.kill();
+                            let _ = kid.proc.wait();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // `Kid::drop` kills and waits, so this collects anything the two passes
+        // above left — an owner child that is no longer the owner, most of all.
         drop(kids);
+        drop(owner_kid);
         std::thread::sleep(Duration::from_millis(100));
 
-        let recovery = check_recovery(&observer);
+        let recovery = check_recovery(&observer, &unreachable_by_hangup, hangup_collector_pinned);
         drop(observer);
         drop(scratch);
 
@@ -670,15 +1606,75 @@ mod imp {
         // would be the flag-that-arms-nothing failure this replaces, one level
         // up.
         if a.crash_points {
+            let mut distinct_armed: Vec<&str> =
+                ledger.armed_sites.iter().map(String::as_str).collect();
+            distinct_armed.sort_unstable();
+            distinct_armed.dedup();
+            let mut distinct_fired: Vec<&str> = ledger.fired.iter().map(String::as_str).collect();
+            distinct_fired.sort_unstable();
+            distinct_fired.dedup();
+            // **Derived from this run, never from a literal list.** A hand
+            // written table of "sites this workload cannot reach" is the same
+            // failure as a hand-written site list one level up: it would go
+            // stale silently the first time the workload gained an operation.
+            // The module doc states the reachability split as a dated
+            // measurement; this line is what a reader can check it against.
+            let never: Vec<&str> = distinct_armed
+                .iter()
+                .copied()
+                .filter(|s| !distinct_fired.contains(s))
+                .collect();
             println!(
-                "  §11.3: {armed} child(ren) armed with a random site, {aborted} aborted at one"
+                "  §11.3: {} child(ren) armed at {} distinct site(s), {} aborted \
+                 at {} distinct site(s)",
+                ledger.armed,
+                distinct_armed.len(),
+                ledger.aborted,
+                distinct_fired.len()
             );
-            if armed > 0 && aborted == 0 {
+            if !distinct_fired.is_empty() {
+                println!("         fired:  {}", distinct_fired.join(", "));
+            }
+            if !never.is_empty() {
                 println!(
-                    "         (none fired: the driver's SIGKILL reached them first, or the \
-                     armed site is on a path this workload does not take — raise --duration \
-                     or lower --kill-hz)"
+                    "         armed, never fired:  {}\n         (each is either a site this \
+                     workload cannot reach — the module doc names three — or one whose race \
+                     the driver's SIGKILL won; a run cannot tell them apart, a longer one \
+                     narrows it)",
+                    never.join(", ")
                 );
+            }
+        }
+        // **§3.5, and it prints per migration rather than as a total.** `armed
+        // N, aborted 0` is the shape this harness already learned to refuse one
+        // level up: a summary line reading "3 owner kills" says nothing about
+        // whether any of them recovered, and a silent zero is exactly what a
+        // disabled arm looks like.
+        if a.owner_kill_every.is_some() {
+            let recovered: Vec<f64> = migrations
+                .iter()
+                .filter_map(|m| m.recovered)
+                .map(|d| d.as_secs_f64() * 1e3)
+                .collect();
+            let inherited: usize = migrations.iter().map(|m| m.inherits).sum();
+            println!(
+                "shm_torture: §3.5: {} owner kill(s), {} inheritance(s) recorded by survivors, \
+                 {} fresh join(s) after a migration{}",
+                migrations.len(),
+                inherited,
+                recovered.len(),
+                if recovered.is_empty() {
+                    String::new()
+                } else {
+                    let worst = recovered.iter().copied().fold(0.0_f64, f64::max);
+                    let mean = recovered.iter().sum::<f64>() / recovered.len() as f64;
+                    format!(" (mean {mean:.1} ms, worst {worst:.1} ms)")
+                }
+            );
+            for m in &migrations {
+                if let Some(why) = m.failure() {
+                    println!("  MIGRATION FAILURE: {why}");
+                }
             }
         }
         for v in &violations {
@@ -703,6 +1699,40 @@ mod imp {
                  (docs/PHASE2.md §12.3 gate 3)",
                 violations.len()
             );
+        }
+        // **§3.5 before the read floor**, because a migration that did not
+        // recover *causes* the floor to trip: no fresh process can join, every
+        // killed child stays out, and the rings freeze. Reporting "the observer
+        // read too little" about that would name the symptom and hide the cause.
+        // The `--readers-only` self-test is unaffected: at 3 s it never reaches
+        // [`OWNER_KILL_FIRST`].
+        let failed: Vec<String> = migrations.iter().filter_map(Migration::failure).collect();
+        if !failed.is_empty() {
+            bail!(
+                "{} of {} owner kill(s) did not recover — docs/PHASE2.md §3.5's ownership \
+                 migration did not happen:\n  {}",
+                failed.len(),
+                migrations.len(),
+                failed.join("\n  ")
+            );
+        }
+        // **A run that never killed the owner must not be quoted as §3.5
+        // coverage**, and the only way to know it should have is arithmetic on
+        // its own schedule. Silence here was the whole defect: §12.3 gate 3 read
+        // "partly met" for the life of this harness because the arm did not
+        // exist, and an arm that is on but never fires looks identical.
+        if let Some(every) = a.owner_kill_every {
+            if migrations.is_empty() && a.duration >= OWNER_KILL_FIRST + every {
+                bail!(
+                    "the owner-kill arm is on and ran {} time(s) in {:?}, which is fewer than \
+                     the schedule (first at {:?}, then every {:?}) requires. This run covers \
+                     none of docs/PHASE2.md §3.5 and must not be quoted as if it did.",
+                    migrations.len(),
+                    a.duration,
+                    OWNER_KILL_FIRST,
+                    every
+                );
+            }
         }
         // **A run that validated nothing must not print PASS.** This is the
         // guard the harness shipped without, and the reason is worth stating:
@@ -843,6 +1873,248 @@ mod imp {
         Ok(())
     }
 
+    /// One owner death and everything the run learned from it.
+    ///
+    /// Three independent facts, and none of them substitutes for another:
+    ///
+    /// * `recovered` — a **fresh process** joined the arena again, and how long
+    ///   after the `SIGKILL`. Measured from the outside because that is the only
+    ///   place the question is meaningful: an ownerless arena is exactly what
+    ///   refuses a new joiner, so this is the property §3.5 exists to restore
+    ///   and the one that was broken between 2026-08-27 and 2026-08-28.
+    /// * `inherits` — how many survivors recorded an inheritance in this
+    ///   window. This is what says the join above succeeded *because* §3.5's
+    ///   caller-driven trigger ran.
+    /// * `reads` — what the observer validated **while the role was vacant**,
+    ///   against §3.5's "lookups do not stop, slow down, or observe anything
+    ///   during a takeover". `read_before` records whether it was reading at all
+    ///   beforehand, so a run whose children never publish is not failed for a
+    ///   pause that was never there to begin with.
+    struct Migration {
+        n: usize,
+        victim: Option<u32>,
+        recovered: Option<Duration>,
+        inherits: usize,
+        reads: Reads,
+        rounds: u64,
+        read_before: bool,
+    }
+
+    impl Migration {
+        /// The per-migration line, printed as it happens so a silent zero is
+        /// impossible — `owner_migration` prints the same shape for the same
+        /// reason.
+        fn line(&self) -> String {
+            let Migration {
+                n,
+                victim,
+                recovered,
+                inherits,
+                ..
+            } = self;
+            format!(
+                "shm_torture: §3.5 owner kill {n}: killed pid {}; {}; {inherits} survivor(s) \
+                 inherited; the observer validated {} transform(s) while the role was vacant",
+                victim.map_or_else(|| "?".to_string(), |p| p.to_string()),
+                recovered.map_or_else(
+                    || format!("NO fresh process joined within {OWNER_RECOVERY_DEADLINE:?}"),
+                    |d| format!(
+                        "a fresh process joined {:.1} ms later",
+                        d.as_secs_f64() * 1e3
+                    )
+                ),
+                self.reads.total(),
+            )
+        }
+
+        /// `Some(why)` if this migration failed the run.
+        fn failure(&self) -> Option<String> {
+            let n = self.n;
+            if self.victim.is_none() {
+                return Some(format!(
+                    "owner kill {n}: the recorded owner pid names no live process of this \
+                     run, so there was nothing to kill. On a second or later kill that is what \
+                     §3.5 *not happening* looks like — the marker still names the owner the \
+                     previous migration killed, because nothing inherited and nothing \
+                     republished it. On the first it is a harness defect: the owner child \
+                     never published its pid. Neither is a passing run."
+                ));
+            }
+            if self.recovered.is_none() {
+                return Some(format!(
+                    "owner kill {n}: no fresh process could join within {:?} of the owner's \
+                     death, and {} survivor(s) recorded an inheritance. That is the state \
+                     docs/PHASE2.md §3.5 exists to end — the arena is ownerless, every \
+                     already-attached process keeps reading, and every new joiner is refused \
+                     `ArenaHeldButUnreachable` against the survivors' held participant bytes.",
+                    OWNER_RECOVERY_DEADLINE, self.inherits
+                ));
+            }
+            if self.inherits == 0 {
+                return Some(format!(
+                    "owner kill {n}: a fresh process joined, but no survivor recorded an \
+                     inheritance. Something is serving the rendezvous and §3.5's trigger is \
+                     not why, so this run cannot claim the mechanism it is here to exercise."
+                ));
+            }
+            // §3.5, NORMATIVE: "Lookups do not stop, slow down, or observe
+            // anything during a takeover. Not during the poll, not during the
+            // lock, not during the bind." Only asserted where there were
+            // lookups to stop.
+            if self.read_before && self.reads.total() == 0 {
+                return Some(format!(
+                    "owner kill {n}: the observer validated 0 transforms while the role was \
+                     vacant, having validated some on the round before. docs/PHASE2.md §3.5 is \
+                     NORMATIVE that the data plane never pauses during a takeover — `Plan::at` \
+                     touches the mapping and nothing else — so a read that stops here is a \
+                     finding about the engine and not about this harness."
+                ));
+            }
+            None
+        }
+    }
+
+    /// `SIGKILL` whichever process currently holds the rendezvous, then require
+    /// what §3.5 owes.
+    ///
+    /// # The victim is looked up, not drawn
+    ///
+    /// After the first migration the owner is whichever child won byte 0, which
+    /// is a fact in the kernel that nothing reports. So an heir publishes its
+    /// pid on inheriting ([`publish_owner_pid`]) and this reads it. A draw would
+    /// make the whole arm depend on luck: with six children, five rounds in six
+    /// would kill a plain participant and the run would report an owner kill
+    /// having performed an ordinary one.
+    ///
+    /// # Whose process it is
+    ///
+    /// Every process here is one this driver spawned, so the pid resolves to
+    /// either the owner child or a worker slot and is `wait`ed for in place. A
+    /// pid that matches neither is not signalled at all — killing an
+    /// unrecognised pid on a shared machine is not this harness's business —
+    /// and the migration records `victim: None`, which [`Migration::failure`]
+    /// treats as a harness defect rather than a passing run.
+    ///
+    /// # The replacement is an ordinary participant
+    ///
+    /// A killed worker slot is refilled by [`drive`]'s existing respawn loop. A
+    /// killed **owner child** is not replaced at all: the role is inherited from
+    /// here on, and a second process opening `IfAbsent` would either join as a
+    /// participant that does nothing or create a second arena and split the run.
+    #[allow(clippy::too_many_arguments)]
+    fn kill_the_owner(
+        dir: &Path,
+        observer: &Tree,
+        owner_kid: &mut Option<Kid>,
+        kids: &mut [Option<Kid>],
+        rng: &mut Rng,
+        violations: &mut Vec<String>,
+        health: &mut Health,
+        n: usize,
+        read_before: bool,
+    ) -> Migration {
+        let mut m = Migration {
+            n,
+            victim: None,
+            recovered: None,
+            inherits: 0,
+            reads: Reads::default(),
+            rounds: 0,
+            read_before,
+        };
+        let before = inheritance_count(dir);
+        let Some(pid) = read_owner_pid(dir) else {
+            return m;
+        };
+
+        let mut killed = false;
+        if owner_kid.as_ref().is_some_and(|k| k.proc.id() == pid) {
+            if let Some(kid) = owner_kid.as_mut() {
+                let _ = kid.proc.kill();
+                let _ = kid.proc.wait();
+            }
+            *owner_kid = None;
+            killed = true;
+        } else {
+            for slot in kids.iter_mut() {
+                if slot.as_ref().is_some_and(|k| k.proc.id() == pid) {
+                    if let Some(kid) = slot.as_mut() {
+                        let _ = kid.proc.kill();
+                        let _ = kid.proc.wait();
+                    }
+                    *slot = None;
+                    killed = true;
+                    break;
+                }
+            }
+        }
+        if !killed {
+            // A pid we did not spawn, or one that has already exited — the
+            // marker is stale. Not signalled; recorded.
+            return m;
+        }
+        m.victim = Some(pid);
+
+        // **Read and probe in one loop.** The observer keeps validating while
+        // the role is vacant (§3.5's data-plane claim) and the fresh join is
+        // what says the role stopped being vacant. Doing them in sequence would
+        // measure the reads *after* recovery, which is the easy case.
+        let start = Instant::now();
+        let mut next_observe = Instant::now();
+        while start.elapsed() < OWNER_RECOVERY_DEADLINE {
+            if Instant::now() >= next_observe {
+                let mut round = RoundHealth::default();
+                m.reads.add(observe(observer, rng, violations, &mut round));
+                health.add(round);
+                m.rounds += 1;
+                next_observe = Instant::now() + MIGRATION_OBSERVE_EVERY;
+                if !violations.is_empty() {
+                    break;
+                }
+            }
+            // A real `open()` from a process that was not here when the owner
+            // died. `ReadOnly` because a consumer is what a robot restarts, and
+            // because a read-write join would register a participant record this
+            // run then has to account for.
+            let joined = tf_tree::Open::new()
+                .mode(AttachMode::ReadOnly)
+                .create(CreatePolicy::Never)
+                // Short: this is a poll, and a long timeout would measure the
+                // timeout rather than the recovery.
+                .timeout(Duration::from_millis(20))
+                .open()
+                .is_ok();
+            if joined {
+                m.recovered = Some(start.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // **The evidence trails the recovery, and reading it immediately is a
+        // race the harness loses.** `Tree::inherit_ownership` binds and renames
+        // the socket over the rendezvous path *before* it returns, so the fresh
+        // join above can succeed while the heir has not yet reached its two
+        // `publish_owner_pid`/`record_inheritance` writes — measured, on a run
+        // that recovered in 0.6 ms and reported `a fresh process joined, but no
+        // survivor recorded an inheritance`, which is a true statement about an
+        // instant and a false one about the migration.
+        //
+        // Bounded, and short. The point of the wait is a file write that has
+        // already been decided on, not a second chance at inheriting: a
+        // migration where nothing inherited never produces this line however
+        // long it waits, and the `--no-inherit` control is what proves that.
+        let evidence_deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            m.inherits = inheritance_count(dir).saturating_sub(before);
+            if m.inherits > 0 || Instant::now() >= evidence_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        m
+    }
+
     /// Collect children that have exited, recording the ones that reported a
     /// violation.
     ///
@@ -850,7 +2122,44 @@ mod imp {
     /// joiner whose owner was killed mid-handshake fails to open, and that is
     /// the run working as intended. Only [`EXIT_VIOLATION`] means the arena lied
     /// to somebody.
-    fn reap_finished(kids: &mut [Option<Kid>], violations: &mut Vec<String>, aborted: &mut usize) {
+    /// Collect the **owner** child if it has exited on its own.
+    ///
+    /// **It needs its own sweep, and leaving it out hid a whole class of
+    /// coverage.** `reap_finished` walks the worker slots; the owner is not one
+    /// of them, so an owner that aborted mid-run at an armed §11.3 site — which
+    /// `hangup.after_probe_before_cas` can only do, since that callback is the
+    /// owner's — was never counted as an abort and the site read as unreachable.
+    /// Measured: `--crash-site hangup.after_probe_before_cas` reported
+    /// `20 armed, 0 aborted` on a run in which the owner had in fact aborted.
+    ///
+    /// An owner that dies this way is not a failure: the role goes vacant and a
+    /// survivor inherits, which is the same recovery [`kill_the_owner`] drives
+    /// deliberately. It is left un-replaced for the same reason a killed owner
+    /// is — the role is inherited from here on.
+    fn reap_owner(owner: &mut Option<Kid>, ledger: &mut CrashLedger) {
+        let Some(kid) = owner.as_mut() else { return };
+        match kid.proc.try_wait() {
+            Ok(Some(status)) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    if status.signal() == Some(libc::SIGABRT) {
+                        ledger.record_abort(kid.crash_at.as_deref());
+                    }
+                }
+                let _ = status;
+                *owner = None;
+            }
+            Ok(None) => {}
+            Err(_) => *owner = None,
+        }
+    }
+
+    fn reap_finished(
+        kids: &mut [Option<Kid>],
+        violations: &mut Vec<String>,
+        ledger: &mut CrashLedger,
+    ) {
         for slot in kids.iter_mut() {
             let Some(kid) = slot.as_mut() else { continue };
             match kid.proc.try_wait() {
@@ -869,7 +2178,7 @@ mod imp {
                     {
                         use std::os::unix::process::ExitStatusExt as _;
                         if status.signal() == Some(libc::SIGABRT) {
-                            *aborted += 1;
+                            ledger.record_abort(kid.crash_at.as_deref());
                         }
                     }
                     if status.code() == Some(EXIT_VIOLATION) {
@@ -888,44 +2197,50 @@ mod imp {
         }
     }
 
-    /// Create and serve the arena the children will join, and hold a reader on
-    /// it for the whole run.
+    /// Join the arena the owner child created, and hold a reader on it for the
+    /// whole run.
     ///
-    /// # Why the *driver* owns it, and what that costs
+    /// # The driver is a joiner now, and what that changed
     ///
-    /// An earlier revision had the driver join with [`CreatePolicy::Never`] and
-    /// let the children race to create, on the argument that the create race is
-    /// worth exercising. It is — but it is exercised by
-    /// `crates/tf_tree/tests/rendezvous.rs` and `tf_tree_ipc`'s multiprocess
-    /// suite, and here it cost the entire rest of the run:
+    /// It used to be the creator and the owner, for a reason that expired.
+    /// **This function's doc comment said §3.5's takeover "is not wired into
+    /// `tf_tree::open`"** and cited `crates/tf_tree/src/open.rs`'s module
+    /// documentation as saying so in as many words. That was true when written
+    /// and stopped being true on **2026-08-28**: `Tree::inherit_ownership` and
+    /// `Tree::owner_lost` exist, that module doc no longer says it, and the
+    /// measurement the paragraph rested on — children failing `open()` with
+    /// `ArenaHeldButUnreachable { holder_slots: 4, first_pid: <the driver> }`
+    /// after a 2 s timeout, for the rest of the run — is exactly the state §3.5
+    /// ends. It is kept here rather than deleted because it is also the *shape*
+    /// of the failure this harness must now detect: [`kill_the_owner`] probes
+    /// for it from the outside on every migration.
     ///
-    /// **`docs/PHASE2.md` §3.5's takeover is not wired into `tf_tree::open`.**
-    /// `crates/tf_tree/src/open.rs`'s module documentation says so in as many
-    /// words: a participant noticing the owner died and promoting itself "is not
-    /// here", it needs a watcher on the client socket. So when the owner is a
-    /// child and the driver kills it, *nothing* takes over: no process is
-    /// serving, and every joiner that wins the ownership byte is then turned
-    /// away by §3.4's split-brain check, because the driver's own participant
-    /// byte is held. Measured, before this changed: children failing `open()`
-    /// with `ArenaHeldButUnreachable { holder_slots: 4, first_pid: <the driver> }`
-    /// after the full 2 s timeout, over and over, while the driver read an arena
-    /// nobody was left to publish to. The run then reported `0 violations` and
-    /// `PASS` having validated nothing at all — including with a child
-    /// publishing NaN throughout.
+    /// Two of the three roles the driver had are unchanged by the move, and the
+    /// third is the one that mattered:
     ///
-    /// So this harness kills **joiners, never the owner**, and says so rather
-    /// than quietly covering less than its name suggests. Killing the owner is
-    /// worth testing and is *not tested here*; it becomes testable when §3.5's
-    /// watcher lands, and the change at that point is one line — spawn a child
-    /// as the owner again and let the driver join with `Never`.
+    /// 1. **It keeps the segment alive.** A joiner's mapping holds the memfd
+    ///    open exactly as a creator's does, so the last child's death cannot
+    ///    free the arena out from under [`check_recovery`].
+    /// 2. **It is a reader that is never killed**, so §11.4's continuous
+    ///    checking does not depend on which child happened to survive.
+    /// 3. It no longer *serves*, which is what made the owner unkillable and
+    ///    left §12.3 gate 3's "the owner dies mid-run" unmet.
+    ///
+    /// **The driver deliberately never inherits.** It has an attach socket like
+    /// any joiner and could call `Tree::owner_lost` itself, and then the process
+    /// that must not be killed would be the owner again — the same fusion, one
+    /// layer down. Inheriting is the children's job; see [`work`].
+    ///
+    /// `Never`, so a driver that somehow raced ahead of its own owner child
+    /// fails to join rather than quietly creating a second arena that half the
+    /// run publishes into.
     fn attach_observer() -> Result<Tree> {
         tf_tree::Open::new()
             .mode(AttachMode::ReadWrite)
-            .create(CreatePolicy::IfAbsent)
-            .layout_if_creating(layout())
-            .timeout(Duration::from_secs(5))
+            .create(CreatePolicy::Never)
+            .timeout(Duration::from_secs(10))
             .open()
-            .context("the driver could not create the torture arena")
+            .context("the driver could not join the torture arena the owner child created")
     }
 
     /// How many transforms one observation round validated.
@@ -1321,7 +2636,18 @@ mod imp {
     /// to either predicate alone.
     fn census(tree: &Tree, h: &mut RoundHealth) {
         let view = tree.arena_view();
-        for edge in 0..view.header().max_edges.min(CHAIN.len() as u32) {
+        // **`1..=CHAIN.len()`, and this line read `0..CHAIN.len()` until
+        // 2026-09-04.** `EdgeId` is 1-based: `TreeBuilder::build_with` sizes the
+        // table as `declared + 1` and writes each declared edge's capacity at
+        // `i + 1`, leaving id 0 a zero-capacity sentinel nothing can ever claim.
+        // So the old bound walked the sentinel and the first three chain edges
+        // and never looked at `arm->tool` — `writers=x/4` was a count over three
+        // real edges and a slot that is free by construction, and
+        // `RoundHealth::arena_is_live` was blind to a round in which the only
+        // live writer held the last edge. Found while adding the two-writers
+        // check, which made the same mistake and failed a healthy arena for it.
+        let last = view.header().max_edges.min(CHAIN.len() as u32 + 1);
+        for edge in 1..last {
             let Some(rec) = view.claim(EdgeId(edge)) else {
                 continue;
             };
@@ -1451,6 +2777,23 @@ mod imp {
         reads
     }
 
+    /// Slots holding a `LIVE` participant record for a process the kernel says
+    /// is dead, from the caller's own attachment and excluding its own slot.
+    ///
+    /// One function so the teardown's wait and `check_recovery`'s verdict ask
+    /// the same question: a wait that polled a different predicate from the one
+    /// that fails the run is a wait that can finish early on the wrong evidence.
+    fn dead_participant_slots(tree: &Tree) -> Vec<u32> {
+        let me = tree.participant_slot();
+        let view = tree.arena_view();
+        let table = view.participants();
+        (0..table.capacity() as u32)
+            .filter(|slot| {
+                *slot != me && table.identity(*slot).is_some() && !tree.participant_alive(*slot)
+            })
+            .collect()
+    }
+
     struct Recovery {
         failures: Vec<String>,
         notes: Vec<String>,
@@ -1462,11 +2805,34 @@ mod imp {
     /// Runs on the observer's attachment, which has been held for the whole run
     /// — so the arena being checked is the one the children tortured, not a
     /// fresh one created after they all died.
-    fn check_recovery(tree: &Tree) -> Result<Recovery> {
+    fn check_recovery(
+        tree: &Tree,
+        unreachable_by_hangup: &[u32],
+        hangup_collector_pinned: bool,
+    ) -> Result<Recovery> {
         let mut out = Recovery {
             failures: Vec::new(),
             notes: Vec::new(),
         };
+
+        // **Which verdict is in force, printed on every run.** Without this a
+        // change that made `hangup_collector_pinned` false everywhere would leave
+        // `a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path`
+        // green while it asserted nothing — the shape this file's own history
+        // says to watch for. That test reads this line, so the downgrade cannot
+        // happen quietly.
+        out.notes.push(
+            if hangup_collector_pinned {
+                "recovery: the role never moved, so the owner's hangup callback was a live \
+                 collector for the whole teardown and every record outside the swept \
+                 partition is judged on the STRICT path"
+            } else {
+                "recovery: the role moved during this run, so there may have been no owner \
+                 to run a hangup callback by teardown; the strict path is NOT in force and \
+                 every record is swept and then required to have been collected"
+            }
+            .to_string(),
+        );
 
         let me = tree.participant_slot();
         let view = tree.arena_view();
@@ -1549,9 +2915,11 @@ mod imp {
         // grant walks past its index, the hangup callback only when the socket
         // that owned it closes, and the one collector that does sweep the whole
         // table — plan step 5's `Tree::reap_participants` — runs when a
-        // participant calls it, which this harness never does. A record still
-        // held by a dead process when the run is over has leaked, because no
-        // further grant is coming and nobody here is going to sweep.
+        // participant calls it, which this function does for one named
+        // partition and nowhere else (see the partition below; children also
+        // call it as one of `work`'s operations, mid-run). A record still held
+        // by a dead process when the run is over has leaked, because no further
+        // grant is coming and no sweep is owed on its behalf.
         //
         // # What this found, and what fixed it
         //
@@ -1589,39 +2957,178 @@ mod imp {
         // performs the `LIVE -> FREE` CAS when it is next scheduled and sees the
         // hangup. `drive` waits 100 ms after the last `wait()` before calling
         // this, which is generous on an idle host and is a *scheduling*
-        // assumption on a loaded four-vCPU runner — and the failure it would
-        // produce is the worst kind, a red nightly naming a defect that is not
-        // there. A real leak never clears, so re-probing costs a genuinely
-        // failing run two seconds and buys a check that does not depend on when
-        // a thread woke up.
+        // assumption on a loaded runner — and the failure it would produce is
+        // the worst kind, a red nightly naming a defect that is not there.
+        //
+        // **What the retries can and cannot buy.** `drive` holds the current
+        // owner back until after its settle window, but by the time this
+        // function runs every process that could run a hangup callback has been
+        // reaped — so these retries do not give that callback more time, and a
+        // failure here does not mean "not scheduling". What they do cover is the
+        // window between the last `wait()` and the kernel finishing the
+        // teardown, and the `reap_participants` this function itself calls for
+        // the partitioned records. That is narrower than "does not depend on
+        // when a thread woke up", which is what this comment used to claim.
+        // **After a migration, one of the two automatic collectors is not
+        // coming for *some* records, and this is where that is paid for — for
+        // those records and no others.**
+        //
+        // `docs/decisions/0043` records the residue in as many words: a survivor
+        // of a migration keeps its slot, its byte and its mapping, but its
+        // attach socket still points at the dead owner and it never registers
+        // with the new one — "that owner never learns this process exists". So
+        // when such a survivor dies, the new owner's hangup callback has no
+        // socket to notice, and the record is collected only by a byte-keyed
+        // collector: the slot assigner, a grant later, or `reap_participants`,
+        // a sweep later. The same is true of every process that has *held* the
+        // role, for a different reason: nothing runs its own hangup callback.
+        //
+        // `unreachable_by_hangup` is the driver's list of exactly those pids —
+        // built from which owner each child last *attached* under
+        // ([`record_attachment`], written by the child, because re-attaching is
+        // an operation in `work` and only the child knows when it happened) and
+        // from which processes have published themselves as owner — and this
+        // function partitions on it **before** sweeping anything.
+        //
+        // **Two earlier versions of this, both recorded rather than quietly
+        // replaced, because each was wrong in the opposite direction and the
+        // shipped shape sits between them.**
+        //
+        // The first swept the whole table on any run that migrated and reported
+        // the count in a note — the same shape as the defect this check exists
+        // to catch. With the owner-kill arm on by default every run took that
+        // branch, nothing downstream of the sweep could fail, and an engine
+        // whose hangup collector had been deleted still printed `PASS`.
+        //
+        // The second put the strict verdict on the migrating arm as well, and
+        // **failed healthy runs**. Two causes, and fixing the first was not
+        // enough: the exempt set was sampled from the `owner.pid` marker (see
+        // [`inherited_pids`]), and — the one that decided the shape — after a
+        // migration there is usually no owner at all by teardown, so the
+        // collector the strict verdict blames was never alive to be blamed.
+        //
+        // What ships requires a sweep to have *worked* on every run, which the
+        // first version did not, and reaches the strict verdict only where the
+        // collector it names is pinned, which the second did not check.
         let table = view.participants();
         let mut leaked = Vec::new();
         for attempt in 0..9 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(250));
             }
-            leaked.clear();
-            for slot in 0..table.capacity() as u32 {
-                if slot != me && table.identity(slot).is_some() && !tree.participant_alive(slot) {
-                    leaked.push(slot);
-                }
-            }
+            leaked = dead_participant_slots(tree);
             if leaked.is_empty() {
                 break;
+            }
+        }
+        // **The records no hangup callback can reach are separated by pid, and
+        // separated *first*.** Two kinds, both named by the driver: a process
+        // that held the rendezvous (nothing runs its own hangup callback), and a
+        // child that attached under an owner which has since died (`0043`'s
+        // residue). Everything else — every child that attached under the owner
+        // still serving at teardown, which the teardown kill batch has just
+        // produced a fleet of — stays on the strict path.
+        //
+        // The partition is taken from `leaked`, which was computed **before**
+        // any sweep, so a record outside it fails this run whatever
+        // `reap_participants` does to the table afterwards. That ordering is the
+        // whole difference between a check and an exemption.
+        //
+        // The partitioned records are **not** given a pass either. They are
+        // swept, and the sweep is then required to have worked — so what would
+        // be an exception becomes a check of `docs/decisions/0028` plan step 5's
+        // collector of last resort.
+        let (mut unreachable, others): (Vec<u32>, Vec<u32>) = leaked.iter().partition(|slot| {
+            table
+                .identity(**slot)
+                .is_some_and(|(rec_pid, _, _)| unreachable_by_hangup.contains(&rec_pid))
+        });
+        leaked = others;
+        // **On a run whose role migrated, the partition is reported and not
+        // enforced, and this is the honest position rather than the strong
+        // one.** The strict half below fails a record outright on the grounds
+        // that the owner's hangup callback was its collector — which presumes an
+        // owner was alive and serving while these processes' sockets closed.
+        // After a migration that presumption is usually wrong: the heir is an
+        // ordinary worker, its `work` loop ends on a detach arm or on its
+        // operation cap, and with every other child already dead nothing remains
+        // to inherit, so the arena spends most of the teardown with no owner at
+        // all. `drive` measured that directly before this branch was written.
+        //
+        // **The first version of this shipped the strict verdict on the
+        // migrating arm and it failed healthy runs**, intermittently, on a
+        // loaded host, with a message naming an engine defect that was not
+        // there — which in a torture harness is worse than no check, because it
+        // teaches the reader to re-run. Two things were wrong and only one of
+        // them was the exempt set being sampled; completing that set (see
+        // [`inherited_pids`]) narrowed the failure rate and did not remove it,
+        // because the premise itself does not hold here.
+        //
+        // What the migrating arm still requires is **weaker and real**: every
+        // record is swept and then required to have been collected, so a run
+        // where reclamation is broken outright still fails, and the sweeper
+        // mutant (`Tree::reap_participants` returning 0) fails it on every seed
+        // tried. What it cannot say is *which* collector should have acted.
+        // `--no-kill-owner` is where that is pinned, and
+        // `a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path`
+        // is the case that drives it.
+        if !hangup_collector_pinned && !leaked.is_empty() {
+            out.notes.push(format!(
+                "recovery: {} slot(s) were held by processes whose last recorded attachment \
+                 named the owner still serving at teardown, so the hangup callback was their \
+                 expected collector — but the role migrated during this run, and a heir is an \
+                 ordinary worker that can detach and leave the arena ownerless before the \
+                 teardown finishes, so this run cannot say the callback was the collector \
+                 that failed. They are swept with the rest rather than failed. Run \
+                 `--no-kill-owner` for the arm that pins this.",
+                leaked.len()
+            ));
+            unreachable.append(&mut leaked);
+            unreachable.sort_unstable();
+        }
+        if !unreachable.is_empty() {
+            let partitioned = unreachable.len();
+            let swept = tree.reap_participants();
+            unreachable
+                .retain(|slot| table.identity(*slot).is_some() && !tree.participant_alive(*slot));
+            out.notes.push(format!(
+                "recovery: {partitioned} slot(s) held a record this run does not require the \
+                 hangup callback to have collected — an owner's own, a pre-migration \
+                 survivor's (docs/decisions/0043), or, on a run whose role migrated, any \
+                 record at all (see the note above) — so `reap_participants` was asked for \
+                 them; it reclaimed {swept} record(s) and {} of those slot(s) remain",
+                unreachable.len()
+            ));
+            if !unreachable.is_empty() {
+                out.failures.push(format!(
+                    "participant slot(s) {unreachable:?} still hold a dead process's LIVE \
+                     record after `Tree::reap_participants` swept the whole table. That sweep \
+                     is `docs/decisions/0028` plan step 5 and is the collector of last resort \
+                     for a record no socket closure can reach, so a record surviving it is a \
+                     defect in the sweeper, not a scheduling delay."
+                ));
             }
         }
         if !leaked.is_empty() {
             out.failures.push(format!(
                 "{} of {} participant slot(s) hold a LIVE record for a process the kernel \
-                 says is dead {:?}{}. These are leaked: nothing in this harness sweeps the \
-                 participant table, so a dead record is collected only when a grant walks past \
-                 its slot (`docs/decisions/0028` plan step 3) or when the socket that owned it \
-                 closes (step 4) — and this run is over, so neither is coming. \
-                 `docs/PHASE2.md` §11.4 \
-                 requires that participant slots never leak and §5 requires that liveness \
-                 come from the lock byte, never from `state`. Still held two seconds after \
-                 the last child was reaped, so this is not the owner's hangup callback \
-                 running late.",
+                 says is dead {:?}{}. No collector reclaimed these, and the driver did not \
+                 classify them as records no hangup callback could reach: each was held by a \
+                 process whose last recorded attachment named the owner that was still \
+                 serving at teardown, so step 4's hangup callback is the collector this run \
+                 expected — which is a statement about what the driver knows, not a \
+                 reconstruction of which socket closed when. The verdict was taken before any \
+                 sweep ran, so `reap_participants` cannot answer for them. A dead record is \
+                 otherwise collected only when a grant walks past its slot \
+                 (`docs/decisions/0028` plan step 3), and this run is over, so none is coming. \
+                 `docs/PHASE2.md` §11.4 requires that participant slots never leak and §5 \
+                 requires that liveness come from the lock byte, never from `state`. This \
+                 verdict is only reached on a run whose owner never changed, where that \
+                 callback ran in a process that was parked and serving for the whole \
+                 teardown. **The message used to close by ruling out a late hangup callback \
+                 on the strength of the retry loop above, which is unsound**: by the time \
+                 that loop runs every process that could run such a callback has been reaped, \
+                 so elapsed time here is evidence of nothing.",
                 leaked.len(),
                 table.capacity(),
                 &leaked[..leaked.len().min(8)],
@@ -1649,6 +3156,7 @@ mod imp {
         let mut seed = 1u64;
         let mut inject = false;
         let mut readers_only = false;
+        let mut no_inherit = false;
         let mut it = argv.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -1659,12 +3167,19 @@ mod imp {
                         .parse()
                         .context("--seed")?;
                 }
+                // The one child that creates and serves; see [`owner_child`].
+                "--role" => match it.next().map(String::as_str) {
+                    Some("owner") => return owner_child(),
+                    other => bail!("child: unknown --role `{other:?}`"),
+                },
                 "--inject-violation" => inject = true,
                 "--readers-only" => readers_only = true,
+                "--no-inherit" => no_inherit = true,
                 other => bail!("child: unknown argument `{other}`"),
             }
         }
         let mut rng = Rng::new(seed);
+        let dir = runtime_dir();
         // One `could not join` line per process; see the arm below.
         let mut reported = false;
 
@@ -1675,6 +3190,11 @@ mod imp {
             // two — half the participants publishing where the observer cannot
             // see them, which is a *green* run that validates nothing. `Never`
             // makes that state a failed `open()` this loop retries instead.
+            // Which owner this attachment will register with, recorded before
+            // the `open()` — see [`record_attachment`]. It is what lets
+            // `check_recovery` judge this child's record on the strict path
+            // instead of exempting it as a `docs/decisions/0043` residue.
+            record_attachment(&dir, read_owner_pid(&dir));
             let tree = match tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
                 .create(CreatePolicy::Never)
@@ -1706,13 +3226,20 @@ mod imp {
                     continue;
                 }
             };
-            work(&tree, &mut rng, inject, readers_only)?;
+            work(&tree, &dir, &mut rng, inject, readers_only, no_inherit)?;
         }
     }
 
     /// The random-operation loop against one attachment. Returns when it decides
     /// to detach and re-join, which is §11.4's "attach/detach".
-    fn work(tree: &Tree, rng: &mut Rng, inject: bool, readers_only: bool) -> Result<()> {
+    fn work(
+        tree: &Tree,
+        dir: &Path,
+        rng: &mut Rng,
+        inject: bool,
+        readers_only: bool,
+        no_inherit: bool,
+    ) -> Result<()> {
         // Interning can fail while another participant is mid-mutation; that is
         // not a violation, it is a retry.
         let mut ids = Vec::new();
@@ -1724,7 +3251,12 @@ mod imp {
         }
         let (map, tool) = (ids[0].0, ids[ids.len() - 1].1);
 
-        let mut held: Option<tf_tree::EdgeWriter<'_>> = None;
+        // **The edge index travels with the writer.** §11.4's "no two writers
+        // ever hold one edge" is checked from inside the writer that holds it
+        // (see the `push` arm below), and that check needs to know *which* claim
+        // record to read. `EdgeWriter` exposes only `push`, and adding an
+        // accessor to it would be a public-API change for a harness's benefit.
+        let mut held: Option<(usize, tf_tree::EdgeWriter<'_>)> = None;
         // A bounded number of operations per attachment, so every child
         // re-attaches regularly instead of one lucky survivor holding the arena
         // for the whole run.
@@ -1742,6 +3274,34 @@ mod imp {
             // reads over 8 s, against 12 800 with it). That was not true of the
             // reader this replaced, and `tests/torture.rs` records the change.
             std::thread::sleep(Duration::from_micros(200 + rng.below(1_600)));
+
+            // **§3.5's trigger, and the participants are the callers.** There is
+            // no daemon and no background thread by design
+            // (`docs/decisions/0019`), so a survivor that never evaluates
+            // `owner_lost` never becomes owner and the arena stays ownerless —
+            // which is precisely the state `kill_the_owner` probes for from the
+            // outside. This loop is what the design means by "the caller's own
+            // loop", and every child runs it, so the property is never left to
+            // whether the surviving population happened to include a read-write
+            // participant.
+            //
+            // The cost in the healthy case is one non-blocking `poll` of one
+            // descriptor: `owner_lost` only reaches its `F_OFD_GETLK` once the
+            // poll reports a hangup.
+            //
+            // `Contended` and `OwnerAlive` are **not** errors — a loser keeps
+            // its slot and stops asking by itself (`0043`) — so only `Inherited`
+            // is recorded.
+            if !no_inherit && tree.owner_lost() {
+                if let Ok(Inheritance::Inherited) = tree.inherit_ownership() {
+                    // pid first, then the log line: the driver reads the count
+                    // to decide a migration happened and the pid to pick the
+                    // next victim, so the pid must never be behind.
+                    publish_owner_pid(dir);
+                    record_inheritance(dir);
+                }
+            }
+
             match rng.below(100) {
                 // Claim an edge, if we hold none.
                 0..=9 => {
@@ -1751,7 +3311,7 @@ mod imp {
                         // A refused claim is the correct answer when somebody
                         // else holds it. Only a *granted* one is interesting.
                         if let Ok(w) = tree.claim(c, p) {
-                            held = Some(w);
+                            held = Some((i, w));
                         }
                     }
                 }
@@ -1760,20 +3320,109 @@ mod imp {
                     held = None;
                 }
                 // Reap whatever the last victim left behind.
-                15..=17 => {
+                15..=16 => {
                     let _ = tree.reap_dead();
+                }
+                // **Sweep the participant table**, which is a different
+                // collector from `reap_dead` above: that one reclaims *claims*
+                // held by dead writers, this one reclaims the dead
+                // participants' *records* (`docs/decisions/0028` plan step 5).
+                //
+                // It is here for two reasons and both are load-bearing. A
+                // migration orphans the hangup collector for every
+                // pre-migration survivor (`0043`), so without a sweeper those
+                // records are collected only when a grant happens to walk past.
+                // And it is the only path in this workload that reaches §11.3's
+                // `reclaim.after_probe_before_cas`, whose row is about a
+                // sweeper killed between the verdict and the CAS — a site that
+                // could not fire in a torture child before, because
+                // `check_recovery`'s own comment recorded that this harness
+                // never called the sweep.
+                //
+                // It has a cost, and [`drive`]'s teardown names it: after a
+                // migration the process holding the role is one of these
+                // children, so the collector the leak check is aimed at and a
+                // sweeper that hides its absence are the same process.
+                17 => {
+                    let _ = tree.reap_participants();
                 }
                 // Detach and re-join.
                 18..=19 => return Ok(()),
                 // Publish.
                 20..=59 => {
-                    if let Some(w) = &held {
+                    if let Some((edge, w)) = &held {
+                        // **§11.4's "no two writers ever hold one edge",
+                        // checked on every push instead of once at teardown.**
+                        //
+                        // The observable form, from inside the writer that
+                        // holds the edge: read the claim word; if it names a
+                        // participant slot that is not ours, then *push*. A
+                        // claim can only pass to another slot through
+                        // `edge::claim`, which CASes the word from free and
+                        // bumps the epoch — and `Publisher::push` compares that
+                        // epoch on every push (A4). So a push that **succeeds**
+                        // while the word names somebody else means the epoch
+                        // did not move, which means the edge was granted twice
+                        // without a release: two writers on a single-writer
+                        // ring, which is the failure D7, A3 and A4 exist to
+                        // prevent.
+                        //
+                        // The ordinary case is a *revoked* claim — this writer
+                        // was judged dead and reaped, another claimed, the
+                        // epoch moved — and there the push fails, which is A4
+                        // working and is not a violation.
+                        //
+                        // # What it does and does not prove
+                        //
+                        // It is a check by the holder, at the holder's rate, so
+                        // it sees every window in which this process held an
+                        // edge somebody else also held. It cannot see a double
+                        // grant on an edge **no live writer holds**, and it
+                        // adds no synchronisation of its own — one `Acquire`
+                        // load of a word this writer's cacheline already owns —
+                        // so it does not perturb the race it is looking for.
+                        // The property itself is held by construction, not by
+                        // this; what this refuses is the version of the harness
+                        // in which "checked continuously" meant a teardown
+                        // probe. `check_recovery` still runs, and answers the
+                        // different question of whether every claim came back.
+                        // **`w.edge()`, never the chain index.** `EdgeId` is
+                        // **1-based** — `TreeBuilder::build_with` sizes the edge
+                        // table as `declared + 1` and writes capacities at
+                        // `i + 1`, reserving id 0 as a sentinel — so the chain's
+                        // four edges are `EdgeId(1)..=EdgeId(4)` and an index
+                        // used as an id reads the *neighbouring* edge's claim
+                        // word. Measured: the first version of this check did
+                        // exactly that and reported three two-writer violations
+                        // in twenty seconds on a healthy arena. `EdgeWriter`
+                        // derefs to `Publisher`, which answers the id this claim
+                        // actually took.
+                        let word = tree
+                            .arena_view()
+                            .claim(w.edge())
+                            .map(|rec| rec.owner.load(Ordering::Acquire))
+                            .unwrap_or(0);
+                        let slot = tf_tree_core::edge::slot_of(word);
+                        let foreign = slot != u32::MAX && slot != tree.participant_slot();
+
                         let iso = sample(rng, inject);
                         // `ClaimRevoked` is A4 working: this writer was judged
                         // dead, reaped, and is being fenced. Drop the claim and
                         // carry on.
                         if w.push(now_nanos(), &iso).is_err() {
                             held = None;
+                        } else if foreign {
+                            let (parent, child) = CHAIN[*edge];
+                            eprintln!(
+                                "VIOLATION pid {} two writers on {parent}->{child}: the claim \
+                                 word named participant slot {slot} while this process (slot \
+                                 {}) pushed to the same edge successfully, so the claim epoch \
+                                 never moved and the edge was granted twice \
+                                 (docs/PHASE2.md §11.4, §1 A3/A4, D7)",
+                                std::process::id(),
+                                tree.participant_slot()
+                            );
+                            std::process::exit(EXIT_VIOLATION);
                         }
                     }
                 }

@@ -290,6 +290,215 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
         kills > 5,
         "only {kills} children were killed, so no recovery path was exercised.\n{stdout}"
     );
+
+    // **§3.5, and eight seconds is chosen so exactly one owner kill lands.**
+    // The first is scheduled `OWNER_KILL_FIRST` (4 s) in, which is early enough
+    // that this case covers the arm and late enough that the 3 s
+    // `--readers-only` case above never reaches it and keeps meaning what it
+    // meant.
+    //
+    // Asserted on the *printed* line rather than on the exit status, for the
+    // reason the binary prints it: a run with the arm silently disabled exits 0
+    // too. `a_run_that_never_inherits_the_owner_role_fails_naming_it` is the
+    // red half — these three assertions all pass on a build where nothing
+    // inherits *if* that test does not exist, because a green run says nothing
+    // about a check that cannot fail.
+    assert!(
+        stdout.contains("§3.5 owner kill 1:"),
+        "the run never killed the rendezvous owner, so PHASE2 §3.5 was not exercised \
+         at all.\n{stdout}"
+    );
+    assert!(
+        stdout.contains("a fresh process joined"),
+        "the owner was killed and no fresh process could join afterwards — or the run \
+         did not check. An ownerless arena is exactly what refuses a new joiner, so this \
+         is the assertion that says the role was inherited.\n{stdout}"
+    );
+    // **Parsed, not matched as a substring.** This read
+    // `!stdout.contains("0 survivor(s) inherited")` until 2026-09-04, which also
+    // matches `10 survivor(s) inherited` — so a healthy run with ten
+    // inheritances in one window would have failed it. The count is read out of
+    // the §3.5 summary line the way `reads`, `composed` and `kills` are read
+    // above, and compared as a number.
+    let inherited: u64 = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("shm_torture: §3.5: "))
+        .find_map(|l| {
+            l.split(" inheritance(s) recorded by survivors")
+                .next()
+                .and_then(|head| head.rsplit(", ").next())
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or(0);
+    assert!(
+        inherited > 0,
+        "a migration recovered with no survivor recording an inheritance: something is \
+         serving and §3.5's caller-driven trigger is not why.\n{stdout}"
+    );
+}
+
+/// **The strict half of the leak check, on a configuration that reaches it.**
+///
+/// `check_recovery` splits the participant records it finds still `LIVE` for a
+/// dead process into two: the ones `docs/decisions/0043` says no hangup callback
+/// can reach — a process that held the rendezvous, or a child whose own owner
+/// has since died — which are swept and then *required* to have been collected,
+/// and everything else, which fails the run outright. This case exercises the
+/// second. It is `--no-kill-owner` because that is the configuration in which
+/// the owner's hangup callback is a real collector for the whole teardown: the
+/// owner is the parked owner child, which runs no operations and cannot detach,
+/// so every worker's record is reachable by it and only the owner's own record
+/// is in the swept partition.
+///
+/// **A migrating run does not reach that verdict, and this doc previously said
+/// it did — with a seed tally, which was wrong twice over.** After a migration
+/// the owner is an ordinary worker; its `work` loop ends on a detach arm or on
+/// its operation cap, and with every other child already dead nothing remains to
+/// inherit, so the arena spends most of the teardown with **no owner**. Blaming
+/// a hangup callback there blames a process that was not running. `drive`
+/// decides this from the inheritance ledger and downgrades the verdict for that
+/// arm to a note; the sweep-and-require half applies either way. Which verdict
+/// was in force is printed by the run and asserted below, so the downgrade
+/// cannot reach this case quietly and leave it green with nothing to say.
+///
+/// Mutant (applied, confirmed fatal, then reverted): delete the
+/// `table.reclaim(slot, observed)` in the owner's hangup callback
+/// (`crates/tf_tree/src/open.rs`, `docs/decisions/0028` plan step 4), rebuild
+/// `shm_torture --release --features shm`, and run this case's own arguments at
+/// a few seeds, idle and under load. It exits 1 naming the slots on every seed
+/// it has been tried at. **The counts that stood here are removed** — one of
+/// them was re-measured by a reviewer and by this file's author and came out
+/// different both times, which is what a tally of a scheduling outcome does.
+/// Run the mutant rather than reading a number.
+#[test]
+fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
+    let out = torture(&[
+        "--duration",
+        "8s",
+        "--children",
+        "4",
+        "--kill-hz",
+        "4",
+        "--seed",
+        "999",
+        "--no-kill-owner",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a run with one owner for its whole life failed; every worker record here is \
+         reachable by that owner's hangup callback.\n{stdout}\n{stderr}"
+    );
+    // The negative half: this configuration must not be reaching the *swept*
+    // partition for anything but the owner's own record. If it were, the run
+    // above would pass on a build whose hangup collector does nothing.
+    assert!(
+        !stdout.contains("§3.5 owner kill 1:"),
+        "`--no-kill-owner` killed the owner, so this case is not the no-migration \
+         configuration it is named for.\n{stdout}"
+    );
+    assert!(
+        stdout.contains("recovery:") && !stdout.contains("RECOVERY FAILURE"),
+        "the recovery check did not run, so nothing here judged a participant \
+         record.\n{stdout}"
+    );
+    // **The positive control for this whole case.** `check_recovery` reaches the
+    // strict verdict only when the run's owner never changed; on the migrating
+    // arm it downgrades to a sweep and a note. Without this assertion a change
+    // that downgraded every run would leave this test green and vacuous, which
+    // is the failure mode the file's own history is full of.
+    assert!(
+        stdout.contains("judged on the STRICT path"),
+        "this run did not put the leak check on its strict path, so passing says \
+         nothing about the owner's hangup callback.\n{stdout}"
+    );
+}
+
+/// **A run in which nothing inherits the owner role FAILS, naming §3.5.**
+///
+/// The red half of the three §3.5 assertions in the test above, and the
+/// counterpart of `--readers-only` one level down: `--no-inherit` makes every
+/// child skip `Tree::owner_lost`, which is the one thing §3.5 requires a
+/// survivor to do. Nothing inherits, the arena goes ownerless the moment the
+/// owner is killed, and no fresh process can join it again — which is precisely
+/// the state that existed between 2026-08-27 and 2026-08-28 and that
+/// `docs/decisions/0037` exists to end.
+///
+/// **What it is written against is a green run, not a red one.** Every
+/// assertion about a migration in this file is satisfiable by a harness that
+/// stopped killing the owner, or that reports a migration it never checked; this
+/// case is what makes those assertions falsifiable.
+///
+/// Measured (2026-09-04): the run prints `NO fresh process joined within 10s`
+/// for the first kill and exits 1. It costs the recovery deadline — the harness
+/// waits the full ten seconds before concluding, because a migration that has
+/// not happened is indistinguishable from a slow one until the deadline passes,
+/// and shortening the deadline to shorten the test would trade a real property
+/// for a fast one.
+///
+/// Mutant (applied, confirmed fatal): delete the `if !failed.is_empty()` bail in
+/// `drive` — the run then reports the failure in its output and exits 0, and the
+/// first assertion fails.
+#[test]
+fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
+    let out = torture(&[
+        "--duration",
+        "6s",
+        "--children",
+        "3",
+        "--kill-hz",
+        "4",
+        "--seed",
+        "999",
+        "--no-inherit",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a run in which no survivor ever called `owner_lost` passed. The owner was killed \
+         and the arena is ownerless, so this run proved nothing about §3.5.\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("ownership migration did not happen"),
+        "the run failed for some other reason; the failure must name §3.5.\n{stdout}\n{stderr}"
+    );
+    // The specific diagnosis, not just the verdict. A run that failed on the
+    // read floor instead would satisfy the assertion above while saying nothing
+    // about the owner, and the read floor *does* trip on this configuration —
+    // which is why the migration check bails first.
+    assert!(
+        stdout.contains("NO fresh process joined"),
+        "the failure must say that no fresh process could join, which is the property \
+         §3.5 restores and the one an internal flag cannot observe.\n{stdout}"
+    );
+}
+
+/// `--crash-site` is refused without `--crash-points`.
+///
+/// The probe forces one §11.3 site in every child so a person can answer "can
+/// this workload reach site X at all", which is what the binary's reachability
+/// table states as a measurement. Accepting it in a build that compiled the
+/// sites out would report every site unreachable while arming none of them —
+/// the same flag-that-arms-nothing failure `--crash-points` already refuses one
+/// level up, in the shape that would be *read as evidence*.
+///
+/// **Mutant:** drop the `crash_site.is_some() && !crash_points` guard. The run
+/// then reaches `--help`, exits 0, and the first assertion fails.
+#[test]
+fn a_forced_crash_site_is_refused_without_the_flag_that_arms_it() {
+    let out = torture(&["--crash-site", "claim.after_cas", "--help"]);
+    assert!(
+        !out.status.success(),
+        "--crash-site was accepted without --crash-points, so the probe would have armed \
+         nothing while reporting a reachability result"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--crash-site needs --crash-points"),
+        "the refusal must name what is missing, got: {err}"
+    );
 }
 
 /// **The arguments `just shm-torture` passes by default actually parse.**
