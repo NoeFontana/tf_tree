@@ -74,29 +74,33 @@
 //! a run*) precisely where it did not hold:
 //!
 //! * **Eight are checkable from the run's own `§11.3:` line at `NAME:1`** —
-//!   `push.*` ×3 (11/4, 9/3, 11/4 armed/aborted), `claim.after_cas` (10/5),
-//!   `takeover.*` (8/1), `reclaim.*` (19/3), `hangup.*` (16/1), and the negative
-//!   control `topo.holding_lock` (16 armed, **0 aborted**, and it is the one row
-//!   that needs no abort to be an answer). **Not the same eight as the first
-//!   table below**: this one is about where the answer is read and includes
+//!   `push.*` ×3, `claim.after_cas`, `takeover.*`, `reclaim.*`, `hangup.*`, and
+//!   the negative control `topo.holding_lock`, which is the one row that needs
+//!   no abort to be an answer. **Not the same eight as the first table below**:
+//!   this one is about where the answer is read and includes
 //!   `topo.holding_lock` while excluding `attach.*`; that one is about what the
-//!   site exercises.
+//!   site exercises. **The armed/aborted pair each of them prints is not
+//!   reproduced here.** It was, per site, and it should not have been: re-run
+//!   the same command at the same seed and the pair moves, because what a
+//!   `SIGKILL`-driven fleet reaches in twelve seconds is a scheduling outcome
+//!   and the seed fixes only the driver's draws. Run the loop below and read the
+//!   pairs off the runs you took; the *split* above is the claim.
 //! * **`attach.after_slot_assigned_before_publish` needs the bare `NAME` form**,
 //!   where the nth is drawn above 1 so the creating owner child survives its
-//!   first hit: 10 armed / 4 aborted, `fired:` names it. At `:1` every one of
-//!   `spawn_owner`'s six attempts aborts and the run bails with no `§11.3:` line
-//!   at all. The bare-form run then *fails* §3.5 — arming every child at an
-//!   attach site starves the migration — which is the probe being a probe, and
-//!   the `fired:` line is still what answers the question.
+//!   first hit, and `fired:` names it. At `:1` every one of `spawn_owner`'s six
+//!   attempts aborts and the run bails with no `§11.3:` line at all. The
+//!   bare-form run then *fails* §3.5 — arming every child at an attach site
+//!   starves the migration — which is the probe being a probe, and the `fired:`
+//!   line is still what answers the question.
 //! * **Four are read off the child's `tf_tree_core: crash point <site> hit N,
 //!   aborting` on stderr**, because at `:1` they abort the owner child on all six
 //!   attempts and `drive` bails before §11.3's report exists:
 //!   `open.after_ownership_lock_before_bind`, `open.after_create_before_bind`,
-//!   `topo.after_copy_before_publish` and `intern.after_hash_cas_before_id_store`
-//!   (6 aborts each). With the bare form the two `open.*` come up and report
-//!   `16 armed, 0 aborted` — they are on the creation path only — so for those
-//!   two the bare form answers *unreachable in a child* and `:1` answers
-//!   *reachable in the creator*, and both halves are wanted.
+//!   `topo.after_copy_before_publish` and `intern.after_hash_cas_before_id_store`.
+//!   With the bare form the two `open.*` come up and arm every child and none
+//!   aborts — they are on the creation path only — so for those two the bare
+//!   form answers *unreachable in a child* and `:1` answers *reachable in the
+//!   creator*, and both halves are wanted.
 //!
 //! | Fires, in a live arena, and the state it leaves is met by live peers | Where |
 //! |---|---|
@@ -118,7 +122,7 @@
 //!
 //! | Never fires | Why |
 //! |---|---|
-//! | `topo.holding_lock` | inside `Tree::reparent`, and nothing here reparents. The topology is a fixed four-edge chain and a participant that reparented it would destroy the property every other check reads. Confirmed by probe: `16 armed, 0 aborted` |
+//! | `topo.holding_lock` | inside `Tree::reparent`, and nothing here reparents. The topology is a fixed four-edge chain and a participant that reparented it would destroy the property every other check reads. Confirmed by probe: every child armed, none aborted |
 //!
 //! So **"every §11.3 crash point recovers" is not a claim this binary can
 //! make**, at any duration: one site never fires and two fire somewhere the
@@ -859,10 +863,15 @@ mod imp {
     /// has since died never registers with the new one, so that owner has no
     /// socket to notice its death — the record is reachable only by a byte-keyed
     /// collector. Which owner a child registered with is a fact only the child
-    /// has: it re-attaches every couple of thousand operations, so "spawned
-    /// before the last migration" is not the same question and answers it far
-    /// too widely — a child spawned at the start and re-attached a second ago is
-    /// on the current owner's socket like any other.
+    /// has, and it re-attaches *often*: 2 000 operations is the cap on one
+    /// attachment, and a 2% detach-and-rejoin arm inside that loop is what
+    /// usually ends it first, so the mean is tens of operations rather than
+    /// thousands. **This comment quoted the cap as the rate**, which is wrong by
+    /// the ratio between them and in the direction that makes the sampling
+    /// problem below look smaller than it is. Either way "spawned before the
+    /// last migration" is not the same question and answers it far too widely —
+    /// a child spawned at the start and re-attached a moment ago is on the
+    /// current owner's socket like any other.
     ///
     /// One file per pid, `write` then `rename`, rather than an append log: the
     /// question is "the *last* owner this pid attached under", which last-write-
@@ -956,6 +965,37 @@ mod imp {
         std::fs::read_to_string(inherited_path(dir))
             .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
             .unwrap_or(0)
+    }
+
+    /// Every process that has ever inherited the role, from the same ledger.
+    ///
+    /// **This is the whole set, not a sample of it, and that distinction is the
+    /// reason this function exists.** The driver used to learn who had held the
+    /// role by re-reading the `owner.pid` marker once a round. That marker is
+    /// last-write-wins, and the role turns over far faster than a driver round:
+    /// polling it at 100 Hz through a healthy 20 s run at 5 children / 5 Hz
+    /// shows it naming dozens of distinct processes, while the ledger written by
+    /// those same processes carries every one of them and the run's own §3.5
+    /// summary counts only the handful that answered an owner *kill*, which is a
+    /// different question. A sampled exempt set is a set with holes in it, and
+    /// each hole is a record judged on `check_recovery`'s strict path that no
+    /// hangup callback could have collected: a healthy run failing with a
+    /// message accusing the engine. That is not a hypothesis; it is what the
+    /// sampled version did, intermittently, on a loaded host.
+    ///
+    /// Reading the ledger removes the sampling instead of compensating for it.
+    /// [`record_inheritance`] already appends one line per inheritance at the
+    /// moment it happens, so there is no second mechanism to keep in step — and
+    /// the ledger cannot miss a turnover the way a poll can, because the heir
+    /// writes it rather than an observer catching it.
+    ///
+    /// It does **not** name the process that created the arena: that one
+    /// publishes itself as owner without inheriting from anybody, so the caller
+    /// adds it.
+    fn inherited_pids(dir: &Path) -> Vec<u32> {
+        std::fs::read_to_string(inherited_path(dir))
+            .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+            .unwrap_or_default()
     }
 
     /// The owner child: create the arena, serve the rendezvous, and park.
@@ -1154,24 +1194,24 @@ mod imp {
             &mut ledger,
         )?);
 
-        // **Who has held the role, in order.** The owner is a child now and the
-        // role migrates, so "the owner" is a sequence rather than a process. Two
-        // things at teardown need it: which process to kill *last*, and which
-        // records are an owner's own — those, plus the children whose last
-        // attachment named an owner that has since died ([`attachments`]), are
-        // the records `docs/decisions/0043` says no hangup callback can reach,
-        // and they are the only ones the sweep is allowed to answer for.
+        // **The one process that holds the role without having inherited it.**
+        // Every later owner appends itself to the inheritance ledger as it takes
+        // over ([`record_inheritance`]), so at teardown [`inherited_pids`]
+        // answers "who has held the rendezvous" completely; the creator is the
+        // one member that ledger cannot contain, and the driver spawned it, so
+        // it knows the pid exactly rather than reading it from anywhere.
         //
-        // Polled from the marker rather than derived from `migrations`, because
-        // the driver is not the only thing that ends an owner's life: the
-        // ordinary victim draw can kill an heir (it is an ordinary worker slot),
-        // and so can an armed §11.3 site. Either way the next heir republishes
-        // and this list grows; deriving it from the owner *kills* would miss
-        // both, and a missed owner is a record judged strictly that no hangup
-        // callback could have collected.
-        let mut owner_pids: Vec<u32> =
-            vec![read_owner_pid(&dir)
-                .unwrap_or_else(|| owner_kid.as_ref().map_or(0, |k| k.proc.id()))];
+        // **This replaced a poll, and the poll was the defect.** The driver used
+        // to re-read the `owner.pid` marker each round and accumulate the pids it
+        // caught. `docs/decisions/0043` says an owner's own record is one no
+        // hangup callback collects, so that accumulated list is what
+        // [`check_recovery`] exempts from its strict path — and a role change the
+        // poll missed became a record judged strictly that nothing could have
+        // collected. The comment on the round-by-round read said exactly that
+        // consequence and treated it as a risk; it is not a risk, it is the
+        // common case, because the role turns over an order of magnitude faster
+        // than the driver's round.
+        let creating_owner_pid = owner_kid.as_ref().map(|k| k.proc.id());
         // The driver keeps two of the three roles it had: it holds the segment
         // alive for `check_recovery`, and it is the never-killed reader. It
         // serves nothing and never inherits.
@@ -1236,17 +1276,6 @@ mod imp {
             let left = deadline.saturating_duration_since(Instant::now());
             std::thread::sleep(interval.mul_f64(jitter).min(left));
 
-            // **The role, re-read every round.** This list has to contain every
-            // process that has ever held the rendezvous, because an owner's own
-            // record is one no hangup callback collects; a role change missed
-            // here is a record judged on the strict path that nothing could
-            // have collected.
-            if let Some(pid) = read_owner_pid(&dir) {
-                if owner_pids.last() != Some(&pid) {
-                    owner_pids.push(pid);
-                }
-            }
-
             let mut round = RoundHealth::default();
             let this_round = observe(&observer, &mut rng, &mut violations, &mut round);
             let last_round_reads = this_round.total();
@@ -1307,15 +1336,6 @@ mod imp {
                     rounds += m.rounds;
                     println!("{}", m.line());
                     migrations.push(m);
-                    // The heir published its pid before it wrote the
-                    // inheritance line `kill_the_owner` just waited for, so the
-                    // marker is current here and the next child spawned belongs
-                    // to the new generation.
-                    if let Some(pid) = read_owner_pid(&dir) {
-                        if owner_pids.last() != Some(&pid) {
-                            owner_pids.push(pid);
-                        }
-                    }
                     next_owner_kill = Some(Instant::now() + every);
                     if !violations.is_empty() {
                         break;
@@ -1362,12 +1382,33 @@ mod imp {
         // This paragraph claimed the owner was killed last while that was true
         // only of a run that never migrated, which is to say only of
         // `--no-kill-owner`.
-        if let Some(pid) = read_owner_pid(&dir) {
-            if owner_pids.last() != Some(&pid) {
-                owner_pids.push(pid);
-            }
-        }
-        let current_owner = owner_pids.last().copied();
+        let current_owner = read_owner_pid(&dir).or(creating_owner_pid);
+        // **Whether this run can pin the owner's hangup callback at all, decided
+        // from the ledger rather than from the flags.** The strict half of
+        // [`check_recovery`] rests on one premise: that the process serving the
+        // rendezvous when the workers were killed is still serving it while
+        // their hangups are processed. That is true when the role never moved —
+        // the creating owner child is parked, runs no operations, and cannot
+        // detach — and it is **usually false the moment the role migrates**,
+        // because the heir is an ordinary worker whose `work` loop ends on a
+        // detach-and-rejoin arm or on its operation cap, and once it detaches
+        // with every other child already dead nothing is left to inherit and the
+        // arena simply has no owner. Measured on this host by sampling
+        // `Tree::owner_lost` from the driver every 10 ms across the settle
+        // window: on `--no-kill-owner` the role is never vacant, and on the
+        // migrating default it is vacant for most of the window in the large
+        // majority of runs.
+        //
+        // `inherited_pids` empty is the exact statement of "the role never
+        // moved", and the second conjunct is what says the process holding it is
+        // the parked owner child this driver spawned and has not yet killed.
+        // Deriving it from `--no-kill-owner` instead would be a flag standing in
+        // for a fact: an armed §11.3 site can end the creating owner's life on a
+        // run that was never going to kill it.
+        let hangup_collector_pinned = inherited_pids(&dir).is_empty()
+            && owner_kid
+                .as_ref()
+                .is_some_and(|k| Some(k.proc.id()) == current_owner);
         for kid in kids.iter_mut().flatten() {
             if Some(kid.proc.id()) == current_owner {
                 continue;
@@ -1380,23 +1421,69 @@ mod imp {
             }
             let _ = kid.proc.wait();
         }
-        // **What the strict path can and cannot pin on a run that migrated, and
-        // it is a limit rather than a caveat.** After a migration the owner is
-        // an ordinary child, and `work` calls `Tree::reap_participants` on 3% of
-        // its operations at roughly a kilohertz — so while the teardown waits
-        // for the hangup callback below, the process running that callback is
-        // *also* sweeping the whole table several times a second, and either
-        // collector can be the one that got there first. The invariant is still
-        // checked (a record no collector reclaimed is still a leak), but which
-        // collector satisfied it is not pinned here. Measured, with the owner's
-        // hangup CAS deleted from `crates/tf_tree/src/open.rs`, over the six
-        // seeds 1/2/3/7/999/1104729: a 20 s migrating run at 6 children / 6 Hz
-        // failed on **two** of the six, while `--no-kill-owner` at 12 s / 4
-        // children / 4 Hz failed on **six** of six.
-        // **`--no-kill-owner` is where that collector is pinned** — the
-        // owner is then the parked owner child, which runs no operations and
-        // sweeps nothing — and `tests/torture.rs` runs that configuration for
-        // exactly this reason.
+        // **What a run that migrated cannot pin, and it is a limit rather than a
+        // caveat.** Two things are true of the heir and both cut the same way.
+        // It is an ordinary child, so `work`'s single `reap_participants` arm —
+        // one value out of a hundred, at roughly a kilohertz — has it sweeping
+        // the whole table several times a second, and the collector the leak
+        // check is aimed at and a sweeper that hides its absence are the same
+        // process. And its `work` loop *ends*, on a detach arm or on its
+        // operation cap, at which point nothing is left to inherit and the arena
+        // has no owner for the rest of the teardown. **This comment said 3%**,
+        // which is the share of operations that reap *something*: `reap_dead`
+        // takes two of those hundred values and the participant sweep takes one,
+        // and they are different collectors.
+        //
+        // So `hangup_collector_pinned` above gates the strict verdict, and this
+        // arm gets the sweep-and-require half plus a note. Deleting the owner's
+        // hangup CAS from `crates/tf_tree/src/open.rs` is the mutant that shows
+        // the difference, and the honest statement of the result is a direction
+        // rather than a tally: `--no-kill-owner` fails on every seed it has been
+        // run at. **A count was written here and it should not have been** —
+        // re-running the migrating arm at a fixed seed gave a different number of
+        // failures each time, so the figure recorded which afternoon it was taken
+        // on. **`--no-kill-owner` is where that collector is pinned** — the owner
+        // is then the parked owner child, which runs no operations, sweeps
+        // nothing and cannot detach — and `tests/torture.rs` runs that
+        // configuration for exactly this reason.
+
+        // **The records no hangup callback can ever collect, named by pid.**
+        // Two kinds, and neither is a tolerance:
+        //
+        // * every process that has held the rendezvous. A process does not run
+        //   its own hangup callback, so an owner's own participant record is
+        //   left to a byte-keyed collector however it dies. That is the
+        //   *creating* owner plus [`inherited_pids`] — the ledger the heirs
+        //   wrote themselves, read whole, rather than the marker samples the
+        //   driver used to collect on its way past.
+        // * every worker that attached under an owner which has since died —
+        //   `docs/decisions/0043`'s residue: "that owner never learns this
+        //   process exists", so the surviving owner has no socket to notice.
+        //
+        // Everything else is the population the 2026-08-17 defect showed up in —
+        // every worker that attached under the owner still serving at teardown,
+        // which the kill batch above has just produced a fleet of. On a run
+        // whose owner never changed that population takes the strict path; on
+        // one that migrated `check_recovery` reports it and sweeps it, because
+        // there is usually no owner left to have been its collector.
+        //
+        // **A child that recorded no attachment at all is judged strictly**, and
+        // that is the deliberate direction: [`record_attachment`] writes before
+        // the `open()`, so a record with no file means the write itself failed.
+        // Reading the absence as an exemption would turn a broken ledger into a
+        // silently permissive check — the failure this whole partition exists to
+        // avoid — while reading it as a leak fails loudly and names the slot.
+        let mut unreachable_by_hangup: Vec<u32> = inherited_pids(&dir);
+        unreachable_by_hangup.extend(creating_owner_pid);
+        unreachable_by_hangup.extend(current_owner);
+        unreachable_by_hangup.extend(
+            attachments(&dir)
+                .into_iter()
+                .filter(|(_, under)| Some(*under) != current_owner)
+                .map(|(pid, _)| pid),
+        );
+        unreachable_by_hangup.sort_unstable();
+        unreachable_by_hangup.dedup();
 
         // **The owner outlives the workers, and the order is a check rather than
         // tidiness.** Whoever holds the role is running the hangup callback,
@@ -1408,13 +1495,14 @@ mod imp {
         //
         // **Measured, and the measurement is narrower than the fix.** The first
         // version of this teardown killed the owner *before* `wait`ing the
-        // workers, and a `--no-kill-owner` run then failed with `4 of 64
-        // participant slot(s) hold a LIVE record` — a real regression of the
-        // check, produced by killing the collector ahead of the records it was
-        // going to collect. Reaping the workers first is what fixes that; the
-        // 200 ms is margin on a loaded host and removing it does **not**
-        // reproduce the failure, which is why this comment says so rather than
-        // claiming a measurement for the sleep.
+        // workers, and a `--no-kill-owner` run then failed naming several slots
+        // — a real regression of the check, produced by killing the collector
+        // ahead of the records it was going to collect. Reaping the workers
+        // first is what fixes that.
+        //
+        // The margin after it is a *scheduling* assumption, and the sleep is now
+        // followed by a bounded poll of the records the verdict is about; see
+        // below for why, which is not that the flat sleep was seen to fail.
         //
         // **On a run that migrated the heir is an ordinary worker, and the two
         // passes above hold it back by pid so the ordering holds there too.**
@@ -1424,8 +1512,47 @@ mod imp {
         // table on any run that migrated — which is a permissive check wearing a
         // strict one's message, on the path every default run takes. The sweep
         // is now answerable for the records `docs/decisions/0043` names and for
-        // nothing else; see `unreachable_by_hangup` below.
+        // nothing else; see `unreachable_by_hangup` above.
+        //
+        // **The wait for that collector belongs HERE, while it is still alive.**
+        // `check_recovery` re-probes for two and a bit seconds before it calls a
+        // record leaked, and that retry cannot buy what its own comment used to
+        // claim: by then every process that could run a hangup callback has been
+        // reaped, so waiting longer waits on nobody. The margin that does buy
+        // something is the one taken *before* the owner is killed, and a flat
+        // 200 ms of it is a guess about scheduling. This replaces the guess with
+        // a *bounded poll* of the very set the strict verdict is about: the run
+        // continues as soon as the collector has done its work, and a genuine
+        // leak — which never clears — costs the failing run the deadline and
+        // nothing else.
+        //
+        // **This is not fixing an observed failure, and an earlier draft of this
+        // comment claimed it was.** That claim came from a build which had lost
+        // the 200 ms sleep entirely; the flat sleep, measured on this host,
+        // passed 24 of 24 strict-arm runs under six busy loops on eight cores.
+        // What the poll removes is the assumption, not a red run.
+        //
+        // The poll runs only where there is something to wait for. On a run
+        // whose role migrated the arena usually has no owner at all by now, so
+        // polling would spend the deadline every time and buy nothing; that arm
+        // does not reach the strict verdict either (see `check_recovery`).
         std::thread::sleep(Duration::from_millis(200));
+        if hangup_collector_pinned {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                let outstanding = dead_participant_slots(&observer).into_iter().any(|slot| {
+                    observer
+                        .arena_view()
+                        .participants()
+                        .identity(slot)
+                        .is_some_and(|(pid, _, _)| !unreachable_by_hangup.contains(&pid))
+                });
+                if !outstanding {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         // The owner last, wherever it lives — the original owner child on a run
         // that never migrated, a worker slot on one that did.
         if let Some(pid) = current_owner {
@@ -1452,38 +1579,7 @@ mod imp {
         drop(owner_kid);
         std::thread::sleep(Duration::from_millis(100));
 
-        // **The records no hangup callback can ever collect, named by pid.**
-        // Two kinds, and neither is a tolerance:
-        //
-        // * every process that has held the rendezvous. A process does not run
-        //   its own hangup callback, so an owner's own participant record is
-        //   left to a byte-keyed collector however it dies.
-        // * every worker that attached under an owner which has since died —
-        //   `docs/decisions/0043`'s residue: "that owner never learns this
-        //   process exists", so the surviving owner has no socket to notice.
-        //
-        // Everything else stays on the strict path, including every worker that
-        // attached under the owner that was still serving at teardown. That is
-        // the population the 2026-08-17 defect showed up in, and it is the one
-        // the teardown kill batch above has just produced.
-        //
-        // **A child that recorded no attachment at all is judged strictly**, and
-        // that is the deliberate direction: [`record_attachment`] writes before
-        // the `open()`, so a record with no file means the write itself failed.
-        // Reading the absence as an exemption would turn a broken ledger into a
-        // silently permissive check — the failure this whole partition exists to
-        // avoid — while reading it as a leak fails loudly and names the slot.
-        let mut unreachable_by_hangup: Vec<u32> = owner_pids.clone();
-        unreachable_by_hangup.extend(
-            attachments(&dir)
-                .into_iter()
-                .filter(|(_, under)| Some(*under) != current_owner)
-                .map(|(pid, _)| pid),
-        );
-        unreachable_by_hangup.sort_unstable();
-        unreachable_by_hangup.dedup();
-
-        let recovery = check_recovery(&observer, &unreachable_by_hangup);
+        let recovery = check_recovery(&observer, &unreachable_by_hangup, hangup_collector_pinned);
         drop(observer);
         drop(scratch);
 
@@ -2629,6 +2725,23 @@ mod imp {
         reads
     }
 
+    /// Slots holding a `LIVE` participant record for a process the kernel says
+    /// is dead, from the caller's own attachment and excluding its own slot.
+    ///
+    /// One function so the teardown's wait and `check_recovery`'s verdict ask
+    /// the same question: a wait that polled a different predicate from the one
+    /// that fails the run is a wait that can finish early on the wrong evidence.
+    fn dead_participant_slots(tree: &Tree) -> Vec<u32> {
+        let me = tree.participant_slot();
+        let view = tree.arena_view();
+        let table = view.participants();
+        (0..table.capacity() as u32)
+            .filter(|slot| {
+                *slot != me && table.identity(*slot).is_some() && !tree.participant_alive(*slot)
+            })
+            .collect()
+    }
+
     struct Recovery {
         failures: Vec<String>,
         notes: Vec<String>,
@@ -2640,11 +2753,34 @@ mod imp {
     /// Runs on the observer's attachment, which has been held for the whole run
     /// — so the arena being checked is the one the children tortured, not a
     /// fresh one created after they all died.
-    fn check_recovery(tree: &Tree, unreachable_by_hangup: &[u32]) -> Result<Recovery> {
+    fn check_recovery(
+        tree: &Tree,
+        unreachable_by_hangup: &[u32],
+        hangup_collector_pinned: bool,
+    ) -> Result<Recovery> {
         let mut out = Recovery {
             failures: Vec::new(),
             notes: Vec::new(),
         };
+
+        // **Which verdict is in force, printed on every run.** Without this a
+        // change that made `hangup_collector_pinned` false everywhere would leave
+        // `a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path`
+        // green while it asserted nothing — the shape this file's own history
+        // says to watch for. That test reads this line, so the downgrade cannot
+        // happen quietly.
+        out.notes.push(
+            if hangup_collector_pinned {
+                "recovery: the role never moved, so the owner's hangup callback was a live \
+                 collector for the whole teardown and every record outside the swept \
+                 partition is judged on the STRICT path"
+            } else {
+                "recovery: the role moved during this run, so there may have been no owner \
+                 to run a hangup callback by teardown; the strict path is NOT in force and \
+                 every record is swept and then required to have been collected"
+            }
+            .to_string(),
+        );
 
         let me = tree.participant_slot();
         let view = tree.arena_view();
@@ -2769,11 +2905,18 @@ mod imp {
         // performs the `LIVE -> FREE` CAS when it is next scheduled and sees the
         // hangup. `drive` waits 100 ms after the last `wait()` before calling
         // this, which is generous on an idle host and is a *scheduling*
-        // assumption on a loaded four-vCPU runner — and the failure it would
-        // produce is the worst kind, a red nightly naming a defect that is not
-        // there. A real leak never clears, so re-probing costs a genuinely
-        // failing run two seconds and buys a check that does not depend on when
-        // a thread woke up.
+        // assumption on a loaded runner — and the failure it would produce is
+        // the worst kind, a red nightly naming a defect that is not there.
+        //
+        // **What the retries can and cannot buy.** `drive` holds the current
+        // owner back until after its settle window, but by the time this
+        // function runs every process that could run a hangup callback has been
+        // reaped — so these retries do not give that callback more time, and a
+        // failure here does not mean "not scheduling". What they do cover is the
+        // window between the last `wait()` and the kernel finishing the
+        // teardown, and the `reap_participants` this function itself calls for
+        // the partitioned records. That is narrower than "does not depend on
+        // when a thread woke up", which is what this comment used to claim.
         // **After a migration, one of the two automatic collectors is not
         // coming for *some* records, and this is where that is paid for — for
         // those records and no others.**
@@ -2795,25 +2938,33 @@ mod imp {
         // from which processes have published themselves as owner — and this
         // function partitions on it **before** sweeping anything.
         //
-        // **The first version of this swept the whole table on any run that
-        // migrated**, which is the same shape as the defect this check exists to
-        // catch: with the owner-kill arm on by default, every default run took
-        // the permissive branch, and an engine whose hangup collector had been
-        // deleted still printed `PASS`. Recorded rather than quietly replaced,
-        // because "sweep, then report the count in a note" reads like a check
-        // and is not one — nothing downstream of that sweep could fail.
+        // **Two earlier versions of this, both recorded rather than quietly
+        // replaced, because each was wrong in the opposite direction and the
+        // shipped shape sits between them.**
+        //
+        // The first swept the whole table on any run that migrated and reported
+        // the count in a note — the same shape as the defect this check exists
+        // to catch. With the owner-kill arm on by default every run took that
+        // branch, nothing downstream of the sweep could fail, and an engine
+        // whose hangup collector had been deleted still printed `PASS`.
+        //
+        // The second put the strict verdict on the migrating arm as well, and
+        // **failed healthy runs**. Two causes, and fixing the first was not
+        // enough: the exempt set was sampled from the `owner.pid` marker (see
+        // [`inherited_pids`]), and — the one that decided the shape — after a
+        // migration there is usually no owner at all by teardown, so the
+        // collector the strict verdict blames was never alive to be blamed.
+        //
+        // What ships requires a sweep to have *worked* on every run, which the
+        // first version did not, and reaches the strict verdict only where the
+        // collector it names is pinned, which the second did not check.
         let table = view.participants();
         let mut leaked = Vec::new();
         for attempt in 0..9 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(250));
             }
-            leaked.clear();
-            for slot in 0..table.capacity() as u32 {
-                if slot != me && table.identity(slot).is_some() && !tree.participant_alive(slot) {
-                    leaked.push(slot);
-                }
-            }
+            leaked = dead_participant_slots(tree);
             if leaked.is_empty() {
                 break;
             }
@@ -2841,16 +2992,59 @@ mod imp {
                 .is_some_and(|(rec_pid, _, _)| unreachable_by_hangup.contains(&rec_pid))
         });
         leaked = others;
+        // **On a run whose role migrated, the partition is reported and not
+        // enforced, and this is the honest position rather than the strong
+        // one.** The strict half below fails a record outright on the grounds
+        // that the owner's hangup callback was its collector — which presumes an
+        // owner was alive and serving while these processes' sockets closed.
+        // After a migration that presumption is usually wrong: the heir is an
+        // ordinary worker, its `work` loop ends on a detach arm or on its
+        // operation cap, and with every other child already dead nothing remains
+        // to inherit, so the arena spends most of the teardown with no owner at
+        // all. `drive` measured that directly before this branch was written.
+        //
+        // **The first version of this shipped the strict verdict on the
+        // migrating arm and it failed healthy runs**, intermittently, on a
+        // loaded host, with a message naming an engine defect that was not
+        // there — which in a torture harness is worse than no check, because it
+        // teaches the reader to re-run. Two things were wrong and only one of
+        // them was the exempt set being sampled; completing that set (see
+        // [`inherited_pids`]) narrowed the failure rate and did not remove it,
+        // because the premise itself does not hold here.
+        //
+        // What the migrating arm still requires is **weaker and real**: every
+        // record is swept and then required to have been collected, so a run
+        // where reclamation is broken outright still fails, and the sweeper
+        // mutant (`Tree::reap_participants` returning 0) fails it on every seed
+        // tried. What it cannot say is *which* collector should have acted.
+        // `--no-kill-owner` is where that is pinned, and
+        // `a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path`
+        // is the case that drives it.
+        if !hangup_collector_pinned && !leaked.is_empty() {
+            out.notes.push(format!(
+                "recovery: {} slot(s) were held by processes whose last recorded attachment \
+                 named the owner still serving at teardown, so the hangup callback was their \
+                 expected collector — but the role migrated during this run, and a heir is an \
+                 ordinary worker that can detach and leave the arena ownerless before the \
+                 teardown finishes, so this run cannot say the callback was the collector \
+                 that failed. They are swept with the rest rather than failed. Run \
+                 `--no-kill-owner` for the arm that pins this.",
+                leaked.len()
+            ));
+            unreachable.append(&mut leaked);
+            unreachable.sort_unstable();
+        }
         if !unreachable.is_empty() {
             let partitioned = unreachable.len();
             let swept = tree.reap_participants();
             unreachable
                 .retain(|slot| table.identity(*slot).is_some() && !tree.participant_alive(*slot));
             out.notes.push(format!(
-                "recovery: {partitioned} slot(s) held a record no hangup callback can reach — \
-                 an owner's own, or a pre-migration survivor's (docs/decisions/0043) — so \
-                 `reap_participants` was asked for them; it reclaimed {swept} record(s) and \
-                 {} of those slot(s) remain",
+                "recovery: {partitioned} slot(s) held a record this run does not require the \
+                 hangup callback to have collected — an owner's own, a pre-migration \
+                 survivor's (docs/decisions/0043), or, on a run whose role migrated, any \
+                 record at all (see the note above) — so `reap_participants` was asked for \
+                 them; it reclaimed {swept} record(s) and {} of those slot(s) remain",
                 unreachable.len()
             ));
             if !unreachable.is_empty() {
@@ -2866,17 +3060,23 @@ mod imp {
         if !leaked.is_empty() {
             out.failures.push(format!(
                 "{} of {} participant slot(s) hold a LIVE record for a process the kernel \
-                 says is dead {:?}{}. These are leaked: each was held by a process that \
-                 attached under the owner still serving at teardown, so the socket that owned \
-                 it closed and step 4's hangup callback was the collector — and this verdict \
-                 was taken before any sweep ran, so `reap_participants` cannot answer for \
-                 them. A dead record is otherwise collected only when a grant walks past its \
-                 slot (`docs/decisions/0028` plan step 3), and this run is over, so none is \
-                 coming. `docs/PHASE2.md` §11.4 \
-                 requires that participant slots never leak and §5 requires that liveness \
-                 come from the lock byte, never from `state`. Still held two seconds after \
-                 the last child was reaped, so this is not the owner's hangup callback \
-                 running late.",
+                 says is dead {:?}{}. No collector reclaimed these, and the driver did not \
+                 classify them as records no hangup callback could reach: each was held by a \
+                 process whose last recorded attachment named the owner that was still \
+                 serving at teardown, so step 4's hangup callback is the collector this run \
+                 expected — which is a statement about what the driver knows, not a \
+                 reconstruction of which socket closed when. The verdict was taken before any \
+                 sweep ran, so `reap_participants` cannot answer for them. A dead record is \
+                 otherwise collected only when a grant walks past its slot \
+                 (`docs/decisions/0028` plan step 3), and this run is over, so none is coming. \
+                 `docs/PHASE2.md` §11.4 requires that participant slots never leak and §5 \
+                 requires that liveness come from the lock byte, never from `state`. This \
+                 verdict is only reached on a run whose owner never changed, where that \
+                 callback ran in a process that was parked and serving for the whole \
+                 teardown. **The message used to close by ruling out a late hangup callback \
+                 on the strength of the retry loop above, which is unsound**: by the time \
+                 that loop runs every process that could run such a callback has been reaped, \
+                 so elapsed time here is evidence of nothing.",
                 leaked.len(),
                 table.capacity(),
                 &leaked[..leaked.len().min(8)],

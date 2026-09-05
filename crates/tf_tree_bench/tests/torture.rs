@@ -337,33 +337,39 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
     );
 }
 
-/// **The strict half of the leak check, on the one configuration that pins it.**
+/// **The strict half of the leak check, on a configuration that reaches it.**
 ///
 /// `check_recovery` splits the participant records it finds still `LIVE` for a
 /// dead process into two: the ones `docs/decisions/0043` says no hangup callback
 /// can reach — a process that held the rendezvous, or a child whose own owner
 /// has since died — which are swept and then *required* to have been collected,
 /// and everything else, which fails the run outright. This case exercises the
-/// second, and it is `--no-kill-owner` because that is the configuration in
-/// which the split is trivial: the owner is the parked owner child for the whole
-/// run, so every worker's record is reachable by its hangup callback and only
-/// the owner's own record is in the swept partition.
+/// second. It is `--no-kill-owner` because that is the configuration in which
+/// the owner's hangup callback is a real collector for the whole teardown: the
+/// owner is the parked owner child, which runs no operations and cannot detach,
+/// so every worker's record is reachable by it and only the owner's own record
+/// is in the swept partition.
 ///
-/// **A migrating run cannot pin this and that is a limit worth stating.** After
-/// a migration the owner is an ordinary child, and `work` calls
-/// `Tree::reap_participants` on 3% of its operations — so while the teardown
-/// waits for the hangup callback, the process running it is also sweeping the
-/// table, and either collector can be the one that got there first.
+/// **A migrating run does not reach that verdict, and this doc previously said
+/// it did — with a seed tally, which was wrong twice over.** After a migration
+/// the owner is an ordinary worker; its `work` loop ends on a detach arm or on
+/// its operation cap, and with every other child already dead nothing remains to
+/// inherit, so the arena spends most of the teardown with **no owner**. Blaming
+/// a hangup callback there blames a process that was not running. `drive`
+/// decides this from the inheritance ledger and downgrades the verdict for that
+/// arm to a note; the sweep-and-require half applies either way. Which verdict
+/// was in force is printed by the run and asserted below, so the downgrade
+/// cannot reach this case quietly and leave it green with nothing to say.
 ///
 /// Mutant (applied, confirmed fatal, then reverted): delete the
 /// `table.reclaim(slot, observed)` in the owner's hangup callback
-/// (`crates/tf_tree/src/open.rs`, `docs/decisions/0028` plan step 4). On this
-/// case's own configuration the run then exits 1 with `3 of 64 participant
-/// slot(s) hold a LIVE record ... [2, 3, 4]`; at 12 s / 4 children / 4 Hz it
-/// failed on all six of the seeds 1/2/3/7/999/1104729, while the default
-/// *migrating* configuration at 20 s / 6 children / 6 Hz passed on four of
-/// those six — which is why this case exists and why it does not kill the
-/// owner.
+/// (`crates/tf_tree/src/open.rs`, `docs/decisions/0028` plan step 4), rebuild
+/// `shm_torture --release --features shm`, and run this case's own arguments at
+/// a few seeds, idle and under load. It exits 1 naming the slots on every seed
+/// it has been tried at. **The counts that stood here are removed** — one of
+/// them was re-measured by a reviewer and by this file's author and came out
+/// different both times, which is what a tally of a scheduling outcome does.
+/// Run the mutant rather than reading a number.
 #[test]
 fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
     let out = torture(&[
@@ -396,6 +402,16 @@ fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
         stdout.contains("recovery:") && !stdout.contains("RECOVERY FAILURE"),
         "the recovery check did not run, so nothing here judged a participant \
          record.\n{stdout}"
+    );
+    // **The positive control for this whole case.** `check_recovery` reaches the
+    // strict verdict only when the run's owner never changed; on the migrating
+    // arm it downgrades to a sweep and a note. Without this assertion a change
+    // that downgraded every run would leave this test green and vacuous, which
+    // is the failure mode the file's own history is full of.
+    assert!(
+        stdout.contains("judged on the STRICT path"),
+        "this run did not put the leak check on its strict path, so passing says \
+         nothing about the owner's hangup callback.\n{stdout}"
     );
 }
 
