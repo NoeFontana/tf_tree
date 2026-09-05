@@ -256,16 +256,19 @@ impl Build {
 /// `MeasurementRefused` is at least paired with a row that carries no numbers.
 /// **The first mitigation was narrower than this paragraph said until
 /// 2026-09-04**: the test read each row's `reproduce` field and not its
-/// `reason`, and three recipes are named in no `reproduce` field at all —
-/// `just dds-bench`, in both `total_rss_n_consumers`' and
-/// `publish_to_visible`'s reasons, and `just bench-check` and
-/// `just bench-baseline-update` in `embedding_cross_crate`'s. It reads both
-/// now. It still says nothing about whether the recipe measures what the row
-/// claims it measures.
+/// `reason`, and recipes are named in reasons that appear in no `reproduce`
+/// field — `just bench-report`, for one, which `frozen_row_reason` names in
+/// both `.tft` rows' reason while neither row's `reproduce` names it. It reads
+/// both now. **A count of those recipes stood here, and in the test, and in
+/// `docs/PHASE5.md`, and it was wrong**: it named a closed set and
+/// `just bench-report` was not in it. It is not replaced with a corrected
+/// count — the set is whatever differencing `reason` against `reproduce` over
+/// the emitted `results.json` answers on the day you ask, and a copy of that
+/// answer in prose is the thing that went stale. The check still says nothing
+/// about whether the recipe measures what the row claims it measures.
 /// **A row whose ground is `NoInstrument` is exactly as trustworthy as the
 /// person who wrote it**, which is why it is spelled out as its own variant
-/// rather than folded into the others: it is greppable, and it is the shortest
-/// list in this file.
+/// rather than folded into the others: it is greppable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ground {
     /// This host cannot produce a trustworthy number on the row's own
@@ -290,7 +293,7 @@ pub enum Ground {
     /// the row names the recipe. **Not decidable here** — see the type's docs.
     MeasuredElsewhere,
     /// Nothing in this repository measures the quantity at all. **Not decidable
-    /// here**, and the weakest of the seven.
+    /// here**, and the weakest of them.
     NoInstrument,
     /// The instrument ran on this host and declined to answer — an unresolved
     /// band, a verdict below the floor, a load error. **Not decidable here**:
@@ -339,14 +342,20 @@ impl Ground {
     /// The stable spelling of the ground, for [`Report::validate`]'s refusal
     /// messages and for the test that seeds a stale ground and greps for it.
     ///
-    /// **It is not in `results.json` or `index.html`, and this doc comment
-    /// claimed it was until 2026-09-04.** It read "the JSON/HTML spelling, so a
-    /// reader of `results.json` sees the ground and not only the prose", in the
-    /// same commit that decided *not* to emit it: `to_json` writes the schema
-    /// `SCHEMA` names and adding a key to it is a consumer-visible change that
-    /// rides a schema bump, which this change did not take. `grep -c ground
-    /// target/bench-report/results.json` answers 0. If the ground is wanted in
-    /// the artifact, that is the bump — not a quiet extra field.
+    /// **No row carries it into `results.json` or `index.html`, and this doc
+    /// comment claimed the opposite until 2026-09-04.** It read "the JSON/HTML
+    /// spelling, so a reader of `results.json` sees the ground and not only the
+    /// prose", in the same commit that decided *not* to emit it: `to_json`
+    /// writes the schema `SCHEMA` names, and adding a key to it is a
+    /// consumer-visible change that rides a schema bump, which this change did
+    /// not take. What a reader of the artifact gets is the prose reason. The
+    /// checkable form of that is the emitter directly above and below: no row
+    /// object written by `to_json` has a `grounds` key. It is *not* checkable by
+    /// grepping the artifact for one of these spellings — a correction this
+    /// paragraph needed twice, because `host_fitness` is also the name of the
+    /// artifact's top-level fitness block, so a grep for it hits and means
+    /// nothing. If the ground is wanted in the artifact, that is the bump — not
+    /// a quiet extra field.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1888,8 +1897,9 @@ impl Default for Options {
 /// lives in a named recipe — and it carries `Ground::MeasuredElsewhere`, which
 /// is one of the three grounds `Report::validate` cannot decide. That is the
 /// honest label: this half of the reason rests on somebody having read the
-/// repository, and `every_command_the_report_names_is_a_command_that_exists` is
-/// the only thing checking any of it.
+/// repository. What checks it here is
+/// `every_command_the_report_names_is_a_command_that_exists`, and what that
+/// resolves is the recipe's *name* — not that the recipe measures this row.
 fn frozen_row_reason(attempt: &str) -> String {
     if cfg!(all(feature = "shm", target_os = "linux")) {
         format!(
@@ -1974,10 +1984,10 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
     // this block shipped with: these were the whole ground list, so on a host
     // with no obstacle at all the three N-way rows were `unavailable` resting
     // on nothing and `Report::validate` rejected the entire report. The
-    // permanent gap is not a host obstacle — `bench_report` is one process, it
-    // stands up no consumers and links no second engine, so **no configuration
-    // of it measures an N-way cross-engine row on any host** — so it leads the
-    // reason unconditionally, and each row states the ground that goes with it:
+    // permanent gap is not a host obstacle — `bench_report` is one process and
+    // stands up no consumers, so **it measures no N-way row on any host** — so
+    // it leads the reason unconditionally, and each row states the ground that
+    // goes with it:
     // `MeasuredElsewhere` where the recipe the row names really does take the
     // number, `NoInstrument` where nothing takes it at all. Those are different
     // claims and `publish_to_visible` is the row that makes the second one, so
@@ -1986,13 +1996,25 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
     // does not exist.
     let mut host_grounds: Vec<Ground> = Vec::new();
     let host_reason = {
+        // Only the process-count half is unconditional. It is true in every
+        // build: nothing here forks a consumer. The second-engine half is NOT —
+        // under `--features tf2` this binary links one, and `crate::ratio::measure`
+        // and `crate::differential::run_tf2` both call `tf2::BufferCore` in this
+        // process — so it lives in the branch below, which fires only when
+        // `no_ros`, and `no_ros` implies `!build.tf2_linked`. An earlier version
+        // of this round asserted "links no second engine … in any build" here,
+        // which was false in exactly the build `docker/tf2` runs. Not
+        // compile-checkable on a host with no ROS 2 install (`cargo check
+        // --features tf2` fails in `tf_tree_tf2_sys`'s build script); the split is
+        // reasoned off `Build::current()`, whose `tf2_linked` is
+        // `cfg!(feature = "tf2")`.
         let mut parts: Vec<String> = vec![format!(
             "this tool is a single process: it stands up none of the {n} consumers this \
-             row compares and links no second engine, so the row is not measured here in \
-             any build or on any host — the command below is what measures it"
+             row compares, so the row is not measured here on any host — the command \
+             below is what measures it"
         )];
         if !ros_reason.is_empty() {
-            parts.push(ros_reason.to_owned());
+            parts.push(format!("this build links no second engine: {ros_reason}"));
             host_grounds.push(Ground::Tf2NotLinked);
         }
         if let Some(c) = fitness.core_reason.as_deref() {
@@ -2119,11 +2141,11 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
     // claim, and `validate` re-derives the second.
     let (ptv_reason, ptv_grounds) = {
         let mut r = format!(
-            "{host_reason}. One further gap, and it is not the one this reason used to \
-             name: nothing in this repository times publish-to-visible end to end. `just \
-             dds-bench` is a real DDS round trip — one publisher, N tf2_ros listeners, \
-             §5.2's QoS — but `dds_report` reports `svc`, the engine call itself, so its \
-             number answers a different question"
+            "{host_reason}. There is a further gap, and it is not the one this reason \
+             used to name: nothing in this repository times publish-to-visible end to \
+             end. `just dds-bench` is a real DDS round trip — one publisher, N tf2_ros \
+             listeners, §5.2's QoS — but `dds_report` reports `svc`, the engine call \
+             itself, so its number answers a different question"
         );
         // **`NoInstrument`, and deliberately not `MeasuredElsewhere`.** This
         // row's own reason says nothing in this repository times
@@ -2158,17 +2180,20 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
             // describes it at length. What is genuinely missing is the
             // *instrument*: `dds_report`'s `svc` column times the engine call,
             // not the publish timestamp to the moment a consumer can see it.
-            // **"Two further gaps" was one of them by 2026-09-04, and the count
-            // is corrected here rather than quietly dropped.** The sentence read
-            // "this row needs the `shm` feature and a second process per
-            // consumer, which `bench_report` does not have; and nothing in this
-            // repository times publish-to-visible end to end" — and the process
-            // count is now the first clause of `host_reason` itself, so quoting
-            // it again as a *further* gap counted one obstacle twice. What is
-            // left over is the instrument, plus the `shm` feature where the
-            // build lacks it — and that half is conditional now, because
-            // `just bench-report-shm` compiles a binary the old unconditional
-            // sentence was false in.
+            // **This sentence has counted its own gaps wrong in both
+            // directions, and now does not count them.** It first read
+            // "Two further gaps: this row needs the
+            // `shm` feature and a second process per consumer, which
+            // `bench_report` does not have; and nothing in this repository times
+            // publish-to-visible end to end" — but the process count is the
+            // first clause of `host_reason` itself, so quoting it again as a
+            // *further* gap counted one obstacle twice. It was corrected to
+            // "One further gap", which was wrong the other way in the default
+            // build: the `shm` clause below appends a second one. A numeral in
+            // front of a list whose length is decided by a `cfg!` further down
+            // the function is not a fact the writer can hold, so there is no
+            // numeral — the sentences enumerate themselves, and the ground list
+            // beside them is what `validate` re-derives.
             ptv_reason,
             "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
         )
@@ -4773,7 +4798,13 @@ mod tests {
             };
             let tok: Vec<String> = plain.split_whitespace().map(String::from).collect();
             for (i, t) in tok.iter().enumerate() {
-                match cmd(t).as_str() {
+                // Bind the trimmed token ONCE. Matching on `cmd(t)` and then
+                // branching on the raw `t` is how a backticked `` `--bench` ``
+                // in a reason selected this arm and then resolved against
+                // `tests/`; the reason scan was added precisely because reasons
+                // spell commands in backticks.
+                let key = cmd(t);
+                match key.as_str() {
                     "just" => {
                         let name = word(tok.get(i + 1).map_or("", String::as_str));
                         assert!(
@@ -4793,12 +4824,12 @@ mod tests {
                     // `--bench X` / `--test X` name files cargo must be able to
                     // find; a renamed harness is the same class of rot.
                     "--bench" | "--test" => {
-                        let dir = if t == "--bench" { "benches" } else { "tests" };
+                        let dir = if key == "--bench" { "benches" } else { "tests" };
                         let name = word(tok.get(i + 1).map_or("", String::as_str));
                         let path = root.join("crates/tf_tree_bench").join(dir);
                         assert!(
                             path.join(format!("{name}.rs")).exists(),
-                            "{whence} says `{t} {name}`, but {} has no {name}.rs",
+                            "{whence} says `{key} {name}`, but {} has no {name}.rs",
                             path.display()
                         );
                         checked += 1;
@@ -4821,11 +4852,14 @@ mod tests {
             // offer this test as the one partial mitigation for
             // `Ground::MeasuredElsewhere`, "resolves the recipe a
             // `MeasuredElsewhere` row names" — and until 2026-09-04 it read
-            // `reproduce` alone, while three recipes appear in no `reproduce`
-            // field at all: `just dds-bench` (in `total_rss_n_consumers`' and
-            // `publish_to_visible`'s reasons) and `just bench-check` /
-            // `just bench-baseline-update` (in `embedding_cross_crate`'s).
-            // A recipe in a reason rots exactly as a
+            // `reproduce` alone, while recipes are named in reasons that appear
+            // in no `reproduce` field: `just bench-report`, for one, which
+            // `frozen_row_reason` puts in both `.tft` rows' reason while
+            // neither row's `reproduce` names it. A count of them stood here
+            // and was wrong — it named a closed set that this one was not in —
+            // and no number replaces it: differencing the two fields over the
+            // emitted `results.json` answers it, and the fact this line needs
+            // is that the set is not empty. A recipe in a reason rots exactly as a
             // recipe in a command does; it is the same prose wearing a
             // different field name.
             check(&row.reason, row.id);
@@ -4842,12 +4876,19 @@ mod tests {
         // naming only fictional commands. **That is not hypothetical here**:
         // the reason scan added above matched zero tokens on its first version,
         // because a reason spells a recipe in backticks, and this floor was low
-        // enough to hide it. Measured on 2026-09-04 in the default build by
-        // raising this floor above the count and reading the message: **14**
-        // with neither the reason scan nor the leading-token trim, **15** with
-        // the trim alone, **23** with both. The floor is 20 rather than 23 so
-        // that deleting one sentence of prose is not a test failure, and it is
-        // above 15 so that losing the reason scan is.
+        // enough to hide it.
+        //
+        // The floor is the one number here on purpose, and it sits *between*
+        // two counts rather than restating them: above what the scan yields
+        // from `reproduce` and the HTML block alone, so deleting
+        // `check(&row.reason, ...)` or reverting the leading-token trim fails
+        // this test; and below what it yields with both, so deleting one
+        // sentence of prose does not. Prose copies of those two counts stood
+        // here and in `docs/PHASE5.md` and are gone — a count in a comment is a
+        // measurement with a date on it, and this one sat in the same file as
+        // the prose it counted, so editing any reason moved it. Re-derive both,
+        // in whichever tree state you are asking about, by replacing this floor
+        // with an unreachable one and reading the panic message.
         assert!(
             checked >= 20,
             "only {checked} commands were checked — the scanner matched nothing"
@@ -5140,20 +5181,9 @@ CPU part\t: 0xd0c
         }
     }
 
-    /// End-to-end: the report this tool actually assembles on *this* host must
-    /// pass its own §9.3 validation, and the emitted JSON must survive a
-    /// round trip through a parser strict about escapes and non-finite numbers.
-    ///
-    /// The skeleton tests above check `validate` against hand-built reports; if
-    /// `assemble` disagrees with them, only this test notices.
-    ///
-    /// Mutant (verified): in `assemble`, give the `lookup_latency` row
-    /// `Status::Measured` and a `p50_ns` metric before the `timing_status`
-    /// match — this test fails on any host that does not pass the clock-fitness
-    /// probe, which includes the one this was developed on.
-    /// The host with **no obstacle at all**, which no committed test could
-    /// reach before this one and where the branch that introduced `Ground` was
-    /// broken.
+    /// The all-clear host: **no obstacle at all**, which no committed test
+    /// could reach before this one and where the branch that introduced
+    /// `Ground` was broken.
     ///
     /// `assemble` probes, and this repository's development host has four
     /// physical cores, so `Fitness::core_reason` was always `Some` and the
@@ -5167,6 +5197,12 @@ CPU part\t: 0xd0c
     /// `Ground::MeasuredElsewhere` in `assemble_on`, which is the honest label
     /// — this tool is one process and these three rows are measured by the
     /// recipes they name.
+    ///
+    /// Mutant (verified, re-run 2026-09-05): replace `n_way_grounds` in
+    /// `assemble_on` with `host_grounds.clone()`, i.e. drop the seeded
+    /// `Ground::MeasuredElsewhere` — this test fails with "row
+    /// `cpu_per_consumer` is unavailable on an all-clear host carrying grounds
+    /// []", which is the shipped defect reproduced.
     #[test]
     fn a_host_with_no_obstacle_still_grounds_every_n_way_row() {
         const N: usize = 4;
@@ -5250,6 +5286,17 @@ CPU part\t: 0xd0c
         assert_eq!(r.validate(), Ok(()));
     }
 
+    /// End-to-end: the report this tool actually assembles on *this* host must
+    /// pass its own §9.3 validation, and the emitted JSON must survive a
+    /// round trip through a parser strict about escapes and non-finite numbers.
+    ///
+    /// The skeleton tests above check `validate` against hand-built reports; if
+    /// `assemble` disagrees with them, only this test notices.
+    ///
+    /// Mutant (verified): in `assemble`, give the `lookup_latency` row
+    /// `Status::Measured` and a `p50_ns` metric before the `timing_status`
+    /// match — this test fails on any host that does not pass the clock-fitness
+    /// probe, which includes the one this was developed on.
     #[test]
     fn the_assembled_report_passes_its_own_validation() {
         let opts = Options {
