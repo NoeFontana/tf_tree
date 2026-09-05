@@ -2159,7 +2159,9 @@ shm-check:
     # (`gate_arithmetic_is_not_vacuous` among them) did run. What was true, and
     # is the reason for this line, is narrower and about CI reach rather than
     # execution: `grep -rn 'just shm-test' .github/` returns nothing, while
-    # `just shm-check` is `.github/workflows/ci.yml:675` in the `shm` job. So
+    # `just shm-check` is a step of the `shm` job in `.github/workflows/ci.yml`
+    # (`grep -n 'just shm-check' .github/workflows/ci.yml` locates it; a line
+    # number is not written here because an edit above it moves one). So
     # the negative control `docs/benchmarks/EVIDENCE.md`'s `owner_migration`
     # row cites — the reason that gate's verdict is known to be able to flip —
     # was reachable only by a human typing `just shm-test`, and is now reached

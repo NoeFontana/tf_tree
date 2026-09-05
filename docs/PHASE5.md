@@ -2091,7 +2091,9 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
    > `cargo nextest run -p tf_tree_bench --features shm --bin owner_migration`
    > since before this change, so those five tests did execute; what no
    > workflow did was invoke that recipe (`grep -rn 'just shm-test' .github/`
-   > returns nothing, `just shm-check` is `.github/workflows/ci.yml:675`). The
+   > returns nothing, while `just shm-check` is a step of that file's `shm` job —
+   > located with `grep -n 'just shm-check' .github/workflows/ci.yml` rather
+   > than by a line number, which the next edit above it invalidates). The
    > claim that survives measurement is about CI reach, not about execution,
    > and it is weaker than the one first published. `frozen_workers`'s two
    > arithmetic tests are the ones that had no recipe of either kind — they are
