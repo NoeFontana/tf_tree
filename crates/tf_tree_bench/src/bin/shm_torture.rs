@@ -1847,7 +1847,7 @@ mod imp {
         // false red needs every one of ~60 independent draws to lose a race
         // measured at ~36% — not a margin worth writing a number for.
         if a.crash_points {
-            if armed == 0 {
+            if ledger.armed == 0 {
                 bail!(
                     "--crash-points armed 0 children over {rounds} rounds, so this run \
                      exercised no §11.3 site at all and `0 violation(s)` says nothing \
@@ -1857,15 +1857,16 @@ mod imp {
                      are non-empty in it."
                 );
             }
-            if aborted == 0 {
+            if ledger.aborted == 0 {
                 bail!(
-                    "--crash-points armed {armed} child(ren) and none of them aborted \
+                    "--crash-points armed {} child(ren) and none of them aborted \
                      at its site, so no process was killed mid-protocol and this run \
                      is a plain SIGKILL soak wearing §11.3's name. The driver's kills \
                      reach an armed child before it gets there — raise --duration or \
                      lower --kill-hz. This is the run the `§11.3:` line's second \
                      number exists to distinguish; the exit status now carries it, \
-                     because a workflow reads only that."
+                     because a workflow reads only that.",
+                    ledger.armed
                 );
             }
         }
