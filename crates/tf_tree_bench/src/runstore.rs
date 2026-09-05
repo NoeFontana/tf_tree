@@ -105,7 +105,27 @@ pub const HOST_CRITICAL_FACTS: &[&str] = &[
     "kernel",
     "target",
     "counters_feature",
+    // **Two THP knobs, and the arena's is the second one.**
+    // `transparent_hugepage/enabled` governs anonymous mappings;
+    // `transparent_hugepage/shmem_enabled` governs the `MAP_SHARED` `memfd`
+    // every harness in this crate that touches a shared arena is measuring, and
+    // the two default differently — `[madvise]` against `[never]` on the
+    // development host. Comparing only the first says two runs measured the same
+    // machine when the arena's huge-page eligibility changed underneath them;
+    // `crates/tf_tree_cli/src/hostfacts.rs` records what that cost `TFT016`. A
+    // run file written before this key existed reads `absent` and therefore as
+    // drift, which is the correct reading rather than a regression.
+    //
+    // **Both are here, and the first is not redundant.** An earlier revision of
+    // this list replaced `transparent_hugepage` with the shmem key rather than
+    // adding it, which silently retired drift detection on the knob the DEFAULT
+    // build depends on: `just bench-report` builds without `--features shm`, so
+    // the arena it measures is a heap — an anonymous mapping, governed by the
+    // first key and not the second. Two runs whose anonymous setting had flipped
+    // compared as the same machine. `every_host_critical_fact_is_diffed` below
+    // is what makes the next such removal a test failure.
     "transparent_hugepage",
+    "transparent_hugepage_shmem",
 ];
 
 /// The provenance facts that make a comparison **impossible**, not merely
@@ -1087,6 +1107,77 @@ mod tests {
             render(&d).contains("row / metric"),
             "the table is still printed"
         );
+    }
+
+    /// [`HOST_CRITICAL_FACTS`]'s membership is pinned here, and every key in it
+    /// is separately shown to be diffed.
+    ///
+    /// **This test exists because a key was silently deleted from that list.**
+    /// A revision adding `transparent_hugepage_shmem` *replaced*
+    /// `transparent_hugepage` rather than joining it, so two runs whose
+    /// anonymous huge-page setting had flipped compared as the same machine.
+    /// Nothing failed: the const had three references in the crate — its
+    /// definition, its doc, and the single `drift()` call site — and no test
+    /// named a key.
+    ///
+    /// **The expected list is spelled out rather than derived, and that is the
+    /// whole mechanism.** The first version of this test looped over
+    /// `HOST_CRITICAL_FACTS` and asserted each key drifted. It passed with a key
+    /// deleted — removing the key removes the arm that would have caught it, so
+    /// it could not fail on the defect it was written for. A membership pin has
+    /// to compare against a list the change under test does not edit; changing
+    /// what this crate treats as host-critical now costs a deliberate edit in
+    /// two places, which is the cost being bought.
+    ///
+    /// Mutant (applied, observed): delete `"transparent_hugepage"` from
+    /// [`HOST_CRITICAL_FACTS`] — fails on the membership assertion, naming it.
+    /// Mutant (applied, observed): drop `HOST_CRITICAL_FACTS` from `drift`'s
+    /// call at [`diff`] — fails in the per-key loop on the first key.
+    #[test]
+    fn every_host_critical_fact_is_pinned_and_diffed() {
+        // Keep in step with `HOST_CRITICAL_FACTS` above, deliberately.
+        const EXPECTED: &[&str] = &[
+            "cpu_model",
+            "physical_cores",
+            "logical_cpus",
+            "cpu_governor",
+            "kernel",
+            "target",
+            "counters_feature",
+            "transparent_hugepage",
+            "transparent_hugepage_shmem",
+        ];
+        assert_eq!(
+            HOST_CRITICAL_FACTS, EXPECTED,
+            "HOST_CRITICAL_FACTS changed. That is allowed — update EXPECTED in \
+             the same commit — but it is never a silent edit: a key dropped \
+             from this list retires drift detection for it, which is how \
+             `transparent_hugepage` went missing"
+        );
+
+        for key in HOST_CRITICAL_FACTS {
+            let mut a = run(vec![row("n=1", 1.0, 0.1)]);
+            let mut b = run(vec![row("n=1", 1.0, 0.1)]);
+            // Pin both sides to a known value first: whether *this* host
+            // records the key is not what is under test, and a key absent from
+            // both runs would otherwise read as agreement.
+            for (r, v) in [(&mut a, "before"), (&mut b, "after")] {
+                match r.provenance.facts.iter_mut().find(|f| &f.key == key) {
+                    Some(f) => f.value = v.to_owned(),
+                    None => r.provenance.facts.push(crate::report::Fact {
+                        key,
+                        value: v.to_owned(),
+                    }),
+                }
+            }
+            let d = diff(&a, &b);
+            assert!(
+                d.host_drift.iter().any(|(k, _, _)| k == key),
+                "`{key}` is in HOST_CRITICAL_FACTS but a change to it is not \
+                 reported as host drift, so nothing would notice the machine \
+                 moving underneath two runs"
+            );
+        }
     }
 
     /// A value for `key` guaranteed to differ from whatever *this* build
