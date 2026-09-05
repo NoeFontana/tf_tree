@@ -813,16 +813,17 @@ Pair the rename with a stronger, testable claim:
 >
 > `just no-network` (`scripts/no-network.sh`) is the assertion, and
 > `.github/workflows/ci.yml`'s `shm` job runs it on both matrix rows.
-> Until 2026-09-04 there was none:
-> `git grep -n 'AF_UNIX|AF_INET|seccomp|strace' main` returned **17 matching
-> lines across 7 files, 9 of them outside `docs/`**, and every one was prose or
-> a comment rather than an assertion — including
-> `crates/tf_tree_cli/src/web.rs`'s design note, which had scoped an assertion
-> that did not exist. **That count was first published as "five" here and in
-> two other files, and was wrong in all three**; the qualitative half (every
-> hit prose, none an assertion) was and is correct, and it is the half the
-> argument rests on. §13's box 4 had recorded this as owed since the section
-> was written, and no §0.0 row covered it, because §0.0 has rows for §1–§10 and
+> Until 2026-09-04 there was none: every hit of
+> `git grep -nE 'AF_UNIX|AF_INET|seccomp|strace' main` was prose or a comment
+> rather than an assertion — including `crates/tf_tree_cli/src/web.rs`'s design
+> note, which had scoped an assertion that did not exist. **A hit count stood
+> here and in two other files and is now deleted rather than corrected again**:
+> it was first published wrong, then corrected, and the corrected figure was
+> printed beside a basic-regex spelling of that command in which `|` is a
+> literal, so a reader who ran what was printed got a different number. The
+> qualitative half — every hit prose, none an assertion — was and is correct,
+> and it is the half the argument rests on. §13's box 4 had recorded this as
+> owed since the section was written, and no §0.0 row covered it, because §0.0 has rows for §1–§10 and
 > nothing for §11's test plan. **The word "full" is what moved**, and the
 > correction is stated rather than quietly applied: §11's row already said
 > *"scoped to the library's suite"* while this sentence said *"the full test
@@ -833,15 +834,20 @@ Pair the rename with a stronger, testable claim:
 > **What is traced.** The test binaries of the five published crates —
 > `tf_tree`, `tf_tree_core`, `tf_tree_math`, `tf_tree_arena`, `tf_tree_ipc` —
 > built with `tf_tree/shm,tf_tree_arena/shm`, under `strace -f`, so a spawned
-> rendezvous child is followed too. Measured on the development host: 26 binaries,
-> **~1 180 `socket(2)` calls, every one `AF_UNIX`**, in ~25 s.
+> rendezvous child is followed too. **Every `socket(2)` call observed was
+> `AF_UNIX`**, in ~25 s on the development host. The call total is deliberately
+> not quoted: it varies run to run on one host, and the script prints its own
+> figure on every run. (A single call total stood here and did not reproduce
+> across later runs on the same host, which is why it is gone rather than
+> re-measured.)
 >
 > **The exception is a positive control rather than a carve-out**, which is the
 > part worth reading. An `AF_INET` socket that the scanner had learned to ignore
 > would be invisible; so would a scan pointed at nothing. The recipe therefore
 > runs a *second*, separate trace over `crates/tf_tree_cli/tests/web.rs` — a
 > package deliberately outside the claim — and **refuses unless it finds
-> `AF_INET` there** (11 sockets on this host). The scoping is expressed once, as
+> `AF_INET` there** — the script prints how many it found. The scoping is
+> expressed once, as
 > a package list, and never as a family the scanner tolerates.
 >
 > **Three more refusals, because a check that cannot check its property must not
@@ -855,7 +861,7 @@ Pair the rename with a stronger, testable claim:
 > was not traced, or opened no `AF_UNIX` socket, is a refusal: that target
 > carries `required-features = ["shm"]`, so it is exactly what disappears if the
 > feature set drifts. **A bare socket count does not catch that** and was tried
-> first — dropping `shm` takes the total from ~1 180 to 23, not to 0, because
+> first — dropping `shm` takes the total to 23, not to 0, because
 > `tf_tree_ipc`'s own tests open theirs regardless, and the seeded run passed.
 >
 > **What it does not establish.** Nothing about a code path no test takes: this
@@ -863,12 +869,15 @@ Pair the rename with a stronger, testable claim:
 > unexercised branch is invisible to it. Nothing about a socket the library never
 > creates but *inherits* — `tf_tree_ipc` passes the rendezvous fd, and `socket(2)`
 > is the syscall this sentence names, not `connect(2)` or `sendto(2)` on a
-> received one. Nothing about a non-Linux target. And **nothing about the
-> packages outside the traced set and outside the control** — `tf_tree_bench`,
-> `tf_tree_ingest`, `tf_tree_bridge`, `tf_tree_c` and `tf_tree_py` are traced by
-> nothing, which follows from the scoping above but is worth naming, because
-> "asserted in CI" over a five-crate subset reads like "asserted over the
-> repository" to somebody who has not opened the script.
+> received one. Nothing about a non-Linux target. And **nothing about any
+> package other than the five traced and the control** — everything else in the
+> repository, `crates/tf_tree_tf2_sys` and `xtask` included, is traced by
+> nothing. That follows from the scoping above by construction, but it is worth
+> saying, because "asserted in CI" over a five-crate subset reads like
+> "asserted over the repository" to somebody who has not opened the script.
+> (An enumeration of the untraced packages stood here and shipped incomplete;
+> the rule replaces it, and `cargo metadata --no-deps` is what generates the
+> list.)
 > `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header, and
 > since 2026-09-04 a RED TESTS block naming which refusals have been seeded and
 > observed to fire.
@@ -1972,7 +1981,7 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
 - **Multi-process page sharing:** 16 processes mapping one `.tft`; assert total RSS is within 1.2× of a single process, measured from `/proc/*/smaps_rollup` `Pss`.
 - **Fork safety:** a `DataLoader` with `num_workers=16` under all three start methods.
 - **Counter contention:** 16 concurrent readers on one edge, each holding a long-lived `Guard`; assert no measurable throughput difference against a `counters`-disabled build.
-- **No network:** full suite under `strace`/seccomp, asserting `socket(2)` is only ever `AF_UNIX` (§5.1). **Scoped to the library's suite** — `tf_tree top --web` is an `AF_INET` listener by construction, and §7's web-view amendment records why that exception belongs in this sentence rather than inside the assertion. **Implemented 2026-09-04**: `just no-network` (`scripts/no-network.sh`), run by `.github/workflows/ci.yml`'s `shm` job on both matrix rows. 26 library test binaries, ~1 180 `socket(2)` calls, all `AF_UNIX`. The exception is the recipe's **positive control** — a separate trace over `crates/tf_tree_cli/tests/web.rs` that must find `AF_INET` — so "scoped to the library" and "scoped so narrowly it sees nothing" are distinguishable outcomes rather than the same green. It refuses on a missing `strace`, on a `strace` that cannot see a socket it is shown on purpose, on a traced binary that exits non-zero, and on a run in which `tests/rendezvous.rs` was not traced or opened no socket. §5.1's amendment carries the rest, including the one word of §5.1 this corrects.
+- **No network:** full suite under `strace`/seccomp, asserting `socket(2)` is only ever `AF_UNIX` (§5.1). **Scoped to the library's suite** — `tf_tree top --web` is an `AF_INET` listener by construction, and §7's web-view amendment records why that exception belongs in this sentence rather than inside the assertion. **Implemented 2026-09-04**: `just no-network` (`scripts/no-network.sh`), run by `.github/workflows/ci.yml`'s `shm` job on both matrix rows. Every `socket(2)` call the library's test binaries made was `AF_UNIX`; the run prints how many binaries and calls that was, and the figure is not copied here because it moves between runs on one host. The exception is the recipe's **positive control** — a separate trace over `crates/tf_tree_cli/tests/web.rs` that must find `AF_INET` — so "scoped to the library" and "scoped so narrowly it sees nothing" are distinguishable outcomes rather than the same green. It refuses on a missing `strace`, on a `strace` that cannot see a socket it is shown on purpose, on a traced binary that exits non-zero, and on a run in which `tests/rendezvous.rs` was not traced or opened no socket. §5.1's amendment carries the rest, including the one word of §5.1 this corrects.
 - **Convenience-path guard reuse:** assert `tree.lookup` in a loop performs O(1) atomic flushes, not O(n).
 - **Diagnostics:** one test per check ID, each with a fixture that triggers exactly that check and no other.
 - **`doctor --json`:** schema-validated; adding a check must not break an existing consumer.
@@ -2322,7 +2331,7 @@ Criterion 4 is the wedge's central claim, and criterion 7 is what makes it belie
 - [ ] `FORMAT_VERSION = 3` shipped in a single commit, with Phase 6 regions reserved and `doctor --explain-version`
 - [ ] Publish-side observability derived, not counted — push path unchanged and benchmarked to prove it
 - [ ] Nothing in the codebase, CLI, or docs is called "telemetry"
-- [x] `socket(2)` restricted to `AF_UNIX`, asserted in CI — `just no-network`, in `ci.yml`'s `shm` job. Scoped to the library's suite per §11; the CLI's one `AF_INET` listener is the check's positive control rather than an exception inside it. **Read the scope with the tick, because it is not the repository**: the five published crates are traced, `tf_tree_cli` is traced as the control, and `tf_tree_bench`, `tf_tree_ingest`, `tf_tree_bridge`, `tf_tree_c` and `tf_tree_py` are traced by **nothing**. §5.1's amendment states what it does and does not prove
+- [x] `socket(2)` restricted to `AF_UNIX`, asserted in CI — `just no-network`, in `ci.yml`'s `shm` job. Scoped to the library's suite per §11; the CLI's one `AF_INET` listener is the check's positive control rather than an exception inside it. **Read the scope with the tick, because it is not the repository**: the five published crates are traced, `tf_tree_cli` is traced as the control, and **every other package here is traced by nothing** (this line used to enumerate them and the enumeration was incomplete). §5.1's amendment states what it does and does not prove
 - [ ] Error-path counters always on with no runtime switch; `counters` cargo feature is the only knob
 - [ ] Convenience path holds a long-lived per-thread `Guard`
 - [ ] `freeze --from-live` captures counters into the manifest

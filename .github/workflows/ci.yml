@@ -652,8 +652,9 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     # 20 until `just no-network` joined it: that recipe builds `tf_tree_cli`'s
-    # test targets for its positive control, which nothing else in this job
-    # needs, and then traces 26 binaries single-threaded.
+    # test targets for its positive control, which no other step in this job
+    # needs, and then traces the library's test binaries single-threaded under
+    # `strace -f`. (A binary count stood here; the recipe prints its own.)
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

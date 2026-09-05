@@ -6,12 +6,14 @@
 # backs — "the `tf_tree` **library** opens no network sockets. Ever." — is one a
 # robotics team makes a procurement decision on, and §5.1 says in as many words
 # that a promise in a README is worth less than an assertion in CI. Before this
-# script, `git grep -n 'AF_UNIX\|AF_INET\|seccomp\|strace' main` returned
-# **17 matching lines across 7 files, 9 of them outside `docs/`**, and every one
-# was prose or a comment — not one was an assertion. (The count is the corrected
-# one: "five hits" was published here, in `docs/PHASE5.md` §5.1's amendment and
-# in the justfile on 2026-09-04, and was wrong in all three. Recount with the
-# command, do not copy the figure.)
+# script, every hit of `git grep -nE 'AF_UNIX|AF_INET|seccomp|strace' main` was
+# prose or a comment — **not one was an assertion**, and that is the half the
+# argument rests on. **A hit count used to be published here, in
+# `docs/PHASE5.md` §5.1's amendment and in the justfile.** It was published
+# wrong, corrected once, and then printed beside a basic-regex spelling of the
+# command in which `|` is a literal, so the instrument and the measurement
+# disagreed. It is deleted rather than corrected a third time: run the command
+# above if you want the size of it.
 #
 # ## PROVES
 #
@@ -60,18 +62,24 @@
 #     features. `--features tf_tree/shm,tf_tree_arena/shm` is used deliberately:
 #     without `shm` the Phase 2 rendezvous is compiled out, and the socket the
 #     claim is *about* is then never opened. **That does not reduce the socket
-#     count to zero** — it fell from ~1 180 to 23, because `tf_tree_ipc`'s own
-#     tests open theirs regardless — which is why the anti-vacuity floor below
-#     names the `tf_tree::rendezvous` binary rather than counting sockets. An
-#     earlier revision of this header claimed a bare count would catch it, and
-#     the run that was supposed to demonstrate that passed.
-#   * Anything about the packages that are not in `PACKAGES` below and are not
-#     the control: `tf_tree_bench`, `tf_tree_ingest`, `tf_tree_bridge`,
-#     `tf_tree_c` and `tf_tree_py` are traced by **nothing**. That is the same
-#     scoping as the `PACKAGES` list — the five published crates are what a
-#     downstream links — but it is worth naming, because "asserted in CI" over
-#     a five-crate subset reads like "asserted over the repository" to somebody
-#     who did not open this file.
+#     count to zero** — with `shm` dropped the total lands at 23 rather than 0,
+#     because `tf_tree_ipc`'s own tests open theirs regardless. That is why the
+#     anti-vacuity floor below names the `tf_tree::rendezvous` binary rather
+#     than counting sockets. An earlier revision of this header claimed a bare
+#     count would catch it, and the run that was supposed to demonstrate that
+#     passed. (The green run's own total is **not** quoted here: it is
+#     run-dependent on one host, and the script prints it every time.)
+#   * Anything about a package that is neither in `PACKAGES` below nor the
+#     control. The traced set is exactly `PACKAGES` — the five published crates,
+#     what a downstream links — plus `tf_tree_cli` as the control; **everything
+#     else in this repository is traced by nothing.** That follows from the
+#     `PACKAGES` list by construction, and it is worth saying because "asserted
+#     in CI" over a five-crate subset reads like "asserted over the repository"
+#     to somebody who did not open this file. (This bullet used to enumerate the
+#     untraced packages. The list was published incomplete — it missed
+#     `crates/tf_tree_tf2_sys`, the ROS 2 bridge, and `xtask` — so the rule
+#     replaces it rather than a longer list: `cargo metadata --no-deps` and
+#     `ls crates/` are what generate it.)
 #
 # ## RED TESTS
 #
@@ -231,8 +239,8 @@ fi
 # becomes a statement about a suite that opens no rendezvous.
 #
 # **The floor names the binary rather than counting.** A count is the obvious
-# guard and it does not work: with `shm` dropped the total falls from ~1 180 to
-# 23 rather than to 0, because `tf_tree_ipc`'s own tests open theirs whatever
+# guard and it does not work: with `shm` dropped the total falls to 23 rather
+# than to 0, because `tf_tree_ipc`'s own tests open theirs whatever
 # `tf_tree` was built with — measured, after a bare count was written here and
 # the run seeded to defeat it passed. `crates/tf_tree/tests/rendezvous.rs`
 # carries `required-features = ["shm"]`, so it is exactly the target that

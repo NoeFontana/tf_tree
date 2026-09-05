@@ -111,8 +111,13 @@ repository":
 - **What it does not cover:** a code path no test takes, a socket the library
   *inherits* rather than creates (`tf_tree_ipc` passes the rendezvous fd, and
   `connect(2)`/`sendto(2)` on a received fd are not traced), a non-Linux target,
-  and the non-published crates (`tf_tree_bench`, `tf_tree_ingest`,
-  `tf_tree_bridge`, `tf_tree_c`, `tf_tree_py`), which are traced by nothing.
+  and **every package in this repository other than the five above and
+  `tf_tree_cli`** — including `crates/tf_tree_tf2_sys`, the ROS 2
+  `tf2::BufferCore` bridge, which is worth naming rather than deriving because
+  ROS 2 middleware is DDS over UDP. Those are traced by nothing. (This
+  bullet used to enumerate the untraced crates by name; the list shipped
+  incomplete, which in a "what it does not cover" bullet is the worst place for
+  an omission, so it is stated as the rule the traced set generates.)
   `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header.
 
 Verify it yourself if it matters to you: `just no-network` (it needs `strace`,

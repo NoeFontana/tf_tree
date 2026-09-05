@@ -2035,21 +2035,24 @@ tsan:
 shm-test:
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
-    # **`owner_migration`'s unit tests and lint.** The binary is
-    # `required-features = ["shm"]`, so `just lint`'s workspace pass compiles it
-    # out entirely; without these two lines the gate that states §12.3 4b would
-    # be linted by nothing. The measurement itself is `just owner-migration` —
-    # minutes long, and scheduler-sensitive, so it does not belong in a
-    # per-branch gate.
+    # **`owner_migration`'s unit tests and lint, so this recipe is
+    # self-contained.** The binary carries `required-features = ["shm"]`
+    # (`crates/tf_tree_bench/Cargo.toml`), so `just lint`'s workspace pass
+    # compiles it out entirely and a developer running only `just shm-test`
+    # would otherwise neither lint nor run the gate that states §12.3 4b. The
+    # measurement itself is `just owner-migration` — minutes long, and
+    # scheduler-sensitive, so it does not belong in a per-branch gate.
     #
-    # **This comment used to end "which run in no other recipe", and that
-    # stopped being true on 2026-09-04**, when `shm-check` grew a
-    # `--features shm --bins` line covering every `[[bin]]` in the crate. The
-    # duplication is deliberate and the two lines are not redundant: this one is
-    # the *only* place `owner_migration` is linted, and `shm-check`'s is the
-    # only place its tests are reached by a recipe a workflow invokes
-    # (`grep -rn 'just shm-test' .github/` returns nothing; `just shm-check` is
-    # `.github/workflows/ci.yml:675`).
+    # **These two lines duplicate `shm-check`, and two earlier versions of this
+    # comment claimed they did not.** It first said the tests "run in no other
+    # recipe"; `shm-check`'s `--features shm --bins` line runs them. The
+    # correction then said this was the only place the binary is *linted*;
+    # `shm-check`'s `cargo clippy -p tf_tree_bench --features shm --all-targets`
+    # compiles this `[[bin]]` too (measured with `--message-format=json`, which
+    # emits an artifact for it). **No third superlative is written here.** Which
+    # recipes reach this binary is a
+    # `grep -n 'tf_tree_bench --features shm' justfile` away, and if it has to
+    # hold it needs a check rather than a sentence.
     cargo clippy -p tf_tree_bench --features shm --bin owner_migration --all-targets -- -D warnings
     cargo nextest run -p tf_tree_bench --features shm --bin owner_migration
 
@@ -2149,10 +2152,10 @@ shm-check:
     #
     # **CORRECTION (2026-09-04, same day):** the first version of this comment
     # said "not one of them had ever been run by a recipe". That was false, and
-    # `just shm-test` (four recipes above this one, at the top of this Phase 2
-    # block) is the refutation — it has run
+    # `just shm-test`, earlier in this same Phase 2 block, is the refutation —
+    # it has run
     # `cargo nextest run -p tf_tree_bench --features shm --bin owner_migration`
-    # since before this line existed, so `owner_migration`'s five tests
+    # since before this line existed, so `owner_migration`'s unit tests
     # (`gate_arithmetic_is_not_vacuous` among them) did run. What was true, and
     # is the reason for this line, is narrower and about CI reach rather than
     # execution: `grep -rn 'just shm-test' .github/` returns nothing, while
@@ -2160,8 +2163,11 @@ shm-check:
     # the negative control `docs/benchmarks/EVIDENCE.md`'s `owner_migration`
     # row cites — the reason that gate's verdict is known to be able to flip —
     # was reachable only by a human typing `just shm-test`, and is now reached
-    # by the job. `frozen_workers`'s two tests are new with `--gate` and had no
-    # recipe of either kind; this line is the only one that runs them.
+    # by the job. `frozen_workers`'s tests are new with `--gate` and had no
+    # recipe of either kind before this line; whether some later recipe also
+    # reaches them is a `grep -n 'tf_tree_bench --features shm' justfile` away,
+    # and no claim about that set is written here — the last two comments in
+    # this file that made one were both wrong.
     cargo nextest run -p tf_tree_bench --features shm --bins
     # **PHASE5 §12 gate 4's exit status** — that `just gate4` fails on a FAIL and
     # `just gate4-python` does not, driven through the shipped binary on a
@@ -2450,13 +2456,15 @@ shm-torture-self-test:
 # a robotics team makes a procurement decision on — "the `tf_tree` **library**
 # opens no network sockets. Ever." — and §5.1 itself says a promise in a README
 # is worth less than an assertion in CI. Until 2026-09-04 there was no
-# assertion: `git grep -n 'AF_UNIX|AF_INET|seccomp|strace' main` returned **17
-# matching lines across 7 files, 9 of them outside `docs/`**, and every one of
-# them was prose or a comment rather than an assertion — including the design
-# note in `crates/tf_tree_cli/src/web.rs` that scopes the assertion away from
-# the CLI. **The figure was first published as "five hits" and was wrong**; it
-# is corrected here, in `scripts/no-network.sh` and in `docs/PHASE5.md` §5.1's
-# amendment together. Recount with the command rather than copying it.
+# assertion: every hit of
+# `git grep -nE 'AF_UNIX|AF_INET|seccomp|strace' main` was prose or a comment
+# rather than an assertion — including the design note in
+# `crates/tf_tree_cli/src/web.rs` that scopes the assertion away from the CLI.
+# **A hit count stood here, in `scripts/no-network.sh` and in `docs/PHASE5.md`
+# §5.1's amendment; it is deleted rather than corrected a third time.** It was
+# published wrong, corrected, and then printed beside a basic-regex spelling of
+# that command in which `|` is a literal, so a reader who ran what was printed
+# got a different number — the instrument and the measurement disagreeing.
 #
 # **Scoped to the library's own suite, which is §11's wording and not a
 # narrowing.** The five published crates are traced; `tf_tree_cli` is not,
@@ -2479,8 +2487,10 @@ shm-torture-self-test:
 # library never creates but *inherits* — `tf_tree_ipc` passes the rendezvous fd,
 # and `socket(2)` is the syscall §5.1 names.
 #
-# ~25 s of tracing on this host over 26 test binaries and ~1 200 `socket(2)`
-# calls, on top of building them. `--test-threads 1` because these binaries run
+# ~25 s of tracing on this host, on top of building the binaries; the run
+# prints how many binaries and `socket(2)` calls that was, and the totals are
+# not copied here because they move between runs on one host.
+# `--test-threads 1` because these binaries run
 # outside nextest, which gives each test its own process: six rendezvous tests
 # share a runtime directory and only that isolates them.
 no-network:

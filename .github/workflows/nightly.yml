@@ -76,7 +76,7 @@ jobs:
   # `tf_tree_core::crash::SITES` and `tf_tree::CRASH_SITES` in about a tenth of
   # children, so the run kills processes *at named instructions*. Until this job
   # existed, that clause was measured by whoever remembered to type the recipe,
-  # and the only number anywhere for it was a hand-measured one in a justfile
+  # and the number quoted for it came from a hand measurement in a justfile
   # comment — a measurement with a date on it, not a gate.
   #
   # **Its own job rather than a row on `torture`, for two reasons that are both
@@ -106,7 +106,11 @@ jobs:
   # (`crates/tf_tree_bench/Cargo.toml`), so the feature set differs all the way
   # down: `--features shm --release` for `just shm-torture-self-test`, and
   # `--features shm,crash-points --release` for `just shm-torture-crash-points`.
-  # Neither is produced by any other job here, so a cold cache pays for both.
+  # The `shm,crash-points` build is produced by no other job in this file; the
+  # `shm` one is also built by the `torture` job above, but on a different
+  # runner with its own `Swatinem/rust-cache` key, so this job's cold cache
+  # still pays for both. (That sentence read "neither is produced by any other
+  # job here", which was false of the `shm` build.)
   # The margin above that is for a slow runner, not for a longer run — a soak
   # that needs more than 5 minutes is a change to the recipe's `*ARGS`, and this
   # comment is what would have to move with it. (It read "10 minutes" beside a
