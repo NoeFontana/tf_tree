@@ -27,6 +27,7 @@ Per D28, every user of this phase changes nothing about their robot. They point 
 | §8 Visualization | **Deliberately not built** — this is the finished state, not a gap |
 | §9 Benchmark artifact | **Partial.** `just bench-report` emits `report/{results.json,index.html}` with the §9.3 provenance header, all eight §9.2 rows, and all four §9.3 "where we are worse" entries; `Report::validate` makes the honesty rules structural — the tool refuses to write a report that over-claims, rather than relying on whoever wrote it. On this host every comparison row is `UNAVAILABLE` with its own reason, which is §9.3's prescribed output, not a gap in the tool. **Two of those reasons had gone stale and were corrected:** the `.tft` rows said §2 and §3 "are not implemented", citing *this table* as the source of truth, while this table records §2 as Done and §3 as done for MCAP — so the tool was printing a false statement under the one section (§9.3) that is about stating a true one. Both reasons are now derived from `cfg!(all(feature = "shm", target_os = "linux"))` — the frozen backend genuinely is not compiled into `just bench-report`'s build — and **two tests pin the general rule: an unavailable row's reason is about this host or this build, never about the roadmap.** **Not done:** §9.1's container image, the public sample recording, `tf_tree bench compare`'s CLI spelling, and §12 gate 7 (reproducing a committed `results.json` on a clean machine). The CLI spelling's blocker is no longer §3 (which landed) but the crate boundary: `tf_tree_bench` is `publish = false` and carries `criterion`, so a shipped `tf_tree` subcommand reaching it would drag a benchmark harness into every install — `CLAUDE.md` routes that to a decision record, not a PR. **§9.1's *measurement* now exists even though its CLI spelling does not** (`just dds-bench`, `ros/tf_tree_bench_ros`): one publisher, real DDS, §5.2's QoS, N `tf2_ros::TransformListener` consumers against the ingest bridge, warm-up discarded and stated, and the whole input set — publisher plan, bridge topology, query set — *generated* from one `tf_tree_bench::workload` entry so §9.3's "identical data" is structural rather than promised. Measured on this host at 4 consumers, in four arms — the two tf_tree ones, the ordinary tf2 deployment, and tf2's *best* case (one composed listener, in the table so the comparison is not a strawman). **The figures live in `docs/benchmarks/tf2.md`'s §9.1 section and are deliberately not restated here.** This row used to carry its own p50 / p99.9 / PSS triple per stack, and not one of those nine numbers survived the run that produced the four-arm table — the same run whose CPU column replaced an instrument that had been reading the main thread's `schedstat` while every arm did its work on other threads. A status table that keeps a private copy of a measurement keeps a copy that goes stale, and this one did. **The arm this row used to say could not exist now runs.** Until [`0015`](./decisions/0015-the-bridge-fills-a-shared-arena.md) landed, `tft_bridge_create` built a *heap* arena with `TreeBuilder::build()` that no second process could attach to, and `dds_report` printed that gap above its own table on every run; this row said the same and called `0015` a **draft**. Both halves are stale: all eight of `0015`'s steps are implemented — it is still **`ready`** rather than `implemented` for the two reasons its own header names, the fork test and §9.2's N = 1…16 curve, and neither of those is this arm — and `just dds-bench` reports **four** arms, the fourth being one bridge process publishing a shared arena under `$TF_TREE_NAME` plus N processes attached to it read-only through `tft_tree_open()`, at 0 % lookup failures. The bridge's CPU and PSS are summed *into* that row and divided by the consumers it serves — it reports `consumers 0` — so the extra process is charged rather than hidden, and the `procs` column shows the N+1. `docs/benchmarks/tf2.md`'s §9.1 section carries the table, the arithmetic and the two places tf_tree is *worse* in it (total PSS at N = 4, and both `.processes` arms' `svc` tails on an unpinned host). That closes §9.2's *total RSS across N consumers* row for a bridge-filled arena and makes §12's criterion 4 demonstrable on the online path, and it leaves this section's remaining gaps the ones listed below rather than the arm itself. **Building it found a real bridge defect**, recorded in `docs/benchmarks/tf2.md`: `tf_tree_bridge::Publisher` is keyed on the resolved *node name* rather than on the GID, so messages arriving before the graph cache resolves claim the edge under an unknown name and `first_writer_wins` then rejects the real publisher permanently — 9 864 of 10 070 transforms dropped and 100 % of lookups failing against a single correctly-declared publisher. Also **not** part of §9 and deliberately not gated: a broader exploratory suite (`just contended-scaling`, `just scale-sweep`, `just soak`, `just bench-run`/`just bench-ab`) covering §11.2's writers-and-pinning row, the width/depth/ring/fan-out axes, multi-minute drift, and A/B comparison of two builds. Those emit `tf_tree.bench-run/1` rather than joining `REQUIRED_ROWS`, because this host fails `Fitness::probe` and a gate that flaps is a gate people learn to ignore. |
 | §10 Open-source readiness | **Partial.** Name decision made, measured and recorded ([`0008`](./decisions/0008-the-name-tf-tree.md)): `tf_tree` is free on the crates.io sparse index and is kept there; **PyPI refused it** as too close to the existing `tftree`, so the distribution is `transform_tree` while the module stays `tf_tree` — an earlier revision of this row said the name was free on PyPI too, which `README.md` and `just artifact-versions` both contradict. `LICENSE-MIT`/`LICENSE-APACHE`, `NOTICE`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` (real address, and an explicit in-scope/out-of-scope boundary around §3.10's trust model) and `SUPPORT.md` (response expectations, platform support, MSRV policy) are in place; `README.md` is rebuilt against the §0.0 tables. **The MSRV was measured and was wrong:** `rust-version = "1.83"` could not build — `blake3` pulls `constant_time_eq 0.4.2`, edition 2024 — so the floor was raised to 1.85 and is now **1.87**, with a CI job that reads it from the manifest and builds `--locked` on exactly it. `just msrv`'s third arm exists because the first two passed while the README said 1.85 and the manifest said 1.87; this row was the same kind of stale copy and is corrected here. Every `publish = false` crate now states its reason in its own manifest. **The benchmark artifact is now a regression gate** (`just bench-check`, CI job `bench-gate`): `crates/tf_tree_bench/baseline/results.json` is committed, and `bench_report --check-baseline` fails on a withdrawn claim, a dropped §9.2 row, a changed `layout_hash`/`format_version`/build profile, or a directional metric past the slack the baseline itself records. **The comparison ignores every host fact by construction** — CPU model, cores, kernel, governor, load and all `reason` prose — because a gate that fails for the CPU model is a gate people learn to ignore; `src/baseline.rs` carries the split. Making that possible needed `results.json` schema `/2`: `/1`'s bare `{value, unit}` gave a consumer no way to know which direction was an improvement. **On this host the gate holds exactly one number** — the LerpSlerp differential's `max_deviation`, the one row that is host-independent by construction — and that is not a placeholder: `Report::validate` now refuses any row that prints numbers while giving none of them a direction, so a row that becomes measurable arrives gated or not at all. **`docs/PHASE2.md` §11.4's `shm_torture` now exists** (`just shm-torture`, 30 minutes, six processes, `SIGKILL` at 6 Hz) with `just shm-torture-asan` for §11.4's "under ASan" and `just shm-torture-self-test` — the seconds-long half that runs in `just shm-check`. It asserts three things, and the second and third are there because the first revision of this harness had none of them and was **vacuous on most seeds**: that an injected corrupt transform is caught by a process that did not write it; that a run validating too little *fails* instead of printing the same `0 violations` a healthy one does; and that `--inject-violation` finishing clean is itself a failure. **The killed processes are joiners, never the rendezvous owner** — see `docs/PHASE2.md` §0.0's §3.5 row for why, and the §11.4 row for what that costs. **The sanitizer rows are wired to recipes that were run on this host, not to a green tick:** `just tsan` (passes), `just shm-torture-asan` (passes on the fixed harness: 152 936 checked reads — 122 344 of them composing all four edges — 477 kills, no ASan report, over 478 observation rounds), and `just cpp-check` for the C++ UBSan half. **There is no Rust UBSan row and its absence is deliberate:** `rustc -Zsanitizer` accepts address/thread/leak/memory and the CFI variants and has no `undefined`, so §10's "ASan/UBSan/TSan" is a C/C++ checklist and its UBSan half lives where there is C++ to check. The nightly workflow (`.github/workflows/nightly.yml`) carries the torture and sanitizer jobs. **Not done, and this list was wrong in two of its three items until 2026-08-29** — its premise, "all three are ceremony **until there is a release**", expired on 2026-08-17, when the project began publishing to crates.io and PyPI. Corrected: **release automation exists and has run.** `.github/workflows/release.yml` publishes the five crates by crates.io Trusted Publisher (OIDC, no stored token) and `wheels.yml` publishes the wheels; both trigger on `v*`, so one tag drives both. `wheels.yml` has run five times and was green on `v0.0.3` (2026-08-19) and `v0.0.4` (2026-08-22), every wheel row included. **PEP 740 attestations are published** — `wheels.yml`'s `publish` job carries `attestations: write` and `attestations: true` — so naming them here as absent was false; `PHASE3.md` §14's checkbox for them was unticked for the same reason and has been split. **`cargo-dist` is absent; prebuilt binaries are not, and this row's previous argument for skipping them was a non-sequitur.** It read: "`cargo-dist` is absent and is not owed — it builds and uploads binaries for a *binary* release, and the only binary here (`tf_tree_cli`) is `publish = false` by decision." `publish = false` is a statement about the **crates.io index**, and `tf_tree_cli`'s own manifest says its reason is mechanical — three of its dependencies are path-only, so there is no version to publish against — and explicitly *not* a claim about what has landed. Nothing in it bears on whether a user should be handed a binary. The cost of that inference was four tags (`v0.0.1`–`v0.0.4`) shipped to crates.io and PyPI with **no GitHub Release at all** — a tag push creates a tag ref and nothing else — so the audience §4 and the README both put first, somebody holding a recording and no Rust toolchain, had `git clone && cargo install` as the only entry to `doctor --from-bag`. **`release.yml` now builds four Linux rows** (`{x86_64,aarch64}` × `{gnu,musl}`, every one a native runner) through `just release-archive`, and a `github-release` job attaches them with a `SHA256SUMS`. `cargo-dist` itself stays absent on §10's own "or equivalent": it *generates* the workflow from its config and regenerates it on upgrade, and every other job in these workflows carries the argument for its own shape, which a generated file cannot. **Four properties are gated inside the recipe rather than asserted here**: the binary is *executed* and its `--version` compared to the workspace number (a cross-build, a truncated write and a stale artifact all produce a plausible file); the archive is unpacked and re-run through the `tft` symlink; the licence texts travel with it, as Apache-2.0 §4(a) requires and as the crates.io tarballs are already checked for; and packaging is byte-deterministic across mtimes, ownership, **modes** and the gzip header. **Three of those checks were vacuous when first written and are recorded as such in the recipe** — packing twice inside one second cannot see a `date`-derived mtime; gzip zeroes its MTIME field for pipe input whether or not `-n` is passed; and the mode differential did not exist at all, so the builder's umask reached the archive and one commit checksummed two ways on a developer's box against a runner — which is `docs/PROJECT.md` §6's anti-vacuity smell caught in this file rather than after it shipped. `--sort=name` remains untested and says so. **The SBOM per release now exists**: `scripts/sbom.py` writes CycloneDX 1.5 from `cargo metadata`, `release.yml` attaches it and covers it with `SHA256SUMS`, and `just sbom <version>` produces the same file locally. It is written from `cargo metadata` rather than by adding `cargo-cyclonedx` for the reason this row already gives for not using `cargo-dist` — a generated artifact cannot carry the argument for its own shape. **Its scope is the shipped graph, not the workspace**: walked from the five publishable crates plus `tf_tree_cli` over `normal` edges only, so `criterion`, `proptest` and the rest of the dev graph are absent — asserted, not assumed. Deterministic by construction (no clock, no random UUID; the serial number is derived from the component set), so two releases diff to their dependency change and nothing else. **Signed tags are half-done and the half that is missing is a key, not code**: `release.yml` checks the tag object for a signature and **warns**, becoming a refusal when the repository variable `REQUIRE_SIGNED_TAGS` is `true`. Warning rather than failing is deliberate — a gate that must exist before a key does cannot also block the next release on that key — and all three paths are exercised: a signed annotated tag passes, an unsigned one warns, a lightweight tag (which has no object and can never be signed) warns. `CONTRIBUTING.md`'s *Releasing* section carries the one-time setup. So what remains is the mdBook site and a signing key; the honest reason for the first is that nobody has asked for it. |
+| §11 Test plan, §12 Gate | **Partial, and this row is new — §0.0 had rows for §1–§10 and nothing covering the test plan or the gate, which is how §13's box 4 stayed unmentioned by any status row for the life of the section.** §11's **No network** row is **done since 2026-09-04**: `just no-network` traces the five published crates' test binaries under `strace` and asserts every `socket(2)` names `AF_UNIX`, `ci.yml`'s `shm` job runs it on both matrix rows, and §5.1's amendment records the one word of §5.1 it corrects (the suite is the *library's*, not the full one) plus what it does not prove. §12 criterion 4 is **MET at 1.024× and, since the same day, actually gated**: `frozen_workers.rs` printed its verdict and returned `Ok(())` on both branches, so `nightly.yml`'s `gate4` job could not go red — see criterion 4's own correction. Criterion 4's Python arm still **reports** and exits 0, which is its amendment's decision and is now held by a test rather than by whoever edits the justfile next. **Not done, and each says so where it lives:** criterion 5 (ingest throughput) is held by nobody, criterion 7 (reproduce the artifact from a published container) is §9's gap, and §11's `--json` schema validation, per-check fixtures and `doctor` rows are §6's. |
 
 ### What this development environment can and cannot gate
 
@@ -806,6 +807,80 @@ Pair the rename with a stronger, testable claim:
 **`tf_tree` is also the name of the shipped binary, and the binary has exactly one exception: `tf_tree top --web`.** It binds an `AF_INET` listener, only when an operator types the flag, loopback unless they name another address — see §7's amendment. Nothing a program links can reach it. The headline above is scoped to the library because that is the claim a team evaluating the crate is making a procurement decision about; stating it without the scope would leave the one exception to be discovered rather than read.
 
 **NORMATIVE CI test:** run the full test suite under `strace` (or a seccomp filter) and assert that `socket(2)` is called only with `AF_UNIX`. A promise in a README is worth less than an assertion in CI, and for a library that ships onto robots this is worth asserting.
+
+> **Amendment — the assertion exists, and the sentence above needs one word
+> changed: the suite is the *library's*, not "the full" one.**
+>
+> `just no-network` (`scripts/no-network.sh`) is the assertion, and
+> `.github/workflows/ci.yml`'s `shm` job runs it on both matrix rows.
+> Until 2026-09-04 there was none: every hit of
+> `git grep -nE 'AF_UNIX|AF_INET|seccomp|strace' main` was prose or a comment
+> rather than an assertion — including `crates/tf_tree_cli/src/web.rs`'s design
+> note, which had scoped an assertion that did not exist. **A hit count stood
+> here and in two other files and is now deleted rather than corrected again**:
+> it was first published wrong, then corrected, and the corrected figure was
+> printed beside a basic-regex spelling of that command in which `|` is a
+> literal, so a reader who ran what was printed got a different number. The
+> qualitative half — every hit prose, none an assertion — was and is correct,
+> and it is the half the argument rests on. §13's box 4 had recorded this as
+> owed since the section was written, and no §0.0 row covered it, because §0.0 has rows for §1–§10 and
+> nothing for §11's test plan. **The word "full" is what moved**, and the
+> correction is stated rather than quietly applied: §11's row already said
+> *"scoped to the library's suite"* while this sentence said *"the full test
+> suite"*, and the two cannot both be satisfied — `tf_tree top --web` binds an
+> `AF_INET` listener by construction and is in the full suite. §11's wording is
+> the correct one and this paragraph is now read through it.
+>
+> **What is traced.** The test binaries of the five published crates —
+> `tf_tree`, `tf_tree_core`, `tf_tree_math`, `tf_tree_arena`, `tf_tree_ipc` —
+> built with `tf_tree/shm,tf_tree_arena/shm`, under `strace -f`, so a spawned
+> rendezvous child is followed too. **Every `socket(2)` call observed was
+> `AF_UNIX`**, in ~25 s on the development host. The call total is deliberately
+> not quoted: it varies run to run on one host, and the script prints its own
+> figure on every run. (A single call total stood here and did not reproduce
+> across later runs on the same host, which is why it is gone rather than
+> re-measured.)
+>
+> **The exception is a positive control rather than a carve-out**, which is the
+> part worth reading. An `AF_INET` socket that the scanner had learned to ignore
+> would be invisible; so would a scan pointed at nothing. The recipe therefore
+> runs a *second*, separate trace over `crates/tf_tree_cli/tests/web.rs` — a
+> package deliberately outside the claim — and **refuses unless it finds
+> `AF_INET` there** — the script prints how many it found. The scoping is
+> expressed once, as
+> a package list, and never as a family the scanner tolerates.
+>
+> **Three more refusals, because a check that cannot check its property must not
+> pass.** No `strace` on the host is a refusal, not a skip. A `strace` that
+> cannot see a `socket(2)` it is *shown on purpose* — the script opens a real
+> `AF_INET` socket through bash's `/dev/tcp` on every run and requires the
+> scanner to catch it — is a refusal, which covers a container without
+> `CAP_SYS_PTRACE`, a `ptrace_scope` of 3, and a change in `strace`'s output
+> format. A traced binary that exits non-zero is a refusal, because its
+> remaining tests never ran. And a run in which `crates/tf_tree/tests/rendezvous.rs`
+> was not traced, or opened no `AF_UNIX` socket, is a refusal: that target
+> carries `required-features = ["shm"]`, so it is exactly what disappears if the
+> feature set drifts. **A bare socket count does not catch that** and was tried
+> first — dropping `shm` takes the total to 23, not to 0, because
+> `tf_tree_ipc`'s own tests open theirs regardless, and the seeded run passed.
+>
+> **What it does not establish.** Nothing about a code path no test takes: this
+> is a dynamic check over the tests that exist, and an `AF_INET` socket behind an
+> unexercised branch is invisible to it. Nothing about a socket the library never
+> creates but *inherits* — `tf_tree_ipc` passes the rendezvous fd, and `socket(2)`
+> is the syscall this sentence names, not `connect(2)` or `sendto(2)` on a
+> received one. Nothing about a non-Linux target. And **nothing about any
+> package other than the five traced and the control** — everything else in the
+> repository, `crates/tf_tree_tf2_sys` and `xtask` included, is traced by
+> nothing. That follows from the scoping above by construction, but it is worth
+> saying, because "asserted in CI" over a five-crate subset reads like
+> "asserted over the repository" to somebody who has not opened the script.
+> (An enumeration of the untraced packages stood here and shipped incomplete;
+> the rule replaces it, and `cargo metadata --no-deps` is what generates the
+> list.)
+> `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header, and
+> since 2026-09-04 a RED TESTS block naming which refusals have been seeded and
+> observed to fire.
 
 ### 5.2 The two kinds of counter have opposite cost profiles
 
@@ -1906,7 +1981,7 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
 - **Multi-process page sharing:** 16 processes mapping one `.tft`; assert total RSS is within 1.2× of a single process, measured from `/proc/*/smaps_rollup` `Pss`.
 - **Fork safety:** a `DataLoader` with `num_workers=16` under all three start methods.
 - **Counter contention:** 16 concurrent readers on one edge, each holding a long-lived `Guard`; assert no measurable throughput difference against a `counters`-disabled build.
-- **No network:** full suite under `strace`/seccomp, asserting `socket(2)` is only ever `AF_UNIX` (§5.1). **Scoped to the library's suite** — `tf_tree top --web` is an `AF_INET` listener by construction, and §7's web-view amendment records why that exception belongs in this sentence rather than inside the assertion.
+- **No network:** full suite under `strace`/seccomp, asserting `socket(2)` is only ever `AF_UNIX` (§5.1). **Scoped to the library's suite** — `tf_tree top --web` is an `AF_INET` listener by construction, and §7's web-view amendment records why that exception belongs in this sentence rather than inside the assertion. **Implemented 2026-09-04**: `just no-network` (`scripts/no-network.sh`), run by `.github/workflows/ci.yml`'s `shm` job on both matrix rows. Every `socket(2)` call the library's test binaries made was `AF_UNIX`; the run prints how many binaries and calls that was, and the figure is not copied here because it moves between runs on one host. The exception is the recipe's **positive control** — a separate trace over `crates/tf_tree_cli/tests/web.rs` that must find `AF_INET` — so "scoped to the library" and "scoped so narrowly it sees nothing" are distinguishable outcomes rather than the same green. It refuses on a missing `strace`, on a `strace` that cannot see a socket it is shown on purpose, on a traced binary that exits non-zero, and on a run in which `tests/rendezvous.rs` was not traced or opened no socket. §5.1's amendment carries the rest, including the one word of §5.1 this corrects.
 - **Convenience-path guard reuse:** assert `tree.lookup` in a loop performs O(1) atomic flushes, not O(n).
 - **Diagnostics:** one test per check ID, each with a fixture that triggers exactly that check and no other.
 - **`doctor --json`:** schema-validated; adding a check must not break an existing consumer.
@@ -1963,7 +2038,66 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
    Reproduced to three decimals across runs when it was taken; repeated runs
    on 2026-08-19, on a host carrying other work, spread over **1.023–1.026×**
    with `p` between 0.36 and 0.41 MiB. The third decimal moves; the verdict has
-   15 % of headroom.
+   15 % of headroom. Re-derived on 2026-09-04 at **1.024×** (235.6 / 230.0 MiB,
+   `p` = 0.37 MiB) by the run that gave the recipe an exit status.
+
+   > **Correction — until 2026-09-04 this criterion was measured and not
+   > gated, and the row above did not say so.**
+   >
+   > `frozen_workers.rs` computed the verdict, printed `PASS` or `FAIL`, and
+   > returned `Ok(())` on both: `grep -n 'process::exit\|ExitCode'` over the
+   > file returned one line, a `use std::process::{Command, Stdio}` for
+   > spawning workers, and nothing else. `nightly.yml`'s `gate4` job runs
+   > `just gate4` as its only step, so criterion 4 could have regressed to any
+   > value at all and that job would have been green — the same shape as the
+   > `abi_cost` failure `docs/benchmarks/EVIDENCE.md` was created to prevent,
+   > reappearing inside a job written to close it, and the same shape as
+   > [`0023`](./decisions/0023-the-gate-that-could-not-gate.md)'s subject. Every
+   > other gated artifact in the register already failed its process
+   > (`owner_migration.rs`, `reclaim_latency.rs`, `mp_bench.rs`,
+   > `abi_cost.rs`); this one did not.
+   >
+   > **The verdict now decides the exit status, and the caller decides whether
+   > this run is a gate.** `just gate4` passes `--gate` and fails the process on
+   > a FAIL; `just gate4-python` does not pass it and still exits 0, which the
+   > amendment below requires. `--gate` additionally *refuses* `--python` (the
+   > second gated arm the amendment defers, naming the record it would be
+   > making) and `--no-touch` (the control, documented below to FAIL at 5.32×),
+   > so neither can arrive as a flag pair in a recipe. A `--gate` run that
+   > cannot evaluate the criterion — no N = 1 or no N = 16 row — refuses
+   > instead of returning 0 with an explanation printed above it.
+   >
+   > **Nothing about the criterion, the harness or the 1.024× moves**, which is
+   > why this is a correction to a status claim rather than a decision record.
+   > What moves is that the number is now re-derived by something that can
+   > fail: `crates/tf_tree_bench/tests/gate4.rs` drives the shipped binary on a
+   > 2-robot fixture that genuinely misses `S ≥ 74p`, and asserts the same
+   > failing measurement exits non-zero with `--gate` and zero without it, so
+   > the distinction the amendment argues for is held by a test rather than by
+   > the discipline of whoever next edits the justfile.
+   >
+   > It also found a second, smaller instance of the same class: this crate's
+   > `[[bin]]` targets all carry `required-features = ["shm"]`, so
+   > `cargo nextest run --workspace` skips them whole and `just shm-check`'s
+   > `--lib` line does not reach them — so `owner_migration`'s
+   > `gate_arithmetic_is_not_vacuous`, which `EVIDENCE.md` cites as the reason
+   > that gate's verdict is known to be able to flip, was reachable only by a
+   > human typing `just shm-test`. **`just shm-check` now runs `--bins`, and
+   > `shm-check` is the recipe `ci.yml`'s `shm` job invokes.**
+   >
+   > **This paragraph said "had never been executed by any recipe" when it was
+   > first written, and that was false** — recorded here rather than rewritten,
+   > because the correction is the interesting half. `just shm-test` has run
+   > `cargo nextest run -p tf_tree_bench --features shm --bin owner_migration`
+   > since before this change, so those five tests did execute; what no
+   > workflow did was invoke that recipe (`grep -rn 'just shm-test' .github/`
+   > returns nothing, while `just shm-check` is a step of that file's `shm` job —
+   > located with `grep -n 'just shm-check' .github/workflows/ci.yml` rather
+   > than by a line number, which the next edit above it invalidates). The
+   > claim that survives measurement is about CI reach, not about execution,
+   > and it is weaker than the one first published. `frozen_workers`'s two
+   > arithmetic tests are the ones that had no recipe of either kind — they are
+   > new with `--gate`.
 
    Three things about this measurement, because each was a way of getting it
    wrong:
@@ -2166,6 +2300,18 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
    > pins, and what corpus size that forces on the fixture — is a decision, and it
    > needs a record.
    >
+   > **Since 2026-09-04 that sentence is enforced rather than observed.** When
+   > the Rust arm acquired an exit status (the correction under **MET** above),
+   > the cheapest possible mistake was to make the `FAIL` global — one `if` with
+   > no condition on the arm — which would have turned `just gate4-python` into
+   > a failing recipe and *decided* this question in a diff that looked like
+   > tidying up. So gating is a `--gate` flag the caller passes, `gate4-python`
+   > does not pass it, and the binary refuses `--gate --python` outright with a
+   > message naming this paragraph. Measured on the same seeded fixture on
+   > 2026-09-04: `just gate4` exited **1** at 5.380× and `just gate4-python`
+   > exited **0** at 7.021× (`p` = 13.31 MiB, consistent with the 13.44–13.86
+   > recorded above).
+   >
    > **What it obliges.** Wherever 1.024× is cited as evidence for the wedge —
    > `README.md`, the §9 benchmark report, a talk — it is cited as *a Rust worker
    > sharing a 338 MiB `.tft`*. Citing it bare, in front of a Python audience,
@@ -2187,7 +2333,7 @@ Criterion 4 is the wedge's central claim, and criterion 7 is what makes it belie
 - [ ] `FORMAT_VERSION = 3` shipped in a single commit, with Phase 6 regions reserved and `doctor --explain-version`
 - [ ] Publish-side observability derived, not counted — push path unchanged and benchmarked to prove it
 - [ ] Nothing in the codebase, CLI, or docs is called "telemetry"
-- [ ] `socket(2)` restricted to `AF_UNIX`, asserted in CI
+- [x] `socket(2)` restricted to `AF_UNIX`, asserted in CI — `just no-network`, in `ci.yml`'s `shm` job. Scoped to the library's suite per §11; the CLI's one `AF_INET` listener is the check's positive control rather than an exception inside it. **Read the scope with the tick, because it is not the repository**: the five published crates are traced, `tf_tree_cli` is traced as the control, and **every other package here is traced by nothing** (this line used to enumerate them and the enumeration was incomplete). §5.1's amendment states what it does and does not prove
 - [ ] Error-path counters always on with no runtime switch; `counters` cargo feature is the only knob
 - [ ] Convenience path holds a long-lived per-thread `Guard`
 - [ ] `freeze --from-live` captures counters into the manifest
