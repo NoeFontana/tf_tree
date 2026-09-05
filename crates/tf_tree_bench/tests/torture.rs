@@ -314,10 +314,88 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
          did not check. An ownerless arena is exactly what refuses a new joiner, so this \
          is the assertion that says the role was inherited.\n{stdout}"
     );
+    // **Parsed, not matched as a substring.** This read
+    // `!stdout.contains("0 survivor(s) inherited")` until 2026-09-04, which also
+    // matches `10 survivor(s) inherited` — so a healthy run with ten
+    // inheritances in one window would have failed it. The count is read out of
+    // the §3.5 summary line the way `reads`, `composed` and `kills` are read
+    // above, and compared as a number.
+    let inherited: u64 = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("shm_torture: §3.5: "))
+        .find_map(|l| {
+            l.split(" inheritance(s) recorded by survivors")
+                .next()
+                .and_then(|head| head.rsplit(", ").next())
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or(0);
     assert!(
-        !stdout.contains("0 survivor(s) inherited"),
+        inherited > 0,
         "a migration recovered with no survivor recording an inheritance: something is \
          serving and §3.5's caller-driven trigger is not why.\n{stdout}"
+    );
+}
+
+/// **The strict half of the leak check, on the one configuration that pins it.**
+///
+/// `check_recovery` splits the participant records it finds still `LIVE` for a
+/// dead process into two: the ones `docs/decisions/0043` says no hangup callback
+/// can reach — a process that held the rendezvous, or a child whose own owner
+/// has since died — which are swept and then *required* to have been collected,
+/// and everything else, which fails the run outright. This case exercises the
+/// second, and it is `--no-kill-owner` because that is the configuration in
+/// which the split is trivial: the owner is the parked owner child for the whole
+/// run, so every worker's record is reachable by its hangup callback and only
+/// the owner's own record is in the swept partition.
+///
+/// **A migrating run cannot pin this and that is a limit worth stating.** After
+/// a migration the owner is an ordinary child, and `work` calls
+/// `Tree::reap_participants` on 3% of its operations — so while the teardown
+/// waits for the hangup callback, the process running it is also sweeping the
+/// table, and either collector can be the one that got there first.
+///
+/// Mutant (applied, confirmed fatal, then reverted): delete the
+/// `table.reclaim(slot, observed)` in the owner's hangup callback
+/// (`crates/tf_tree/src/open.rs`, `docs/decisions/0028` plan step 4). On this
+/// case's own configuration the run then exits 1 with `3 of 64 participant
+/// slot(s) hold a LIVE record ... [2, 3, 4]`; at 12 s / 4 children / 4 Hz it
+/// failed on all six of the seeds 1/2/3/7/999/1104729, while the default
+/// *migrating* configuration at 20 s / 6 children / 6 Hz passed on four of
+/// those six — which is why this case exists and why it does not kill the
+/// owner.
+#[test]
+fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
+    let out = torture(&[
+        "--duration",
+        "8s",
+        "--children",
+        "4",
+        "--kill-hz",
+        "4",
+        "--seed",
+        "999",
+        "--no-kill-owner",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a run with one owner for its whole life failed; every worker record here is \
+         reachable by that owner's hangup callback.\n{stdout}\n{stderr}"
+    );
+    // The negative half: this configuration must not be reaching the *swept*
+    // partition for anything but the owner's own record. If it were, the run
+    // above would pass on a build whose hangup collector does nothing.
+    assert!(
+        !stdout.contains("§3.5 owner kill 1:"),
+        "`--no-kill-owner` killed the owner, so this case is not the no-migration \
+         configuration it is named for.\n{stdout}"
+    );
+    assert!(
+        stdout.contains("recovery:") && !stdout.contains("RECOVERY FAILURE"),
+        "the recovery check did not run, so nothing here judged a participant \
+         record.\n{stdout}"
     );
 }
 
