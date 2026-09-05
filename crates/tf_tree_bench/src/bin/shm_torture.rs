@@ -1528,9 +1528,11 @@ mod imp {
         //
         // **This is not fixing an observed failure, and an earlier draft of this
         // comment claimed it was.** That claim came from a build which had lost
-        // the 200 ms sleep entirely; the flat sleep, measured on this host,
-        // passed 24 of 24 strict-arm runs under six busy loops on eight cores.
-        // What the poll removes is the assumption, not a red run.
+        // the 200 ms sleep entirely; the flat sleep passed every strict-arm run
+        // it was measured over on a deliberately loaded host. What the poll
+        // removes is the assumption, not a red run — and no pass tally is kept
+        // here, because a scheduling count taken on one host on one day reads
+        // as a property of the code.
         //
         // The poll runs only where there is something to wait for. On a run
         // whose role migrated the arena usually has no owner at all by now, so
