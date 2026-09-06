@@ -94,6 +94,19 @@
 //! `just abi-attached`, which wires the two together.
 
 #![allow(clippy::print_stdout)]
+// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
+// measure it** (`docs/decisions/0048`). The posture is declared here rather than
+// inherited: `crates/tf_tree_bench/src/lib.rs` is `#![forbid(unsafe_code)]` and a
+// bin is a **separate crate root**, so that attribute governs none of this file.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+// SAFETY (module invariant): every `unsafe` block below is a call to a
+// `tft_*` entry point of `tf_tree_c`, on a handle this process created and has
+// not freed, from the thread that created it — which is the affinity every one
+// of those entry points documents. The two arms attach independently and
+// neither handle is converted into the other; there is no API to do that, and
+// doing it would defeat what this binary measures.
 
 use anyhow::{anyhow, bail, Context, Result};
 

@@ -253,8 +253,22 @@ jobs:
           root=$(basename "$tarball" .tar.gz)
           echo "checking $tarball"
           declared=$(tar -xOzf "$tarball" "$root/PKG-INFO" | sed -n 's/^License-File: //p')
+          # **An empty subject set is not a pass.** This branch used to print
+          # "no License-File headers to check" and `exit 0`, which made the step
+          # green in exactly the state it exists to prevent: an sdist that
+          # declares no licence file and therefore is not required to carry one.
+          # Every way of arriving there is a defect — maturin stopping emitting
+          # the headers, `[project] license` changing shape, the `sed` pattern
+          # drifting past a renamed field, `PKG-INFO` moving inside the archive
+          # — and none of them is distinguishable here from a licence that
+          # travelled. `pyproject.toml` declares the licence files, so at least
+          # one header is the floor, and the same discipline
+          # `scripts/artifact-versions.py` writes down for `VERSION_FILES`
+          # applies: a scan that silently finds nothing is how a gate keeps
+          # passing after its subject moved.
           if [ -z "$declared" ]; then
-            echo "no License-File headers to check"; exit 0
+            echo "::error file=pyproject.toml::PKG-INFO in $tarball declares no 'License-File:' header at all, so this check has nothing to compare and the sdist carries no required licence file. Apache-2.0 4(a) is what makes that a defect rather than a formality." >&2
+            exit 1
           fi
           contents=$(tar -tzf "$tarball")
           rc=0

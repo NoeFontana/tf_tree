@@ -147,7 +147,7 @@ hostile file. Exposing all ten would make the signature the struct's shape
 rather than the task's.
 
 `max_record_bytes` is the exception among the guards, because
-[`0010`](./0010-a-ceiling-on-one-record.md) added it *specifically* so that "the
+[`0010`](./0010-naming-the-record-size-refusal.md) added it *specifically* so that "the
 person who meets it can raise it without forking the crate". Reachable only from
 Rust, that argument does not hold for the audience §4 is for. It is exposed for
 the reason it was built.

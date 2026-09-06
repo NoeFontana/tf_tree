@@ -564,20 +564,37 @@ impl FixtureCodec {
 ///
 /// `ruzstd`'s encoder, not libzstd, so every compressed fixture in this crate proves
 /// **round-trip** and not conformance, and its frames are not shaped like the ones a
-/// recorder writes. Measured on this host: `ruzstd` decodes its own `Fastest` output
-/// at 849 MiB/s and a libzstd `-3` frame at 674 MiB/s, and it declares a 128 KiB
-/// window where a streaming `zstd -19` declares 8 MiB. So a fixture understates the
-/// decode cost of a real recording by roughly **1.3×** and exercises a different
-/// window path. `testdata/zstd_conformance.mcap` is what closes the conformance half
-/// for zstd; for lz4, with no `lz4` CLI on this host, it is closed by a
-/// hand-authored spec frame instead of by an independently written file, and
+/// recorder writes: it declares a 128 KiB window where a streaming `zstd -19`
+/// declares 8 MiB, so a fixture exercises a different window path, and `ruzstd`
+/// decodes its own output faster than a libzstd frame of the same size.
+/// `testdata/zstd_conformance.mcap` is what closes the conformance half for zstd;
+/// for lz4, with no `lz4` CLI on this host, it is closed by a hand-authored spec
+/// frame instead of by an independently written file, and
 /// `testdata/ATTRIBUTION.md` states what that does and does not cover.
 ///
-/// There is also **no ingest benchmark in `crates/tf_tree_bench`**, so
-/// `just bench-check` cannot see a throughput regression on this path and
-/// `docs/PHASE5.md` §12's ingest gate is asserted by no code. A benchmark whose
-/// corpus came from *this* function would understate it by the factor above, which is
-/// why one has not simply been added; §11 records what it would take.
+/// **CORRECTION (2026-09-05): a decode-rate ratio was being read as a throughput
+/// one, and the paragraph that did it is deleted.** This doc read: "Measured on
+/// this host: `ruzstd` decodes its own `Fastest` output at 849 MiB/s and a libzstd
+/// `-3` frame at 674 MiB/s … So a fixture understates the decode cost of a real
+/// recording by roughly **1.3×**", followed by "There is also **no ingest benchmark
+/// in `crates/tf_tree_bench`**, so `just bench-check` cannot see a throughput
+/// regression on this path and `docs/PHASE5.md` §12's ingest gate is asserted by no
+/// code. A benchmark whose corpus came from *this* function would understate it by
+/// the factor above, which is why one has not simply been added; §11 records what
+/// it would take." Three things were wrong with that. The two MiB/s figures had
+/// **no producer anywhere in this repository**, which is what
+/// `docs/benchmarks/EVIDENCE.md` exists to prevent. The 1.3× is a **per-byte**
+/// ratio and does not transfer to a recording, because a libzstd frame decodes
+/// slower per byte *and* there are fewer bytes of it — the two act in opposite
+/// directions and their net is derived nowhere. And §11 recorded no such thing: it
+/// had no ingest-benchmark row at all until `docs/PHASE5.md` §12 criterion 5's
+/// gate landed, which is `just gate5` and
+/// `docs/decisions/0050-what-ten-times-real-time-divides.md`.
+///
+/// **§12's ingest gate is asserted by code now**, and it generates its corpus with
+/// this writer — so what the gate measures is a round trip through the decoder's
+/// own encoder, which `0050` records as a stated limit rather than as a
+/// justification for not measuring at all.
 ///
 /// **`bytes` is taken by value so the uncompressed arm is a move.** It used to take
 /// a slice and `to_vec()` it, which reintroduced exactly the full-size copy the

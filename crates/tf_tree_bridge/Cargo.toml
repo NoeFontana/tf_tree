@@ -24,10 +24,17 @@ publish = false
 # behind a container nobody runs on the normal development loop.
 #
 # `tf_tree_tf2_sys` is the counter-example and the reason this matters: it is
-# excluded from the workspace because it needs ROS headers, and as a result it
-# is the one crate carrying `unsafe` with no lint coverage — its own comment
-# says so. The rclcpp shell (§5.8) will have the same problem. Everything that
-# does not *have* to be over there belongs here.
+# excluded from the workspace because it needs ROS headers, so `cargo clippy
+# --workspace` never compiles it and the container-only `just tf2-check` is its
+# whole gate. The rclcpp shell (§5.8) will have the same problem. Everything
+# that does not *have* to be over there belongs here.
+#
+# **This comment called it "the one crate carrying `unsafe` with no lint
+# coverage" until 2026-09-05, and that superlative was never checked** — a count
+# written beside the thing that produces it. `scripts/unsafe-budget.sh` is the
+# instrument now: it censuses with the compiler over the justfile's own clippy
+# selectors, so what is and is not covered is recomputed rather than asserted.
+# `docs/decisions/0048` carries the reading it produced.
 # **One dependency, and it is not ROS.**
 #
 # §5.4-§5.7 are still decision functions over plain data and still need nothing.

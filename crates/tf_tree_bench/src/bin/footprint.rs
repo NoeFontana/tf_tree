@@ -42,6 +42,22 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
+// **`docs/decisions/0007` rule 1, kind 2 — the OS** (`docs/decisions/0048`: a
+// kind is a property, not a crate name). Declared here rather than inherited:
+// `crates/tf_tree_bench/src/lib.rs` is `#![forbid(unsafe_code)]` and a bin is a
+// **separate crate root**, so that attribute governs none of this file — which
+// is why this binary's `mallinfo2` call compiled under a plain `just build` for
+// the whole life of the project.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+// SAFETY (module invariant): the single `unsafe` block below calls glibc's
+// `mallinfo2`, declared in this file's own `extern "C"` block because libc does
+// not expose it. It takes no arguments, reads only the allocator's own
+// bookkeeping, and returns a POD struct by value whose `MallInfo2` mirror is the
+// documented ten-`size_t` layout. The alternatives measure something else: a
+// `GlobalAlloc` counter is itself an `unsafe impl`, and /proc RSS is resident
+// pages rather than allocator bookkeeping.
 
 use std::hint::black_box;
 

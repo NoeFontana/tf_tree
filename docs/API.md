@@ -1214,14 +1214,36 @@ things address it and a third does not exist:
 
 - **Per-edge population at take-up** (`docs/PHASE2.md` §7.1, `0024`) faults the
   pages an edge uses when the edge is claimed, not when it is first read.
-- **`mlockall(MCL_CURRENT | MCL_FUTURE)` in the embedding process** is what pins
-  the mapping, and it is the *application's* call, not this library's — a library
-  that locks memory on its caller's behalf is deciding an `RLIMIT_MEMLOCK` budget
-  it cannot see. `TFT016` reports the limit against the arena size so the failure
-  is found before the control loop meets it.
-- **There is no `LockPolicy` and no `mlock` call in this codebase.** `MLOCK_ONFAULT`
-  would not prefault, so it adds nothing over §7.1; and on a swapless host — which
-  is what a real-time robot runs — the pages are not reclaimable anyway.
+- **`mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)` in the embedding process**
+  is what pins the mapping, and it is the *application's* call, not this
+  library's — a library that locks memory on its caller's behalf is deciding an
+  `RLIMIT_MEMLOCK` budget it cannot see. **`MCL_ONFAULT` is load-bearing and this
+  bullet recommended the call without it until 2026-09-05:** measured, plain
+  `MCL_CURRENT|MCL_FUTURE` takes an untouched 64 MiB `memfd` mapping from `Rss`
+  0 to 65 536 kB the instant it is issued, and prefaults mappings made *after*
+  the call too — which is per-arena population at address-space scope, the thing
+  §7.1's title forbids and
+  [`0024`](./decisions/0024-population-is-per-edge-at-take-up.md) removed at a
+  measured 5.2×. `TFT016` reports the limit against the arena size so the failure
+  is found before the control loop meets it — **one term of two**: `mlockall`
+  charges the whole address space, so that check staying quiet is not a
+  clearance, and its own message says so.
+- **There is no `LockPolicy` and no `mlock` call in this codebase**, and
+  [`0049`](./decisions/0049-the-flag-that-prefaults-the-arena.md) is the record.
+  The reason is the bullet above — *who* may spend the budget — and **not** the
+  two clauses that stood here until 2026-09-05, *"`MLOCK_ONFAULT` would not
+  prefault, so it adds nothing over §7.1; and on a swapless host […] the pages
+  are not reclaimable anyway"*. Measured by
+  `crates/tf_tree_bench/examples/mlock_probe.rs`: it does not prefault (**true**);
+  it does not *"add nothing"* — §7.1 establishes PTEs once and `MLOCK_ONFAULT` is
+  what keeps them, with `MADV_PAGEOUT` refused while locked and accepted on the
+  same range after `munlock`; and the swapless clause is **undetermined**, not
+  true and not false. Directed reclaim tears the mapping down; organic
+  memory-cgroup pressure on a swapless host did not, and OOM-killed instead,
+  against a file-backed positive control that was reclaimed. Global `kswapd`
+  pressure is untested. **A conclusion about reclaim policy was stated here in
+  the grammar of a mechanism fact**, which is the defect regardless of which way
+  the open question settles.
 
 ### 8.4 What this section does not claim
 

@@ -491,6 +491,19 @@ named test:
   with a `// SAFETY:` block. `tf_tree_bench` is `publish = false` and its crate root is
   `#![forbid(unsafe_code)]`, so this is a separate bin target, and it is called out
   here rather than discovered later.
+  **(Amended by [`0048`](./0048-a-kind-is-not-a-crate-name.md), 2026-09-05: the
+  COUNT is stale and the scope clause is not.** That file carries more than one
+  `unsafe` site now — two of them `libc::fork()` and the rest split between the
+  OS and this workspace's own C ABI, driven across the fork for `0015`'s
+  *Invariants to maintain*. Recount with `scripts/unsafe-budget.sh`, which
+  censuses with the compiler rather than with a grep, rather than trusting a
+  number in a frozen record. What this bullet got right is the clause *"so this
+  is a separate bin target"*: the `forbid` is on `src/lib.rs` and governs no bin,
+  test, bench or example. Several other sites in this repository had that
+  backwards and cited the attribute as the reason for a design choice; `0048`
+  corrects them and lists them. And since `0048` makes 0007's kinds **properties
+  rather than crate names**, this is no longer a bent budget at all — it is kinds
+  2 and 5, registered in `scripts/unsafe-budget.txt`.)
 - Miri coverage does **not** extend to any of this: miri cannot execute
   `memfd_create`, `F_ADD_SEALS`, or `fcntl(F_OFD_*)`. The `just miri` recipe gains a
   comment saying so, so that nobody "fixes" it by adding `--features shm`.

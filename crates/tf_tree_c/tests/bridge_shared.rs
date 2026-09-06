@@ -172,13 +172,7 @@ fn offer(b: &Bridge, parent: &str, child: &str, stamp: i64, pose: [f64; 7]) -> t
         pose,
         received_steady_nanos: 0,
     };
-    let mut out = tft_bridge_outcome {
-        struct_size: core::mem::size_of::<tft_bridge_outcome>() as u32,
-        // SAFETY: `tft_bridge_outcome` is `#[repr(C)]`, `Copy`, and made of
-        // integers, `f64` arrays and pointers, so all-zero is a valid value of
-        // it. The ABI overwrites every field before it returns.
-        ..unsafe { core::mem::zeroed() }
-    };
+    let mut out = tft_bridge_outcome::blank();
     // SAFETY: live handle on its creating thread; the `CString`s outlive the
     // call; `out` is a live local with `struct_size` set.
     let rc = unsafe { tft_bridge_offer(b.0, TFT_BRIDGE_TOPIC_TF, &s, ptr::null(), &mut out) };
@@ -194,20 +188,11 @@ fn offer(b: &Bridge, parent: &str, child: &str, stamp: i64, pose: [f64; 7]) -> t
 
 /// This thread's last error message, as Rust text.
 fn last_message() -> String {
-    let mut e = tft_error {
-        struct_size: core::mem::size_of::<tft_error>() as u32,
-        ..blank_error()
-    };
+    let mut e = tft_error::blank();
     // SAFETY: `e` is a live local with `struct_size` set.
     let rc = unsafe { tft_last_error(&mut e) };
     assert_eq!(rc, TFT_OK);
     text(e.message.as_ptr())
-}
-
-fn blank_error() -> tft_error {
-    // SAFETY: `tft_error` is `#[repr(C)]`, `Copy`, and made entirely of integers
-    // and a byte array, so all-zero is a valid value of it.
-    unsafe { core::mem::zeroed() }
 }
 
 fn text(p: *const c_char) -> String {

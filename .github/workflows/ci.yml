@@ -90,8 +90,16 @@ jobs:
   # gate rather than the loud skip it used to be. The `bindings` job below runs
   # the same recipe against a pinned interpreter; see its comment for why both.
   # `lint` also depends on `evidence-audit` and `artifact-versions`, which is
-  # why neither has a job of its own: 0.81 s and 0.09 s respectively, and both
-  # are pure text checks over the checkout.
+  # why neither has a job of its own: both are pure text checks over the
+  # checkout and cost a fraction of a second, which `time` answers and this
+  # comment does not — the figures that used to be written here had gone stale
+  # by a factor of three. It depends on `sbom` too, for the
+  # opposite reason — that one checks nothing, it only runs. `scripts/sbom.py`
+  # was reached by exactly one caller, `release.yml`'s tag-gated
+  # `github-release` job, and the commit adding it landed after the last tag, so
+  # it had never executed on any path and no release carries an SBOM. This is
+  # where it becomes exercised before a release rather than during one; it costs
+  # one `cargo metadata` and no compile.
   #
   # **`just audit`, not `EmbarkStudios/cargo-deny-action`.** The old note here
   # said the action stays because it supplies the binary and the recipe is one
@@ -517,8 +525,8 @@ jobs:
         run: just py-setup
       # **`just quickstart` — the README's documented first five minutes, which
       # ran in no workflow.** CLAUDE.md's command table lists it as a gate; it
-      # was one only for whoever typed it. It executes the `## First five
-      # minutes` snippet *out of `README.md`* and compares stdout against the
+      # was one only for whoever typed it. It executes the `## Start with no
+      # data at all` snippet *out of `README.md`* and compares stdout against the
       # `# ->` marker in the snippet itself, so it fails when an API change makes
       # the documentation a reader follows stop working — which is a per-PR
       # concern, not a nightly one, because the documentation drifts on the same

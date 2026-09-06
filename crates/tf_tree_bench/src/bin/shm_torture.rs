@@ -26,10 +26,17 @@
 //!   writer that holds the edge (`work`'s `two_writers` arm). The other two
 //!   are not: slot leakage is checked once, at teardown (`check_recovery`),
 //!   and "the arena hash is stable across quiescent points" is not implemented
-//!   at all — there is no safe accessor for the arena's bytes from a
-//!   `forbid(unsafe_code)` crate, so it needs a new public API and therefore a
-//!   decision record. `docs/PHASE2.md` §0.0's §11.4 row says so where a reader
-//!   will meet it.
+//!   at all. **The reason is not the lint posture, and this header said it
+//!   was until 2026-09-05**: `#![forbid(unsafe_code)]` sits on
+//!   `crates/tf_tree_bench/src/lib.rs`, and a bin is a **separate crate root**
+//!   that it does not govern — this file's only crate-level attribute is a
+//!   `clippy` allow, and sibling bins in this package carry `unsafe`
+//!   (`scripts/unsafe-budget.txt` is the list). What is actually missing is a
+//!   safe accessor for the arena's bytes,
+//!   which is a new public API and therefore a decision record; and
+//!   "quiescent point" is undefined for a harness that kills processes several
+//!   times a second. `docs/PHASE2.md` §0.0's §11.4 row says both where a reader
+//!   will meet them.
 //!
 //! **Three claims that stood in this header until 2026-09-04 were false, and
 //! are corrected rather than deleted**, because each one was a reason somebody

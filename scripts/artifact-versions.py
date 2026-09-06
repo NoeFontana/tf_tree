@@ -36,6 +36,7 @@ Run it from anywhere; it chdirs to the repository root.
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import subprocess
@@ -85,6 +86,7 @@ VERSION_FILES = (
     "ros/tf_tree_bench_ros/package.xml",
 )
 
+
 CMAKE_FILES = (
     "crates/tf_tree_c/CMakeLists.txt",
     "ros/tf_tree_ros/CMakeLists.txt",
@@ -129,6 +131,77 @@ def load_toml(rel: str) -> dict:
 # ---------------------------------------------------------------------------
 # 1. Every version string in the repository agrees.
 # ---------------------------------------------------------------------------
+
+
+def local_crate_names() -> frozenset[str]:
+    """Every package name this repository defines, read out of the manifests.
+
+    Derived rather than listed, because the list would be the third copy of the
+    crate set in this file after `PUBLISHABLE` and `EXCLUDED_MANIFESTS`, and
+    the two crates outside `[workspace]` mean `cargo metadata` cannot answer it
+    either — it sees the workspace, and `tf_tree_py`/`tf_tree_tf2_sys` are
+    excluded from it by design.
+    """
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "*Cargo.toml"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    names = set()
+    for rel in (f for f in listed.split("\0") if f):
+        package = load_toml(rel).get("package", {})
+        name = package.get("name")
+        if isinstance(name, str):
+            names.add(name)
+    if not names:
+        fail("no [package] name found in any tracked Cargo.toml; the scan is broken")
+    return frozenset(names)
+
+
+@functools.cache
+def tracked_lockfiles() -> tuple[str, ...]:
+    """Every tracked `Cargo.lock`, read out of git rather than listed here.
+
+    **Not hand-kept — generated, and that is exactly why they drift.** `cargo`
+    rewrites a lockfile on any command that resolves, so a lock only stays
+    current where somebody builds that crate, and two of the three here build
+    nowhere on an ordinary host. `crates/tf_tree_tf2_sys/Cargo.lock` sat at
+    `0.0.1` from the `0.0.1` release until a container run regenerated it —
+    four releases, held by nothing, because building it needs ROS 2 and neither
+    CI nor `just lint` can.
+
+    **Nothing else reports the drift, and that is the argument for this gate
+    rather than against it.** A stale lock entry for a *path* dependency is not
+    a resolution failure: cargo recomputes the version from the manifest and
+    silently rewrites the lock (measured — seeding `tf_tree_math` back to
+    `0.0.1` here and running `cargo metadata --offline` exits 0, prints
+    `Updating tf_tree_math v0.0.1 -> v0.0.5`, and leaves the lock correct on
+    disk). No path in this repository builds either excluded crate with
+    `--locked`, so there is no invocation anywhere that turns the drift into an
+    error. The committed artifact is simply wrong until somebody happens to
+    build in the container, and what they get then is a diff they did not ask
+    for in a file they did not touch.
+
+    Derived, for the same reason `local_crate_names()` is: a fourth tracked
+    lockfile added to a hand-kept tuple is outside the gate silently, which is
+    the exact shape of the defect this rule was written for. `PUBLISHABLE`
+    stays a literal because `publish` in a manifest is the authority a gate
+    would otherwise be comparing to itself; a lockfile list has no such
+    problem.
+    """
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "*Cargo.lock"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    found = tuple(sorted(f for f in listed.split("\0") if f))
+    if not found:
+        fail("no tracked Cargo.lock found; the scan is broken")
+    return found
 
 
 def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
@@ -219,6 +292,27 @@ def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
             continue
         sites.append((rel, "<version>", version.strip()))
 
+    # A lockfile records a version for every package in the graph, ours and the
+    # registry's alike, so the entries are filtered **two** ways. By name, to
+    # the packages this repository defines — a third-party crate's version is
+    # nothing to do with this release. And by the absence of a `source` key,
+    # which is how cargo spells "this came from a path": that excludes a
+    # registry or git copy of a crate we *also* publish, which would otherwise
+    # be read as a site and compared against a number it has no reason to
+    # equal. What this does **not** exclude is a path
+    # `[patch]` pointing at another checkout: cargo writes no `source` key for
+    # one, so it is read as ours and compared. That fails loudly if its version
+    # differs, which is the right way round — a second checkout of one of our
+    # crates wired into this build is a thing somebody should have to argue
+    # for, not a thing this gate should silently skip.
+    ours = local_crate_names()
+    for rel in tracked_lockfiles():
+        for package in load_toml(rel).get("package", []):
+            name = package.get("name")
+            if name not in ours or "source" in package:
+                continue
+            sites.append((rel, f"[[package]] {name}.version", package["version"]))
+
     return sites
 
 
@@ -229,14 +323,16 @@ def check_versions() -> str:
     sites = collect_version_sites(authority)
 
     covered = {file for file, _, _ in sites}
-    for rel in VERSION_FILES:
+    for rel in VERSION_FILES + tracked_lockfiles():
         if rel == "Cargo.toml":
             continue  # its own [workspace.package] version is the authority
         if rel not in covered:
             fail(
                 f"{rel}: no version site found. Either the file stopped carrying one "
-                f"(then drop it from VERSION_FILES here, in the same commit) or the "
-                f"scan stopped seeing it, which is worse."
+                f"(a manifest: drop it from VERSION_FILES here, in the same commit; a "
+                f"lockfile: it no longer records any package this repository "
+                f"defines, which wants an argument) or the scan stopped seeing it, "
+                f"which is worse."
             )
 
     for file, where, value in sites:
@@ -252,7 +348,7 @@ def check_versions() -> str:
     # authority and a carrier — its five intra-workspace pins are hand-kept
     # copies like any other — so counting it out would understate by one.
     return (
-        f"{len(sites)} hand-kept version sites in {len(covered)} files all read "
+        f"{len(sites)} version sites in {len(covered)} files all read "
         f"{authority} — the root Cargo.toml's [workspace.package] version"
     )
 
@@ -366,6 +462,24 @@ def code_spans(markdown: str) -> list[tuple[int, str]]:
     blanked = FENCE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), markdown)
     spans += [(m.start(1), m.group(1)) for m in INLINE_RE.finditer(blanked)]
     return spans
+
+
+def blank_code(markdown: str, *, fences: bool = True) -> str:
+    """`code_spans`' inverse: the document with its code blanked to spaces.
+
+    Same length, newlines kept, so every offset still names its own line. Two
+    callers want two different dispositions of *fenced* blocks and the flag is
+    what keeps that one function rather than two: a link inside a ```sh``` block
+    is a shell argument and not a link, while a version literal inside a fence
+    on a crates.io front page is exactly the claim that check is looking for.
+    """
+    blanked = FENCE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), markdown)
+    keep = blanked if fences else markdown
+    out = list(keep)
+    for span in INLINE_RE.finditer(blanked):
+        for i in range(span.start(), span.end()):
+            out[i] = " "
+    return "".join(out)
 
 
 def check_recipe_references() -> str:
@@ -723,6 +837,86 @@ def check_markdown_tables() -> str:
     )
 
 
+# `](target` — an inline link's destination, taken up to the first whitespace or
+# `)` so an optional title is not swallowed. Reference definitions
+# (`[label]: target`) are deliberately out of scope: the three in this
+# repository are all `https:`, and a rule measured against no in-scope subject
+# is a rule nobody has tested.
+MD_LINK_RE = re.compile(r"\]\(\s*([^)\s]+)")
+
+
+def check_relative_links() -> str:
+    """Every relative Markdown link resolves to a file that exists.
+
+    **Two were broken when this was written**, and both had been for a while:
+    `docs/PHASE1.md`'s citation of `0013` climbed one directory too far
+    (`../decisions/` from inside `docs/`, which is the repository's parent),
+    and `docs/decisions/0046` cited `0010` by a title that record does not have.
+    Neither is visible in a diff, both render as ordinary links, and github.com
+    answers a 404 only to the reader who clicks.
+
+    **Code is blanked first, fences included**, which is the difference from
+    `check_front_page_versions`: a link-shaped path inside a ```sh``` block is
+    an argument to a command, not a link. That is a rule on principle, not a
+    rule with a case behind it — measured over every tracked Markdown file, the
+    scan sees the same links and reports the same zero failures with the
+    blanking removed outright. The one hit blanking removes is a rustdoc path
+    in a code span, and the scheme filter below already skips it. Kept because
+    a fenced example of a *broken* link is a thing documentation does, and it
+    should not fail this gate.
+
+    **Anchors are not checked, only the file.** `](#section)` is skipped
+    outright and a `#fragment` is stripped before resolving, because heading
+    slugs are a renderer's business and GFM's rule is not the only one in play.
+
+    The floor below is the point of the exercise: a scan of these documents that
+    silently matched nothing would print the same "all resolve" as a clean one.
+    """
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "*.md"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    files = sorted(f for f in listed.split("\0") if f)
+
+    checked = 0
+    for rel in files:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        prose = blank_code(text)
+        for hit in MD_LINK_RE.finditer(prose):
+            target = hit.group(1)
+            # A scheme (`https:`, `mailto:`) before the first `/`, or a bare
+            # in-page anchor. Neither names a file in this repository.
+            head = target.split("/", 1)[0]
+            if ":" in head or target.startswith("#"):
+                continue
+            checked += 1
+            path = target.split("#", 1)[0]
+            if not path:
+                continue
+            resolved = (ROOT / rel).parent / path
+            if resolved.exists():
+                continue
+            line_no = text.count("\n", 0, hit.start()) + 1
+            fail(
+                f"{rel}:{line_no} links to {target!r}, which does not exist.\n"
+                f"      resolved: {resolved.resolve()}\n"
+                f"    Relative links are resolved against the file that carries "
+                f"them, so a `../` from inside `docs/` leaves the repository."
+            )
+
+    if checked < 100:
+        fail(
+            f"only {checked} relative links were found across {len(files)} "
+            f"documents. This corpus has hundreds; a scan that stops matching "
+            f"reports every document as clean."
+        )
+
+    return f"{checked} relative links in {len(files)} documents all resolve"
+
+
 PROSE_VERSION_RE = re.compile(r"\bv?[0-9]+\.[0-9]+\.[0-9]+\b")
 
 
@@ -739,12 +933,23 @@ def check_front_page_versions() -> str:
     for a gate: a lesson written into prose only propagates if the next person
     reads the prose.
 
-    **Scope is derived, not listed.** `PUBLISHABLE` names the release; each of
-    those manifests names its own front page in `[package] readme`. A crate that
-    publishes without a `readme` key is itself a failure, in the same shape as
-    `check_versions`' "no version site found" — a scan that silently finds
-    nothing is how a gate keeps passing after its subject moved. So this does not
-    pay option 2's stated cost of encoding "these five files".
+    **Scope is derived from a listed set**, and the distinction is worth the
+    sentence because the earlier phrasing here — *"scope is derived, not
+    listed"* — read as stronger than it is. `PUBLISHABLE` is the one literal in
+    this file that is not read out of the repository, with the argument for that
+    at its definition; what is derived is each crate's front *page*, which its
+    own manifest names in `[package] readme`. A crate that publishes without a
+    `readme` key is itself a failure, in the same shape as `check_versions`'
+    "no version site found" — a scan that silently finds nothing is how a gate
+    keeps passing after its subject moved.
+
+    **The sixth front page is the root `README.md`, and it is not merely the
+    GitHub landing page.** `pyproject.toml`'s `[project] readme` names it, so it
+    is what PyPI renders for `transform_tree` — a package index front page by
+    the same argument as the five, and uncovered here until 2026-09-05. It is
+    read out of `pyproject.toml` rather than hard-coded, and a `[project]`
+    without a `readme` key fails: the distribution would render no description
+    at all, which is a defect in its own right.
 
     **Why three components, and why inline code is exempt.** Both narrower than
     they look, and both were measured against the whole corpus before being
@@ -771,31 +976,40 @@ def check_front_page_versions() -> str:
     This is purely a regression guard. Its value is that #236's lesson stops
     depending on anybody re-reading it.
     """
-    checked = []
+    # (index name, front page) for every page a package registry renders: the
+    # five crates.io pages, then the PyPI one.
+    pages: list[tuple[str, str]] = []
     for name in sorted(PUBLISHABLE):
         manifest = f"crates/{name}/Cargo.toml"
         readme = load_toml(manifest).get("package", {}).get("readme")
-        if not readme:
+        if not isinstance(readme, str) or not readme:
             fail(
                 f"{manifest} publishes but declares no [package] readme, so this "
                 f"check cannot find its crates.io front page. Either name the "
                 f"file or explain here why the crate has none."
             )
             continue
+        pages.append((name, f"crates/{name}/{readme}"))
 
-        rel = f"crates/{name}/{readme}"
+    project = load_toml("pyproject.toml")["project"]
+    py_readme = project.get("readme")
+    if not isinstance(py_readme, str) or not py_readme:
+        fail(
+            "pyproject.toml [project] declares no `readme` (or declares one this "
+            "check cannot resolve to a path), so the PyPI front page for "
+            f"{project.get('name', '?')!r} is unknown here — and a distribution "
+            "with no readme renders no description on the index at all."
+        )
+    else:
+        pages.append((project["name"], py_readme))
+
+    checked = []
+    for name, rel in pages:
         text = (ROOT / rel).read_text(encoding="utf-8")
 
-        # Blank the code, keep the prose — the inverse of `code_spans`, which is
-        # why that helper is not reused here. Fences are blanked first (same
-        # length, newlines kept) so the inline pass cannot match a backtick
-        # inside one and so every offset still names the right line.
-        fence_blanked = FENCE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
-        prose = list(text)
-        for span in INLINE_RE.finditer(fence_blanked):
-            for i in range(span.start(), span.end()):
-                prose[i] = " "
-        prose = "".join(prose)
+        # Blank the inline code, keep the prose *and the fences* — see
+        # `blank_code`, whose flag is why this is not a second spelling of it.
+        prose = blank_code(text, fences=False)
 
         for hit in PROSE_VERSION_RE.finditer(prose):
             line_no = text.count("\n", 0, hit.start()) + 1
@@ -803,16 +1017,17 @@ def check_front_page_versions() -> str:
             fail(
                 f"{rel}:{line_no} states the version {hit.group(0)!r} in prose:\n"
                 f"      {line}\n"
-                f"    This file is rendered as {name}'s crates.io front page, and "
-                f"nothing updates a number written there. Delete it and say why, "
-                f"as crates/tf_tree_math/README.md does — or put it in backticks "
+                f"    This file is rendered as {name}'s front page on the index "
+                f"that ships it, and nothing updates a number written there. "
+                f"Delete it and say why, as crates/tf_tree_math/README.md does "
+                f"— or put it in backticks "
                 f"if it is a worked example rather than a claim about this release."
             )
         checked.append(rel)
 
     return (
-        f"no version literal in prose on any of the "
-        f"{len(checked)} publishable crates' front pages"
+        f"no version literal in prose on any of the {len(checked)} package-index "
+        f"front pages (crates.io and PyPI)"
     )
 
 
@@ -871,6 +1086,7 @@ def main() -> int:
         check_changelog(authority),
         check_recipe_references(),
         check_markdown_tables(),
+        check_relative_links(),
         check_front_page_versions(),
         check_distribution_name(),
     ]

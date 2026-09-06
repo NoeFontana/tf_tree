@@ -77,9 +77,11 @@ jobs:
           python-version: "3.13"
 
       # **`just artifact-versions`, not a transcription of it.** That recipe
-      # already asserts the seventeen hand-kept version sites agree, that the
-      # publishable set is exactly the five crates below, and that CHANGELOG.md
-      # carries a section for the current version. Re-spelling any of it here
+      # already asserts that every version site in the repository agrees — the
+      # hand-kept copies and, since the tf2 lockfile sat four releases behind,
+      # the tracked lockfiles too — that the publishable set is exactly the five
+      # crates below, and that CHANGELOG.md carries a section for the current
+      # version. The count is the recipe's own output, not a number here. Re-spelling any of it here
       # would be a second copy to drift (`docs/PROJECT.md` §6).
       - name: just artifact-versions
         run: just artifact-versions
@@ -92,8 +94,8 @@ jobs:
           tag="${GITHUB_REF#refs/tags/v}"
           # `[workspace.package] version` is the one number every publishable
           # crate inherits; `just artifact-versions` above has already asserted
-          # that the other sixteen sites agree with it, so reading it here is
-          # reading all of them.
+          # that every other site agrees with it, so reading it here is reading
+          # all of them.
           ws="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
           echo "tag=${tag} workspace=${ws}"
           if [[ "$tag" != "$ws" ]]; then
@@ -519,6 +521,18 @@ jobs:
       # once beside them is the honest shape. It is deterministic — same graph,
       # same bytes, same serial number — so two releases diff to their dependency
       # change and nothing else.
+      #
+      # **This step spells the command out rather than invoking `just sbom`,
+      # and that is a known residual.** CLAUDE.md's rule is that CI mirrors the
+      # recipes by invoking them; this job installs a Rust toolchain and not
+      # `just`, so closing it costs an install step on the release path. What
+      # bounds the drift meanwhile is that both spellings call the same script
+      # with the same `--version` **value** — the tag with its `v` stripped,
+      # which is the workspace number `just sbom`'s default resolves to, so the
+      # documents are identical — and that `just lint` now runs the recipe on
+      # every pull request, so the generator is exercised even though this step,
+      # gated on a tag, still has not been. The two differ in the `-o` name
+      # only: the asset here keeps the `v` so it sorts with the archives.
       - uses: dtolnay/rust-toolchain@stable
       - name: generate the SBOM
         run: |

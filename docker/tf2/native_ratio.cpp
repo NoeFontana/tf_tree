@@ -4,9 +4,16 @@
 //
 // `crates/tf_tree_bench/src/ratio.rs` measures the same quotient from Rust, and
 // its tf2 arm goes through `tf_tree_tf2_sys`. `docs/benchmarks/tf2.md` prices
-// that boundary at **~21 ns / 8% at depth 3** (bias 3: cross-TU, no inlining,
-// one extra copy) and it is charged to tf2 — so every ratio measured that way
-// flatters `tf_tree`.
+// that boundary at **45.3 ns / 10% at depth 3** (bias 3: cross-TU, no inlining,
+// one extra copy) — 498.2 ns through the binding against 452.9 ns native, a
+// subtraction between two rows of that document's bracket table, one of which
+// **this file produces**. It is charged to tf2 — so every ratio measured that
+// way flatters `tf_tree`. (This line read `~21 ns / 8%` until 2026-09-05;
+// `tf2.md` withdrew that figure for having no derivation recorded anywhere and
+// for disagreeing with its own bracket table by a factor of two. To find every
+// site that still carries it, grep — an enumeration written here is a list that
+// goes stale silently, which is how this file came to cite the document that
+// withdrew the number it was quoting.)
 //
 // Here the arms are the other way round:
 //

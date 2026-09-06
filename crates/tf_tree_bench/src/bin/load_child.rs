@@ -46,11 +46,17 @@
 //!
 //! # Why a reader is a process and not a thread
 //!
-//! Per-*thread* core pinning needs `sched_setaffinity`, which is `unsafe` and
-//! which `CLAUDE.md`'s unsafe budget would route to a decision record —
-//! `tf_tree_bench`'s library is `#![forbid(unsafe_code)]`. A process can be
-//! placed exactly by `taskset -c N`, needs no `unsafe` at all, and is closer to
-//! the shape a deployment actually has. The coordinator does the placing; this
+//! Per-*thread* core pinning needs `sched_setaffinity`, an OS-boundary `unsafe`
+//! call whose only purpose is placement — and `docs/decisions/0007` rule 1
+//! admits a boundary the compiler cannot see across, not a convenience. A
+//! process can be placed exactly by `taskset -c N`, needs no `unsafe` at all,
+//! and is closer to the shape a deployment actually has.
+//!
+//! **This paragraph cited *"`tf_tree_bench`'s library is
+//! `#![forbid(unsafe_code)]`"* until 2026-09-05**, which is the wrong scope: the
+//! attribute is on `src/lib.rs`, a separate crate root from this bin, and
+//! sibling bins carry `unsafe` — `scripts/unsafe-budget.txt` is the list. The
+//! design choice survives on the rule alone. The coordinator does the placing; this
 //! binary knows nothing about it.
 //!
 //! Output is a line protocol on stdout, read by the coordinator. Usage errors go

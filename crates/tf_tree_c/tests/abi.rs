@@ -17,8 +17,7 @@ use tf_tree_c::*;
 /// Read this thread's error detail. Returns `None` if the call itself failed.
 #[cfg(feature = "test-hooks")]
 fn last_error() -> Option<tft_error> {
-    let mut e: tft_error = unsafe { core::mem::zeroed() };
-    e.struct_size = core::mem::size_of::<tft_error>() as u32;
+    let mut e = tft_error::blank();
     // SAFETY: `e` is a live, aligned `tft_error` with `struct_size` set.
     let rc = unsafe { tft_last_error(&mut e) };
     (rc == TFT_OK).then_some(e)
@@ -192,7 +191,7 @@ fn the_layout_addition_moved_the_minor_and_not_the_major() {
 /// rather than having a struct of the wrong length written over its stack.
 #[test]
 fn last_error_rejects_a_struct_size_it_does_not_know() {
-    let mut e: tft_error = unsafe { core::mem::zeroed() };
+    let mut e = tft_error::blank();
     e.struct_size = 8; // far too small
                        // SAFETY: `e` is a live, aligned `tft_error`.
     assert_eq!(unsafe { tft_last_error(&mut e) }, TFT_ERR_BAD_STRUCT_SIZE);
@@ -251,7 +250,7 @@ fn tft_error_layout_is_what_the_header_promises() {
         "no tail padding surprises"
     );
     assert_eq!(TFT_MESSAGE_LEN, 256);
-    let e: tft_error = unsafe { core::mem::zeroed() };
+    let e = tft_error::blank();
     let base = core::ptr::addr_of!(e) as usize;
     assert_eq!(
         core::ptr::addr_of!(e.struct_size) as usize - base,
@@ -275,9 +274,7 @@ fn tft_extrapolated_layout_is_what_the_header_promises() {
         0,
         "no tail padding surprises"
     );
-    // SAFETY: three integers with no niche and no validity invariant, so an
-    // all-zero bit pattern is a valid value of this type.
-    let e: tft_extrapolated = unsafe { core::mem::zeroed() };
+    let e = tft_extrapolated::blank();
     let base = core::ptr::addr_of!(e) as usize;
     assert_eq!(
         core::ptr::addr_of!(e.struct_size) as usize - base,

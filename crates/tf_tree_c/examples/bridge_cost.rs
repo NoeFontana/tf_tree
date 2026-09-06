@@ -195,12 +195,7 @@ fn main() {
     println!("tft_bridge_offer — {EDGES} dynamic edges, {N} accepted offers/round");
     println!("min of {ROUNDS} rounds: {ns:.1} ns per accepted transform");
 
-    let mut stats = tft_bridge_stats {
-        struct_size: core::mem::size_of::<tft_bridge_stats>() as u32,
-        // SAFETY: `tft_bridge_stats` is `#[repr(C)]` and made of integers, for
-        // which all-zero is a valid value.
-        ..unsafe { core::mem::zeroed() }
-    };
+    let mut stats = tft_bridge_stats::blank();
     // SAFETY: live handle on its creating thread; `stats` is a live local with
     // `struct_size` set.
     assert_eq!(unsafe { tft_bridge_get_stats(b, &mut stats) }, TFT_OK);

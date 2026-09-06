@@ -24,9 +24,28 @@
 //! compared two code paths as well as two backends, and a difference could then
 //! be attributed to either.
 //!
-//! The recording is real: it is written to MCAP and read back, so the messages
-//! both trees replay have been through the same serialisation a robot's bag
-//! would put them through.
+//! # What the recording is, and what it is not
+//!
+//! The fixture is written to `run.mcap` and the file is asserted to exist. It
+//! is **not** read back: both trees replay the same in-memory
+//! `Vec<FixtureMessage>`, and this file imports no reader. So CDR encode and
+//! decode of the pose bits, MCAP chunking and the reader's own path are all
+//! outside the assertion — *"written to MCAP and read back"* stood here until
+//! 2026-09-05 and was never true.
+//!
+//! The claim §10 asks for is unaffected, because it is about the two read paths
+//! and not about serialisation: one recording, two backends, bit-identical
+//! `f64`. Widening this to a real round trip is a change with a decision in it
+//! rather than a one-line addition — the fixture's `/tf_static` edges carry
+//! `stamp_ns == 0`, which `read_tf` consumers routinely skip, so reading the
+//! file back would change the query set. `docs/PHASE2.md` §15's box for this
+//! test carries the argument.
+//!
+//! # Where this test runs
+//!
+//! It is `shm`-gated, so `just test` does not reach it: `cargo nextest list -p
+//! tf_tree_cli` does not list it and the same command with `--features shm`
+//! does. `just shm-check` runs it, and CI runs `just shm-check`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(all(feature = "shm", target_os = "linux"))]
@@ -162,11 +181,14 @@ fn a_replay_into_heap_and_mapped_arenas_is_bit_identical() {
     let scratch = Scratch::new("bitident");
     let msgs = small_recording();
 
-    // Through a real MCAP file and back, so both arenas replay messages that
-    // have been serialised and parsed rather than held in memory.
+    // The recording is written and asserted to exist. It is deliberately not
+    // read back: both arenas below replay `msgs`, the same in-memory fixture.
     let bag = scratch.0.join("run.mcap");
     write_mcap(&bag, &msgs).expect("write the recording");
-    assert!(bag.is_file(), "the recording must exist to be replayed");
+    assert!(
+        bag.is_file(),
+        "the recording must be writable to be a recording"
+    );
 
     let heap = builder_for(&msgs).build().expect("heap arena");
     let mapped = builder_for(&msgs)

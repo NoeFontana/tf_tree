@@ -297,8 +297,7 @@ fn a_successful_call_clears_the_error_slot() {
         )
     };
     assert_eq!(rc, TFT_ERR_EXTRAPOLATION);
-    let mut e: tft_error = unsafe { core::mem::zeroed() };
-    e.struct_size = core::mem::size_of::<tft_error>() as u32;
+    let mut e = tft_error::blank();
     // SAFETY: `e` is live and its struct_size is set.
     unsafe { tft_last_error(&mut e) };
     assert_eq!(e.code, TFT_ERR_EXTRAPOLATION);
@@ -455,8 +454,7 @@ fn a_plan_that_cannot_compile_returns_no_handle() {
 
 /// Read this thread's error detail.
 fn fetch_error() -> tft_error {
-    let mut e: tft_error = unsafe { core::mem::zeroed() };
-    e.struct_size = core::mem::size_of::<tft_error>() as u32;
+    let mut e = tft_error::blank();
     // SAFETY: `e` is live, aligned, and its struct_size is set.
     assert_eq!(unsafe { tft_last_error(&mut e) }, TFT_OK);
     e
@@ -1141,8 +1139,7 @@ fn introspection_reports_the_tree_and_refuses_to_truncate() {
         "nothing may be written when it does not fit"
     );
     // ...and the caller is told how much it needed.
-    let mut e: tft_error = unsafe { core::mem::zeroed() };
-    e.struct_size = core::mem::size_of::<tft_error>() as u32;
+    let mut e = tft_error::blank();
     // SAFETY: `e` is a live, aligned `tft_error` with `struct_size` set.
     assert_eq!(unsafe { tft_last_error(&mut e) }, TFT_OK);
     assert_eq!(e.requested, 7, "the required length, NUL included");
@@ -1468,13 +1465,27 @@ const NEWEST_NS: i64 = 310_000_000;
 /// running faster than its state estimate is in on every tick.
 const PAST_NS: i64 = 400_000_000;
 
-/// A blank [`tft_extrapolated`] with `struct_size` set, as a C caller writes it.
+/// A value the callee cannot be confused with, `struct_size` set.
+///
+/// **Not [`tft_extrapolated::blank`], and the reason is that `blank()` is
+/// field-identical to the answer.** On the in-window path
+/// `tft_plan_at_extrapolating` writes `{ struct_size, by_ns: 0, edge:
+/// TFT_INVALID_ID }`, which is exactly what `blank()` already holds — so a
+/// caller that seeded `blank()` cannot tell *the callee wrote the sentinel*
+/// from *the callee wrote nothing*. `by_ns` is seeded to a distance no
+/// extrapolation can report, so every assertion about a written `by_ns`
+/// requires the write. `edge` stays `TFT_INVALID_ID`, because the
+/// extrapolating assertions are `assert_ne!(info.edge, TFT_INVALID_ID)` and a
+/// seed that already differed would make *those* vacuous instead.
+const EXTRAP_OUT_UNWRITTEN_BY_NS: i64 = i64::MIN;
+
+/// A [`tft_extrapolated`] a C caller could write, seeded so the callee's write
+/// is observable — see [`EXTRAP_OUT_UNWRITTEN_BY_NS`].
 fn extrap_out() -> tft_extrapolated {
-    // SAFETY: `tft_extrapolated` is a POD of three integers with no niche and
-    // no validity invariant, so an all-zero bit pattern is a valid value of it.
-    let mut e: tft_extrapolated = unsafe { core::mem::zeroed() };
-    e.struct_size = core::mem::size_of::<tft_extrapolated>() as u32;
-    e
+    tft_extrapolated {
+        by_ns: EXTRAP_OUT_UNWRITTEN_BY_NS,
+        ..tft_extrapolated::blank()
+    }
 }
 
 /// Evaluate `plan` at `stamp` under `policy` into `MAT4_ROW`.
@@ -1533,7 +1544,10 @@ fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
         "Error refuses a stamp past newest"
     );
     assert_eq!(out, [0u8; 128], "a refused call writes no pose");
-    assert_eq!(info.by_ns, 0, "and no distance");
+    assert_eq!(
+        info.by_ns, EXTRAP_OUT_UNWRITTEN_BY_NS,
+        "and leaves the caller's `info` untouched"
+    );
     let e = fetch_error();
     assert_eq!(e.code, TFT_ERR_EXTRAPOLATION);
     assert_eq!(
@@ -1617,6 +1631,13 @@ fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
 /// Mutant: pass `x.edge.get()` through unconditionally ⇒ `an interpolated
 /// answer has no stale edge to name` fails with `edge` = the fixture's dynamic
 /// edge id.
+///
+/// **The `edge` assertion here reads a value only because the `by_ns` one
+/// proves a write happened.** The callee writes the whole struct or none of it,
+/// and its in-window answer is field-identical to
+/// [`tft_extrapolated::blank`] — so the seed is
+/// [`EXTRAP_OUT_UNWRITTEN_BY_NS`], and `by_ns == 0` is what separates *wrote
+/// the sentinel* from *wrote nothing*.
 #[test]
 fn an_in_window_stamp_reports_no_extrapolation_under_any_policy() {
     let tree = DomainTree::new(1);

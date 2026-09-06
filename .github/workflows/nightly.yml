@@ -255,10 +255,23 @@ jobs:
   # tree: a 1.9-second gate must not be reported behind a 30-minute soak, and it
   # must not go unrun on a night the soak fails early.
   #
-  # ~340 MiB of disk for the index and ~620 MiB peak RSS, both well inside a
-  # hosted runner.
+  # Disk: each of the two gates freezes its own gate-scale index under
+  # `target/`. `just gate2` deletes its fixtures again on success, so what this
+  # job holds afterwards is gate 4's index alone rather than both; ~620 MiB peak
+  # RSS. Both well inside a hosted runner, and no total is written here — the
+  # two recipes are where the sizes are stated, and this line has already been
+  # wrong once by describing one index while the job produced two.
+  #
+  # **`just gate2` is a step of this job rather than a job of its own**, and for
+  # the reason above read the other way: what is expensive is the `--release`
+  # `--features shm` build of `tf_tree_bench`, which this job already pays for,
+  # and gate 2 adds ~4 s of measurement on top of it. The stated reason gate 4
+  # is not a step on `torture` — a two-second gate must not be reported behind a
+  # thirty-minute soak — is satisfied by sharing *this* job, not by adding a
+  # third. **The job id stays `gate4`** so that anything referring to it by name
+  # keeps working; the display name is what moved.
   gate4:
-    name: gate4 (16 workers share one .tft)
+    name: the .tft gates (open time, 16 workers sharing one file)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -268,5 +281,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      - name: just gate2
+        run: just gate2
       - name: just gate4
         run: just gate4
+      # gate 5 needs no `shm` and its red test therefore runs per-PR in
+      # `just test`; what runs here is the *release* measurement, because a
+      # debug ingest reads about a tenth of the shipped one and the number this
+      # job publishes should be the shipped one.
+      - name: just gate5
+        run: just gate5

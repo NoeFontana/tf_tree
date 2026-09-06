@@ -55,11 +55,19 @@
 //! **What the C-free codecs cost, measured.** On this host, `survey` over a
 //! 160 000-transform recording takes 0.027 s uncompressed, 0.035 s for lz4 and
 //! 0.048 s for zstd — so roughly **1.8× the per-pass wall time** of an uncompressed
-//! recording, and `ruzstd` decodes libzstd frames at about **a quarter of libzstd's
-//! own rate**. Multiplied by the pass count, which is `1 + groups + spilled edges`.
+//! recording. Multiplied by the pass count, which is `1 + groups + spilled edges`.
 //! An earlier revision of this section said the constraint had no visible cost; it
 //! has a modest and measurable one, and that is still the right trade against a C
-//! build step.
+//! build step. **Those three figures are a `survey` measurement taken by hand and
+//! re-derived by nothing**; `docs/PHASE5.md` §12 criterion 5's gate (`just gate5`,
+//! `docs/decisions/0050-what-ten-times-real-time-divides.md`) times a whole `run`
+//! on one codec arm and does not reproduce them.
+//!
+//! **CORRECTION (2026-09-05): "`ruzstd` decodes libzstd frames at about a quarter
+//! of libzstd's own rate" is deleted rather than kept.** It stood here and in
+//! `crate::decompress`, in two spellings, with no producer for either — the shape
+//! `docs/benchmarks/EVIDENCE.md` exists to prevent. `decompress`'s module doc
+//! carries the qualitative claim, which is what the trade rests on.
 //!
 //! # Status against §3
 //!

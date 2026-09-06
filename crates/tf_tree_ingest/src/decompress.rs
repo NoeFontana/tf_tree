@@ -31,13 +31,27 @@
 //! and that was false.** On this host (AMD EPYC-Milan, release, page cache warm),
 //! [`crate::survey`] over a 160 000-transform recording in 16 chunks: **0.027 s
 //! uncompressed, 0.035 s lz4 (1.33×), 0.048 s zstd (1.82×)**. Isolated, `ruzstd`
-//! decodes a libzstd `-3` frame at **674 MiB/s** against libzstd's own
-//! **2 480 MiB/s** on the same bytes (`zstd -b3`), i.e. **~3.7× slower**. Two
-//! things multiply that: decompression is repeated on **every pass**, and the pass
-//! count is `1 + groups + spilled edges` rather than a flat two, so `--max-memory`
+//! decodes a libzstd frame at a **small fraction of libzstd's own rate on the same
+//! bytes** — several times slower, in the direction this paragraph says. Two things
+//! multiply that: decompression is repeated on **every pass**, and the pass count
+//! is `1 + groups + spilled edges` rather than a flat two, so `--max-memory`
 //! pressure buys extra decodes. It is a price worth paying for no C build step, and
-//! it is not the same as free — `docs/PHASE5.md` §12's throughput gate is still met
-//! with a wide margin.
+//! it is not the same as free — `docs/PHASE5.md` §12's throughput gate is measured
+//! and gated since 2026-09-05 (`just gate5`) and is met by more than an order of
+//! magnitude.
+//!
+//! **CORRECTION (2026-09-05): two MiB/s figures are deleted rather than kept.**
+//! This paragraph read "**674 MiB/s** against libzstd's own **2 480 MiB/s** on the
+//! same bytes (`zstd -b3`), i.e. **~3.7× slower**". Nothing in this repository
+//! re-derives either number — `docs/benchmarks/EVIDENCE.md`'s own rule is that a
+//! probe's figure needs a documented command, and these had none, which is the
+//! shape that file exists to prevent. The qualitative claim is what the argument
+//! rests on and it stays; a reader who needs the ratio should measure it and
+//! register a probe. The three `survey` figures above are in the same position
+//! and are **kept**, because they are what §0.0's row quotes and deleting them
+//! there and here at once would leave that row citing nothing — they are a hand
+//! measurement, and `just gate5` does not re-derive them: it times a whole `run`
+//! on one codec arm rather than a `survey` on three.
 //!
 //! So the framing is ours instead. It is nine bytes — `opcode: u8`, `len: u64`
 //! little-endian, `body[len]` — plus an eight-byte magic at each end of the file,

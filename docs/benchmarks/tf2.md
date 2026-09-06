@@ -1302,9 +1302,15 @@ Each of the three, checked against the code:
   tests alone.
 
 `PHASE2.md` §0.0 remains the authoritative status table; what is still open
-there is the tooling half (`tf_tree_record`, the long-running fault harness) and
-`tf_tree serve` ([`0019`](../decisions/0019-one-binary-and-topology-you-can-wait-for.md)
-steps 6–7, deliberately unscheduled), not the lifecycle. None of the numbers
+there is `tf_tree serve`
+([`0019`](../decisions/0019-one-binary-and-topology-you-can-wait-for.md) steps
+6–7, deliberately unscheduled), not the lifecycle. **This sentence also named
+`tf_tree_record` and the long-running fault harness as open, until 2026-09-05,
+and neither is**: the recorder is declined by
+[`0047`](../decisions/0047-the-recording-this-reader-would-refuse.md), and the
+fault harness is `shm_torture`, which §0.0 records as done and nightly — with
+the qualifier that row asks a quoter to carry, that one of §11.4's four
+continuous invariants is not implemented. None of the numbers
 above depended on any of it either way.
 
 ## The performance suite: contention, scale, duration, and the transport

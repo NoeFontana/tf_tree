@@ -27,10 +27,19 @@
 //!
 //! # Pinning without `unsafe`
 //!
-//! Per-thread placement needs `sched_setaffinity`; `tf_tree_bench`'s library is
-//! `#![forbid(unsafe_code)]` and `CLAUDE.md`'s unsafe budget routes a new kind of
-//! `unsafe` to a decision record. A *process* is placed exactly by `taskset -c
-//! N`, which costs no `unsafe`, and it is the closer model of a robot anyway.
+//! Per-thread placement needs `sched_setaffinity`, which is an OS-boundary
+//! `unsafe` call whose only purpose is placement — and `docs/decisions/0007`
+//! rule 1 admits a boundary the compiler cannot see across, not a convenience.
+//! A *process* is placed exactly by `taskset -c N`, which costs no `unsafe` at
+//! all, and it is the closer model of a robot anyway.
+//!
+//! **The reason given here until 2026-09-05 was the wrong one and it is worth
+//! keeping**: it read *"`tf_tree_bench`'s library is `#![forbid(unsafe_code)]`"*,
+//! and that attribute is on `src/lib.rs` — a **separate crate root** from this
+//! bin, which it does not govern. Sibling bins in this package carry `unsafe`.
+//! The architecture is right; it rests on the rule, not on the
+//! attribute. `docs/decisions/0048` is where that distinction is decided and
+//! `scripts/unsafe-budget.txt` is where each site's kind is written down.
 //! When `taskset` is absent the run continues unpinned and **says so in the
 //! output and in the emitted JSON**, because an unpinned scaling row is a
 //! different experiment.

@@ -21,13 +21,30 @@
 //!
 //!   **`tf_tree` never calls `mlock`, and this row does not imply that it does.**
 //!   `docs/PHASE2.md` §7.4 specifies a `LockPolicy::Locked` that exists nowhere
-//!   in this codebase (§0.0 carries the row), and `docs/API.md` §8.3 records why
-//!   it is not simply missing work: `MLOCK_ONFAULT`, the flag §7.4 names, does
-//!   not prefault, so it adds nothing over §7.1's shipped per-edge
-//!   `MADV_POPULATE_*` — and pinning a whole address space is
-//!   `mlockall(MCL_CURRENT|MCL_FUTURE)` in the *embedding application*, which is
-//!   the only place that can see the `RLIMIT_MEMLOCK` budget it is spending.
-//!   So this is a limit reported **for the consumer to act on**, not for us.
+//!   in this codebase (§0.0 carries the row), and
+//!   `docs/decisions/0049-the-flag-that-prefaults-the-arena.md` is why it is not
+//!   simply missing work: locking memory on a caller's behalf spends an
+//!   `RLIMIT_MEMLOCK` budget this library cannot see, and the arena is
+//!   deliberately over-provisioned. Pinning a whole address space is
+//!   `mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT)` in the *embedding
+//!   application*, which is the only place that can see the budget it is
+//!   spending. So this is a limit reported **for the consumer to act on**, not
+//!   for us.
+//!
+//!   **This paragraph said `MLOCK_ONFAULT` "adds nothing over §7.1" and
+//!   recommended `mlockall(MCL_CURRENT|MCL_FUTURE)` until 2026-09-05**, both
+//!   copied from `docs/API.md` §8.3 in the PR that wrote it. Measured by
+//!   `crates/tf_tree_bench/examples/mlock_probe.rs`: `MCL_ONFAULT` is what
+//!   stops the call prefaulting the whole arena, which is per-arena population
+//!   at address-space scope and the thing `docs/decisions/0024` removed at
+//!   5.2×. `0049` carries the measurements and the one clause that stays
+//!   undetermined.
+//!
+//!   **What this row cannot see is the other term.** `mlockall` charges the
+//!   process's whole address space; this compares a limit against the *arena*.
+//!   Measured, the call fails `ENOMEM` at limits well above a small arena while
+//!   this check is silent, so silence here is not a clearance — the finding
+//!   says so.
 //!
 //! # Why `/proc/self/limits` rather than `getrlimit`
 //!

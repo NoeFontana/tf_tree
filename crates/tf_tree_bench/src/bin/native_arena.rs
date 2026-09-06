@@ -7,8 +7,13 @@
 //! `docs/benchmarks/tf2.md` prices four measurement biases, and the one that
 //! cannot be removed from an in-process Rust harness is the third: the residual
 //! FFI boundary between `tf_tree_tf2_sys` and `tf2::BufferCore` — cross-TU, no
-//! inlining, one extra copy, **~21 ns / 8% at depth 3**. It is charged to tf2,
-//! so every ratio measured that way *flatters* `tf_tree`.
+//! inlining, one extra copy, **45.3 ns / 10% at depth 3** — 498.2 ns through
+//! the binding against 452.9 ns native, a subtraction between two rows of that
+//! document's bracket table. It is charged to tf2, so every ratio measured that
+//! way *flatters* `tf_tree`. (This line read `~21 ns / 8%` until 2026-09-05;
+//! `tf2.md` withdrew that figure for having no derivation recorded anywhere.
+//! `grep -rn '21 ns'` finds the sites that still carry it; a list written into
+//! a comment is one more thing to go stale.)
 //!
 //! The fix is to put both engines in one **C++** process: tf2 natively, and
 //! `tf_tree` through its C ABI. That reverses the direction of the residual

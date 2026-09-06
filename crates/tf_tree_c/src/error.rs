@@ -203,7 +203,15 @@ pub struct tft_error {
 }
 
 impl tft_error {
-    const fn blank() -> tft_error {
+    /// A well-formed all-clear `tft_error`, with `struct_size` already set.
+    ///
+    /// **Public because the alternative is `unsafe { core::mem::zeroed() }` at
+    /// every caller.** `docs/decisions/0048` found that spelling across this
+    /// crate's own tests and examples and `tf_tree_bench`'s bins: every one is
+    /// an `unsafe` block with a safe replacement, and this is the replacement.
+    /// `#[derive(Default)]` is not available — `message` is `[c_char; 256]` and
+    /// arrays longer than 32 have no `Default`.
+    pub const fn blank() -> tft_error {
         tft_error {
             struct_size: core::mem::size_of::<tft_error>() as u32,
             code: TFT_OK,
