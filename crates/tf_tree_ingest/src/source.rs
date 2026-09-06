@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::cdr::{decode_tf_message, CdrError};
@@ -216,6 +216,21 @@ pub struct ReadPolicy {
 pub struct SkipCounts {
     /// Messages on a TF-schema channel whose `message_encoding` was not `cdr`.
     pub non_cdr: u64,
+    /// Top-level records over [`ReadPolicy::max_record_bytes`] that this reader
+    /// does not need, and therefore stepped over instead of refusing the file.
+    ///
+    /// **Only records `source::reader_needs` answers `false` for.** An oversized
+    /// `Chunk`, `Schema`, `Channel` or `Message` still refuses with
+    /// [`crate::IngestError::RecordTooLarge`], because a skipped one reads
+    /// downstream exactly like a recording that never held it.
+    ///
+    /// **This is not a promise that the transform stream is whole.** The record
+    /// was stepped over on a declared length that nothing validated, and the
+    /// only check on where that lands is `resyncs_here` — which a length landing
+    /// on some later record's boundary passes while everything between it and
+    /// the skip disappears. What this number says is that the reader declined to
+    /// look at part of the file and `--max-record-size` is what makes it look.
+    pub oversized_records_skipped: u64,
     /// Channels carrying the TF schema that the topic filter excluded.
     pub filtered_channels: u64,
     /// The recording ended mid-record: everything up to that point was read and
@@ -287,6 +302,51 @@ fn is_sqlite(input: &mut BufReader<File>) -> Result<bool, IngestError> {
     Ok(head.starts_with(SQLITE_MAGIC))
 }
 
+/// Whether this reader has to look inside a top-level record of this opcode.
+///
+/// A `Chunk` because it contains other records, and `Schema`/`Channel`/`Message`
+/// because they are the three [`handle_record`] acts on. Every other opcode in
+/// `mcap::records::op` is parsed and dropped today, so its bytes buy nothing.
+/// **The complement is deliberately not enumerated here** — an earlier version of
+/// this comment listed it and the list was wrong: it said "both index kinds"
+/// while `mcap::records::op` names index opcodes it did not count. That is the
+/// failure a list beside a closed `matches!` always has, because the arm is
+/// checked by the compiler and the prose is not.
+///
+/// **Written as the set the reader *needs*, not the set it may skip**, so that a
+/// record kind this reader starts using is a change here rather than a silent
+/// skip: the failure of the other spelling has no symptom, because a needed record
+/// stepped over reads exactly like a recording that did not contain it.
+const fn reader_needs(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        mcap::records::op::CHUNK
+            | mcap::records::op::SCHEMA
+            | mcap::records::op::CHANNEL
+            | mcap::records::op::MESSAGE
+    )
+}
+
+/// Step over `len` bytes of a record body without reading them in.
+///
+/// Returns whether the body was entirely present. `file_len` is read once, at
+/// open: seeking past the end of a file is *allowed*, so without the comparison a
+/// record declaring more bytes than the file holds would leave the cursor past the
+/// end, the next header read would return zero, and the loop would take that for a
+/// clean end of recording — reporting a truncated file as whole.
+fn skip_body(input: &mut BufReader<File>, len: u64, file_len: u64) -> Result<bool, IngestError> {
+    let io = |e: &std::io::Error| IngestError::Io {
+        raw_os_error: e.raw_os_error().unwrap_or(0),
+    };
+    let at = input.stream_position().map_err(|e| io(&e))?;
+    let end = at.saturating_add(len);
+    let complete = end <= file_len;
+    input
+        .seek(SeekFrom::Start(if complete { end } else { file_len }))
+        .map_err(|e| io(&e))?;
+    Ok(complete)
+}
+
 /// Read every TF transform in `path`, calling `f` once per transform.
 ///
 /// The callback returns a `Result` so a caller can stop on the first anomaly it
@@ -314,6 +374,15 @@ where
     let file = File::open(path).map_err(|e| IngestError::Io {
         raw_os_error: e.raw_os_error().unwrap_or(0),
     })?;
+    // Read once, and only [`skip_body`] uses it: seeking past the end of a file
+    // succeeds, so a skip needs a length to compare against or it cannot tell a
+    // record it stepped over from one the file never held.
+    let file_len = file
+        .metadata()
+        .map_err(|e| IngestError::Io {
+            raw_os_error: e.raw_os_error().unwrap_or(0),
+        })?
+        .len();
     let mut input = BufReader::new(file);
     if is_sqlite(&mut input)? {
         return Err(IngestError::Rosbag2Sqlite);
@@ -393,16 +462,68 @@ where
         // **Compared in `u64`, before the `usize` narrowing.** On a 32-bit
         // target `usize::try_from` would reject a declared length the caller's
         // ceiling might legitimately admit, so the ceiling has to be applied in
-        // the width the file speaks.
-        if declared > policy.max_record_bytes {
-            return Err(IngestError::RecordTooLarge {
-                declared,
-                ceiling: policy.max_record_bytes,
-            });
-        }
-        // The 32-bit narrowing. Same refusal, because from the caller's side it
-        // is the same fact — this reader will not allocate that much — and a
+        // the width the file speaks. The narrowing itself is folded into the same
+        // condition rather than kept as a second refusal: from the caller's side
+        // it is the same fact — this reader will not allocate that much — and a
         // second variant would make the remedy depend on the host's word size.
+        let fits = declared <= policy.max_record_bytes && usize::try_from(declared).is_ok();
+        // **The opcode is consulted before the length decides**, and that ordering
+        // is the whole point. `DEFAULT_MAX_RECORD_BYTES` bounds what this reader
+        // will *allocate*; a record it never reads costs no allocation, so
+        // refusing the recording for one is a ceiling enforced against a cost
+        // nobody pays. An attachment — a calibration YAML, a camera-intrinsics
+        // dump, a bag of images — is a top-level record like any other, and
+        // before this it aborted an ingest whose transforms were all intact.
+        //
+        // The refusal survives for every record the reader does need. That is the
+        // asymmetry [`reader_needs`] exists to state: skipping a `Chunk` loses
+        // transforms silently, which is strictly worse than a named error carrying
+        // the number to raise.
+        if !fits {
+            if reader_needs(opcode) {
+                return Err(IngestError::RecordTooLarge {
+                    declared,
+                    ceiling: policy.max_record_bytes,
+                });
+            }
+            if !skip_body(&mut input, declared, file_len)? {
+                skips.truncated = true;
+                break;
+            }
+            // **A skipped length is an unvalidated number, so where it lands is
+            // checked before the walk trusts it.** Until 2026-09-05 it was not,
+            // and that was a regression rather than a gap: before the opcode was
+            // consulted at all, the ceiling refused every over-long record, so it
+            // doubled as a corrupt-header detector (the comment above says as
+            // much — "a corrupt one asks for a multi-gigabyte allocation"). Once
+            // an opcode the reader does not read became a seek, a corrupt length
+            // on such a record became a silent resync at whatever offset it
+            // reached. So the position has to look like a record boundary —
+            // `resyncs_here` is what counts as one — and anything else returns
+            // the refusal the ceiling gave before, which carries the number to
+            // raise; raising it makes this reader read and parse the record
+            // instead of stepping over it, which is what turns "somewhere around
+            // here" into a diagnosis.
+            //
+            // **What it cannot catch is a length that lands on a real record
+            // boundary**, which `tests/record_ceiling.rs`'s
+            // `a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so`
+            // pins by aiming one there: everything between the skip and that
+            // boundary
+            // disappears and every check here passes. A linear walk has no way to
+            // tell that from a genuinely large record, which is why neither the
+            // summary row nor `SkipCounts::oversized_records_skipped` claims the
+            // transform stream is whole.
+            if !resyncs_here(&mut input, file_len)? {
+                return Err(IngestError::RecordTooLarge {
+                    declared,
+                    ceiling: policy.max_record_bytes,
+                });
+            }
+            skips.oversized_records_skipped += 1;
+            continue;
+        }
+        // Infallible after `fits`, which is where the two bounds were checked.
         let Ok(want) = usize::try_from(declared) else {
             return Err(IngestError::RecordTooLarge {
                 declared,
@@ -495,6 +616,50 @@ fn read_exact_or_eof(input: &mut BufReader<File>, buf: &mut [u8]) -> Result<(), 
     } else {
         Err(IngestError::Mcap)
     }
+}
+
+/// Whether the reader's current position looks like the start of a record.
+///
+/// Used after a record body is stepped over rather than read: the length that was
+/// stepped over came off disk unvalidated, so this is the only thing standing
+/// between a corrupt one and a walk that carries on parsing whatever it lands in.
+///
+/// Accepted: the end of the file, the eight-byte end magic, and a header whose
+/// opcode is one MCAP has assigned and whose own declared length is no larger
+/// than the whole file. Those last two bounds are deliberately loose — a record longer than the file it is in is corrupt on any reading, while
+/// a *truncated* file's final record legitimately declares more bytes than remain,
+/// and reporting that as truncation is `read_tf`'s job rather than this one's.
+///
+/// **A private-use opcode (MCAP reserves `0x80`–`0xFF` for them) does not resync
+/// here**, so an application-extension record directly after a skipped one is
+/// refused rather than stepped over. That is the conservative direction: the
+/// refusal is the one the ceiling gave before any of this existed, and it names
+/// the flag that reads the file.
+///
+/// The peek is undone before returning, so the caller's position is unchanged.
+fn resyncs_here(input: &mut BufReader<File>, file_len: u64) -> Result<bool, IngestError> {
+    let io = |e: &std::io::Error| IngestError::Io {
+        raw_os_error: e.raw_os_error().unwrap_or(0),
+    };
+    let at = input.stream_position().map_err(|e| io(&e))?;
+    let mut head = [0u8; RECORD_HEADER_LEN];
+    let n = read_full(input, &mut head)?;
+    input.seek(SeekFrom::Start(at)).map_err(|e| io(&e))?;
+    Ok(match n {
+        0 => true,
+        MAGIC_LEN if head[..MAGIC_LEN] == *mcap::MAGIC => true,
+        RECORD_HEADER_LEN => {
+            let Ok(len_bytes) = <[u8; 8]>::try_from(&head[1..RECORD_HEADER_LEN]) else {
+                return Ok(false);
+            };
+            let assigned = matches!(
+                head[0],
+                mcap::records::op::HEADER..=mcap::records::op::DATA_END
+            );
+            assigned && u64::from_le_bytes(len_bytes) <= file_len
+        }
+        _ => false,
+    })
 }
 
 /// Read the records inside one chunk record's body.

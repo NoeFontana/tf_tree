@@ -18,14 +18,19 @@ used to point at a daemon at all. **`tf_tree serve` is not built either** —
 escalation rather than a prerequisite — so nothing below may name it as a
 remedy. Any row you find still marked *(needs `tf_treed`)*, or pointing at
 `tf_tree serve`, is a defect in this document: it is telling you to run a
-program that does not exist. The seven `doctor` checks are `cycle`,
+program that does not exist. The `doctor` checks Phase 1 shipped are `cycle`,
 `unclaimed-dynamic`, `multi-writer`, `short-buffer`, `inconsistent-rate`,
-`unreachable`, `out-of-order`.
+`unreachable`, `out-of-order` — **and every one of them has a `TFT` id now**
+(`TFT012`, `TFT017`, `TFT001`, `TFT011`, `TFT008`, `TFT012`, `TFT018`; the
+mapping is the table in `crates/tf_tree_cli/src/catalogue.rs`'s module docs, and
+`PHASE5.md` §6 has since added checks that were never in this list). The ids are
+what `--suppress` takes and what `--json` emits; these names appear here because
+they are what older documents and this file's own §3.2 rows say.
 
-**Two of those seven go blind when `doctor` is attached to a live arena**, and it
-says so on every run rather than implying a clean bill of health it did not earn:
-`multi-writer` and `short-buffer` both need a recorded push stream, and a ring
-retains stamps but not who wrote each one or how late it arrived. See
+**`multi-writer` (`TFT001`) and `short-buffer` (`TFT011`) go blind when `doctor`
+is attached to a live arena**, and it says so on every run rather than implying a
+clean bill of health it did not earn: both need a recorded push stream, and a
+ring retains stamps but not who wrote each one or how late it arrived. See
 [Attaching to a running robot](#attaching-to-a-running-robot).
 
 ---
@@ -351,9 +356,40 @@ either buggy or hostile and the two are indistinguishable from here.
 
 ### `ParticipantTableFull` / `NoParticipantSlots`
 
-More than `max_participants` processes attached. Raise the limit; it requires
-recreating the arena, because capacity is fixed at construction by design
-([`PROJECT.md`](./PROJECT.md) §5 D4).
+More than `max_participants` processes attached. **There is no flag for this**,
+and the first thing to look for is a leak — a participant that exited without
+releasing its slot.
+
+**Two commands, two different tables, and only one of them is the table that ran
+out.** `tf_tree participants` reads the **lock file and nothing else**: it walks
+the lock's byte slots, prints `live` where the kernel still holds the byte and
+`stale` where it does not, and never opens the arena's participant table. That
+finds the ordinary leak — a `SIGKILL`ed rendezvous participant leaves a `stale`
+row — and it is blind to the class that needs no lock byte at all. A
+`TreeBuilder::build_shared` creator registers a `LIVE` arena record and takes no
+byte, because such a tree has no lock file
+([`0031`](./decisions/0031-the-participant-record-with-no-byte.md));
+against one of those this command prints *"no lock file: nothing has ever
+attached to this domain/name"* while the slot is spent. **The command that reads
+the arena's own table is `tf_tree doctor --attach`**, whose `TFT014` walks the
+participant records, says how many slots are spent of how many, and names each
+pid — see its row in *Diagnostics* below for what reclaims one. Its own
+detection limits are written where it is implemented (`tft014`,
+`crates/tf_tree_cli/src/checks.rs`): a record with no lock byte reaches the
+`unknown` byte row and is judged by `/proc` alone, and a claim left by a dead
+owner or by a `build_shared` participant is invisible to it, because neither has
+a socket hangup anybody sees.
+
+*This paragraph read "a participant that exited without releasing its slot,
+which `tf_tree participants` names" until 2026-09-05 — one command, no scope, and
+the wrong table for the byte-less class.*
+
+Capacity is fixed at
+construction by design ([`PROJECT.md`](./PROJECT.md) §5 D4): the value comes from
+`tf_tree_arena::layout::DEFAULT_MAX_PARTICIPANTS`, every `ArenaLayout`
+constructor uses it, and header validation refuses a segment whose header
+disagrees — so raising it means changing that constant, rebuilding every
+participant from one commit and restarting them together.
 
 ### `SIGBUS` inside a lookup
 
@@ -375,10 +411,13 @@ are opt-in: a diagnostic tool that can write to a robot's tree can corrupt it
 with any bug it happens to have (D18), and a tool that creates on a typo will
 conjure an empty arena and then report it healthy.
 
-`doctor --attach` prints which checks it could not run. Two of the seven need a
-recorded push stream — `multi-writer` cannot see a writer that has already been
-replaced, and `short-buffer` needs each sample's arrival lateness, which nothing
-in the arena records. Neither can fire on a live arena, so neither is claimed.
+`doctor --attach` prints which checks it could not run. `multi-writer`
+(`TFT001`) and `short-buffer` (`TFT011`) need a recorded push stream —
+`multi-writer` cannot see a writer that has already been replaced, and
+`short-buffer` needs each sample's arrival lateness, which nothing in the arena
+records. Neither can fire on a live arena, so neither is claimed. The report's
+`not run:` block is the list for the run in front of you; no count of it is
+written here, because the set moves with the source and with the arena.
 
 ### Why `doctor --from-bag` reports `TFT010` and `TFT011` as *not run*
 
@@ -855,13 +894,14 @@ Almost certainly a bug — topology should be near-static after startup.
 | `unclaimed-dynamic` | A dynamic edge with no live writer | The publisher never started, or exited without releasing. Expected briefly at startup; sustained means a dead node |
 | `multi-writer` | More than one PID published to one edge | Configuration error — two nodes own the same edge. Both PIDs are named |
 | `short-buffer` | Ring shorter than the observed publish latency | Raise that edge's capacity. This is the warning that precedes `Extrapolation`/`SlotRecycled` outages |
-| `inconsistent-rate` | A frame published at a wildly varying rate | Often benign (a genuinely event-driven publisher), sometimes a struggling node. Compare against the rate you expect |
+| `inconsistent-rate` (`TFT008`) | A frame published at a wildly varying rate — the spread of its inter-arrival intervals about their own centre, **not** a comparison against a declared rate; that is `TFT007` | Often benign (a genuinely event-driven publisher), sometimes a struggling node. Compare against the rate you expect. It reports **not run** in two states rather than passing: no edge has retained enough intervals to measure a spread, or every edge that had has stopped publishing — in the second, read `TFT009`, which names the silence |
+| `TFT013` | An edge declared dynamic that nothing has ever published to | The publisher never started. It reports **not run** inside a grace period, measured against how long the arena's longest-running publisher has been going, so a `doctor` at bringup does not accuse every edge; and it reports **not run** on an arena where nothing has published at all, because that is bringup and a total outage at once. `TFT017` is the id for an edge whose writer is gone |
 | `unreachable` | Frames not reachable from the main root | A subtree is detached — usually a missing static declaration or a publisher that has not started |
 | `out-of-order` (`TFT018`) | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
 | `TFT014` — *slot N pid P, byte free* | A participant record nothing will reassign: the process is gone and the kernel has released its lock byte, but its arena record still says `LIVE` (or `RESERVED`) | **Three things reclaim it, and none of them is `doctor`.** The owner's slot assigner collects it when a grant walks past that index; the owner's socket-hangup callback collects it when a participant's connection closes; and **any read-write participant can sweep the whole table with `Tree::reap_participants()`**, which is the only one that reaches the *owner's own* slot. So the usual response to this finding is to attach a read-write consumer and sweep — not to stop the fleet. Count how many the finding says are spent (`N of 64`); at 64 every further attach fails `NoParticipantSlots` until something collects. **Two cases still have no repair**: a slot whose byte is *held* by a fork inheritor (that is the separate fork finding, and the kernel's answer is *held* — see [`0030`](./decisions/0030-the-atfork-handler-and-inherited-descriptors.md)), and an arena whose owner has died **with no read-write survivor that calls `Tree::inherit_ownership`** — §3.5's inheritance shipped on 2026-08-28, but it is caller-driven and a read-only survivor is refused with `Inheritance::ReadOnly`, so an all-consumer fleet still cannot be joined (see *The arena's owner died*). For those, stopping every attached process so the segment is freed is still the recovery — and `SIGTERM` is not one, because nothing installs a handler and the default disposition skips every destructor. `tf_tree participants` shows the same slots as `stale`. See [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) |
 | `TFT014` — *slot N pid P, byte still HELD* | The **fork** case: a forked child inherited the parent's open file descriptions, so the lock byte is still held on behalf of a process that no longer exists. Reported for a read-only parent too, where there is no arena record at all — the finding then reads *the record is FREE (no arena record: a read-only participant, D18)*. **It is not reported for a participant in another PID namespace** ([`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md)): that used to render the identical sentence about a healthy process, so if a build predating `0033` shows you this for a containerised worker, check the namespace before acting on it | Different fault, different fix — **do not go looking for a reaper**, and nothing may run one: the kernel's own answer for this slot is *held*, and overruling it with a `/proc` guess is what would evict a running participant. Stop the child, and start workers with a start method that inherits no descriptors — `multiprocessing`'s `spawn` (Python defaults to `fork` on Linux), or fork+exec. The byte comes back on its own when the last inheritor exits. Same root cause as *The tree works in the parent and everything fails in a forked child*, above |
 | `TFT014` — *slot N pid P, byte not probed* | The same record-left-behind shape, seen by a run that read **no lock file**: `--from-bag`, or the built-in fixture. The verdict is a `/proc` inference alone | Read it as a weaker claim than the `byte free` row, not a different fault. To get the kernel's answer, run `doctor --attach` against the live domain — that is the only source that opens the rendezvous |
-| `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena — which, `doctor` having no recording source, is the only outcome either of them has on a deployment |
+| `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena. **That is not the only outcome either of them has on a deployment, and this row said it was until 2026-09-05** — the clause read *"`doctor` having no recording source"*, which stopped being true when `--from-bag` landed, and the same document has told you to run `tf_tree doctor --from-bag run.mcap` since. Point it at the recording: both reach a verdict there |
 
 ---
 

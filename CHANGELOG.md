@@ -33,6 +33,91 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed
+
+- **The C ABI's count-returning entry points carry a panic guard**
+  (`d5dd109`, `docs/PHASE4.md` §3.4 / §9). `error::guard` returns a
+  `tft_status`, so it fitted only the boundaries that report through one, and
+  `tft_tree_frame_count` / `tft_tree_edge_count` — both in the *unstable* tier —
+  had no guard at all. They now run under `error::guard_value` and **return `0`
+  instead of aborting the process** if the body panics. No signature changes and
+  no header changes; what moves is the behaviour of a panicking build, from a
+  process abort in the C or C++ host to a count that reads as "nothing to
+  report". `tft_test_panic_value` forces the panic and is the test; it is in the
+  `TEST_ONLY` tier (`xtask/src/headers.rs`), so it reaches neither shipped
+  header.
+
+- **`tf_tree doctor` reports the resolved rendezvous runtime directory**
+  (`973e594`, `docs/PHASE2.md` §15). The human renderer prints a `runtime dir`
+  line and `--json` gains a top-level `"runtime_dir"` key, `null` when
+  resolution fails. It is resolved independently of the arena — the run in which
+  an operator most needs to know which directory was searched is the run in
+  which nothing was found in it — and it carries the rule that produced it
+  (`$TF_TREE_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/tf_tree`, `/run/tf_tree`,
+  `/tmp/tf_tree-<uid>`). **The `--json` schema tag is unchanged at
+  `tf_tree.doctor/1`**, which `crates/tf_tree_cli/src/catalogue.rs` says is
+  bumped only for an incompatible change; an added key is not one.
+
+### Added
+
+- **An SBOM per release** (`d5dd109`, `docs/PHASE5.md` §10). `scripts/sbom.py`
+  writes CycloneDX 1.5 from `cargo metadata`, `just sbom <version>` produces the
+  same file locally, and `release.yml`'s `github-release` job generates it,
+  prints its component count, appends it to `SHA256SUMS` and uploads it. **No
+  release has produced one yet**: that job is gated on a `v*` tag push and the
+  newest tag predates the script.
+
+- **`just no-network`** (`0787b9e`, `docs/PHASE5.md` §5.1 / §13 box 4) — the
+  `AF_UNIX`-only assertion, under `strace -f`, over the five published crates'
+  test binaries, with `tf_tree top --web`'s `AF_INET` listener as a required
+  positive control. Run by `ci.yml`'s `shm` job. It refuses rather than skips.
+
+- **`just split-brain-soak`** (`0575311`) and **`just reclaim-latency`**
+  (`6e8b19b`) — `docs/PHASE2.md` §11.2 scenario 9 a thousand times, and §12.3
+  criterion 4's kill-to-re-claimable measurement.
+
+### Fixed
+
+- **`docs/PHASE5.md` §12 gate 4's binary now exits non-zero on a FAIL**
+  (`db9502e`). `frozen_workers.rs` printed its verdict and returned `Ok(())` on
+  both branches, so `nightly.yml`'s `gate4` job could not go red. Not a shipped
+  surface — `tf_tree_bench` is `publish = false` — and recorded here because a
+  gate that could not fail is what the `[0.0.5]` section below calls the
+  costliest kind of stale claim.
+
+### Changed — `tf_tree doctor`
+
+- **`TFT013` waits out a grace period, which its `docs/PHASE5.md` §6 row has
+  always required and the predicate never had.** Before this, `head == 0` alone
+  was the rule, so a `doctor` run at bringup — before the publishers start,
+  which is the run an operator is most likely to make — reported every dynamic
+  edge in the arena. No arena field was added to get a clock: the grace is
+  measured against how long the arena's longest-running publisher has been
+  going, `(head - 1) x median period`, which is the quantity that keeps growing
+  after a ring wraps. An arena in which nothing has published at all is a
+  *stated skip* rather than a verdict, because bringup and a total outage are
+  the same arena and no fact in it separates them.
+
+- **`TFT007` and `TFT008` no longer report `pass` about a publisher `TFT009` is
+  reporting as stopped.** Every rule in the catalogue measures *between*
+  retained stamps, so a full ring of evenly spaced samples from a publisher that
+  died compares equal to its declared rate and has a coefficient of variation of
+  ~0. `doctor --attach` printed those verdicts side by side: `TFT009` calling the
+  edge dead, `TFT008` clearing it, and — wherever the topology declared a
+  `rate_hz` for that edge — `TFT007` clearing it too. Neither gains a finding
+  — a second warn id for one fault would inflate what `--exit-code warn` gates
+  on — they **withhold** such an edge, disclose it in `notes`, and skip rather
+  than pass when withholding leaves nothing judged. `TFT008` also skips, rather
+  than passing, on an arena where no edge retained the intervals a spread needs
+  (`doctor::SPREAD_MIN_INTERVALS`, which its skip reason quotes).
+
+- **`--json` is schema-validated.** The `tf_tree.doctor/1` document is now
+  parsed and held to the schema `render_json` documents, by a test that runs the
+  real binary. No schema file is shipped and the document is still written by
+  hand. The id sequence is pinned against a literal rather than folded from
+  `Tft::ALL`: the emitter walks that array too, so a comparison against it
+  asserted membership and not order.
+
 ### Fixed — documentation
 
 - **Public surface that shipped in 0.0.5 with no entry, and stale claims a
@@ -570,9 +655,14 @@ is a bug.
   workspace is `publish = false` by decision. **Signed tags are the one item of
   the three genuinely open** — all four tags are unsigned, checked.
 
-  What remains under §10 is therefore the mdBook site, the SBOM, and signed
-  tags, and the honest reason for the first two is no longer "until there is a
-  release".
+  What remained under §10 **at this tag** was therefore the mdBook site, the
+  SBOM and signed tags, and the honest reason for the first two is no longer
+  "until there is a release". *Two of those three have moved since, and the
+  sentence is dated rather than rewritten because it is true of what `0.0.5`
+  shipped, which is what a consumer reading this section is holding:* the SBOM
+  generator landed after the tag (`[Unreleased]`, above) and `docs/PHASE5.md`
+  §0.0's §10 row is the live statement; signed tags are still open, and every
+  tag through `v0.0.5` is unsigned.
 
 - **`doctor`'s zero-counter skip reason named three causes and missed the one a
   running robot is usually in.** `Guard::drop` and `note_err` both early-return

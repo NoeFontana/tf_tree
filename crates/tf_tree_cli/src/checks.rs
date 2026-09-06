@@ -11,10 +11,22 @@
 //! rather than passed
 //!
 //! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason — **two** unconditionally, and **nine** more depending on what the
-//! arena, the engine build and the host can supply. A check that silently returns
-//! nothing is indistinguishable from one that found nothing, and those two
-//! answers mean opposite things to whoever is reading:
+//! reason: two unconditionally, and the rest depending on what the arena, the
+//! engine build and the host can supply. A check that silently returns nothing
+//! is indistinguishable from one that found nothing, and those two answers mean
+//! opposite things to whoever is reading.
+//!
+//! **No count appears here, and its absence is the correction.** This sentence
+//! read *"two unconditionally, and **nine** more"* while `docs/PHASE5.md` §0.0
+//! read ten and [`crate::catalogue`] read ten — three sites, two answers, and
+//! the bullet list below was missing `TFT014` entirely, so the number and the
+//! enumeration under it disagreed in the same comment. §0.0 is the source of
+//! truth over this module's prose (`CLAUDE.md`) and it enumerates rather than
+//! tallies; the instrument for the code is
+//! `rg -n 'CheckOutcome::skipped' crates/tf_tree_cli/src/checks.rs`, which
+//! answers from the file this comment is in rather than from a number somebody
+//! has to remember to raise. The same drift happened in `catalogue.rs` once
+//! before, in the note it carries about it.
 //!
 //! * **`TFT002`** (static republished with a different value) and **`TFT003`**
 //!   (edge kind changed) are detected by [`tf_tree_bridge`]'s `StaticStore`,
@@ -57,6 +69,13 @@
 //!   `EdgeCfg::nominal_rate_hz`, and a topology file's `rate_hz` reaches it
 //!   through `TopologyConfig::builder`. An arena built without one still skips,
 //!   because a `0` means *undeclared* and not *0 Hz* — see `tft007`.
+//! * **`TFT008`** (inter-arrival spread) is skipped when it judged **nothing**:
+//!   no edge retained the intervals a spread needs
+//!   (`doctor::SPREAD_MIN_INTERVALS`, which the skip reason quotes rather than
+//!   this line restating it), or the only ones that did have stopped publishing
+//!   — see [`stopped_publishers`]. It needs no
+//!   declaration, so unlike `TFT007` it has evidence on an arena built without a
+//!   topology file.
 //! * **`TFT010`** is skipped whenever the `docs/PHASE5.md` §5 counters carry no
 //!   verdict — see [`no_counter_evidence`], which is *two* conditions: an engine
 //!   built without the feature, and an arena that has served **no lookups**. The
@@ -67,6 +86,17 @@
 //!   counters, and `capacity x period` against a per-sample arrival delay — and
 //!   skips only when *both* are blind, which is what a recording is. Where one
 //!   half survives it runs, and `evidence_notes` discloses the other.
+//! * **`TFT013`** (declared and never published to) is skipped inside the grace
+//!   period §6's row requires, because `head == 0` is what every dynamic edge of
+//!   a correct arena reads as before its publishers start. The arena records no
+//!   declaration time, so the evidence is `publish_activity_ns` — how long the
+//!   longest-running publisher in this arena has been running — and an arena in
+//!   which nothing has published at all is a second, separate skip: bringup and
+//!   a total outage are the same arena and no fact in it separates them.
+//! * **`TFT014`** (participant or claim slot leak) is skipped on a frozen `.tft`,
+//!   whose participant table is a byte copy of one from a run that has ended —
+//!   see [`SlotTable`]. Running there would fire on every correct `.tft` ever
+//!   written, about an arena with no assigner for a leaked slot to wedge.
 //! * **`TFT016`** is skipped when the host is not Linux.
 //! * **`TFT018`** (out-of-order stamps) is skipped wherever the push stream was
 //!   replayed from an arena's rings rather than recorded as it arrived, and the
@@ -80,7 +110,7 @@
 //!
 //! [`tf_tree_bridge`]: https://docs.rs/tf_tree_bridge
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 
 use tf_tree::unstable::EdgeKind;
@@ -1153,14 +1183,27 @@ fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&[&PushSample]>) -> RateE
 /// earned by the second is exactly the fabricated assurance the first case is
 /// guarded against.
 ///
+/// There is a third way to have none, and it is the one a `pass` would be most
+/// wrong about: every declaring edge's publisher has **stopped**. Its ring is
+/// still full of stamps spaced at exactly the declared rate, so the comparison
+/// succeeds and reports a perfect match about a stream that is no longer
+/// arriving. [`stopped_publishers`] is the predicate — the same one `TFT009`
+/// fires on — and such an edge is withheld from the comparison rather than
+/// reported, because a second warn id for one fault is the duplicate spelling
+/// §6's `TFT017`/`TFT018` amendment forbids by name.
+///
 /// When *some* edges are comparable and others are not, the check runs on those
-/// and [`rate_coverage_note`] states what it did not cover, because a bare
-/// `pass` would otherwise read as "every edge publishes at its intended rate".
+/// and [`rate_coverage_note`] (which gap each uncompared edge fell into) and
+/// [`stopped_publisher_note`] (the withheld publishers, named from the other
+/// side) state what it did not cover, because a bare `pass` would otherwise
+/// read as "every edge publishes at its intended rate".
 fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
     let by_edge = inp.obs.by_edge();
+    let stopped = stopped_publishers(inp.obs, inp.clock, inp.stream);
     let mut out = Vec::new();
     let mut declared = 0usize;
     let mut comparable = 0usize;
+    let mut withheld = 0usize;
     for e in &inp.snap.edges {
         match rate_evidence(e, by_edge.get(&e.id).map(Vec::as_slice)) {
             RateEvidence::NotDeclared => continue,
@@ -1170,6 +1213,17 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
                 observed_hz,
             } => {
                 declared += 1;
+                // **A stopped publisher's ring is evenly spaced at its declared
+                // rate**, so the comparison below would certify the edge
+                // `TFT009` is reporting as dead. Withheld rather than reported:
+                // a second warn id for one fault inflates the count
+                // `--exit-code warn` gates on, and `docs/PHASE5.md` §6's
+                // TFT017/TFT018 amendment forbids giving an id a second meaning
+                // by name.
+                if stopped.contains_key(&e.id) {
+                    withheld += 1;
+                    continue;
+                }
                 comparable += 1;
                 let ratio = observed_hz / declared_hz;
                 if (ratio - 1.0).abs() <= RATE_TOLERANCE {
@@ -1211,10 +1265,13 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
                     .to_owned()
             } else {
                 format!(
-                    "{declared} edge(s) declare a nominal rate, but none has the \
-                     {RATE_MIN_INTERVALS} retained intervals needed to measure an observed one \
-                     against it; the publishers may not have started, may have stopped, or the \
-                     arena was read too soon after bringup"
+                    "{declared} edge(s) declare a nominal rate and none of them was compared: \
+                     {withheld} have stopped publishing, which TFT009 reports and this check \
+                     will not certify as nominal, and {} have fewer than {RATE_MIN_INTERVALS} \
+                     retained intervals to measure an observed rate from; the publishers may \
+                     not have started, may have stopped, or the arena was read too soon after \
+                     bringup",
+                    declared - withheld
                 )
             },
         );
@@ -1225,14 +1282,34 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
 /// The disclosure that pairs with `tft007`: which edges its result covers.
 ///
 /// `None` when the answer is unambiguous — nothing was compared (the check
-/// skipped and says so itself, naming which of its two gaps it hit), or every
-/// dynamic edge was declared and measurable. A note is emitted only for the
-/// middle case, where `pass` is true of the edges that were compared and silent
-/// about the rest.
+/// skipped and says so itself, naming which of its gaps it hit), or every
+/// dynamic edge was declared, measurable and still publishing. A note is
+/// emitted only for the middle case, where `pass` is true of the edges that
+/// were compared and silent about the rest.
+///
+/// # Why it takes the clock and the source
+///
+/// `tft007` withholds every edge [`stopped_publishers`] names, so its
+/// `comparable` count is *not* the one `rate_evidence` alone produces.
+/// A note computed without that set counts a withheld edge as compared, and the
+/// first arena to show it is the one the withholding was built for: a live
+/// arena with one stopped declaring edge and one undeclared edge makes `TFT007`
+/// skip having compared nothing while the note claims it compared one of two.
+/// One report, two answers. The withheld count is stated as its own term rather
+/// than folded into `too_few`, because the remedy differs — wait for a ring to
+/// fill, or go and look at a dead publisher — and because
+/// [`stopped_publisher_note`] names the same edges from the other side.
 #[must_use]
-pub fn rate_coverage_note(snap: &Snapshot, obs: &Observations) -> Option<String> {
+pub fn rate_coverage_note(
+    snap: &Snapshot,
+    obs: &Observations,
+    clock: Clock,
+    stream: PushStream,
+) -> Option<String> {
     let by_edge = obs.by_edge();
-    let (mut comparable, mut too_few, mut undeclared) = (0usize, 0usize, 0usize);
+    let stopped = stopped_publishers(obs, clock, stream);
+    let (mut comparable, mut too_few, mut undeclared, mut withheld) =
+        (0usize, 0usize, 0usize, 0usize);
     for e in &snap.edges {
         if e.kind != EdgeKind::Dynamic {
             continue;
@@ -1240,17 +1317,19 @@ pub fn rate_coverage_note(snap: &Snapshot, obs: &Observations) -> Option<String>
         match rate_evidence(e, by_edge.get(&e.id).map(Vec::as_slice)) {
             RateEvidence::NotDeclared => undeclared += 1,
             RateEvidence::TooFewIntervals => too_few += 1,
+            RateEvidence::Comparable { .. } if stopped.contains_key(&e.id) => withheld += 1,
             RateEvidence::Comparable { .. } => comparable += 1,
         }
     }
-    if comparable == 0 || (undeclared == 0 && too_few == 0) {
+    if comparable == 0 || (undeclared == 0 && too_few == 0 && withheld == 0) {
         return None;
     }
     Some(format!(
         "TFT007 compared {comparable} of {} dynamic edge(s): {undeclared} declare no nominal \
-         rate (no rate_hz in the topology) and {too_few} have fewer than {RATE_MIN_INTERVALS} \
-         retained intervals to measure one from",
-        comparable + too_few + undeclared
+         rate (no rate_hz in the topology), {too_few} have fewer than {RATE_MIN_INTERVALS} \
+         retained intervals to measure one from, and {withheld} have stopped publishing, which \
+         TFT009 reports and this check will not certify as nominal",
+        comparable + too_few + undeclared + withheld
     ))
 }
 
@@ -1259,12 +1338,67 @@ pub fn rate_coverage_note(snap: &Snapshot, obs: &Observations) -> Option<String>
 /// about its own centre. Distinct from [`tft007`] and not redundant with it: a
 /// publisher can hold a perfectly steady period at the wrong rate (`TFT007`
 /// fires, this passes) or average its declared rate while alternating 1 ms and
-/// 100 ms gaps (this fires, `TFT007` passes). This one needs no declaration and
-/// therefore runs on every arena.
+/// 100 ms gaps (this fires, `TFT007` passes). This one needs no declaration, so
+/// it has evidence on arenas `TFT007` cannot judge at all.
+///
+/// # It is the spread, not a p99 against the nominal
+///
+/// `docs/PHASE5.md` §6's row read *"p99 inter-arrival ≫ nominal"* until the
+/// amendment that corrected it to this rule. Two reasons, both of them §6's own
+/// arguments applied one row over. Judging against the *declared* nominal is
+/// what [`tft009`]'s doc refuses for gaps — an edge running at half its nominal
+/// would have every interval over the bar, burying the jitter this check exists
+/// to find under a deviation `TFT007` already reports once. And a nominal exists
+/// only where a topology file declared one, so keying on it would make the one
+/// spread check in the catalogue skip on every arena built without a `rate_hz` —
+/// which is where a stranger's first `doctor` run happens.
+///
+/// # A stopped publisher is withheld, not judged
+///
+/// Its ring is a full set of perfectly spaced samples, so its coefficient of
+/// variation is ~0 and this check would print a healthy cadence beside `TFT009`
+/// reporting the same edge as silent. [`stopped_publishers`] is the predicate,
+/// shared with `TFT007` and `TFT009` rather than spelled again here, and
+/// [`stopped_publisher_note`] is the disclosure.
+///
+/// # And a run that judged nothing skips rather than passing
+///
+/// `Pass` here is the active claim *no edge in this arena publishes unevenly*,
+/// and an arena where no edge retained [`doctor::SPREAD_MIN_INTERVALS`]
+/// intervals — or where the only ones that did have stopped — supports no such
+/// claim. The two are different skips
+/// because the remedies are opposite: wait for the rings to fill, or go and look
+/// at a dead publisher.
 fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
+    let withheld: BTreeSet<u32> = stopped_publishers(inp.obs, inp.clock, inp.stream)
+        .into_keys()
+        .collect();
+    let spread = doctor::check_inconsistent_rates(inp.obs, &withheld);
+    if spread.judged == 0 {
+        return CheckOutcome::skipped(
+            Tft::Tft008,
+            if spread.withheld > 0 {
+                format!(
+                    "every edge with a measurable inter-arrival distribution has stopped \
+                     publishing ({} of them): a stopped publisher leaves an evenly spaced ring, \
+                     so its coefficient of variation is ~0 and a pass here would certify the \
+                     cadence of a stream that is no longer arriving. TFT009 reports the silence",
+                    spread.withheld
+                )
+            } else {
+                format!(
+                    "no edge in this arena has retained the {} intervals an inter-arrival spread \
+                     needs, so there is no distribution to call inconsistent; the publishers may \
+                     not have started, or the arena was read too soon after bringup",
+                    doctor::SPREAD_MIN_INTERVALS
+                )
+            },
+        );
+    }
     CheckOutcome::ran(
         Tft::Tft008,
-        doctor::check_inconsistent_rates(inp.obs)
+        spread
+            .findings
             .into_iter()
             .map(|f| Finding::about(Tft::Tft008, "edge", f.message))
             .collect(),
@@ -1279,90 +1413,180 @@ fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
 /// nominal has no dropouts, and reporting one for every interval would bury the
 /// gaps this check exists to find under a rate deviation `TFT007` already
 /// reports once.
+/// The shape of one edge's retained inter-arrival distribution: the median
+/// period it publishes at, and the largest gap between two retained stamps.
+///
+/// `None` where neither number would mean anything, and the three conditions
+/// are `TFT009`'s rather than this type's:
+///
+/// * **Fewer than four intervals.** A median over three is one sample away from
+///   being an extremum.
+/// * **Any negative interval**, not just a non-positive median. A stream with a
+///   handful of inverted pairs keeps a healthy positive median, but the jump
+///   back to the true timeline after an inversion becomes `worst_ns` — so
+///   `TFT009` would report a dropout of N x the median that never happened. The
+///   real fault is `TFT018`, which fires on the same stream at error severity;
+///   adding a warn about a phantom gap next to it sends the operator looking
+///   for a lost publisher instead of a reordered one. Skipping loses nothing:
+///   an interval sequence that is not monotone has no meaningful inter-arrival
+///   distribution to measure a gap against.
+/// * **A non-positive median**, which every retained stamp being identical
+///   produces: the ratio would divide by zero and make every non-zero interval
+///   an infinite gap.
+///
+/// The median is [`doctor::median_period`] rather than a second sort in this
+/// file, so "the period this edge publishes at" is one number across `TFT007`,
+/// `TFT008`, `TFT011` and here.
+struct IntervalShape {
+    /// The median retained inter-arrival interval. Strictly positive.
+    median_ns: i64,
+    /// The largest retained inter-arrival interval.
+    worst_ns: i64,
+}
+
+/// One edge's [`IntervalShape`], or `None` when its stream cannot support one.
+fn interval_shape(samples: &[&PushSample]) -> Option<IntervalShape> {
+    let mut worst = i64::MIN;
+    let mut intervals = 0usize;
+    for w in samples.windows(2) {
+        let d = w[1].stamp_ns - w[0].stamp_ns;
+        if d < 0 {
+            return None;
+        }
+        worst = worst.max(d);
+        intervals += 1;
+    }
+    if intervals < 4 {
+        return None;
+    }
+    Some(IntervalShape {
+        median_ns: doctor::median_period(samples)?,
+        worst_ns: worst,
+    })
+}
+
+/// How long one edge has been silent, and what its own cadence says about that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Silence {
+    /// `now - newest retained stamp`.
+    pub silent_ns: i64,
+    /// The edge's own median period, which is what makes the number above a
+    /// judgement rather than a duration.
+    pub median_ns: i64,
+}
+
+/// Every edge whose publisher has **stopped** — the gap that has not ended.
+///
+/// # One predicate, because three checks have to agree about it
+///
+/// Every rule in this module that judges a publisher measures *between*
+/// retained stamps, and a publisher that died three weeks ago leaves a full ring
+/// of perfectly spaced samples: the median is healthy, the largest gap is one
+/// period, the coefficient of variation is ~0, and the observed rate equals the
+/// declared one. `TFT009` reports the silence; `TFT007` and `TFT008` must not
+/// report `pass` about the same edge in the same document, because a check
+/// clearing a publisher another one is calling dead is worse than either answer
+/// alone. (`TFT008` is in that position on any such arena; `TFT007` only where
+/// the edge declared a rate — without a declaration it skips before reaching
+/// the edge. `docs/PHASE5.md` §6's amendment states the full condition.)
+///
+/// So the three read this one function, and [`stopped_publisher_note`]
+/// discloses what it withheld. `CLAUDE.md` forbids a second spelling of an
+/// existing path; a rule is a path.
+///
+/// # It answers nothing on a source nobody is writing
+///
+/// See `live_wall_now`: on a recording or a frozen `.tft` the distance from
+/// the newest stamp to now is the age of the file, and judging it would report
+/// every archive as a stopped publisher.
+#[must_use]
+pub fn stopped_publishers(
+    obs: &Observations,
+    clock: Clock,
+    stream: PushStream,
+) -> BTreeMap<u32, Silence> {
+    let Some(now) = live_wall_now(clock, stream) else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for (edge, samples) in obs.by_edge() {
+        let Some(shape) = interval_shape(&samples) else {
+            continue;
+        };
+        // Monotone by `interval_shape`'s negative-interval guard, so the last
+        // retained stamp is the newest.
+        let newest = samples.last().map_or(0, |s| s.stamp_ns);
+        let silent = now.saturating_sub(newest);
+        if silent > shape.median_ns.saturating_mul(GAP_FACTOR) {
+            out.insert(
+                edge,
+                Silence {
+                    silent_ns: silent,
+                    median_ns: shape.median_ns,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// `TFT009` — an inter-arrival interval far above the edge's own median, and
+/// the one that has not ended.
+///
+/// Relative to the edge's own median rather than to a fixed threshold because a
+/// 200 ms gap is a dropout at 100 Hz and normal at 5 Hz. Deliberately still not
+/// against the declared rate [`tft007`] now has: an edge running at half its
+/// nominal has no dropouts, and reporting one for every interval would bury the
+/// gaps this check exists to find under a rate deviation `TFT007` already
+/// reports once.
+///
+/// The second half is [`stopped_publishers`] — **the gap that has not ended
+/// yet**, which every rule above is blind to because they all measure *between*
+/// retained stamps. `tf_tree top` already reports it under this same id, but it
+/// needs two ticks to see a `head` that did not move; a single snapshot has to
+/// compare the newest stamp against a clock instead. The interval is
+/// `now - newest`: the trailing edge of the same inter-arrival distribution the
+/// rules above measure, judged by the same [`GAP_FACTOR`] against the same
+/// median. Nothing new is calibrated.
 fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
+    let stopped = stopped_publishers(inp.obs, inp.clock, inp.stream);
     let mut out = Vec::new();
     for (edge, samples) in inp.obs.by_edge() {
-        let mut intervals: Vec<i64> = samples
-            .windows(2)
-            .map(|w| w[1].stamp_ns - w[0].stamp_ns)
-            .collect();
-        if intervals.len() < 4 {
-            continue;
-        }
-        // **Any** negative interval disqualifies the edge, not just a
-        // non-positive median. A stream with a handful of inverted pairs keeps
-        // a healthy positive median, but the jump back to the true timeline
-        // after an inversion becomes `worst` — so TFT009 reports a dropout of
-        // N x the median that never happened. The real fault is the id-less
-        // `out-of-order` check, which fires on the same stream at error
-        // severity; adding a warn about a phantom gap next to it sends the
-        // operator looking for a lost publisher instead of a reordered one.
-        //
-        // Skipping loses nothing: an interval sequence that is not monotone has
-        // no meaningful inter-arrival distribution to measure a gap against.
-        if intervals.iter().any(|&d| d < 0) {
-            continue;
-        }
-        let worst = intervals.iter().copied().max().unwrap_or(0);
-        intervals.sort_unstable();
-        let median = intervals[intervals.len() / 2];
-        // A zero median (every retained stamp identical) would divide by zero
-        // in the ratio and make every non-zero interval an infinite gap.
-        if median <= 0 {
-            continue;
-        }
-        if worst > median.saturating_mul(GAP_FACTOR) {
-            out.push(Finding::on_edge(
-                Tft::Tft009,
-                edge,
-                format!("edge#{edge}"),
-                format!(
-                    "largest gap {:.1} ms is {:.1}x the median period {:.1} ms",
-                    worst as f64 / 1e6,
-                    worst as f64 / median as f64,
-                    median as f64 / 1e6
-                ),
-            ));
-        }
-        // **The gap that has not ended yet**, which every rule above is blind to
-        // because they all measure *between* retained stamps. A publisher that
-        // stopped three weeks ago leaves a full ring of perfectly spaced samples,
-        // so the median is healthy, `worst` is one period, and nothing fires —
-        // while the most common fault in the field is exactly that: a node died
-        // or wedged and the transform is frozen. `tf_tree top` already reports it
-        // under this same id, but it needs two ticks to see a `head` that did not
-        // move; a single snapshot has to compare the newest stamp against a
-        // clock instead.
-        //
-        // The interval is `now - newest`: the trailing edge of the same
-        // inter-arrival distribution the rules above measure, judged by the same
-        // `GAP_FACTOR` against the same median. Nothing new is calibrated.
-        if let Some(now) = live_wall_now(inp) {
-            // Monotone by the check above, so the last retained stamp is the
-            // newest.
-            let newest = samples.last().map_or(0, |s| s.stamp_ns);
-            let silent = now.saturating_sub(newest);
-            if silent > median.saturating_mul(GAP_FACTOR) {
+        if let Some(shape) = interval_shape(&samples) {
+            if shape.worst_ns > shape.median_ns.saturating_mul(GAP_FACTOR) {
                 out.push(Finding::on_edge(
                     Tft::Tft009,
                     edge,
                     format!("edge#{edge}"),
                     format!(
-                        "no sample for {:.1} s, {:.1}x the median period {:.1} ms — its \
-                         publisher has stopped, and every retained sample still reads healthy",
-                        silent as f64 / 1e9,
-                        silent as f64 / median as f64,
-                        median as f64 / 1e6
+                        "largest gap {:.1} ms is {:.1}x the median period {:.1} ms",
+                        shape.worst_ns as f64 / 1e6,
+                        shape.worst_ns as f64 / shape.median_ns as f64,
+                        shape.median_ns as f64 / 1e6
                     ),
                 ));
             }
+        }
+        if let Some(s) = stopped.get(&edge) {
+            out.push(Finding::on_edge(
+                Tft::Tft009,
+                edge,
+                format!("edge#{edge}"),
+                format!(
+                    "no sample for {:.1} s, {:.1}x the median period {:.1} ms — its \
+                     publisher has stopped, and every retained sample still reads healthy",
+                    s.silent_ns as f64 / 1e9,
+                    s.silent_ns as f64 / s.median_ns as f64,
+                    s.median_ns as f64 / 1e6
+                ),
+            ));
         }
     }
     CheckOutcome::ran(Tft::Tft009, out)
 }
 
-/// The reference instant to measure a *trailing* silence against, or `None` when
-/// there is no such thing for this source.
+/// The reference instant to measure a *trailing* silence against, or `None`
+/// when there is no such thing for this source.
 ///
 /// Two conditions, and both are about whether "how long since the last sample"
 /// is a question with an answer:
@@ -1376,8 +1600,8 @@ fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
 ///   [`PushStream::RingsUnderWriter`] is `doctor --attach`, the live case, and is
 ///   the only one where a silent edge means a publisher stopped rather than a
 ///   file being old.
-fn live_wall_now(inp: &Inputs<'_>) -> Option<i64> {
-    match (inp.clock, inp.stream) {
+fn live_wall_now(clock: Clock, stream: PushStream) -> Option<i64> {
+    match (clock, stream) {
         (Clock::Wall(now), PushStream::RingsUnderWriter) => Some(now),
         _ => None,
     }
@@ -1410,6 +1634,31 @@ pub fn silence_coverage_note(clock: Clock, stream: PushStream) -> Option<String>
                 .into(),
         ),
     }
+}
+
+/// The disclosure that pairs with the withholding: which edges `TFT007` and
+/// `TFT008` declined to judge because [`stopped_publishers`] named them.
+///
+/// `None` when nothing was withheld. It is a note rather than a skip because
+/// those checks may still have judged other edges — and where they judged
+/// *nothing*, each says so in its own skip reason instead of leaning on this
+/// line, exactly as `TFT007` already does for an undeclared rate.
+#[must_use]
+pub fn stopped_publisher_note(
+    obs: &Observations,
+    clock: Clock,
+    stream: PushStream,
+) -> Option<String> {
+    let stopped = stopped_publishers(obs, clock, stream);
+    if stopped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "TFT007 and TFT008 withheld judgement on {} edge(s) whose publisher has stopped: a \
+         dead publisher leaves an evenly spaced ring, so a declared-rate comparison and an \
+         inter-arrival spread over it both read healthy. TFT009 reports the silence",
+        stopped.len()
+    ))
 }
 
 /// `TFT010` — an edge whose consumers keep asking outside its window.
@@ -1554,11 +1803,110 @@ fn tft012(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft012, out)
 }
 
-/// `TFT013` — an edge declared and never published to.
+/// How long *something* in an arena must have been publishing before `TFT013`
+/// will call an edge that has not published a fault — §6's *"after a grace
+/// period"*.
+///
+/// **Five seconds, and it is `tf_tree_cli`'s choice rather than
+/// `docs/PHASE5.md`'s**, in the same way `CLOCK_STEP_MIN_REJECTED_RUN` is: §6
+/// names no length, and the value lives here rather than in prose that can
+/// drift from it. Both of its costs are real and are stated rather than
+/// tuned away. Too short and a node still in DDS discovery is reported as
+/// missing — a robot's publishers do not all start in the same millisecond, and
+/// a check that fires during every bringup is one an operator suppresses
+/// permanently. Too long and an arena whose publishers have produced less than
+/// this much data never reaches a verdict at all, which is why that outcome is a
+/// *stated skip* here and not silence.
+///
+/// Five is comfortably past node startup and DDS discovery on the stacks this
+/// tool is pointed at, and far below any duration in which a genuinely absent
+/// publisher stops mattering.
+const DECLARATION_GRACE_NS: i64 = 5_000_000_000;
+
+/// A lower bound on how long **anything** in this arena has been publishing, or
+/// `None` when nothing has.
+///
+/// # Why this quantity and not the arena's age
+///
+/// The arena records no declaration time, and adding one is an arena field that
+/// `CLAUDE.md` forbids adding opportunistically —
+/// `docs/decisions/0032` is the queue such a field joins. So the grace period is
+/// measured against the only clock the arena keeps about itself: its own
+/// publishing.
+///
+/// `EdgeRecord::head` is the **monotone total** samples ever published
+/// (invariant 5), not a ring index, so `(head - 1) x median period` is how long
+/// that publisher has been running — including across every lap the ring has
+/// wrapped. That matters: the *retained* span would have been the obvious
+/// quantity and it saturates at `capacity / rate`, so a 100 Hz edge with a
+/// 100-slot ring would report one second forever and an arena that had been up
+/// for a week would never clear a five-second grace.
+///
+/// It is a **lower** bound in both terms — `head` counts accepted pushes, and
+/// the median under-reads a stream with gaps — which is the conservative
+/// direction: this check accuses late rather than early.
+fn publish_activity_ns(inp: &Inputs<'_>) -> Option<i64> {
+    let by_edge = inp.obs.by_edge();
+    let mut best: Option<i64> = None;
+    for e in &inp.snap.edges {
+        if e.kind != EdgeKind::Dynamic || e.head == 0 {
+            continue;
+        }
+        let Some(samples) = by_edge.get(&e.id) else {
+            continue;
+        };
+        let Some(period) = doctor::median_period(samples) else {
+            continue;
+        };
+        let span = i128::from(e.head - 1) * i128::from(period);
+        let span = i64::try_from(span).unwrap_or(i64::MAX);
+        best = Some(best.map_or(span, |b: i64| b.max(span)));
+    }
+    best
+}
+
+/// `TFT013` — an edge declared and never published to, **after a grace period**.
 ///
 /// Dynamic edges only. A static edge carries its pose inline in the record and
 /// never pushes, so its `head` is 0 for the whole life of a correct arena.
+///
+/// # The grace period, which §6's row required and this check did not have
+///
+/// `head == 0` alone is the state of *every* dynamic edge of a correct arena
+/// between `TreeBuilder::build` and the first push, so a `doctor` run at bringup
+/// — before the publishers are up, which is the run an operator is most likely
+/// to make — accused every one of them. §6's Detection column has always read
+/// "head == 0 **after a grace period**"; the predicate had no time term at all.
+///
+/// The evidence is [`publish_activity_ns`], and where there is none the whole
+/// check **skips** with a reason. That skip is the honest answer to a real
+/// ambiguity rather than a gap: an arena in which nothing has ever published is
+/// a robot at bringup and a robot whose every publisher is dead, and no fact in
+/// the arena separates them. `TFT017` (no live writer) is the id that reports
+/// the second.
 fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
+    let Some(activity) = publish_activity_ns(inp) else {
+        return CheckOutcome::skipped(
+            Tft::Tft013,
+            "nothing in this arena has published a measurable stream, so there is no evidence \
+             that any publisher has had time to start: an edge with head == 0 is what every \
+             dynamic edge of a correct arena reads as at bringup. TFT017 is the id for an edge \
+             whose writer is gone",
+        );
+    };
+    if activity < DECLARATION_GRACE_NS {
+        return CheckOutcome::skipped(
+            Tft::Tft013,
+            format!(
+                "the longest-running publisher in this arena has produced {:.1} s of samples, \
+                 inside the {:.0} s grace period this check allows for publishers to start \
+                 (PHASE5 §6's \"after a grace period\"); an edge with head == 0 here is not yet \
+                 evidence of anything",
+                activity as f64 / 1e9,
+                DECLARATION_GRACE_NS as f64 / 1e9
+            ),
+        );
+    }
     let mut out = Vec::new();
     for e in &inp.snap.edges {
         if e.kind == EdgeKind::Dynamic && e.head == 0 {
@@ -1566,7 +1914,11 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
                 Tft::Tft013,
                 e.id,
                 inp.snap.edge_label(e),
-                "declared as dynamic but head is 0 — nothing has ever been published to it",
+                format!(
+                    "declared as dynamic but head is 0 — nothing has ever been published to it, \
+                     and another publisher in this arena has been running for {:.1} s",
+                    activity as f64 / 1e9
+                ),
             ));
         }
     }
@@ -2774,6 +3126,275 @@ mod tests {
         );
     }
 
+    /// **A publisher that stopped is not certified healthy by `TFT007` and
+    /// `TFT008` while `TFT009` is calling it dead.**
+    ///
+    /// Every rule in the catalogue that judges a publisher measures *between*
+    /// retained stamps, so a full ring of perfectly spaced samples from three
+    /// weeks ago reads healthy: the observed rate equals the declared one and
+    /// the coefficient of variation is ~0. `TFT009`'s trailing half was repaired
+    /// for exactly that; these two carried the identical blindness, and a report
+    /// with all three in it read as checks clearing a publisher another one was
+    /// calling dead.
+    ///
+    /// **The fixture declares a nominal rate deliberately**, and that is what
+    /// puts `TFT007` in a position to clear the edge at all: on an arena with no
+    /// `rate_hz` it skips before reaching any edge, so what this test pins is
+    /// the declared-rate case. `TFT008` needs no declaration and is in that
+    /// position on any such arena.
+    ///
+    /// **The two halves are asserted against the same fixture**, which is what
+    /// makes this a statement about the blindness rather than about a fixture
+    /// chosen to fire: the identical 100 Hz stream at its identical declared
+    /// 100 Hz is judged `Pass` when nothing is writing — correctly, because on
+    /// a recording the trailing distance is the age of the file — and withheld
+    /// when something is.
+    ///
+    /// **Mutant A**, run: drop the `stopped.contains_key(&e.id)` arm from
+    /// `tft007`. The live case reports `Pass`, and its `Skipped` assertion fails
+    /// with the message an operator would have read as an all-clear.
+    /// **Mutant B**, run: drop the `stopped.contains(&edge)` arm from
+    /// `doctor::check_inconsistent_rates`. `TFT008`'s live case reports `Pass`
+    /// and its assertion fails. Each arm is its own mutant because a union of
+    /// the two would let either cover for the other.
+    /// **Mutant C**, run: make `stopped_publisher_note` return `None`. The note
+    /// assertion fails; the two skips still hold, which is why the note is
+    /// asserted separately rather than trusted to follow from them.
+    #[test]
+    fn a_stopped_publisher_is_not_certified_healthy_by_tft007_and_tft008() {
+        const MS: i64 = 1_000_000;
+        // A flawless 100 Hz stream, ending 8 seconds ago, on an edge that
+        // declares exactly 100 Hz. Both checks therefore have evidence and both
+        // would report a perfect result.
+        let obs = Observations::from_samples(steady(1, 40, 10 * MS));
+        // Read out of the stream the checks read, rather than recomputed from a
+        // second list built to the same recipe: the 8 s below has to be a
+        // silence in *this* stream, and a `stamps.len() == 40` assertion beside
+        // a locally built copy compares a length against a literal and cannot
+        // fail on the property its message names.
+        let newest = obs.by_edge()[&1]
+            .last()
+            .expect("the fixture has samples on edge 1")
+            .stamp_ns;
+        let mut e = edge(1, 1, 2, 40);
+        e.nominal_rate_mhz = Some(100_000); // 100 Hz, in milli-hertz.
+        let snap = two_frame_snapshot(e);
+        let now = Clock::Wall(newest + 8_000 * MS);
+
+        // Nothing is writing: the trailing distance is the age of the source and
+        // means nothing, so both checks judge the retained window and pass.
+        let at_rest = inputs(&snap, &obs, &[], now);
+        assert_eq!(
+            tft007(&at_rest).status,
+            Status::Pass,
+            "{:?}",
+            tft007(&at_rest)
+        );
+        assert_eq!(
+            tft008(&at_rest).status,
+            Status::Pass,
+            "{:?}",
+            tft008(&at_rest)
+        );
+        assert_eq!(
+            stopped_publisher_note(&obs, now, PushStream::Observed),
+            None,
+            "nothing was withheld here, so there is nothing to disclose"
+        );
+
+        // The same stream on a live arena, which is what `doctor --attach`
+        // reads. TFT009 fires; these two must not certify the edge it fired on.
+        let live = live_inputs(&snap, &obs, &[], now);
+        assert_eq!(
+            tft009(&live).status,
+            Status::Fired,
+            "the fixture must be one TFT009 reports, or this test asserts nothing"
+        );
+        match &tft007(&live).status {
+            Status::Skipped(why) => assert!(
+                why.contains("stopped publishing"),
+                "TFT007 must name the stopped publisher as what it declined to \
+                 compare: {why}"
+            ),
+            other => panic!(
+                "TFT007 judged a stopped publisher against its declaration and reported \
+                 {other:?}: its ring is evenly spaced at exactly the declared rate, so \
+                 that verdict is a fabricated all-clear"
+            ),
+        }
+        match &tft008(&live).status {
+            Status::Skipped(why) => assert!(
+                why.contains("stopped publishing"),
+                "TFT008 must name the stopped publisher: {why}"
+            ),
+            other => panic!(
+                "TFT008 reported {other:?} about a stopped publisher: a dead ring's \
+                 coefficient of variation is ~0, which is what a perfect publisher looks \
+                 like"
+            ),
+        }
+        let note = stopped_publisher_note(&obs, now, PushStream::RingsUnderWriter)
+            .expect("a withheld edge has to be disclosed");
+        assert!(note.contains("withheld judgement on 1 edge(s)"), "{note}");
+    }
+
+    /// **The coverage note and `TFT007`'s own status describe the same run.**
+    ///
+    /// `tft007` withholds a stopped publisher from its comparison;
+    /// [`rate_coverage_note`] states what the check covered. They read the same
+    /// arena, so an edge withheld by one must not be counted as compared by the
+    /// other — and until this test existed the note computed its counts from
+    /// [`rate_evidence`] alone, so on the first arena below the report said both
+    /// *not run, compared nothing* and *compared 1 of 2*. That is the
+    /// self-contradiction the withholding was built to remove, produced by the
+    /// change that removed it.
+    ///
+    /// Both arenas are live (`live_inputs`), because withholding only happens
+    /// where a trailing silence has an answer.
+    ///
+    /// **Mutant A**, run: drop the `stopped.contains_key(&e.id)` guard from
+    /// `rate_coverage_note`'s match. The first arena's `assert_eq!(.., None)`
+    /// fails with the "compared 1 of 2" note the skip contradicts.
+    /// **Mutant B**, run: count a withheld edge into `too_few` instead of its
+    /// own term. The second arena's note reads "2 have fewer than 8 retained
+    /// intervals" — a claim about a ring that is full — and the assertion on
+    /// "1 have stopped publishing" fails.
+    #[test]
+    fn the_rate_coverage_note_and_tft007_agree_about_a_stopped_publisher() {
+        const MS: i64 = 1_000_000;
+        let sample = |edge: u32, stamp_ns: i64| PushSample {
+            edge,
+            writer_pid: 4711,
+            stamp_ns,
+            arrival_delay_ns: 0,
+        };
+        let declaring = |id: u32, parent: u32, child: u32| {
+            let mut e = edge(id, parent, child, 40);
+            e.nominal_rate_mhz = Some(100_000); // 100 Hz, in milli-hertz.
+            e
+        };
+
+        // Arena one: the only declaring edge has stopped, and the other edge
+        // declares nothing. `TFT007` compared nothing and skips, so a note is
+        // the second, contradicting answer.
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+            ],
+            edges: vec![declaring(1, 1, 2), edge(2, 2, 3, 40)],
+            participants: live_writer(),
+        };
+        let obs = Observations::from_samples(steady(1, 40, 10 * MS));
+        let newest = obs.by_edge()[&1]
+            .last()
+            .expect("the fixture has samples on edge 1")
+            .stamp_ns;
+        let now = Clock::Wall(newest + 8_000 * MS);
+        let live = live_inputs(&snap, &obs, &[], now);
+        match &tft007(&live).status {
+            Status::Skipped(why) => assert!(why.contains("stopped publishing"), "{why}"),
+            other => panic!("the fixture must be one TFT007 declines to judge, got {other:?}"),
+        }
+        assert_eq!(
+            rate_coverage_note(&snap, &obs, now, PushStream::RingsUnderWriter),
+            None,
+            "TFT007 skipped having compared nothing; a note claiming coverage \
+             contradicts the status in the same report"
+        );
+
+        // Arena two: one stopped declaring edge, one declaring edge still
+        // publishing, one that declares nothing. The check runs on the middle
+        // one, so the note is the disclosure — and it has to name all three
+        // reasons apart.
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+                frame(4, "laser", 3, 3),
+            ],
+            edges: vec![declaring(1, 1, 2), declaring(2, 2, 3), edge(3, 3, 4, 40)],
+            participants: live_writer(),
+        };
+        // Edge 2 publishes at the same 100 Hz and its newest stamp is `now`, so
+        // it is comparable and not silent; nothing but the stopped set can
+        // explain edge 1 being excluded.
+        let mut events = steady(1, 40, 10 * MS);
+        let start = newest + 8_000 * MS - 39 * 10 * MS;
+        events.extend((0..40i64).map(|k| sample(2, start + k * 10 * MS)));
+        let obs = Observations::from_samples(events);
+        let live = live_inputs(&snap, &obs, &[], now);
+        assert_eq!(
+            tft007(&live).status,
+            Status::Pass,
+            "{:?}",
+            tft007(&live).status
+        );
+        let note = rate_coverage_note(&snap, &obs, now, PushStream::RingsUnderWriter)
+            .expect("a partial run must disclose itself");
+        assert!(
+            note.contains("compared 1 of 3")
+                && note.contains("1 declare no nominal rate")
+                && note.contains("0 have fewer than 8")
+                && note.contains("1 have stopped publishing"),
+            "{note}"
+        );
+    }
+
+    /// **`TFT008` skips rather than passing on an arena it could not measure a
+    /// spread over at all.**
+    ///
+    /// `Pass` here is the active claim *no edge in this arena publishes
+    /// unevenly*, and an arena read seconds after bringup supports no such
+    /// claim: every ring holds fewer than [`doctor::SPREAD_MIN_INTERVALS`]
+    /// intervals, `check_inconsistent_rates` judges nothing, and an empty
+    /// finding list used to render as an all-clear. It is `TFT007`'s
+    /// compared-nothing defect one row over, and the arm that fixes it had no
+    /// test — the whole crate stayed green with the guard weakened back to the
+    /// bare `Pass`.
+    ///
+    /// Distinct from the stopped-publisher skip beside it, which this asserts
+    /// by reading the reason: the remedies are opposite — wait for the rings to
+    /// fill, or go and look at a dead publisher.
+    ///
+    /// **Mutant A**, run: replace the `spread.judged == 0` skip with
+    /// `CheckOutcome::ran(Tft::Tft008, ...)`, i.e. the behaviour that shipped
+    /// before. The first case reports `Pass` and the `match` panics.
+    /// **Mutant B**, run: `SPREAD_MIN_INTERVALS: usize = 2`. The first case is
+    /// then measurable and passes, so the constant the reason quotes is the
+    /// only thing separating the two halves of this test.
+    #[test]
+    fn tft008_skips_when_nothing_retained_enough_intervals_to_measure() {
+        const MS: i64 = 1_000_000;
+        let snap = two_frame_snapshot(edge(1, 1, 2, 3));
+
+        // Three stamps is two intervals: one short of a spread.
+        let obs = Observations::from_samples(steady(1, 3, 10 * MS));
+        let o = tft008(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("has retained the 3 intervals") && !why.contains("stopped"),
+                "the skip must name the missing evidence, and must not be the \
+                 stopped-publisher one: {why}"
+            ),
+            other => panic!(
+                "TFT008 reported {other:?} about an arena in which it measured no \
+                 distribution at all: an empty finding list there means \"nothing to \
+                 measure\", not \"every edge is even\""
+            ),
+        }
+
+        // Non-vacuity: one more stamp is three intervals, which is a
+        // distribution, and an even one passes.
+        let obs = Observations::from_samples(steady(1, 4, 10 * MS));
+        assert_eq!(
+            tft008(&inputs(&snap, &obs, &[], Clock::Wall(0))).status,
+            Status::Pass
+        );
+    }
+
     /// **A live publisher at its declared cadence is not reported as stopped**,
     /// which is the false positive that would make an operator stop reading.
     #[test]
@@ -3179,6 +3800,111 @@ mod tests {
             .contains("days from the reference clock"));
     }
 
+    /// An arena in which edge 1 has been publishing at 100 Hz for `activity_ns`,
+    /// plus the `subject` edge (id 2) the test is about.
+    ///
+    /// `publish_activity_ns` reads `head` and the observed median together, so
+    /// both halves have to be here: a snapshot with a large `head` and no samples
+    /// measures nothing, and so does a full sample list on an edge whose `head`
+    /// the fixture forgot to set.
+    fn with_a_running_publisher(subject: EdgeInfo, activity_ns: i64) -> (Snapshot, Observations) {
+        const PERIOD_NS: i64 = 10_000_000; // 100 Hz.
+        let head = u64::try_from(activity_ns / PERIOD_NS).unwrap() + 1;
+        let snap = Snapshot {
+            frames: vec![
+                frame(1, "map", 0, 0),
+                frame(2, "odom", 1, 1),
+                frame(3, "base", 2, 2),
+            ],
+            edges: vec![edge(1, 1, 2, head), subject],
+            participants: live_writer(),
+        };
+        (snap, Observations::from_samples(steady(1, 10, PERIOD_NS)))
+    }
+
+    /// **`TFT005` fires past its tolerance, stays quiet inside it, and refuses
+    /// the question outright when the arena's stamps are not wall-clock time.**
+    ///
+    /// The check had no test of any kind: its firing branch, its 50 ms
+    /// tolerance and its message had never been executed, and the reference
+    /// fixture cannot reach it — the fixture stamps from 0, so `Clock::decide`
+    /// lands on `Clock::NewestStamp` and this check skips there. `docs/PHASE5.md`
+    /// §11 asks for one test per check id; this is `TFT005`'s.
+    ///
+    /// **The tolerance is pinned at its edge**, one nanosecond either side, in
+    /// the shape `the_rate_tolerance_band_is_pinned_at_its_edge` uses: a test
+    /// written against "now" and "an hour ahead" passes with the constant set to
+    /// anything at all, and the constant's own doc is an argument about a
+    /// *small* number — a publisher stamping a few hundred microseconds before
+    /// the sample reaches the arena is normal, and firing on that is how a check
+    /// gets suppressed permanently.
+    ///
+    /// The third case is the epoch guard, which is not a detail:
+    /// `EdgeRecord::domain` lets an arena carry stamps in any time domain, and
+    /// "this stamp is in the future" is only a sentence when the arena's stamps
+    /// and the host's clock share an epoch. Without it every edge of a
+    /// monotonic-clock arena reads as decades ahead.
+    ///
+    /// **Mutant A**, run: `if ahead > FUTURE_TOLERANCE_NS` to `if false`. The
+    /// firing case reports `Pass` and its assertion fails.
+    /// **Mutant B**, run: `if ahead > 0`. The inside-the-tolerance case fires
+    /// and its assertion fails.
+    /// **Mutant C**, run: delete the `let Clock::Wall(now) = inp.clock else`
+    /// guard and read `inp.clock.nanos()`. The skip case fires instead of
+    /// skipping and its `match` panics.
+    #[test]
+    fn tft005_fires_past_the_future_tolerance_and_not_inside_it() {
+        let obs = Observations::new();
+        let stats: [EdgeStats; 0] = [];
+        const NOW: i64 = 1_700_000_000_000_000_000;
+        let ahead_by = |ns: i64| {
+            let mut e = edge(1, 1, 2, 100);
+            e.newest_stamp = Some(NOW + ns);
+            two_frame_snapshot(e)
+        };
+
+        // Exactly at the tolerance: a publisher stamping just before its push.
+        let snap = ahead_by(FUTURE_TOLERANCE_NS);
+        let o = tft005(&inputs(&snap, &obs, &stats, Clock::Wall(NOW)));
+        assert_eq!(
+            o.status,
+            Status::Pass,
+            "a stamp at the tolerance is the normal case the constant exists for: {o:?}"
+        );
+
+        // One nanosecond past it.
+        let snap = ahead_by(FUTURE_TOLERANCE_NS + 1);
+        let o = tft005(&inputs(&snap, &obs, &stats, Clock::Wall(NOW)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(o.findings.len(), 1, "{:?}", o.findings);
+        assert_eq!(o.findings[0].edge, Some(1));
+
+        // And the distance reaches the operator, which is the number they act
+        // on: half a second ahead is a publisher whose clock is wrong, not a
+        // late push.
+        let snap = ahead_by(500_000_000);
+        let o = tft005(&inputs(&snap, &obs, &stats, Clock::Wall(NOW)));
+        let msg = &o.findings[0].message;
+        assert!(
+            msg.contains("500 ms ahead of the wall clock") && msg.contains("tolerance 50 ms"),
+            "the finding must say how far ahead and against what tolerance: {msg}"
+        );
+
+        // The same arena whose stamps are not Unix time: the question has no
+        // meaning and the check says so rather than reporting every edge.
+        let o = tft005(&inputs(&snap, &obs, &stats, Clock::NewestStamp(NOW)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("share an epoch"),
+                "the skip must name the epoch condition: {why}"
+            ),
+            other => panic!(
+                "a non-wall-clock arena has no \"in the future\": {other:?} — every edge of a \
+                 monotonic-clock arena would be reported decades ahead"
+            ),
+        }
+    }
+
     /// **`TFT013` is about dynamic edges only.**
     ///
     /// A static edge carries its pose inline in `EdgeRecord::static_pose` and
@@ -3186,34 +3912,195 @@ mod tests {
     /// that did not exclude them would report every static edge on every
     /// healthy robot — which is how a diagnostic becomes noise nobody reads.
     ///
+    /// Every case here clears the grace period, so the kind guard is the only
+    /// thing that can explain the difference between them.
+    ///
     /// Mutant: drop `e.kind == EdgeKind::Dynamic` from the `tft013` guard.
     /// Applied: the static-edge assertion fails.
     #[test]
     fn never_published_does_not_accuse_static_edges() {
-        let obs = Observations::new();
         let stats: [EdgeStats; 0] = [];
+        let long_enough = DECLARATION_GRACE_NS * 2;
 
-        let mut e = edge(1, 1, 2, 0);
+        let mut e = edge(2, 2, 3, 0);
         e.kind = EdgeKind::Static;
         e.capacity = 0;
-        let snap = two_frame_snapshot(e);
+        let (snap, obs) = with_a_running_publisher(e, long_enough);
         assert_eq!(
             tft013(&inputs(&snap, &obs, &stats, Clock::Wall(0))).status,
             Status::Pass,
             "a static edge's head is 0 for the life of a correct arena"
         );
 
-        let snap = two_frame_snapshot(edge(1, 1, 2, 0));
+        let (snap, obs) = with_a_running_publisher(edge(2, 2, 3, 0), long_enough);
         let o = tft013(&inputs(&snap, &obs, &stats, Clock::Wall(0)));
         assert_eq!(o.status, Status::Fired, "{o:?}");
-        assert_eq!(o.findings[0].edge, Some(1));
+        assert_eq!(o.findings.len(), 1, "{:?}", o.findings);
+        assert_eq!(o.findings[0].edge, Some(2));
 
         // Non-vacuity: a dynamic edge that has published is clean.
-        let snap = two_frame_snapshot(edge(1, 1, 2, 7));
+        let (snap, obs) = with_a_running_publisher(edge(2, 2, 3, 7), long_enough);
         assert_eq!(
             tft013(&inputs(&snap, &obs, &stats, Clock::Wall(0))).status,
             Status::Pass
         );
+    }
+
+    /// **`TFT013` waits out the grace period §6's row has always required, and
+    /// says so instead of accusing every dynamic edge at bringup.**
+    ///
+    /// The two cases below are the *same* unpublished edge. The only thing that
+    /// differs is how long the arena's other publisher has been running — one
+    /// millisecond inside the grace period, and one millisecond outside it — so
+    /// nothing but the grace term can explain the difference in outcome. That is
+    /// the shape `the_rate_tolerance_band_is_pinned_at_its_edge` uses for
+    /// `RATE_TOLERANCE`, for the same reason: a test pinned to *any* two widely
+    /// separated durations survives a guard that fires on the wrong quantity.
+    ///
+    /// The third case is the arena with no published stream at all, which is a
+    /// robot at bringup and a robot whose every publisher has died, and no fact
+    /// in the arena separates them. A skip is the answer; `TFT017` is the id for
+    /// the second.
+    ///
+    /// **Mutant A**, run: delete the `activity < DECLARATION_GRACE_NS` guard.
+    /// The inside-the-grace case fires and its `Skipped` assertion fails.
+    /// **Mutant B**, run: make the guard `activity < i64::MAX`. The
+    /// outside-the-grace case skips and its `Fired` assertion fails.
+    /// **Mutant C**, run: read the retained span (`newest - oldest` of the
+    /// samples) instead of `(head - 1) x median`. Every fixture in both this
+    /// test and `never_published_does_not_accuse_static_edges` then measures
+    /// 90 ms — the ten samples the observation list holds, whatever `head` says
+    /// — and both tests fail. That is the ring-wrap saturation
+    /// `publish_activity_ns`' doc argues about, reproduced.
+    #[test]
+    fn an_unpublished_edge_is_not_accused_inside_the_grace_period() {
+        let stats: [EdgeStats; 0] = [];
+        const MS: i64 = 1_000_000;
+
+        let (snap, obs) = with_a_running_publisher(edge(2, 2, 3, 0), DECLARATION_GRACE_NS - MS);
+        let o = tft013(&inputs(&snap, &obs, &stats, Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("grace period"),
+                "the skip must name the grace period as the reason: {why}"
+            ),
+            other => panic!(
+                "an arena younger than the grace period must not accuse an unpublished \
+                 edge: {other:?}"
+            ),
+        }
+
+        let (snap, obs) = with_a_running_publisher(edge(2, 2, 3, 0), DECLARATION_GRACE_NS + MS);
+        let o = tft013(&inputs(&snap, &obs, &stats, Clock::Wall(0)));
+        assert_eq!(
+            o.status,
+            Status::Fired,
+            "past the grace period an edge nothing has ever published to is the fault \
+             this check is for: {o:?}"
+        );
+
+        // Nothing has published anywhere: bringup and a total outage are the
+        // same arena, and the check says so rather than choosing one.
+        let snap = two_frame_snapshot(edge(1, 1, 2, 0));
+        let o = tft013(&inputs(&snap, &Observations::new(), &stats, Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(why.contains("TFT017"), "{why}"),
+            other => panic!("expected a skip on an arena with no published stream: {other:?}"),
+        }
+    }
+
+    /// **The grace period is measured against the *longest*-running publisher
+    /// in the arena, and only against a dynamic one.**
+    ///
+    /// Both clauses are written into `publish_activity_ns`' doc and neither was
+    /// pinned: every other `TFT013` fixture has a single publishing edge, where
+    /// a maximum and a minimum are the same number and a kind filter over one
+    /// dynamic edge does nothing. A review mutated `b.max(span)` to
+    /// `b.min(span)` and dropped the `EdgeKind::Dynamic` guard, and the whole
+    /// crate stayed green.
+    ///
+    /// The direction matters: a minimum means one publisher restarting resets
+    /// the grace for the entire arena, so an edge nothing has ever published to
+    /// is never reported while any publisher is young. And a static edge's
+    /// stream — which a correct arena does not have, but a hand-built or
+    /// corrupt record does — must not be what clears the grace, for the same
+    /// reason `rate_evidence` refuses a static edge's stray nominal rate: the
+    /// check's subject is what dynamic publishers have had time to do.
+    ///
+    /// **Mutant A**, run: `b.min(span)`. Both halves of the first case skip
+    /// inside the grace and the `Fired` assertions fail.
+    /// **Mutant B**, run: drop the `e.kind != EdgeKind::Dynamic` term. The
+    /// static case's `Skipped` assertion fails — the static edge's 10 s of
+    /// samples clears a grace no dynamic publisher had reached.
+    /// **Mutant C**, run: `best.unwrap_or(span)`, i.e. the first edge that
+    /// measures wins. The first ordering fails.
+    /// **Mutant D**, run: `best = Some(span)`, i.e. the last one wins. The
+    /// second ordering fails. Both are why the loop above runs the pair in
+    /// both orders rather than once.
+    #[test]
+    fn the_grace_period_reads_the_longest_running_dynamic_publisher() {
+        const MS: i64 = 1_000_000;
+        const PERIOD_NS: i64 = 10_000_000; // 100 Hz, as `with_a_running_publisher`.
+        let stats: [EdgeStats; 0] = [];
+        let head_for = |activity_ns: i64| u64::try_from(activity_ns / PERIOD_NS).unwrap() + 1;
+        // Edge 2 is the subject: dynamic, `head == 0`, nothing ever published.
+        // Edges 1 and 3 are the publishers whose activity decides the grace.
+        let arena = |a: i64, b: i64, kind_of_3: EdgeKind| {
+            let mut third = edge(3, 3, 4, head_for(b));
+            third.kind = kind_of_3;
+            let snap = Snapshot {
+                frames: vec![
+                    frame(1, "map", 0, 0),
+                    frame(2, "odom", 1, 1),
+                    frame(3, "base", 2, 2),
+                    frame(4, "laser", 3, 3),
+                ],
+                edges: vec![edge(1, 1, 2, head_for(a)), edge(2, 2, 3, 0), third],
+                participants: live_writer(),
+            };
+            let mut events = steady(1, 10, PERIOD_NS);
+            events.extend(steady(3, 10, PERIOD_NS));
+            (snap, Observations::from_samples(events))
+        };
+
+        // One publisher inside the grace, one well past it — in both orders, so
+        // that neither "the first one that measures" nor "the last one" can
+        // explain the verdict either.
+        for (a, b) in [
+            (DECLARATION_GRACE_NS - MS, DECLARATION_GRACE_NS * 2),
+            (DECLARATION_GRACE_NS * 2, DECLARATION_GRACE_NS - MS),
+        ] {
+            let (snap, obs) = arena(a, b, EdgeKind::Dynamic);
+            let o = tft013(&inputs(&snap, &obs, &stats, Clock::Wall(0)));
+            assert_eq!(
+                o.status,
+                Status::Fired,
+                "a publisher that has been up for twice the grace period is evidence \
+                 that an edge with head == 0 should have seen something: {o:?}"
+            );
+            assert_eq!(o.findings.len(), 1, "{:?}", o.findings);
+            assert_eq!(o.findings[0].edge, Some(2));
+        }
+
+        // The same durations, with the long-running stream on a *static* edge.
+        // Its head and its samples are both what a correct arena never has, and
+        // neither may extend the grace decision.
+        let (snap, obs) = arena(
+            DECLARATION_GRACE_NS - MS,
+            DECLARATION_GRACE_NS * 2,
+            EdgeKind::Static,
+        );
+        let o = tft013(&inputs(&snap, &obs, &stats, Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("grace period"),
+                "only a dynamic publisher's activity clears the grace: {why}"
+            ),
+            other => panic!(
+                "a static edge's stream cleared the grace period for a check about \
+                 dynamic publishers: {other:?}"
+            ),
+        }
     }
 
     /// **`TFT010` needs the counters, and says so rather than passing.**
@@ -4784,7 +5671,7 @@ mod tests {
             other => panic!("expected a skip, got {other:?}"),
         }
         assert_eq!(
-            rate_coverage_note(&snap, &obs),
+            rate_coverage_note(&snap, &obs, Clock::Wall(0), PushStream::Observed),
             None,
             "the note stays silent here, which is why the skip has to carry the disclosure"
         );
@@ -4801,9 +5688,11 @@ mod tests {
             tft007(&inputs(&snap, &obs, &[], Clock::Wall(0))).status,
             Status::Pass
         );
-        assert!(rate_coverage_note(&snap, &obs)
-            .expect("a partial run discloses itself")
-            .contains("compared 1 of 2"));
+        assert!(
+            rate_coverage_note(&snap, &obs, Clock::Wall(0), PushStream::Observed)
+                .expect("a partial run discloses itself")
+                .contains("compared 1 of 2")
+        );
     }
 
     /// **`RATE_TOLERANCE` is the band, and one milli-hertz either side of it
@@ -4897,7 +5786,8 @@ mod tests {
         events.extend(steady(2, 4, 50 * MS));
         let obs = Observations::from_samples(events);
 
-        let note = rate_coverage_note(&snap, &obs).expect("a partial run must disclose itself");
+        let note = rate_coverage_note(&snap, &obs, Clock::Wall(0), PushStream::Observed)
+            .expect("a partial run must disclose itself");
         assert!(
             note.contains("compared 1 of 3")
                 && note.contains("1 declare no nominal rate")
@@ -4910,12 +5800,18 @@ mod tests {
         a.nominal_rate_mhz = Some(20_000);
         let full = two_frame_snapshot(a);
         let obs = Observations::from_samples(steady(1, 12, 50 * MS));
-        assert_eq!(rate_coverage_note(&full, &obs), None);
+        assert_eq!(
+            rate_coverage_note(&full, &obs, Clock::Wall(0), PushStream::Observed),
+            None
+        );
 
         // Nothing declared: the check skips and says so itself, so a note here
         // would be a second, weaker statement of the same fact.
         let none = two_frame_snapshot(edge(1, 1, 2, 100));
-        assert_eq!(rate_coverage_note(&none, &obs), None);
+        assert_eq!(
+            rate_coverage_note(&none, &obs, Clock::Wall(0), PushStream::Observed),
+            None
+        );
     }
 
     /// **An arena that has served no lookups must not read as a healthy one.**

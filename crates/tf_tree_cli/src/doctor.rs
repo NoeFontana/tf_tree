@@ -988,25 +988,64 @@ pub fn check_short_buffers(snap: &Snapshot, obs: &Observations) -> Vec<Finding> 
     out
 }
 
+/// Intervals an edge must have retained before its spread means anything.
+///
+/// **Named rather than inlined because `TFT008`'s skip reason quotes it**, and a
+/// message in `tf_tree_cli::checks` carrying a second copy of this number is how
+/// a report comes to state a threshold the rule does not use.
+pub(crate) const SPREAD_MIN_INTERVALS: usize = 3;
+
+/// What [`check_inconsistent_rates`] found, **and what it looked at**.
+///
+/// The second half is not bookkeeping. A coefficient of variation is only a
+/// verdict about the edges it was computed over, so an empty finding list means
+/// either "every edge publishes evenly" or "there was nothing to measure", and
+/// those are opposite answers. `TFT008` turns the second into a stated skip
+/// rather than a `pass` — the rule `docs/PHASE5.md` §6's `TFT007` amendment
+/// already established for a rate compared against nothing.
+pub struct RateSpread {
+    /// One finding per edge whose spread is above the threshold.
+    pub findings: Vec<Finding>,
+    /// How many edges the rule was applied to.
+    pub judged: usize,
+    /// How many were **withheld** because their publisher has stopped.
+    pub withheld: usize,
+}
+
 /// (5) A frame whose inter-sample intervals vary widely (coefficient of variation
 /// above a threshold) is publishing at an inconsistent rate.
+///
+/// `stopped` names the edges whose publisher has stopped — `tf_tree_cli::checks`
+/// computes it, because deciding that needs a clock and a source and this module
+/// has neither. They are **withheld, not judged**: a publisher that died leaves a
+/// full ring of perfectly spaced samples, whose coefficient of variation is ~0,
+/// so judging it would print a healthy cadence beside `TFT009` reporting the
+/// same edge as silent. The set is empty for every caller that has no such
+/// evidence, which is the state this function shipped in.
 #[must_use]
-pub fn check_inconsistent_rates(obs: &Observations) -> Vec<Finding> {
+pub fn check_inconsistent_rates(obs: &Observations, stopped: &BTreeSet<u32>) -> RateSpread {
     /// Coefficient-of-variation threshold above which a rate is "inconsistent".
     const COV_THRESHOLD: f64 = 0.5;
     let mut out = Vec::new();
+    let mut judged = 0usize;
+    let mut withheld = 0usize;
     for (edge, samples) in obs.by_edge() {
         let intervals: Vec<f64> = samples
             .windows(2)
             .map(|w| (w[1].stamp_ns - w[0].stamp_ns) as f64)
             .collect();
-        if intervals.len() < 3 {
+        if intervals.len() < SPREAD_MIN_INTERVALS {
             continue;
         }
         let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
         if mean <= 0.0 {
             continue;
         }
+        if stopped.contains(&edge) {
+            withheld += 1;
+            continue;
+        }
+        judged += 1;
         let var =
             intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
         let cov = var.sqrt() / mean;
@@ -1020,7 +1059,11 @@ pub fn check_inconsistent_rates(obs: &Observations) -> Vec<Finding> {
             ));
         }
     }
-    out
+    RateSpread {
+        findings: out,
+        judged,
+        withheld,
+    }
 }
 
 /// (6) Frames not reachable from the main (largest) root component — an
@@ -1233,7 +1276,10 @@ pub fn all_findings(snap: &Snapshot, obs: &Observations) -> Vec<Finding> {
     findings.extend(check_unclaimed_dynamic(snap));
     findings.extend(check_multi_writer(obs));
     findings.extend(check_short_buffers(snap, obs));
-    findings.extend(check_inconsistent_rates(obs));
+    // No `stopped` set: this aggregate is handed no clock and no source, so it
+    // cannot decide that a publisher has stopped. `TFT008` is the caller that
+    // can, and does.
+    findings.extend(check_inconsistent_rates(obs, &BTreeSet::new()).findings);
     findings.extend(check_unreachable(snap));
     findings.extend(check_out_of_order(obs));
     findings
@@ -1527,16 +1573,41 @@ mod tests {
             sample(1, 1, 102_000_000, 0),
             sample(1, 1, 202_000_000, 0),
         ]);
-        let findings = check_inconsistent_rates(&obs);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].check, Check::InconsistentRate);
+        let spread = check_inconsistent_rates(&obs, &BTreeSet::new());
+        assert_eq!(spread.findings.len(), 1);
+        assert_eq!(spread.findings[0].check, Check::InconsistentRate);
+        assert_eq!(spread.judged, 1, "the edge was measured, not skipped");
+        assert_eq!(spread.withheld, 0);
     }
 
     #[test]
     fn steady_rate_is_clean() {
         let obs =
             Observations::from_samples((0..10).map(|k| sample(1, 1, k * 10_000_000, 0)).collect());
-        assert!(check_inconsistent_rates(&obs).is_empty());
+        let spread = check_inconsistent_rates(&obs, &BTreeSet::new());
+        assert!(spread.findings.is_empty());
+        // **Non-vacuity, and it is the whole reason `judged` exists.** An empty
+        // finding list is also what "there was nothing to measure" produces, and
+        // `TFT008` turns those two into opposite answers.
+        assert_eq!(spread.judged, 1);
+    }
+
+    /// **An edge whose publisher has stopped is withheld rather than judged.**
+    ///
+    /// The same flawless stream, twice: measured it is clean, and named as
+    /// stopped it is not measured at all. `TFT008` needs the second so it cannot
+    /// print a healthy cadence for an edge `TFT009` is reporting as silent.
+    ///
+    /// Mutant: drop the `stopped.contains(&edge)` arm. Applied: `judged` reads
+    /// 1 and `withheld` 0, and both assertions below fail.
+    #[test]
+    fn a_stopped_publisher_is_withheld_from_the_spread() {
+        let obs =
+            Observations::from_samples((0..10).map(|k| sample(1, 1, k * 10_000_000, 0)).collect());
+        let spread = check_inconsistent_rates(&obs, &BTreeSet::from([1]));
+        assert_eq!(spread.judged, 0, "a stopped publisher must not be judged");
+        assert_eq!(spread.withheld, 1);
+        assert!(spread.findings.is_empty());
     }
 
     // --- (6) unreachable frames -----------------------------------------

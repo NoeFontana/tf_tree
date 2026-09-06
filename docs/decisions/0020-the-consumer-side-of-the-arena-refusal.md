@@ -46,7 +46,7 @@ one sentence for every one of these:
 | `IpcError::NetworkFilesystem` / `StatFsFailed` — `$TF_TREE_RUNTIME_DIR` is on NFS | fix the deployment |
 | `IpcError::DomainNotAnInteger` / `NameInvalid` — a typo in `$TF_TREE_DOMAIN` / `$TF_TREE_NAME` | fix the environment |
 | `HandshakeRejected { VersionMismatch \| LayoutMismatch }` | rebuild every participant together |
-| `HandshakeRejected { NoParticipantSlots }` | raise `--participants`, or find the leak |
+| `HandshakeRejected { NoParticipantSlots }` | find the leak. **There is no `--participants` flag and never was** — capacity is fixed at construction (`PROJECT.md` §5 D4, `tf_tree_arena::layout::DEFAULT_MAX_PARTICIPANTS`), so raising it means rebuilding every participant together. *This cell read* raise `--participants`, or find the leak *until 2026-09-05.* |
 | `OpenError::Map` — the segment arrived and could not be mapped | a bug, or a resource limit |
 
 **Four** of `OpenError`'s six variants are *not* in that table and should not
