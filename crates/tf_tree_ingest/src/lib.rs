@@ -63,13 +63,55 @@
 //!
 //! # Status against §3
 //!
-//! Implemented: §3.1's two passes **including the spill-to-run-file**, §3.3's
-//! MCAP source, and every row of §3.2 except `--on-clock-reset=split`, which is
-//! refused with a reason ([`IngestError::ClockResetSplitUnsupported`]) rather
-//! than silently doing something else. `docs/PHASE5.md` §3.2 carries the
-//! argument for leaving it refused; it is a decision, not a backlog entry.
-//! `rosbag2` sqlite3 (§3.3, "lower priority") and `freeze_from_arrays` are not
-//! here.
+//! Implemented: §3.1's **pass structure** — two passes, the group re-read and the
+//! spill-to-run-file — §3.3's MCAP source, and every row of §3.2 except
+//! `--on-clock-reset=split`, which is refused with a reason
+//! ([`IngestError::ClockResetSplitUnsupported`]) rather than silently doing
+//! something else. `docs/PHASE5.md` §3.2 carries the argument for leaving it
+//! refused; it is a decision, not a backlog entry. `rosbag2` sqlite3 (§3.3,
+//! "lower priority") and `freeze_from_arrays` are not here.
+//!
+//! **Two corrections to what this block used to claim, kept rather than
+//! rewritten**, because a claim silently repaired stops recording that it was
+//! ever stronger:
+//!
+//! * It said "every row of §3.2" while the **static-conflict** row —
+//!   *"report both values"* — was implemented as a bare count. Both values are
+//!   now on [`StaticConflict`], in the report's JSON and in its summary.
+//!   `docs/PHASE4.md` §5.7 states what the count could not answer: which of two
+//!   URDFs is installed.
+//! * It said "§3.1's two passes" without qualification, and **§3.1's pass one is
+//!   NORMATIVE that it detects the time domain, which nothing here does.**
+//!   `rg -n 'TreeBuilder::new|static_edge|dynamic_edge'
+//!   crates/tf_tree_ingest/src/ingest.rs` prints where this crate constructs a
+//!   tree and its edges (`ingest::fill` is its only `TreeBuilder` call site) and
+//!   none of them names a domain, so every ingested edge takes `TreeBuilder`'s
+//!   default — `SystemDomain`, tag 0 — whatever clock the recording was made
+//!   against. **The command written here used to be `rg -ni domain
+//!   crates/tf_tree_ingest/src/` "returns nothing", which this very paragraph
+//!   falsified the moment it was written**: the doc block is under `src/`, so the
+//!   instrument was inside its own measurement and the published procedure
+//!   returned the opposite of what it claimed. The conclusion was and is correct
+//!   — it was re-derived from the call sites, not from the grep — and what
+//!   replaces the grep is a *positive* listing, output a reader can compare
+//!   against the file rather than an absence any later sentence can break.
+//!   **This is a specification gap and is
+//!   deliberately not closed by code**: a `TFMessage` carries no domain, and every
+//!   other domain in this project is *declared* (`tf_tree_bridge::config`'s
+//!   `domain`/`default_domain`, [`tf_tree::EdgeCfg::domain`]) rather than
+//!   inferred — `ros/tf_tree_ros/src/bridge_node.cpp` warns the *operator* to
+//!   configure one when `use_sim_time` is set, which is the online half admitting
+//!   the same thing. Inventing an inference rule here is what `CLAUDE.md` forbids.
+//!   `docs/PHASE5.md` §3.1's amendment carries the consequence: a bag recorded
+//!   under simulated time is indistinguishable, to every consumer, from one
+//!   recorded against a wall clock.
+//!
+//! **Every test in this crate reads a recording this crate wrote.** The MCAP
+//! framing under test is produced by `crate::fixture` (or, for the compressed
+//! conformance file, by `crate::fixture` with libzstd supplying only the chunk
+//! payloads), so the suite gates this reader's *bookkeeping* and never its
+//! agreement with a real `rosbag2` or DDS writer. `testdata/ATTRIBUTION.md` says
+//! the same in its first paragraph.
 
 use std::path::Path;
 
@@ -153,10 +195,10 @@ pub mod tft;
 
 pub use ingest::{
     fill, survey, Anomalies, ClockResetPolicy, EdgeSurvey, FillStats, Frames, IngestOptions,
-    Survey, DEFAULT_FUTURE_HORIZON_NS, DEFAULT_MAX_CHUNK_EXPANSION_RATIO,
+    StaticConflict, Survey, DEFAULT_FUTURE_HORIZON_NS, DEFAULT_MAX_CHUNK_EXPANSION_RATIO,
     DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_RECORD_BYTES,
 };
-pub use report::IngestReport;
+pub use report::{IngestReport, StaticConflictRow};
 pub use source::{OnBadChunk, ReadPolicy, TopicRoles};
 
 /// An index into [`Frames`], which is how a `Copy` error names a frame.

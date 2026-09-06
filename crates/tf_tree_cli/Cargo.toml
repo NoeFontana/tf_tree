@@ -115,6 +115,23 @@ counters = ["tf_tree/counters"]
 shm = ["tf_tree/shm", "dep:tf_tree_ipc", "tf_tree_ingest/shm"]
 
 [dev-dependencies]
+# **Reading `doctor --json` back, in `tests/catalogue.rs`, and nothing else.**
+# `docs/PHASE5.md` §11 requires that document to be schema-validated, and a
+# hand-rolled reader for our own output would fail *open* on exactly the defects
+# it exists to catch — `render_json` writes the document line by line, and the
+# extractors in `tests/doctor_recording.rs` read it back by line offset with an
+# assertion that the field order has not moved, which is an acknowledgement that
+# they are not parsing.
+#
+# **It costs the workspace nothing**, which is the whole reason this is allowed
+# past `docs/PROJECT.md`'s dependency budget without a decision record: it is
+# already in the lockfile (`criterion` pulls it) and already in *this* crate's
+# build graph, because `tf_tree_bench` — a normal dependency here — declares
+# `serde_json` as a normal dependency of its own for reading the committed
+# benchmark baseline. A dev-dependency, so the shipped `tf_tree` binary does not
+# link it either way; `render_json`'s own doc argues against a serializer for
+# *writing*, and this is reading.
+serde_json.workspace = true
 # `sizing.rs`'s four constants are claims about `ArenaLayout`'s regions, and the
 # test that keeps them true differences two real layouts instead of trusting the
 # comment beside them. A dev-dependency rather than a dependency: the CLI itself

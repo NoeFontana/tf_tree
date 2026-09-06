@@ -97,9 +97,21 @@ of them tells an operator to run a program that does not exist.
 **What has already changed under all three.** D16 said ownership is *configured,
 not negotiated*, and a daemon existed to make configuring it trivial.
 [`0005`](./0005-the-shared-memory-seam.md) §8 retired the "no takeover" half:
-ownership is a role the kernel reassigns on an uncontended `F_OFD_SETLK`, and
-`OpenOutcome::TookOver` ships. Liveness, reaping and owner death are all handled
-with no daemon at all. **Most of §9's responsibilities are already discharged by
+ownership is a role the kernel reassigns on an uncontended `F_OFD_SETLK`.
+Liveness, reaping and owner death are all handled with no daemon at all.
+
+> **This sentence used to end "and `OpenOutcome::TookOver` ships", and the
+> variant no longer exists.** #275 deleted the arm and the builder that reached
+> it, leaving a producerless variant that `tf_tree::open` refused with
+> `OpenError::TakeoverUnsupported`; #278 then deleted both, answering
+> [`0037`](./0037-a-takeover-is-not-a-second-open.md) question 3 — a takeover is
+> not an outcome of `open()`. `OpenOutcome` is `Joined | Created`
+> (`crates/tf_tree_ipc/src/open.rs`). **Nothing in this paragraph's argument
+> moves**: the ownership migration that shipped on 2026-08-28 is
+> `Session::take_over_ownership` plus `Tree::inherit_ownership`, still the
+> kernel reassigning one byte with no message exchanged, and it is still
+> caller-driven, which is what steps 6–7 below decline to build a daemon for.
+> `docs/PHASE2.md` §0.0's ownership-migration row is the authoritative status. **Most of §9's responsibilities are already discharged by
 whichever process creates the arena.**
 
 **What actually remains is narrower, and it is not a lifecycle problem.**

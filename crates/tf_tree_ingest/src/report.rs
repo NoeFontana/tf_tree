@@ -58,6 +58,38 @@ pub struct IngestReport {
     pub remaps: Vec<(String, String)>,
     /// Dynamic edges that ended with no samples.
     pub edges_without_samples: Vec<String>,
+    /// §3.2's static-conflict row, with **both** values — one row per
+    /// contradicted edge.
+    ///
+    /// [`crate::Anomalies::static_conflicts`] counts the contradicting *messages*;
+    /// this names the edge and carries the two poses, which is what the row asks
+    /// for and what an operator holding two URDFs needs.
+    ///
+    /// **The two are spelled apart on purpose** — see
+    /// [`crate::Survey::static_conflict_details`], which records the day they
+    /// were not.
+    pub static_conflict_details: Vec<StaticConflictRow>,
+}
+
+/// One contradicted static edge in the report, with frame names resolved.
+///
+/// The report's own shape of [`crate::StaticConflict`]: that type names frames by
+/// [`crate::FrameId`], because a `Copy` survey cannot own strings; a report is
+/// rendered and so it carries the names.
+#[derive(Clone, Debug)]
+pub struct StaticConflictRow {
+    /// Parent frame name.
+    pub parent: String,
+    /// Child frame name.
+    pub child: String,
+    /// Which topic declared [`existing`](StaticConflictRow::existing).
+    pub declared_by: String,
+    /// Which topic offered [`offered`](StaticConflictRow::offered).
+    pub contradicted_by: String,
+    /// The value on file, which wins. Canonical order — `[qw qx qy qz tx ty tz]`.
+    pub existing: [f64; 7],
+    /// The value that was refused, in the same order.
+    pub offered: [f64; 7],
 }
 
 /// One edge's row in the report.
@@ -150,6 +182,18 @@ impl IngestReport {
             edges,
             anomalies,
             remaps: survey.remaps.clone(),
+            static_conflict_details: survey
+                .static_conflict_details
+                .iter()
+                .map(|c| StaticConflictRow {
+                    parent: frames.name(c.parent).to_owned(),
+                    child: frames.name(c.child).to_owned(),
+                    declared_by: c.declared_by.clone(),
+                    contradicted_by: c.contradicted_by.clone(),
+                    existing: c.existing,
+                    offered: c.offered,
+                })
+                .collect(),
         }
     }
 
@@ -212,6 +256,11 @@ impl IngestReport {
         let _ = write!(s, ",\"truncated\":{}", a.truncated);
         let _ = write!(s, ",\"bad_chunks\":{}", a.bad_chunks);
         let _ = write!(s, ",\"chunks_over_limit\":{}", a.chunks_over_limit);
+        let _ = write!(
+            s,
+            ",\"oversized_records_skipped\":{}",
+            a.oversized_records_skipped
+        );
         s.push_str(",\"bad_chunk_span_ns\":");
         match a.bad_chunk_span_ns {
             Some((lo, hi)) => {
@@ -277,6 +326,29 @@ impl IngestReport {
                 s.push(',');
             }
             push_json_string(&mut s, e);
+        }
+        s.push(']');
+
+        // §3.2's "report both values". The count is in `anomalies` above and this
+        // is the payload: a consumer diffing two URDFs reads it from here.
+        s.push_str(",\"static_conflict_details\":[");
+        for (i, c) in self.static_conflict_details.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push('{');
+            push_kv_str(&mut s, "parent", &c.parent);
+            s.push(',');
+            push_kv_str(&mut s, "child", &c.child);
+            s.push(',');
+            push_kv_str(&mut s, "declared_by", &c.declared_by);
+            s.push(',');
+            push_kv_str(&mut s, "contradicted_by", &c.contradicted_by);
+            s.push_str(",\"existing\":");
+            push_pose(&mut s, &c.existing);
+            s.push_str(",\"offered\":");
+            push_pose(&mut s, &c.offered);
+            s.push('}');
         }
         s.push_str("]}");
         s
@@ -387,6 +459,32 @@ impl IngestReport {
                 a.chunks_over_limit
             ),
         );
+        // Beside the chunk rows, because it is the same kind of fact: a piece of
+        // the file this reader declined to look at, with a flag that would have
+        // read it.
+        //
+        // **It named the record kind and promised the transform stream was whole
+        // until 2026-09-05, and could support neither.** The sentence read "N
+        // record(s) this reader does not read (an attachment, a metadata block)
+        // were larger than --max-record-size and were stepped over; no transform
+        // was lost". The reader never parses the record, so "an attachment" is a
+        // guess; and it steps over the length the record itself declares, so a
+        // corrupt one can land on a later record boundary with whole chunks of
+        // transforms inside the span — measured, by
+        // `a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so`,
+        // which is where that sentence stopped being defensible.
+        // What is left is what this run actually knows: it did not look, and
+        // which flag makes it look.
+        row(
+            a.oversized_records_skipped > 0,
+            format!(
+                "{} record(s) over --max-record-size were of a kind this reader \
+                 does not read, and were stepped over on the length they declare; \
+                 the bytes inside that span were not read, so raise \
+                 --max-record-size to have them parsed rather than skipped",
+                a.oversized_records_skipped
+            ),
+        );
         row(
             a.zero_stamp_drops > 0,
             format!(
@@ -424,13 +522,31 @@ impl IngestReport {
                 a.clock_resets
             ),
         );
-        row(
-            a.static_conflicts > 0,
-            format!(
+        row(a.static_conflicts > 0, {
+            // **Both values, indented under the count.** §3.2's row says "report
+            // both values" and the count alone does not: a conflict is two URDFs
+            // disagreeing, and the operator's next move is to work out which one
+            // is installed. Full precision on purpose — `StaticStore` calls two
+            // poses the same within 1e-12, so a rounded rendering can print two
+            // identical-looking numbers under a line claiming they differ.
+            let mut t = format!(
                 "{} /tf_static messages contradicted an already-declared value; the first won",
                 a.static_conflicts
-            ),
-        );
+            );
+            for c in &self.static_conflict_details {
+                let _ = write!(
+                    t,
+                    "\n      {} -> {}: {} declared {}, {} offered {}",
+                    c.parent,
+                    c.child,
+                    c.declared_by,
+                    pose_text(&c.existing),
+                    c.contradicted_by,
+                    pose_text(&c.offered),
+                );
+            }
+            t
+        });
         row(
             a.stripped_slash_names > 0,
             format!(
@@ -462,6 +578,34 @@ impl IngestReport {
         );
         s
     }
+}
+
+/// A canonical `[qw qx qy qz tx ty tz]` pose as a JSON array.
+///
+/// Non-finite components become `null`, for the reason `rate_hz` does: JSON has no
+/// spelling for `NaN`, and a document containing one is refused by `json.load`.
+/// A pose comes off a recording through a CDR decode, so a component that is not a
+/// number is reachable without anything in this crate being wrong.
+fn push_pose(s: &mut String, p: &[f64; 7]) {
+    s.push('[');
+    for (i, v) in p.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        if v.is_finite() {
+            let _ = write!(s, "{v}");
+        } else {
+            s.push_str("null");
+        }
+    }
+    s.push(']');
+}
+
+/// The same pose for the terminal, at full `f64` round-trip precision.
+fn pose_text(p: &[f64; 7]) -> String {
+    let mut s = String::new();
+    push_pose(&mut s, p);
+    s
 }
 
 fn push_opt_i64(s: &mut String, v: Option<i64>) {
@@ -544,6 +688,7 @@ mod tests {
             anomalies: crate::Anomalies::default(),
             remaps: Vec::new(),
             edges_without_samples: Vec::new(),
+            static_conflict_details: Vec::new(),
         };
         let json = report.to_json();
         assert!(json.contains("\"rate_hz\":null"), "{json}");
@@ -587,6 +732,7 @@ mod tests {
                 },
                 remaps: Vec::new(),
                 edges_without_samples: Vec::new(),
+                static_conflict_details: Vec::new(),
             }
             .summary()
         };

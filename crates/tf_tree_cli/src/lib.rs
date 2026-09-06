@@ -1465,10 +1465,11 @@ fn evidence_notes(
     counter_evidence: Option<&'static str>,
 ) -> Vec<String> {
     let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
-    notes.extend(checks::rate_coverage_note(snap, obs));
+    notes.extend(checks::rate_coverage_note(snap, obs, clock, stream));
     notes.extend(checks::clock_offset_note(snap, stream, clock));
     notes.extend(clock_step.coverage_note(stream));
     notes.extend(checks::silence_coverage_note(clock, stream));
+    notes.extend(checks::stopped_publisher_note(obs, clock, stream));
     match (counter_evidence, stream.no_arrival_delays()) {
         // Both blind: `tft011` skipped and said so itself.
         (Some(_), Some(_)) => {}
@@ -2354,7 +2355,8 @@ mod tests {
     /// declaring a rate and measurable, one declaring nothing — so the note is
     /// about coverage and not about a skip.
     ///
-    /// Mutant: delete `notes.extend(checks::rate_coverage_note(snap, obs));`
+    /// Mutant: delete `notes.extend(checks::rate_coverage_note(snap, obs, clock,
+    /// stream));`
     /// from `evidence_notes`. Applied: the `expect` fires with "no coverage
     /// note".
     #[test]
@@ -2514,6 +2516,106 @@ mod tests {
         assert!(
             !notes.iter().any(|n| n.starts_with("TFT009")),
             "the half ran; a note about coverage it did reach is noise: {notes:?}"
+        );
+    }
+
+    /// **The stopped-publisher note reaches `Meta.notes`, and is silent when
+    /// nothing was withheld.**
+    ///
+    /// Same argument as the two tests above: `checks::stopped_publisher_note` is
+    /// unit tested and the line that *calls* it is not reachable from there.
+    /// Without the call, `TFT007` and `TFT008` skip on a live arena whose only
+    /// publisher has stopped and the report carries no line saying which edge
+    /// they declined to judge — so a reader sees two "not run" rows and no
+    /// subject.
+    ///
+    /// Mutant: delete `notes.extend(checks::stopped_publisher_note(obs, clock,
+    /// stream));` from `evidence_notes`. Applied: the `expect` fires with "no
+    /// stopped-publisher note".
+    #[test]
+    fn the_stopped_publisher_note_reaches_the_report_metadata() {
+        use doctor::{EdgeInfo, FrameInfo};
+        use tf_tree::InterpPolicy;
+        use tf_tree_bench::fixture::PushSample;
+
+        const MS: i64 = 1_000_000;
+        let snap = Snapshot {
+            frames: vec![
+                FrameInfo {
+                    id: 1,
+                    name: "map".to_owned(),
+                    parent: 0,
+                    depth: 0,
+                    edge_of_child: 0,
+                },
+                FrameInfo {
+                    id: 2,
+                    name: "odom".to_owned(),
+                    parent: 1,
+                    depth: 1,
+                    edge_of_child: 0,
+                },
+            ],
+            edges: vec![EdgeInfo {
+                id: 1,
+                parent: 1,
+                child: 2,
+                kind: EdgeKind::Dynamic,
+                capacity: 512,
+                interp: InterpPolicy::ScLerp,
+                domain: 0,
+                head: 40,
+                claimed: true,
+                claiming: false,
+                owner_slot: Some(0),
+                owner_pid: 4711,
+                newest_stamp: Some(390 * MS),
+                clock_offset_nanos: None,
+                nominal_rate_mhz: Some(100_000),
+            }],
+            participants: live_writer(),
+        };
+        // A flawless 100 Hz stream that stopped 8 seconds ago.
+        let obs = Observations::from_samples(
+            (0..40i64)
+                .map(|k| PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: k * 10 * MS,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+        let step = checks::ClockStepEvidence::capture(&snap, &obs);
+        let now = checks::Clock::Wall(390 * MS + 8_000 * MS);
+
+        let notes = evidence_notes(
+            checks::PushStream::RingsUnderWriter,
+            &snap,
+            &obs,
+            now,
+            &step,
+            None,
+        );
+        let note = notes
+            .iter()
+            .find(|n| n.contains("withheld judgement"))
+            .expect("no stopped-publisher note: two silent skips with no named subject");
+        assert!(note.contains("1 edge(s)"), "{note}");
+
+        // The same arena read from a source nobody is writing: nothing is
+        // withheld, so a note about it would be about a decision never made.
+        let notes = evidence_notes(
+            checks::PushStream::RingsAtRest,
+            &snap,
+            &obs,
+            now,
+            &step,
+            None,
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("withheld judgement")),
+            "nothing was withheld on a source at rest: {notes:?}"
         );
     }
 

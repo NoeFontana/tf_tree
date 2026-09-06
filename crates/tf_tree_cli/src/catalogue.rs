@@ -53,20 +53,25 @@
 //! future check without an id takes, which is the state this catalogue spent its
 //! first revision in.
 //!
-//! Going the other way, some ids have no detection *here*: **two** cannot detect
-//! anything in any configuration — `TFT002` and `TFT003`, owned by
-//! `tf_tree_bridge::StaticStore`, whose state is process-local — and **ten** more
-//! depend on what this arena, this engine build and this host can supply. Each is
-//! reported [`Status::Skipped`] with the reason stated in [`crate::checks`], never
-//! silently passed.
+//! Going the other way, some ids have no detection *here*: `TFT002` and `TFT003`
+//! cannot detect anything in any configuration `doctor` currently builds — they
+//! are owned by `tf_tree_bridge::StaticStore`, whose state is process-local —
+//! and the rest depend on what this arena, this engine build and this host can
+//! supply. Each is reported [`Status::Skipped`] with the reason stated in
+//! [`crate::checks`], never silently passed.
 //!
-//! **This said "three ... and seven more" until 2026-08-28, and both numbers were
-//! stale.** `TFT004` left the first group when #274 gave it a `ClaimRecord`
-//! offset to read, and that PR's own message records the move — *"sixteen
-//! detecting becomes seventeen"* — while updating a different comment in this
-//! file and not this one. `docs/PHASE5.md` §0.0 is the source of truth over this
-//! module's prose (`CLAUDE.md`), it has said seventeen since that PR, and these
-//! counts are now read off it.
+//! **The counts that used to be in the paragraph above are gone, and their
+//! removal is the correction.** It said *"three ... and seven more"* until
+//! 2026-08-28, when `TFT004` left the first group and #274's own message
+//! recorded the move — *"sixteen detecting becomes seventeen"* — while updating
+//! a different comment in this file and not this one. It was then rewritten to
+//! *"two ... and ten more"*, which agreed with `docs/PHASE5.md` §0.0 and
+//! disagreed with `crate::checks`' own header, which said nine and enumerated
+//! nine while `TFT014` skipped conditionally and appeared in neither. Three
+//! sites, two answers, and a third site's enumeration missing a member. §0.0 is
+//! the source of truth over this module's prose (`CLAUDE.md`) and it enumerates
+//! rather than tallies; the enumeration for the code is
+//! `rg -n 'CheckOutcome::skipped' crates/tf_tree_cli/src/checks.rs`.
 //!
 //! # Severity is a property of the check, not of the finding
 //!

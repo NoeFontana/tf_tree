@@ -1159,6 +1159,7 @@ version = "0.0.5"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
  "tf_tree",
  "tf_tree_arena",
  "tf_tree_bench",

@@ -181,13 +181,28 @@ pub const DEFAULT_MAX_CHUNK_EXPANSION_RATIO: u64 = 1024;
 /// its own doc comment called the difference "a gap rather than a decision",
 /// which is what this closes.
 ///
-/// **The number itself is not re-derived here and is owed a measurement.**
-/// `0010`'s question 2 asks whether 256 MiB is still right against recordings
-/// with large *attachments*, which are also top-level records, and the reader
-/// has no opcode-based skip — it sizes and fills the body for every record
-/// before it looks at the opcode, so an oversized attachment aborts the whole
-/// ingest rather than being skipped past. A knob is what makes that survivable
-/// while the measurement is outstanding.
+/// **`0010`'s question 2 has since been measured** — 41 published SLAM recordings,
+/// largest single record 1.2 MiB and always a `Chunk`, zero attachments in any of
+/// them — so nothing in reach challenges the number. That measurement covers one
+/// converter's output and not "robotics recordings", which is why the knob exists.
+///
+/// **The sentence that used to end this comment is no longer true and is recorded
+/// rather than deleted.** It read: *"the reader has no opcode-based skip — it
+/// sizes and fills the body for every record before it looks at the opcode, so an
+/// oversized attachment aborts the whole ingest rather than being skipped past."*
+/// It does now: `source::read_tf` consults `source::reader_needs` first, steps over
+/// an oversized record it does not read, and counts it as
+/// [`Anomalies::oversized_records_skipped`]. A record the reader *does* need — a
+/// `Chunk`, `Schema`, `Channel` or `Message` — still refuses, because skipping one
+/// of those loses transforms silently.
+///
+/// **The skip is bounded by a length nothing validated**, so `source` checks that
+/// it lands on something shaped like a record boundary and refuses with
+/// `RecordTooLarge` when it does not. That check cannot see a length that lands on
+/// a *real* boundary, so the ceiling is no longer the corrupt-header detector it
+/// incidentally was for these opcodes; what replaces the guarantee is that neither
+/// the report row nor [`Anomalies::oversized_records_skipped`] claims the transform
+/// stream past a skip is intact.
 pub const DEFAULT_MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How ingest should handle a backward clock jump (§3.2).
@@ -403,6 +418,52 @@ impl EdgeSurvey {
     }
 }
 
+/// One `/tf_static` contradiction, with **both** values (§3.2 — "report both
+/// values"; `docs/PHASE4.md` §5.7).
+///
+/// # Why a count was not enough
+///
+/// [`Anomalies::static_conflicts`] says *that* a contradiction happened. §3.2's
+/// row asks for something else: two `robot_state_publisher` instances with
+/// different URDFs is the misconfiguration this row exists for, and the operator's
+/// question is *which URDF is installed* — which only the two poses answer. A bare
+/// count sends them to diff two files that the report never named.
+///
+/// **Not in [`Anomalies`], for a reason the type system enforces**: `Anomalies`
+/// derives `Eq`, and a `[f64; 7]` does not implement it. It lives on [`Survey`]
+/// beside the counts rather than inside them.
+///
+/// # One row per edge, not one per message
+///
+/// `/tf_static` is latched, so a contradicting publisher re-delivers to every late
+/// joiner and the same two values arrive many times. `StaticStore` already
+/// rate-limits by identity (`StaticVerdict::Conflict::first_time`), and only the
+/// first occurrence is recorded here — so this vector is bounded by the number of
+/// edges, while the count keeps counting every message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StaticConflict {
+    /// Parent frame of the contradicted edge.
+    pub parent: FrameId,
+    /// Child frame of the contradicted edge.
+    pub child: FrameId,
+    /// The value on file — the one that wins, under the first-writer authority
+    /// policy this crate applies.
+    pub existing: [f64; 7],
+    /// The value that was offered and refused.
+    pub offered: [f64; 7],
+    /// Which topic declared [`existing`](StaticConflict::existing).
+    ///
+    /// **A topic and not a node name**, because a recording has neither a GID nor
+    /// a graph: `Publisher::Topic` is what the offline half of
+    /// `tf_tree_bridge::statics` is given, and its own documentation says a topic
+    /// is a stable identity for the length of a recording. Two publishers on one
+    /// topic are therefore indistinguishable here, and the two *values* are what
+    /// separate them.
+    pub declared_by: String,
+    /// Which topic offered [`offered`](StaticConflict::offered).
+    pub contradicted_by: String,
+}
+
 /// Everything §3.2 asks to be counted and reported.
 ///
 /// Every field is a count of something that happens in real recordings; none of
@@ -451,6 +512,29 @@ pub struct Anomalies {
     /// out matters: every number in this report is then a number about a
     /// *prefix* of the run they recorded.
     pub truncated: bool,
+    /// Top-level records the reader does not need that were larger than
+    /// `--max-record-size`, and were stepped over rather than refusing the file.
+    ///
+    /// **An attachment is a top-level record**, so a recording carrying a
+    /// calibration dump or a bag of images larger than the ceiling used to abort an
+    /// ingest whose transforms were entirely intact. `source::reader_needs` is the
+    /// line: a `Chunk`, `Schema`, `Channel` or `Message` over the ceiling still
+    /// refuses with [`crate::IngestError::RecordTooLarge`], because skipping one of
+    /// those loses transforms and reads exactly like a recording that never had
+    /// them.
+    ///
+    /// Reported rather than silent for the reason every other row here is: the
+    /// skipped record is data this run declined to look at, and `--max-record-size`
+    /// is the flag that would have read it.
+    ///
+    /// **It says nothing about what the record was, or about the records after
+    /// it.** The reader steps over the length on disk without parsing anything, so
+    /// "an attachment" is the motivating case and never a finding; and a corrupt
+    /// length that lands on a later record boundary takes everything in between
+    /// with it while every check `source` can make still passes. The report row
+    /// used to end "no transform was lost" and that is withdrawn — the count is a
+    /// statement that this run declined to look, not that there was nothing there.
+    pub oversized_records_skipped: u64,
     /// Chunks that were unreadable and skipped (`OnBadChunk::Skip`).
     ///
     /// Reported next to [`truncated`](Anomalies::truncated), and for the same
@@ -484,6 +568,18 @@ pub struct Survey {
     pub edges: Vec<EdgeSurvey>,
     /// What was odd about the recording.
     pub anomalies: Anomalies,
+    /// §3.2's "report both values": one row per contradicted static edge.
+    ///
+    /// Carries what [`Anomalies::static_conflicts`] cannot — see
+    /// [`StaticConflict`] for why it is here and not there.
+    ///
+    /// **`_details` because the count next door is already `static_conflicts`.**
+    /// This field shipped under that same name for a day, which put a `u64` at
+    /// `survey.anomalies.static_conflicts` and a `Vec` at
+    /// `survey.static_conflicts` — and, in the JSON, one key meaning two things
+    /// at two nesting depths, so a consumer grepping for it got a number or an
+    /// array depending on where it looked.
+    pub static_conflict_details: Vec<StaticConflict>,
     /// Transforms read, before any drop.
     pub transforms_read: u64,
     /// Frame-name remappings applied, as `(raw, normalized)`.
@@ -551,6 +647,7 @@ pub fn survey(
     let mut out = Survey {
         edges: Vec::new(),
         anomalies: Anomalies::default(),
+        static_conflict_details: Vec::new(),
         transforms_read: 0,
         remaps: Vec::new(),
     };
@@ -614,10 +711,34 @@ pub fn survey(
             ) {
                 StaticVerdict::Declare => out.edges[slot].static_pose = Some(rec.pose),
                 StaticVerdict::Idempotent => {}
-                StaticVerdict::Conflict { .. } => {
+                StaticVerdict::Conflict {
+                    owner,
+                    intruder,
+                    existing,
+                    offered,
+                    first_time,
+                } => {
                     // First writer wins, matching the bridge's default
-                    // authority policy; the count is what the report surfaces.
+                    // authority policy.
                     out.anomalies.static_conflicts += 1;
+                    // **And both values are kept, which the count cannot carry.**
+                    // §3.2's row is "report both values", and §5.7's whole point
+                    // is that the operator's next move is to work out which of two
+                    // URDFs is installed. `first_time` is `StaticStore`'s own
+                    // rate limit: `/tf_static` is latched, so the same
+                    // contradiction re-arrives for every late joiner and an
+                    // unfiltered push would grow this vector with the recording's
+                    // length rather than with its topology.
+                    if first_time {
+                        out.static_conflict_details.push(StaticConflict {
+                            parent,
+                            child,
+                            existing,
+                            offered,
+                            declared_by: publisher_label(&owner),
+                            contradicted_by: publisher_label(&intruder),
+                        });
+                    }
                 }
                 StaticVerdict::KindChanged { .. } => {
                     return Err(IngestError::EdgeKindChanged {
@@ -710,6 +831,7 @@ pub fn survey(
     out.anomalies.truncated = skips.truncated;
     out.anomalies.bad_chunks = skips.bad_chunks;
     out.anomalies.chunks_over_limit = skips.chunks_over_limit;
+    out.anomalies.oversized_records_skipped = skips.oversized_records_skipped;
     out.anomalies.bad_chunk_span_ns = skips.bad_chunk_span_ns;
     out.anomalies.stripped_slash_names = normalizer.stripped_count();
     out.remaps = normalizer.remaps().to_vec();
@@ -742,6 +864,20 @@ pub fn survey(
         });
     }
     Ok(out)
+}
+
+/// How a [`Publisher`] is named in a report.
+///
+/// Offline there is exactly one shape — `Publisher::Topic`, because a recording
+/// carries no GID and no graph — but the enum is the bridge's and has four
+/// variants, so this matches rather than assuming. Every other variant renders as
+/// its `Debug` form, which is honest about being a shape this path does not
+/// produce instead of silently printing an empty string.
+fn publisher_label(p: &Publisher) -> String {
+    match p {
+        Publisher::Topic(t) => t.clone(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Normalize one record's frame pair, interning both. `None` when either name
@@ -1119,16 +1255,17 @@ fn fill_spilled(
         if buf.len() == run_samples {
             // **Stable**, for the same reason the in-memory path is stable: it
             // is what makes "last wins" mean the last occurrence in the
-            // recording. See `spill`'s module docs for the other half — the tie
-            // break across runs.
-            buf.sort_by_key(|(s, _)| *s);
+            // recording. `spill::sort_run` is the one spelling of that rule and
+            // carries the argument; see `spill`'s module docs for the other half
+            // — the tie break across runs.
+            spill::sort_run(&mut buf);
             runs.write_run(&buf)?;
             buf.clear();
         }
         Ok(())
     })?;
     if !buf.is_empty() {
-        buf.sort_by_key(|(s, _)| *s);
+        spill::sort_run(&mut buf);
         runs.write_run(&buf)?;
     }
     stats.peak_buffer_bytes = stats
@@ -1309,6 +1446,7 @@ mod tests {
                 })
                 .collect(),
             anomalies: Anomalies::default(),
+            static_conflict_details: Vec::new(),
             transforms_read: 0,
             remaps: Vec::new(),
         }

@@ -814,6 +814,102 @@ fn static_conflicts_are_reported_and_first_wins() {
     );
 }
 
+/// §3.2's static-conflict row says **"report both values"**, and until this test
+/// the implementation reported a count.
+///
+/// The count says a contradiction happened. The two values say *which publisher is
+/// wrong*, which is the question §5.7 states the row exists to answer: two
+/// `robot_state_publisher` instances with different URDFs, and the operator has to
+/// work out which URDF is installed. A report that cannot be diffed against a URDF
+/// does not close that.
+///
+/// **Asserted on the exact numbers, in both renderings.** A test that only checked
+/// for a non-empty `static_conflict_details` list would pass against a row carrying the
+/// same pose twice, which is the shape a copy-paste produces.
+///
+/// Mutant 1: drop the `existing`/`offered` payload and render only the publishers
+/// — see the report row's fields; applied by replacing `existing: c.existing` with
+/// `existing: c.offered` in `IngestReport::new`, and this failed on the JSON
+/// `existing` array. Mutant 2: push the conflict row unconditionally rather than on
+/// `first_time` — applied, and the latched-repeat assertion below failed with two
+/// rows for one edge.
+#[test]
+fn a_static_conflict_reports_both_values() {
+    let dir = Scratch::new("static_both");
+    let (first, second) = (pose(0.2), pose(0.9));
+    let msgs = vec![
+        FixtureMessage::static_edge("base_link", "laser", first),
+        FixtureMessage::static_edge("base_link", "laser", second),
+        // Latched `/tf_static` re-delivers to every late joiner, so the same
+        // contradiction arrives again. The count must rise; the detail must not.
+        FixtureMessage::static_edge("base_link", "laser", second),
+        FixtureMessage::dynamic("odom", "base_link", 1_000_000_000, pose(1.0)),
+    ];
+    let path = write(&dir, "static_both.mcap", &msgs);
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames).unwrap();
+
+    assert_eq!(
+        out.report.anomalies.static_conflicts, 2,
+        "both contradicting messages are counted"
+    );
+    assert_eq!(
+        out.report.static_conflict_details.len(),
+        1,
+        "one row per contradicted edge, not one per latched repeat: {:?}",
+        out.report.static_conflict_details
+    );
+    let c = &out.report.static_conflict_details[0];
+    assert_eq!(
+        (c.parent.as_str(), c.child.as_str()),
+        ("base_link", "laser")
+    );
+    assert_eq!(
+        (c.declared_by.as_str(), c.contradicted_by.as_str()),
+        ("/tf_static", "/tf_static")
+    );
+    // Bit-identical: these poses went into the fixture as `f64` and came back
+    // through CDR, which is a little-endian `f64` on the wire, so no rounding
+    // happens anywhere on the path and any tolerance here would be slack that
+    // hides a swapped component.
+    assert_eq!(c.existing, first, "the value on file, which wins");
+    assert_eq!(c.offered, second, "the value that was refused");
+    assert_ne!(
+        c.existing, c.offered,
+        "a conflict whose two values are equal is not one"
+    );
+
+    // The JSON carries both, spelled so a consumer can diff them against a URDF.
+    let json = out.report.to_json();
+    let want_existing = format!(
+        "\"existing\":[{},{},{},{},{},{},{}]",
+        first[0], first[1], first[2], first[3], first[4], first[5], first[6]
+    );
+    let want_offered = format!(
+        "\"offered\":[{},{},{},{},{},{},{}]",
+        second[0], second[1], second[2], second[3], second[4], second[5], second[6]
+    );
+    assert!(
+        json.contains(&want_existing),
+        "missing {want_existing} in {json}"
+    );
+    assert!(
+        json.contains(&want_offered),
+        "missing {want_offered} in {json}"
+    );
+
+    // And the terminal summary does too, at full precision: `StaticStore` calls
+    // two poses the same within 1e-12, so a rounded rendering could print two
+    // identical numbers under a line saying they differ.
+    let text = out.report.summary();
+    assert!(
+        text.contains("base_link -> laser")
+            && text.contains(&format!("{}", first[4]))
+            && text.contains(&format!("{}", second[4])),
+        "the summary must name the edge and both values: {text}"
+    );
+}
+
 /// A file that is not an MCAP at all fails with a named error, not a panic and
 /// not an empty tree.
 ///
@@ -1562,6 +1658,142 @@ fn a_reduce_pass_keeps_the_last_occurrence() {
             )
             .unwrap();
         assert_eq!(got, same, "{which}: the two paths disagree");
+    }
+}
+
+/// §3.1's spill path: the **per-run** sort is stable, so "last wins" means the
+/// last occurrence in the recording *inside* one run.
+///
+/// # Why this test exists and why it is shaped like this
+///
+/// `docs/PHASE5.md` §0.0 recorded this property as gated by nothing:
+/// *"Swapping it for `sort_unstable_by_key` survives the whole suite, because a
+/// run at the caps these tests use is short enough that `sort_unstable`
+/// insertion-sorts and is stable in fact."* Both existing spill tests run at
+/// `--max-memory 1024`, whose run is fourteen samples;
+/// `an_oversized_edge_spills_and_matches_the_in_memory_path`'s docstring records
+/// the mutant surviving, and `a_reduce_pass_keeps_the_last_occurrence`'s
+/// within-run pair is in a run of the same length.
+///
+/// So the cap here is `CAP`, whose run — `spill::spill_budget(CAP)`'s first
+/// element — is `RUN` samples, and every run is **entirely duplicate pairs**:
+/// `PAIRS` stamps each appearing twice, scattered by a stride coprime with
+/// `PAIRS` so the run does not arrive sorted. A run that arrives sorted is the
+/// case pdqsort detects and leaves alone, which would make an unstable sort
+/// stable by accident again.
+///
+/// The ties are **within** runs only: run `r`'s stamps are offset by `r` seconds,
+/// so no two runs share a stamp and the cross-run tie break — which
+/// `a_reduce_pass_keeps_the_last_occurrence` already gates — cannot decide any of
+/// these. `RUNS` is below `spill::fan_in(CAP)`, so there is one merge and no
+/// reduce pass, and the per-run sort is the only thing that can order a tie.
+///
+/// **The parameters are named rather than spelled** because the first version of
+/// this docstring spelled a *different* test's — the attempt the mutant survived,
+/// which the body below records in the one place the number it explains lives.
+/// A prose copy of a constant twenty lines from the constant is how a file comes
+/// to tell two stories about one test.
+///
+/// Mutant: replace `spill::sort_run`'s body with `sort_unstable_by_key` —
+/// applied, and this failed; the observed output is in the commit message.
+#[test]
+fn the_per_run_sort_is_stable_so_last_wins_inside_a_run() {
+    // `spill::spill_budget(65_536)`'s samples per run. Spelled as a literal
+    // because the constant is crate-private, and a test that recomputed it from
+    // the same expression would be checking nothing.
+    //
+    // **The run length is the load-bearing number and it had to be measured, not
+    // reasoned about.** A first version of this test used a 2 048 B cap — a run of
+    // twenty-eight, chosen because `sort_unstable` insertion-sorts below about
+    // twenty — and the `sort_unstable_by_key` mutant *survived* it: the standard
+    // library's small-sort covers more than twenty elements for a type this cheap
+    // to move. Eight hundred and ninety-six is past every small-sort threshold,
+    // and the mutant fails.
+    const RUN: usize = 896;
+    const RUNS: usize = 4;
+    const PAIRS: usize = RUN / 2;
+    const CAP: u64 = 64 * 1024;
+    // Coprime with `PAIRS` (448 = 2^6 · 7), so `j * STRIDE % PAIRS` visits every
+    // key once and the run arrives scattered rather than sorted.
+    const STRIDE: usize = 11;
+
+    let dir = Scratch::new("run_stability");
+    let spill = dir.0.join("spill");
+    std::fs::create_dir_all(&spill).unwrap();
+
+    // Position `j` and position `j + PAIRS` of each run carry the same stamp,
+    // because `STRIDE * PAIRS % PAIRS == 0`. The later one is the one that must
+    // survive.
+    let key_ns = |r: usize, j: usize| {
+        1_000_000_000
+            + (r as i64) * 1_000_000_000
+            + (((j % PAIRS) * STRIDE % PAIRS) as i64) * 1_000_000
+    };
+    let mut msgs = Vec::new();
+    for r in 0..RUNS {
+        for j in 0..RUN {
+            let i = r * RUN + j;
+            let t = key_ns(r, j);
+            msgs.push(FixtureMessage::dynamic("odom", "base_link", t, pose(i as f64)).logged_at(0));
+        }
+    }
+    assert_eq!(msgs.len(), RUN * RUNS);
+
+    let path = write(&dir, "run_stability.mcap", &msgs);
+    let base = IngestOptions {
+        // The fixture is deliberately out of stamp order by seconds, which at the
+        // default threshold is a clock reset — `out_of_order_ingest_matches_ordered`
+        // states the same at length.
+        clock_reset_threshold_ns: i64::MAX,
+        ..IngestOptions::default()
+    };
+    let mut f1 = Frames::default();
+    let spilled = tf_tree_ingest::run(
+        &path,
+        &IngestOptions {
+            max_memory_bytes: CAP,
+            spill_dir: Some(spill),
+            ..base
+        },
+        &mut f1,
+    )
+    .unwrap();
+
+    // Non-degenerate: the spill path has to have run, or this is an in-memory
+    // test under another name.
+    assert!(
+        spilled.report.fill.spilled_runs >= RUNS as u32,
+        "{} runs written; the edge did not spill in {RUNS} pieces",
+        spilled.report.fill.spilled_runs
+    );
+    assert_eq!(
+        spilled.report.anomalies.duplicate_stamps,
+        (PAIRS * RUNS) as u64,
+        "every pair is one collapsed duplicate"
+    );
+
+    for r in 0..RUNS {
+        for j in 0..PAIRS {
+            // The second occurrence in recording order, which is the one §3.2
+            // says wins.
+            let want = pose((r * RUN + j + PAIRS) as f64);
+            let got = spilled
+                .tree
+                .lookup(
+                    "odom",
+                    "base_link",
+                    Stamp::<SystemDomain>::from_nanos(key_ns(r, j)),
+                )
+                .unwrap();
+            // Bit-identical: the pose is an `f64` written to CDR and read back,
+            // and the arena stores it verbatim, so any tolerance here would be
+            // slack that admits the *other* member of the pair.
+            assert_eq!(
+                (got.t.x, got.t.y, got.t.z),
+                (want[4], want[5], want[6]),
+                "run {r}, key {j}: the last occurrence in the run must win"
+            );
+        }
     }
 }
 

@@ -45,11 +45,18 @@ do. §0.0 is the live status table and outranks this file.
 This section used to say that
 [`docs/decisions/0005`](./docs/decisions/0005-the-shared-memory-seam.md) scoped
 "what is left (fd passing, liveness, reaping)". All three landed under `0005`.
-What §0.0 still carries open is the daemon and tooling surface (§9, §10), the
-long-running fault harness (§11.3, §11.4), and **ownership migration (§3.5),
-which is not implemented and has no path today** — the takeover half was deleted
-in #275 and [`0037`](./docs/decisions/0037-a-takeover-is-not-a-second-open.md)
-records why a second `open()` cannot be it. Read §0.0's row, not this list.
+**Ownership migration (§3.5) has landed too, and this file said the opposite for
+longer than it was true.** It read *"not implemented and has no path today"* — a
+sentence written when #275 deleted the takeover half — while `PHASE2.md` §0.0's
+row read **Done as of 2026-08-28** and the code carried
+`Tree::inherit_ownership` (`crates/tf_tree/src/open.rs`), `Tree::owner_lost`
+(`crates/tf_tree/src/tree.rs`) and `Session::take_over_ownership`
+(`crates/tf_tree_ipc/src/open.rs`).
+[`0037`](./docs/decisions/0037-a-takeover-is-not-a-second-open.md) records why a
+second `open()` could not be it and what shape the replacement took: a method on
+the session an heir already holds, triggered by the caller and by no background
+thread. **Read §0.0's row, not this list** — that instruction is the one this
+paragraph failed, and it is why no list of open items is restated here.
 
 `tf_tree_core` is the source of truth. `tf_tree_math` and `tf_tree_arena` are
 separately publishable and separately testable — keeping the math crate free of
@@ -72,13 +79,20 @@ are their gate.
 ```sh
 just build            # cargo build --workspace --all-targets
 just test             # cargo nextest + doctests + ingest-check
-just lint             # fmt --check + eight clippy -D warnings passes, behind five gates
+just lint             # fmt --check, then a clippy -D warnings pass per feature config
 just audit            # cargo deny check (NOT part of `just lint`)
 just fmt              # auto-format + clippy --fix
 just loom             # concurrency model checking
 just miri             # UB checking (arena + core + the facade's one unsafe)
 just bench            # benchmark suite + go/no-go gate
 ```
+
+`just lint` runs several prerequisite recipes before it lints, and one
+`clippy -D warnings` pass per feature configuration the workspace pass compiles
+out. **The comment above used to count both** — *"eight clippy -D warnings
+passes, behind five gates"* — and the first number had drifted below the
+recipe's; `grep -c 'cargo clippy' justfile` counts every recipe's passes at
+once, so read the `lint` recipe itself rather than a number kept here.
 
 ## Workflow for significant changes
 

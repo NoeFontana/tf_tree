@@ -178,6 +178,28 @@ pub(crate) fn merge_window_samples(user_cap: u64, runs: usize) -> usize {
     clamp_usize((cap * WINDOW_SHARE_NUM / WINDOW_SHARE_DEN / ENCODED as u64 / divisor).max(1))
 }
 
+/// Sort one run's samples by stamp, **stably**.
+///
+/// # Why this is a named function and not two `sort_by_key` calls
+///
+/// It is the same rule as the in-memory path's sort and it is what makes §3.2's
+/// "last wins" mean *the last occurrence in the recording*: two samples with equal
+/// stamps must leave this call in the order they arrived, because the merge's
+/// duplicate collapse keeps whichever comes last. An unstable sort picks an
+/// arbitrary one of them, so ingesting one recording twice could produce two
+/// different `.tft` files.
+///
+/// The property was gated by nothing until 2026-09-05, and `docs/PHASE5.md` §0.0
+/// said so: swapping the two call sites for `sort_unstable_by_key` survived the
+/// whole suite, because every run in every test was short enough that
+/// `sort_unstable` insertion-sorts and is stable *in fact*. Giving the rule one
+/// name gives it one place to be tested, and
+/// `tests/ingest.rs::the_per_run_sort_is_stable_so_last_wins_inside_a_run` is the
+/// test — over runs long enough that the two sorts genuinely differ.
+pub(crate) fn sort_run(buf: &mut [Sample]) {
+    buf.sort_by_key(|(s, _)| *s);
+}
+
 fn io(e: &std::io::Error) -> IngestError {
     IngestError::Spill {
         raw_os_error: e.raw_os_error().unwrap_or(0),
