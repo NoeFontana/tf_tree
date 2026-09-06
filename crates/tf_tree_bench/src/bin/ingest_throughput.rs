@@ -83,7 +83,14 @@
 //! same fact the density floor above exists to state: the criterion is
 //! corpus-relative. `just gate5`'s red test uses it. `--floor` exists and is the
 //! weaker falsifier, because moving a threshold proves only that the comparison
-//! is wired.
+//! is wired — and under `--gate` it is a falsifier in one direction only.
+//!
+//! `--floor` is the **whole** of this gate's comparison, so a gated run that
+//! PASSES against a floor below `FLOOR` is refused: otherwise one flag turns any
+//! FAIL into `§12 gate 5 — PASS (gated)` at exit 0, which is a verdict about the
+//! argument rather than about the code. `frozen_workers`'s `--gate` is the
+//! precedent — its `GATE` is a constant, not a flag. Tightening stays legal,
+//! because it can only turn a PASS into a FAIL.
 //!
 //! # What this does not measure
 //!
@@ -94,6 +101,10 @@
 //! that does and does not cover. The corpus is also written and then read
 //! immediately, so every figure here is **page-cache warm**; a first-touch
 //! ingest off cold storage is slower by an amount this does not measure.
+//! `--reuse-corpus` is the one path that does not *write* the corpus, so it is
+//! also the one path that does not delete it — and it REFUSES a path that does
+//! not exist, because generating one there would report a fabricated corpus
+//! under the name of a recording.
 //!
 //! # Usage
 //!
@@ -157,6 +168,11 @@ fn main() -> Result<()> {
     // against a corpus this process did not just write — a page cache that is
     // not warm, or one day a real recording — and it is the shape `just gate4`'s
     // `rm -f` line exists to defeat, so the recipe generates every time.
+    //
+    // It implies `--keep-corpus` for the file it reads (`drive` removes only
+    // what it wrote) and it REFUSES a path that does not exist rather than
+    // fabricating one there; both live in `drive`, beside the code that would
+    // otherwise do the damage.
     let mut reuse = false;
 
     let mut args = std::env::args().skip(1);
@@ -345,28 +361,76 @@ fn measure(label: &'static str, path: &Path, rounds: usize, max_memory_bytes: u6
 /// because the two happened to multiply out the same.
 ///
 /// The rule is `plan_groups`' own. It is first-fit-**decreasing** over whole
-/// edges of `samples * SAMPLE_BYTES`, so a cap equal to the sum of the largest
-/// `ceil(n / CRITERION_PASSES)` edges admits exactly those in group one, and the
-/// remainder — every one of them no larger than any edge already placed — fits
-/// in the next group. For `n < CRITERION_PASSES` there is no such cap; the arm's
-/// own pass-count assertion is what reports that, and it reports it as a fact
-/// about the run rather than as an argument about this function.
+/// edges of `samples * SAMPLE_BYTES`, and it packs against `sum + the group's
+/// largest member` rather than `sum` — the reserve for the stable sort's own
+/// scratch. So the cap that admits exactly the largest
+/// `ceil(n / CRITERION_PASSES)` edges in group one is their sum **plus the
+/// largest edge**, and the remainder — every one of them no larger than any edge
+/// already placed — fits in the next group. For `n < CRITERION_PASSES` there is
+/// no such cap; the arm's own pass-count assertion is what reports that, and it
+/// reports it as a fact about the run rather than as an argument about this
+/// function.
+///
+/// **The `+ largest` term is not padding.** Without it this function names a cap
+/// that yields three groups, not two, and the gated arm refuses: 50 equal edges
+/// against a cap of exactly 25 of them admits 24, because sorting the first
+/// buffer allocates a copy of it while the other 23 are still held.
+///
+/// **A second regime where the answer is not honoured**, disclosed for the same
+/// reason: `tf_tree_ingest`'s spill path raises any cap below its own private
+/// floor before planning, so a corpus whose *whole* buffered size is under that
+/// floor is planned at the floor and comes out in one group however this
+/// function is asked. It is not reachable from any corpus this binary
+/// generates — every edge is a whole number of samples and the criterion's own
+/// density puts the total orders of magnitude above it — and the same
+/// pass-count assertion reports it if it ever is.
+///
+///
+/// **The reserve above is what closed a measured flakiness**, recorded here
+/// because the number is the argument: without it the cap on the recipe's own
+/// default corpus was exactly half the total with no slack, and `just gate5`
+/// refused — exit 1, nothing published — twice in about thirty release runs on
+/// the development host. The failing runs read a `peak_buffer_bytes` of exactly
+/// one edge more than the passing ones: the sort's scratch copy, in flight and
+/// counted. It failed safe, never as a pass, which is why the repair is a
+/// reserve in the planner rather than a wider threshold — a gate whose bound is
+/// moved to stop it going red is the shape this binary's `--gate` refusals
+/// exist to prevent.
 fn grouped_cap_from(edge_bytes_desc: &[u64]) -> u64 {
     let first_group = edge_bytes_desc
         .len()
         .div_ceil(CRITERION_PASSES as usize)
         .max(1);
-    edge_bytes_desc
+    let packed = edge_bytes_desc
         .iter()
         .take(first_group)
-        .fold(0u64, |a, b| a.saturating_add(*b))
+        .fold(0u64, |a, b| a.saturating_add(*b));
+    // `edge_bytes_desc` is descending, so the first element is the largest —
+    // written as `max` anyway, because the reserve is a property of the group's
+    // contents and not of the caller's sort order.
+    packed.saturating_add(edge_bytes_desc.iter().copied().max().unwrap_or(0))
 }
 
 fn drive(d: &Drive) -> Result<()> {
     if let Some(dir) = d.corpus.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let generated = !(d.reuse && d.corpus.exists());
+    // **`--reuse-corpus` on a path that does not exist is a REFUSAL, not a
+    // fabrication.** The flag's whole content is "measure the corpus that is
+    // there"; a typo, a moved recording or a cleaned target directory would
+    // otherwise silently hand the arm a synthetic corpus built from
+    // `--edges`/`--rate-hz`/`--seconds` and label it as one this process wrote.
+    // This binary's other premises — the pass counts, the density — refuse
+    // rather than proceed, and this is the same shape.
+    if d.reuse && !d.corpus.exists() {
+        bail!(
+            "REFUSED — --reuse-corpus names {}, which does not exist. The flag measures a \
+             corpus this process did not write; generating one here would report a synthetic \
+             corpus as the one you named. Drop --reuse-corpus to generate, or fix the path.",
+            d.corpus.display()
+        );
+    }
+    let generated = !d.reuse;
     if generated {
         let messages = corpus_messages(d.edges, d.rate_hz, d.seconds);
         let bytes = tf_tree_ingest::fixture::chunked_mcap_bytes(
@@ -512,6 +576,26 @@ fn drive(d: &Drive) -> Result<()> {
 
     let ratio = grouped.times_real_time();
     let ok = meets_floor(ratio, d.floor);
+    // **A loosened threshold may not produce a gated PASS.** `--floor` is the
+    // whole of this gate's comparison, so accepting one below `FLOOR` under
+    // `--gate` makes the verdict a function of the caller's argument: the same
+    // failing run exits 0 with one flag. `frozen_workers`'s `--gate` is the
+    // precedent — its `GATE` is a constant and its header says the stamp count
+    // is "not a tuning knob for the verdict".
+    //
+    // Refused in the loosening direction only, and *before* any verdict line is
+    // printed: a refusal must publish nothing. Tightening stays legal, because
+    // it can only turn a PASS into a FAIL, which is the falsifier direction the
+    // header describes and which `tests/ingest_throughput.rs` uses.
+    if d.gate && ok && d.floor < FLOOR {
+        bail!(
+            "REFUSED — --floor {:.1} is below PHASE5 §12 gate 5's own {FLOOR:.1}x, and this \
+             run would have PASSED against it. The floor is the entire gated comparison, \
+             so a gated PASS against a loosened one is a statement about the argument and \
+             not about the code. Tighten it, or drop --gate to report.",
+            d.floor
+        );
+    }
     println!(
         "  GATED   grouped arm: {ratio:.1}x real time against {:.1}x — {}",
         d.floor,
@@ -554,7 +638,14 @@ fn drive(d: &Drive) -> Result<()> {
          touches it."
     );
 
-    if !d.keep {
+    // **`&& generated`: this process only removes what this process wrote.**
+    // Without it `--reuse-corpus` deleted the corpus it exists to reuse — "a
+    // page cache that is not warm, or one day a real recording" — and the next
+    // invocation at the same path found nothing, regenerated a *fabricated*
+    // corpus from `--edges`/`--rate-hz`/`--seconds`, and printed "page cache
+    // WARM (written by this process)" over it. The operator believes they are
+    // re-measuring one recording and are measuring another.
+    if !d.keep && generated {
         let _ = std::fs::remove_file(&d.corpus);
     }
     if d.gate && !ok {
@@ -606,28 +697,48 @@ mod tests {
     ///
     /// `total / CRITERION_PASSES` does not: `plan_groups` packs whole edges, so
     /// an odd count needs three groups under that formula — measured, five
-    /// edges gave `passes = 3` and the arm refused. This drives
-    /// `plan_groups`' own loop against the function's answer rather than
-    /// re-deriving the cap, so a change to either side fails here.
+    /// edges gave `passes = 3` and the arm refused.
+    ///
+    /// **It drives a MODEL of `plan_groups`, not `plan_groups`.** That function
+    /// is private to `tf_tree_ingest` and unreachable from this crate, so what
+    /// is pinned here is the arithmetic against its first-fit-decreasing
+    /// *shape* — the same standing `SAMPLE_BYTES` above is on. *This doc used to
+    /// claim it drove the real loop "so a change to either side fails here",
+    /// which was false in both directions.* What actually couples this to
+    /// `plan_groups` at run time is the grouped arm's own
+    /// `grouped.passes != CRITERION_PASSES` refusal; what pins the packing rule
+    /// and the cap floor is `tf_tree_ingest`'s
+    /// `a_cap_below_the_floor_is_planned_at_the_floor` and `groups_respect_the_cap`.
+    ///
+    /// The model omits `spill::cap_of`, which raises any cap below a private
+    /// floor, so it is valid only at or above that floor. **Every fixture below
+    /// is therefore a corpus the arm could actually see**: each entry a whole
+    /// number of `SAMPLE_BYTES`, and each derived cap at or above the floor —
+    /// two of them used not to be (`[1000, 1]` and seven 64-byte edges), and on
+    /// exactly those two the model answered two groups where `plan_groups`
+    /// answers one.
     #[test]
     fn the_grouped_cap_is_sized_for_two_groups() {
         // `plan_groups`' loop, as a fixture: first fit over the descending
-        // sizes, flushing when the next edge would not fit.
+        // sizes, flushing when the next edge plus the group's sort reserve
+        // would not fit. The reserve is the group's largest member; `desc` is
+        // descending, so that is whichever edge opened the group.
         fn ffd_groups(desc: &[u64], cap: u64) -> u64 {
             let mut groups = 0u64;
-            let mut cur: Option<u64> = None;
+            let mut cur: Option<(u64, u64)> = None;
             for &need in desc {
                 assert!(
-                    need <= cap,
-                    "an edge larger than the cap would spill instead"
+                    need.saturating_mul(2) <= cap,
+                    "an edge over half the cap would spill instead — a group of \
+                     one still pays for its own sort scratch"
                 );
                 match cur {
-                    Some(bytes) if bytes + need > cap => {
+                    Some((bytes, max)) if bytes + need + max.max(need) > cap => {
                         groups += 1;
-                        cur = Some(need);
+                        cur = Some((need, need));
                     }
-                    Some(bytes) => cur = Some(bytes + need),
-                    None => cur = Some(need),
+                    Some((bytes, max)) => cur = Some((bytes + need, max.max(need))),
+                    None => cur = Some((need, need)),
                 }
             }
             if cur.is_some() {
@@ -652,10 +763,14 @@ mod tests {
         // it did not write lands in — the one the cap used to be blind to,
         // because it came from the arguments rather than from the survey.
         for desc in [
-            vec![900u64, 800, 700, 100, 50, 10],
-            vec![1_000u64, 1],
-            vec![64u64, 64, 64, 64, 64, 64, 64],
-            vec![5_000u64, 4_000, 10],
+            vec![960u64, 832, 704, 128, 64, 64],
+            vec![1_984u64, 64],
+            // Seven equal edges whose derived cap lands **exactly** on the
+            // spill floor, deliberately: the many-small-equal-edges shape the
+            // old `[64; 7]` fixture was for, moved to the edge of the regime
+            // rather than out of it.
+            vec![256u64; 7],
+            vec![5_056u64, 4_032, 64],
         ] {
             let cap = grouped_cap_from(&desc);
             assert_eq!(

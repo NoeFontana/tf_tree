@@ -225,9 +225,15 @@ on its own and phase 2 is dropped rather than smuggled in via an unsafe island.
 > regression on real workloads and the fixture would never have caught it.
 >
 > The intent survives elsewhere: `sample_from`'s galloping cursor already
-> exploits query-to-query locality, which is the form of seeding that *is* robust
-> to gaps, and `bracket` is now branchless so its cost no longer depends on the
-> stamp distribution at all.
+> exploits query-to-query locality, which is the form of seeding that *is*
+> robust to gaps.
+>
+> **CORRECTION (2026-09-06).** This paragraph used to end *"and `bracket` is now
+> branchless so its cost no longer depends on the stamp distribution at all"*.
+> `bracket` is not branchless: its mask-select compiles to a conditional branch,
+> so its cost does depend on the distribution, and on the `soak --workload robot`
+> fixture that branch is the largest single source of mispredicts in the process.
+> [`0053`](../decisions/0053-the-branchless-bracket-that-branches.md) has the disassembly and the numbers.
 
 ### The original proposal, retained for the record
 
@@ -355,7 +361,7 @@ returned a tenth of its estimate.
 | **1** — transcendental-free `slerp` | 50 → ~10 ns/step | 50.1 → 27.0 ns/step; depth-3 263.5 → 197.7 ns | **In.** Half the projected gain |
 | **1b** — transcendental-free `screw_pow` | *not proposed* | ScLerp 51.6 → 43.6 ns/eval (−15%) | **In.** Not in this document at all |
 | **3** — interpolation-seeded search | 21 → ~4 ns/step | seed misses by 11–48 indices on real data | **Rejected** (§5) |
-| **3b** — branchless `bracket` | *not proposed* | −1.2% instructions; 237.0 → 231.2 ns @ cap 16384 | **In.** A tenth of the expected gain |
+| **3b** — mask-select `bracket` (this row read "branchless") | *not proposed* | −1.2% instructions; 237.0 → 231.2 ns @ cap 16384 | **In.** A tenth of the expected gain — and it is still a branch, see [`0053`](../decisions/0053-the-branchless-bracket-that-branches.md) |
 | **2**, **4**, **5** | — | not attempted | Open |
 
 ### What this document got wrong, and the pattern in it
@@ -369,9 +375,16 @@ second term costs what it does — twice, in the same direction:
   guess would land close. Real stamps have a clean 100.0 ms median period and
   **gaps covering 50–71% of the timeline**. The nominal rate was right and the
   inference from it was wrong.
-* The branchless rewrite assumed the search's data-dependent `if` was costing
-  most of the fixture's 8.16 mispredicts per lookup. LLVM had already turned it
-  into a `cmov`, so there was almost nothing there to win.
+* The mask rewrite assumed the search's data-dependent `if` was costing most of
+  the fixture's 8.16 mispredicts per lookup, and was written up here as *"LLVM
+  had already turned it into a `cmov`, so there was almost nothing there to
+  win"*. **Both halves of that were wrong** and each was found by a different
+  instrument: `just profile-lookup` showed the mispredicts really are in the
+  bracket loop, and the disassembly (2026-09-06,
+  [`0053`](../decisions/0053-the-branchless-bracket-that-branches.md)) shows LLVM emits a
+  branch for *every* spelling of the update tried so far — the `if`, the
+  multiply and the mask alike. The lever landed for a real but different reason:
+  a smaller loop body.
 
 Both errors share a shape: a plausible mechanism was reasoned about instead of
 measured, in a document whose own §1 opens by warning against exactly that. The
@@ -419,7 +432,7 @@ landing between samples. Measured marginal from the depth sweep: **72.5 ns/step*
 | Fold overhead + the two O(depth) scans | ~11.5 | 16% | residual against the depth sweep |
 | `Iso3` composition | 6.8 | 9% | direct, chained |
 | `read_slot` ×2 | 6.6 | 9% | direct |
-| `ArenaView::sampler` | 1.9 | 3% | direct |
+| `ArenaView::sampler` | 1.9 | 3% | direct — measured while `SampleRing` still carried a stored `mask`; it builds one field fewer since 2026-09-06 and the row has not been re-run |
 | Ring preamble | 1.7 | 2% | `sample(Hold) − read_slot` |
 | Interp-policy dispatch | ~0 | 0% | `guard_sample − sampler − sample(between)` |
 | **sum** | **75.0** | | vs 72.5 measured — **3% closure** |
@@ -615,13 +628,19 @@ that is waiting on cache does not hide the wait — it multiplies the misses
 competing for the same L1. Six searches in flight over a 32 KiB stamp array
 evict each other.
 
-This is the third time this document has recorded the same failure shape, and it
-is worth naming as a rule rather than an anecdote:
+This document keeps recording the same failure shape — the list below is its
+own tally and grew again on 2026-09-06 — so it is worth naming as a rule rather
+than an anecdote:
 
-> §5 assumed real stamps were isochronous. The branchless rewrite assumed the
-> search's `if` was mispredicting. Lever 2 assumed *d* dependent chains would
-> overlap. Each was a plausible mechanism, reasoned about rather than measured,
-> and each was wrong. **The cheap test of a structural lever is usually available
+> §5 assumed real stamps were isochronous. The mask rewrite assumed the
+> search's `if` was mispredicting, and its own post-mortem then assumed the
+> compiler had emitted a `cmov` — an assumption that then propagated across this
+> document, `sample.rs` and `docs/benchmarks/tf2.md` because nobody ran
+> `objdump` (`grep -rn 'branchless\|cmov' crates/ docs/` is the census; no count
+> is written here, because the last two attempts at one both undercounted).
+> Lever 2
+> assumed *d* dependent chains would overlap. Each was a plausible mechanism,
+> reasoned about rather than measured, and each was wrong. **The cheap test of a structural lever is usually available
 > before the structure is built** — here it was two harness loops against code
 > that already existed.
 

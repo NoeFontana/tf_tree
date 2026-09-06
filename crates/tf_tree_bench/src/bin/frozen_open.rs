@@ -110,13 +110,21 @@
 //! — in particular it does **not** refuse `--prefault`, which is this gate's
 //! falsifier and must be able to turn it red. What it does refuse is a *run it
 //! cannot evaluate*: a fixture under the criterion's own scale, two fixtures too
-//! close in size to compare, and an evicted arm whose eviction was not
-//! witnessed. Those are refusals rather than verdicts, and they are a different
-//! thing from declining a flag pair. The third is a refusal **only under
-//! `--gate`** — see the evicted arm's premise above. Gate 4 refuses `--gate
-//! --no-touch` because that control produces a meaningless *pass*; a control
-//! that produces a real FAIL is the opposite case and gating on it is the
-//! point.
+//! close in size to compare, an evicted arm whose eviction was not witnessed,
+//! and a run that would PASS against a `--budget-ms` **above** the criterion's
+//! own. Those are refusals rather than verdicts, and they are a different thing
+//! from declining a flag pair. The third is a refusal **only under `--gate`** —
+//! see the evicted arm's premise above. Gate 4 refuses `--gate --no-touch`
+//! because that control produces a meaningless *pass*; a control that produces
+//! a real FAIL is the opposite case and gating on it is the point.
+//!
+//! The fourth is that rule applied to a threshold rather than to a mode. Gate 4
+//! has no threshold flag at all, and a gate whose comparison a caller can move
+//! in the loosening direction is a gate a caller can green. So `--budget-ms`
+//! keeps both of the directions that can only make a run *harder* — lowering
+//! it, and raising it on a run that still fails, which is how `tests/gate2.rs`
+//! isolates each half of the conjunctive verdict — and loses the one that can
+//! only make it easier.
 //!
 //! # The falsifier
 //!
@@ -127,7 +135,9 @@
 //! matching on the backing rather than by discipline — and it edits no
 //! threshold: it is the gate's own arithmetic on an open that does
 //! size-proportional work. `--budget-ms` exists too and is the **weaker** of the
-//! two, because moving a threshold proves only that the comparison is wired.
+//! two, because moving a threshold proves only that the comparison is wired —
+//! and under `--gate` it is the weaker one in one direction only: a raised
+//! budget that would produce a PASS is refused, per the section above.
 //!
 //! A fault-count assertion would *not* catch that regression in every form:
 //! prefaulting inside `mmap(MAP_POPULATE)` costs the time and generates no
@@ -675,11 +685,21 @@ fn drive(d: &Drive) -> Result<()> {
         println!("  --no-evict: the evicted arm's cache was left resident (the control)");
     }
     // Without `--gate` the floors above are not refusals, so say it here rather
-    // than letting a PASS read as a PASS of the criterion.
+    // than letting a PASS read as a PASS of the criterion. **Both floors get a
+    // line**: the scale-invariance one had none, so an ungated run over two
+    // fixtures of the same size printed a line prefixed `GATED` over a
+    // comparison that is structurally green.
     if !d.gate && large_bytes < GATE_INDEX_FLOOR_BYTES {
         println!(
             "  NOT AT GATE SCALE: {large_bytes} B is under §12 gate 2's 233 MB index, so this \
              run reports an open time and does not evaluate the criterion"
+        );
+    }
+    if !d.gate && small_bytes.saturating_mul(SCALE_SPAN) > large_bytes {
+        println!(
+            "  SPAN TOO NARROW: {small_bytes} B and {large_bytes} B are under {SCALE_SPAN}x \
+             apart, so the scale-invariance line below compares an open with itself and \
+             cannot fail. It is not a verdict on this run."
         );
     }
     for (label, arm, bytes) in [
@@ -743,6 +763,24 @@ fn drive(d: &Drive) -> Result<()> {
     let budget_ok = within_budget(resident_large.worst_ms, d.budget_ms);
     let scale_ok = scale_invariant(resident_large.best_ms, resident_small.best_ms);
     let ratio = resident_large.best_ms / resident_small.best_ms;
+
+    // **A loosened budget may not produce a gated PASS.** `SCALE_BOUND` is a
+    // constant, but `--budget-ms` is not, and the verdict is a conjunction of
+    // the two — so a raised budget can only ever help a run pass. Refused in
+    // the loosening direction only, and before any verdict line is printed: a
+    // refusal must publish nothing. Lowering it stays legal, which is what
+    // `tests/gate2.rs` uses to drive the budget half red on its own; so does
+    // raising it *while the run still fails*, which is how that file isolates
+    // the scale half.
+    if d.gate && budget_ok && scale_ok && d.budget_ms > BUDGET_MS {
+        bail!(
+            "REFUSED — --budget-ms {:.4} is above PHASE5 §12 gate 2's own {BUDGET_MS:.4} ms, \
+             and this run would have PASSED against it. A gated PASS against a loosened \
+             budget is a statement about the argument and not about the code. Tighten it, \
+             or drop --gate to report.",
+            d.budget_ms
+        );
+    }
 
     println!(
         "  GATED   budget:          {:.4} ms worst resident against {:.4} ms — {}",

@@ -856,6 +856,19 @@ fn a_stamp_in_the_future_reaches_a_tft005_finding_on_a_real_arena() {
 ///   field is compatible by construction — it stays compatible, and it now
 ///   requires editing the schema block and this list in the same commit, which
 ///   is the point.
+///
+///   **That last clause was false of the block until 2026-09-06 and it is the
+///   defect worth recording**, because the assertion message named a comparison
+///   nobody made. The wire document has **three** spellings — the block, the
+///   `writeln!` emitter under it, and `expected_keys` here — and only the last
+///   two were compared. Measured: emitting `"host_arch"` and adding it to
+///   `expected_keys`, with the block untouched, left `cargo nextest run -p
+///   tf_tree_cli` green, and `cargo test --doc` never sees the block because it
+///   is fenced ```` ```text ````. [`documented_top_level_keys`] parses it now
+///   and this list is held to it first, so the literal keeps its value (it is
+///   what caught the `Tft::ALL` reorder mutant below) while the block stops
+///   being a spelling nothing reads. Its **top level only** — see that
+///   function's own doc for which lists that leaves uncoupled.
 /// * **The schema string is pinned to a literal**, so `JSON_SCHEMA` moving is a
 ///   deliberate edit and not a typo. §6's rule is *bump only for an incompatible
 ///   change*, and nothing else in the tree reads that constant.
@@ -945,12 +958,25 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
         "tool_version",
         "uncatalogued",
     ];
+    // **The literal is held to the block, and only then to the bytes.** The
+    // sentence above claimed the emitted document was compared against
+    // `render_json`'s schema block; nothing read that block, so what was
+    // compared was the bytes against this literal, and a key added to the
+    // emitter and to the literal in one commit left the block silently behind.
+    // Measured: emitting one extra key and adding it here left the crate green,
+    // and `cargo test --doc` never runs the block because it is fenced ```text.
+    assert_eq!(
+        documented_top_level_keys(),
+        expected_keys.to_vec(),
+        "the schema block and this list disagree"
+    );
+
     let obj = doc.as_object().expect("the report is an object");
     let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(
         keys, expected_keys,
-        "the emitted document and render_json's schema block disagree"
+        "the emitted document and this list disagree"
     );
 
     assert_eq!(
@@ -1158,4 +1184,284 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
             .any(|c| !c["findings"].as_array().unwrap().is_empty()),
         "no finding in the whole report, so the finding shape was never checked"
     );
+}
+
+/// **`TFT013`'s grace evidence is unobtainable on an arena whose rings retain
+/// one sample, and the skip it printed there stated something false about the
+/// arena.**
+///
+/// The grace period is `(head - 1) x median period`, and `doctor::median_period`
+/// needs two retained samples. `Capacity::history` is
+/// `next_pow2(ceil(rate_hz * secs))` and `SampleRing::retained` is
+/// `capacity - 1`, so an edge declared `rate_hz * secs <= 2` retains **one**
+/// sample however long its publisher runs — the median is `None`, the whole
+/// check skips, and it skipped saying *nothing in this arena has published a
+/// measurable stream … an edge with head == 0 is what every dynamic edge of a
+/// correct arena reads as at bringup. TFT017 is the id for an edge whose writer
+/// is gone*. The publisher below has accepted 3 600 pushes.
+///
+/// It is an integration test rather than a unit one because the claim under test
+/// is **reachability**: a hand-built `Snapshot` can be given `head = 3600` and
+/// one observation by fiat, which proves the reason and not that any arena is
+/// ever in that state. This builds the ring through the shipped `Capacity` and
+/// lets `Observations::from_arena` decide how many samples come back.
+///
+/// **The second arena below is the same defect one level down.**
+/// `Unmeasurable` is reached whenever *no* dynamic edge yields two
+/// observations, and a ring size is only one of the two ways to get there: a
+/// publisher that has pushed once into a 512-slot ring — every `doctor
+/// --attach` at bringup — is in it with 511 slots free. A skip that answered
+/// *make the ring bigger* there would be the ring-size sentence stating
+/// something false about the arena it printed on, which is what the first
+/// arena's assertions exist to stop.
+///
+/// Mutant, run: fold `PublishActivity::Unmeasurable` back into `NoPublisher`.
+/// The status is unchanged and the reason assertion fails — which is the whole
+/// finding, since the defect was never a wrong verdict.
+/// **Mutant, run:** delete the `retained_capacity < 2` branch and print the
+/// ring-size clause unconditionally. The first arena still passes and the
+/// second one fails on `!why.contains("four slots")`.
+#[test]
+fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_measure() {
+    use tf_tree::{Capacity, EdgeCfg, TreeBuilder};
+
+    // Two slots, one retained sample, for the life of the arena.
+    let slow = Capacity::history(1.0, 2.0);
+    assert_eq!(
+        slow.get(),
+        2,
+        "if this stops rounding to two the fixture no longer reaches the state"
+    );
+
+    let tree = TreeBuilder::new()
+        .dynamic_edge("odom", "base_footprint", EdgeCfg::new(slow))
+        // The fault `TFT013` exists to name, present and unreportable: declared
+        // dynamic and never published to.
+        .dynamic_edge(
+            "base_footprint",
+            "base_link",
+            EdgeCfg::new(Capacity::slots(64)),
+        )
+        .build()
+        .expect("build");
+
+    let odom = tree.frame("odom").unwrap();
+    let foot = tree.frame("base_footprint").unwrap();
+    let w = tree.claim(foot, odom).expect("claim odom->base_footprint");
+    for k in 0..3_600i64 {
+        w.push(k * 1_000_000_000, &tf_tree::Iso3::IDENTITY).unwrap();
+    }
+
+    let snap = Snapshot::capture(&tree);
+    let obs = Observations::from_arena(&tree, &snap);
+    let stats = checks::collect_edge_stats(&tree, &snap);
+
+    // Non-vacuity, both halves: the publisher really has published, and the
+    // arena really cannot yield it a median period.
+    assert_eq!(
+        snap.edges.iter().map(|e| e.head).max(),
+        Some(3_600),
+        "the busiest edge must have published, or the reason under test is right"
+    );
+    assert_eq!(
+        obs.by_edge().values().map(Vec::len).max(),
+        Some(1),
+        "a two-slot ring must retain one sample, or this arena is not the one \
+         the finding is about"
+    );
+
+    let report = checks::run(
+        &Inputs {
+            snap: &snap,
+            obs: &obs,
+            stats: &stats,
+            host: None,
+            clock: Clock::Wall(3_600_000_000_000),
+            arena_bytes: tree.arena_size_bytes() as u64,
+            occupancy: checks::occupancy_of(&tree),
+            clock_step: &checks::ClockStepEvidence::capture(&snap, &obs),
+            stream: checks::PushStream::RingsUnderWriter,
+            slots: checks::SlotTable::Current,
+            counters: tf_tree::counters_compiled_in(),
+        },
+        &BTreeSet::new(),
+    );
+
+    let o = report
+        .outcomes
+        .iter()
+        .find(|o| o.check == Tft::Tft013)
+        .expect("TFT013 must be in the report");
+    match &o.status {
+        Status::Skipped(why) => {
+            assert!(
+                why.contains("has publishers") && why.contains("3600 push(es)"),
+                "the reason must name the publishers this arena has: {why}"
+            );
+            assert!(
+                !why.contains("nothing in this arena has published"),
+                "the arena has published 3 600 times; this sentence is false of it: {why}"
+            );
+            assert!(
+                why.contains("four slots") && why.contains("no ring in it can hold two"),
+                "on THIS arena the obstacle is the ring size and the reason has to say so: \
+                 {why}"
+            );
+        }
+        other => panic!("TFT013 reported {other:?} on an arena it cannot measure a grace on"),
+    }
+
+    // The catalogue's rule that one fault is one id: no two checks may report a
+    // finding about the same subject. `TFT017` owns the unpublished edge here.
+    let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for oc in &report.outcomes {
+        for f in &oc.findings {
+            seen.entry(f.subject.as_str())
+                .or_default()
+                .push(oc.check.id());
+        }
+    }
+    // An empty subject set is not a pass: if nothing fired at all the loop
+    // below runs no comparison and this section asserts nothing.
+    assert!(
+        seen.values().flatten().any(|id| *id == "TFT017"),
+        "the never-published edge must reach TFT017, or the duplicate check \
+         below has no subjects: {seen:?}"
+    );
+    for (subject, ids) in &seen {
+        let unique: BTreeSet<&&str> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            1,
+            "one fault, two warn ids on {subject}: {ids:?}"
+        );
+    }
+
+    // The other arena that reaches the same variant: a 512-slot ring with one
+    // push in it, which is every `doctor --attach` issued at bringup. The
+    // obstacle here is the stream, not the ring, and a ring-size remedy printed
+    // over it is the sentence this whole test exists to keep out of the report.
+    let tree = TreeBuilder::new()
+        .dynamic_edge("odom", "base_footprint", EdgeCfg::new(Capacity::slots(512)))
+        .dynamic_edge(
+            "base_footprint",
+            "base_link",
+            EdgeCfg::new(Capacity::slots(64)),
+        )
+        .build()
+        .expect("build");
+    let odom = tree.frame("odom").unwrap();
+    let foot = tree.frame("base_footprint").unwrap();
+    let w = tree.claim(foot, odom).expect("claim odom->base_footprint");
+    w.push(0, &tf_tree::Iso3::IDENTITY).unwrap();
+
+    let snap = Snapshot::capture(&tree);
+    let obs = Observations::from_arena(&tree, &snap);
+    let stats = checks::collect_edge_stats(&tree, &snap);
+    // Non-vacuity: the ring is large and the stream is what is short, or this
+    // arena is not the one the second half of the finding is about.
+    assert_eq!(
+        snap.edges.iter().map(|e| e.head).max(),
+        Some(1),
+        "one push, or the arena under test is a different one"
+    );
+    assert_eq!(
+        obs.by_edge().values().map(Vec::len).max(),
+        Some(1),
+        "one retained sample out of 511 slots, or the arena is a different one"
+    );
+
+    let report = checks::run(
+        &Inputs {
+            snap: &snap,
+            obs: &obs,
+            stats: &stats,
+            host: None,
+            clock: Clock::Wall(3_600_000_000_000),
+            arena_bytes: tree.arena_size_bytes() as u64,
+            occupancy: checks::occupancy_of(&tree),
+            clock_step: &checks::ClockStepEvidence::capture(&snap, &obs),
+            stream: checks::PushStream::RingsUnderWriter,
+            slots: checks::SlotTable::Current,
+            counters: tf_tree::counters_compiled_in(),
+        },
+        &BTreeSet::new(),
+    );
+    let o = report
+        .outcomes
+        .iter()
+        .find(|o| o.check == Tft::Tft013)
+        .expect("TFT013 must be in the report");
+    match &o.status {
+        Status::Skipped(why) => {
+            assert!(
+                why.contains("1 push(es)") && why.contains("rings are large enough"),
+                "the reason must name the obstacle this arena actually has: {why}"
+            );
+            assert!(
+                !why.contains("four slots") && !why.contains("RingSize::History"),
+                "511 slots are free; a ring-size remedy is false about this arena: {why}"
+            );
+        }
+        other => panic!("TFT013 reported {other:?} on an arena it cannot measure a grace on"),
+    }
+}
+
+/// The **top-level** keys `catalogue::render_json`'s rustdoc schema block
+/// documents, sorted.
+///
+/// Source-text parsing, because the block is fenced ```` ```text ```` — rustdoc
+/// never runs it and `#[doc = ...]` takes no `const`, so there is no way to
+/// interpolate one list into both. What this buys is that the block stops being
+/// a spelling nothing compares: the literal in
+/// [`the_json_report_parses_and_matches_its_documented_schema`] is held to it,
+/// and the bytes are held to the literal, so all three move together.
+///
+/// # What it does not recover
+///
+/// **Only the top level.** The block spells nested shapes inline
+/// (`"rings": { "edges": u32, … }`), so `arena`, `arena.rings`, the per-check
+/// object, `summary` and the per-finding object are still compared against
+/// literals in that test and against nothing else. Writing a parser for the
+/// nested shapes would be a second, partial JSON grammar in a test file, which
+/// is a worse trade than naming the lists that stay uncoupled — the sentence
+/// above enumerates them, which is what a count of them would replace.
+///
+/// The rule is "a `///` line whose content begins at exactly three spaces and a
+/// quote", which is what makes the top level separable from a continuation line
+/// — every nested key in the block is indented past its opening brace.
+///
+/// **Mutant, run:** emit and document one extra top-level key, then delete it
+/// from the block alone. The assertion fails with the 13 documented keys on the
+/// left and 14 on the right.
+fn documented_top_level_keys() -> Vec<&'static str> {
+    let src = include_str!("../src/catalogue.rs");
+    let (_, after) = src
+        .split_once("/// # Schema — stable")
+        .expect("render_json's schema block must be findable by its heading");
+    let (_, body) = after
+        .split_once("/// ```text")
+        .expect("the schema block opens with a text fence");
+    let (block, _) = body
+        .split_once("/// ```")
+        .expect("the schema block is closed");
+
+    let mut keys: Vec<&str> = block
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("///"))
+        .filter_map(|l| l.strip_prefix("   \""))
+        .filter_map(|l| l.split_once('"'))
+        .map(|(key, _)| key)
+        .collect();
+    // Non-vacuity: a parse that found nothing would make the comparison above
+    // an assertion that the emitter documents no keys at all, which is the
+    // empty-subject-set pass this repository keeps finding.
+    assert!(
+        keys.len() > 5,
+        "the schema block parse recovered {} key(s); the block's shape has \
+         changed and this helper is reading nothing",
+        keys.len()
+    );
+    keys.sort_unstable();
+    keys
 }

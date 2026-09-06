@@ -954,18 +954,128 @@ mod imp {
 
     /// Record that this process inherited the role.
     ///
-    /// One `write` of one short line to an `O_APPEND` descriptor, which Linux
-    /// serialises against other appenders — so concurrent heirs cannot interleave
-    /// a line, and a heir `SIGKILL`ed a microsecond later has either written its
-    /// line or not.
+    /// One `write(2)` of one short line to an `O_APPEND` descriptor: the append
+    /// is all-or-nothing, so a heir `SIGKILL`ed a microsecond later has either
+    /// written its line or not. Concurrent heirs do not arise —
+    /// `inherit_ownership` grants `Inherited` to one process at a time — so
+    /// `O_APPEND` is here for the crash, not for the race.
+    ///
+    /// **`write_all` of one formatted buffer, not `writeln!`**, and the
+    /// difference is the whole of the sentence above. `io::Write::write_fmt`
+    /// forwards each format piece to `write_all`, so `writeln!(f, "{}", pid)`
+    /// is **two** `write(2)` calls — the digits, then the newline — and
+    /// `O_APPEND`'s atomicity is per syscall: a process killed between them has
+    /// written its digits and not its terminator. Measured under `strace`, the
+    /// spelling below is `write(3, "1805698\n", 8) = 8`. (`write_all`'s
+    /// short-write loop is a theoretical re-opening of the same window; for
+    /// eight bytes to a regular file it does not occur.)
+    ///
+    /// Hardening the *readers* to tolerate a final unterminated line was the
+    /// alternative and is rejected: it keeps two spellings of the ledger's shape
+    /// and leaves a torn record silently uncounted, which is the permissive
+    /// direction [`inherited_pids`] argues against.
     fn record_inheritance(dir: &Path) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(inherited_path(dir))
         {
-            let _ = writeln!(f, "{}", std::process::id());
+            let _ = f.write_all(format!("{}\n", std::process::id()).as_bytes());
         }
+    }
+
+    /// Where every survivor records **what §3.5's trigger answered**, one line
+    /// per evaluation as `<pid> <outcome>`.
+    ///
+    /// # Why the inheritance ledger is not enough
+    ///
+    /// [`inherited_path`] records only the winners, so a run in which five
+    /// survivors called [`Tree::inherit_ownership`] and every one of them was
+    /// refused writes exactly what a run in which nobody called writes:
+    /// nothing. Those are an engine failure and a population condition, they
+    /// have opposite remedies, and until 2026-09-06 the shipped output could
+    /// not tell them apart — the trigger discarded every outcome but
+    /// `Inherited`, so `Err`, `Contended`, `ReadOnly` and `NotApplicable` all
+    /// left the same trace as silence.
+    ///
+    /// Read with [`trigger_tally`] and printed as a run-level tally, which is
+    /// the granularity the question needs: *did anybody ask, and what were they
+    /// told*.
+    fn triggers_path(dir: &Path) -> PathBuf {
+        dir.join("triggers.log")
+    }
+
+    /// A short, stable tag for one trigger outcome.
+    ///
+    /// [`Inheritance`] is `#[non_exhaustive]`, so the wildcard is required
+    /// rather than defensive; it falls back to the derived `Debug`, which keeps
+    /// a variant added later legible here instead of silently folding it into
+    /// one of the arms above.
+    fn trigger_tag(outcome: &Result<Inheritance, tf_tree::OpenError>) -> String {
+        match outcome {
+            Ok(Inheritance::Inherited) => "inherited".to_string(),
+            Ok(Inheritance::OwnerAlive) => "owner-alive".to_string(),
+            Ok(Inheritance::Contended) => "contended".to_string(),
+            Ok(Inheritance::ReadOnly) => "read-only".to_string(),
+            Ok(Inheritance::NotApplicable) => "not-applicable".to_string(),
+            Ok(other) => format!("ok-{other:?}"),
+            Err(e) => format!("err-{e:?}"),
+        }
+    }
+
+    /// Append one trigger outcome, up to `TRIGGER_LOG_CAP` per process.
+    ///
+    /// **Capped, because the write rate is unbounded by construction.** A
+    /// survivor evaluates the trigger once per `work` iteration (~1 kHz) and
+    /// `owner_lost` answers `true` for as long as the role is vacant, so a run
+    /// that never recovers would otherwise write for the whole 10 s deadline
+    /// from every attached child. The cap costs nothing the tally needs: the
+    /// question is which outcomes occurred and roughly how often, and a
+    /// truncated count still separates "nobody asked" from "everybody was
+    /// refused". `written` is per-process state, so a child that is
+    /// `SIGKILL`ed mid-run simply stops contributing, which is correct.
+    fn record_trigger_outcome(
+        dir: &Path,
+        written: &mut usize,
+        outcome: &Result<Inheritance, tf_tree::OpenError>,
+    ) {
+        const TRIGGER_LOG_CAP: usize = 256;
+        if *written >= TRIGGER_LOG_CAP {
+            return;
+        }
+        *written += 1;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(triggers_path(dir))
+        {
+            // One `write_all` of one pre-formatted line, like
+            // `record_inheritance`: `O_APPEND` makes a single write atomic
+            // against the other children, and a second call would let their
+            // lines interleave inside this one.
+            let _ = f
+                .write_all(format!("{} {}\n", std::process::id(), trigger_tag(outcome)).as_bytes());
+        }
+    }
+
+    /// The run's trigger outcomes, most frequent first.
+    fn trigger_tally(dir: &Path) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        let Ok(text) = std::fs::read_to_string(triggers_path(dir)) else {
+            return counts;
+        };
+        for line in text.lines() {
+            let Some((_, tag)) = line.trim().split_once(' ') else {
+                continue;
+            };
+            if let Some(slot) = counts.iter_mut().find(|(t, _)| t == tag) {
+                slot.1 += 1;
+            } else {
+                counts.push((tag.to_string(), 1));
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts
     }
 
     fn inheritance_count(dir: &Path) -> usize {
@@ -1590,6 +1700,13 @@ mod imp {
 
         let recovery = check_recovery(&observer, &unreachable_by_hangup, hangup_collector_pinned);
         drop(observer);
+        // **Read before the scratch directory is removed, printed long after.**
+        // `Scratch::drop` deletes the runtime dir, and every ledger in it, on
+        // the line below; the §3.5 summary that reports this is ~90 lines
+        // further down. Reading it there returns an empty tally on every run —
+        // which is indistinguishable from the finding it exists to report, "no
+        // survivor ever evaluated the trigger". Measured, on the first run.
+        let trigger_outcomes = trigger_tally(&dir);
         drop(scratch);
 
         println!(
@@ -1676,6 +1793,23 @@ mod imp {
                     let worst = recovered.iter().copied().fold(0.0_f64, f64::max);
                     let mean = recovered.iter().sum::<f64>() / recovered.len() as f64;
                     format!(" (mean {mean:.1} ms, worst {worst:.1} ms)")
+                }
+            );
+            // **The tally is printed whatever the verdict**, because its
+            // value is highest on the run that fails: `0 survivor(s)
+            // inherited` with an empty tally is a population that had nobody
+            // to ask, and the same line with `contended` or an `err-` tag is
+            // the engine refusing heirs that did ask.
+            println!(
+                "shm_torture: §3.5 trigger outcomes: {}",
+                if trigger_outcomes.is_empty() {
+                    "none recorded — no survivor ever evaluated the trigger".to_string()
+                } else {
+                    trigger_outcomes
+                        .iter()
+                        .map(|(tag, n)| format!("{tag}={n}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 }
             );
             for m in &migrations {
@@ -1906,6 +2040,26 @@ mod imp {
         reads: Reads,
         rounds: u64,
         read_before: bool,
+        /// Live participants other than this driver's own observer, censused
+        /// the instant the victim was reaped — i.e. **the heirs that existed
+        /// when the role fell vacant**.
+        ///
+        /// §3.5 is caller-driven (`docs/decisions/0019`), so "nothing
+        /// inherited" has two producers and this is the only number that
+        /// separates them: an engine that refused every heir, and a population
+        /// with no heir left to ask. The harness already refuses the second
+        /// case statically at argument-parse time (`--children < 2`, and see
+        /// that comment) and until 2026-09-06 never re-checked it at the one
+        /// instant it is decided. `None` only if the victim was never
+        /// identified, in which case `failure` bails on `victim` first.
+        heirs_at_kill: Option<u64>,
+        /// The same census on the first observation round *after* the kill.
+        ///
+        /// The pool drains during a vacancy — a worker ends its attachment on
+        /// `work`'s bounded op count or its detach arm and cannot re-enter
+        /// against an arena no owner is serving — so a run that recovers late
+        /// has two different populations, and only the pair says which.
+        heirs_first_round: Option<u64>,
     }
 
     impl Migration {
@@ -1918,12 +2072,16 @@ mod imp {
                 victim,
                 recovered,
                 inherits,
+                heirs_at_kill,
+                heirs_first_round,
                 ..
             } = self;
+            let unknown = || "?".to_string();
             format!(
                 "shm_torture: §3.5 owner kill {n}: killed pid {}; {}; {inherits} survivor(s) \
-                 inherited; the observer validated {} transform(s) while the role was vacant",
-                victim.map_or_else(|| "?".to_string(), |p| p.to_string()),
+                 inherited; {} heir(s) attached at the kill, {} on the first round after; the \
+                 observer validated {} transform(s) while the role was vacant",
+                victim.map_or_else(unknown, |p| p.to_string()),
                 recovered.map_or_else(
                     || format!("NO fresh process joined within {OWNER_RECOVERY_DEADLINE:?}"),
                     |d| format!(
@@ -1931,6 +2089,8 @@ mod imp {
                         d.as_secs_f64() * 1e3
                     )
                 ),
+                heirs_at_kill.map_or_else(unknown, |c| c.to_string()),
+                heirs_first_round.map_or_else(unknown, |c| c.to_string()),
                 self.reads.total(),
             )
         }
@@ -2029,6 +2189,8 @@ mod imp {
             reads: Reads::default(),
             rounds: 0,
             read_before,
+            heirs_at_kill: None,
+            heirs_first_round: None,
         };
         let before = inheritance_count(dir);
         let Some(pid) = read_owner_pid(dir) else {
@@ -2063,6 +2225,26 @@ mod imp {
         }
         m.victim = Some(pid);
 
+        // **Censused here and nowhere else, because this is the only instant
+        // the number means what the verdict needs.** `drive` observes at the
+        // top of its round, then reaps and re-`fork`s up to `--children`
+        // processes, and only then calls this function — so the round's own
+        // census is stale across exactly the interval in which the pool can
+        // change. Taken *after* the victim's `kill`+`wait`, so the dead owner's
+        // participant byte is already released and is not counted as an heir;
+        // `census` skips the observer's own slot, so what is left is the set of
+        // read-write survivors that could answer `owner_lost`.
+        //
+        // Note `Health::add` keeps only `slots_alive_min` over the whole run,
+        // and `health.add` runs *inside* the deadline loop below — so the
+        // printed `slots=Nreg/Malive` is a run-wide minimum that necessarily
+        // reads 0 for any run that stayed ownerless, in both the
+        // engine-refused-every-heir case and the no-heir-existed case. That
+        // aggregate cannot classify this; this field is not an aggregate.
+        let mut at_kill = RoundHealth::default();
+        census(observer, &mut at_kill);
+        m.heirs_at_kill = Some(at_kill.slots_alive);
+
         // **Read and probe in one loop.** The observer keeps validating while
         // the role is vacant (§3.5's data-plane claim) and the fresh join is
         // what says the role stopped being vacant. Doing them in sequence would
@@ -2073,6 +2255,9 @@ mod imp {
             if Instant::now() >= next_observe {
                 let mut round = RoundHealth::default();
                 m.reads.add(observe(observer, rng, violations, &mut round));
+                if m.heirs_first_round.is_none() {
+                    m.heirs_first_round = Some(round.slots_alive);
+                }
                 health.add(round);
                 m.rounds += 1;
                 next_observe = Instant::now() + MIGRATION_OBSERVE_EVERY;
@@ -2959,24 +3144,39 @@ mod imp {
         // prevents is silent by
         // construction: a wedged arena reads exactly like a healthy one. `arena_is_live` catches
         // the *consequence* a round at a time; this names the cause.
-        // **Polled, not sampled once, and the difference is a flaky gate.**
-        // Reclamation is asynchronous by construction: the child's socket closes
-        // when the kernel tears the process down, and the owner's serving thread
-        // performs the `LIVE -> FREE` CAS when it is next scheduled and sees the
-        // hangup. `drive` waits 100 ms after the last `wait()` before calling
-        // this, which is generous on an idle host and is a *scheduling*
-        // assumption on a loaded runner — and the failure it would produce is
-        // the worst kind, a red nightly naming a defect that is not there.
+        // **A fixed settle window, and it says so.** *This comment used to read
+        // "Polled, not sampled once, and the difference is a flaky gate", above
+        // a `for attempt in 0..9` loop whose early exit was structurally
+        // unreachable* — it broke when `dead_participant_slots(tree)` came back
+        // empty over the WHOLE table, before the `unreachable_by_hangup`
+        // partition on the next statement, and that partition is never empty by
+        // construction: it always contains the creating owner and the current
+        // owner, and `drive` kills the owner immediately before calling this. So
+        // the predicate could not clear, every run burned all nine attempts, and
+        // the code claimed a poll it did not perform.
         //
-        // **What the retries can and cannot buy.** `drive` holds the current
+        // It is written as the sleep it always was rather than given a reachable
+        // exit, because a reachable one would be the weaker check: a record
+        // whose kernel teardown has not finished reads as *alive*, is therefore
+        // absent from `dead_participant_slots`, and an early exit would take the
+        // verdict before it appears. [`dead_participant_slots`]'s own doc says
+        // it: a wait that polls a different predicate from the one that fails
+        // the run is a wait that can finish early on the wrong evidence. The
+        // unreachable exit was what guaranteed the maximum settle; the constant
+        // makes that deliberate instead of accidental, and shortening it is a
+        // measurement rather than an edit.
+        //
+        // **What the window can and cannot buy.** `drive` holds the current
         // owner back until after its settle window, but by the time this
         // function runs every process that could run a hangup callback has been
-        // reaped — so these retries do not give that callback more time, and a
-        // failure here does not mean "not scheduling". What they do cover is the
-        // window between the last `wait()` and the kernel finishing the
-        // teardown, and the `reap_participants` this function itself calls for
-        // the partitioned records. That is narrower than "does not depend on
-        // when a thread woke up", which is what this comment used to claim.
+        // reaped — so this does not give that callback more time, and a failure
+        // here does not mean "not scheduling". What it does cover is the window
+        // between the last `wait()` and the kernel finishing the teardown, and
+        // the `reap_participants` this function itself calls for the partitioned
+        // records. That is narrower than "does not depend on when a thread woke
+        // up", which is what this comment used to claim. The poll that *does*
+        // have a reachable exit, on the exempt-filtered predicate, is the
+        // teardown one in `drive`, which is where an early exit belongs.
         // **After a migration, one of the two automatic collectors is not
         // coming for *some* records, and this is where that is paid for — for
         // those records and no others.**
@@ -3018,17 +3218,14 @@ mod imp {
         // What ships requires a sweep to have *worked* on every run, which the
         // first version did not, and reaches the strict verdict only where the
         // collector it names is pinned, which the second did not check.
+        /// How long to let the kernel finish tearing the killed children down
+        /// before the strict verdict is read. Eight 250 ms steps, which is what
+        /// the unreachable retry loop this replaced always spent.
+        const SETTLE_WINDOW: Duration = Duration::from_millis(8 * 250);
+
         let table = view.participants();
-        let mut leaked = Vec::new();
-        for attempt in 0..9 {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            leaked = dead_participant_slots(tree);
-            if leaked.is_empty() {
-                break;
-            }
-        }
+        std::thread::sleep(SETTLE_WINDOW);
+        let mut leaked = dead_participant_slots(tree);
         // **The records no hangup callback can reach are separated by pid, and
         // separated *first*.** Two kinds, both named by the driver: a process
         // that held the rendezvous (nothing runs its own hangup callback), and a
@@ -3265,6 +3462,11 @@ mod imp {
         // record to read. `EdgeWriter` exposes only `push`, and adding an
         // accessor to it would be a public-API change for a harness's benefit.
         let mut held: Option<(usize, tf_tree::EdgeWriter<'_>)> = None;
+        // Per-attachment, so the cap in `record_trigger_outcome` bounds the
+        // writes of one `work` call rather than of one process: a child that
+        // re-attaches gets a fresh budget, and a child stuck outside the arena
+        // during a vacancy is not in this loop at all.
+        let mut triggers_logged = 0usize;
         // A bounded number of operations per attachment, so every child
         // re-attaches regularly instead of one lucky survivor holding the arena
         // for the whole run.
@@ -3301,7 +3503,19 @@ mod imp {
             // its slot and stops asking by itself (`0043`) — so only `Inherited`
             // is recorded.
             if !no_inherit && tree.owner_lost() {
-                if let Ok(Inheritance::Inherited) = tree.inherit_ownership() {
+                // **The answer is recorded before it is filtered.** `Contended`
+                // and `OwnerAlive` are still not errors and still not counted
+                // as inheritances — a loser keeps its slot and stops asking by
+                // itself (`0043`) — but "not an error" is not "not worth
+                // recording": `if let Ok(Inheritance::Inherited)` threw away
+                // the one fact that says whether §3.5's trigger was ever
+                // *answered*, and with it the difference between an engine that
+                // refused every heir and an arena with no heir left to ask.
+                // Both print `0 survivor(s) inherited` and only one of them is
+                // a defect of this engine.
+                let outcome = tree.inherit_ownership();
+                record_trigger_outcome(dir, &mut triggers_logged, &outcome);
+                if let Ok(Inheritance::Inherited) = outcome {
                     // pid first, then the log line: the driver reads the count
                     // to decide a migration happened and the pid to pick the
                     // next victim, so the pid must never be behind.

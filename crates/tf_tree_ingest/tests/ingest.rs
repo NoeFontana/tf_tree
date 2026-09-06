@@ -24,7 +24,7 @@ use tf_tree_ingest::fixture::{
     conformance_recording, FixtureCodec, CONFORMANCE_MESSAGES_PER_CHUNK,
 };
 use tf_tree_ingest::{
-    BadChunkKind, ClockResetPolicy, Frames, IngestError, IngestOptions, OnBadChunk,
+    BadChunkKind, ClockResetPolicy, Frames, IngestError, IngestOptions, OnBadChunk, TopicRoles,
 };
 
 /// A scratch directory that removes itself, so a failing test does not leave a
@@ -705,13 +705,16 @@ fn the_ros1_schema_spelling_is_read() {
 /// not fed to a decoder that would fail on it.
 ///
 /// A `json` or `protobuf` channel carrying the TF schema name is possible and is
-/// not this crate's to decode. The count reaching the report is the other half:
-/// `filtered_channels` is `skips.filtered_channels + skips.non_cdr`, and the
-/// `+ non_cdr` term had nothing exercising it.
+/// not this crate's to decode. The count reaching the report is the other half.
 ///
-/// Mutant: set `filtered_channels = skips.filtered_channels` in `survey`,
-/// dropping the `+ non_cdr` — applied, and the count assertion failed at 0 and
-/// the summary line vanished.
+/// **It lands in `non_cdr_channels`, and `a_topic_filter_is_not_an_undecodable_channel`
+/// is the other side of the pair.** Until 2026-09-06 both landed in one field
+/// rendered as `undecodable_channels`, and this test was the only one of the two
+/// that existed — so the union read as true while the JSON told a consumer that
+/// the operator's own `--tf-topic` was a broken publisher.
+///
+/// Mutant: set `non_cdr_channels = 0` in `survey` — applied, and the count
+/// assertion failed at 0 and the summary line vanished.
 #[test]
 fn a_non_cdr_tf_channel_is_counted_not_decoded() {
     let dir = Scratch::new("noncdr");
@@ -744,10 +747,112 @@ fn a_non_cdr_tf_channel_is_counted_not_decoded() {
     assert_eq!(out.report.samples_pushed, 4);
     assert_eq!(out.report.dynamic_edges, 1);
     // …and the JSON channel is counted, not silently ignored and not decoded.
-    assert_eq!(out.report.anomalies.filtered_channels, 1);
+    assert_eq!(out.report.anomalies.non_cdr_channels, 1);
+    assert_eq!(
+        out.report.anomalies.filtered_channels, 0,
+        "no topic filter was set, so nothing was excluded by one"
+    );
+    // The terminal row names the two numbers, and which number is which is the
+    // whole point of the split — so the arm asserts the rendered text, not the
+    // substring both arms share. Swapping the two format arguments passes every
+    // `contains("TF channels were skipped")` in the workspace.
     assert!(
-        out.report.summary().contains("TF channels were skipped"),
-        "the skip must reach the report:\n{}",
+        out.report
+            .summary()
+            .contains("1 TF channels were skipped (1 not CDR, 0 excluded by --topic)"),
+        "the skip must reach the report, on the right side:\n{}",
+        out.report.summary()
+    );
+    assert!(
+        out.report.to_json().contains("\"non_cdr_channels\":1"),
+        "the machine-readable half must say which of the two reasons it was:\n{}",
+        out.report.to_json()
+    );
+}
+
+/// A channel the operator's own `--tf-topic` excluded is **not** a channel this
+/// build could not decode.
+///
+/// This is the arm that did not exist. `skips.filtered_channels` was summed into
+/// one field, that field was documented as "messages on a TF channel this build
+/// could not decode", and the JSON key was `undecodable_channels` — so a
+/// consumer pinning the schema read an operator's narrowing as a defect in the
+/// recording and went looking for a broken publisher. Both channels here carry
+/// `message_encoding = "cdr"` and the one that was read decodes, which is what
+/// makes "decodable" a measurement rather than an assumption.
+///
+/// Mutant: restore the withdrawn rendering — one JSON key
+/// `undecodable_channels` carrying the sum — applied, and this failed on the
+/// `filtered_channels":1` assertion, as did
+/// `a_non_cdr_tf_channel_is_counted_not_decoded` and
+/// `the_anomaly_corpus_report_is_exact`.
+///
+/// **A mutant that folds the two *fields* back together is not the one to use
+/// here**, and this is worth stating because it was the first one tried: with
+/// `filtered_channels = skips.filtered_channels + skips.non_cdr` and
+/// `non_cdr_channels = 0`, this fixture has no non-`cdr` channel at all, so
+/// every number in it is unchanged and the test passes. That mutant is
+/// `a_non_cdr_tf_channel_is_counted_not_decoded`'s, and it fails there. Neither
+/// arm alone covers the pair.
+#[test]
+fn a_topic_filter_is_not_an_undecodable_channel() {
+    let dir = Scratch::new("filtered");
+    let p = dir.path("two_topics.mcap");
+
+    let mut msgs: Vec<FixtureMessage> = (1..5)
+        .map(|i| FixtureMessage::dynamic("odom", "base_link", i * 1_000_000_000, pose(i as f64)))
+        .collect();
+    for i in 1..5 {
+        msgs.push(FixtureMessage {
+            topic: "/robot2/tf".into(),
+            log_time_ns: i * 1_000_000_000,
+            transforms: vec![TransformStamped {
+                stamp_ns: i * 1_000_000_000,
+                frame_id: "map".into(),
+                child_frame_id: "odom".into(),
+                pose: pose(i as f64),
+            }],
+        });
+    }
+    write_mcap(&p, &msgs).unwrap();
+
+    let opts = IngestOptions {
+        roles: TopicRoles {
+            dynamic_topics: vec!["/tf".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut frames = Frames::default();
+    let out = tf_tree_ingest::run(&p, &opts, &mut frames).unwrap();
+
+    // The narrowing worked: one topic in, one out.
+    assert_eq!(out.report.transforms_read, 4);
+    assert_eq!(out.report.samples_pushed, 4);
+    assert_eq!(out.report.anomalies.filtered_channels, 1);
+    // And the excluded channel is **not** reported as one this build cannot
+    // decode. It carries `cdr` like the one that was read.
+    assert_eq!(out.report.anomalies.non_cdr_channels, 0);
+    let json = out.report.to_json();
+    assert!(
+        json.contains("\"filtered_channels\":1") && json.contains("\"non_cdr_channels\":0"),
+        "the JSON must say which of the two it was:\n{json}"
+    );
+    assert!(
+        !json.contains("undecodable"),
+        "the withdrawn key names one term of a sum:\n{json}"
+    );
+    // And the terminal row, which is the other rendering and was the ungated
+    // one: it prints both numbers, so it can misdescribe this channel the same
+    // way the withdrawn JSON key did. Asserted in both arms of the pair for the
+    // reason stated above — swapping the two format arguments leaves this
+    // fixture's total unchanged and only the other arm's assertion would have
+    // to hold, and vice versa.
+    assert!(
+        out.report
+            .summary()
+            .contains("1 TF channels were skipped (0 not CDR, 1 excluded by --topic)"),
+        "the excluded channel must not read as an undecodable one:\n{}",
         out.report.summary()
     );
 }
@@ -1177,7 +1282,7 @@ fn report_json_is_well_formed() {
     let out = tf_tree_ingest::run(&path, &IngestOptions::default(), &mut frames).unwrap();
     let json = out.report.to_json();
 
-    assert!(json.contains("\"schema\":\"tf_tree.ingest/1\""));
+    assert!(json.contains("\"schema\":\"tf_tree.ingest/2\""));
     assert!(
         !json.contains("NaN") && !json.contains("Infinity"),
         "{json}"
@@ -1311,15 +1416,25 @@ fn an_oversized_edge_spills_and_matches_the_in_memory_path() {
         "peak {} B over the {cap} B cap",
         spilled.report.fill.peak_buffer_bytes
     );
-    // And a *lower* bound, which is the half that makes the peak a measurement
-    // rather than a ceiling: the spill phase alone holds `run_samples × 64`
-    // plus staging, and `WINDOW_SHARE_*` puts that at three quarters of the cap
-    // at the least. Without this, deleting every `peak_buffer_bytes` update in
-    // `fill_spilled` — reporting zero for the whole spill path — passes.
-    assert!(
-        spilled.report.fill.peak_buffer_bytes >= cap * 3 / 4,
-        "peak {} B is too small to be the spill path's; it was not measured",
-        spilled.report.fill.peak_buffer_bytes
+    // And the **exact** value, which pins the reported bound from below, so a
+    // term dropped from that bound is caught. The reported number is a bound by
+    // construction — nothing in this process measures an allocator — so the
+    // `<= cap` assertion above is only half of it: without a lower bound of some
+    // kind, deleting every `peak_buffer_bytes` update in `fill_spilled` —
+    // reporting zero for the whole spill path — passes.
+    //
+    // It is exact rather than `>= cap * 3 / 4` because the loose bound could not
+    // see the term that matters. `spill_budget(8192)` is `staging = 1024` and
+    // `run = (8192 - 1024) / (2 × 64) = 56`, so the spill phase holds
+    // `2 × 56 × 64 + 1024` = the cap on the nose: the run buffer, the stable
+    // sort's scratch for it, and the staging. Sizing the run against **one**
+    // copy instead of two — the defect this arithmetic replaced — reports 7 168
+    // here, which the three-quarters bound accepted, and overran the cap in the
+    // process by the missing 3 584 B.
+    assert_eq!(
+        spilled.report.fill.peak_buffer_bytes, cap,
+        "the spill phase's own peak is the cap by construction at this cap; \
+         a smaller number means a term is missing from it"
     );
 
     // The two paths agree about how much survived, and about the duplicate.
@@ -1435,10 +1550,16 @@ fn a_rosbag2_sqlite3_bag_is_named_as_one() {
 /// satisfied by not measuring.
 #[test]
 fn a_tiny_cap_reduces_in_several_passes() {
-    // 2 200 samples at 14 per run is 158 runs against a fan-in of 11: one
-    // reduce pass leaves 15, still over the fan-in, so a second runs and leaves
-    // 2. `spilled_runs` is the sum over passes and comes back at 158 + 15 + 2 =
-    // 175 — measured, not derived.
+    // 2 200 samples at 7 per run is 315 runs against a fan-in of 11: one reduce
+    // pass leaves 29, still over the fan-in, so a second runs and leaves 3.
+    // `spilled_runs` is the sum over passes and comes back at 315 + 29 + 3 =
+    // 347 — measured, not derived.
+    //
+    // **Seven per run, not fourteen.** `spill::sort_run` is stable and
+    // allocates, so `spill_budget` sizes the run against two copies of it
+    // (`2 * ENCODED`) rather than one. That halving is the visible cost of the
+    // cap being a cap on this path: twice as many runs for the same edge, and
+    // one more reduce pass than the fourteen-per-run split needed.
     const N: i64 = 2_200;
     const STRIDE: i64 = 7;
     const CAP: u64 = 1024;
@@ -1477,8 +1598,8 @@ fn a_tiny_cap_reduces_in_several_passes() {
         reduced.report.fill.spilled_bytes
     );
     assert_eq!(
-        reduced.report.fill.spilled_runs, 175,
-        "158 runs, then 15, then 2 — a different split means the reduce loop \
+        reduced.report.fill.spilled_runs, 347,
+        "315 runs, then 29, then 3 — a different split means the reduce loop \
          changed shape and this test's arithmetic no longer describes it"
     );
     assert!(
@@ -1487,7 +1608,11 @@ fn a_tiny_cap_reduces_in_several_passes() {
         reduced.report.fill.peak_buffer_bytes
     );
     // The other side of the bound: a spill path that reported nothing would
-    // pass the assertion above. See the sibling test for the same pair.
+    // pass the assertion above. See the sibling test for the same pair — and
+    // for the exact-value form, which this test cannot use: at a 1 024 B cap the
+    // reduce pass's own resident total is also exactly the cap, so it masks the
+    // spill phase's term and only `an_oversized_edge_spills_and_matches_the_in_memory_path`
+    // can see that one shrink.
     assert!(
         reduced.report.fill.peak_buffer_bytes >= CAP * 3 / 4,
         "peak {} B is too small to be the spill path's; it was not measured",

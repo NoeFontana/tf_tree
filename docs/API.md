@@ -275,7 +275,7 @@ is a call per step.
 > | `Plan::at` **alone** | 106 B — *byte-identical* | 1 → `Plan::fold_at` |
 > | `fold_at` alone | 62 B | 1 → `Plan::at` |
 > | `fold_at` + `Plan::at` | 1332 B | 1 → `Guard::sample_hinted` |
-> | all five on this path, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
+> | all five on this path | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
 >
 > So there was exactly **one** cross-crate call, not one per step, and what the
 > attribute changes is LLVM's `inlinehint` on the *non-generic* links. `fold_at`
@@ -283,6 +283,29 @@ is a call per step.
 > now-larger `at`; `Guard::sample*` removes the last one. "Marking fewer leaves
 > a call in the middle" survives as a claim — rows three and four are it — but
 > it is now a measurement rather than an assertion.
+>
+> **CORRECTION (2026-09-06) — the last row was labelled "as shipped" and stopped
+> being true on 2026-08-29. NORMATIVE item 1 is unaffected; this amendment's
+> account of what it buys is what moved.** All five placements are still
+> present, so item 1 is still literally satisfied. What changed is that
+> `Plan::at_tagged` was interposed between `Plan::at` and `fold_at` (`0038`, the
+> runtime domain tag) carrying no attribute, so the chain is cut in the middle
+> and a downstream caller emits **one** real cross-crate call again — to
+> `at_tagged`. An external `#[inline(never)]` probe consuming all seven `Iso3`
+> components, at `lto = "thin", codegen-units = 1`, is 16 instructions and one
+> indirect `call` that `objdump -R` + `nm -C` resolve to
+> `<tf_tree_core::plan::Plan>::at_tagged`; adding `#[inline]` to `at_tagged`
+> alone takes it to 1403 instructions and 8 calls.
+>
+> Three consequences, and the third is the one that costs something:
+>
+> * The `106 B → 1565 B` price below is the price of a shape that is not
+>   currently emitted.
+> * The attribute is **not** simply added. A review probe measured +8–10 %
+>   instructions with it on; unreproduced, and recorded at `at_tagged`'s own doc
+>   comment together with the reason a naive probe reads the opposite sign.
+> * **Item 3's gated row cannot see any of this**, which is the more serious
+>   half — see the `embedding_cross_crate` note appended to item 3 below.
 >
 > **The price is caller code size: 106 B → 1565 B, ~15×, at every embedder call
 > site.** That is the trade this section should have named and did not — and it
@@ -321,9 +344,11 @@ is a call per step.
 > deliberately not in `results.json`; `PHASE5.md` §9.2's amendment is the table
 > of which is which.
 >
-> **The measured ratio is 1.250–1.254×, so §9.2's 5% criterion is NOT met**, and
-> that is reported rather than engineered around. Three consecutive pinned runs,
-> paired rounds:
+> **The measured ratio was 1.250–1.254×, so §9.2's 5% criterion was NOT met**,
+> and that was reported rather than engineered around — a reading taken before
+> 2026-08-29, while the row still had an independent variable; the amendment
+> further down this item is what the row does now. Three consecutive pinned
+> runs, paired rounds:
 >
 > | downstream profile | out-of-crate | in-crate | ratio |
 > |---|---|---|---|
@@ -371,6 +396,67 @@ is a call per step.
 > `Fitness::probe`, so the row is `unavailable` in this repository's own
 > committed baseline and the numbers above are evidence for a design decision
 > rather than claims.
+
+> **Amendment (2026-09-06) — item 3's row lost its independent variable on
+> 2026-08-29 and kept printing a number. `just embed-cost` now says so on every
+> run, and refuses unless the escape below is set.**
+>
+> The row exists because one identical body compiled in two crates isolates the
+> boundary, and `embed.rs`'s module doc names the failure it was built to avoid:
+> *"A row whose denominator came from the facade — or from any existing benchmark
+> in this workspace — would report ≈1.00× for ever while the real boundary went
+> unmeasured."* **That became the row's own state.** `Plan::at_tagged` was
+> interposed between `Plan::at` and the fold carrying no `#[inline]` (see the
+> correction to this section's own table above), so both columns compile to the
+> same call stub around one out-of-line symbol that lives in `tf_tree_core`
+> either way — `nm -C --print-size` gives both bodies **the same 58 bytes**, and
+> `objdump -R` resolves both `call`s to the same GOT slot. Which crate the
+> *stub* was compiled in changes nothing, the quotient is 1.0 by construction,
+> and `Verdict::Over` is unreachable.
+>
+> **The run is the sharpest part.** Pinned, at `[profile.embedder]`, on the same
+> host and in the same sitting as the toggle below:
+>
+> | `at_tagged` | out-of-crate | in-crate | verdict |
+> |---|---|---|---|
+> | out of line (shipped) | 236.2 ns | 236.1 ns | `1.000x (rounds spanned 0.997-1.004), within PHASE5 §9.2's 5% gate` |
+> | `#[inline]` | 240.9 ns | 194.3 ns | `1.243x, OVER PHASE5 §9.2's 5% gate` |
+>
+> The collapsed row is not noise and does not report `unresolved`: it is a clean
+> **PASS at exactly 1.000 with a 1 % round-to-round band**, which is what a gate
+> looks like when its independent variable is gone. The table above records
+> 1.250–1.254 for the same measurement, taken while the chain was whole.
+>
+> Two things landed:
+>
+> 1. **A structural self-check in the `embed-cost` recipe**, comparing the two
+>    symbols' *sizes* (byte comparison is toolchain-sensitive; equal sizes are
+>    sufficient evidence of the collapse). It fires on today's tree and goes
+>    quiet the moment the row measures something. **An absent symbol REFUSES
+>    rather than passing** — `embed::one` is a private `fn` linking LOCAL, so a
+>    rustc that drops or renames it takes the check's subject away, and an empty
+>    subject set is the shape this whole item is about.
+>
+>    **It ships with a disclosed escape rather than as a permanently red gate.**
+>    The collapse is a defect in the code under test, not in the recipe, and its
+>    repair is the trade this amendment ends on — so `bench-check`,
+>    `bench-baseline-update` and CI's `bench-gate` job would have been red for as
+>    long as that decision stayed open, which is how a check gets deleted rather
+>    than answered. `EMBED_COST_KNOWN_COLLAPSED=1` lets the recipe finish; the
+>    diagnosis above prints on every run either way, followed by a line saying
+>    the quotient that follows is not a measurement. CI sets it, and deleting
+>    both the `env:` block and the recipe's escape branch is part of the commit
+>    that restores the variable.
+> 2. **The toggle above, as a measurement rather than an argument.** It is a
+>    diagnostic here and **not a proposed fix**: marking `at_tagged` is a ~10×
+>    growth of every embedder's call site and the only instruction measurement
+>    anyone has taken of it is negative. See `Plan::at_tagged`'s doc comment.
+>
+> The row's committed baseline status is `unavailable` and stays that way, so
+> nothing about the withdrawn-claim comparison changes. **What this amendment
+> does not do is restore the variable**: that is a trade between item 1's
+> normative placement list and item 3's ability to fail, and it needs
+> `just embed-cost` plus `just bench-ab` on a host that passes `Fitness::probe`.
 
 ### 2.4 Two things that are not going to exist
 
@@ -1074,7 +1160,7 @@ authorized by this document alone.
 |---|---|---|---|---|
 | 1 | `Tree::claim_owned` → `OwnedWriter`; delete the PyO3 and C ABI lifetime extensions | Rust, Python, C | [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) | **landed** — `OwnedWriter` plus `0017` steps 6–7; `PyPublisher`, `tft_publisher` and the bridge's writer map all hold one, both `extend_to_static` helpers are deleted, and §2.1's rule is now a description rather than a direction |
 | 2 | `Arc<Tree>` documented as the embedding idiom | Rust (docs only) | §2.2 | **landed** — `tf_tree` crate docs; `0017` step 8 keeps only the lifetime rule and the scoped-vs-owned guidance |
-| 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **all three landed.** `#[inline]`: five placements, measured, a sixth measured as a *pessimization* and left off. LTO guidance: `tf_tree` crate docs. Row: `embedding_cross_crate` in `PHASE5.md` §9.2's artifact (`just embed-cost`) — one build, one profile, `tf_tree_bench` against `tf_tree_core::bench_probe` — gated at 5% on `boundary_ratio`, `out_of_crate_ns` and `in_crate_ns`, and **reporting 1.250–1.254×, i.e. over §9.2's criterion**, with the `lto = "thin"` control at 0.994–0.996× beside it. The two-profile comparison is kept as an exploratory measurement, never gated |
+| 3 | `#[inline]` on the fold; LTO guidance; a cross-crate bench row gated at 5% | Rust | §2.3 | **all three landed.** `#[inline]`: five placements, measured, a sixth measured as a *pessimization* and left off. LTO guidance: `tf_tree` crate docs. Row: `embedding_cross_crate` in `PHASE5.md` §9.2's artifact (`just embed-cost`) — one build, one profile, `tf_tree_bench` against `tf_tree_core::bench_probe` — gated at 5% on `boundary_ratio`, `out_of_crate_ns` and `in_crate_ns`. The two-profile comparison is kept as an exploratory measurement, never gated. **The row has had no independent variable since 2026-08-29** and therefore reports nothing: both its columns compile to the same stub, so its quotient is 1.0 by construction. §2.3's 2026-09-06 amendment is the account; the readings this cell used to quote were taken while the chain was whole and are there, not here |
 | 4 | `# Stability` headings on CLI-facing exports; then the `unstable` tier itself | Rust | §2.6 | **landed** — `tf_tree::unstable` behind a default-off `unstable` feature whose docs are the waiver. Three items moved off the crate root: `ArenaView`, `EdgeKind`, and `EdgeMeta` (which the audit found was *unusable* from the stable tier — the facade never re-exported the `compile` it is an input to). `Tree::arena_view` is gated with them, because a caller reaches every accessor on the returned value by inference without naming the type. `tf_tree_cli`, `tf_tree_c`, `tf_tree_bench` and `tf_tree_py` turn it on — four, checked against the `[dependencies]` entries by `just stable-tier-check` rather than counted by hand; three `compile_fail,E0432` doctests pin that the root no longer answers. **Gating the door did not remove the capability**: stable `Tree::frames` and `Tree::edges` land with it, mirroring row 8's Python surface, so an embedder never signs the waiver to ask what is in their own tree (§7 check 1). the facade's own default feature set with the feature off is what **no `--workspace` command compiles**, because the resolver unifies the feature in from those four — measured with `cargo tree -f '{p} FEATURES=[{f}]'`, §2.6. `just stable-tier-check` is the gate for it and CI runs it as its own job; since 0.0.1 deleted the facade's self-dev-dependency it is no longer the *only* recipe that reaches the configuration, because every `-p tf_tree` selection now does — `just miri` and `just test-doc-error-codes` included |
 | 5 | Per-edge nominal rate reachable from a plan (`Plan::span` already ships) | Rust core | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | **landed** — `Plan::slowest_nominal_rate_mhz`, `Guard`-scoped and generation-checked like `span`; `0` means undeclared and is skipped, not treated as slow |
 | 6 | No blocking primitive in the arena; the escalation path recorded | all | [`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md) | recorded, not built |
@@ -1101,12 +1187,16 @@ revision said "ten … 1, 2, 5, 7, 8, 9 and 11 in full, 3 in part", which named
 eight rows and called them ten; the revision after that kept row 13 out of the
 count after its record's remaining steps had landed.)
 
-- **Row 3 has landed in full, and its benchmark row reports a failing gate.**
-  `embedding_cross_crate` measures **1.250–1.254×** against §9.2's 5% criterion.
-  That is the row working — it was built to report what it finds — but "landed"
-  here means the row exists, not that the number passes. What would close it is
-  `API.md` §2.3 item 2's LTO guidance in the *embedder's* profile, and the
-  `lto = "thin"` control at 0.994–0.996× is that stated as a measurement.
+- **Row 3 has landed in full, and its benchmark row currently measures
+  nothing.** "Landed" here means the row exists, not that it is answering. This
+  bullet used to read *"its benchmark row reports a failing gate … that is the
+  row working"*, which stopped being true on 2026-08-29: `Plan::at_tagged` was
+  interposed between `Plan::at` and the fold with no `#[inline]`, both of the
+  row's columns became the same call stub, and the quotient became 1.0 by
+  construction — so what the row reports is a clean pass and `Verdict::Over` is
+  unreachable. §2.3's 2026-09-06 amendment carries the measurement, the toggle
+  and the trade; `just embed-cost` refuses on the collapse. The account appears
+  in more than one file — `grep -rn '1\.25' docs crates` is the census.
 - **Row 6** is recorded, not built, and is meant to stay that way
   ([`0018`](./decisions/0018-blocking-waits-belong-in-the-shim.md)).
 - **Row 10 has landed, but `0013` has not.** The constant moved (55 → 64

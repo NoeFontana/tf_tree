@@ -449,6 +449,17 @@ impl Report {
         self.count_at(Severity::Error) == 0 && self.count_at(Severity::Warn) == 0
     }
 
+    /// One check's outcome, for a disclosure that must not contradict it.
+    ///
+    /// A note in [`Meta::notes`] saying a check *did half its work* is false
+    /// beside a `not run` line for the same id, and the two are written in
+    /// different files. Reading the outcome back is what makes them one fact
+    /// rather than two predicates that happen to agree today.
+    #[must_use]
+    pub fn outcome(&self, id: Tft) -> Option<&CheckOutcome> {
+        self.outcomes.iter().find(|o| o.check == id)
+    }
+
     /// `(passed, fired, skipped, suppressed)` counts over the catalogue.
     #[must_use]
     pub fn tally(&self) -> (usize, usize, usize, usize) {

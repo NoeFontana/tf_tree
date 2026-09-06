@@ -3,10 +3,22 @@
 #
 # The Rust harness (`crates/tf_tree_bench/src/ratio.rs`) measures the same
 # quotient with tf2 behind `tf_tree_tf2_sys`, which charges tf2 the residual FFI
-# boundary — ~21 ns / 8% at this depth, per `docs/benchmarks/tf2.md` bias 3 — and
-# therefore flatters `tf_tree`. This one reverses it: tf2 pays nothing and
-# `tf_tree` pays the C ABI's measured 1.020x, so the result is a conservative
-# lower bound.
+# boundary and therefore flatters `tf_tree`. This one reverses it: tf2 pays
+# nothing and `tf_tree` pays its C ABI, so the result is a conservative lower
+# bound.
+#
+# **Both of those costs are priced in `native_ratio.cpp`'s header — the file
+# this script builds and runs — and are deliberately not restated here.** This
+# header carried its own copy of each until 2026-09-05, and both copies were of
+# withdrawn figures: `~21 ns / 8%` for the FFI boundary, cited to the very
+# `docs/benchmarks/tf2.md` section that withdraws it, and "the C ABI's measured
+# 1.020x", which `docs/PHASE4.md` §0.0 and §7 gate 1 retract on
+# `docs/decisions/0023-the-gate-that-could-not-gate.md`. The
+# direction of the argument survived both — a larger charged boundary makes this
+# arm a stricter lower bound — and neither magnitude did. The fix is deletion
+# rather than a third spelling: `grep -rn '21 ns'` and `grep -rn '1\.020'` are
+# the instruments, because an enumeration of sites written here is a list that
+# goes stale silently.
 #
 # Three processes' worth of setup, for one reason: `tft_tree_open` **attaches**
 # and cannot create (D18, and not something to work around for a benchmark). So

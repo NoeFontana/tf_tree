@@ -138,7 +138,7 @@ fn write(dir: &Path, name: &str, msgs: &[FixtureMessage]) -> PathBuf {
 /// other is the workspace version, and neither is a fact about the reader.
 ///
 /// **Changing the report's shape will fail this test, deliberately.** The JSON is
-/// a published surface with a schema tag (`tf_tree.ingest/1`) a consumer pins; a
+/// a published surface with a schema tag (`tf_tree.ingest/2`) a consumer pins; a
 /// field added or renamed without a bump is the thing this catches.
 ///
 /// The per-row mutants are in this file's other tests and in the commit that
@@ -154,16 +154,16 @@ fn the_anomaly_corpus_report_is_exact() {
     let p2 = pose(2.0);
     let want = format!(
         concat!(
-            r#"{{"schema":"tf_tree.ingest/1","tf_tree":"{version}","source":"{source}","#,
+            r#"{{"schema":"tf_tree.ingest/2","tf_tree":"{version}","source":"{source}","#,
             r#""frames":4,"static_edges":1,"dynamic_edges":2,"#,
             r#""transforms_read":10,"samples_pushed":4,"#,
-            r#""passes":1,"peak_buffer_bytes":320,"peak_run_index_bytes":0,"#,
+            r#""passes":1,"peak_buffer_bytes":640,"peak_run_index_bytes":0,"#,
             r#""spilled_runs":0,"spilled_bytes":0,"#,
             r#""span_ns":[1000000000,20000000000],"#,
             r#""anomalies":{{"zero_stamp_drops":3,"future_stamps":1,"#,
             r#""worst_future_offset_ns":18800000000,"out_of_order":1,"#,
             r#""clock_resets":0,"static_conflicts":1,"duplicate_stamps":1,"#,
-            r#""stripped_slash_names":0,"empty_names":0,"undecodable_channels":0,"#,
+            r#""stripped_slash_names":0,"empty_names":0,"filtered_channels":0,"non_cdr_channels":0,"#,
             r#""truncated":false,"bad_chunks":0,"chunks_over_limit":0,"#,
             r#""oversized_records_skipped":0,"bad_chunk_span_ns":null,"#,
             r#""first_reset_at_ns":null}},"#,

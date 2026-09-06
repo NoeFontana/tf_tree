@@ -426,11 +426,24 @@ def check_changelog(authority: str) -> str:
 # ---------------------------------------------------------------------------
 
 # A recipe name as this repository spells them: lowercase, digits, hyphens.
-# Anything else in the argument position is deliberately *not* checked, and
-# there are exactly two such tokens in the corpus today — `just --list` (a
-# flag) and `just py-*` (prose about a family of recipes, not a call). Both are
-# real writing and neither is a recipe reference; narrowing the rule to exclude
-# them is what took this check from three findings to one.
+# Anything else in the argument position is deliberately *not* checked, and it
+# is a FAMILY rather than a short list: a flag (`just --list`), a glob naming a
+# family of recipes rather than calling one (`just py-*`), a metavariable
+# (`just <recipe>`), and a token whose trailing backtick or quote the span
+# regexes carry in. Narrowing the rule to exclude that family is what took this
+# check from three findings to one. **No count is written here** — this comment
+# said "exactly two such tokens in the corpus today" and was wrong by four,
+# which is the shape `CLAUDE.md` and PHASE5 §10 both name: a measurement in
+# prose beside no instrument.
+#
+# **The one skipped shape worth naming, because it is a real reference and not
+# prose:** `.github/workflows/nightly.yml`'s `just ${{ matrix.recipe }}`. Its
+# two values (`tsan`, `shm-torture-asan`) are recipe references this check does
+# not resolve — resolving them means reading `strategy.matrix`, which is more
+# YAML parsing than a version-skew gate should carry. Both are named in the
+# maintained documents and therefore checked by the doc arm above, so the hole
+# is currently covered from the other side; the day one of them stops being
+# documented, this note is what says the workflow arm never saw it.
 RECIPE_TOKEN_RE = re.compile(r"[a-z][a-z0-9-]*")
 
 # Root markdown, the phase specs, and the benchmark register. **`docs/decisions/`
@@ -517,6 +530,20 @@ def check_recipe_references() -> str:
                     doc_findings.append((str(rel), line, message))
     for _, _, message in sorted(doc_findings):
         fail(message)
+    # **Anti-vacuity, in the shape this file's own siblings use** — `if not X`,
+    # never a magnitude: `check_markdown_tables` floors on `if not tables` and
+    # the recipe census above on `if not recipes`. A number here would be one
+    # more measurement in prose with nothing re-taking it. What each of these
+    # catches is a scan that stopped matching: a moved doc tree, a `code_spans`
+    # or `JUST_CALL_RE` that no longer fires, a workflow directory that moved.
+    if not doc_files:
+        fail(f"DOC_GLOBS {DOC_GLOBS} matched no document; this check scanned nothing")
+    if not doc_checked:
+        fail(
+            "no `just <recipe>` reference was found in any maintained document.\n"
+            "    Every one of them resolving is not what that means — the "
+            "detector stopped matching."
+        )
 
     wf_checked = 0
     # Both spellings. Every workflow here is `.yml` today; a `.yaml` one that
@@ -545,6 +572,18 @@ def check_recipe_references() -> str:
                         f"    CI mirrors these recipes 1:1, so this is a job that "
                         f"will fail on `error: Justfile does not contain recipe`."
                     )
+
+    if not workflows:
+        fail(
+            ".github/workflows/ matched no `.yml` or `.yaml` file; the workflow "
+            "half of this check scanned nothing"
+        )
+    if not wf_checked:
+        fail(
+            "no `just <recipe>` reference was found in any workflow.\n"
+            "    CI mirrors these recipes 1:1 by invoking them, so a workflow "
+            "corpus with no `just` call in it means this scan stopped matching."
+        )
 
     return (
         f"{doc_checked} `just <recipe>` references in {len(doc_files)} documents and "

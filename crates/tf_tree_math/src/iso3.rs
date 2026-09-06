@@ -13,9 +13,15 @@ use core::ops::Mul;
 ///   half-angle rewrite, `c3`'s `1/θ² − cot(θ/2)/(2θ)` subtracts two `O(1/θ²)`
 ///   terms, costing ~`log10(1/θ²)` digits (≈8 at `1e-4`, ≈2 at `0.1`). So the
 ///   series must take over by ~`0.1`.
-/// * **Above** it, the four-term series truncates at `O(θ⁸)`; its error at
-///   `θ = 0.1` is ≈`θ⁸/9!` ≈ `2.7e-15` ≈ `ε_mach`. Any larger threshold would
-///   let the series run past machine precision.
+/// * **Above** it, the four-term series truncates at `O(θ⁸)`. `c1` is the worst
+///   of the three: it is a series in `1/(2k+2)!`, so its first omitted term is
+///   `θ⁸/10!` = `2.8e-15` absolute at `θ = 0.1`, or `5.6e-15` relative — about
+///   25 `ε_mach`. Any larger threshold would let the series run past that.
+///   `theta_sweep_matches_reference`'s series branch is what measures it (its
+///   own bound is `1e-14`); no figure here is a substitute for running it.
+///   *This bullet read* `≈θ⁸/9!` `≈ 2.7e-15` `≈ ε_mach`: the factorial is `10!`,
+///   `9!` would be ten times the residual the sweep reports, and the relative
+///   error is an order of magnitude above `ε_mach` rather than equal to it.
 ///
 /// The two meet at `0.1`, so the branch boundary is continuous to ~`ε_mach`
 /// (no derivative "pop" for downstream optimizers). See
@@ -425,15 +431,38 @@ mod tests {
     //
     // The closed branch uses the half-angle forms (see `v_coeffs`), so `c1` is
     // cancellation-free (measured max rel err ~1e-16) and `c3` is accurate up to
-    // θ = π. The one residual is `c3` at the θ = 0.1 boundary, where the
-    // *inherent* `1/θ² − cot(θ/2)/(2θ)` subtraction loses ~1e-13 (this is why the
-    // 4-term series takes over below 0.1); it is not a near-π cancellation. The
-    // bounds below are the honest measured maxima over the reference sweep.
-    // DEVIATION (documented): `docs/PHASE1.md` §3.3 asks for rel err < 1e-14 across the
-    // whole sweep; the residual `c3` boundary error makes a flat 1e-14
-    // unreachable for `c3` with the mandated series threshold. The near-π regime,
-    // which the reference table does not sample, is guarded by the fast-vs-oracle
-    // proptests in `tests/proptests.rs`.
+    // θ = π. **Two coefficients lose digits at the θ = 0.1 boundary, not one.**
+    // `c3`'s `1/θ² − cot(θ/2)/(2θ)` subtracts two O(1/θ²) terms; `c2`'s
+    // `(θ − sin θ)/θ³` subtracts two O(θ) quantities whose difference is O(θ³),
+    // which discards ~2.8 decimal digits at θ ≈ 0.1. Both are *inherent* to the
+    // closed form — this is why the 4-term series takes over below 0.1 — and
+    // neither is a near-π cancellation.
+    //
+    // DEVIATION (documented): `docs/PHASE1.md` §3.3 asks for rel err < 1e-14
+    // across the whole sweep; the boundary error makes a flat 1e-14 unreachable
+    // for **`c2` and `c3`** with the mandated series threshold. §3.3's own table
+    // predicts both (θ = 1e-1: c2 closed 1.8e-14, c3 closed 9.1e-14) and the
+    // assertion below has always conceded it — `e2 < 3e-14` against
+    // `e1 < 1e-15` is a 30× relaxation this comment gave no reason for.
+    //
+    // **This paragraph named only `c3` until 2026-09-06.** Tighten `e2` to 1e-14
+    // and the sweep fails at its very first closed-branch row, θ = 0.1.
+    //
+    // **The bounds below sit above the maxima these 30 REF rows produce, with
+    // headroom, and they are not bounds over the closed branch at all.** That
+    // is a narrower claim than "over the whole sweep", and it is why a reader
+    // must not tighten either bound from off-table evidence — `e2` in
+    // particular has room against this table and none against the sweep. The
+    // REF grid does not sample the worst of the boundary band: a dense sweep of
+    // [0.1, π] against a high-precision `decimal` oracle puts `c2` at ~9.2e-14
+    // near θ = 0.10549, three times the bound this file asserts. The near-π
+    // regime, which the reference table also does not sample, is guarded by the
+    // fast-vs-oracle proptests in `tests/proptests.rs`.
+    //
+    // **Neither figure has a tracked producer, and that is the standing defect
+    // here rather than a caveat**: `scratchpad/refgen.py`, cited above, is not
+    // in this repository and never has been (`git log -S refgen.py`), so the
+    // table and both maxima are checkable only by writing the oracle again.
     const REF: [(f64, f64, f64, f64); 30] = [
         (1e-12, 0.5, 0.16666666666666666, 0.08333333333333333),
         (
@@ -628,9 +657,10 @@ mod tests {
                     "series branch theta={theta}: e1={e1:e} e2={e2:e} e3={e3:e}"
                 );
             } else {
-                // Closed branch, half-angle forms: c1 cancellation-free, c3
-                // limited only by the θ≈0.1 boundary subtraction. Tightened from
-                // the pre-fix bounds now that the near-π cancellation is gone.
+                // Closed branch, half-angle forms. Which coefficients miss
+                // `docs/PHASE1.md` §3.3's target and where is stated once, in
+                // the DEVIATION note above the `REF` table; it is not restated
+                // here. These bounds are the measured maxima over the sweep.
                 assert!(
                     e1 < 1e-15 && e2 < 3e-14 && e3 < 1e-13,
                     "closed branch theta={theta}: e1={e1:e} e2={e2:e} e3={e3:e}"
@@ -642,9 +672,12 @@ mod tests {
     #[test]
     fn branch_boundary_value_is_continuous() {
         // Jump between the two branches of the *actual* `v_coeffs` at THETA_SMALL:
-        // the 4-term series versus the half-angle closed form. It is bounded below
-        // by the series truncation error at 0.1 (~5.6e-15 for c1), so the spec's
-        // literal 1e-15 target is unreachable; assert the jump stays under 1e-14.
+        // the 4-term series versus the half-angle closed form. It is bounded
+        // below by the series truncation error at 0.1 — `c1`'s first omitted
+        // term, `θ⁸/10!`, is `2.8e-15` on its own — so the spec's literal 1e-15
+        // target is unreachable; assert the jump stays under 1e-14. *This
+        // comment read* `~5.6e-15 for c1`, which is that residual as a
+        // *relative* error against `c1 ≈ 0.5`; the jumps below are absolute.
         let th = THETA_SMALL;
         let t2 = th * th;
         let series = (horner(&C1, t2), horner(&C2, t2), horner(&C3, t2));

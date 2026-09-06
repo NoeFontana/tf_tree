@@ -21,11 +21,17 @@ test-rust:
     # but the two `+nightly` rows of `just c-abi-check`, so on a machine without
     # a nightly toolchain the §5 seam had no gate at all.
     #
-    # **Counts, re-measured** — this comment said "nine entry points" and
-    # "21 tests" and both were stale. `grep -c 'extern "C" fn' bridge.rs` is 10;
-    # `cargo nextest run -p tf_tree_c --features bridge` runs **63** tests
-    # against **31** without the feature, so the feature is worth **32** tests
-    # that `cargo nextest run --workspace` never runs.
+    # **Counts, deleted rather than re-measured.** This comment said "nine entry
+    # points" and "21 tests", was corrected to ten and 63-against-31, and both
+    # test figures were stale again within the wave that corrected them. The
+    # instruments, which are cheap:
+    #
+    #     grep -c 'extern "C" fn' crates/tf_tree_c/src/bridge.rs
+    #     cargo nextest run -p tf_tree_c --features bridge   # against
+    #     cargo nextest run -p tf_tree_c                     # this
+    #
+    # The difference between the last two is what the feature is worth and what
+    # `cargo nextest run --workspace` never runs.
     #
     # This is the same shape `shm-check` exists for, one crate over: a
     # default-off feature is invisible to `--workspace`, and a file nobody
@@ -39,8 +45,11 @@ test-rust:
     # the ordinary reason `shm` is Linux-only and this recipe runs on the
     # aarch64 matrix.
     cargo nextest run -p tf_tree_c --features bridge
-    # **`crash-points` (`docs/PHASE2.md` §11.3) — eight tests `--workspace` does
-    # not run.** Same shape as the `bridge` row above and `just shm-check`: a
+    # **`crash-points` (`docs/PHASE2.md` §11.3) — tests `--workspace` does not
+    # run.** No count here either: this comment said "eight" and
+    # `cargo nextest list -p tf_tree_core --features crash-points | grep -c
+    # 'crash_tests::'` disagrees. Same shape as the `bridge` row above and
+    # `just shm-check`: a
     # default-off feature is invisible to `--workspace`, and a test nobody runs
     # is not a test. These re-execute the test binary as a child, arm one named
     # site through `TF_TREE_CRASH_AT`, and assert the child died of `SIGABRT` at
@@ -409,6 +418,16 @@ unsafe-budget:
     bash scripts/unsafe-budget.sh
 
 # Every runnable artifact is executed by a recipe or registered as a probe.
+#
+# **A name is not a call site**, and until 2026-09-06 every test in that script
+# was plain substring containment: `benches/lookup.rs` was excused by the recipe
+# name `profile-lookup` and `benches/push.rs` by the bare `push:` GitHub Actions
+# trigger key, so both were executed by nothing, registered nowhere and green.
+# It now matches the shapes that execute a target — a `--bench`/`--bin`/
+# `--example` selector, a `/`-prefixed path, `CARGO_BIN_EXE_`, `sibling_binary(`
+# — and requires a register hit to be a table ROW rather than any backticked
+# mention. The script's own header carries the class; a new spelling belongs in
+# its patterns, never in a widened test.
 evidence-audit:
     ./scripts/evidence-audit.sh
 
@@ -1267,9 +1286,17 @@ doc:
 # one whose failure invalidates the rest: if the tree has build output committed
 # in it, what clippy thinks of the source is not the interesting news.
 # `unsafe-budget` goes **last** among the dependencies for the opposite reason:
-# it is the one that compiles anything, and a contributor whose tree fails
-# `no-build-output` should hear about it in six milliseconds rather than after a
-# census.
+# it costs 9 s warm and 55 s cold, plus ~1 GiB of extra `target/` because
+# `RUSTFLAGS` is part of cargo's fingerprint — and a contributor whose tree
+# fails `no-build-output` should hear about it in six milliseconds rather than
+# after a census. **It is not the only dependency that compiles**: `py-compile`,
+# third on the same line, runs `cargo clippy --all-targets` over `tf_tree_py`,
+# and its own comment further down carries that measurement. What is distinctive
+# about `unsafe-budget` is the *workspace* under a second `RUSTFLAGS`
+# fingerprint; `py-compile` compiles a workspace-excluded crate into its own
+# target directory. The comment pins only the first and last positions and never
+# claimed a monotone cost ordering. No cost ranking is asserted here and none is
+# checked anywhere: run the recipes if you need one.
 
 # fmt, then one `clippy -D warnings` pass per feature configuration the
 # workspace pass compiles out, behind the cheap audits on the line below.
@@ -1300,6 +1327,11 @@ lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-ver
     # `tests/codec_free.rs` left `cargo clippy --workspace --all-targets -- -D warnings`
     # finishing clean, and this line failed on it.
     cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
+    # The CLI's own default-ON axis, and the only row here that had no comment of
+    # its own — it sat under the `tf_tree_ingest` block above and read as part of
+    # it. `tf_tree_cli`'s default features pull the ingest codecs in; without
+    # this row the `doctor --from-bag` paths that must still compile when they
+    # are absent are compiled by nothing.
     cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
     # **`pure-hash`, because every pass above compiles it out.** The feature is
     # off by default and swaps `blake3`'s backend, so nothing else here builds a
@@ -1315,7 +1347,7 @@ lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-ver
     # **`crash-points` (`docs/PHASE2.md` §11.3), for the same reason as every row
     # above it.** The feature is default-off and places named `abort()` sites in
     # the mutation protocols; the workspace pass compiles all of it out, so
-    # without this row the module and its eight feature-gated tests are code no
+    # without this row the module and its feature-gated tests are code no
     # gate can see — the state `tf_tree_py` was in when it shipped a
     # `transmute` that silently discarded a claim lease.
     #
@@ -1643,16 +1675,113 @@ bench-report-shm *ARGS:
 # `bench-baseline-update` depend on this recipe and pass that directory with
 # `--embed-cost`; `just bench-report --embed-cost target/embed-cost` reads the
 # same pair by hand.
+#
+# **`EMBED_COST_KNOWN_COLLAPSED=1` is a disclosed escape, currently set by CI's
+# `bench-gate` job.** The structural self-check below has been red since it was
+# written, on a defect in the code under test that predates it, and whose repair
+# is a trade nobody has priced. The escape keeps the recipe running and prints
+# the whole diagnosis plus a statement that the run's quotient is 1.0 by
+# construction; it is not a suppression and there is no quiet mode. It is
+# deleted by the commit that restores the row's independent variable — which is
+# also what makes `docs/API.md` §2.3's 2026-09-06 amendment stop applying.
 embed-cost:
     #!/usr/bin/env bash
     set -euo pipefail
     out=target/embed-cost
     mkdir -p "$out"
+    # **`${CARGO_TARGET_DIR:-target}`, not `./target/`**, for `release-archive`'s
+    # reason: a developer who exports `CARGO_TARGET_DIR` moves the binaries and
+    # not this path. Here that does not silently disable anything — the symbol
+    # lookup below refuses on a missing file — but it refuses for the
+    # environment rather than for its subject, which is the same defect one step
+    # further on.
+    bin_dir="${CARGO_TARGET_DIR:-target}"
     cargo build -q --profile embedder -p tf_tree_bench --features embed-probe --bin embed_cost
     cargo build -q --release -p tf_tree_bench --features embed-probe --bin embed_cost
-    taskset -c 2 ./target/embedder/embed_cost --json "$out/embedder.json"
-    taskset -c 2 ./target/release/embed_cost --json "$out/release.json"
-    ./target/release/embed_cost --compare "$out"
+    # **STRUCTURAL SELF-CHECK: is the crate boundary still this row's variable?**
+    #
+    # The row's entire design is that one identical three-line body is compiled
+    # twice, once in `tf_tree_bench` (numerator) and once in `tf_tree_core`
+    # (denominator), so the quotient is the boundary and nothing else. If the
+    # thing the boundary is supposed to interpose on stops being inlinable, both
+    # columns collapse to the same call stub around the same out-of-line symbol,
+    # the quotient is 1.0 **by construction**, and `Verdict::Over` becomes
+    # unreachable — the row keeps printing and can no longer fail. That is not
+    # hypothetical: it is the state `Plan::at_tagged` put the row in on
+    # 2026-08-29, undetected for a week, and `embed.rs`'s own module doc names
+    # this exact failure as the thing the row was built to avoid.
+    #
+    # Symbol SIZES, not bytes: byte comparison is toolchain-sensitive, and equal
+    # sizes are sufficient evidence of the collapse without needing to prove a
+    # boundary exists. `[profile.embedder]` sets `strip = "none"`, so both
+    # symbols are there by construction — `embed::one` is a private `fn` and
+    # links LOCAL (`t` in nm), so a future rustc that drops or hash-suffixes it
+    # takes this check's subject away, and an empty subject set REFUSES rather
+    # than passing (`just no-network`'s precedent).
+    #
+    # **The `awk` reads its input to the end and does not `exit` on the match.**
+    # An early `exit` makes `nm` die of SIGPIPE, and under `pipefail` the
+    # pipeline then reports 141 whether the symbol was found or not — so the
+    # check would REFUSE on every run, for a reason that has nothing to do with
+    # its subject. Measured here before it shipped; it is the same trap
+    # `scripts/evidence-audit.sh`'s own comment block records.
+    body_size() {
+        nm --print-size --defined-only -C "$bin_dir/embedder/embed_cost" \
+          | awk -v p="$1" '$4 == p { s = $2; found = 1 } END { if (!found) exit 1; print s }'
+    }
+    for sym in tf_tree_bench::embed::one tf_tree_core::bench_probe::depth3_lookup; do
+        body_size "$sym" >/dev/null || {
+            echo "embed-cost REFUSES: no symbol \`$sym\` in $bin_dir/embedder/embed_cost." >&2
+            echo "  This check has lost its subject. Re-cut it against whatever the two" >&2
+            echo "  columns are called now; do not delete it — an absent subject is" >&2
+            echo "  indistinguishable from a passing check, which is the defect it exists" >&2
+            echo "  to catch." >&2
+            exit 1
+        }
+    done
+    if [ "$(body_size tf_tree_bench::embed::one)" = "$(body_size tf_tree_core::bench_probe::depth3_lookup)" ]; then
+        echo "embed-cost: both columns compiled to the same body, so the crate boundary" >&2
+        echo "  is not this row's variable and the gate cannot fail." >&2
+        echo "  Confirm with:" >&2
+        echo "    nm -C --print-size --defined-only $bin_dir/embedder/embed_cost \\" >&2
+        echo "      | grep -E 'embed::one\$|bench_probe::depth3_lookup\$'" >&2
+        echo "    objdump -d -C $bin_dir/embedder/embed_cost   # both call one shared symbol" >&2
+        echo "  The cause on 2026-08-29 was \`Plan::at_tagged\` interposed between" >&2
+        echo "  \`Plan::at\` and the fold with no \`#[inline]\`, which makes both columns" >&2
+        echo "  a stub around one out-of-line symbol in \`tf_tree_core\`. Two ways out and" >&2
+        echo "  they are a trade, not a fix: mark \`at_tagged\` (read its doc comment" >&2
+        echo "  first — the one measurement anybody has taken says it costs instructions," >&2
+        echo "  and \`docs/API.md\` §2.3 prices the code-size half), or re-anchor the row" >&2
+        echo "  on an entry point that is still inlinable across the boundary, which" >&2
+        echo "  changes what \`docs/PHASE5.md\` §9.2 measures and is a decision record." >&2
+        # **`EMBED_COST_KNOWN_COLLAPSED` is the escape, and it is the thing to
+        # delete.** The collapse is a real, pre-existing defect in the code under
+        # test, not in this recipe, and the repair is a trade nobody has priced on
+        # a host that passes `Fitness::probe`. Without an escape this recipe — and
+        # through it `bench-check` and `bench-baseline-update`, and CI's
+        # `bench-gate` job — is red for as long as that decision is open, which is
+        # how a check gets deleted rather than answered. With it, the whole message
+        # above still prints on every run and the ratio below is disclosed as
+        # meaningless, so the escape is louder than the failure it replaces.
+        # **Delete this branch, and the `env:` block in `.github/workflows/ci.yml`
+        # that sets the variable, in the commit that restores the variable.**
+        if [ "${EMBED_COST_KNOWN_COLLAPSED:-}" = "1" ]; then
+            echo "" >&2
+            echo "  EMBED_COST_KNOWN_COLLAPSED=1 is set, so this run continues." >&2
+            echo "  READ THIS BEFORE READING THE NUMBERS BELOW: while the two bodies are" >&2
+            echo "  identical the quotient is 1.0 by construction. A \`within\` verdict from" >&2
+            echo "  this run is not evidence that the crate boundary is cheap; it is the" >&2
+            echo "  absence of a measurement. \`Verdict::Over\` is unreachable." >&2
+        else
+            echo "" >&2
+            echo "  Set EMBED_COST_KNOWN_COLLAPSED=1 to run anyway with that disclosure" >&2
+            echo "  printed; do not delete this check." >&2
+            exit 1
+        fi
+    fi
+    taskset -c 2 "$bin_dir/embedder/embed_cost" --json "$out/embedder.json"
+    taskset -c 2 "$bin_dir/release/embed_cost" --json "$out/release.json"
+    "$bin_dir/release/embed_cost" --compare "$out"
 
 # **fmt / clippy / tests for the default-off `embed-probe` configuration.**
 #
@@ -1973,7 +2102,10 @@ tf2-bench-baseline-update:
 # `tf2-bench-check` above builds with `cargo run --release`, so its
 # `lookup_ratio_vs_tf2` row is taken under *this workspace's*
 # `[profile.release]` — `lto = "thin"`, which inlines `Plan::at` across the
-# `tf_tree` crate boundary into the harness. A consumer does not get that build:
+# `tf_tree` crate boundary into the harness. (`Plan::at` specifically: LTO also
+# reaches `Plan::at_tagged` beneath it, which carries no `#[inline]` and is a
+# real call in a consumer's own default `--release` build. That asymmetry is the
+# whole reason this recipe runs both profiles.) A consumer does not get that build:
 # cargo applies the **top-level** package's profile to the whole dependency
 # graph, and cargo's own release defaults set no LTO. `[profile.embedder]` is
 # those defaults written out field by field.

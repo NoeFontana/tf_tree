@@ -80,7 +80,7 @@ fn ingest_prints_a_report_and_writes_json() {
     assert!(!stdout.contains(" ! "), "summary:\n{stdout}");
 
     let text = std::fs::read_to_string(&json).unwrap();
-    assert!(text.contains("\"schema\":\"tf_tree.ingest/1\""), "{text}");
+    assert!(text.contains("\"schema\":\"tf_tree.ingest/2\""), "{text}");
     assert!(text.contains("\"samples_pushed\":160"), "{text}");
     // The default cap is 4 096 **MiB**, so a 160-sample recording is one
     // re-read with nothing spilled. These two are the observable consequence of

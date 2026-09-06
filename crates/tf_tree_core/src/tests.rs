@@ -32,7 +32,6 @@ struct HeapRing {
     heartbeat: AtomicU64,
     stamps: Vec<AtomicI64>,
     poses: Vec<PoseSlot>,
-    mask: u64,
 }
 
 impl HeapRing {
@@ -49,7 +48,6 @@ impl HeapRing {
             heartbeat: AtomicU64::new(0),
             stamps,
             poses,
-            mask: (capacity as u64) - 1,
         }
     }
 
@@ -59,7 +57,6 @@ impl HeapRing {
             heartbeat: &self.heartbeat,
             stamps: &self.stamps,
             poses: &self.poses,
-            mask: self.mask,
             edge: EdgeId(0),
         }
     }

@@ -214,7 +214,10 @@ pub struct ReadPolicy {
 /// Counts of what the reader declined to decode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SkipCounts {
-    /// Messages on a TF-schema channel whose `message_encoding` was not `cdr`.
+    /// **Channels** carrying the TF schema whose `message_encoding` was not
+    /// `cdr` — counted once per channel id, not once per message, because
+    /// `Bookkeeping::seen_channels` deduplicates the Channel record MCAP repeats
+    /// in its summary section.
     pub non_cdr: u64,
     /// Top-level records over [`ReadPolicy::max_record_bytes`] that this reader
     /// does not need, and therefore stepped over instead of refusing the file.
@@ -231,7 +234,9 @@ pub struct SkipCounts {
     /// the skip disappears. What this number says is that the reader declined to
     /// look at part of the file and `--max-record-size` is what makes it look.
     pub oversized_records_skipped: u64,
-    /// Channels carrying the TF schema that the topic filter excluded.
+    /// Channels carrying the TF schema that the topic filter excluded — the
+    /// operator's own `--tf-topic`/`--tf-static-topic` narrowing, not a defect
+    /// in the recording. Counted once per channel id, as [`Self::non_cdr`] is.
     pub filtered_channels: u64,
     /// The recording ended mid-record: everything up to that point was read and
     /// the rest does not exist. See [`read_tf`].
@@ -374,9 +379,11 @@ where
     let file = File::open(path).map_err(|e| IngestError::Io {
         raw_os_error: e.raw_os_error().unwrap_or(0),
     })?;
-    // Read once, and only [`skip_body`] uses it: seeking past the end of a file
-    // succeeds, so a skip needs a length to compare against or it cannot tell a
-    // record it stepped over from one the file never held.
+    // Read once, at open: seeking past the end of a file succeeds, so a reader
+    // that steps over a record needs a length to compare against or it cannot
+    // tell a record it skipped from one the file never held. Snapshotted, so it
+    // is the length at open and not the length now — see the `complete` verdict
+    // below, which is taken on the declared length for that reason.
     let file_len = file
         .metadata()
         .map_err(|e| IngestError::Io {
@@ -523,8 +530,47 @@ where
             skips.oversized_records_skipped += 1;
             continue;
         }
-        // Infallible after `fits`, which is where the two bounds were checked.
-        let Ok(want) = usize::try_from(declared) else {
+        // **The buffer is sized against the file as well as against the ceiling,
+        // and `min` is the whole of it.**
+        //
+        // `fits` above bounds `declared` by `policy.max_record_bytes` and by
+        // nothing else, so until 2026-09-06 a nine-byte record header was
+        // believed on its own word: a seventeen-byte file declaring 256 MiB
+        // drove a 256 MiB `resize(want, 0)` — an allocation and a memset — before
+        // `read_full` discovered there were no bytes to fill it with. The ceiling
+        // is caller-widenable (`--max-record-size` saturates to `u64::MAX`), and
+        // past `isize::MAX` `reserve_exact` panics with "capacity overflow" while
+        // a merely enormous value aborts the process at the allocator: both are
+        // process death from a seventeen-byte file, in a crate that forbids
+        // `unsafe` and a workspace that denies `clippy::panic`.
+        //
+        // `file_len` is the file's own length, already read at open. It is the
+        // same comparison the two branches that do *not* allocate already make —
+        // `skip_body`'s `end <= file_len`, and `resyncs_here`' refusal of a
+        // header whose length exceeds the file — applied to the branch that does.
+        //
+        // **On a file whose length does not change it changes no outcome.** When
+        // `declared <= file_len`, `want` is what it always was. When
+        // `declared > file_len` the cursor is already past the eight-byte magic
+        // and this record's nine-byte header, so `got <= file_len - 17 < want`
+        // and `complete` is false exactly as it was before — the same truncation
+        // verdict, reached without the allocation. That argument assumes the
+        // length is still the one snapshotted at open; the `complete` block below
+        // names the case where it is not, which is why the verdict is taken on
+        // the *declared* length and the clamp only decides what is allocated.
+        //
+        // **What it does not do**, said here rather than implied: it bounds the
+        // buffer by the whole file rather than by the bytes remaining after this
+        // record's header, so a corrupt length near the end of a large recording
+        // still allocates up to `min(ceiling, file length)`. The tighter bound
+        // needs a running offset maintained beside the three `stream_position`
+        // calls this function already has — a second spelling of "where are we",
+        // which `CLAUDE.md` forbids — for a bound that is already at most the
+        // size of the file the caller handed us.
+        //
+        // Infallible after `fits`, which is where the two bounds were checked;
+        // the clamp only lowers `declared`, so it cannot make the narrowing fail.
+        let Ok(want) = usize::try_from(declared.min(file_len)) else {
             return Err(IngestError::RecordTooLarge {
                 declared,
                 ceiling: policy.max_record_bytes,
@@ -555,7 +601,17 @@ where
         // reader for whole records only would lose every transform in the final
         // chunk — up to a few megabytes of a real recording, and all of a small
         // one.
-        let complete = got == want;
+        //
+        // **Compared against `declared`, not against `want`.** They are the same
+        // number for every record whose body is in the file, and `want` is the
+        // clamped one — so `got == want` would call a record complete on the
+        // strength of a length this reader chose rather than the one the record
+        // stated. That is not reachable on a file whose length does not change
+        // (the cursor is already past the magic and this header, so `got` is
+        // strictly below `file_len`), and it is reachable on one being appended
+        // to as it is read, since `file_len` is snapshotted at open. Naming the
+        // declared length costs nothing and needs no such argument.
+        let complete = got as u64 == declared;
         if !complete {
             skips.truncated = true;
             body.truncate(got);

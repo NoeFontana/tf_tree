@@ -188,8 +188,12 @@
 //! sits across a crate boundary from every consumer, and it and the fold beneath
 //! it live one crate further down still, in `tf_tree_core`. Five functions on
 //! the evaluate path carry `#[inline]` for exactly that reason (`Plan::at`, the
-//! scalar fold, and the three [`Guard`] sampling entry points), but what an
-//! attribute buys depends on **your** profile, not on ours: cargo's
+//! scalar fold, and the three [`Guard`] sampling entry points) — **a true count
+//! and, since 2026-08-29, an incomplete explanation: `Plan::at_tagged` sits
+//! between the first and the second carrying no attribute, so your build still
+//! emits one real cross-crate call. Its doc comment says why that is deliberate
+//! and what measuring it costs.** What an attribute buys depends in any case on
+//! **your** profile, not on ours: cargo's
 //! `--release` defaults are `lto = false, codegen-units = 16`, and this
 //! workspace's are not, so every latency number this project publishes is taken
 //! under whole-program optimisation and your node's is not.

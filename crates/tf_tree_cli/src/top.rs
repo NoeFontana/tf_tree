@@ -341,7 +341,7 @@ impl Capture {
                 retained_count = usize::try_from(retained).unwrap_or(usize::MAX);
                 let mut prev: Option<i64> = None;
                 for i in (head - retained)..head {
-                    let s = ring.stamps[(i & ring.mask) as usize].load(Ordering::Relaxed);
+                    let s = ring.stamps[(i & ring.mask()) as usize].load(Ordering::Relaxed);
                     if oldest.is_none() {
                         oldest = Some(s);
                     }

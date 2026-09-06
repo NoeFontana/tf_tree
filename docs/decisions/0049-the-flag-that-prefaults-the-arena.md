@@ -226,6 +226,30 @@ measurement of the optimiser.
   including the shipped operator string.** Correcting the two documents and
   leaving `checks.rs` would be the worst outcome: the code is what an operator
   acts on, and `TFT016` has already been corrected once for giving bad advice.
+
+  **Nothing enforced that bullet when it was written, and every arm of the
+  string it is about was untested** — measured 2026-09-06 by inverting
+  `ShmemThp::honours_madvise`'s use in `fn tft016` and deleting `|MCL_ONFAULT`
+  from the memlock message, both of which left `cargo nextest run -p
+  tf_tree_cli` green. `checks::tests::every_tft016_arm_fires_and_the_two_corrected_strings_are_pinned`
+  now drives every arm from synthetic `HostFacts` (no `/sys`, no `/proc`) and
+  holds the shipped message to `docs/API.md` §8.3, which is where the wrong
+  advice was copied from: it `include_str!`s `docs/API.md`, takes the **first**
+  `mlockall(...)` under §8.3 — the recommendation the section leads with — and
+  compares its argument list, whitespace and backticks normalised, against the
+  message's. A normalised argument list rather than a `contains`, because the
+  two sites spell the same flags with different spacing and because
+  `contains("MCL_ONFAULT")` is satisfied by a message that names that flag and
+  drops one of the other two. **The first call rather than every call in the
+  span**: §8.3 quotes the withdrawn flags underneath the recommendation to say
+  what they do wrong — today without the `mlockall(` prefix, so a set over the
+  section happens to be a set of one — and this record spells them with the
+  prefix twice. Any comparison wide enough to reach a quotation reads it as a
+  second recommendation and goes red on an editorial change that says nothing
+  about the advice; taking the first call is what makes the guard indifferent
+  to one. Every other site that spells these flags is
+  guarded by review alone; `rg -l mlockall` is that list, and no count of it is
+  written here.
 - **`TFT016`'s comparison is unchanged; its message is narrower and now
   discloses that its silence is not a clearance.** The check gets quieter in no
   configuration — the firing condition is identical.

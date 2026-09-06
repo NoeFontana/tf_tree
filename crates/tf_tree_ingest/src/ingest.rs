@@ -502,8 +502,26 @@ pub struct Anomalies {
     pub stripped_slash_names: u64,
     /// Transforms whose parent or child name was empty, dropped.
     pub empty_names: u64,
-    /// Messages on a TF channel this build could not decode.
+    /// **Channels** carrying the TF schema that the operator's own
+    /// `--tf-topic`/`--tf-static-topic` narrowing excluded — one per channel id,
+    /// not one per message.
+    ///
+    /// **Nothing is wrong with the recording when this is non-zero**, which is
+    /// why it is its own number. Until 2026-09-06 it was the *sum* of this and
+    /// [`Self::non_cdr_channels`], documented as "messages on a TF channel this
+    /// build could not decode" and rendered into the JSON under the key
+    /// `undecodable_channels` — so a consumer pinning the schema read an
+    /// operator's own `--tf-topic` as a broken publisher, and the field doc was
+    /// wrong about the unit as well as about the cause.
     pub filtered_channels: u64,
+    /// **Channels** carrying the TF schema whose encoding this build cannot
+    /// decode — a `json` or `protobuf` channel under the TF schema name. One per
+    /// channel id.
+    ///
+    /// Separate from [`Self::filtered_channels`] because the two have different
+    /// remedies — nothing, against `--tf-topic` — exactly as
+    /// [`Self::chunks_over_limit`] is separate from [`Self::bad_chunks`].
+    pub non_cdr_channels: u64,
     /// The recording stopped mid-record: everything before the cut was read.
     ///
     /// Not a count, because it is not a quantity — the recording either ends
@@ -823,11 +841,15 @@ pub fn survey(
         Ok(())
     })?;
 
-    // Both terms, and the `+ non_cdr` is not decoration: a TF-schema channel
-    // this build cannot decode is skipped for a *different* reason than one the
-    // topic filter excluded, and the report's single "channels were skipped"
-    // line has to account for either or it under-reports silently.
-    out.anomalies.filtered_channels = skips.filtered_channels + skips.non_cdr;
+    // **Two fields, and the summary's single line is the sum of them.** A
+    // TF-schema channel this build cannot decode is skipped for a *different*
+    // reason than one the topic filter excluded, so the report's one "channels
+    // were skipped" line has to account for either or it under-reports silently
+    // — that argument is unchanged and lives in `IngestReport::summary`. What
+    // changed on 2026-09-06 is that the sum was also the only thing the JSON
+    // carried, under a key naming one of its two terms.
+    out.anomalies.filtered_channels = skips.filtered_channels;
+    out.anomalies.non_cdr_channels = skips.non_cdr;
     out.anomalies.truncated = skips.truncated;
     out.anomalies.bad_chunks = skips.bad_chunks;
     out.anomalies.chunks_over_limit = skips.chunks_over_limit;
@@ -899,8 +921,17 @@ pub struct FillStats {
     /// `--max-memory`. `1` is the ordinary case.
     pub passes: u32,
     /// Peak bytes of buffered **samples** across those passes — the sort
-    /// buffers, the spill path's merge windows and its encode/decode staging.
-    /// This is the number `--max-memory` bounds.
+    /// buffers, **the stable sort's own scratch**, the spill path's merge
+    /// windows and its encode/decode staging. This is the number `--max-memory`
+    /// bounds.
+    ///
+    /// The scratch term is an upper bound (one full extra copy of the buffer
+    /// being sorted) rather than a measurement of what the standard library
+    /// allocated, because that is not a contract. It is the same bound
+    /// `plan_groups` packs against, so the reported number and
+    /// the enforced one cannot drift. Until 2026-09-06 the term was in neither:
+    /// this field was computed from `buf.len() * SAMPLE_BYTES` before the sort
+    /// ran, so it read exactly the cap on runs that used 1.95× of it.
     pub peak_buffer_bytes: u64,
     /// Peak bytes of the spill path's *run index* — sixteen bytes per sorted
     /// run, live for as long as the file that holds them. `0` unless an edge
@@ -943,7 +974,18 @@ pub struct FillStats {
 /// |---|---|---|
 /// | The arena, from `builder.build()` | 78 B per sample, measured | **No** |
 /// | Pass two's sort buffers | `SAMPLE_BYTES` = 64 B per sample | Yes |
+/// | The **stable sort's own scratch** | up to another 64 B per sample of the largest buffer in the group | Yes, since 2026-09-06 — see `plan_groups` |
 /// | The spill path's run index | 16 B per sorted run | **No** — reported as [`FillStats::peak_run_index_bytes`] |
+///
+/// The third row is the one that was missing, and it was missing from the
+/// *budget* as well as from this table: `slice::sort_by_key` is stable and
+/// therefore allocates, the scratch is a sample buffer like the others, and it
+/// is live while every buffer this group has not drained yet is still held. The
+/// cap was overrun by up to 1.95× — measured, with a counting allocator, at
+/// every cap including the 4 GiB default. `plan_groups` reserves for it now
+/// and [`FillStats::peak_buffer_bytes`] reports it; the cost is that a group
+/// holds one edge fewer, and that an edge over half the cap takes the spill
+/// path.
 ///
 /// The arena is not capped because it *cannot* be: it is the output. Every
 /// sample the recording contains has to be resident in it for the index to
@@ -954,15 +996,24 @@ pub struct FillStats {
 /// only fewer samples would.
 ///
 /// What the cap removes is the *second* copy. Buffering the whole recording
-/// before sorting costs another 64 B per sample on top of the arena; splitting
-/// into groups replaces that with the cap. Measured here on a 90 000-sample,
-/// three-edge fixture (`tests/memory.rs`): 7 096 704 B of arena either way, and
-/// a peak of 142 B/sample in one pass against 121 B/sample at a 4 MiB cap. The
-/// saving is bounded by how finely the edges divide — three equal edges split
-/// 2–1, so this is close to the worst case — and it is paid for with one extra
-/// sequential re-read. That is the trade §3.1 asks for, reached without a
-/// temporary run-file to leak, to fill a different filesystem, or to leave
-/// behind when the process is killed.
+/// before sorting costs another 64 B per sample on top of the arena, plus the
+/// sort's scratch for the largest edge; splitting into groups replaces that with
+/// the cap. Measured here on a 90 000-sample, three-edge fixture
+/// (`tests/memory.rs`): 7 096 704 B of arena either way, and a peak of
+/// **164 B/sample** in one pass against **121 B/sample** at a 4 MiB cap. The
+/// saving is bounded by how finely the edges divide — three equal edges are one
+/// per group under the reserve, so this is close to the worst case — and it is
+/// paid for with two extra sequential re-reads. That is the trade §3.1 asks for,
+/// reached without a temporary run-file to leak, to fill a different filesystem,
+/// or to leave behind when the process is killed.
+///
+/// **The 164 was 142 until the sort's scratch was counted**, and the capped 121
+/// did not move: two buffers of 1 920 000 B is the same peak as one buffer plus
+/// its own scratch. The uncapped figure is also where "the arena is the larger
+/// of the two" stops holding on *this* fixture — 85.3 B/sample of buffer against
+/// 78.9 of arena — because the scratch is a per-group term rather than a
+/// per-sample one and is largest exactly when the edges are few and equal. The
+/// per-sample rates in the table above are unchanged.
 ///
 /// Grouping's smallest unit is an edge, so it cannot serve a **single** edge
 /// whose samples exceed the cap on their own — at the default 4 GiB, 67 million
@@ -1075,13 +1126,27 @@ pub fn fill(
             Ok(())
         })?;
 
-        let live: u64 = buffers
+        // **The peak is inside the drain loop, not before it.** The number this
+        // line used to record was `sum(buffers)` computed here, which is every
+        // sample buffer and none of the sort's own scratch — so the report said
+        // 1 048 576 at a 1 048 576 B cap while the process used 2 046 121.
+        // `buffers` is drained by value, so at the k-th buffer the ones after it
+        // are still owned by the iterator: the peak is
+        // `remaining + scratch(k)`, and `plan_groups` reserves for exactly that.
+        let mut remaining: u64 = buffers
             .values()
             .map(|b| b.len() as u64 * SAMPLE_BYTES)
             .sum();
-        stats.peak_buffer_bytes = stats.peak_buffer_bytes.max(live);
 
         for (slot, mut buf) in buffers {
+            let held = buf.len() as u64 * SAMPLE_BYTES;
+            // **The bound, not a measurement of the standard library.** A stable
+            // sort's auxiliary allocation is not part of `slice::sort_by_key`'s
+            // contract; one full copy is the worst case for a merge-based one and
+            // is what today's implementation takes. Reporting the bound is what
+            // makes this number safe to size a container against — and it is the
+            // same number `plan_groups` packed against, so the two cannot drift.
+            stats.peak_buffer_bytes = stats.peak_buffer_bytes.max(remaining + held);
             // **Stable** sort, and that is what makes "last wins" mean the last
             // occurrence *in the recording*. An unstable sort would pick an
             // arbitrary one of two duplicates, so ingesting the same bag twice
@@ -1118,6 +1183,9 @@ pub fn fill(
                     .map_err(IngestError::Push)?;
                 stats.pushed += 1;
             }
+            // `buf` is dropped here, so the next iteration's peak is over one
+            // buffer fewer.
+            remaining -= held;
         }
     }
     Ok((tree, stats))
@@ -1140,6 +1208,45 @@ enum Group {
 /// the cap on its own becomes a [`Group::Spilled`] of its own rather than
 /// joining a group it would blow — grouping cannot subdivide an edge, which is
 /// the whole reason the spill path exists.
+///
+/// # The reserve, and why "fits" is not `sum <= cap`
+///
+/// `fill` sorts each buffer with [`slice::sort_by_key`], which is **stable** for
+/// the reason §3.2 needs it to be — and a stable sort allocates. The scratch is
+/// a *sample* buffer like the others, up to one full extra copy of the buffer
+/// being sorted, and it is live at the peak: `fill` drains a `BTreeMap` by
+/// value, so every buffer it has not reached yet is still owned by the iterator
+/// while the current one is sorted.
+///
+/// So the peak of one group is `sum(buffers) + max(scratch)`, and the largest
+/// scratch is the largest buffer's. Packing against `sum <= cap` therefore
+/// overran the cap by up to **1.95×** — measured on `tests/memory.rs`'s own
+/// fixture with a counting allocator, before this reserve existed: at
+/// `--max-memory 1048576` the report said exactly 1 048 576 and the process used
+/// 2 046 121 B. That is not an accounting error to be papered over in the
+/// report: §3.1's motivating user "will not accept an OOM", and a cap exceeded
+/// by a factor of two is not a cap.
+///
+/// **The reserve is the group's largest member, not half the cap.** Those are
+/// the same number only for a group of one; for the ordinary case of many edges
+/// it costs one edge's worth of a bin rather than half of it, and a bin is a
+/// whole re-read of the recording. What it does cost is real and is stated here
+/// rather than discovered: a recording whose edges are near the cap gets one
+/// more group than it used to, and an edge between `cap / 2` and `cap` now takes
+/// the spill path — it cannot be sorted in memory inside the cap on its own.
+///
+/// **The reserve is an upper bound rather than a contract.** The standard
+/// library does not promise how much a stable sort allocates; one full copy is
+/// the worst case for a merge-based one, and the current implementation stays
+/// inside it. Reserving the bound rather than any measurement of today's
+/// heuristic is what keeps this from depending on it — a formula for what std
+/// allocates would be a second thing to keep true across toolchains, and the
+/// reserve does not rest on one.
+///
+/// The other route — a sort that allocates nothing — would cost 4-8 B per sample
+/// of explicit arrival index instead of 64, and would move `spill::ENCODED`,
+/// which is a run-file width with its own `size_of` test. It is a decision
+/// record rather than a patch, and `CLAUDE.md`'s workflow says so.
 fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
     // The *effective* cap, not the requested one: the spill path raises anything
     // below `spill::MIN_CAP` to it, so deciding "does this edge fit?" against
@@ -1150,12 +1257,17 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
     let mut cur_bytes = 0u64;
-    let flush = |cur: &mut Vec<usize>, cur_bytes: &mut u64, groups: &mut Vec<Group>| {
-        if !cur.is_empty() {
-            groups.push(Group::InMemory(core::mem::take(cur)));
-        }
-        *cur_bytes = 0;
-    };
+    // The largest buffer in the group being packed — the sort scratch this
+    // group has to leave room for. See the reserve section above.
+    let mut cur_max = 0u64;
+    let flush =
+        |cur: &mut Vec<usize>, cur_bytes: &mut u64, cur_max: &mut u64, groups: &mut Vec<Group>| {
+            if !cur.is_empty() {
+                groups.push(Group::InMemory(core::mem::take(cur)));
+            }
+            *cur_bytes = 0;
+            *cur_max = 0;
+        };
     // **First-fit *decreasing*, and the bin is the expensive thing.** Every
     // `Group::InMemory` is one whole re-read of the recording — reopen, re-walk,
     // re-decompress, re-CDR-decode — so a bin saved is the largest saving
@@ -1182,23 +1294,38 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
             continue;
         }
         let need = e.samples.saturating_mul(SAMPLE_BYTES);
-        if need > cap {
+        // **`2 * need`, not `need`**: an edge alone in a group still pays for its
+        // own sort scratch, so one at `0.9 * cap` peaks at `1.8 * cap` in memory
+        // and belongs on the spill path, whose budget subdivides it.
+        if need.saturating_mul(2) > cap {
             // Emitted in place in the **packing** order, not the canonical one —
             // so the spilled edge still keeps a fixed position and the number of
             // re-reads stays a function of the survey alone. `rank` is the tie
             // break, which is what makes "fixed" mean deterministic here rather
             // than merely stable.
-            flush(&mut cur, &mut cur_bytes, &mut groups);
+            flush(&mut cur, &mut cur_bytes, &mut cur_max, &mut groups);
             groups.push(Group::Spilled(i));
             continue;
         }
-        if cur_bytes + need > cap {
-            flush(&mut cur, &mut cur_bytes, &mut groups);
+        // `sum + max(scratch)`, and the largest scratch in a group is the largest
+        // buffer's. `packing` is decreasing, so `cur_max` is this group's first
+        // member; the `max` is written out anyway, because the invariant is about
+        // the group's contents and not about the packing order.
+        // Saturating, for the same reason `need` is: `cap` is a caller knob that
+        // reaches `u64::MAX`, and this sum grew a term. Saturation flushes, which
+        // is the safe direction.
+        if cur_bytes
+            .saturating_add(need)
+            .saturating_add(cur_max.max(need))
+            > cap
+        {
+            flush(&mut cur, &mut cur_bytes, &mut cur_max, &mut groups);
         }
         cur.push(i);
         cur_bytes += need;
+        cur_max = cur_max.max(need);
     }
-    flush(&mut cur, &mut cur_bytes, &mut groups);
+    flush(&mut cur, &mut cur_bytes, &mut cur_max, &mut groups);
     groups
 }
 
@@ -1268,9 +1395,13 @@ fn fill_spilled(
         spill::sort_run(&mut buf);
         runs.write_run(&buf)?;
     }
+    // **Twice the run buffer.** `spill::sort_run` is stable and allocates, and it
+    // runs with `buf` at capacity and the staging buffer live, so the resident
+    // peak of the spill phase is the buffer, its scratch and the staging.
+    // `spill::spill_budget` sizes the run against the same arithmetic.
     stats.peak_buffer_bytes = stats
         .peak_buffer_bytes
-        .max(run_samples as u64 * SAMPLE_BYTES + staging as u64);
+        .max(2 * run_samples as u64 * SAMPLE_BYTES + staging as u64);
     stats.peak_run_index_bytes = stats.peak_run_index_bytes.max(runs.index_bytes());
     stats.spilled_runs = stats.spilled_runs.saturating_add(runs.runs() as u32);
     stats.spilled_bytes += runs.bytes();
@@ -1453,10 +1584,18 @@ mod tests {
     }
 
     /// A cap smaller than the dataset splits the edges across several passes,
-    /// and no group exceeds the cap.
+    /// and no group's **peak** exceeds the cap.
+    ///
+    /// The peak is `sum(buffers) + max(buffer)`, not `sum(buffers)`: `fill`
+    /// sorts each buffer with a stable sort, which allocates, while every
+    /// buffer it has not drained yet is still held. Asserting the sum alone is
+    /// what let the cap be overrun by up to 1.95× — this assertion was
+    /// `bytes <= cap` until 2026-09-06 and passed throughout.
     ///
     /// Mutant: change the flush condition to `cur_bytes + need > cap * 2` —
     /// applied, and the per-group budget assertion failed at 2 × cap.
+    /// Mutant 2: drop the reserve (`cur_bytes + need > cap`) — applied, and this
+    /// failed with `group [0, 1] peaks at 1920 > 1600`.
     #[test]
     fn groups_respect_the_cap() {
         let s = survey_with(&[10, 10, 10, 10]);
@@ -1467,13 +1606,15 @@ mod tests {
         let mut seen: Vec<usize> = Vec::new();
         for g in &groups {
             let Group::InMemory(slots) = g else {
-                panic!("no edge here exceeds the cap alone: {g:?}")
+                panic!("no edge here exceeds half the cap alone: {g:?}")
             };
-            let bytes: u64 = slots
+            let each: Vec<u64> = slots
                 .iter()
                 .map(|&i| s.edges[i].samples * SAMPLE_BYTES)
-                .sum();
-            assert!(bytes <= cap, "group {slots:?} needs {bytes} > {cap}");
+                .collect();
+            let bytes: u64 = each.iter().sum();
+            let peak = bytes + each.iter().copied().max().unwrap_or(0);
+            assert!(peak <= cap, "group {slots:?} peaks at {peak} > {cap}");
             seen.extend(slots);
         }
         // Every non-empty edge appears exactly once.
@@ -1481,11 +1622,44 @@ mod tests {
         assert_eq!(seen, vec![0, 1, 2, 3]);
     }
 
+    /// An edge over **half** the cap cannot be sorted in memory inside it, so it
+    /// takes the spill path.
+    ///
+    /// A group of one still pays for its own sort scratch: 15 samples is 960 B,
+    /// and sorting them peaks at 1 920 against a 1 600 B cap. The old threshold
+    /// was `need > cap`, which admitted exactly this edge and then overran by
+    /// 1.2× — and by up to 1.95× as the edge approaches the cap.
+    ///
+    /// **This is the visible cost of the reserve**, and it is a real one: an edge
+    /// between `cap / 2` and `cap` now writes a run file where it used to sort in
+    /// memory. `spill`'s module docs say why that is second choice.
+    ///
+    /// Mutant: restore `if need > cap` — applied, and this failed with
+    /// `[InMemory([0])]`.
+    #[test]
+    fn an_edge_over_half_the_cap_takes_the_spill_path() {
+        let s = survey_with(&[15]);
+        let order: Vec<usize> = (0..s.edges.len()).collect();
+        assert_eq!(
+            plan_groups(&s, &order, 25 * SAMPLE_BYTES),
+            vec![Group::Spilled(0)],
+            "a group of one peaks at twice its buffer"
+        );
+        // The control: a hair under half the cap still sorts in memory, so the
+        // assertion above is about the threshold and not about a planner that
+        // spills everything.
+        let s = survey_with(&[12]);
+        assert_eq!(
+            plan_groups(&s, &order, 25 * SAMPLE_BYTES),
+            vec![Group::InMemory(vec![0])]
+        );
+    }
+
     /// One edge larger than the whole cap becomes a spilled group of its own —
     /// grouping cannot subdivide an edge, so this is the case §3.1's run file
     /// exists for.
     ///
-    /// Mutant: delete the `if need > cap` arm — applied, and this failed with
+    /// Mutant: delete the over-cap arm — applied, and this failed with
     /// `InMemory([0, 1])`, a group 3× over budget, instead of the two groups
     /// asserted here.
     #[test]

@@ -586,7 +586,6 @@ impl<'a> ArenaView<'a> {
             heartbeat: &claim.heartbeat,
             stamps,
             poses,
-            mask: (cap as u64) - 1,
             edge: id,
         })
     }

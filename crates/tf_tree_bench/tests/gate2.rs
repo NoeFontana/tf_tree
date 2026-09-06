@@ -15,13 +15,17 @@
 //! | `--gate --budget-ms <tiny>` | the **budget** check alone can fail: scale invariance passes and the verdict is still red |
 //! | `--gate --no-evict` | a **gated** run REFUSES when its eviction did not take, rather than publishing a resident number as an evicted one (an ungated one voids the arm and says so — the evicted arm gates nothing, and a RAM-backed filesystem is an environment rather than a defect) |
 //! | a fixture under 233 MB, with `--gate` | the gate-scale floor REFUSES, rather than passing 10 ms trivially |
+//! | two fixtures under 8x apart, with `--gate` | the **span** floor REFUSES: the scale-invariance arm would be comparing an open with itself |
+//! | `--gate --budget-ms 1000` on an unmodified open | REFUSED: a gated PASS against a budget **above** the criterion's own is a verdict about the argument. The same flag on a run that still FAILS — the scale-only case above — is untouched |
 //!
-//! **Why the first five share one fixture and one test.** The freeze of a
+//! **Why every case above but the last shares one fixture and one test.** The freeze of a
 //! gate-scale `.tft` is ~1.4 s and ~338 MiB of disk; the measurements
 //! themselves are milliseconds. nextest runs each `#[test]` in its own process,
-//! so five tests would be five freezes and 1.7 GB. They are five separate
-//! assertions with five separate messages against one fixture, driven in
-//! sequence. `tests/gate4.rs` splits its cases because its fixture is 2 MiB.
+//! so a test apiece would be a freeze apiece. They are separate assertions with
+//! separate messages against one fixture, driven in sequence — including the
+//! two floors, which `bail!` before `measure` runs and so touch no file, no page
+//! cache and no ordering. `tests/gate4.rs` splits its cases because its fixture
+//! is 2 MiB.
 //!
 //! # The mutants, seeded and observed
 //!
@@ -35,7 +39,13 @@
 //!   the floor test below;
 //! * `scale_invariant` rewritten to `true` — caught by the
 //!   `--prefault --budget-ms 1000` assertion, which is the case that exists so
-//!   the budget cannot cover for it.
+//!   the budget cannot cover for it;
+//! * `if false && d.gate && small_bytes.saturating_mul(SCALE_SPAN) > large_bytes`
+//!   — caught by the same-fixture case, which until it was written was the one
+//!   declared refusal in this binary that nothing had ever driven;
+//! * `if false && d.gate && budget_ok && scale_ok && d.budget_ms > BUDGET_MS`
+//!   — caught by the `--budget-ms 1000` case, which then observes the
+//!   `PASS (gated)` at exit 0 the refusal exists to prevent.
 //!
 //! Requires `--features shm` (`Tree::open_frozen` is `shm`-gated, and the
 //! evicted arm is Linux page cache). Run: `just shm-check`.
@@ -220,6 +230,62 @@ fn the_verdict_can_go_red_and_each_half_can_do_it_alone() {
         stdout_of(&unevicted)
     );
 
+    // **The span floor, gate 2's second anti-vacuity refusal.** The
+    // scale-invariance arm compares an open at two index sizes; driven with the
+    // same fixture on both sides it compares an open with itself and cannot
+    // fail. It needs no new fixture and no second freeze — the floor `bail!`s
+    // before `measure` runs, so it touches no file and no page cache.
+    let large = dir.join("index.tft").display().to_string();
+    let narrow = drive(&as_args(&with(
+        &base,
+        &["--gate", "--small-tft", large.as_str()],
+    )));
+    let err = String::from_utf8_lossy(&narrow.stderr).into_owned();
+    assert!(
+        !narrow.status.success(),
+        "two fixtures of the same size must refuse under --gate; got:\n{}{err}",
+        stdout_of(&narrow)
+    );
+    assert!(
+        err.contains("apart"),
+        "the refusal must name the span it is refusing on; got:\n{err}"
+    );
+    assert!(
+        !stdout_of(&narrow).contains("gate 2 — PASS"),
+        "a refused run must publish no verdict; got:\n{}",
+        stdout_of(&narrow)
+    );
+
+    // **A loosened `--budget-ms` may not produce a gated PASS.** `SCALE_BOUND`
+    // is a constant and `--budget-ms` is not, so a raised budget is the one
+    // argument a caller could use to green a run. Refused in that direction
+    // only: the `--prefault --budget-ms 1000` case above passes the same
+    // loosened budget and is untouched, because that run still FAILS.
+    let loosened = drive(&as_args(&with(&base, &["--gate", "--budget-ms", "1000"])));
+    let err = String::from_utf8_lossy(&loosened.stderr).into_owned();
+    assert!(
+        !loosened.status.success(),
+        "a gated PASS against a budget above the criterion's own must refuse; got:\n{}{err}",
+        stdout_of(&loosened)
+    );
+    assert!(
+        err.contains("REFUSED — --budget-ms"),
+        "the refusal must name the flag that caused it; got:\n{err}"
+    );
+    assert!(
+        !stdout_of(&loosened).contains("GATED"),
+        "a refusal must print neither the gated comparisons nor a verdict; got:\n{}",
+        stdout_of(&loosened)
+    );
+    // The same loosened budget, ungated, still reports a PASS at exit 0 — what
+    // the refusal closes is the gate, not the flag.
+    let reported = drive(&as_args(&with(&base, &["--budget-ms", "1000"])));
+    let out = stdout_of(&reported);
+    assert!(
+        reported.status.success() && out.contains("§12 gate 2 — PASS (reported)"),
+        "got:\n{out}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -229,6 +295,9 @@ fn the_verdict_can_go_red_and_each_half_can_do_it_alone() {
 /// 10 ms for reasons that have nothing to do with this design. A gate whose
 /// subject is too small to fail is green exactly when it checked nothing, so
 /// the floor refuses rather than passing.
+///
+/// The same fixture pair is 1.05x apart, so ungated it also trips the **span**
+/// disclosure — the two floors are independent and this pair is under both.
 #[test]
 fn a_fixture_below_the_criterions_own_scale_is_refused_rather_than_passed() {
     let dir = scratch("floor");
@@ -264,6 +333,15 @@ fn a_fixture_below_the_criterions_own_scale_is_refused_rather_than_passed() {
     let out = stdout_of(&reported);
     assert!(reported.status.success(), "got:\n{out}");
     assert!(out.contains("NOT AT GATE SCALE"), "got:\n{out}");
+    // **Both ungated disclosures, and this fixture pair trips both.** 2.2 MiB
+    // and 2.1 MiB are 1.05x apart, so the scale-invariance line is comparing an
+    // open with itself; it printed a `GATED` prefix over that with nothing said
+    // until the disclosure was added.
+    assert!(
+        out.contains("SPAN TOO NARROW"),
+        "an ungated run over two fixtures under 8x apart must say the scale line cannot \
+         fail; got:\n{out}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

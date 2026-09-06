@@ -490,7 +490,11 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
 /// The closed form is `Cₙ = 2ⁿ⁺¹ / ((n+1)²·C(2n+2, n+1))`; deriving each term
 /// from it rather than by hand is the only reliable way to get eight right. The
 /// shipped `C₇` was `128/315315` until a review caught it — the correct value is
-/// `2/6435`, 31% smaller. Inside the θ ≤ 0.15 fast path the term contributes
+/// `2/6435`, exactly `49/64` of the shipped one (23% smaller). *This read
+/// "31% smaller", which is the reciprocal comparison stated in the wrong
+/// direction: `128/315315` is 30.6% larger than `2/6435`. A paragraph whose
+/// subject is a coefficient error caught by review is a bad place for
+/// arithmetic nobody checked.* Inside the θ ≤ 0.15 fast path the term contributes
 /// ~1e-17 relative, so no test could see it and no result was ever wrong; at
 /// θ = 0.3 it is the difference between 3.2e-14 and 1.2e-15. It mattered because
 /// the "exact to `f64`" claim above is what any future threshold increase would
@@ -689,7 +693,11 @@ mod tests {
             .fold(0.0f64, f64::max);
         assert!(
             worst > 1e-15,
-            "the series is accurate at theta=0.9; the threshold could be raised \
+            // The θ is interpolated, not spelled: the literal here read
+            // `theta=0.9` — twice the value the probe above actually uses —
+            // from the commit that introduced both lines, so the one thing a
+            // maintainer sees when this fires named a θ the test never probes.
+            "the series is accurate at theta={theta}; the threshold could be raised \
              (worst rel err {worst:e}) — re-derive it from a sweep"
         );
     }

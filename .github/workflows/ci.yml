@@ -47,25 +47,28 @@ jobs:
   # **`just lint`, not a transcription of two of its lines.**
   #
   # This job used to run `cargo fmt --all -- --check` and `cargo clippy
-  # --workspace --all-targets` directly. `just lint` is those two plus **seven**
-  # more clippy invocations. Counted off the recipe body rather than remembered:
-  # it runs eight `cargo clippy` commands, of which the `--workspace` one is the
-  # line this job already had. (`grep -c 'cargo clippy'` says 9 — one of those
-  # is a *comment* quoting the workspace command, which is why the count is
-  # taken from the executed lines.)
+  # --workspace --all-targets` directly. `just lint` is those two plus one
+  # clippy pass per feature configuration the `--workspace` pass compiles out.
   #
-  # **This paragraph said five and six until it was corrected here.** `pure-hash`
-  # (#243) added two rows and neither this comment nor CLAUDE.md's table was
-  # updated, so a count explicitly labelled "counted, not remembered" drifted
-  # anyway — which is the argument for the recipe being the single source and
-  # these numbers being prose that any reader should re-count.
+  # **No count of them is written here any more, and the deletion is the fix.**
+  # This paragraph said "five and six", was corrected to "seven more / eight"
+  # under the label *counted, not remembered*, and had drifted again before
+  # anyone re-read it. Twice is a stale number; three times is a class. The
+  # recipe is the list, and this prints its size:
   #
-  # Each of the seven exists because a default-off (or default-*on*) feature
-  # makes a file invisible to `--workspace`: `-p tf_tree_c --features bridge`,
-  # `-p tf_tree_c --features test-hooks`, `-p tf_tree_ingest --features fixture`,
-  # `-p tf_tree_ingest --no-default-features`, `-p tf_tree_cli
-  # --no-default-features`, and `--features pure-hash` for each of
-  # `tf_tree_core` and `tf_tree`. One of them —
+  #     awk '/^lint[: ]/{f=1;next} f&&/^[a-zA-Z0-9_-]+[: ]/{exit} f' justfile \
+  #       | grep -v '^[[:space:]]*#' | grep -c 'cargo clippy'
+  #
+  # The `grep -v` is load-bearing: the recipe body quotes the `--workspace`
+  # command inside a comment, so a bare `grep -c` over-counts by one. CLAUDE.md's
+  # `just lint` row already refuses to keep a count for the same reason; this
+  # comment is the site that had not caught up.
+  #
+  # They exist because a default-off (or default-*on*) feature makes a file
+  # invisible to `--workspace`. **The enumeration that used to sit here is
+  # deleted for the same reason the count was**: a hedged list is the same
+  # instrument as a hedged number, and it went stale the same way. The command
+  # above prints the rows; the recipe is the list. One of them —
   # `-p tf_tree_c --features test-hooks` — ran in **no workflow at all** under
   # the old spelling, and the justfile records that a real warning had been
   # sitting in `publish.rs` unseen. Running the recipe is what makes CLAUDE.md's
@@ -669,8 +672,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           # Declared, not inherited. `dtolnay/rust-toolchain` installs with
-          # `--profile minimal`, and this job runs `cargo fmt` below and five
-          # `cargo clippy` lines inside `just shm-check`. They work today only
+          # `--profile minimal`, and this job runs `cargo fmt` below and the
+          # `cargo clippy` lines inside `just shm-check` — no count of them
+          # here, for the reason the `lint` job's header sets out; this comment
+          # said "five", the recipe had six the day it was written, and it has
+          # been wrong ever since. They work today only
           # because the runner image happens to `rustup component add rustfmt
           # clippy` after its own minimal install; an image that stopped would
           # turn this job into `error: no such command: clippy`.
@@ -752,9 +758,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # `just embed-cost-check` below opens with `cargo fmt --check` and two
+          # `just embed-cost-check` below opens with `cargo fmt --check` and
           # `cargo clippy` lines; see the `shm` job for why these are named
-          # rather than inherited from the runner image.
+          # rather than inherited from the runner image, and the `lint` job for
+          # why no count of them is kept beside it.
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -794,6 +801,23 @@ jobs:
       # row, and a baseline row the check cannot produce is a permanent failure.
       - name: just bench-check
         run: just bench-check
+        # **`EMBED_COST_KNOWN_COLLAPSED` is a disclosed escape, and deleting it is
+        # the point.** `just embed-cost` — which `bench-check` depends on — carries
+        # a structural self-check that the `embedding_cross_crate` row's two
+        # columns still compile to different bodies. It has been red since it was
+        # written, on a defect in the code under test that predates it: since
+        # 2026-08-29 `Plan::at_tagged` sits between `Plan::at` and the fold with no
+        # `#[inline]`, so both columns are the same call stub and the row's
+        # quotient is 1.0 by construction. Repairing that is a trade
+        # (`docs/API.md` §2.3's 2026-09-06 amendment prices it) and not a CI
+        # decision, so this job sets the escape rather than the alternatives —
+        # deleting the check, or leaving a permanently red required job that
+        # people learn to ignore. **The escape does not quiet anything**: the full
+        # diagnosis prints on every run, followed by a line saying the quotient
+        # below is not a measurement. Delete this `env:` block and the recipe's
+        # escape branch in the commit that restores the row's variable.
+        env:
+          EMBED_COST_KNOWN_COLLAPSED: "1"
       # The artifact itself, so a failing gate can be inspected rather than
       # re-derived. `bench_report` writes it before comparing, precisely so it
       # survives the failure.

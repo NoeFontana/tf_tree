@@ -841,7 +841,7 @@ impl Observations {
                 events.push(PushSample {
                     edge: e.id,
                     writer_pid: e.owner_pid,
-                    stamp_ns: ring.stamps[(i & ring.mask) as usize].load(Ordering::Relaxed),
+                    stamp_ns: ring.stamps[(i & ring.mask()) as usize].load(Ordering::Relaxed),
                     arrival_delay_ns: 0,
                 });
             }

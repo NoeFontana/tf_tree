@@ -518,19 +518,24 @@ Stamps live in a **separate** array of `AtomicI64`, so binary search touches 8 s
 >   `head` at every quiescent point because `head` is written in exactly one
 >   place and never reset. The stored value is identical. Measured 8.66 → 4.65
 >   ns/push.
+> - **`self.mask()`**, where this listing used to read `self.mask`. `SampleRing`
+>   stored the ring capacity twice — as `poses.len()` and as a `pub mask: u64`
+>   whose relationship to it nothing enforced — and a ring built with the two
+>   disagreeing returns a silently wrong pose rather than an error. The mask is
+>   derived from `poses.len()` now; the arithmetic is identical.
 >
-> The ordering annotations remain NORMATIVE as written; neither correction
-> weakens one.
+> The ordering annotations remain NORMATIVE as written; none of these
+> corrections weakens one.
 
 ```rust
 // NORMATIVE ordering annotations.
 fn push(&mut self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
     let h = self.rec.head.load(Ordering::Relaxed);   // single writer: Relaxed is correct
     if h > 0 {
-        let last = self.stamps[((h - 1) & self.mask) as usize].load(Ordering::Relaxed);
+        let last = self.stamps[((h - 1) & self.mask()) as usize].load(Ordering::Relaxed);
         if stamp < last { return Err(PushError::NonMonotonicStamp { last, got: stamp }); }
     }
-    let idx = (h & self.mask) as usize;
+    let idx = (h & self.mask()) as usize;
     let slot = &self.poses[idx];
 
     let s = slot.seq.load(Ordering::Relaxed) | 1;           // A5: force, do not increment
