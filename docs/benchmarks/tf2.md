@@ -755,12 +755,23 @@ per-line profiling (`just profile-lookup`, once it worked) shows why: 99.97% of
 
 — so the search was the right suspect all along. `half * cmp` reads as
 branchless and is not; the backend emits a branch for it. Replacing the
-multiply with a mask (`half & (0 - cmp)`, an AND the backend cannot turn back
-into control flow) moves simulated mispredicts 7.70 -> 7.32 per lookup and
-wall-clock by **-2.8% at depth 3 / sclerp, -1.5% at depth 3 / lerpslerp, -1.2%
-at depth 6**, with no change at depth 1 and no change in instruction count.
-Confirmed over two runs; the first run's apparent +3.3% at depth 1 did not
-reproduce (p = 0.09).
+multiply with a mask (`half & (0 - cmp)`) moves simulated mispredicts
+7.70 -> 7.32 per lookup and wall-clock by **-2.8% at depth 3 / sclerp, -1.5% at
+depth 3 / lerpslerp, -1.2% at depth 6**, with no change at depth 1 and no change
+in instruction count. Confirmed over two runs; the first run's apparent +3.3% at
+depth 1 did not reproduce (p = 0.09).
+
+**CORRECTION (2026-09-06).** That parenthesis used to read *"an AND the backend
+cannot turn back into control flow"*, and it is the **second** wrong mechanism
+this paragraph has carried for the same residual. The backend can and does:
+LLVM folds `x & sext(cmp)` back into a `select`, and because the select sits on
+the loop-carried dependency chain the x86 cmov-conversion pass expands it into
+a conditional branch — in every inlined copy in the shipped `--release` rlib.
+So the 0.38 mispredicts per lookup the mask bought is a cheaper loop body, not
+an erased branch, and **the 7.32 that remained is the branch still being
+there**. [`0053`](../decisions/0053-the-branchless-bracket-that-branches.md) carries the disassembly, a
+cachegrind table over four spellings of the line, and why none of the three
+alternatives has landed.
 
 The lesson stands, just not the one originally drawn: the simple predictor
 model was not the problem, the *absence of line-level data* was
@@ -989,8 +1000,15 @@ attributed by file.
 Two things follow, and they point at different optimisations:
 
 - **Essentially every mispredict is in the sampling path**, not in the maths.
-  The bracket search is already branchless (a `cmp` folded into the index), so
-  what remains is the bounds and seqlock structure around it.
+  **CORRECTION (2026-09-06):** this bullet used to continue *"the bracket search
+  is already branchless (a `cmp` folded into the index), so what remains is the
+  bounds and seqlock structure around it"*, and it is the sentence that sent the
+  next reader away from the line that carries most of the column. The search is
+  not branchless; its index select compiles to a conditional branch, and on
+  `soak --workload robot` that one line plus the loop back-edge are the great
+  majority of the process's mispredicts.
+  [`0053`](../decisions/0053-the-branchless-bracket-that-branches.md) measures both. Read it before spending
+  effort on the bounds and seqlock structure around the search.
 - **The maths is ~35% of instructions and mispredicts nothing.** That is the
   shape that rewards SIMD and does not reward branch work — the opposite of
   where intuition sends you after reading the mispredict column.

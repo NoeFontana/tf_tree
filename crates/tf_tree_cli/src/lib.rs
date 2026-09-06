@@ -1392,6 +1392,10 @@ fn cmd_doctor(
             inputs.clock,
             &clock_step,
             checks::no_counter_evidence(inputs.counters, inputs.stats),
+            // The outcome itself, not a second predicate: a disclosure that
+            // `TFT009` did half its work must not be printed beside its own
+            // `not run` line.
+            report.outcome(catalogue::Tft::Tft009),
         ),
     };
 
@@ -1436,6 +1440,18 @@ fn cmd_doctor(
 /// reason already carries both sentences — a note repeating them next to a
 /// `not run` line would be the report explaining itself twice.
 ///
+/// `TFT009`'s silence disclosure follows the same rule from the other side, and
+/// needed the check's own outcome to do it: the note says the retained-gap half
+/// ran and only the trailing-silence half did not, which is false on an arena
+/// where `TFT009` **skipped** — and the two conditions are independent (the skip
+/// is about the arena's samples, the note about the clock and the source), so
+/// neither could be derived from the other. `checks::silence_coverage_note`
+/// therefore takes the outcome rather than a second predicate. Its `None` is
+/// not reachable from `checks::run`, which emits one outcome per `Tft::ALL`;
+/// the parameter is an `Option` so the note tests below can call this without
+/// building a whole report, and a report missing the id would drop the
+/// disclosure rather than assert about it.
+///
 /// `TFT017`'s is an all-or-nothing disclosure rather than a partial-coverage
 /// one: when *every* dynamic edge is unclaimed, the finding is about the arena
 /// and not about any edge in it, and an arena built from a recording or opened
@@ -1463,12 +1479,13 @@ fn evidence_notes(
     clock: checks::Clock,
     clock_step: &checks::ClockStepEvidence,
     counter_evidence: Option<&'static str>,
+    tft009: Option<&catalogue::CheckOutcome>,
 ) -> Vec<String> {
     let mut notes = vec![checks::PARTICIPANT_OCCUPANCY_NOTE.to_owned()];
     notes.extend(checks::rate_coverage_note(snap, obs, clock, stream));
     notes.extend(checks::clock_offset_note(snap, stream, clock));
     notes.extend(clock_step.coverage_note(stream));
-    notes.extend(checks::silence_coverage_note(clock, stream));
+    notes.extend(tft009.and_then(|o| checks::silence_coverage_note(o, clock, stream)));
     notes.extend(checks::stopped_publisher_note(obs, clock, stream));
     match (counter_evidence, stream.no_arrival_delays()) {
         // Both blind: `tft011` skipped and said so itself.
@@ -2324,6 +2341,18 @@ fn explain_format_version() {
 mod tests {
     use super::*;
 
+    /// A `TFT009` outcome that **ran**, which is the state every note test in
+    /// this module is about.
+    ///
+    /// `evidence_notes` reads the real one out of the report, because the
+    /// silence disclosure is false beside a `not run` line for the same id.
+    /// These tests are about the other conditions, so they hold that one fixed
+    /// and [`the_silence_coverage_note_reaches_the_report_metadata`] is where
+    /// the skipping arm is driven.
+    fn tft009_ran() -> catalogue::CheckOutcome {
+        catalogue::CheckOutcome::ran(catalogue::Tft::Tft009, Vec::new())
+    }
+
     /// One running writer in slot 0 — the owner every claimed edge in this
     /// module's hand-built snapshots names.
     ///
@@ -2418,6 +2447,7 @@ mod tests {
             checks::Clock::Wall(0),
             &checks::ClockStepEvidence::capture(&snap, &obs),
             None,
+            Some(&tft009_ran()),
         );
         let note = notes.iter().find(|n| n.starts_with("TFT007")).expect(
             "no coverage note in Meta.notes: a partial TFT007 pass would read as a full \
@@ -2438,9 +2468,16 @@ mod tests {
     /// as though `doctor` had looked for a stopped publisher, which is the one
     /// fault an operator most often opens the report to find.
     ///
-    /// Mutant: delete `notes.extend(checks::silence_coverage_note(clock, stream));`
-    /// from `evidence_notes`. Applied: the `expect` fires with "no TFT009
-    /// silence note".
+    /// The third case is the contradiction the note could produce on its own:
+    /// `TFT009` reporting `not run` while the note beside it says the check
+    /// measured the gaps between retained samples.
+    ///
+    /// Mutant: delete the `silence_coverage_note` line from `evidence_notes`.
+    /// Applied: the `expect` fires with "no TFT009 silence note".
+    /// **Mutant, run:** drop the `Status::Skipped` guard from
+    /// `checks::silence_coverage_note`. The first two cases still pass and the
+    /// third fails, which is the whole finding — the note was never wrong about
+    /// the source, only about the run.
     #[test]
     fn the_silence_coverage_note_reaches_the_report_metadata() {
         use doctor::{EdgeInfo, FrameInfo};
@@ -2494,6 +2531,7 @@ mod tests {
             checks::Clock::Wall(0),
             &step,
             None,
+            Some(&tft009_ran()),
         );
         let note = notes
             .iter()
@@ -2512,10 +2550,33 @@ mod tests {
             checks::Clock::Wall(0),
             &step,
             None,
+            Some(&tft009_ran()),
         );
         assert!(
             !notes.iter().any(|n| n.starts_with("TFT009")),
             "the half ran; a note about coverage it did reach is noise: {notes:?}"
+        );
+
+        // And the third case, which is the one the note contradicted: the same
+        // unwritten source, with `TFT009` reporting `not run`. The note says
+        // the retained-gap half measured something; the skip line says there
+        // was nothing to measure. One of them is false and it is not the skip.
+        let notes = evidence_notes(
+            checks::PushStream::RingsAtRest,
+            &snap,
+            &obs,
+            checks::Clock::Wall(0),
+            &step,
+            None,
+            Some(&catalogue::CheckOutcome::skipped(
+                catalogue::Tft::Tft009,
+                "no edge in this arena has a retained inter-arrival distribution",
+            )),
+        );
+        assert!(
+            !notes.iter().any(|n| n.starts_with("TFT009")),
+            "TFT009 did not run; a note describing half of its work is the report \
+             contradicting itself: {notes:?}"
         );
     }
 
@@ -2596,6 +2657,7 @@ mod tests {
             now,
             &step,
             None,
+            Some(&tft009_ran()),
         );
         let note = notes
             .iter()
@@ -2612,6 +2674,7 @@ mod tests {
             now,
             &step,
             None,
+            Some(&tft009_ran()),
         );
         assert!(
             !notes.iter().any(|n| n.contains("withheld judgement")),
@@ -2706,6 +2769,7 @@ mod tests {
             checks::Clock::Wall(0),
             &ev,
             None,
+            Some(&tft009_ran()),
         );
         let note = notes
             .iter()
@@ -2723,7 +2787,8 @@ mod tests {
                 &obs,
                 checks::Clock::Wall(0),
                 &ev,
-                None
+                None,
+                Some(&tft009_ran()),
             )
             .iter()
             .any(|n| n.starts_with("TFT019")),
@@ -3080,6 +3145,7 @@ mod tests {
             checks::Clock::Wall(0),
             &ev,
             None,
+            Some(&tft009_ran()),
         ));
         assert!(
             note.contains("counter evidence only") && note.contains("no receipt time"),
@@ -3094,6 +3160,7 @@ mod tests {
             checks::Clock::Wall(0),
             &ev,
             Some("this arena has served no lookups"),
+            Some(&tft009_ran()),
         ));
         assert!(
             note.contains("capacity-vs-latency evidence only")
@@ -3110,6 +3177,7 @@ mod tests {
                 checks::Clock::Wall(0),
                 &ev,
                 Some("this arena has served no lookups"),
+                Some(&tft009_ran()),
             )),
             "",
             "a note beside a `not run` line repeats the skip reason"
@@ -3123,7 +3191,8 @@ mod tests {
                 &obs,
                 checks::Clock::Wall(0),
                 &ev,
-                None
+                None,
+                Some(&tft009_ran()),
             )),
             ""
         );

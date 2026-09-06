@@ -35,6 +35,17 @@ is a bug.
 
 ### Changed
 
+- **`SampleRing::mask` is a method, not a `pub` field** (breaking, `tf_tree_core`
+  only — the type is not re-exported from the `tf_tree` facade). The struct
+  stored the ring capacity twice, as `poses.len()` and as a `pub mask: u64` whose
+  relationship to it its own `# INVARIANT` asserted and nothing enforced. A ring
+  built with the two disagreeing returns a **silently wrong pose**: `capacity`
+  and `retained` compute a window the mask cannot address, so `oldest_stamp`
+  reports a sample it excludes and the sampler interpolates the wrong pair — no
+  error, no panic, and `push`'s own `debug_assert` does not fire. `mask()` is
+  derived from `poses.len()`, so the two cannot disagree. Callers outside the
+  crate read `ring.mask()`.
+
 - **`PHASE5.md` §1.2's region-table clause is retracted, and the stride array is
   coupled to the region count** (`docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md`,
   now `ready`). `FORMAT_VERSION = 3` reserved Phase 6's **header fields** and not
@@ -131,6 +142,118 @@ is a bug.
   (`6e8b19b`) — `docs/PHASE2.md` §11.2 scenario 9 a thousand times, and §12.3
   criterion 4's kill-to-re-claimable measurement.
 
+### Fixed — gates a caller could green, and one that could not see its subject
+
+- **`docs/PHASE5.md` §12 gates 2 and 5 refuse a loosened threshold under
+  `--gate`.** `--floor` is the *whole* of gate 5's gated comparison and was
+  accepted in the loosening direction, so the identical failing run exited 0 —
+  `§12 gate 5 — FAIL (gated)` at exit 1 became `PASS (gated)` at exit 0 with
+  `--floor 0.5` and no change to the measured ratio. `--budget-ms` is the same
+  shape in gate 2, mitigated only by that verdict being a conjunction. Gate 4,
+  the precedent both cite for `--gate`, has no threshold flag at all. Both now
+  refuse a loosened threshold that would produce a gated PASS, *before* printing
+  any verdict; tightening stays legal, and so does loosening a run that still
+  FAILs, which is how `tests/gate2.rs` isolates each half.
+
+- **Gate 2's span floor — one of its two declared anti-vacuity refusals — was
+  reached by no test, no recipe and no seeded mutant**, and an ungated run over
+  two fixtures too close in size printed a `GATED` line over a comparison that
+  is structurally green. It has a case and a disclosure now.
+
+- **`--reuse-corpus` deleted the corpus it exists to reuse, and the next run
+  fabricated a different one at that path and labelled it "written by this
+  process".** The cleanup was guarded on `--keep-corpus` alone; measured, an
+  829 485 B corpus written with `--keep-corpus` was gone after one
+  `--reuse-corpus` run, and the run after that reported a 31.980 s span where
+  the original was 7.980 s. The cleanup now removes only what the process wrote,
+  and `--reuse-corpus` on a missing path refuses — recorded as an amendment to
+  `docs/decisions/0050`, since the second is a behaviour change rather than a
+  repair.
+
+- **`scripts/evidence-audit.sh` matched target names as unanchored substrings**,
+  so `crates/tf_tree_bench/benches/lookup.rs` and `benches/push.rs` were
+  executed by nothing, registered nowhere, and the gate was green over both —
+  `lookup` excused by the recipe name `profile-lookup`, `push` by the bare
+  `push:` GitHub Actions trigger key. `docs/PHASE1.md` §11.3 is NORMATIVE about
+  `benches/lookup.rs`. The coverage tests now match the shapes that *execute* a
+  target, the register arm requires a table ROW rather than any backticked
+  mention, both benches have rows, and an empty subject set is red.
+
+- **Host-drift detection could be retired from the producer side.**
+  `runstore::diff` reports a fact only when two runs disagree, so a key absent
+  from both compares equal forever — and the test written for that class pinned
+  the *list* while writing each key into both synthetic runs, so it never
+  consulted `Provenance::collect`. Renaming the `target` push would have made an
+  x86_64 run and an aarch64 run compare as the same machine with no `HOST DRIFT`
+  banner.
+
+- **`scripts/sbom.py` dropped an unresolvable root silently** and emitted a
+  zero-component CycloneDX document at exit 0; **`check_recipe_references` had
+  no anti-vacuity floor** on either of its two subject sets; and **the unsafe
+  budget's clippy matrix cannot see a pass written across a `\`-continued
+  line**, which the justfile already contains — now reported by name rather than
+  absorbed by the `MIN_SELECTORS` floor.
+
+- **`check_recovery`'s settle loop could never take its early exit** (its
+  predicate was the whole participant table, read before the exemption partition
+  that is never empty), so it always spent its full 2.00 s while its comment
+  sold it as a poll. It is written as the fixed window it always was, because a
+  reachable exit would be the weaker check. And **`record_inheritance`'s
+  documented "one `write`" was two `write(2)` calls** — `writeln!` forwards each
+  format piece to `write_all` — so an `O_APPEND` claim about torn records was
+  false; measured under `strace`, it is one call now.
+
+### Fixed
+
+- **A record body is sized against the file, not against its own header**
+  (`crates/tf_tree_ingest/src/source.rs`). `read_tf` bounded a top-level MCAP
+  record's declared length by `--max-record-size` and by nothing else, then
+  sized the read buffer to it. A **seventeen-byte** file — the MCAP magic plus
+  one record header declaring 256 MiB — allocated and memset 256 MiB before
+  finding it had read nothing: measured at 265 856 KB peak RSS and 0.16 s
+  through the release binary. `--max-record-size` saturates to `u64::MAX`, so
+  the same seventeen bytes reached a `RawVec` "capacity overflow" panic (exit
+  101) at a declared `2^63` and a `SIGABRT` at `2^47`. The buffer is clamped by
+  the file's own length now, which is the comparison the two branches that do
+  not allocate already made. All three files exit 1 with the truncation
+  diagnosis, at 3 968 KB. **Nothing about a well-formed recording changes**: for
+  a record whose body is in the file, the clamp is the declared length.
+
+### Changed — `--max-memory`
+
+- **The stable sort's own scratch is inside the cap now, and inside the reported
+  peak.** `slice::sort_by_key` is stable because `docs/PHASE5.md` §3.2's "last
+  occurrence in the recording wins" needs it to be, and a stable sort allocates
+  up to a full extra copy of the buffer it sorts. That copy is a sample buffer
+  like the ones `--max-memory` enumerates, and it is live while every buffer the
+  pass has not drained yet is still held — but `plan_groups` packed against
+  `sum(buffers) <= cap`, `spill_budget` sized a run against one copy of itself,
+  and `peak_buffer_bytes` was computed before the sort ran. Measured with a
+  counting allocator on `tests/memory.rs`'s fixture: at `--max-memory 1048576`
+  the report read exactly 1 048 576 and the process used **2 046 121 B**.
+  `plan_groups` reserves the group's largest member now, `spill_budget` divides
+  by `2 * ENCODED`, and the reported peak carries the term — so the number a user
+  sizes a container against is the number that was enforced.
+  **It costs re-reads**, which is the trade and is stated: a group holds one edge
+  fewer, an edge between `cap / 2` and `cap` takes the spill path, and a spill
+  run is half as long. `docs/PHASE5.md` §3.1's new amendment carries the
+  measurements, the alternative that was weighed, and what still has no
+  instrument. §12 gate 5's arm boundary did **not** move — its cap is derived
+  from the survey by the same rule.
+
+### Changed — the ingest report
+
+- **`tf_tree.ingest/1` -> `tf_tree.ingest/2`: `undecodable_channels` is split
+  into `filtered_channels` and `non_cdr_channels`.** The withdrawn key was the
+  **sum** of channels this build cannot decode and channels the operator's own
+  `--tf-topic` excluded, so it named one of its two terms: a consumer pinning
+  the schema read its own narrowing as a defect in the recording. The field's
+  doc comment ("messages on a TF channel this build could not decode") was
+  wrong about the unit as well — these are channels, one per channel id. The
+  terminal summary was already correct and still prints one row for the pair,
+  now naming both numbers. The `filtered_channels` arm had no test at all;
+  `a_topic_filter_is_not_an_undecodable_channel` is it.
+
 ### Fixed
 
 - **`docs/PHASE5.md` §12 gate 4's binary now exits non-zero on a FAIL**
@@ -153,6 +276,54 @@ is a bug.
   *stated skip* rather than a verdict, because bringup and a total outage are
   the same arena and no fact in it separates them.
 
+- **`TFT013`'s second skip stated something false about the arena it printed on,
+  and there are three skips rather than two.** The sentence above — and
+  `docs/PHASE5.md` §6's amendment, §0.0's skip list, `docs/RUNBOOK.md`'s row and
+  the check's own doc comment, and this entry is another — described the condition as
+  *nothing has published at all*. The predicate was *no dynamic edge yields a
+  median period*, and a median needs two retained samples: `Capacity::history` is
+  `next_pow2(ceil(rate_hz * secs))` and a ring retains `capacity - 1`, so an edge
+  declared `rate_hz * secs <= 2` retains one sample for the life of the arena.
+  An operator whose publisher had accepted 3 600 pushes into a two-slot ring was
+  told nothing in the arena had published and sent to `TFT017`. The fact that
+  separates the two was already read three lines earlier: `publish_activity`
+  returns a three-valued `PublishActivity` now, and the second reason names the
+  publishers that exist and the busiest edge's push count. **That reason then
+  had the same shape one level down and branches now**: `doctor::median_period`
+  declines a stream shorter than two samples and a non-positive median alike, so
+  a ring-size remedy is false about a 512-slot ring holding one sample — every
+  `doctor --attach` at bringup, and a `--from-bag` run whose recording carries
+  one dated record for an edge — and about a publisher stamping one instant into
+  a full ring, which is `TFT009`'s and `TFT018`'s subject. `Unmeasurable`
+  carries the largest ring's retained capacity and the largest number of samples
+  recovered, and each branch names only what its own arena can act on.
+  Whether the grace can be *cleared* in that
+  state is deliberately not decided — a **declared** rate substituted for a
+  **measured** one is a §6 amendment, not a patch.
+
+- **`TFT009` reports `not run` rather than `pass` on an arena where it judged no
+  edge at all.** It was the one check in this group with no skip arm. Both of its
+  halves run only over edges `interval_shape` accepted, so a four-sample stream
+  holding a five-second hole at 500x its own cadence reported `pass` — beside
+  `TFT008`, in the same document, skipping over the identical empty set. The
+  floor is five retained samples, which is every arena for its first four pushes
+  per edge, every publisher restart, and permanently any edge sized
+  `rate_hz * secs <= 4`. The reason is three-valued, because
+  `interval_shape` declines for three conditions whose remedies are opposite:
+  too few intervals, a stamp that goes backwards (`TFT018` is that fault), and
+  every retained stamp at one instant. **No verdict moves**: the edges the
+  trailing-silence half names are a subset of the ones counted as judged, so the
+  finding list is provably empty wherever this now skips, and
+  `Report::has_error` counts findings and never statuses. A `--json` consumer
+  sees `not_run` where it saw `pass` on a sparse arena. **The disclosure in
+  `Meta.notes` is silenced with it**: `silence_coverage_note` says the check
+  measured the gaps between retained samples and only skipped the trailing
+  silence, which is false beside a `not run` line for the same id — and the two
+  conditions are independent, the skip being about the arena's samples and the
+  note about the clock and the source, so neither predicate could catch the
+  other. It reads the check's own outcome now, which is the rule `TFT011`'s two
+  disclosures already followed.
+
 - **`TFT007` and `TFT008` no longer report `pass` about a publisher `TFT009` is
   reporting as stopped.** Every rule in the catalogue measures *between*
   retained stamps, so a full ring of evenly spaced samples from a publisher that
@@ -166,9 +337,16 @@ is a bug.
   than passing, on an arena where no edge retained the intervals a spread needs
   (`doctor::SPREAD_MIN_INTERVALS`, which its skip reason quotes).
 
-- **`--json` is schema-validated.** The `tf_tree.doctor/1` document is now
-  parsed and held to the schema `render_json` documents, by a test that runs the
-  real binary. No schema file is shipped and the document is still written by
+- **`--json` is schema-validated, and the schema block is now one of the
+  spellings that is read.** The `tf_tree.doctor/1` document is parsed and held to
+  the schema `render_json` documents, by a test that runs the real binary. That
+  sentence was an overclaim when first written: the block, the `writeln!`
+  emitter and the test's key literal are three spellings and only the last two
+  were compared, so emitting a key and adding it to the literal left every check
+  green — the block is fenced ```` ```text ````, so `cargo test --doc` does not
+  reach it either. The test parses the block out of `catalogue.rs` and holds the
+  literal to it, at the **top level**; the nested object shapes are still
+  literals compared to nothing else, and the test's own doc says which. No schema file is shipped and the document is still written by
   hand. The id sequence is pinned against a literal rather than folded from
   `Tft::ALL`: the emitter walks that array too, so a comparison against it
   asserted membership and not order.
@@ -216,6 +394,27 @@ is a bug.
   half.
 
 ### Fixed — gates and release wiring
+
+- **`just embed-cost`'s new structural self-check ships with a disclosed escape,
+  `EMBED_COST_KNOWN_COLLAPSED=1`, which CI's `bench-gate` job sets.** The check
+  asserts that `PHASE5.md` §9.2's `embedding_cross_crate` row still has an
+  independent variable — that its two columns compile to different bodies — and
+  it is red on this tree, on a defect in the code under test that predates it:
+  since 2026-08-29 `Plan::at_tagged` has sat between `Plan::at` and the fold
+  with no `#[inline]`, so both columns are the same call stub and the row's
+  quotient is 1.0 by construction. Repairing that is a trade (`docs/API.md`
+  §2.3's 2026-09-06 amendment prices it) and not a CI decision, so the escape
+  keeps `bench-check` and `bench-baseline-update` runnable instead of leaving a
+  required job permanently red — which is how a check gets deleted rather than
+  answered. **It suppresses nothing**: the full diagnosis prints on every run
+  and is followed by a line saying the run's quotient is not a measurement. It
+  is deleted by the commit that restores the row's variable.
+
+- **The same recipe failed for anyone who exports `CARGO_TARGET_DIR`.** It
+  looked for the two `embed_cost` binaries under a hard-coded `./target/`, so
+  the symbol lookup refused for the environment rather than for its subject.
+  It reads `${CARGO_TARGET_DIR:-target}` now, as `just sbom` and
+  `just release-archive` already do.
 
 - **`scripts/sbom.py` had never executed on any path, and no release carries an
   SBOM.** Its one caller is `release.yml`'s `github-release` job, gated on

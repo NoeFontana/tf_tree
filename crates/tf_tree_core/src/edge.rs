@@ -286,12 +286,32 @@ pub struct ClaimRecord {
     _pad: [u8; 32],
 }
 
+// The argument is the one above `EdgeRecord`'s pins — `size_of` is not a layout,
+// and this record travels the same two routes: a peer process maps it out of the
+// `memfd`, and `write_frozen` memcpys it into every `.tft`.
+//
+// **This block used to cover two of the four fields.** `heartbeat` and
+// `clock_offset_nanos` are the same width class, so swapping them changes
+// neither size, nor alignment, nor `layout_hash` — measured, the swap builds
+// with zero warnings and leaves the whole workspace suite green, including the
+// committed `.tft` fixture test. Two builds would then agree on
+// `FORMAT_VERSION` and `layout_hash`, attach to the same segment, and read a
+// monotone push count as a nanosecond clock offset.
+//
+// The blast radius is narrower than the sibling records' and it is written down
+// rather than left to be re-derived: `owner` and `epoch` — the words the claim
+// protocol and the zombie fence actually depend on — were already pinned, and
+// both of the fields this block was missing are diagnostics-only and "never a
+// reaping trigger" (`docs/PHASE2.md` §6.4). A pin is still what belongs here:
+// the cost is four lines that can only fail once the layout has already moved.
 #[cfg(not(loom))]
 const _: () = {
     assert!(core::mem::size_of::<ClaimRecord>() == 64);
     assert!(core::mem::align_of::<ClaimRecord>() == 64);
     assert!(core::mem::offset_of!(ClaimRecord, owner) == 0);
     assert!(core::mem::offset_of!(ClaimRecord, epoch) == 8);
+    assert!(core::mem::offset_of!(ClaimRecord, heartbeat) == 16);
+    assert!(core::mem::offset_of!(ClaimRecord, clock_offset_nanos) == 24);
 };
 
 /// Under `loom`, `ClaimRecord` is a plain heap struct of loom atomics (loom

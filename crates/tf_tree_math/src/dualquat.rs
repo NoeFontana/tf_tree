@@ -124,7 +124,53 @@ fn screw_parts(rel: &Iso3) -> Screw {
     }
 
     // Dual part q_d = ½·(0,t)⊗q = ½·(−t·q_v, cos(θ/2)·t + t×q_v).
-    let q_d = (Quat::from_pure(t) * q).scale(0.5);
+    //
+    // **Written out rather than `(Quat::from_pure(t) * q).scale(0.5)`, because
+    // LLVM cannot fold the zero operand away.** Three quarters of the scalar
+    // operand's contribution is the literal `0.0`, and `fmul 0.0, x` is not
+    // foldable without `nnan`/`nsz` (it is `-0.0` for negative `x` and `NaN` for
+    // infinite `x`), nor is `±0.0 ± y`. So `Quat::from_pure(t) * q` emits the
+    // four `a.w * b.*` multiplies and their whole add/sub chain — it costs
+    // exactly what a **fully general** `Quat * Quat` costs, which is the claim
+    // to check, and it is inside a function that is `#[inline(always)]` into
+    // `screw_pow`, `screw_twist` and `screw_pow_with_twist`, the kernel of the
+    // default `ScLerp` policy.
+    //
+    // The saving is the four dead multiplies and their chain: a Hamilton product
+    // is 16 multiplies, the form below is 12, and `scale` adds 4 to either. That
+    // count is algebra and holds for any build. **Instruction counts are not
+    // quoted here** — they are vectorisation-dependent, so the same three bodies
+    // give different totals on different hosts while the scalar-multiply counts
+    // do not. To re-derive: build `(Quat::from_pure(t) * q).scale(0.5)`, a
+    // general `(a * q).scale(0.5)` and the form below as three
+    // `#[inline(never)] #[no_mangle] extern "C"` wrappers in one binary at
+    // `lto = "thin", codegen-units = 1`, and count `mul*` operands per body from
+    // `objdump -d --disassemble=<name>` — packed multiplies count two.
+    //
+    // **The association is load-bearing and must not be tidied.** The natural
+    // `½(−t·q_v, ch·t + t×q_v)` spelling through `Vec3::dot`/`Vec3::cross`
+    // reassociates (`ch*t.x + (t.y*q.z − t.z*q.y)` against
+    // `(t.x*q.w + t.y*q.z) − t.z*q.y`) and is **not** bit-identical. What is
+    // below is the general product's own tree with the `0.0 * b` terms deleted,
+    // term for term.
+    //
+    // **Residual, intermediate only.** Deleting `+0.0 − y` is not an identity
+    // when `y` is exactly `+0.0`: at `t = (0, 0, 0)` this `q_d.w` is `-0.0`
+    // where the general product gave `+0.0`. It does not reach an output —
+    // `screw_pow`, `screw_twist` and `screw_pow_with_twist` were compared
+    // bit-for-bit against the general form over 414 336 cases (400 000 random
+    // poses spanning 40 decades of rotation magnitude, plus every zero/non-zero
+    // pattern of `t` with each zero drawn `+0.0` and `-0.0`, against both
+    // hemispheres and all eight sign patterns of `q_v`, at fourteen (θ, s)
+    // pairs from 1e-9 to π): **0 differing**. Sampled, not proved; a caller that
+    // reaches `q_d` by some future route must re-check it.
+    let q_d = Quat::new(
+        -(t.x * q.x) - t.y * q.y - t.z * q.z,
+        t.x * q.w + t.y * q.z - t.z * q.y,
+        -(t.x * q.z) + t.y * q.w + t.z * q.x,
+        t.x * q.y - t.y * q.x + t.z * q.w,
+    )
+    .scale(0.5);
 
     // k = q_d.w / sin²(θ/2). Divergent on its own (q_d.w ∝ sin(θ/2)), but it
     // only ever reaches the result multiplied by q_v ∝ sin(θ/2), so every

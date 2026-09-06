@@ -93,14 +93,24 @@ pub(crate) const ENCODED: usize = 8 + 7 * 8;
 /// Below it the floors do not fit: a merge holds at least one sample per run and
 /// a reduce pass holds two staging buffers, and there is a cap under which those
 /// three alone exceed it. Rather than let the arithmetic quietly go negative,
-/// the cap is raised here — and the ingest report prints the *measured* peak, so
-/// a user who asked for 200 bytes is told what was really used rather than what
-/// they asked for.
+/// the cap is raised here — and the ingest report prints the peak the run
+/// planned for, so a user who asked for 200 bytes is told the number that was
+/// enforced rather than the one they asked for.
+///
+/// **That sentence used to say "the *measured* peak … what was really used", and
+/// it was false at every cap measured.** The report's number came from
+/// `buf.len() * SAMPLE_BYTES` and the stable sort's own scratch was in neither
+/// the number nor the budget, so a 1 MiB cap reported exactly 1 MiB on a run
+/// that used 2 046 121 B. Nothing in this process measures an allocator — that
+/// needs a counting global allocator, which needs `unsafe` this crate forbids —
+/// so what the report can honestly print is the bound the plan enforced, which
+/// is what it prints. See `ingest::plan_groups`.
 ///
 /// # What the cap covers, and the one thing it does not
 ///
-/// It covers every buffer that holds *samples*: the spill buffer, the merge
-/// windows, and the encode/decode staging. It does **not** cover the run index,
+/// It covers every buffer that holds *samples*: the spill buffer, **the stable
+/// sort's scratch**, the merge windows, and the encode/decode staging. It does
+/// **not** cover the run index,
 /// [`RunFile::index_bytes`] — sixteen bytes per run, and the run count is
 /// `samples / (cap / 64)`, so the index crosses the cap itself at roughly
 /// `cap² / 2048` samples. At the 4 GiB default that is far past any recording;
@@ -146,10 +156,24 @@ fn clamp_usize(v: u64) -> usize {
 }
 
 /// `(samples per run, staging bytes)` for the spill phase.
+///
+/// **`2 * ENCODED`, not `ENCODED`.** A run is filled to `run` samples and then
+/// handed to [`sort_run`], which is stable and therefore allocates — up to one
+/// full extra copy of the buffer, live while the buffer itself and the staging
+/// buffer are. Sizing the run against one copy made the spill phase's real peak
+/// nearly twice the cap; `budget_fits_the_cap` checks the pair now. The other
+/// halves of that repair are `ingest::plan_groups`' reserve and the peak
+/// `ingest::fill_spilled` reports, and the argument for reserving a bound rather
+/// than measuring the standard library is on `plan_groups`.
+///
+/// It costs runs: half as many samples per run is twice as many runs for the
+/// same edge, so the reduce loop does more passes. That is the price of the cap
+/// being a cap on this path, and the run *index* — which grows with the run
+/// count — is still outside it, as [`MIN_CAP`] says.
 pub(crate) fn spill_budget(user_cap: u64) -> (usize, usize) {
     let cap = cap_of(user_cap);
     let staging = staging_of(cap);
-    let run = ((cap - staging) / ENCODED as u64).max(1);
+    let run = ((cap - staging) / (2 * ENCODED as u64)).max(1);
     (clamp_usize(run), clamp_usize(staging))
 }
 
@@ -756,8 +780,13 @@ mod tests {
             let cap = cap_of(user_cap);
             let (run, staging) = spill_budget(user_cap);
             assert!(run >= 1 && staging >= ENCODED);
+            // **Twice the run, because `sort_run` is stable and allocates.** The
+            // run buffer is at capacity, its scratch is up to another full copy,
+            // and the staging buffer is live beside both. This assertion read
+            // `run * ENCODED + staging` until 2026-09-06 and passed while the
+            // phase used nearly twice the cap.
             assert!(
-                run as u64 * ENCODED as u64 + staging as u64 <= cap,
+                2 * run as u64 * ENCODED as u64 + staging as u64 <= cap,
                 "spill phase over cap {cap}"
             );
             let f = fan_in(user_cap);

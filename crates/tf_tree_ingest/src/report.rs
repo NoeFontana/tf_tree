@@ -27,7 +27,15 @@ use crate::ingest::{FillStats, Frames, Survey};
 
 /// The JSON document's schema tag. Bumped only for a breaking change, so a
 /// consumer can pin it.
-pub const REPORT_SCHEMA: &str = "tf_tree.ingest/1";
+///
+/// `/1` -> `/2` on 2026-09-06: the key `undecodable_channels` was the sum of the
+/// channels this build cannot decode **and** the channels the operator's own
+/// `--tf-topic` excluded, so it named one of its two terms and reported the
+/// operator's narrowing as a defect in the recording. It is replaced by
+/// `filtered_channels` and `non_cdr_channels`, which have different remedies.
+/// The terminal summary was already correct and still prints one row for the
+/// pair.
+pub const REPORT_SCHEMA: &str = "tf_tree.ingest/2";
 
 /// What one ingest did, as data.
 #[derive(Clone, Debug)]
@@ -241,7 +249,7 @@ impl IngestReport {
              \"worst_future_offset_ns\":{},\"out_of_order\":{},\
              \"clock_resets\":{},\"static_conflicts\":{},\
              \"duplicate_stamps\":{},\"stripped_slash_names\":{},\
-             \"empty_names\":{},\"undecodable_channels\":{}",
+             \"empty_names\":{},\"filtered_channels\":{},\"non_cdr_channels\":{}",
             a.zero_stamp_drops,
             a.future_stamps,
             a.worst_future_offset_ns,
@@ -252,6 +260,7 @@ impl IngestReport {
             a.stripped_slash_names,
             a.empty_names,
             a.filtered_channels,
+            a.non_cdr_channels,
         );
         let _ = write!(s, ",\"truncated\":{}", a.truncated);
         let _ = write!(s, ",\"bad_chunks\":{}", a.bad_chunks);
@@ -561,10 +570,17 @@ impl IngestReport {
                 a.empty_names
             ),
         );
+        // **One row over two fields, deliberately.** The JSON keeps them apart
+        // because they have different remedies; a terminal summary is a list of
+        // things worth looking at, and "some TF channels were not read" is one
+        // of those whichever reason applies. The two numbers are named so the
+        // reader can tell which they have without opening the JSON.
         row(
-            a.filtered_channels > 0,
+            a.filtered_channels + a.non_cdr_channels > 0,
             format!(
-                "{} TF channels were skipped (not CDR, or excluded by --topic)",
+                "{} TF channels were skipped ({} not CDR, {} excluded by --topic)",
+                a.filtered_channels + a.non_cdr_channels,
+                a.non_cdr_channels,
                 a.filtered_channels
             ),
         );

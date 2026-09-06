@@ -87,9 +87,13 @@ nothing compiling it. So the honest choice is between *headers plus a gate* and
 *no headers*, and the middle option is the one that decays.
 
 *Headers plus a gate* is a real option and it loses on cost against value. The
-cost is a check on every new source file, in perpetuity, plus a 289-file commit
-that touches every blame line in the repository. The value is a file-level
-licence marker for a consumer who copies one file out of a dual-licensed
+cost is a check on every new source file, in perpetuity, plus a commit that
+touches every source file, and so every blame line, in the repository — the
+`git ls-files … | wc -l` line above prints how many, and this sentence
+deliberately does not. It said "289", which was exact on the day this record
+landed and had drifted by the next; the commit that reviewed this record had
+already deleted the same literal from the transcript block, and left it here.
+The value is a file-level licence marker for a consumer who copies one file out of a dual-licensed
 project whose root, every crate directory, and every published artifact already
 carry both licence texts. Nobody has asked for it.
 
@@ -116,8 +120,8 @@ files look like a statement about those files.
   and in every artifact.
 * If headers ever land they land **all at once and under a check**, with the
   expression derived from `[workspace.package] license` rather than typed. A
-  hand-typed dual-licence expression in 289 files is a rename waiting to
-  disagree with the manifest.
+  hand-typed dual-licence expression in every source file is a rename waiting
+  to disagree with the manifest.
 * §10's checklist gains a shape it did not have: an item may be *declined*, and
   a declined item names the record that declined it. `PHASE7.md` already works
   this way for a whole phase.

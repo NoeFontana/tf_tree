@@ -25,7 +25,7 @@
 //! check is stronger than it is.
 //!
 //! **1. The search itself can be corrupted by one concurrent push.** `SampleRing::bracket`
-//! is a branchless binary search over `stamp_at`, which is a `Relaxed` load of an
+//! is a binary search over `stamp_at`, which is a `Relaxed` load of an
 //! array the writer overwrites in place. The searched window's oldest index is
 //! `head - retained`, and `push` destroys logical `head - capacity` — one index
 //! below it — so **two** pushes during a search reach the window and the stamps
@@ -157,7 +157,7 @@ impl SampleRing<'_> {
                     newest: t_new,
                 }),
                 ExtrapPolicy::Hold => self
-                    .read_slot((newest & self.mask) as usize)
+                    .read_slot((newest & self.mask()) as usize)
                     .and_then(|p| self.revalidated(newest, retained, p)),
                 ExtrapPolicy::ConstantTwist => self
                     .constant_twist(lo_logical, newest, t, t_new)
@@ -165,7 +165,7 @@ impl SampleRing<'_> {
             };
         }
         if t == t_new {
-            let p = self.read_slot((newest & self.mask) as usize)?;
+            let p = self.read_slot((newest & self.mask()) as usize)?;
             return self.revalidated(newest, retained, p);
         }
 
@@ -174,11 +174,11 @@ impl SampleRing<'_> {
 
         let result = if t_i == t {
             // Exact hit — no interpolation.
-            self.read_slot((i & self.mask) as usize)?
+            self.read_slot((i & self.mask()) as usize)?
         } else {
             let t_j = self.stamp_at(i + 1);
-            let a = self.read_slot((i & self.mask) as usize)?;
-            let b = self.read_slot(((i + 1) & self.mask) as usize)?;
+            let a = self.read_slot((i & self.mask()) as usize)?;
+            let b = self.read_slot(((i + 1) & self.mask()) as usize)?;
             // t_i < t < t_j guaranteed here, so the denominator is non-zero.
             let s = span_ns(t_i, t) / span_ns(t_i, t_j);
             I::eval(&a, &b, s)
@@ -280,7 +280,7 @@ impl SampleRing<'_> {
                     newest: t_new,
                 }),
                 ExtrapPolicy::Hold => self
-                    .read_slot((newest & self.mask) as usize)
+                    .read_slot((newest & self.mask()) as usize)
                     .and_then(|p| self.revalidated(newest, retained, p)),
                 ExtrapPolicy::ConstantTwist => self
                     .constant_twist(lo_logical, newest, t, t_new)
@@ -289,7 +289,7 @@ impl SampleRing<'_> {
         }
         if t == t_new {
             *cursor = newest;
-            let p = self.read_slot((newest & self.mask) as usize)?;
+            let p = self.read_slot((newest & self.mask()) as usize)?;
             return self.revalidated(newest, retained, p);
         }
 
@@ -300,11 +300,11 @@ impl SampleRing<'_> {
         let t_i = self.stamp_at(i);
 
         let result = if t_i == t {
-            self.read_slot((i & self.mask) as usize)?
+            self.read_slot((i & self.mask()) as usize)?
         } else {
             let t_j = self.stamp_at(i + 1);
-            let a = self.read_slot((i & self.mask) as usize)?;
-            let b = self.read_slot(((i + 1) & self.mask) as usize)?;
+            let a = self.read_slot((i & self.mask()) as usize)?;
+            let b = self.read_slot(((i + 1) & self.mask()) as usize)?;
             let s = span_ns(t_i, t) / span_ns(t_i, t_j);
             I::eval(&a, &b, s)
         };
@@ -321,50 +321,75 @@ impl SampleRing<'_> {
     /// racing overwrite of a since-lapped slot is not a data race.
     #[inline]
     fn stamp_at(&self, logical: u64) -> i64 {
-        self.stamps[(logical & self.mask) as usize].load(Ordering::Relaxed)
+        self.stamps[(logical & self.mask()) as usize].load(Ordering::Relaxed)
     }
 
-    /// Last logical index in `[lo, hi]` whose stamp is `<= t`, **branchlessly**.
+    /// Last logical index in `[lo, hi]` whose stamp is `<= t`.
+    ///
+    /// This line used to end **"branchlessly"**. It is not — see the section
+    /// below, which carries the disassembly command that settles it.
     ///
     /// Caller guarantees `stamp[lo] <= t < stamp[hi]`, which `sample` and
     /// `sample_from` establish before calling. Under that precondition the
     /// result is always `< hi`, so `i + 1` is a valid index for the upper
     /// bracket.
     ///
-    /// # Why branchless, and how much it is actually worth
+    /// # This loop is not branchless, and this section used to say it was
     ///
     /// The textbook form is `if stamp <= t { lo = mid } else { hi = mid }`,
     /// whose branch is by construction a coin flip: a binary search able to
     /// predict its own comparisons would not need to make them. This form
-    /// instead does `base += half * (cmp as u64)` — a multiply by 0 or 1 — and
-    /// shrinks `len` unconditionally, so the trip count depends only on the
-    /// window size.
+    /// instead writes the update as a mask — `base += half & (0 - cmp)` — and
+    /// shrinks `len` unconditionally.
     ///
-    /// **The measured gain is small, and the reason is worth recording so nobody
-    /// re-derives the same wrong expectation.** The hypothesis was that the
-    /// branchy form was paying most of the fixture's 8.16 mispredicted branches
-    /// per depth-3 lookup. It was not: LLVM already compiled that `if` to a
-    /// `cmov`, so the two forms were nearly the same machine code. Rewriting it
-    /// bought **1.2% fewer instructions** and, on the pinned `cost_model`,
-    /// 219.2 -> 217.0 ns at capacity 4096 and 237.0 -> 231.2 ns at 16384 — real,
-    /// largest where the search is deepest, and about a tenth of what was
-    /// expected.
+    /// **Only the second half of that survives codegen.** The trip count really
+    /// does depend on the window size alone. The mask does not: LLVM folds
+    /// `x & sext(cmp)` back into a `select`, and because that select sits on the
+    /// loop-carried dependency chain the x86 cmov-conversion pass expands it
+    /// into control flow. Every inlined copy of this loop in the shipped
+    /// `--release` rlib is `cmpq` / `jle` / `xorl` over the loaded stamp — no
+    /// `cmov`, no `and`. The disassembly is the instrument, and it takes about
+    /// two seconds:
     ///
-    /// It is kept because it is the same amount of code, it does not depend on
-    /// the optimizer continuing to choose `cmov` across future edits, and its
-    /// cost is independent of the stamp distribution. It is *not* kept on the
-    /// strength of a branch-prediction argument, which did not survive contact
-    /// with the measurement.
+    /// ```text
+    /// cargo rustc -p tf_tree_core --release --lib -- --emit asm -C debuginfo=2
+    /// F=$(ls -t target/release/deps/tf_tree_core-*.s | head -1)
+    /// ID=$(awk '/^\t\.file\t[0-9]+ .*sample\.rs"/ {print $2; exit}' "$F")
+    /// LN=$(grep -n '^ *base = base.wrapping_add(half &' crates/tf_tree_core/src/sample.rs | cut -d: -f1)
+    /// grep -c -P "\\.loc\\t$ID $LN " "$F"                       # inlined copies of this line
+    /// grep -B12 -A4 -P "\\.loc\\t$ID $LN " "$F" | grep -c cmov  # 0
+    /// ```
     ///
-    /// The serial dependent-load chain remains — each probe's address depends on
-    /// the previous result — and dominates: at ~1.7 ns/probe the search is
-    /// latency-bound, not branch-bound.
+    /// So the cost of this line *is* a function of the stamp distribution, and
+    /// on `soak --workload robot` it is the largest single source of mispredicts
+    /// in the whole process.
+    /// [`0053`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0053-the-branchless-bracket-that-branches.md)
+    /// carries the cachegrind table, the three alternative spellings that were
+    /// measured against it, and why none of them has landed.
     ///
-    /// (The 8.16 figure comes from cachegrind, whose branch predictor is a
-    /// simple two-level model, not a Zen 3 TAGE. It is sound for comparing two
-    /// engines under the *same* model, which is how
-    /// `docs/benchmarks/tf2.md` uses it, and should not be read as the count a
-    /// real CPU incurs.)
+    /// **CORRECTION.** This block used to keep the mask over the `if` on the
+    /// grounds that it "does not depend on the optimizer continuing to choose
+    /// `cmov` across future edits" and that "its cost is independent of the
+    /// stamp distribution", and it used to report that "LLVM already compiled
+    /// that `if` to a `cmov`, so the two forms were nearly the same machine
+    /// code". All three were read off the source rather than off the object
+    /// code. On the toolchain this repository pins, neither form emits a `cmov`;
+    /// `0053` measures the `if` as the cheaper of the two on both instructions
+    /// and mispredicts, so the sentence that justified the rewrite is the one
+    /// that argues against it.
+    ///
+    /// The serial dependent-load chain also remains — each probe's address
+    /// depends on the previous result. **Which of the two dominates is not
+    /// settled here.** "At ~1.7 ns/probe the search is latency-bound, not
+    /// branch-bound" stood in this paragraph and was inferred on the assumption
+    /// that there was no branch left to be bound by; `perf_event_paranoid=4` on
+    /// the development host means nobody has timed the alternative.
+    ///
+    /// (Every mispredict figure in `0053` and in `docs/benchmarks/tf2.md` comes
+    /// from cachegrind, whose branch predictor is a simple two-level model, not
+    /// a Zen 3 TAGE. It is sound for comparing two builds under the *same*
+    /// model, which is all either document does with it, and should not be read
+    /// as the count a real CPU incurs.)
     ///
     /// # Why not an interpolated seed
     ///
@@ -384,10 +409,10 @@ impl SampleRing<'_> {
         let mut len = hi - lo + 1;
         while len > 1 {
             let half = len / 2;
-            // Mask, not multiply. `half * cmp` reads as branchless and is not:
-            // measured at 1.38 mispredicts per call, LLVM emits a branch for it.
-            // `0 - cmp` is 0 or all-ones, and `half & mask` is an AND the
-            // backend cannot turn back into control flow.
+            // Mask, not multiply — and the backend turns this one back into
+            // control flow as well, so both spellings branch here. The section
+            // above says how to see that in the disassembly; do not restore a
+            // branchlessness claim to this comment without re-running it.
             let cmp = u64::from(self.stamp_at(base + half) <= t);
             base = base.wrapping_add(half & 0u64.wrapping_sub(cmp));
             len -= half;
@@ -448,8 +473,9 @@ impl SampleRing<'_> {
             }
             (hint.saturating_sub(step).max(lo_logical), hint - step / 2)
         };
-        // Binary search within the galloped bracket, branchless — see
-        // [`Self::bracket`]. Invariant: stamp[lo] <= t < stamp[hi].
+        // Binary search within the galloped bracket — see [`Self::bracket`],
+        // which is where the (retracted) branchlessness claim lived.
+        // Invariant: stamp[lo] <= t < stamp[hi].
         self.bracket(lo, hi, t)
     }
 
@@ -585,7 +611,7 @@ impl SampleRing<'_> {
                 ExtrapPolicy::Hold => {
                     // The pose is pinned, so the velocity really is zero. This is
                     // not a fallback — it is the derivative of what Hold does.
-                    let p = self.read_slot((newest & self.mask) as usize)?;
+                    let p = self.read_slot((newest & self.mask()) as usize)?;
                     return self.revalidated(newest, retained, (p, Twist::ZERO));
                 }
                 ExtrapPolicy::ConstantTwist => {
@@ -623,8 +649,8 @@ impl SampleRing<'_> {
             // velocity would be infinite rather than merely unknown.
             return Err(LookupError::NoSegment { edge: self.edge });
         }
-        let a = self.read_slot((i & self.mask) as usize)?;
-        let b = self.read_slot(((i + 1) & self.mask) as usize)?;
+        let a = self.read_slot((i & self.mask()) as usize)?;
+        let b = self.read_slot(((i + 1) & self.mask()) as usize)?;
         let s = span_ns(t_i, t) / dt;
         let (pose, xi) = ScLerp::eval_with_twist(&a, &b, s);
 
@@ -672,13 +698,13 @@ impl SampleRing<'_> {
     ) -> Result<(Iso3, Twist), LookupError> {
         if newest == lo_logical {
             // Only one sample retained: no twist to extend.
-            let p = self.read_slot((newest & self.mask) as usize)?;
+            let p = self.read_slot((newest & self.mask()) as usize)?;
             return self.revalidated(newest, self.retained(), (p, Twist::ZERO));
         }
         let prev = newest - 1;
         let t_prev = self.stamp_at(prev);
-        let a = self.read_slot((prev & self.mask) as usize)?;
-        let b = self.read_slot((newest & self.mask) as usize)?;
+        let a = self.read_slot((prev & self.mask()) as usize)?;
+        let b = self.read_slot((newest & self.mask()) as usize)?;
         let dt = span_ns(t_prev, t_new);
         let result = if dt == 0.0 {
             // Equal stamps span no time: nothing to extend along, and the

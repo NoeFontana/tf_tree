@@ -185,7 +185,9 @@ fn plan_edges(plan: &tf_tree_core::plan::Plan) -> Vec<EdgeId> {
 // ---------------------------------------------------------------------------
 
 /// Term 1 — `ArenaView::sampler`: bounds check, edge record, claim record, the
-/// two region sub-range checks, and the six-field `SampleRing` construction.
+/// two region sub-range checks, and the `SampleRing` construction (five fields
+/// since the capacity stopped being spelled twice — see `SampleRing`'s
+/// `INVARIANT`; the mask is derived from `poses.len()` now).
 ///
 /// Every field of the returned ring is folded into the accumulator, including
 /// both slice base pointers, so the construction cannot be optimized down to
@@ -198,7 +200,7 @@ fn t_sampler(view: &ArenaView<'_>, edges: &[EdgeId]) -> f64 {
             for &e in edges {
                 let (interp, ring) = view.sampler(black_box(e)).unwrap();
                 acc ^= u64::from(interp)
-                    ^ ring.mask
+                    ^ ring.mask()
                     ^ (ring.stamps.as_ptr() as u64)
                     ^ (ring.poses.as_ptr() as u64);
             }
@@ -215,7 +217,7 @@ fn t_sampler(view: &ArenaView<'_>, edges: &[EdgeId]) -> f64 {
 fn t_read_slot(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
     let idx: Vec<usize> = stamps
         .iter()
-        .map(|t| ((t / 1_000_000) as u64 & ring.mask) as usize)
+        .map(|t| ((t / 1_000_000) as u64 & ring.mask()) as usize)
         .collect();
     median_ns(idx.len(), || {
         let mut acc = 0.0;
@@ -596,7 +598,7 @@ fn main() {
     // Poses for the composition term, read out of the ring so they are the same
     // values the fold composes.
     let poses: Vec<Iso3> = (0..N)
-        .map(|k| ring1.read_slot(k & (ring1.mask as usize)).unwrap())
+        .map(|k| ring1.read_slot(k & (ring1.mask() as usize)).unwrap())
         .collect();
     let compose = t_compose(&poses);
 

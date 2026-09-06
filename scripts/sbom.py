@@ -55,7 +55,22 @@ def shipped_ids(md: dict) -> set[str]:
     nodes = {n["id"]: n for n in md["resolve"]["nodes"]}
     by_name = {p["name"]: p["id"] for p in md["packages"]}
     seen: set[str] = set()
-    stack = [by_name[r] for r in ROOTS if r in by_name]
+    # **A root cargo cannot resolve is a REFUSAL, not a silent skip.** The
+    # comprehension used to drop it, so a renamed or removed crate left a walk
+    # starting from fewer roots — and with every root gone it emitted a
+    # syntactically valid CycloneDX document with an empty `components` array at
+    # exit 0. `scripts/artifact-versions.py` states the rule beside
+    # `VERSION_FILES`: "a scan that silently finds nothing is the classic way a
+    # gate keeps passing after the thing it looked at moved", and
+    # `scripts/no-network.sh` implements it as refusing rather than skipping.
+    missing = [r for r in ROOTS if r not in by_name]
+    if missing:
+        raise SystemExit(
+            f"sbom: ROOTS names {', '.join(missing)}, which `cargo metadata` does not "
+            f"resolve. The bill of materials would be a walk from the roots that are "
+            f"left, and nothing downstream would say so."
+        )
+    stack = [by_name[r] for r in ROOTS]
     while stack:
         pid = stack.pop()
         if pid in seen:
@@ -98,6 +113,17 @@ def main() -> int:
         key=lambda p: (p["name"], p["version"]),
     )
     components = [component(p) for p in pkgs if p["name"] not in ROOTS]
+    # The residual the refusal above does not cover: every root resolved and the
+    # graph still came out empty. `tf_tree_core` alone pulls libm, bytemuck and
+    # blake3, so this cannot happen while the dependency budget stands — which
+    # is exactly why an empty document must be an error rather than a claim that
+    # nothing ships.
+    if not components:
+        raise SystemExit(
+            "sbom: the walk from ROOTS reached no dependency at all. An empty "
+            "bill of materials is a broken traversal, not a claim that this "
+            "release ships no third-party code."
+        )
 
     digest = hashlib.sha256(
         "\n".join(f"{c['name']}@{c['version']}" for c in components).encode()

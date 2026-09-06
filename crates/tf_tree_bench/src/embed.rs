@@ -40,6 +40,45 @@
 //! benchmark in this workspace, all of which sit outside `tf_tree_core` — would
 //! report ≈1.00× for ever while the real boundary went unmeasured.
 //!
+//! **That failure happened, from the other end, and the row could not see it.**
+//! On 2026-08-29 `Plan::at_tagged` was interposed between `Plan::at` and the
+//! fold carrying no `#[inline]`, so *both* columns became the same call stub
+//! around one out-of-line symbol in `tf_tree_core` — `nm -C --print-size` gives
+//! `one` and `tf_tree_core::bench_probe::depth3_lookup` the same 58 bytes and
+//! `objdump -R` resolves both `call`s to the same GOT slot. Which crate the stub
+//! was compiled in changes nothing; the quotient is 1.0 by construction and
+//! `Verdict::Over` is unreachable. Measured on this host, pinned, at
+//! `[profile.embedder]`: **`1.000x (rounds spanned 0.997-1.004), within PHASE5
+//! §9.2's 5% gate`** — a clean PASS with a 1 % band, not an `unresolved`, which
+//! is what a gate looks like when its variable is gone. Marking `at_tagged` and
+//! changing nothing else, same sitting: `1.243x, OVER`.
+//!
+//! **`just embed-cost` now asserts the two bodies differ before it times
+//! anything**, and refuses if it cannot find either symbol; the recipe's comment
+//! carries the argument and the two ways out. `docs/API.md` §2.3's 2026-09-06
+//! amendment is the record. It exits non-zero on the collapse unless
+//! `EMBED_COST_KNOWN_COLLAPSED=1` is set, which CI's `bench-gate` job does; with
+//! the escape the whole diagnosis still prints, followed by a line saying the
+//! run's quotient is not a measurement. The escape is deleted by the commit that
+//! restores the variable.
+//!
+//! **The `1.243x` above is a reading through a probe shape
+//! `Plan::at_tagged`'s own doc names as a trap, and this module is where that
+//! shape lives.** Both columns are
+//! `match plan.at(g, s) { Ok(iso) => iso.t.x, Err(_) => f64::NAN }` — see
+//! `one` and `tf_tree_core::bench_probe::depth3_lookup` — so they consume one
+//! of the seven pose components and LLVM dead-codes the other six across an
+//! inlined body. That is fine for the row's own question, which is a *ratio* of
+//! two identically-shaped columns; it is not fine for the marked-vs-unmarked
+//! comparison, whose sign it can invert. Repairing both bodies to consume all
+//! seven components is a prerequisite of deciding the attribute through this
+//! recipe.
+//!
+//! The lesson generalises past this row: *the denominator is not the only end a
+//! controlled comparison can lose.* Guarding the denominator's crate was
+//! correct and was not sufficient, because what makes the two columns different
+//! is a property of the code under test, not of where the harness sits.
+//!
 //! ## Why not `benches/lookup.rs`, which already times a depth-3 lookup
 //!
 //! It is the obvious reuse, and the reasons it cannot serve are properties of
@@ -98,6 +137,13 @@
 //!
 //! ## What it measured
 //!
+//! **Every figure in this section was taken before 2026-08-29, while the row
+//! still had an independent variable.** It is kept as the record of what the
+//! boundary cost when it was last measurable; it is not a statement about this
+//! tree, where both columns are the same stub and the row reports 1.0 by
+//! construction. See the collapse note at the top of this module and
+//! `docs/API.md` §2.3's 2026-09-06 amendment.
+//!
 //! Three consecutive `just embed-cost` runs on the host described under
 //! *Provenance*:
 //!
@@ -106,9 +152,9 @@
 //! | `[profile.embedder]` — `lto = false`, `codegen-units = 16` | 240.0–240.1 ns | 191.3–191.8 ns | **1.250, 1.254, 1.254** (rounds spanned 1.216–1.270) |
 //! | `[profile.release]` — `lto = "thin"`, `codegen-units = 1` | 193.0–195.0 ns | 194.2–196.2 ns | 0.994–0.996 (rounds spanned 0.985–1.022) |
 //!
-//! So **§9.2's 5% criterion is not met at an embedder's default profile**, and
-//! that is reported rather than engineered around. The second row is the
-//! control: the same two bodies, the same host, one profile setting different,
+//! So **§9.2's 5% criterion was not met at an embedder's default profile** on
+//! that tree, and that was reported rather than engineered around. The second
+//! row is the control: the same two bodies, the same host, one setting different,
 //! and the boundary gone. That is `docs/API.md` §2.3 item 2's LTO guidance
 //! measured against the thing it is guidance about.
 //!

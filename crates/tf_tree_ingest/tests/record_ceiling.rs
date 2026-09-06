@@ -513,3 +513,107 @@ fn a_skip_that_lands_off_a_boundary_refuses_rather_than_resyncing() {
          landed in"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The ceiling bounds what the reader allocates; the **file** has to bound it too.
+//
+// `read_tf` sized the record body from the declared length alone. A seventeen-byte
+// file — the eight-byte magic plus one nine-byte record header — declaring 256 MiB
+// allocated and memset 256 MiB before discovering there were no bytes to fill it
+// with, and with `--max-record-size` raised (it saturates to `u64::MAX`) the same
+// seventeen bytes reached `RawVec`'s "capacity overflow" panic or the allocator's
+// abort. The buffer is clamped by `file_len` now, which is the comparison
+// `skip_body` and `resyncs_here` already made on the branches that do not
+// allocate.
+//
+// **Not in `tests/anomaly_corpus.rs`**, which is `PHASE5.md` §11's byte-exact
+// assertion over §3.2's *reportable* rows: this file produces no report at all —
+// it is a refusal path — and it is about `max_record_bytes`, which is what this
+// file is for.
+// ---------------------------------------------------------------------------
+
+/// The smallest hostile input: magic, then a record header and nothing else.
+///
+/// Written by hand rather than by `fixture::write_mcap`, because the whole point
+/// is a header the writer would never emit. Seventeen bytes: `MAGIC` (8),
+/// opcode (1), length (8, LE).
+fn magic_and_one_header(opcode: u8, declared: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.extend_from_slice(b"\x89MCAP0\r\n");
+    out.push(opcode);
+    out.extend_from_slice(&declared.to_le_bytes());
+    out
+}
+
+/// A record header declaring more than `isize::MAX` bytes must not reach the
+/// allocator.
+///
+/// The ceiling is a caller knob and the CLI saturates it to `u64::MAX`, so this
+/// configuration is reachable by a supported flag rather than only by a library
+/// caller. `2^63` is one past `isize::MAX`, which is where `Vec::reserve_exact`
+/// panics with "capacity overflow" — a panic inside a reader, from seventeen
+/// bytes on disk, in a workspace whose lints deny `clippy::panic`.
+///
+/// Mutant: restore `usize::try_from(declared)` in place of
+/// `usize::try_from(declared.min(file_len))` — applied, and this test died with
+/// `panicked at library/alloc/src/raw_vec/mod.rs:28:5: capacity overflow` rather
+/// than failing an assertion. Through the release binary the same mutant gives
+/// `exit 101` on this file and `SIGABRT` (`memory allocation of
+/// 140737488355328 bytes failed`, exit 134) on one declaring `2^47`.
+#[test]
+fn a_declared_length_past_the_address_space_is_truncation_not_a_panic() {
+    let dir = Scratch::new("hostile_wide");
+    let path = dir.0.join("tiny.mcap");
+    std::fs::write(&path, magic_and_one_header(OP_CHUNK, 1u64 << 63)).unwrap();
+
+    // The ceiling that admits it: this is the arm the guard exists for, because
+    // at the default ceiling the length is refused before it is believed.
+    let wide = IngestOptions {
+        max_record_bytes: u64::MAX,
+        ..Default::default()
+    };
+    let mut frames = Frames::default();
+    assert_eq!(
+        tf_tree_ingest::survey(&path, &wide, &mut frames).unwrap_err(),
+        IngestError::TruncatedBeforeAnyChunk,
+        "a record body that is not in the file is a truncated recording"
+    );
+}
+
+/// The same file at the **default** ceiling: a length inside the ceiling and far
+/// outside the file.
+///
+/// **This arm has no mutant and passes against the defect**, which is worth
+/// stating rather than leaving for the next reader to discover. The verdict was
+/// already right here — the recording is truncated — and what was wrong was the
+/// 256 MiB allocation and memset on the way to it. Nothing in this suite can see
+/// an allocation: measuring one needs a counting global allocator, which needs an
+/// `unsafe impl GlobalAlloc` and therefore a row in `scripts/unsafe-budget.txt`.
+/// So the cost is a hand measurement through the release binary, on 2026-09-06,
+/// on the file this test writes:
+///
+/// ```text
+/// unclamped: RSS 265 856 KB, 0.16 s, exit 1
+/// clamped:   RSS   3 968 KB, 0.00 s, exit 1
+/// ```
+///
+/// What this arm holds is that the *diagnosis* stays the truncation one at the
+/// shipped default, where the clamp changes what is allocated and must change
+/// nothing else. `a_declared_length_past_the_address_space_is_truncation_not_a_panic`
+/// is the arm that fails when the clamp is removed.
+#[test]
+fn a_declared_length_larger_than_the_file_is_truncation() {
+    let dir = Scratch::new("hostile_default");
+    let path = dir.0.join("tiny.mcap");
+    std::fs::write(
+        &path,
+        magic_and_one_header(OP_CHUNK, DEFAULT_MAX_RECORD_BYTES),
+    )
+    .unwrap();
+
+    let mut frames = Frames::default();
+    assert_eq!(
+        tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut frames).unwrap_err(),
+        IngestError::TruncatedBeforeAnyChunk
+    );
+}

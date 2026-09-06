@@ -31,7 +31,12 @@
 # needs `shm` and its fourth mode `bridge`. Re-spelling that list here would let
 # it drift from the clippy passes it is meant to mirror, so the selectors are
 # **read out of the justfile's own `cargo clippy … --all-targets` lines**. A new
-# feature-named pass therefore enters this census the day it is added.
+# feature-named pass therefore enters this census the day it is added —
+# **provided it is written on one physical line**, which the extractor requires
+# and which `continuation_blind_spots` below is what makes true rather than
+# hoped for. It reports, by name, a pass whose `--all-targets` sits past a
+# `\`; before it existed the sentence above was simply false for that shape,
+# and the file being read already contained one.
 #
 # ## What it does NOT prove
 #
@@ -115,7 +120,44 @@ compare() {
 }
 
 # ---------------------------------------------------------------------------
-# Self-test: the three ways this check can be wrong, driven over fixtures.
+# The matrix is extracted line by line, so a pass whose `--all-targets` sits on
+# a `\`-continued line contributes NOTHING to the census and nothing says so.
+#
+# That shape is not hypothetical: the file being read already contains one —
+# `py-compile`'s `cargo clippy \` / `--all-targets`. It is excluded for another
+# reason (`--manifest-path`), so today it costs nothing, and the floor cannot
+# cover for it either: a floor absorbs a drop, it does not report one.
+#
+# Joining continuations *before* extracting is the wrong repair — it merges
+# `tf2-check`'s three invocations into one line that the `--manifest-path`
+# filter then swallows whole. So the extractor is left alone and this reports,
+# by name, a clippy pass the matrix cannot see: one whose joined form carries
+# `--all-targets`, whose physical line does not, and which none of the three
+# exclusions would have dropped anyway.
+#
+# `$1` = the justfile to read. Prints each invisible pass; returns 1 if any.
+# ---------------------------------------------------------------------------
+continuation_blind_spots() {
+    awk '
+        { sub(/#.*/, "") }
+        /cargo clippy/ {
+            phys = $0; joined = $0
+            while (joined ~ /\\[[:space:]]*$/ && (getline nxt) > 0) {
+                sub(/\\[[:space:]]*$/, " ", joined); joined = joined nxt
+            }
+            if (joined ~ /--all-targets/ && phys !~ /--all-targets/ \
+                && joined !~ /--manifest-path/ && joined !~ /--features tf2/ \
+                && joined !~ /--fix/) {
+                print FILENAME ":" NR ": INVISIBLE TO THE MATRIX: " joined
+                n++
+            }
+        }
+        END { exit (n > 0) }
+    ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Self-test: the ways this check can be wrong, driven over fixtures.
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--self-test" ]; then
     d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
@@ -156,6 +198,29 @@ if [ "${1:-}" = "--self-test" ]; then
     [ "$rc" -eq 0 ] \
         && echo "self-test 5 ok: an out-of-reach row that DOES appear is not an error" \
         || { echo "SELF-TEST FAILED: an out-of-reach row must be permitted, not required"; exit 1; }
+    printf 'lint:\n    cargo clippy --workspace --all-targets -- -D warnings\n' > "$d/jf_one"
+    continuation_blind_spots "$d/jf_one" > /dev/null && rc=0 || rc=$?
+    [ "$rc" -eq 0 ] \
+        && echo "self-test 6 ok: a one-line clippy pass is visible to the matrix" \
+        || { echo "SELF-TEST FAILED: a one-line pass must not be reported; rc=$rc"; exit 1; }
+
+    printf 'lint:\n    cargo clippy --workspace \\\n        --all-targets -- -D warnings\n' \
+        > "$d/jf_cont"
+    out=$(continuation_blind_spots "$d/jf_cont") && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'INVISIBLE TO THE MATRIX'; then
+        echo "self-test 7 ok: a continuation-written pass is reported by name"
+    else
+        echo "SELF-TEST FAILED: a \`\\\`-continued --all-targets must be reported; rc=$rc"
+        exit 1
+    fi
+
+    printf 'x:\n    cargo clippy --manifest-path a/Cargo.toml \\\n        --all-targets\n' \
+        > "$d/jf_excl"
+    continuation_blind_spots "$d/jf_excl" > /dev/null && rc=0 || rc=$?
+    [ "$rc" -eq 0 ] \
+        && echo "self-test 8 ok: a continuation the extractor would have excluded anyway is not reported" \
+        || { echo "SELF-TEST FAILED: an excluded pass must not be reported; rc=$rc"; exit 1; }
+
     echo "unsafe-budget: self-test passed (the floors below are what catch an"
     echo "               empty census when the register is also empty)"
     exit 0
@@ -178,6 +243,14 @@ mapfile -t SELECTORS < <(
                   s/[[:space:]]+/ /g; s/^ //; s/ $//' \
         | sort -u
 )
+if ! continuation_blind_spots justfile; then
+    echo "unsafe-budget: the line(s) above carry \`--all-targets\` on a continuation, so the"
+    echo "               extractor above sees them without it and they contribute NOTHING"
+    echo "               to the census — silently. Put the whole invocation on one physical"
+    echo "               line, or teach the extractor that shape; do not lower the floor,"
+    echo "               which absorbs a drop rather than reporting one."
+    exit 1
+fi
 if [ "${#SELECTORS[@]}" -lt "$MIN_SELECTORS" ]; then
     echo "unsafe-budget: the justfile yielded ${#SELECTORS[@]} clippy selectors, below the"
     echo "               floor of $MIN_SELECTORS. The matrix is read out of the justfile's own"

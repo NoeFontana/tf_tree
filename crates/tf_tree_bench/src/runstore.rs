@@ -1129,10 +1129,26 @@ mod tests {
     /// what this crate treats as host-critical now costs a deliberate edit in
     /// two places, which is the cost being bought.
     ///
+    /// **Three doors, and the third was open until 2026-09-06.** The list can
+    /// be retired by deleting a key (the membership pin), the *differ* can be
+    /// retired by dropping the list from `drift`'s call (the per-key loop), and
+    /// the **producer** can be retired by renaming or deleting a `push` in
+    /// [`Provenance::collect`] — which neither of the first two can see,
+    /// because the per-key loop writes the key into both synthetic runs before
+    /// comparing and `drift` treats a key absent from both as agreement. The
+    /// presence loop is the third door.
+    ///
     /// Mutant (applied, observed): delete `"transparent_hugepage"` from
     /// [`HOST_CRITICAL_FACTS`] — fails on the membership assertion, naming it.
     /// Mutant (applied, observed): drop `HOST_CRITICAL_FACTS` from `drift`'s
     /// call at [`diff`] — fails in the per-key loop on the first key.
+    /// Mutant (applied, observed): rename `push("cpu_governor", …)` to
+    /// `push("cpu_governor_RENAMED", …)` in [`Provenance::collect`] — passed
+    /// everything before the presence loop existed, and now fails naming the
+    /// key. The sharper instance is `target`: it is `std::env::consts::ARCH`,
+    /// always present and always different across architectures, and aarch64 CI
+    /// has been live since 2026-08-16, so retiring it makes an x86_64 run and
+    /// an aarch64 run compare as the same machine.
     #[test]
     fn every_host_critical_fact_is_pinned_and_diffed() {
         // Keep in step with `HOST_CRITICAL_FACTS` above, deliberately.
@@ -1154,6 +1170,37 @@ mod tests {
              from this list retires drift detection for it, which is how \
              `transparent_hugepage` went missing"
         );
+
+        // **The other half of the same door, and it was open.** The loop below
+        // writes each key into BOTH synthetic runs before comparing, so it
+        // never consults the producer — and `drift` reports a difference, so a
+        // key absent from both runs compares EQUAL. Retiring a fact from
+        // `Provenance::collect` (a rename, a deleted `push`) therefore made
+        // every future pair of runs agree on it forever, with the membership
+        // pin above still green: measured on the shipped `bench_ab`, an
+        // x86_64 run and an aarch64 run would compare with no `HOST DRIFT`
+        // banner at all.
+        //
+        // PRESENCE only, never a value: `physical_cores` is `unknown` on
+        // aarch64 and `cpu_governor` is `unknown` on any host with no cpufreq
+        // sysfs, and both are correct readings. All nine are unconditional
+        // pushes, so this holds on every host.
+        //
+        // `BUILD_CRITICAL_FACTS` deliberately gets no such loop: `build_profile`
+        // and `build_lto` are already asserted by name off a live `collect()` in
+        // `report.rs`, and the three `dds_*` keys are pushed by `bin/dds_report`
+        // rather than by `collect`, so a loop over that list would fail for the
+        // wrong reason.
+        let produced = Provenance::collect();
+        for key in HOST_CRITICAL_FACTS {
+            assert!(
+                produced.get(key).is_some(),
+                "`{key}` is in HOST_CRITICAL_FACTS and `Provenance::collect` no \
+                 longer emits it. Drift detection for it is retired: a key \
+                 absent from both runs compares equal, so every future pair of \
+                 runs agrees on it"
+            );
+        }
 
         for key in HOST_CRITICAL_FACTS {
             let mut a = run(vec![row("n=1", 1.0, 0.1)]);

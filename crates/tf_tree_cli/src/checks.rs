@@ -76,6 +76,16 @@
 //!   — see [`stopped_publishers`]. It needs no
 //!   declaration, so unlike `TFT007` it has evidence on an arena built without a
 //!   topology file.
+//! * **`TFT009`** (gaps / dropouts) is skipped when it judged **nothing**, for
+//!   `TFT008`'s reason a row over and with a longer reach: both of its halves
+//!   run only over edges `interval_shape` accepted, so an arena whose every
+//!   edge falls into a `ShapeGap` left it reporting `pass` beside a `TFT008`
+//!   skip over the identical empty set. The floor is permanent as well as
+//!   transient — an edge sized `RingSize::History { rate_hz, secs }` with
+//!   `rate_hz * secs <= 4` never retains enough. `gap_evidence_skip` names
+//!   **which** gap, because *wait for the ring to fill*, *go and read
+//!   `TFT018`* and *a publisher stamping one instant* are three different next
+//!   steps.
 //! * **`TFT010`** is skipped whenever the `docs/PHASE5.md` §5 counters carry no
 //!   verdict — see [`no_counter_evidence`], which is *two* conditions: an engine
 //!   built without the feature, and an arena that has served **no lookups**. The
@@ -89,10 +99,14 @@
 //! * **`TFT013`** (declared and never published to) is skipped inside the grace
 //!   period §6's row requires, because `head == 0` is what every dynamic edge of
 //!   a correct arena reads as before its publishers start. The arena records no
-//!   declaration time, so the evidence is `publish_activity_ns` — how long the
-//!   longest-running publisher in this arena has been running — and an arena in
-//!   which nothing has published at all is a second, separate skip: bringup and
-//!   a total outage are the same arena and no fact in it separates them.
+//!   declaration time, so the evidence is `publish_activity` — how long the
+//!   longest-running publisher in this arena has been running — and there are
+//!   two further skips, which are different arenas: one in which nothing has
+//!   published at all (bringup and a total outage are the same arena and no
+//!   fact in it separates them), and one in which publishers **exist** and no
+//!   ring retains the two samples a median period needs, which is permanent on
+//!   any edge sized `rate_hz * secs <= 2` and is a ring-size remedy rather than
+//!   an ambiguity.
 //! * **`TFT014`** (participant or claim slot leak) is skipped on a frozen `.tft`,
 //!   whose participant table is a byte copy of one from a run that has ended —
 //!   see [`SlotTable`]. Running there would fire on every correct `.tft` ever
@@ -117,7 +131,7 @@ use tf_tree::unstable::EdgeKind;
 use tf_tree::{Domain, EdgeId, SensorDomain, SimDomain, SteadyDomain, SystemDomain, Tree};
 use tf_tree_bench::fixture::PushSample;
 
-use crate::catalogue::{CheckOutcome, Finding, Report, Tft};
+use crate::catalogue::{CheckOutcome, Finding, Report, Status, Tft};
 use crate::doctor::{
     self, EdgeInfo, LockByte, Observations, ParticipantInfo, RecordedProcess, SlotState, Snapshot,
 };
@@ -366,7 +380,7 @@ pub fn collect_edge_stats(tree: &Tree, snap: &Snapshot) -> Vec<EdgeStats> {
             // `capacity()`.
             let retained = ring.retained().min(head);
             for i in (head - retained)..head {
-                let s = ring.stamps[(i & ring.mask) as usize].load(Ordering::Relaxed);
+                let s = ring.stamps[(i & ring.mask()) as usize].load(Ordering::Relaxed);
                 if s < 0 {
                     st.negative_stamps += 1;
                 } else if s == 0 {
@@ -1405,34 +1419,18 @@ fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
     )
 }
 
-/// `TFT009` — an inter-arrival interval far above the edge's own median.
+/// Intervals an edge must retain before `TFT009` has an inter-arrival
+/// distribution to measure a gap against. Four, because a median over three is
+/// one sample away from being an extremum.
 ///
-/// Relative to the edge's own median rather than to a fixed threshold because a
-/// 200 ms gap is a dropout at 100 Hz and normal at 5 Hz. Deliberately still not
-/// against the declared rate [`tft007`] now has: an edge running at half its
-/// nominal has no dropouts, and reporting one for every interval would bury the
-/// gaps this check exists to find under a rate deviation `TFT007` already
-/// reports once.
+/// Written once, and quoted by the skip reason rather than restated there —
+/// the shape [`tft008`]'s skip already uses for
+/// [`doctor::SPREAD_MIN_INTERVALS`]. A number spelled beside the predicate that
+/// enforces it is a number that drifts from it.
+const GAP_MIN_INTERVALS: usize = 4;
+
 /// The shape of one edge's retained inter-arrival distribution: the median
 /// period it publishes at, and the largest gap between two retained stamps.
-///
-/// `None` where neither number would mean anything, and the three conditions
-/// are `TFT009`'s rather than this type's:
-///
-/// * **Fewer than four intervals.** A median over three is one sample away from
-///   being an extremum.
-/// * **Any negative interval**, not just a non-positive median. A stream with a
-///   handful of inverted pairs keeps a healthy positive median, but the jump
-///   back to the true timeline after an inversion becomes `worst_ns` — so
-///   `TFT009` would report a dropout of N x the median that never happened. The
-///   real fault is `TFT018`, which fires on the same stream at error severity;
-///   adding a warn about a phantom gap next to it sends the operator looking
-///   for a lost publisher instead of a reordered one. Skipping loses nothing:
-///   an interval sequence that is not monotone has no meaningful inter-arrival
-///   distribution to measure a gap against.
-/// * **A non-positive median**, which every retained stamp being identical
-///   produces: the ratio would divide by zero and make every non-zero interval
-///   an infinite gap.
 ///
 /// The median is [`doctor::median_period`] rather than a second sort in this
 /// file, so "the period this edge publishes at" is one number across `TFT007`,
@@ -1444,25 +1442,99 @@ struct IntervalShape {
     worst_ns: i64,
 }
 
-/// One edge's [`IntervalShape`], or `None` when its stream cannot support one.
-fn interval_shape(samples: &[&PushSample]) -> Option<IntervalShape> {
+/// Why one edge's retained stream supports no [`IntervalShape`].
+///
+/// Three-valued for [`RateEvidence`]'s reason one row over: the three are not
+/// interchangeable, the remedies are opposite, and `TFT009` has to be able to
+/// say **which** when it judged nothing at all. Folding them would send an
+/// operator after a bringup problem when the fault is a reordered stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeGap {
+    /// Fewer than [`GAP_MIN_INTERVALS`] intervals. A median over three is one
+    /// sample away from being an extremum. The remedy is to wait for the ring
+    /// to fill, or to size it above the floor.
+    TooFewIntervals,
+    /// **Any negative interval**, not just a non-positive median. A stream with
+    /// a handful of inverted pairs keeps a healthy positive median, but the
+    /// jump back to the true timeline after an inversion becomes `worst_ns` —
+    /// so `TFT009` would report a dropout of N x the median that never
+    /// happened. The real fault is `TFT018`, which fires on the same stream at
+    /// error severity; adding a warn about a phantom gap next to it sends the
+    /// operator looking for a lost publisher instead of a reordered one.
+    /// Declining loses nothing: an interval sequence that is not monotone has
+    /// no meaningful inter-arrival distribution to measure a gap against.
+    NotMonotone,
+    /// A non-positive median, which every retained stamp being identical
+    /// produces: the ratio would divide by zero and make every non-zero
+    /// interval an infinite gap.
+    NoPeriod,
+}
+
+/// One edge's [`IntervalShape`], or which [`ShapeGap`] its stream fell into.
+fn interval_shape(samples: &[&PushSample]) -> Result<IntervalShape, ShapeGap> {
     let mut worst = i64::MIN;
     let mut intervals = 0usize;
     for w in samples.windows(2) {
         let d = w[1].stamp_ns - w[0].stamp_ns;
         if d < 0 {
-            return None;
+            return Err(ShapeGap::NotMonotone);
         }
         worst = worst.max(d);
         intervals += 1;
     }
-    if intervals < 4 {
-        return None;
+    if intervals < GAP_MIN_INTERVALS {
+        return Err(ShapeGap::TooFewIntervals);
     }
-    Some(IntervalShape {
-        median_ns: doctor::median_period(samples)?,
-        worst_ns: worst,
-    })
+    match doctor::median_period(samples) {
+        Some(median_ns) => Ok(IntervalShape {
+            median_ns,
+            worst_ns: worst,
+        }),
+        None => Err(ShapeGap::NoPeriod),
+    }
+}
+
+/// Why `TFT009` judged no edge at all, in terms an operator can act on.
+///
+/// One clause per [`ShapeGap`] **present**, never a fixed three-clause shape
+/// with two zeroes in it and never a fold of the three into one: the remedies
+/// are different — wait for the rings to fill (or size them above
+/// [`GAP_MIN_INTERVALS`]), go and read `TFT018`, or go and look at a publisher
+/// stamping one instant — and a skip whose reason does not separate them costs
+/// the operator the same walk the check was supposed to save.
+///
+/// The empty case is its own sentence, because "no edge retained enough" and
+/// "nothing published at all" are different arenas.
+fn gap_evidence_skip(too_few: usize, not_monotone: usize, no_period: usize) -> String {
+    let mut why: Vec<String> = Vec::new();
+    if too_few > 0 {
+        why.push(format!(
+            "{too_few} retained fewer than the {GAP_MIN_INTERVALS} intervals a median needs, so \
+             the publishers may not have started or the ring is sized below that floor"
+        ));
+    }
+    if not_monotone > 0 {
+        why.push(format!(
+            "{not_monotone} carry a stamp that goes backwards, and a gap measured across an \
+             inversion is a dropout that never happened — TFT018 is the id for that fault"
+        ));
+    }
+    if no_period > 0 {
+        why.push(format!(
+            "{no_period} hold every retained stamp at one instant, so there is no period for a \
+             gap to be a multiple of"
+        ));
+    }
+    if why.is_empty() {
+        return "nothing has published to any edge of this arena, so there is no inter-arrival \
+                distribution to call a gap in and no newest stamp to measure a silence from"
+            .to_owned();
+    }
+    format!(
+        "no edge in this arena has a retained inter-arrival distribution, so there is no gap to \
+         call a dropout and nothing to measure a trailing silence against: {}",
+        why.join("; ")
+    )
 }
 
 /// How long one edge has been silent, and what its own cadence says about that.
@@ -1510,7 +1582,7 @@ pub fn stopped_publishers(
     };
     let mut out = BTreeMap::new();
     for (edge, samples) in obs.by_edge() {
-        let Some(shape) = interval_shape(&samples) else {
+        let Ok(shape) = interval_shape(&samples) else {
             continue;
         };
         // Monotone by `interval_shape`'s negative-interval guard, so the last
@@ -1548,24 +1620,50 @@ pub fn stopped_publishers(
 /// `now - newest`: the trailing edge of the same inter-arrival distribution the
 /// rules above measure, judged by the same [`GAP_FACTOR`] against the same
 /// median. Nothing new is calibrated.
+///
+/// # And a run that judged nothing skips rather than passing
+///
+/// `Pass` here is the active claim *no edge in this arena has a dropout*, and
+/// **both** halves run only over edges [`interval_shape`] accepted — so on an
+/// arena where every edge falls into a [`ShapeGap`] the subject set is empty
+/// and the empty finding list used to render as an all-clear. It is `TFT007`'s
+/// compared-nothing defect and `TFT008`'s judged-nothing defect a third time,
+/// and it reached further than either: the floor is
+/// [`GAP_MIN_INTERVALS`] + 1 retained samples, which is every arena for its
+/// first four pushes per edge, every publisher restart, and **permanently**
+/// every edge sized `RingSize::History { rate_hz, secs }` with
+/// `rate_hz * secs <= 4`, since `Capacity::history` rounds to a power of two
+/// and `SampleRing::retained` is `capacity - 1`. `TFT008` skips on exactly
+/// those arenas, so one document said *not run, nothing to measure* and
+/// *pass* about the same empty set.
+///
+/// [`gap_evidence_skip`] is the reason, and it names which [`ShapeGap`] rather
+/// than only that there was one.
 fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
     let stopped = stopped_publishers(inp.obs, inp.clock, inp.stream);
     let mut out = Vec::new();
+    let (mut judged, mut too_few, mut not_monotone, mut no_period) = (0usize, 0, 0, 0);
     for (edge, samples) in inp.obs.by_edge() {
-        if let Some(shape) = interval_shape(&samples) {
-            if shape.worst_ns > shape.median_ns.saturating_mul(GAP_FACTOR) {
-                out.push(Finding::on_edge(
-                    Tft::Tft009,
-                    edge,
-                    format!("edge#{edge}"),
-                    format!(
-                        "largest gap {:.1} ms is {:.1}x the median period {:.1} ms",
-                        shape.worst_ns as f64 / 1e6,
-                        shape.worst_ns as f64 / shape.median_ns as f64,
-                        shape.median_ns as f64 / 1e6
-                    ),
-                ));
+        match interval_shape(&samples) {
+            Ok(shape) => {
+                judged += 1;
+                if shape.worst_ns > shape.median_ns.saturating_mul(GAP_FACTOR) {
+                    out.push(Finding::on_edge(
+                        Tft::Tft009,
+                        edge,
+                        format!("edge#{edge}"),
+                        format!(
+                            "largest gap {:.1} ms is {:.1}x the median period {:.1} ms",
+                            shape.worst_ns as f64 / 1e6,
+                            shape.worst_ns as f64 / shape.median_ns as f64,
+                            shape.median_ns as f64 / 1e6
+                        ),
+                    ));
+                }
             }
+            Err(ShapeGap::TooFewIntervals) => too_few += 1,
+            Err(ShapeGap::NotMonotone) => not_monotone += 1,
+            Err(ShapeGap::NoPeriod) => no_period += 1,
         }
         if let Some(s) = stopped.get(&edge) {
             out.push(Finding::on_edge(
@@ -1581,6 +1679,22 @@ fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
                 ),
             ));
         }
+    }
+    if judged == 0 {
+        // `stopped_publishers` reads the same `interval_shape`, so its map is a
+        // subset of the edges counted in `judged` and nothing above can have
+        // pushed a finding here. `CheckOutcome::skipped` carries none, so if
+        // that ever stops being true a finding would be dropped silently —
+        // which is the failure this whole repair is about, one layer in.
+        debug_assert!(
+            out.is_empty(),
+            "TFT009 judged no edge and produced {} finding(s): a skip would discard them",
+            out.len()
+        );
+        return CheckOutcome::skipped(
+            Tft::Tft009,
+            gap_evidence_skip(too_few, not_monotone, no_period),
+        );
     }
     CheckOutcome::ran(Tft::Tft009, out)
 }
@@ -1608,16 +1722,40 @@ fn live_wall_now(clock: Clock, stream: PushStream) -> Option<i64> {
 }
 
 /// Why `TFT009` could not look for a publisher that **stopped**, or `None` when
-/// it could.
+/// it could — or when it did not run at all.
 ///
 /// The retained-gap half of `TFT009` runs on every source; the trailing-silence
 /// half needs a live arena and a comparable clock (`live_wall_now`). A check that
 /// quietly does half its work is indistinguishable from one that passed, which is
 /// the whole reason [`crate::catalogue::Status::Skipped`] carries a mandatory
-/// reason — and `TFT009` is not *skipped* here, so the disclosure has to be a
-/// note.
+/// reason — so where `TFT009` *ran*, the disclosure has to be a note.
+///
+/// # It reads the outcome, because the two can contradict each other
+///
+/// `TFT009` skips outright when `interval_shape` accepted no edge, and that
+/// skip reason already says there is *nothing to measure a trailing silence
+/// against*. A note next to it claiming the check "measured gaps between
+/// retained samples but not the gap since the newest one" describes work that
+/// did not happen, in the same document, about the same run. That is the rule
+/// `TFT011`'s two disclosures already follow one file over — when both halves
+/// are blind the check skips and the notes stay quiet rather than the report
+/// explaining itself twice — and the two conditions here are independent, so
+/// neither predicate could have caught it: the skip is about the arena's
+/// samples and the note is about the clock and the source.
 #[must_use]
-pub fn silence_coverage_note(clock: Clock, stream: PushStream) -> Option<String> {
+pub fn silence_coverage_note(
+    tft009: &CheckOutcome,
+    clock: Clock,
+    stream: PushStream,
+) -> Option<String> {
+    debug_assert_eq!(
+        tft009.check,
+        Tft::Tft009,
+        "the outcome read here has to be the one this note is about"
+    );
+    if matches!(tft009.status, Status::Skipped(_)) {
+        return None;
+    }
     match (clock, stream) {
         (Clock::Wall(_), PushStream::RingsUnderWriter) => None,
         (_, PushStream::RingsUnderWriter) => Some(
@@ -1823,8 +1961,70 @@ fn tft012(inp: &Inputs<'_>) -> CheckOutcome {
 /// publisher stops mattering.
 const DECLARATION_GRACE_NS: i64 = 5_000_000_000;
 
-/// A lower bound on how long **anything** in this arena has been publishing, or
-/// `None` when nothing has.
+/// How long **anything** in this arena has been publishing, or which of the two
+/// absences stands in the way of an answer.
+///
+/// Three-valued for [`RateEvidence`]'s reason: `TFT013`'s skip reason has to
+/// name **which**, and the two absences are opposite arenas with opposite next
+/// steps. A `None` folded them, and the reason printed for the fold described
+/// only the first — an arena with a publisher that had accepted 3600 pushes was
+/// told *nothing in this arena has published a measurable stream … an edge with
+/// `head == 0` is what every dynamic edge of a correct arena reads as at
+/// bringup*, using a fact ([`doctor::EdgeInfo::head`]) the same function had
+/// already read three lines earlier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishActivity {
+    /// No dynamic edge has ever accepted a push. Bringup and a total outage at
+    /// once, and no fact in the arena separates them; `TFT017` reports the
+    /// second.
+    NoPublisher,
+    /// Something **has** published — `largest_head` pushes on the busiest
+    /// dynamic edge — and no dynamic edge yielded the two samples
+    /// [`doctor::median_period`] needs, so the span below cannot be computed
+    /// from any of them.
+    ///
+    /// **Three arenas reach this state and their remedies are different**,
+    /// which is why the numbers travel with it rather than one sentence being
+    /// printed over all of them.
+    ///
+    /// * A ring that *cannot* hold two. `Capacity::history` is
+    ///   `next_pow2(ceil(rate_hz * secs))` and `SampleRing::retained` is
+    ///   `capacity - 1`, so a ring declared `rate_hz * secs <= 2` retains
+    ///   exactly one sample however long the publisher runs — reachable
+    ///   **permanently**, not only at bringup.
+    /// * A ring that has simply not been given two: a publisher that has pushed
+    ///   once into a 512-slot ring, which is every `doctor --attach` at
+    ///   bringup, and a `--from-bag` run whose recording carries one dated
+    ///   record for the edge — `crate::recording` admits no record with
+    ///   `stamp_ns == 0`, so a bag can yield no observation at all against a
+    ///   head in the thousands.
+    /// * Samples enough and **no positive median period**:
+    ///   [`doctor::median_period`] declines a non-positive median as well as a
+    ///   short stream, so a publisher stamping one instant or stamping
+    ///   backwards lands here with a full ring.
+    ///
+    /// Naming one of the three as *the* cause is the defect this variant was
+    /// split out of [`PublishActivity::NoPublisher`] to stop, one arena over.
+    Unmeasurable {
+        /// Accepted pushes on the busiest dynamic edge. The evidence that this
+        /// is not the arena above.
+        largest_head: u64,
+        /// The most samples any dynamic edge that has published *can* retain
+        /// (`capacity - 1`). Below two, no ring in this arena can ever hold a
+        /// median period and the ring size is the remedy.
+        retained_capacity: u32,
+        /// The most samples actually recovered from any of those edges. With
+        /// `retained_capacity` at two or more it separates the second arena
+        /// from the third: below two the stream is short, at two or more the
+        /// samples are there and their cadence is what is missing.
+        observed: usize,
+    },
+    /// A lower bound on how long the longest-running dynamic publisher has been
+    /// going, in nanoseconds.
+    Running(i64),
+}
+
+/// [`PublishActivity`] for this arena.
 ///
 /// # Why this quantity and not the arena's age
 ///
@@ -1845,16 +2045,29 @@ const DECLARATION_GRACE_NS: i64 = 5_000_000_000;
 /// It is a **lower** bound in both terms — `head` counts accepted pushes, and
 /// the median under-reads a stream with gaps — which is the conservative
 /// direction: this check accuses late rather than early.
-fn publish_activity_ns(inp: &Inputs<'_>) -> Option<i64> {
+///
+/// One walk, not two: an "is anything publishing" pass beside a "how long" pass
+/// can come to disagree, which is the defect
+/// [`rate_coverage_note`] was repaired for one section up.
+fn publish_activity(inp: &Inputs<'_>) -> PublishActivity {
     let by_edge = inp.obs.by_edge();
     let mut best: Option<i64> = None;
+    let mut largest_head = 0u64;
+    let mut retained_capacity = 0u32;
+    let mut observed = 0usize;
     for e in &inp.snap.edges {
         if e.kind != EdgeKind::Dynamic || e.head == 0 {
             continue;
         }
+        largest_head = largest_head.max(e.head);
+        // `SampleRing::retained` is `capacity - 1`. Collected in the same walk
+        // as the span for the reason stated above: a second pass to ask "could
+        // any ring here have held two?" can come to disagree with this one.
+        retained_capacity = retained_capacity.max(e.capacity.saturating_sub(1));
         let Some(samples) = by_edge.get(&e.id) else {
             continue;
         };
+        observed = observed.max(samples.len());
         let Some(period) = doctor::median_period(samples) else {
             continue;
         };
@@ -1862,7 +2075,15 @@ fn publish_activity_ns(inp: &Inputs<'_>) -> Option<i64> {
         let span = i64::try_from(span).unwrap_or(i64::MAX);
         best = Some(best.map_or(span, |b: i64| b.max(span)));
     }
-    best
+    match (best, largest_head) {
+        (Some(span), _) => PublishActivity::Running(span),
+        (None, 0) => PublishActivity::NoPublisher,
+        (None, largest_head) => PublishActivity::Unmeasurable {
+            largest_head,
+            retained_capacity,
+            observed,
+        },
+    }
 }
 
 /// `TFT013` — an edge declared and never published to, **after a grace period**.
@@ -1878,21 +2099,85 @@ fn publish_activity_ns(inp: &Inputs<'_>) -> Option<i64> {
 /// to make — accused every one of them. §6's Detection column has always read
 /// "head == 0 **after a grace period**"; the predicate had no time term at all.
 ///
-/// The evidence is [`publish_activity_ns`], and where there is none the whole
-/// check **skips** with a reason. That skip is the honest answer to a real
-/// ambiguity rather than a gap: an arena in which nothing has ever published is
-/// a robot at bringup and a robot whose every publisher is dead, and no fact in
-/// the arena separates them. `TFT017` (no live writer) is the id that reports
-/// the second.
+/// The evidence is [`publish_activity`], and where there is none the whole check
+/// **skips** with a reason. There are **two** such arenas and the reason has to
+/// say which, because they are opposite:
+///
+/// * [`PublishActivity::NoPublisher`] — nothing has ever published. That skip is
+///   the honest answer to a real ambiguity rather than a gap: it is a robot at
+///   bringup and a robot whose every publisher is dead, and no fact in the arena
+///   separates them. `TFT017` (no live writer) is the id that reports the
+///   second.
+/// * [`PublishActivity::Unmeasurable`] — publishers **exist** and no dynamic
+///   edge yielded the two samples a median period needs. This one is not an
+///   ambiguity at all, and printing the sentence above for it states something
+///   false about the arena: it says nothing has published, to an operator whose
+///   publisher has accepted thousands of pushes, and sends them to `TFT017`.
+///   **Its own reason then has the same shape one level down**, which is why
+///   the variant carries two numbers and the message branches on them. A ring
+///   too small to ever hold two samples, a large ring that has only been given
+///   one, and a stream of samples with no positive median period are three
+///   different arenas: a ring-size remedy is false about a 512-slot ring at
+///   bringup or a recording carrying one dated record per edge, and a
+///   too-few-samples sentence is false about a publisher stamping one instant,
+///   which [`doctor::median_period`] declines for its own reason.
 fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
-    let Some(activity) = publish_activity_ns(inp) else {
-        return CheckOutcome::skipped(
-            Tft::Tft013,
-            "nothing in this arena has published a measurable stream, so there is no evidence \
-             that any publisher has had time to start: an edge with head == 0 is what every \
-             dynamic edge of a correct arena reads as at bringup. TFT017 is the id for an edge \
-             whose writer is gone",
-        );
+    let activity = match publish_activity(inp) {
+        PublishActivity::Running(ns) => ns,
+        PublishActivity::NoPublisher => {
+            return CheckOutcome::skipped(
+                Tft::Tft013,
+                "nothing in this arena has published a measurable stream, so there is no \
+                 evidence that any publisher has had time to start: an edge with head == 0 is \
+                 what every dynamic edge of a correct arena reads as at bringup. TFT017 is the \
+                 id for an edge whose writer is gone",
+            );
+        }
+        PublishActivity::Unmeasurable {
+            largest_head,
+            retained_capacity,
+            observed,
+        } => {
+            // Which of the three arenas this is, said from the numbers rather
+            // than assumed. Naming a ring size to an operator whose ring holds
+            // 511 samples is the defect one level up, reintroduced — and
+            // `doctor::median_period` declines on a non-positive median as well
+            // as on a short stream, so "not enough samples" is not the whole of
+            // the third case either.
+            let cause = if retained_capacity < 2 {
+                format!(
+                    "no ring in it can hold two — the largest retains {retained_capacity}. A \
+                     ring of four slots retains three; RingSize::History rounds rate_hz x secs \
+                     up to a power of two, so anything at or below two rounds to a ring that \
+                     retains one sample for the life of the arena"
+                )
+            } else if observed < 2 {
+                format!(
+                    "the rings are large enough — the largest retains {retained_capacity} — \
+                     and {observed} sample(s) came back from the best-supplied edge. A \
+                     publisher that has pushed once reads like this at bringup, and so does a \
+                     recording that carries one dated record for an edge; a record with no \
+                     stamp is not an observation"
+                )
+            } else {
+                format!(
+                    "the samples are there — the largest ring retains {retained_capacity} and \
+                     {observed} came back from the best-supplied edge — and no edge has a \
+                     positive median period, so there is no cadence to multiply. TFT009 names \
+                     that gap on the edge it belongs to, and TFT018 names stamps that go \
+                     backwards"
+                )
+            };
+            return CheckOutcome::skipped(
+                Tft::Tft013,
+                format!(
+                    "this arena has publishers — the busiest dynamic edge has accepted \
+                     {largest_head} push(es) — but no dynamic edge yielded the two samples a \
+                     median period needs, so how long they have been running cannot be measured \
+                     from it and the grace period this check owes them has no clock: {cause}"
+                ),
+            );
+        }
     };
     if activity < DECLARATION_GRACE_NS {
         return CheckOutcome::skipped(
@@ -2932,7 +3217,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-    use crate::catalogue::Status;
     use crate::doctor::{EdgeInfo, FrameInfo};
     use tf_tree::InterpPolicy;
 
@@ -3098,7 +3382,7 @@ mod tests {
              stay quiet: {o:?}"
         );
         assert!(
-            silence_coverage_note(now, PushStream::Observed).is_some(),
+            silence_coverage_note(&o, now, PushStream::Observed).is_some(),
             "a source this half cannot run on must say so"
         );
 
@@ -3113,7 +3397,7 @@ mod tests {
             "the finding must name the silence and what it means: {msg}"
         );
         assert!(
-            silence_coverage_note(now, PushStream::RingsUnderWriter).is_none(),
+            silence_coverage_note(&o, now, PushStream::RingsUnderWriter).is_none(),
             "the half ran, so there is nothing to disclose"
         );
 
@@ -3125,10 +3409,12 @@ mod tests {
             Status::Pass,
             "a non-wall clock has no answer for \"how long since the last sample\": {o:?}"
         );
-        assert!(
-            silence_coverage_note(Clock::NewestStamp(newest), PushStream::RingsUnderWriter)
-                .is_some()
-        );
+        assert!(silence_coverage_note(
+            &o,
+            Clock::NewestStamp(newest),
+            PushStream::RingsUnderWriter
+        )
+        .is_some());
     }
 
     /// **A publisher that stopped is not certified healthy by `TFT007` and
@@ -3398,6 +3684,441 @@ mod tests {
             tft008(&inputs(&snap, &obs, &[], Clock::Wall(0))).status,
             Status::Pass
         );
+    }
+
+    /// **Every finding-producing arm of `TFT016` fires, and the two arms nobody
+    /// could have noticed breaking are pinned by more than a count.**
+    ///
+    /// This check had no test of any kind. The only `Inputs` this module builds
+    /// carries `host: None`, which drives the Linux skip and nothing else; the
+    /// whole-fixture harness in `tests/catalogue.rs` passes `None` on purpose
+    /// (*"a test whose result depends on the CI runner's huge-page setting is a
+    /// test that fails for a reason nobody can act on"*); and the end-to-end
+    /// `--json` test runs the real binary and asserts nothing about this id.
+    /// `hostfacts`' parsers are well tested — they hold that
+    /// [`crate::hostfacts::probe`] reads the right *files*. Nothing held what
+    /// the check does with what they return.
+    ///
+    /// **What it does not prove**, stated because the split is the point: it
+    /// reads no `/sys` and no `/proc` and constructs every [`HostFacts`] by
+    /// hand, so it says nothing about whether `probe` reads the right files.
+    /// That half is `hostfacts`' own parser tests, and keeping them apart is
+    /// what makes this one runnable on any CI runner.
+    ///
+    /// **Mutants, both run.** (1) Invert the shmem predicate —
+    /// `if !host.shmem_thp.honours_madvise()` → `if host.…`. That is *healthy
+    /// host reads broken, broken host reads healthy*, the one thing
+    /// `hostfacts`' own module doc says a diagnostic must never do, and the
+    /// whole crate stayed green before this test: the `Never` row and its
+    /// `Advise`/`WithinSize` complements are what catch it, and only the pair
+    /// pins the **direction**. (2) Delete `|MCL_ONFAULT` from the memlock
+    /// message. `docs/decisions/0049` measured that flag — without it the call
+    /// prefaults the whole over-provisioned arena — and the advice it replaced
+    /// had already shipped to operators, the second time this string has been
+    /// corrected. The substring assertions below are deliberate and are not
+    /// brittleness: they are what makes the third correction fail a test rather
+    /// than reach a robot. (3) Change `docs/API.md` §8.3's recommended flags,
+    /// which is the same drift from the other end and is what the comparison
+    /// against that section catches. **Also run, and it must stay GREEN:**
+    /// give §8.3's *withdrawn* quotation the `mlockall(` prefix it does not
+    /// currently carry. That is an editorial change and says nothing about the
+    /// advice; a comparison that read the whole document, or a set over the
+    /// section, would go red on it.
+    #[test]
+    fn every_tft016_arm_fires_and_the_two_corrected_strings_are_pinned() {
+        let snap = two_frame_snapshot(edge(1, 1, 2, 4));
+        let obs = Observations::new();
+        let host_inputs = |host: HostFacts| Inputs {
+            host: Some(host),
+            ..inputs(&snap, &obs, &[], Clock::Wall(0))
+        };
+        let arena = inputs(&snap, &obs, &[], Clock::Wall(0)).arena_bytes;
+        let facts = |thp, shmem_thp, memlock| HostFacts {
+            thp,
+            shmem_thp,
+            memlock,
+        };
+
+        // A host with nothing wrong with it. Every row below is read against
+        // this one, so a check that fired unconditionally would fail here
+        // rather than look like coverage.
+        for quiet in [
+            facts(Thp::Madvise, ShmemThp::Advise, MemLock::Unlimited),
+            facts(Thp::Always, ShmemThp::Always, MemLock::Unlimited),
+            // `within_size` behaves as `advise` for a whole-file mapping, which
+            // `ShmemThp::honours_madvise` encodes and its doc states.
+            facts(Thp::Madvise, ShmemThp::WithinSize, MemLock::Unlimited),
+            // Exactly the arena is enough; the predicate is `limit < arena`.
+            facts(Thp::Madvise, ShmemThp::Advise, MemLock::Bytes(arena)),
+        ] {
+            let o = tft016(&host_inputs(quiet));
+            assert_eq!(
+                o.status,
+                Status::Pass,
+                "nothing is wrong with {quiet:?} and TFT016 reported {o:?}"
+            );
+        }
+
+        // One arm each, and *one* finding each: a row that fires two arms
+        // cannot say which one the assertion is about.
+        let one = |host: HostFacts, needle: &str| {
+            let o = tft016(&host_inputs(host));
+            assert_eq!(o.status, Status::Fired, "{host:?} must fire: {o:?}");
+            assert_eq!(o.findings.len(), 1, "{host:?} must fire one arm: {o:?}");
+            assert!(
+                o.findings[0].message.contains(needle),
+                "the {host:?} finding must name {needle}: {}",
+                o.findings[0].message
+            );
+            o.findings[0].message.clone()
+        };
+        one(
+            facts(Thp::Never, ShmemThp::Advise, MemLock::Unlimited),
+            "transparent huge pages are 'never'",
+        );
+        one(
+            facts(Thp::Unknown, ShmemThp::Advise, MemLock::Unlimited),
+            "transparent_hugepage/enabled was absent",
+        );
+        // The inverted-predicate mutant dies here, against the quiet rows above.
+        one(
+            facts(Thp::Madvise, ShmemThp::Never, MemLock::Unlimited),
+            "shmem transparent huge pages are 'never'",
+        );
+        one(
+            facts(Thp::Madvise, ShmemThp::Deny, MemLock::Unlimited),
+            "shmem transparent huge pages are 'deny'",
+        );
+        one(
+            facts(Thp::Madvise, ShmemThp::Unknown, MemLock::Unlimited),
+            "transparent_hugepage/shmem_enabled was absent",
+        );
+        one(
+            facts(Thp::Madvise, ShmemThp::Advise, MemLock::Unknown),
+            "no 'Max locked memory' row",
+        );
+
+        // The boundary of `limit < inp.arena_bytes`, whose quiet side is above.
+        let msg = one(
+            facts(Thp::Madvise, ShmemThp::Advise, MemLock::Bytes(arena - 1)),
+            "RLIMIT_MEMLOCK is",
+        );
+        assert!(
+            msg.contains(&format!("{} byte arena", arena)),
+            "the limit is compared against the arena and the finding must say so: {msg}"
+        );
+        // `docs/decisions/0049`: `MCL_ONFAULT` is what stops the call
+        // prefaulting the whole over-provisioned arena, and the advice without
+        // it shipped once. `mlockall` charges the whole address space, so a
+        // limit above the arena is not sufficient and silence is not a
+        // clearance — both clauses were corrected once and neither was pinned.
+        assert!(
+            msg.contains("MCL_ONFAULT") && msg.contains("not a clearance"),
+            "0049's two corrections must survive a rewording of the paragraph: {msg}"
+        );
+
+        // Three unknown sources are three findings, not one: an operator who
+        // can read none of the three files has three things to fix.
+        let o = tft016(&host_inputs(facts(
+            Thp::Unknown,
+            ShmemThp::Unknown,
+            MemLock::Unknown,
+        )));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(o.findings.len(), 3, "one finding per unknown source: {o:?}");
+
+        // And the skip that was the only reachable arm before this test.
+        let o = tft016(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert!(
+            matches!(&o.status, Status::Skipped(why) if why.contains("only on Linux")),
+            "with no host facts the check must skip with its reason: {o:?}"
+        );
+
+        // `docs/decisions/0049`'s Consequences: *"correcting the two documents
+        // and leaving `checks.rs` would be the worst outcome"*, and nothing
+        // enforced that. This holds the operator-facing string to
+        // `docs/API.md` §8.3, which is where the wrong advice was copied from.
+        // The other sites that spell the flags are guarded by review alone;
+        // `rg -l mlockall` is the list, and no count of it is written here.
+        // The advice this message was copied from, read out of the document
+        // rather than spelled a second time here.
+        let recommended = api_md_recommended_mlockall();
+        assert_eq!(
+            mlockall_args(&msg),
+            vec![recommended.clone()],
+            "TFT016's advice and docs/API.md §8.3's recommendation name \
+             different flags ({recommended} there); 0049 corrected this string \
+             once and correcting one site alone is the outcome its Consequences \
+             names as the worst"
+        );
+    }
+
+    /// The `mlockall(...)` flags `docs/API.md` §8.3 **recommends**, whitespace
+    /// and backticks removed.
+    ///
+    /// # Why the first call in the section, and not a set over it
+    ///
+    /// §8.3 spells the flags twice: the recommendation, and the *withdrawn*
+    /// form quoted underneath to say what it does wrong. A set over the section
+    /// — or over the whole document, or over `0049`, which quotes the withdrawn
+    /// form twice — reads that quotation as a second recommendation and turns
+    /// red on an editorial change that says nothing about the advice.
+    /// Document order is what separates them: the recommendation is the bullet
+    /// the section leads with.
+    ///
+    /// It is a comparison rather than a `contains` because the two sites spell
+    /// the same flags with different spacing and backticks, and because
+    /// `contains("MCL_ONFAULT")` is satisfied by a message that names that flag
+    /// and drops one of the other two. The question is *which flags*, and only
+    /// the whole argument list asks it.
+    fn api_md_recommended_mlockall() -> String {
+        const API_MD: &str = include_str!("../../../docs/API.md");
+        let (_, after) = API_MD
+            .split_once("### 8.3 ")
+            .expect("docs/API.md must still carry §8.3");
+        let section = after.split_once("\n### ").map_or(after, |(body, _)| body);
+        // An empty parse is not a pass: the comparison above would then hold
+        // the message to nothing.
+        mlockall_args(section)
+            .into_iter()
+            .next()
+            .expect("docs/API.md §8.3 must still recommend an mlockall(...) call")
+    }
+
+    /// Every `mlockall(...)` argument list in `s`, whitespace and backticks
+    /// removed, in document order.
+    fn mlockall_args(s: &str) -> Vec<String> {
+        s.split("mlockall(")
+            .skip(1)
+            .filter_map(|rest| rest.split_once(')'))
+            .map(|(args, _)| {
+                args.chars()
+                    .filter(|c| !c.is_whitespace() && *c != '`')
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// **`TFT013`'s unmeasurable skip names the obstacle this arena has, and
+    /// there are three of them.**
+    ///
+    /// [`PublishActivity::Unmeasurable`] is reached whenever no dynamic edge
+    /// yields [`doctor::median_period`] an answer, and the sentence that
+    /// shipped named a ring size for all of them. `median_period` declines a
+    /// stream shorter than two **and** a non-positive median, and a ring that
+    /// can hold 511 samples is not a ring-size problem, so a remedy printed
+    /// over all three is false about two of them — the same shape as the
+    /// `NoPublisher` fold this variant was split out of.
+    ///
+    /// `tests/catalogue.rs` drives the first two through a real arena, which is
+    /// where the reachability claim belongs. This is the arm-by-arm reading of
+    /// the message, including the third, which needs stamps a `TreeBuilder`
+    /// will not accept.
+    ///
+    /// **Mutant, run:** delete the `observed < 2` arm. The third case then
+    /// reports a stream of one against `observed = 5` and the last assertion
+    /// fails.
+    #[test]
+    fn tft013_names_which_of_the_three_unmeasurable_arenas_this_is() {
+        let one_sample = |edge: u32, stamp: i64, n: usize| {
+            Observations::from_samples(
+                (0..n)
+                    .map(|_| PushSample {
+                        edge,
+                        writer_pid: 4711,
+                        stamp_ns: stamp,
+                        arrival_delay_ns: 0,
+                    })
+                    .collect(),
+            )
+        };
+
+        // (1) A two-slot ring: it retains one sample whatever the publisher
+        // does, so the ring size is the remedy.
+        let mut e = edge(1, 1, 2, 3_600);
+        e.capacity = 2;
+        let snap = two_frame_snapshot(e);
+        let obs = one_sample(1, 7_000_000, 1);
+        let o = tft013(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("3600 push(es)")
+                    && why.contains("no ring in it can hold two")
+                    && why.contains("four slots"),
+                "the ring is the obstacle and the reason has to say so: {why}"
+            ),
+            other => panic!("TFT013 reported {other:?} on an arena it cannot measure"),
+        }
+
+        // (2) A 512-slot ring with one sample in it — `doctor --attach` at
+        // bringup. 511 slots are free and a ring-size remedy is false.
+        let snap = two_frame_snapshot(edge(1, 1, 2, 1));
+        let o = tft013(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("rings are large enough")
+                    && why.contains("511")
+                    && !why.contains("four slots"),
+                "511 free slots are not a ring-size problem: {why}"
+            ),
+            other => panic!("TFT013 reported {other:?} on an arena it cannot measure"),
+        }
+
+        // (3) Five samples at one instant: the count and the ring are both
+        // fine and `median_period` declines on the median itself. Neither of
+        // the sentences above is true of this arena.
+        let obs = one_sample(1, 7_000_000, 5);
+        let snap = two_frame_snapshot(edge(1, 1, 2, 5));
+        let o = tft013(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("no edge has a positive median period")
+                    && why.contains("TFT009")
+                    && !why.contains("four slots")
+                    && !why.contains("rings are large enough"),
+                "the samples are there and their cadence is what is missing: {why}"
+            ),
+            other => panic!("TFT013 reported {other:?} on an arena it cannot measure"),
+        }
+    }
+
+    /// **`TFT009` skips rather than passing on an arena in which it judged no
+    /// edge at all**, which is `TFT008`'s defect one row over and reached
+    /// further than it.
+    ///
+    /// Both of `TFT009`'s halves — the retained gap and the trailing silence —
+    /// run only over edges [`interval_shape`] accepted, so on an arena where
+    /// every edge falls into a [`ShapeGap`] the subject set is empty and the
+    /// empty finding list rendered as `pass` for a check titled *gaps /
+    /// dropouts*. `TFT008` **skips** on exactly those arenas, so one document
+    /// carried *not run, nothing to measure* and *pass* about the same empty
+    /// set — and it did so about a five-second dropout that is in `TFT009`'s
+    /// own samples.
+    ///
+    /// The floor is permanent as well as transient: an edge sized
+    /// `RingSize::History { rate_hz, secs }` with `rate_hz * secs <= 4` retains
+    /// at most three samples for the life of the arena.
+    ///
+    /// **Mutant A**, run: replace the `judged == 0` skip with the bare
+    /// `CheckOutcome::ran`, i.e. the behaviour that shipped. The first case
+    /// reports `Pass` and the `match` panics.
+    /// **Mutant B**, run: `GAP_MIN_INTERVALS: usize = 3`. The first case is then
+    /// measurable and the dropout fires, so the constant the reason quotes is
+    /// the only thing separating the two halves of this test.
+    /// **Mutant C**, run: delete the empty-arena sentence from
+    /// `gap_evidence_skip` and let an arena with no samples fall into the
+    /// three-clause one, which then names no class at all.
+    /// **Mutant D**, run: give `ShapeGap::NoPeriod` the too-few-intervals
+    /// clause. The status stays `Skipped` and the last arm fails, which is why
+    /// each arm reads the reason instead of the status.
+    #[test]
+    fn tft009_skips_when_no_edge_retained_enough_intervals_to_measure_a_gap() {
+        const MS: i64 = 1_000_000;
+        let snap = two_frame_snapshot(edge(1, 1, 2, 4));
+        let now = Clock::Wall(5_030 * MS);
+        // Four stamps is three intervals: one short of the floor. The 5 s hole
+        // between the third and the fourth is 500x the 10 ms cadence around it.
+        let stamps = [0, 10 * MS, 20 * MS, 5_020 * MS];
+        let obs = Observations::from_samples(
+            stamps
+                .iter()
+                .map(|&ns| tf_tree_bench::fixture::PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: ns,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+        let o = tft009(&live_inputs(&snap, &obs, &[], now));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("fewer than the 4 intervals")
+                    && !why.contains("backwards")
+                    && !why.contains("one instant"),
+                "the skip must name the missing evidence, and must not be one of the \
+                 other two gaps: {why}"
+            ),
+            other => panic!(
+                "TFT009 reported {other:?} about an arena in which it judged no edge at \
+                 all — while a 5 s dropout is in its own samples and TFT008 fires on the \
+                 same edge in the same document"
+            ),
+        }
+        // The other check in that document, on the same inputs, over the same
+        // empty set. It has an answer; a `pass` beside it is two answers.
+        assert_ne!(
+            tft008(&live_inputs(&snap, &obs, &[], now)).status,
+            Status::Pass,
+            "if TFT008 ever passes here this test no longer says what it claims"
+        );
+        // And the disclosure in `Meta.notes` is the third answer that must not
+        // appear. This source would otherwise get the "nothing is writing this
+        // source" note, which says the retained-gap half ran — beside a `not
+        // run` line for the same id, in the same document.
+        assert!(
+            silence_coverage_note(&o, Clock::Wall(0), PushStream::Observed).is_none(),
+            "TFT009 skipped; a note claiming it measured the retained gaps is the \
+             report contradicting itself: {o:?}"
+        );
+
+        // Non-vacuity: one more stamp is four intervals, and the dropout that
+        // was always in these samples is reported.
+        let obs = Observations::from_samples(
+            [0, 10 * MS, 20 * MS, 30 * MS, 5_030 * MS]
+                .iter()
+                .map(|&ns| tf_tree_bench::fixture::PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: ns,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+        let o = tft009(&live_inputs(&snap, &obs, &[], Clock::Wall(5_040 * MS)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert!(
+            o.findings.iter().any(|f| f.message.contains("largest gap")),
+            "the gap was in the samples all along: {o:?}"
+        );
+
+        // The third gap, which no other test reaches: five stamps at one
+        // instant is four intervals and a zero median, so the count and the
+        // monotone guards both pass and `median_period` is what declines.
+        let obs = Observations::from_samples(
+            (0..5)
+                .map(|_| tf_tree_bench::fixture::PushSample {
+                    edge: 1,
+                    writer_pid: 4711,
+                    stamp_ns: 7 * MS,
+                    arrival_delay_ns: 0,
+                })
+                .collect(),
+        );
+        let o = tft009(&live_inputs(&snap, &obs, &[], now));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("one instant") && !why.contains("intervals a median"),
+                "a publisher stamping one instant is its own gap, and the remedy is \
+                 neither a fuller ring nor TFT018: {why}"
+            ),
+            other => panic!(
+                "TFT009 reported {other:?} about a stream with no period to be a \
+                 multiple of"
+            ),
+        }
+
+        // And an arena nothing has published to at all is its own sentence,
+        // because "no edge retained enough" and "nothing published" are
+        // different arenas with different next steps.
+        let o = tft009(&live_inputs(&snap, &Observations::new(), &[], now));
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("nothing has published") && !why.contains("intervals a median"),
+                "an empty observation set is not the too-few-intervals arena: {why}"
+            ),
+            other => panic!("TFT009 reported {other:?} about an arena with no samples"),
+        }
     }
 
     /// **A live publisher at its declared cadence is not reported as stopped**,
@@ -3808,7 +4529,7 @@ mod tests {
     /// An arena in which edge 1 has been publishing at 100 Hz for `activity_ns`,
     /// plus the `subject` edge (id 2) the test is about.
     ///
-    /// `publish_activity_ns` reads `head` and the observed median together, so
+    /// `publish_activity` reads `head` and the observed median together, so
     /// both halves have to be here: a snapshot with a large `head` and no samples
     /// measures nothing, and so does a full sample list on an edge whose `head`
     /// the fixture forgot to set.
@@ -3976,7 +4697,7 @@ mod tests {
     /// test and `never_published_does_not_accuse_static_edges` then measures
     /// 90 ms — the ten samples the observation list holds, whatever `head` says
     /// — and both tests fail. That is the ring-wrap saturation
-    /// `publish_activity_ns`' doc argues about, reproduced.
+    /// `publish_activity`' doc argues about, reproduced.
     #[test]
     fn an_unpublished_edge_is_not_accused_inside_the_grace_period() {
         let stats: [EdgeStats; 0] = [];
@@ -4017,7 +4738,7 @@ mod tests {
     /// **The grace period is measured against the *longest*-running publisher
     /// in the arena, and only against a dynamic one.**
     ///
-    /// Both clauses are written into `publish_activity_ns`' doc and neither was
+    /// Both clauses are written into `publish_activity`' doc and neither was
     /// pinned: every other `TFT013` fixture has a single publishing edge, where
     /// a maximum and a minimum are the same number and a kind filter over one
     /// dynamic edge does nothing. A review mutated `b.max(span)` to
@@ -4818,10 +5539,16 @@ mod tests {
     /// jump is 350 ms, comfortably past `GAP_FACTOR` x median (so the old code
     /// really did fire).
     ///
-    /// Mutant: replace the `intervals.iter().any(|&d| d < 0)` guard with the
-    /// old `median <= 0` test alone. Applied: `TFT009` fires with
+    /// Mutant: drop [`ShapeGap::NotMonotone`] and let a negative interval fall
+    /// through to the median test alone. Applied: `TFT009` fires with
     /// "largest gap 350.0 ms is 3.5x the median period 100.0 ms" and the first
-    /// assertion fails.
+    /// arm panics.
+    ///
+    /// **Second mutant**, which is what the `match` below is for rather than an
+    /// `assert_ne!`: fold [`ShapeGap::NotMonotone`] into
+    /// [`ShapeGap::TooFewIntervals`] in [`gap_evidence_skip`]. The status is
+    /// still `Skipped` and the reason then tells the operator to wait for a
+    /// ring to fill on an arena whose fault is a reordered publisher.
     #[test]
     fn an_out_of_order_stream_is_not_reported_as_a_dropout() {
         const MS: i64 = 1_000_000;
@@ -4841,12 +5568,23 @@ mod tests {
         );
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
         let o = tft009(&inputs(&snap, &obs, &[], Clock::Wall(0)));
-        assert_eq!(
-            o.status,
-            Status::Pass,
-            "a reordered stream has no inter-arrival distribution to measure a gap \
-             against; the fault is out-of-order, not a dropout: {o:?}"
-        );
+        // Not `Pass`, which is what this asserted until the empty-subject-set
+        // repair: the one edge in this arena is the one edge declined, so the
+        // subject set is empty and a pass would be the all-clear the repair
+        // removed. The reason has to send the operator to `TFT018` rather than
+        // to a ring that has not filled.
+        match &o.status {
+            Status::Skipped(why) => assert!(
+                why.contains("goes backwards") && why.contains("TFT018"),
+                "a reordered stream has no inter-arrival distribution to measure a gap \
+                 against, and the skip must name the fault that does explain it: {why}"
+            ),
+            other => panic!(
+                "TFT009 reported {other:?} about a stream whose only edge it declined: \
+                 the fault is out-of-order, not a dropout, and an empty subject set is \
+                 not a pass"
+            ),
+        }
 
         // Non-vacuity, twice over. The stream really is out of order...
         assert!(

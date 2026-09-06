@@ -884,7 +884,25 @@ impl Plan {
     /// | `Plan::at` **alone** | 106 B — *byte-identical* | 1 → `Plan::fold_at` |
     /// | `fold_at` alone | 62 B | 1 → `Plan::at` |
     /// | `fold_at` + `Plan::at` | 1332 B | 1 → `Guard::sample_hinted` |
-    /// | all five on this path, as shipped | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
+    /// | all five on this path | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
+    ///
+    /// **CORRECTION (2026-09-06): the last row was labelled *"as shipped"* and
+    /// is not.** The table was measured 2026-08-02. On 2026-08-29
+    /// [`Self::at_tagged`] was interposed between this method and `fold_at`
+    /// (`0038`, the runtime domain tag) carrying **no attribute**, so the chain
+    /// is cut in the middle: everything below `at_tagged` inlines into
+    /// `at_tagged`, and a downstream caller emits exactly **one** real
+    /// cross-crate call — to `at_tagged`, not to `fold_at`. Re-derive it rather
+    /// than reading the row: an external `#[inline(never)]` probe that consumes
+    /// all seven `Iso3` components, at `lto = "thin", codegen-units = 1`, is 16
+    /// instructions and one indirect `call` whose GOT slot `objdump -R` and
+    /// `nm -C` resolve to `<tf_tree_core::plan::Plan>::at_tagged`. Adding
+    /// `#[inline]` to `at_tagged` and changing nothing else takes that same
+    /// probe to 1403 instructions and 8 calls — the table's shape again.
+    ///
+    /// **The attribute is deliberately not added**, and the reason is a
+    /// measurement rather than a preference: see [`Self::at_tagged`]'s own doc
+    /// comment, including the trap in how to measure it.
     ///
     /// **Five, not six.** `Self::fold_at_cursors` was marked in the same
     /// commit and is not on this path at all — no row above ever moved because
@@ -895,11 +913,13 @@ impl Plan {
     /// **`at` is generic, so its MIR crossed the crate boundary anyway and a
     /// downstream caller was already inlining it.** On its own the attribute
     /// changes nothing. What it buys is LLVM's `inlinehint` on the *non-generic*
-    /// links: `fold_at` first — the one real cross-crate call there ever
-    /// was — then this method again, to stop the cost model halting at a
-    /// now-larger `at`, then `Guard::sample*` to remove the last one. Marking
-    /// fewer leaves a call in the middle; that is the claim the third and fourth
-    /// rows above test rather than assert.
+    /// links: `fold_at` first — which was, when this was written, the one real
+    /// cross-crate call there was — then this method again, to stop the cost
+    /// model halting at a now-larger `at`, then `Guard::sample*` to remove the
+    /// last one. Marking fewer leaves a call in the middle; that is the claim
+    /// the third and fourth rows above test rather than assert — **and it is
+    /// now demonstrated in the other direction, because there is a call in the
+    /// middle again and it is `at_tagged`, not `fold_at`.**
     ///
     /// **The price is the caller's code size: 106 B → 1565 B at every embedder
     /// call site**, ~15×, and that is the *scalar* caller only. It is why
@@ -964,6 +984,41 @@ impl Plan {
     /// mistake is a compile error.
     ///
     /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
+    ///
+    /// # It carries no `#[inline]`, on purpose, and that is not free
+    ///
+    /// Every other link on the scalar evaluate path is marked — [`Self::at`],
+    /// `Self::fold_at`, and `Guard`'s `sample`, `sample_hinted` and
+    /// `sample_from`. This one is not, and it sits in the middle of
+    /// them, so **it is the one real cross-crate call a downstream
+    /// `plan.at(&g, t)` emits**: everything below it inlines into this body and
+    /// the caller gets a 16-instruction stub. [`Self::at`]'s doc table describes
+    /// the fully-inlined shape that existed before this method did, and carries
+    /// the correction and the way to re-derive it.
+    ///
+    /// Marking it restores that shape and is **not** obviously a win. A review
+    /// probe measured **+8–10 % instructions per lookup** at depths 1, 3 and 6
+    /// with it on, on a caller consuming the whole `Iso3`. That figure has not
+    /// been independently reproduced and is not quoted here as settled. What
+    /// *is* settled, and is the reason this paragraph exists at all, is the
+    /// trap: **the obvious probe inverts the sign.** A probe returning only
+    /// `iso.t.x` reads the attribute as a couple of percent *cheaper*, because
+    /// LLVM dead-codes the six unused pose components across the now-inlined
+    /// body. Anyone re-opening this must consume all seven components, and must
+    /// decide with `just embed-cost` and `just bench-ab` rather than with a hand
+    /// probe — `docs/API.md` §2.3 item 3 is the row that is supposed to notice.
+    ///
+    /// **`just embed-cost` is subject to that trap as it stands, and that is a
+    /// prerequisite rather than a caveat.** Both of its probe bodies —
+    /// `tf_tree_bench::embed::one` and
+    /// `tf_tree_core::bench_probe::depth3_lookup`, byte-identical on purpose —
+    /// are `match plan.at(g, s) { Ok(iso) => iso.t.x, Err(_) => f64::NAN }`, so
+    /// they consume exactly the one component the sentence above says inverts
+    /// the sign, and every reading anybody has taken through that recipe with
+    /// this attribute toggled was taken through it. Repairing both bodies to
+    /// consume all seven components is the first step of re-opening this, not a
+    /// refinement afterwards; `just bench-ab` is the only one of the two named
+    /// instruments that is clear of it today.
     ///
     /// # Errors
     ///

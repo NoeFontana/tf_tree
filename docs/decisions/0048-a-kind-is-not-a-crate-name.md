@@ -32,23 +32,28 @@ allow-by-default. Enforcement was review, and review had not caught it.
 
 ### The census, and how it was taken
 
-**By the compiler, not by a grep**, and the difference is measured over
-`crates/` on 2026-09-05, each figure with the command that produced it:
+**By the compiler, not by a grep**, and the difference is large enough that the
+instrument is the finding. **This table carried four answers, dated 2026-09-05,
+each beside the command that produced it, and three of them measurably drifted
+within a day of being written** — which is why the answers are gone and the
+commands are not. Run them:
 
-| instrument | answer |
+| instrument | what it answers |
 |---|---|
-| `grep -rn --include='*.rs' 'unsafe' crates \| wc -l` | **690** lines |
-| …of which name an `unsafe_code` / `unsafe_op_in_unsafe_fn` **attribute** | **56** — the rule's own enforcement mechanism, counted as violations of it |
-| `grep -rn --include='*.rs' -E '\bunsafe\b' crates \| wc -l` | **633** lines |
-| `just unsafe-budget`, over the workspace | **488** sites |
+| `grep -rn --include='*.rs' 'unsafe' crates \| wc -l` | lines mentioning the word at all |
+| `grep -rn --include='*.rs' -e unsafe_code -e unsafe_op_in_unsafe_fn crates \| wc -l` | how many of those name the rule's own **enforcement mechanism**, which the line above counts as violations of it |
+| `grep -rn --include='*.rs' -E '\bunsafe\b' crates \| wc -l` | the better grep, and still not the census |
+| `just unsafe-budget` | the census: `unsafe` **sites**, from `--force-warn unsafe_code` |
 
-The word-boundary form is the better grep and is still wrong by more than a
-hundred lines against the compiler, because this repository's prose *about*
-`unsafe` is unusually dense and every `// SAFETY:` paragraph that uses the word
-counts. It also silently drops what the plain form over-counts: `\bunsafe\b`
-does **not** match `unsafe_code`, because the character after `unsafe` there is
-`_` and there is no word boundary. So the two greps are wrong in opposite
-directions, and neither number is the census.
+The word-boundary form is the better grep and still overshoots the compiler by a
+wide margin, because this repository's prose *about* `unsafe` is unusually dense
+and every `// SAFETY:` paragraph that uses the word counts. It also silently
+drops what the plain form over-counts: `\bunsafe\b` does **not** match
+`unsafe_code`, because the character after `unsafe` there is `_` and there is no
+word boundary. So the two greps are wrong in opposite directions, and neither
+number is the census. The four rows are also not in one unit — three count
+*lines* and the last counts *sites* — which is a second reason a reader should
+run them rather than subtract two figures printed side by side.
 
 `RUSTFLAGS="--force-warn unsafe_code"` is the instrument. It **overrides
 `#![forbid(unsafe_code)]`** rather than being suppressed by it — measured, by
@@ -61,7 +66,13 @@ repository has several: `footprint` builds by default, `abi_attached` needs
 `abi-probe`, `fork_child` needs `shm` and its fourth mode `bridge`. The matrix is
 therefore the justfile's own `cargo clippy … --all-targets` lines, so a new
 feature-named pass enters the census the day it is added
-rather than when somebody remembers.
+rather than when somebody remembers — **provided it is written on one physical
+line**, because the extractor reads one line at a time. That proviso was
+unstated and unheld until 2026-09-06, and the file being read already contained
+the shape (`py-compile`'s `cargo clippy \` / `--all-targets`, excluded for
+another reason). `scripts/unsafe-budget.sh`'s `continuation_blind_spots` now
+reports such a pass by name and refuses; the `MIN_SELECTORS` floor could not,
+because a floor absorbs a drop rather than reporting one.
 
 **No count from this section is repeated in `CLAUDE.md`.** Run
 `just unsafe-budget`, which prints its own file and site totals; `0005`'s

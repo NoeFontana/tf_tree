@@ -217,6 +217,9 @@ not at all.
   ordering it measured and asserts none, and the gated verdict does not depend
   on it: the grouped arm is gated because it is the regime the criterion's own
   words put the measurement in, not because it is the slower one.
+  **That inversion should be re-measured before it is cited again**, and the
+  reason is the amendment below: at the time it was observed, a second
+  `--reuse-corpus` run at one path was not a second run over one corpus.
 * **The four-hour recording itself.** The gated arm reproduces its *pass count*,
   not its size. That the ratio at a given pass count is size-independent to
   first order is an argument about where the work is, not a measurement.
@@ -228,6 +231,52 @@ not at all.
   `.tft` is frozen from a generated fleet and was never a bag, and this gate's
   corpus is a fabricated MCAP nothing freezes. The row stays `unavailable` and
   keeps its ground.
+
+### Amendment (2026-09-06) — `--reuse-corpus` did not reuse
+
+Two behaviour changes to the binary this record specifies, recorded here rather
+than made silently, because the second is a decision and not only a repair.
+
+* **The end-of-run cleanup now removes only what this process wrote.** It was
+  guarded on `--keep-corpus` alone, so a `--reuse-corpus` run *deleted* the
+  corpus the flag exists to reuse — "a page cache that is not warm, or one day a
+  real recording" — at exit 0. Measured: an 829 485 B corpus written with
+  `--keep-corpus`, then read with `--reuse-corpus`, was gone afterwards.
+* **`--reuse-corpus` on a path that does not exist now REFUSES.** It used to
+  compute *did this process generate the corpus* from `corpus.exists()`, so the
+  next run at that path fabricated a synthetic corpus from
+  `--edges`/`--rate-hz`/`--seconds` and printed `page cache WARM (written by
+  this process)` over it — measured at a 31.980 s span where the original was
+  7.980 s. The one-word cleanup fix stops the binary causing that state itself;
+  a typo or a moved recording still could. Every other premise this binary has
+  refuses rather than proceeding (the pass counts, the density), and this is the
+  same shape, so the flag now means *measure the corpus that is there* with no
+  second meaning. `--edges`/`--rate-hz`/`--seconds` under it decide nothing and
+  the run already says so.
+
+Both are driven through the shipped binary by
+`reuse_corpus_neither_deletes_the_corpus_nor_fabricates_one`, red-tested on the
+two mutants that restore each half.
+
+### Residual (2026-09-06) — the grouped cap has no headroom, and the arm has refused because of it
+
+Not a decision this record makes; a measurement it now carries, because the
+repair *is* a decision about §4's cap derivation. On the recipe's own default
+corpus (50 edges x 100 Hz x 32 s), at `--release` on the development host, the
+grouped arm reported **3** fill passes and the binary refused — twice in about
+thirty runs. The corpus has 50 equal edges of 204 736 B; the derived cap is
+exactly 25 of them (5 118 400 B), i.e. exactly half, with no slack, and in both
+failing runs the in-memory arm's `peak_buffer_bytes` read 10 441 536 B — exactly
+**51** edges' worth — against 10 236 800 B on every passing run. One edge in
+flight, counted, takes group one from 25 edges to 24.
+
+It fails safe: a refusal, never a pass, and nothing is published from such a run.
+The obvious repair is to derive the cap with one edge of headroom, which stays at
+`CRITERION_PASSES` groups for any corpus whose total exceeds it — but the
+minimal cap is what §4's argument is about, so changing it changes what the gated
+arm measures. That is an amendment to this record, not an edit to the binary, and
+a threshold moved to stop a gate going red is what this gate's own `--gate`
+refusals exist to prevent.
 
 **A number to watch rather than a threshold to trust.** The margin is more than
 an order of magnitude at `--release` and about 1.7× in debug on this host, which
@@ -252,9 +301,11 @@ green direction to `just gate5`.
 3. **`crates/tf_tree_bench/tests/ingest_throughput.rs`**, unfenced, driving the
    shipped binary: a denser corpus turns the gate red without editing a
    threshold, the same run exits 0 without `--gate`, `--floor` is the weaker
-   falsifier, and both premises refuse. — verified by `cargo nextest run
-   -p tf_tree_bench --test ingest_throughput`, and by three seeded mutants listed
-   in that file's header, each observed to fail before being reverted.
+   falsifier, and every premise refuses. — verified by `cargo nextest run
+   -p tf_tree_bench --test ingest_throughput`, and by the seeded mutants listed
+   in that file's header, each observed to fail before being reverted. The count
+   is not written here: the list is in the header, so adding one is a single
+   edit.
 4. **`just gate5`, a step on `nightly.yml`'s `.tft`-gates job,
    `docs/benchmarks/EVIDENCE.md`'s Gates table.** — verified by
    `just evidence-audit` (a `just lint` dependency, which fails on an

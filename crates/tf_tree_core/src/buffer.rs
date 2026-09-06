@@ -56,10 +56,25 @@ pub struct PoseSlot {
     data: [AtomicU64; 7],
 }
 
+// `PoseSlot` is a wire record too — it is what a peer process reads out of the
+// ring and what `write_frozen` copies into a `.tft` — so `size_of` is not a
+// layout here either (`edge.rs`'s `EdgeRecord` block carries the argument).
+//
+// **This is a strictly weaker improvement than the sibling pins and it is worth
+// saying which**: unlike `ClaimRecord`'s two diagnostics-only fields, a swap of
+// `seq` and `data` here already HAS a guard — the committed fixture test
+// `tf_tree::frozen::the_committed_sensor_domain_fixture_reads_and_is_still_tag_one`
+// fails with `SlotContended`, measured. That test runs only under
+// `just shm-check` (its target carries `required-features = ["shm"]`), catches
+// it by a property rather than by the layout, and its own doc says so. These two
+// lines replace an accidental runtime guard two recipes away with a
+// compile-time one; they do not close a hole.
 #[cfg(not(loom))]
 const _: () = {
     assert!(core::mem::size_of::<PoseSlot>() == 64);
     assert!(core::mem::align_of::<PoseSlot>() == 64);
+    assert!(core::mem::offset_of!(PoseSlot, seq) == 0);
+    assert!(core::mem::offset_of!(PoseSlot, data) == 8);
 };
 
 /// Under `loom`, `PoseSlot` holds loom's instrumented atomics and lives on the
@@ -131,8 +146,18 @@ impl Default for PoseSlot {
 ///
 /// # INVARIANT
 ///
-/// `stamps.len() == poses.len()`, that length is a power of two equal to the
-/// edge's ring capacity, and `mask == capacity - 1`.
+/// `stamps.len() == poses.len()`, and that length is a power of two equal to the
+/// edge's ring capacity.
+///
+/// **The capacity used to be spelled twice** — as `poses.len()` and as a `pub
+/// mask: u64` field this comment then had to assert was `capacity - 1`. Nothing
+/// enforced it, on a `pub` field of a `pub` struct in a published crate, and a
+/// ring built with `mask = 3` over 8-slot arrays returned a **silently wrong
+/// pose**: [`Self::capacity`] and [`Self::retained`] compute a 7-sample window
+/// while `stamp_at` masks into 4 slots, so `oldest_stamp` reports a
+/// sample it excludes and the sampler interpolates the wrong pair. No error, no
+/// panic, and the `debug_assert` inside `push` does not fire. [`Self::mask`] is
+/// derived from `poses.len()` now, so the two cannot disagree.
 pub struct SampleRing<'a> {
     /// Monotone count of samples ever published (invariant 5). Never masked in
     /// storage, only at access.
@@ -143,8 +168,6 @@ pub struct SampleRing<'a> {
     pub stamps: &'a [AtomicI64],
     /// Per-slot poses.
     pub poses: &'a [PoseSlot],
-    /// `capacity - 1`; AND a logical index with this to get a physical index.
-    pub mask: u64,
     /// The edge this ring belongs to (named by every error it can raise).
     pub edge: EdgeId,
 }
@@ -155,6 +178,28 @@ impl SampleRing<'_> {
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.poses.len() as u64
+    }
+
+    /// `capacity - 1`; AND a logical index with this to get a physical index.
+    ///
+    /// Derived rather than stored — see the struct's `INVARIANT` for what the
+    /// stored version cost.
+    ///
+    /// **`wrapping_sub` and not `- 1`, and the reason is that the guarantee is
+    /// narrower than it looks.** For a ring this crate builds the capacity is a
+    /// power of two and therefore non-zero: `ArenaView::ring_bytes` is the one
+    /// place that is established, and it returns `None` when
+    /// `!cap.is_power_of_two()`, which also rejects `0`. That is a property of
+    /// the *constructor*, not of the type — every remaining field of
+    /// [`SampleRing`] is `pub`, `poses` included, so a caller outside this
+    /// crate can build one over an empty or non-power-of-two slice and no
+    /// guarantee here applies to it. `wrapping_sub` is what keeps such a ring
+    /// failing the way it always has, at the slice bounds check, instead of
+    /// adding a second debug-only panic site on the read path.
+    #[inline]
+    #[must_use]
+    pub fn mask(&self) -> u64 {
+        self.capacity().wrapping_sub(1)
     }
 
     /// How many of the most recent logical indices a reader may safely touch.
@@ -192,7 +237,7 @@ impl SampleRing<'_> {
         if h == 0 {
             return None;
         }
-        Some(self.stamps[((h - 1) & self.mask) as usize].load(Ordering::Relaxed))
+        Some(self.stamps[((h - 1) & self.mask()) as usize].load(Ordering::Relaxed))
     }
 
     /// The oldest stamp a reader may still touch, or `None` if the ring is
@@ -215,7 +260,7 @@ impl SampleRing<'_> {
             return None;
         }
         let oldest = h.saturating_sub(self.retained());
-        Some(self.stamps[(oldest & self.mask) as usize].load(Ordering::Relaxed))
+        Some(self.stamps[(oldest & self.mask()) as usize].load(Ordering::Relaxed))
     }
 
     /// How many samples this ring currently holds — `min(head, retained())`.
@@ -242,12 +287,12 @@ impl SampleRing<'_> {
         // Single writer: a Relaxed load of our own monotone head is correct.
         let h = self.head.load(Ordering::Relaxed);
         if h > 0 {
-            let last = self.stamps[((h - 1) & self.mask) as usize].load(Ordering::Relaxed);
+            let last = self.stamps[((h - 1) & self.mask()) as usize].load(Ordering::Relaxed);
             if stamp < last {
                 return Err(PushError::NonMonotonicStamp { last, got: stamp });
             }
         }
-        let idx = (h & self.mask) as usize;
+        let idx = (h & self.mask()) as usize;
         let slot = &self.poses[idx];
 
         // Flip the slot's seqlock to odd (write in progress). The Release fence
@@ -316,7 +361,12 @@ impl SampleRing<'_> {
         // store immediately above already rests on. On x86 `fetch_add` lowers to
         // a `lock`-prefixed instruction whose implicit full barrier drains the
         // store buffer right behind the eight relaxed payload stores above.
-        // Measured on `push/single_writer`: 8.85 ns -> 4.60 ns per push.
+        // Measured on `push/single_writer`; the figure and the host are in
+        // `0014`, which this comment already cites twice. *No number is written
+        // here: this line carried an earlier run's figure, contradicting the
+        // record it names as authoritative. `docs/decisions/README.md`'s `0014`
+        // row carries the erratum, and it is the only place the superseded pair
+        // appears.*
         //
         // This is the cost `counters.rs`'s module doc already rules out for
         // publish-side diagnostics — "a relaxed `fetch_add` on the push path

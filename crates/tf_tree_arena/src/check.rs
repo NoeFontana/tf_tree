@@ -194,7 +194,9 @@ mod tests {
         HeapArena::new(&layout, 0, 0, [0; 16])
     }
 
-    /// Every field the geometry block compares, scrambled one at a time.
+    /// Every field the geometry block compares, scrambled one at a time —
+    /// **including `arena_size`, which is the conjunct that ties the derived
+    /// geometry to the length of the memory actually mapped.**
     ///
     /// The block is the only thing bounding `participant_table_off` /
     /// `max_participants` before `ArenaView::participants` builds a slice from
@@ -203,8 +205,21 @@ mod tests {
     /// makes a *partial* deletion attributable: a single scrambled-header case
     /// would pass as long as any one comparison survived.
     ///
-    /// Mutant: drop any one `&& implied.… == h.…` conjunct ⇒ the case naming that
-    /// field reports `Ok(())` and fails.
+    /// `size` is read *after* the poke, from the header itself, so `size` and
+    /// `h.arena_size` move together and the earlier `SizeMismatch` check cannot
+    /// pre-empt the geometry block. That is what makes the `arena_size` row
+    /// reachable at all: with `a.len()` as `size` the two can never disagree,
+    /// which is why `implied.total_size() as u64 == h.arena_size` was the one
+    /// conjunct in this function with no test anywhere in the workspace —
+    /// deleting it left the whole suite green while a header declaring a
+    /// 4096-byte arena kept a `pose_arena_off` of 11264. It costs one thing,
+    /// stated rather than hidden: `SizeMismatch` is structurally unreachable in
+    /// this driver, and is covered by `the_checks_run_in_the_documented_order`'s
+    /// `size - 64` case.
+    ///
+    /// Mutant: drop any one conjunct of the `let matches = …` chain — the
+    /// leading `implied.total_size() as u64 == h.arena_size` included — ⇒ the
+    /// case naming that field reports `Ok(())` and fails.
     #[test]
     fn a_header_that_disagrees_with_its_own_counts_is_refused() {
         let good = arena();
@@ -215,7 +230,7 @@ mod tests {
         );
 
         type Poke = fn(&mut ArenaHeader);
-        let pokes: [(&str, Poke); 13] = [
+        let pokes: [(&str, Poke); 14] = [
             ("frame_table_off", |h| h.frame_table_off += 64),
             ("frame_hash_off", |h| h.frame_hash_off += 64),
             ("topo_block_off", |h| h.topo_block_off += 64),
@@ -231,17 +246,21 @@ mod tests {
                 h.participant_counters_off += 64
             }),
             ("pose_slots", |h| h.pose_slots += 1),
+            ("arena_size", |h| h.arena_size -= 4096),
         ];
 
         for (field, poke) in pokes {
             let a = arena();
-            let size = a.len() as u64;
             // SAFETY: this test uniquely owns `a`, whose base is a live,
             // 64-byte-aligned, initialized `ArenaHeader` written by
             // `HeapArena::new`. No other reference to it is live across this
             // call, so the `&mut` is unaliased for its whole (statement-long)
             // lifetime.
             unsafe { poke(&mut *a.base().cast::<ArenaHeader>()) };
+            // Read after the poke, so the `arena_size` row reaches the geometry
+            // block instead of stopping at `SizeMismatch`. Every other row
+            // leaves the field alone, so this is still `a.len()` for them.
+            let size = a.header().arena_size;
             assert_eq!(
                 validate_arena_header(a.header(), size),
                 Err(ShmError::HeaderInconsistent),

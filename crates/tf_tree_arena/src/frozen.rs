@@ -555,7 +555,16 @@ impl FrozenArena {
 ///
 /// Called **before** any of them is handed to `mmap` or `pread`. Every branch
 /// here is a way a hand-edited or truncated `.tft` could otherwise make this
-/// process map or read something that is not there.
+/// process map or read something that is not there — **with one exception,
+/// named because the sentence above certified it for a while and a reader
+/// deciding whether a new field needs its own guard would have believed it.**
+/// The `manifest_off + manifest_len` overflow arm is unreachable while both
+/// fields are `u32`: `u64::from(u32::MAX) * 2` is 8 589 934 590, nine orders of
+/// magnitude below `u64::MAX`. It is kept as a width guard for the day either
+/// field is widened, the same way `plan_header`'s write side spends a
+/// `u32::try_from` refusal rather than an `as`; replacing it with `+` would be a
+/// silent wrap on that day. The `arena_off + arena_size` arm is *not* in that
+/// class — both operands are `u64` and a hand-edited header reaches it.
 fn check_extents(h: &FrozenHeader) -> Result<(), FrozenError> {
     if !h.arena_off.is_multiple_of(ARENA_FILE_ALIGN) {
         return Err(FrozenError::HeaderInconsistent);
@@ -966,6 +975,18 @@ mod tests {
     ///
     /// Mutant: drop the `manifest_end > arena_off` comparison ⇒ the overlapping
     /// case below passes and the assertion fails.
+    ///
+    /// Mutant: replace the `arena_off.checked_add(arena_size)` refusal with
+    /// `wrapping_add` ⇒ `arena_end` wraps to a small number, the `> file_size`
+    /// guard passes, and the header reaches `mmap` at an offset past EOF, where
+    /// `validate_arena_header`'s deref is a `SIGBUS` rather than a typed error.
+    /// The `wraps` case below is what kills it; before that case existed the
+    /// mutant survived the whole suite.
+    ///
+    /// The *other* `checked_add`, on the manifest, is deliberately not covered:
+    /// `check_extents`'s own doc records that it cannot be reached while both
+    /// its operands are `u32`, and a test asserting an unreachable branch is a
+    /// test that can never go red.
     #[test]
     fn check_extents_rejects_every_way_the_offsets_can_lie() {
         let good = FrozenHeader {
@@ -1013,5 +1034,25 @@ mod tests {
         let mut past_end = good;
         past_end.arena_size = ARENA_FILE_ALIGN;
         assert_eq!(check_extents(&past_end), Err(FrozenError::Truncated));
+
+        // `arena_off + arena_size` overflowing `u64`. The offset is
+        // `2^64 - 2^21`, so it is still a multiple of `ARENA_FILE_ALIGN` and
+        // clears the alignment branch; the sum is exactly `2^64`. Without the
+        // `checked_add` this wraps to 0, which is not greater than any
+        // `file_size`, so the header would reach `mmap`.
+        //
+        // The `is_multiple_of` line below **cannot fail while
+        // `ARENA_FILE_ALIGN` is a power of two** — `2^64 − A` is a multiple of
+        // any such `A` — and it is not the case's assertion. It guards the
+        // constant: if `ARENA_FILE_ALIGN` ever stops being a power of two this
+        // fixture starts failing the alignment branch instead of the overflow
+        // one, and the `Err(HeaderInconsistent)` below would still be green for
+        // the wrong reason.
+        let mut wraps = good;
+        wraps.arena_off = u64::MAX - ARENA_FILE_ALIGN + 1;
+        wraps.arena_size = ARENA_FILE_ALIGN;
+        wraps.file_size = u64::MAX;
+        assert!(wraps.arena_off.is_multiple_of(ARENA_FILE_ALIGN));
+        assert_eq!(check_extents(&wraps), Err(FrozenError::HeaderInconsistent));
     }
 }

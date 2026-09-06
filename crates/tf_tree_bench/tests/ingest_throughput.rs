@@ -16,12 +16,16 @@
 //! | `--floor` far above the measured ratio | the comparison itself is wired, which is the weaker falsifier |
 //! | a corpus **sparser** than the criterion's own, with `--gate` | REFUSED, not passed: a sparse corpus reads arbitrarily higher and would pass without checking anything |
 //! | a **single-edge** corpus, with `--gate` | REFUSED: one edge over the cap spills rather than grouping, so the grouped arm did not take the pass count it declares, and an arm in the wrong regime is a different claim |
+//! | `--floor` **below** the criterion's own, with `--gate`, on a run that would pass against it | REFUSED, publishing no verdict line: the floor is the whole of the gated comparison, so one flag would otherwise turn any FAIL into `PASS (gated)` at exit 0 |
+//! | the same, without `--gate` | it prints `PASS (reported)` at exit 0 — what is closed is the gate, not the flag |
+//! | `--reuse-corpus` on a missing path | REFUSED, rather than fabricating a corpus there and labelling it as one this process wrote |
+//! | `--reuse-corpus` on a corpus this process did not write | the file survives the run, twice, and is never reported as `WARM (written by this process)` |
 //!
 //! # What this deliberately does NOT assert: that the gate is green
 //!
-//! `just test` builds debug, and the same measurement that reads ~180x real
-//! time at `--release` reads ~17x in debug on the development host — a 1.7x
-//! margin over the floor, which a loaded runner could genuinely take under it.
+//! `just test` builds debug, and the same measurement reads far lower there
+//! than at `--release` — close enough to the floor on the development host
+//! that a loaded runner could genuinely take it under.
 //! A flaky gate is a gate somebody disables. So the green direction is asserted
 //! by `just gate5` (release, nightly), and what this file asserts about the
 //! declared-density corpus is **profile-independent**: that both arms took the
@@ -39,6 +43,9 @@
 //!   sparse-corpus test;
 //! * `if false && grouped.passes != CRITERION_PASSES` — caught by the
 //!   single-edge test;
+//! * `if false && d.gate && ok && d.floor < FLOOR` around the threshold
+//!   refusal — caught by `a_loosened_floor_may_not_produce_a_gated_pass`, which
+//!   then observes the `PASS (gated)` at exit 0 the refusal exists to prevent;
 //! * the two arms' **labels swapped** at their `measure` call sites, so the
 //!   default-cap arm prints as `grouped` and the lowered-cap arm as
 //!   `in-memory` — caught by the per-arm pass-count assertions in the
@@ -251,6 +258,185 @@ fn the_verdict_goes_red_on_a_denser_corpus_and_the_two_premises_refuse() {
     for p in [&declared, &dense_path, &floor_path] {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
+}
+
+/// **`--reuse-corpus` reads a corpus this process did not write, so it neither
+/// deletes it nor invents one.**
+///
+/// Two halves of the same defect. The end-of-run cleanup was guarded on
+/// `--keep-corpus` alone, so a reused corpus — the flag's entire purpose, "one
+/// day a real recording" — was unlinked at exit 0. And `generated` was
+/// recomputed from `corpus.exists()`, so the *next* `--reuse-corpus` run at that
+/// path silently regenerated a synthetic corpus from
+/// `--edges`/`--rate-hz`/`--seconds` and printed "page cache WARM (written by
+/// this process)" over it: the operator believes they are re-measuring one
+/// recording and are measuring another.
+#[test]
+fn reuse_corpus_neither_deletes_the_corpus_nor_fabricates_one() {
+    let path = scratch("reuse");
+    let corpus = path.display().to_string();
+    let generate = [
+        "--corpus",
+        &corpus,
+        "--edges",
+        "50",
+        "--rate-hz",
+        "100",
+        "--seconds",
+        "2",
+        "--rounds",
+        "1",
+    ];
+
+    // A path that does not exist REFUSES rather than fabricating a corpus there.
+    let mut reuse: Vec<&str> = generate.to_vec();
+    reuse.push("--reuse-corpus");
+    let missing = drive(&reuse);
+    assert!(
+        !missing.status.success() && err(&missing).contains("REFUSED — --reuse-corpus"),
+        "--reuse-corpus on a missing path must refuse; got:\n{}{}",
+        out(&missing),
+        err(&missing)
+    );
+
+    // Write one, keeping it, and record its size.
+    let mut kept: Vec<&str> = generate.to_vec();
+    kept.push("--keep-corpus");
+    let written = drive(&kept);
+    assert!(
+        written.status.success(),
+        "got:\n{}{}",
+        out(&written),
+        err(&written)
+    );
+    let bytes = std::fs::metadata(&path)
+        .expect("the corpus --keep-corpus wrote must be on disk")
+        .len();
+
+    // Reuse it: the run must read it, report it as found, and leave it there.
+    let reused = drive(&reuse);
+    let reused_out = out(&reused);
+    assert!(
+        reused.status.success(),
+        "got:\n{reused_out}{}",
+        err(&reused)
+    );
+    assert!(
+        reused_out.contains("page cache as found (--reuse-corpus)"),
+        "got:\n{reused_out}"
+    );
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("a corpus this process did not write must survive the run")
+            .len(),
+        bytes,
+        "--reuse-corpus must not delete, nor rewrite, the corpus it was pointed at"
+    );
+
+    // And again — the run before it cannot have substituted a different corpus.
+    let again = drive(&reuse);
+    let again_out = out(&again);
+    assert!(again.status.success(), "got:\n{again_out}{}", err(&again));
+    assert!(
+        !again_out.contains("WARM (written by this process)"),
+        "a reused corpus must never be reported as one this process wrote; got:\n{again_out}"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).expect("still there").len(),
+        bytes,
+        "the second reuse must read the same bytes as the first"
+    );
+
+    // The generating path still cleans up after itself.
+    let generated = drive(&generate);
+    assert!(
+        generated.status.success(),
+        "got:\n{}{}",
+        out(&generated),
+        err(&generated)
+    );
+    assert!(
+        !path.exists(),
+        "a corpus this process generated must still be removed at exit without --keep-corpus"
+    );
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// **The threshold floor: a loosened `--floor` may not produce a gated PASS.**
+///
+/// `--floor` is the whole of gate 5's gated comparison, so a caller who may
+/// move it downwards under `--gate` can turn any FAIL into
+/// `§12 gate 5 — PASS (gated)` at exit 0 — a verdict about the argument rather
+/// than about the code. `frozen_workers`'s `--gate` is the precedent: its
+/// threshold is a constant and not a flag.
+///
+/// The corpus here is the criterion's own declared density, and the floor is
+/// `0.5` — far under the ratio this corpus measures in either profile, and the
+/// run prints that ratio on its own verdict line rather than leaving a reader
+/// to trust a figure written here. That matters: the PASS this refuses has to
+/// be a PASS the binary really would have printed, and a *dense* corpus reads
+/// under 0.5x in debug, where the refusal would never fire and the test would
+/// be green for the wrong reason.
+///
+/// Three directions in one test, because what matters is that exactly one of
+/// them is closed: loosening under `--gate` REFUSES and publishes no verdict;
+/// the identical loosening **without** `--gate` still reports a PASS at exit 0;
+/// and tightening under `--gate` is untouched (that one is asserted by the
+/// `--floor 1000000` case above).
+#[test]
+fn a_loosened_floor_may_not_produce_a_gated_pass() {
+    let path = scratch("loosened");
+    let args = [
+        "--corpus",
+        &path.display().to_string(),
+        "--edges",
+        "50",
+        "--rate-hz",
+        "100",
+        "--seconds",
+        "2",
+        "--rounds",
+        "1",
+        "--floor",
+        "0.5",
+    ];
+
+    let mut gated: Vec<&str> = args.to_vec();
+    gated.push("--gate");
+    let refused = drive(&gated);
+    assert!(
+        !refused.status.success(),
+        "a gated PASS against a floor below the criterion's own must refuse; got:\n{}{}",
+        out(&refused),
+        err(&refused)
+    );
+    assert!(
+        err(&refused).contains("REFUSED — --floor"),
+        "the refusal must name the flag that caused it; got:\n{}{}",
+        out(&refused),
+        err(&refused)
+    );
+    // **A refusal publishes no verdict.** An exit status nobody reads plus a
+    // PASS line somebody quotes is the failure `docs/benchmarks/EVIDENCE.md`
+    // exists to prevent.
+    assert!(
+        !out(&refused).contains("GATED") && !out(&refused).contains("— PASS"),
+        "a refusal must print neither the gated comparison nor a verdict; got:\n{}",
+        out(&refused)
+    );
+
+    // The same loosened floor, ungated, is a report and still passes — so what
+    // the refusal above closes is the *gate*, not the flag.
+    let reported = drive(&args);
+    assert!(
+        reported.status.success() && out(&reported).contains("§12 gate 5 — PASS (reported)"),
+        "got:\n{}{}",
+        out(&reported),
+        err(&reported)
+    );
+
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 /// **The density floor.** §12 gate 5's representative recording is 100 Hz x 50
