@@ -3,13 +3,29 @@
 //!
 //! # Why this crate exists separately
 //!
-//! `tf_tree_bench` is `#![forbid(unsafe_code)]` and the workspace unsafe budget
-//! (see `CLAUDE.md`) permits `unsafe` only in `tf_tree_arena` and
-//! `tf_tree_core::{buffer, arena_view}`. FFI is irreducibly `unsafe`, so it is
-//! isolated here in a dedicated `-sys` crate — the idiomatic Rust split, and the
-//! one that leaves every existing crate's guarantee exactly as documented. This
-//! crate is `publish = false`, is reached only through
-//! `tf_tree_bench --features tf2`, and is never part of the shipped library.
+//! `tf_tree_bench`'s **library** crate root is `#![forbid(unsafe_code)]`, and
+//! FFI is irreducibly `unsafe`, so it is isolated here in a dedicated `-sys`
+//! crate — the idiomatic Rust split, and the one that leaves every existing
+//! crate's guarantee exactly as documented. This crate is `publish = false`, is
+//! reached only through `tf_tree_bench --features tf2`, and is never part of the
+//! shipped library.
+//!
+//! **This paragraph read that the budget "permits `unsafe` only in
+//! `tf_tree_arena` and `tf_tree_core::{buffer, arena_view}`" until 2026-09-05,
+//! and that is the PRE-[`0007`] enumeration** — the rule has named four
+//! boundaries since, and [`0048`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0048-a-kind-is-not-a-crate-name.md)
+//! has since made them properties rather than crate names. This crate is **kind
+//! 3**: a foreign runtime or library that owns its own objects. `tf2::BufferCore`
+//! owns its frame table exactly as CPython owns its `PyObject`s, which is the
+//! kind `tf_tree_py` was named for. It was never a fifth kind and it never
+//! needed one.
+//!
+//! The clause about `tf_tree_bench` is also narrower than it reads and was
+//! load-bearing for the wrong reason: `forbid` sits on that crate's
+//! `src/lib.rs`, and a bin, test, bench or example is a **separate crate root**
+//! that it does not govern. Bins of that package carry `unsafe`;
+//! `scripts/unsafe-budget.txt` is the list and no count of it is kept here.
+//! The split is still right; the reason is the *kind*, not the attribute.
 //!
 //! # SAFETY (module invariant)
 //!

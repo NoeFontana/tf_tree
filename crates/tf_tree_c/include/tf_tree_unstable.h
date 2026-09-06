@@ -871,7 +871,7 @@ typedef int32_t tft_bridge_evidence;
  * No clock judgment was made on this outcome, and
  * `clock_evidence_detail` is `0`.
  *
- * The value **every** outcome starts at, set by `blank_outcome` before any arm
+ * The value **every** outcome starts at, set by `tft_bridge_outcome::blank` before any arm
  * runs, so a caller reading these two fields on an unrelated outcome sees
  * "nothing to report" rather than the last clock event's evidence. That is the
  * same mechanism the borrowed strings use, and it exists for the same reason: a

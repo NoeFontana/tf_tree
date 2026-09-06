@@ -2,9 +2,20 @@
 //!
 //! # Why this bends the unsafe budget, deliberately
 //!
-//! `docs/PROJECT.md` §5 budgets `unsafe` to `tf_tree_arena` and
-//! `tf_tree_core::{buffer, arena_view}`. This file is outside it, and `0005`
-//! records the exception rather than quietly taking it.
+//! `docs/decisions/0007` rule 1 permits `unsafe` only at a boundary the
+//! compiler cannot see across, and `docs/decisions/0048` makes those boundaries
+//! **properties rather than crate names**. This file carries two of them: the OS
+//! (`fork`, `_exit`, `waitpid`) and our own C ABI driven across that fork. It is
+//! not an exception — it is kinds 2 and 5, and `scripts/unsafe-budget.txt` is
+//! where that is written down.
+//!
+//! **This paragraph read *"`docs/PROJECT.md` §5 budgets `unsafe` to
+//! `tf_tree_arena` and `tf_tree_core::{buffer, arena_view}`"* until 2026-09-05
+//! and was wrong twice**: `PROJECT.md` §5 is the decision log and contains no
+//! `unsafe` text at all — the rule is §6's design-smell entry — and the
+//! two-module enumeration it quoted is the pre-`0007` budget, which `0007`
+//! replaced in full. `0005` still records this file's `fork()` exception, and
+//! its Consequences bullet has its own amendment: the count it gives is stale.
 //!
 //! There is no way around it. What has to be tested is `fork()` **without
 //! `exec`** — a child that inherits the parent's address space, its `MADV_DONTFORK`
@@ -71,6 +82,25 @@
     clippy::print_stdout,
     clippy::panic
 )]
+// **`docs/decisions/0007` rule 1, kinds 2 and 5** — the OS (`fork`, `_exit`,
+// `waitpid`) and our own C ABI driven across that fork (`docs/decisions/0015`'s
+// *Invariants to maintain*). `docs/decisions/0048` is what makes both of those
+// statements rather than exceptions: a kind is a property, and rule 1's
+// parenthetical was an index rather than the rule.
+//
+// Declared here rather than inherited: `crates/tf_tree_bench/src/lib.rs` is
+// `#![forbid(unsafe_code)]` and a bin is a **separate crate root**, so that
+// attribute governs none of this file.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+// SAFETY (module invariant): two families, and every block names which.
+// (1) `libc::fork`, `libc::_exit` and `libc::waitpid` — the child path between
+// `fork` and `_exit` is async-signal-safe, which is why it uses `_exit` and not
+// `std::process::exit`, and no destructor runs there. (2) `tft_*` calls into
+// `tf_tree_c` on a handle this process (or its parent) created, from the thread
+// that created it. Every block carries its own `// SAFETY:` naming the specific
+// invariant; this block names the two classes so a reader knows which to expect.
 
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn main() {
@@ -497,7 +527,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
             let mut status = OK;
 
             let (rc, out) = offer(b, 2_000 * MS);
-            let mut stats = blank_stats();
+            let mut stats = tft_bridge_stats::blank();
             // **Called unconditionally, not inside the chain below.** All three
             // entry points under test must be *reached* in the child; the chain
             // only classifies what they answered. Folding this into an
@@ -693,26 +723,11 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
             pose: POSE,
             received_steady_nanos: 0,
         };
-        let mut out = tft_bridge_outcome {
-            struct_size: core::mem::size_of::<tft_bridge_outcome>() as u32,
-            // SAFETY: `tft_bridge_outcome` is `#[repr(C)]`, `Copy`, and made of
-            // integers, `f64` arrays and pointers, so all-zero is a valid value
-            // of it. The ABI overwrites every field before it returns.
-            ..unsafe { core::mem::zeroed() }
-        };
+        let mut out = tft_bridge_outcome::blank();
         // SAFETY: a live handle on its creating thread; the `CString`s outlive
         // the call; `out` is a live local with `struct_size` set.
         let rc = unsafe { tft_bridge_offer(b, TFT_BRIDGE_TOPIC_TF, &s, ptr::null(), &mut out) };
         (rc, out)
-    }
-
-    fn blank_stats() -> tft_bridge_stats {
-        tft_bridge_stats {
-            struct_size: core::mem::size_of::<tft_bridge_stats>() as u32,
-            // SAFETY: `tft_bridge_stats` is `#[repr(C)]`, `Copy` and made
-            // entirely of integers, so all-zero is a valid value of it.
-            ..unsafe { core::mem::zeroed() }
-        }
     }
 
     /// `target <- source` at `stamp`, or `None` for any reason it could not be
@@ -761,12 +776,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
 
     /// This thread's last error message, as Rust text.
     fn last_message() -> String {
-        let mut e = tft_error {
-            struct_size: core::mem::size_of::<tft_error>() as u32,
-            // SAFETY: `tft_error` is `#[repr(C)]`, `Copy`, and made entirely of
-            // integers and a byte array, so all-zero is a valid value of it.
-            ..unsafe { core::mem::zeroed() }
-        };
+        let mut e = tft_error::blank();
         // SAFETY: `e` is a live local with `struct_size` set.
         let _ = unsafe { tft_last_error(&mut e) };
         text(e.message.as_ptr())

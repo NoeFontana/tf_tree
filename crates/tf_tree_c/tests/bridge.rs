@@ -171,7 +171,7 @@ impl Bridge {
     fn stats(&self) -> tft_bridge_stats {
         let mut s = tft_bridge_stats {
             struct_size: core::mem::size_of::<tft_bridge_stats>() as u32,
-            ..zeroed_stats()
+            ..tft_bridge_stats::blank()
         };
         // SAFETY: live handle on its creating thread; `s` is a live local with
         // `struct_size` set.
@@ -266,12 +266,6 @@ fn poisoned_outcome() -> tft_bridge_outcome {
 
 const SIZEOF_OUTCOME: usize = core::mem::size_of::<tft_bridge_outcome>();
 
-fn zeroed_stats() -> tft_bridge_stats {
-    // SAFETY: `tft_bridge_stats` is `#[repr(C)]` and made of integers, for
-    // which all-zero is a valid value.
-    unsafe { core::mem::zeroed() }
-}
-
 /// A borrowed outcome string, as a C caller would read it.
 ///
 /// # Panics
@@ -291,10 +285,7 @@ fn text(p: *const c_char) -> String {
 // note. The allow is the fix — deleting the cast breaks x86_64.
 #[allow(clippy::unnecessary_cast)]
 fn last_message() -> String {
-    let mut e = tft_error {
-        struct_size: core::mem::size_of::<tft_error>() as u32,
-        ..unsafe { core::mem::zeroed() }
-    };
+    let mut e = tft_error::blank();
     // SAFETY: `e` is a live local with `struct_size` set.
     if unsafe { tft_last_error(&mut e) } != TFT_OK {
         return "<tft_last_error failed>".to_string();

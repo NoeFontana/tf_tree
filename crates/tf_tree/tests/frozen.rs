@@ -641,7 +641,26 @@ fn the_manifest_is_cbor_and_names_the_frames() {
 /// version- and layout-checked on open, so a `FORMAT_VERSION` or `layout_hash`
 /// change makes the file unreadable — and it would be unreadable *in a Python
 /// test run*, which is not where a Rust format change should first be noticed.
-/// Here it fails in `just test`, naming the regenerator.
+/// Here it fails naming the regenerator — in `just shm-check`, not in
+/// `just test`: this target carries `required-features = ["shm"]`, so
+/// `cargo nextest run --workspace` does not list it. *This line said
+/// `just test` until 2026-09-05.*
+///
+/// It is also the Rust-side red arm for a forgotten region stride — see
+/// `docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md`,
+/// which cites this test as the answer to its question 1. It is not the only
+/// place that failure lands: `tests/python/test_domains.py` and
+/// `tests/python/test_extrapolation.py` open this same file through
+/// `tf_tree.open_file`, so `just py-test` stops opening it too. The two arms
+/// are worth telling apart, because it goes red in both and says something
+/// different: a twelfth region with the stride array updated fails here as
+/// `LayoutMismatch`, which is a true statement about version skew; with the
+/// stride forgotten it fails as `HeaderInconsistent`, which `docs/RUNBOOK.md`
+/// tells an operator to treat as corruption. Since the stride array is
+/// declared `[u32; N_REGIONS + 1]` (`crates/tf_tree_arena/src/layout.rs`), the
+/// build that forgot the stride now fails with `error[E0308]` first, so the
+/// second arm is reached only by taking rustc's suggestion to pin the length
+/// back to a literal.
 ///
 /// **Properties, not bytes.** Two freezes of one tree are never byte-identical:
 /// the header carries `created_unix_ns`, `creator_pid`, `boot_id` and

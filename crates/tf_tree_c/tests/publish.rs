@@ -76,8 +76,7 @@ impl Drop for Publisher {
 }
 
 fn last_error() -> tft_error {
-    let mut e: tft_error = unsafe { core::mem::zeroed() };
-    e.struct_size = core::mem::size_of::<tft_error>() as u32;
+    let mut e = tft_error::blank();
     // SAFETY: `e` is a live, aligned `tft_error` with `struct_size` set.
     assert_eq!(unsafe { tft_last_error(&mut e) }, TFT_OK);
     e

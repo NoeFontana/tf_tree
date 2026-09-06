@@ -19,11 +19,42 @@ publish = false
 workspace = true
 
 [features]
-default = ["counters"]
+default = ["counters", "ingest-compression", "ingest-fixture"]
 # Passthrough, so `counter_cost` can measure both sides of §5.5's switch from
 # one crate. Without it, `cfg!(feature = "counters")` here reads *this* crate's
 # features and reports OFF while the engine is counting.
 counters = ["tf_tree/counters"]
+# **The zstd decoder `docs/PHASE5.md` §12 gate 5's corpus needs, as a
+# passthrough and not as a direct `features = ["compression"]` on the dependency
+# below.** rosbag2 and Foxglove write zstd chunks by default, so a gate whose
+# corpus was uncompressed would measure the faster path and publish the
+# flattering number.
+#
+# It is a *feature* rather than an edge because
+# `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader` asserts
+# that `cfg!(feature = "compression")` in the CLI equals
+# `tf_tree_ingest::compression_compiled_in()`, and `tf_tree_cli` names this
+# crate as a normal dependency. Turning the codec on unconditionally here would
+# switch the reader under `cargo nextest run -p tf_tree_cli
+# --no-default-features` and fail that test — which is exactly the "some
+# dependency is re-enabling it through its own defaults" case it names, and
+# which `tf_tree_bench` has already done once, to `counters`. The workspace
+# declares this crate `default-features = false`, so a **default-on** feature
+# here reaches `--workspace` and `-p tf_tree_bench` builds and reaches the CLI's
+# dependency edge not at all.
+ingest-compression = ["tf_tree_ingest/compression"]
+# **The corpus writer `docs/PHASE5.md` §12 gate 5 generates its recording with,
+# as a passthrough for the same reason `ingest-compression` is one.**
+# `tf_tree_ingest`'s `fixture` feature is off by default there because it
+# fabricates recordings and is not a product surface. Writing
+# `features = ["fixture"]` on the dependency below turns it on for every build
+# that reaches this crate — and `tf_tree_cli` names this crate as a **normal**
+# dependency, so the fabricator lands in the shipped `tf_tree` binary's graph.
+# A default-on feature here does not: the workspace declares this crate
+# `default-features = false`, so `--workspace` and `-p tf_tree_bench` builds get
+# it and the CLI's dependency edge does not. `just ingest-check` asserts both
+# directions against `cargo tree`.
+ingest-fixture = ["tf_tree_ingest/fixture"]
 # The `tf2::BufferCore` differential path. Requires a ROS 2 install and the C++
 # FFI shim described in `src/tf2.rs`; deliberately *not* built on the host used
 # for this PR (there is no ROS 2 here). Enabling it without the shim is expected
@@ -121,6 +152,20 @@ serde_json.workspace = true
 # the library, not only from the relocation gate's dev-dependency.
 tf_tree_arena.workspace = true
 
+# **`docs/PHASE5.md` §12 gate 5's ingest throughput — a new edge for this crate,
+# and `docs/decisions/0050` records it.** `src/bin/ingest_throughput.rs` needs
+# both halves: `tf_tree_ingest::run` is the thing being timed, and
+# `tf_tree_ingest::fixture` is what writes the corpus it is timed on.
+#
+# **No `features = [...]` here**: `fixture` arrives through the `ingest-fixture`
+# passthrough above, for the reason that feature's own comment gives. A
+# dependency-level feature travels the `tf_tree_cli -> tf_tree_bench` normal
+# edge and lands in the shipped binary's graph.
+#
+# A normal dependency rather than a dev one: `[[bin]]` targets do not see
+# dev-dependencies, and the gate lives in a binary.
+tf_tree_ingest.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
 
@@ -205,6 +250,31 @@ required-features = ["shm"]
 name = "frozen_workers"
 path = "src/bin/frozen_workers.rs"
 required-features = ["shm"]
+
+# **`docs/PHASE5.md` §12 gate criterion 2**: `.tft` open time under 10 ms for a
+# 233 MB index. `required-features = ["shm"]` for the same reason as the binary
+# above — `Tree::open_frozen` is `#[cfg(all(feature = "shm", target_os =
+# "linux"))]`, so without the feature there is nothing here to time. A separate
+# binary from `frozen_workers` rather than a mode on it: `docs/benchmarks/EVIDENCE.md`'s
+# Gates table is one artifact per criterion, and gate 4's `--gate` refusals are
+# arguments about gate 4's two worker arms that a third meaning would blur.
+[[bin]]
+name = "frozen_open"
+path = "src/bin/frozen_open.rs"
+required-features = ["shm"]
+
+# **`docs/PHASE5.md` §12 gate criterion 5**: ingest throughput >= 10x real time.
+#
+# **No `required-features`, and that is the point rather than an omission.**
+# Ingesting into an in-process `Tree` needs no frozen backend and no shared
+# memory — `crates/tf_tree_ingest/Cargo.toml`'s own `shm` comment says so — so
+# this binary and `tests/ingest_throughput.rs` are built and run by
+# `cargo nextest run --workspace`, i.e. by `just test`, on every pull request.
+# Copying `frozen_workers`'s manifest stanza would have moved the red test into
+# `just shm-check` for no reason.
+[[bin]]
+name = "ingest_throughput"
+path = "src/bin/ingest_throughput.rs"
 
 # **Is the C ABI's +101 ns on a shared arena the ABI, or the C++ caller?**
 # Calls `tft_plan_at` from Rust on the same arena a C++ probe measures at 302 ns,

@@ -476,7 +476,7 @@ pub type tft_bridge_evidence = i32;
 /// No clock judgment was made on this outcome, and
 /// `clock_evidence_detail` is `0`.
 ///
-/// The value **every** outcome starts at, set by `blank_outcome` before any arm
+/// The value **every** outcome starts at, set by `tft_bridge_outcome::blank` before any arm
 /// runs, so a caller reading these two fields on an unrelated outcome sees
 /// "nothing to report" rather than the last clock event's evidence. That is the
 /// same mechanism the borrowed strings use, and it exists for the same reason: a
@@ -777,7 +777,7 @@ pub struct tft_bridge_stats {
 /// over from the previous outcome would still point at valid memory — so no
 /// sanitizer would complain — and would name the wrong publisher, which is the
 /// failure mode a bridge diagnostic can least afford. What prevents it is that
-/// [`blank_outcome`] starts every pointer at a *static* empty string, so a
+/// [`tft_bridge_outcome::blank`] starts every pointer at a *static* empty string, so a
 /// pointer into one of these buffers appears in the outcome only where the same
 /// arm just wrote it. Clearing them as well would make a forgotten
 /// `o.field = ptr(...)` show `""` instead of the wrong name either way, at the
@@ -813,7 +813,7 @@ fn ptr(v: &[u8]) -> *const c_char {
 
 /// The `""` every outcome field starts at.
 ///
-/// `static`, not a field of [`Strings`], so [`blank_outcome`] needs no handle:
+/// `static`, not a field of [`Strings`], so [`tft_bridge_outcome::blank`] needs no handle:
 /// `*out` can then be filled **before** the handle is validated, which is what
 /// makes [`tft_bridge_offer`]'s promise — that a caller who ignores the status
 /// reads a well-formed "nothing happened" rather than its own stack — true for
@@ -1536,7 +1536,7 @@ pub unsafe extern "C" fn tft_bridge_offer(
         //
         // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
         // invariants, so a bitwise write is a complete initialisation.
-        let mut o = blank_outcome();
+        let mut o = tft_bridge_outcome::blank();
         unsafe { core::ptr::write(out, o) };
 
         // SAFETY: the caller contracts a live handle.
@@ -1954,7 +1954,7 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
             // The stop is announced once. This arm runs exactly once per bridge
             // — `inner.stopped` is latched immediately below and every later
             // offer short-circuits to the `Stopped` path, which leaves
-            // `first_time` at `blank_outcome`'s 0 — so the flag is definitional
+            // `first_time` at `tft_bridge_outcome::blank`'s 0 — so the flag is definitional
             // here rather than a counter. It is the only thing distinguishing
             // the transition from the replay: without it a caller that logs a
             // halt logs one line per transform for the life of the process,
@@ -2029,7 +2029,7 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                     // was never processed, so `scratch` holds whichever edge
                     // happened to be next on the wire. Printing it would name an
                     // innocent edge as the cause of the halt. `parent`/`child`
-                    // stay at `blank_outcome`'s `""`, which is the documented
+                    // stay at `tft_bridge_outcome::blank`'s `""`, which is the documented
                     // "does not apply to this outcome".
                     format!(
                         "STRICT: the startup window closed with {authority} authority and \
@@ -2174,7 +2174,7 @@ fn clock_evidence(evidence: ClockEvidence, delta_nanos: i64) -> String {
 ///
 /// **They are the raw names, not the normalized ones**, and that is why this is
 /// separate from the arms that set `o.parent` themselves rather than folded into
-/// [`blank_outcome`]. §5.6's normalization strips one leading `/` and applies
+/// [`tft_bridge_outcome::blank`]. §5.6's normalization strips one leading `/` and applies
 /// `tf_prefix`, so the pair still identifies the same edge — and for
 /// `TFT_BRIDGE_REASON_BAD_NAME` the raw name is the *only* useful one, because
 /// the whole outcome is that it did not normalize.
@@ -2455,7 +2455,7 @@ pub unsafe extern "C" fn tft_bridge_note_time_jump(
         //
         // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
         // invariants, so a bitwise write is a complete initialisation.
-        let mut o = blank_outcome();
+        let mut o = tft_bridge_outcome::blank();
         unsafe { core::ptr::write(out, o) };
 
         let kind = match kind {
@@ -2604,31 +2604,80 @@ pub unsafe extern "C" fn tft_bridge_get_stats(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// A well-formed "nothing happened" outcome, with every string pointing at the
-/// static empty string.
-fn blank_outcome() -> tft_bridge_outcome {
-    let empty: *const c_char = EMPTY.as_ptr();
-    tft_bridge_outcome {
-        struct_size: core::mem::size_of::<tft_bridge_outcome>() as u32,
-        action: TFT_BRIDGE_DROPPED,
-        reason: TFT_BRIDGE_REASON_NONE,
-        status: TFT_OK,
-        first_time: 0,
-        by_nanos: 0,
-        parent: empty,
-        child: empty,
-        owner: empty,
-        intruder: empty,
-        existing: [0.0; 7],
-        offered: [0.0; 7],
-        detail: empty,
-        delta_nanos: 0,
-        // **The `NONE` that keeps the evidence fields from ever going stale.**
-        // Every outcome passes through here before any arm runs, so the two
-        // clock-evidence fields are cleared once, in one place, rather than by
-        // each of the seven arms remembering to.
-        clock_evidence: TFT_BRIDGE_EVIDENCE_NONE,
-        clock_evidence_detail: 0,
+impl tft_bridge_outcome {
+    /// A well-formed "nothing happened" outcome, with every string pointing at
+    /// the static empty string.
+    ///
+    /// **The strings are `EMPTY`, not NULL, and that is this crate's
+    /// convention** — a C consumer reading `outcome.detail` gets a valid empty
+    /// string rather than a pointer it has to test. It is also why this is the
+    /// constructor to reuse rather than a `ptr::null()` twin: two blanks in one
+    /// crate would disagree about what a caller may dereference.
+    ///
+    /// **Public because the alternative is `unsafe { core::mem::zeroed() }` at
+    /// every caller**, which is the spelling `docs/decisions/0048` deletes. It
+    /// cannot be `#[derive(Default)]`: the five string fields are raw pointers,
+    /// which have no `Default`.
+    #[must_use]
+    pub fn blank() -> tft_bridge_outcome {
+        let empty: *const c_char = EMPTY.as_ptr();
+        tft_bridge_outcome {
+            struct_size: core::mem::size_of::<tft_bridge_outcome>() as u32,
+            action: TFT_BRIDGE_DROPPED,
+            reason: TFT_BRIDGE_REASON_NONE,
+            status: TFT_OK,
+            first_time: 0,
+            by_nanos: 0,
+            parent: empty,
+            child: empty,
+            owner: empty,
+            intruder: empty,
+            existing: [0.0; 7],
+            offered: [0.0; 7],
+            detail: empty,
+            delta_nanos: 0,
+            // **The `NONE` that keeps the evidence fields from ever going stale.**
+            // Every outcome passes through here before any arm runs, so the two
+            // clock-evidence fields are cleared once, in one place, rather than by
+            // each of the seven arms remembering to.
+            clock_evidence: TFT_BRIDGE_EVIDENCE_NONE,
+            clock_evidence_detail: 0,
+        }
+    }
+}
+
+impl tft_bridge_stats {
+    /// An all-zero `tft_bridge_stats` with `struct_size` already set.
+    ///
+    /// Every field is a counter, so zero is the honest starting value and no
+    /// field needs a sentinel. Enumerated rather than `..zeroed()`: a
+    /// seventeenth counter added to the struct is then a **compile error here**
+    /// rather than a silently-zeroed field, which is the property
+    /// `docs/decisions/0048` is trading the `unsafe` blocks for.
+    ///
+    /// `#[derive(Default)]` would work for this one type and not for its two
+    /// siblings; one spelling across all three is what a caller can remember.
+    #[must_use]
+    pub const fn blank() -> tft_bridge_stats {
+        tft_bridge_stats {
+            struct_size: core::mem::size_of::<tft_bridge_stats>() as u32,
+            messages: 0,
+            transforms: 0,
+            applied: 0,
+            static_verified: 0,
+            dropped_authority: 0,
+            dropped_non_monotonic: 0,
+            dropped_bad_name: 0,
+            dropped_kind_change: 0,
+            dropped_undeclared: 0,
+            dropped_bad_pose: 0,
+            rejected_by_arena: 0,
+            refused_after_halt: 0,
+            clock_resets: 0,
+            static_conflicts: 0,
+            queue_high_water: 0,
+            queue_capacity: 0,
+        }
     }
 }
 

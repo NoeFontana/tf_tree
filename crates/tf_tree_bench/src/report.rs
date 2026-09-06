@@ -1900,14 +1900,21 @@ impl Default for Options {
 /// repository. What checks it here is
 /// `every_command_the_report_names_is_a_command_that_exists`, and what that
 /// resolves is the recipe's *name* — not that the recipe measures this row.
-fn frozen_row_reason(attempt: &str) -> String {
+///
+/// **CORRECTION (2026-09-05): the recipe is a parameter now, because one name
+/// was being told to two rows and it was wrong for one of them.** The branch
+/// named `just gate4` for both, describing a binary that "re-execs itself as N
+/// workers and sums their Pss" — true of the Pss row, and false about the
+/// *open timing* the other row is waiting for, because `just gate4` never
+/// starts a clock. Each row names the recipe that takes its own measurement
+/// now (`just gate4`, `just gate2`). That changes nothing about the residual
+/// disclosed above: what is resolved is still a name.
+fn frozen_row_reason(attempt: &str, recipe: &str) -> String {
     if cfg!(all(feature = "shm", target_os = "linux")) {
         format!(
             "{attempt} is not done inside this process: `bench_report` is one process and \
-             maps no .tft. It is done by `crates/tf_tree_bench/src/bin/frozen_workers.rs`, \
-             in this crate, which freezes an index on the order of 338 MiB — §12 gate 2's \
-             233 MB scale rather than a fixture's — re-execs itself as N workers and sums \
-             their Pss. Run it with `just gate4`"
+             maps no .tft. It is done elsewhere, on an index frozen at §12 gate 2's 233 MB \
+             scale rather than at a fixture's. Run it with `{recipe}`"
         )
     } else {
         format!(
@@ -2245,7 +2252,10 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
             "Frozen .tft: 16 dataloader workers, total RSS vs 16 bag parses (MB)",
             "The wedge's central claim (§12 gate 4: total Pss within 1.2x of one worker).",
             Sensitivity::Memory,
-            frozen_row_reason("mapping one .tft from sixteen worker processes"),
+            frozen_row_reason(
+                "mapping one .tft from sixteen worker processes",
+                "just gate4",
+            ),
             // **Not "on >= 16 physical cores".** This is a `Memory` row, and
             // `Report::validate`'s core-budget clause exempts exactly this
             // case: sixteen workers mapping one `.tft` share the pages they
@@ -2272,18 +2282,26 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
             ".tft open time vs bag parse time (ms)",
             "§12 gate 2 wants open under 10 ms for a 233 MB index.",
             Sensitivity::AbsoluteTiming,
-            // **The `.tft` half moved and the bag half did not.** `frozen_workers`
-            // freezes an index at §12 gate 2's scale, so the open time is reachable
-            // where the backend is compiled — but the row is a *comparison*, and
-            // nothing in this repository times a bag parse: §12 gate 5 records that
-            // `crates/tf_tree_bench/benches/` has no ingest benchmark. A one-sided
-            // ratio is the same thumb on the scale a one-sided memory row is.
+            // **Both halves have an instrument now, and the row still has
+            // none, because the row is a comparison.** `just gate2` times the
+            // open of a 338 MiB `.tft`; `just gate5` times a full
+            // `tf_tree_ingest::run` over an MCAP. What no artifact holds is the
+            // two over **one recording**: gate 2's index is frozen from a
+            // generated `Fleet` and was never a bag, and gate 5's corpus is a
+            // fabricated MCAP that nothing freezes. A ratio of two numbers
+            // taken on two different corpora is not this row's quantity, and
+            // publishing it would be the same thumb on the scale a one-sided
+            // memory row is — so the ground stays `NoInstrument`, which is a
+            // claim about the *ratio*.
             format!(
-                "{}. The comparison arm is missing outright: nothing in this repository times \
-             a bag parse — `docs/PHASE5.md` §12 gate 5 records that \
-             `crates/tf_tree_bench/benches/` carries no ingest benchmark — so even where \
-             the open time is measurable there is nothing to divide it by",
-                frozen_row_reason("timing `Tree::open_frozen` against a 233 MB index")
+                "{}. The comparison itself is what is missing: the open time and an ingest \
+             time both have recipes, but no artifact holds them over one recording — the \
+             gated `.tft` is frozen from a generated fleet and was never a bag — so there \
+             is still nothing to divide the open time by",
+                frozen_row_reason(
+                    "timing `Tree::open_frozen` against a 233 MB index",
+                    "just gate2"
+                )
             ),
             "just bench-report-shm against a .tft built by `tf_tree freeze --from-bag` from a \
          recording large enough to produce §12 gate 2's 233 MB index",
@@ -2405,8 +2423,7 @@ const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides
     stamp before either is timed. **The tf2 column goes through `tf_tree_tf2_sys` and \
     therefore FLATTERS tf_tree** by the residual FFI boundary, 45.3 ns / 10% at this depth \
     (498.2 ns through the binding against 452.9 ns native — this figure used to read \
-    `~21 ns / 8%` here, which `docs/benchmarks/tf2.md` withdrew for having no derivation, \
-    and the correction had reached `ratio.rs` but not this string); \
+    `~21 ns / 8%` here, which `docs/benchmarks/tf2.md` withdrew for having no derivation); \
     the binding-free comparison is `docker/tf2/native_scaling.cpp` and its headline is \
     2.7x. The floor is set well under both for that reason: this row catches an engine \
     regression, it does not publish the headline. **The floor speaks for the build in this \

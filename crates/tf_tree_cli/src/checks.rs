@@ -2454,11 +2454,16 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
             Tft::Tft016,
             "host",
             format!(
-                "RLIMIT_MEMLOCK is {limit} bytes, below the {} byte arena; a consumer that \
-                 pins its address space with mlockall(MCL_CURRENT|MCL_FUTURE) will fail, so \
-                 it cannot keep page faults out of its control loop. tf_tree itself never \
-                 calls mlock: pinning is the embedding application's to do, and this is the \
-                 limit it needs (docs/API.md §8.3)",
+                "RLIMIT_MEMLOCK is {limit} bytes, below the {} byte arena; the arena \
+                 alone cannot be pinned, so a consumer cannot keep page faults out of its \
+                 control loop. tf_tree itself never calls mlock: pinning is the embedding \
+                 application's to do (mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT) — the \
+                 ONFAULT is what stops it prefaulting the whole over-provisioned arena), \
+                 and this is one term of the limit it needs. The other term is not \
+                 visible from here: mlockall charges the process's whole address space, \
+                 not the arena, so a limit above the arena size is not sufficient and this \
+                 check staying quiet is not a clearance (docs/API.md §8.3, \
+                 docs/decisions/0049)",
                 inp.arena_bytes
             ),
         )),

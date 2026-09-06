@@ -62,6 +62,16 @@ version moves anyway.
 > after this one added `tf_tree_ipc`, `tf_tree_py` and `tf_tree_c` under it.
 > Corrected rather than annotated because this section is normative and a rule
 > that says `forbid` while the code says `deny` is worse than either.
+>
+> **And the list is a snapshot in a second way this note did not say**, which
+> [`0048`](./decisions/0048-a-kind-is-not-a-crate-name.md) settles: `0007`'s kinds
+> are **properties**, the crate names beside them were an index, and the index
+> now lives in `scripts/unsafe-budget.txt` where a check recomputes it. Two
+> further things it decides bear on the paragraph above. The budget binds every
+> **crate root**, not every package — `#![forbid(unsafe_code)]` on a `src/lib.rs`
+> governs no bin, test, bench or example of the same package, and this paragraph
+> naming crates rather than roots is how that went unnoticed. And kind 3 is *"a
+> foreign runtime **or library**"*, so `tf_tree_tf2_sys` was never a new kind.
 
 **If a design question is not answered by this document, stop and ask rather than choosing.** The most expensive failure mode here is an agent that picks a reasonable-looking simplification in the concurrency or layout sections.
 
@@ -963,7 +973,7 @@ Proceed to Phase 2 if:
 - Zero allocations confirmed.
 - **Read throughput scales at least 2.5× from 1 to 4 threads**, on ≥ 4 physical cores, *and* **tf_tree's 1→4 scaling factor is at least 5× tf2's** over the same sweep.
 
-> **The first and third criteria were re-cut by [`0013`](../decisions/0013-the-benchmark-gate-never-interpolated.md), which is `ready`; its *Resolution* holds the arguments and this is the normative statement of the result.** Neither change is a concession to a regression, and both were previously ungateable rather than merely unmet.
+> **The first and third criteria were re-cut by [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md), which is `ready`; its *Resolution* holds the arguments and this is the normative statement of the result.** Neither change is a concession to a regression, and both were previously ungateable rather than merely unmet.
 >
 > **The first** used to read *"under 150 ns with `ScLerp`, under 100 ns with `LerpSlerp`"*. Those figures were chosen before anything in this repository had measured interpolation: the fixture's query stamp `NOW_NS` was an exact multiple of all four dynamic periods, so every edge took `SampleRing::sample`'s exact-hit branch, `I::eval` never ran, and the row timed `bracket` plus a seqlock read. Off-grid the same rows measure **192.7 ns ScLerp** (band 190.4–268.9, n = 9) and **151.8 ns LerpSlerp** (band 146.2–190.4, n = 9). The new ceilings sit ~1.12× above each observed *maximum*, not above the median: a ceiling under 268.9 would fail about one run in nine on an unchanged engine, and a gate that flaps is one people learn to ignore. They are stated per interpolator because the two differ by 1.27× off-grid and by 1.00× on-grid — a single number written for the slower one would leave `LerpSlerp` effectively ungated. The 25 % regression clause is the half that actually bites, and is not new machinery: `bench_report`'s `lookup_latency` row has been gating exactly that (`LATENCY_SLACK`) all along.
 >

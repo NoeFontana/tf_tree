@@ -88,10 +88,18 @@ mcap = { version = "0.25", default-features = false }
 # `crate::decompress` deliberately never calls, because the chunk's own CRC32 over
 # the same bytes is the hash the MCAP writer actually committed to. So the hottest
 # loop in the ingest was making a full extra pass over every decompressed byte to
-# produce a number nothing reads. Measured on a 4 MiB libzstd `-3` frame the
-# saving is small — 673.9 against 665.1 MiB/s, about 1%, which is inside this
-# host's run-to-run spread — so the case for turning it off is that the work is
-# provably unused, not that the benchmark is decisive.
+# produce a number nothing reads. Measured once on a 4 MiB libzstd `-3` frame the
+# saving was about **1%**, which is inside this host's run-to-run spread — so the
+# case for turning it off is that the work is provably unused, not that the
+# benchmark is decisive.
+#
+# **CORRECTION (2026-09-05): the two decode-rate figures that stood here are
+# deleted.** This comment read "673.9 against 665.1 MiB/s". Nothing in this
+# repository re-derives either, and `docs/benchmarks/EVIDENCE.md`'s rule is that
+# a probe's figure needs a documented command; the percentage is what the
+# argument uses and it is kept. `crates/tf_tree_ingest/src/decompress.rs` and
+# `src/fixture.rs` carry the same correction for the same reason. `just gate5`
+# measures a whole ingest and does not produce a per-frame decode rate.
 #
 # Decoding is unaffected: `state.check_sum` is read from the stream outside the
 # `cfg` and `decode_all` compares nothing either way, so a frame carrying an XXH64

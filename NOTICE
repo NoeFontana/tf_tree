@@ -19,7 +19,8 @@ carries no third-party attributions of its own: `tf_tree` vendors no source and
 statically links no code it did not write. Its Rust dependencies are ordinary
 crates.io dependencies, each under its own licence, resolved at build time and
 enumerated in `Cargo.lock`; the set is constrained by `deny.toml` and checked by
-`cargo deny check`, which `just lint` runs.
+`cargo deny check` — the recipe `just audit`, run in CI as its own step of the
+job named `lint`.
 
 `tf_tree` is not affiliated with, endorsed by, or derived from the Open Source
 Robotics Foundation, ROS, or the `tf` / `tf2` packages. It is an independent

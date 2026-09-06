@@ -35,6 +35,20 @@ is a bug.
 
 ### Changed
 
+- **`PHASE5.md` §1.2's region-table clause is retracted, and the stride array is
+  coupled to the region count** (`docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md`,
+  now `ready`). `FORMAT_VERSION = 3` reserved Phase 6's **header fields** and not
+  a region slot, so a Phase 6 spline region is a twelfth region and costs another
+  `FORMAT_VERSION`; the clause said the opposite in `PHASE5.md` §0, §0.0, §1.1,
+  §1.2 and §13 and in `PROJECT.md` §4, and `CLAUDE.md` had already been
+  corrected past it.
+  `docs/PROJECT.md` §5.1 opens the ledger that break's entries queue in.
+  **The one code change is one line**: `layout_hash`'s stride array is declared
+  `[u32; N_REGIONS + 1]` rather than `[u32; 12]`, which turns a forgotten stride
+  from a `HeaderInconsistent` a peer reports at attach time into `error[E0308]`
+  at the build that forgot it. `layout_hash` is unchanged. `0032`'s question 1
+  and the `frozen.rs` doc comment corrected beside it carry the measurement.
+
 - **The C ABI's count-returning entry points carry a panic guard**
   (`d5dd109`, `docs/PHASE4.md` §3.4 / §9). `error::guard` returns a
   `tft_status`, so it fitted only the boundaries that report through one, and
@@ -59,6 +73,47 @@ is a bug.
   bumped only for an incompatible change; an added key is not one.
 
 ### Added
+
+- **`docs/PHASE5.md` §12 criteria 2 and 5 are measured and gated**
+  (`just gate2`, `just gate5`). Both read *held by nobody — never measured* until
+  now, and both PASS with margin, so each is a **regression guard rather than a
+  discovery**.
+  - *Criterion 2, `.tft` open under 10 ms for a 233 MB index*:
+    `crates/tf_tree_bench/src/bin/frozen_open.rs`. The gated resident arm clears
+    the 10 ms budget by more than two orders of magnitude, worst of 8 fresh
+    processes; the recipe prints the run's own numbers and no interval is quoted
+    here, because a range over a handful of runs is a sample rather than the
+    instrument's spread. **Only the resident arm gates**, together with a scale-invariance ratio
+    against a fixture two orders of magnitude smaller: an open takes exactly one
+    major fault when the cache was dropped and zero when it was not, *at both
+    sizes*, so the evicted arm's size dependence lives inside that single fault
+    and is a property of the storage rather than of `open_frozen`.
+  - *Criterion 5, ingest throughput ≥ 10× real time*:
+    `crates/tf_tree_bench/src/bin/ingest_throughput.rs`, recorded in
+    [`0050`](docs/decisions/0050-what-ten-times-real-time-divides.md). The
+    **grouped** arm clears the 10× floor by more than an order of magnitude, and
+    it is the gated one because §12's own
+    four-hour representative recording does not fit `DEFAULT_MAX_MEMORY_BYTES`
+    and takes two fill passes. The corpus is generated at run time, and the
+    density is measured off the survey and floored, because "10× real time" is a
+    statement about the corpus as much as about the code.
+  - Both publish an absolute duration on a host that fails `Fitness::probe`,
+    under **`docs/PHASE5.md` §9.3's new one-sided-budget amendment**: every
+    check that probe fails can only make the measurement slower, so a PASS with
+    margin is conservative and a FAIL is not attributable to the code. Neither is
+    a `bench_report` row; `tft_open_vs_bag_parse` stays `unavailable` — both of
+    its halves have a recipe now and no recording is on both sides.
+  - Each verdict is red-testable **without editing a threshold** — `--prefault`
+    for gate 2, a denser corpus for gate 5 — and a **gated** run refuses rather
+    than passing when its own premise fails. Ungated, gate 2 voids its evicted
+    arm and prints why instead: that arm gates nothing, and the ordinary reason
+    an eviction does not take is a filesystem whose pages are RAM.
+    `crates/tf_tree_bench/tests/gate2.rs`
+    (per-PR, `just shm-check`) and `crates/tf_tree_bench/tests/ingest_throughput.rs`
+    (per-PR, `just test`) drive the shipped binaries in both directions.
+  - Gate 5's grouped `--max-memory` and its density floor both come off the
+    **survey**, so `--edges`/`--rate-hz`/`--seconds` describe nothing under
+    `--reuse-corpus` and the run says so.
 
 - **An SBOM per release** (`d5dd109`, `docs/PHASE5.md` §10). `scripts/sbom.py`
   writes CycloneDX 1.5 from `cargo metadata`, `just sbom <version>` produces the
@@ -133,6 +188,194 @@ is a bug.
   comment says why the order is a soundness guarantee — measuring after would let
   a `push` landing mid-fold report `by_ns == 0`, "not extrapolated", for a pose
   the fold invented.
+
+- **`NOTICE` said `cargo deny check` is run by `just lint`. It is `just audit`.**
+  `just lint` has never had a `deny` line in its body; CI runs both, as separate
+  steps of the job named `lint`, which is where the confusion came from. This
+  one matters more than its size: `NOTICE` is packed into every crates.io
+  tarball, every wheel and every release archive, so a false statement about
+  this repository was shipped to two indexes.
+
+- **Two relative documentation links resolved to nothing**, and now nothing can
+  add a third: `docs/PHASE1.md`'s citation of `0013` climbed one directory too
+  far — `../decisions/` from inside `docs/` is the repository's parent — and
+  `docs/decisions/0046` cited `0010` by a title that record does not have.
+  `just artifact-versions` gained a relative-link scan over every tracked
+  Markdown file, with a floor on the number of links it found, because a scan
+  that silently stops matching reports every document as clean.
+
+- **Sites across the tree still priced the residual FFI boundary at the
+  withdrawn `~21 ns / 8%`.** `docs/benchmarks/tf2.md` replaced that figure with
+  45.3 ns / 10% — 498.2 ns through the binding against 452.9 ns native — for
+  having no derivation recorded anywhere. The first sweep enumerated the sites
+  it had corrected, which is what let `docker/tf2/native_ratio.cpp` — a file
+  that *produces* one of the two rows the corrected figure is derived from —
+  keep citing the document that withdrew it; `grep -rn '21 ns'` is the
+  enumeration, and no list of sites is written down anywhere. The gate does not
+  move with it: `FLOOR` is bounded by an estimate with no binding in either
+  half.
+
+### Fixed — gates and release wiring
+
+- **`scripts/sbom.py` had never executed on any path, and no release carries an
+  SBOM.** Its one caller is `release.yml`'s `github-release` job, gated on
+  `refs/tags/v*`, and the commit that added the step (`d5dd109`) is not an
+  ancestor of `v0.0.5` — so the step has never run, and `v0.0.5`'s assets are
+  four archives and `SHA256SUMS`. `just lint` now depends on `sbom`, which costs
+  one `cargo metadata` and no compile, so the generator is exercised before a
+  release rather than during one. `docs/PHASE5.md` §0.0's §10 row is corrected
+  in both directions: the SBOM is *generated on demand and attached by wiring
+  that has never fired*, and its dev-graph exclusion is **derived by
+  construction, not asserted** — no assertion phrased over the same graph and
+  the same `dep_kinds` rule could fail.
+
+- **`just sbom` failed outright for anyone who exports `CARGO_TARGET_DIR`**
+  (`FileNotFoundError`, exit 1). It writes under `${CARGO_TARGET_DIR:-target}`
+  now, and its `VERSION` defaults to the workspace number through the same
+  `cargo pkgid` idiom `release-archive` uses, so `just sbom` with no argument is
+  the check and `just sbom <tag> <path>` is what a release passes.
+
+- **`wheels.yml`'s licence check passed on an empty subject set.** If `PKG-INFO`
+  declared no `License-File:` header it printed "no License-File headers to
+  check" and exited 0 — green in exactly the state it exists to prevent, an
+  sdist that declares no licence file and is therefore required to carry none.
+  It now requires at least one header. Red-tested on three shapes: declared and
+  present (0), declared and missing (1), none declared (1, and 0 before).
+
+- **`just artifact-versions` reads the tracked lockfiles.**
+  `crates/tf_tree_tf2_sys/Cargo.lock` recorded `0.0.1` four releases on, held by
+  nothing: cargo rewrites a lock only where somebody builds that crate, and that
+  one builds only in the ROS 2 container. Entries are filtered to the package
+  names read out of this repository's own manifests *and* to those with no
+  `source` key, so a third-party version is never read as one of ours. The set
+  of lockfiles is `git ls-files '*Cargo.lock'` rather than a list in the script:
+  a hand-kept list is how an artifact nobody thought to add drifts for four
+  releases, which is the defect being fixed. Each lockfile joins the coverage
+  assertion, so a lock that stops carrying our packages fails rather than
+  passing on nothing. **Nothing else reports this drift** — a stale lock entry
+  for a path dependency is silently relocked by the next build that resolves,
+  and no invocation here passes `--locked` to either excluded crate.
+
+- **The version-in-prose rule covered five of the project's six package-index
+  front pages.** It reads each publishable crate's `[package] readme` — the
+  pages crates.io renders — and `pyproject.toml`'s `[project] readme` names the
+  **root** `README.md`, which is what PyPI renders for `transform_tree`. The
+  page a Python user lands on was the uncovered one. Zero findings today; the
+  value is the same regression guard the other five are, and #236's lesson stops
+  depending on anybody re-reading it.
+
+### Added — decision records
+
+- [`0051`](docs/decisions/0051-the-licence-travels-with-the-artifact-not-the-file.md)
+  (`ready`) — **no per-file licence headers.** §10's three-word `license
+  headers` clause was neither done nor declined, which is why the §0.0 row
+  enumerating what remains had omitted it. The obligation is Apache-2.0 §4(a)'s
+  and it is on the artifact, asserted at all three distribution surfaces; a pass
+  would rewrite every source file in the repository, and a header nothing gates
+  drifts. REUSE is named as the shape a future record would take.
+
+- [`0052`](docs/decisions/0052-the-first-five-minutes-nobody-runs.md) (`draft`)
+  — **the mdBook site and the path it is supposed to open with are one
+  question.** §10 asks for `pip install transform_tree`, three lines, a real
+  result; what runs on every pull request is the README's snippet under a
+  from-source `just quickstart`, and nothing anywhere installs the published
+  distribution and imports it. The record's first open question is *where such a
+  smoke would run*, because putting it in `wheels.yml` would repeat the SBOM
+  defect this same change fixed.
+
+- **`PHASE2.md` §10's recorder is declined rather than pending**
+  (`docs/decisions/0047-the-recording-this-reader-would-refuse.md`, `draft`).
+  There is no `tf_tree_record` crate and none is owed: §10's own MCAP channels
+  carry no `tf2_msgs` schema, and `tf_tree_ingest` accepts a channel only by
+  schema, so a recorder built as specified would emit a bag the only reader here
+  refuses. §10(c) — the NORMATIVE heap-against-mapped bit-identity test — is met
+  and is the half that shipped. Six prose sites carried the recorder, the `/tf`
+  bridge or the fault harness as still owed after each had moved, across
+  `PHASE2.md`, `PROJECT.md` and `docs/benchmarks/tf2.md`; all are corrected in
+  place with what they used to say.
+
+- **`crates/tf_tree_cli/tests/replay_bit_identity.rs` stops claiming a round
+  trip it does not perform.** Its module doc said the recording is *"written to
+  MCAP and read back"* and an inline comment said the messages had been
+  *"serialised and parsed"*; the test writes the file, asserts it exists, and
+  replays the in-memory fixture into both arenas, importing no reader. The
+  assertion §10 asks for is unaffected — it is about two read paths, not about
+  serialisation. `PHASE2.md` §15's box recorded this correction on 2026-09-05
+  and deferred the code; this is the code. The same box now also names where its
+  evidence runs (`just shm-check`, and the CI step that invokes it — **not**
+  `just test`, which never compiles the `shm` feature).
+
+### Changed — `tf_tree doctor` (2)
+
+- **`TFT016`'s finding stops predicting a call it cannot predict, and names the
+  flag that does not undo `0024`**
+  (`docs/decisions/0049-the-flag-that-prefaults-the-arena.md`, `draft`). Its
+  detection rule and severity are unchanged. Two things in the *message* were
+  wrong. It recommended `mlockall(MCL_CURRENT|MCL_FUTURE)`, which — measured by
+  the new `mlock_probe` example — takes an untouched 64 MiB `memfd` mapping from
+  `Rss` 0 to 65 536 kB the moment it is issued, and prefaults mappings made
+  after the call as well: per-arena population at address-space scope, which is
+  what `0024` removed at 5.2×. And it said the call "will fail", which this
+  check cannot know: `mlockall` charges the whole address space and the check
+  compares a limit against the *arena*, so the call returns `ENOMEM` at limits
+  well above a small arena while the check is silent. The finding now names
+  `MCL_ONFAULT` and says outright that its silence is not a clearance. The same
+  correction lands in `hostfacts.rs`'s module doc, `docs/API.md` §8.3,
+  `docs/PHASE2.md` §0.0 and §7.4, and `docs/PHASE5.md` §6 — where the `TFT016`
+  row also stops naming `getrlimit`, which this crate has never called.
+
+### Added — evidence
+
+- **`crates/tf_tree_bench/examples/mlock_probe.rs`**, registered as a probe in
+  `docs/benchmarks/EVIDENCE.md`. `docs/API.md` §8.3 asserted two syscall
+  behaviours and reproduced no probe, against `PHASE2.md`'s own preamble rule;
+  one of them was wrong and one was a reclaim-*policy* conclusion written in the
+  grammar of a mechanism *fact*, and neither could be doubted without a C
+  compiler and an afternoon. Eight arms, each `mlockall` arm in its own process
+  because the call is process-wide, plus two organic-memory-pressure arms with a
+  file-backed positive control. It is a cargo example rather than a fenced block
+  in an appendix on purpose: `scripts/evidence-audit.sh` takes its subject set
+  from `cargo metadata`'s bin/example/bench targets, so a markdown fence could
+  never have been audited at all.
+
+### Added — the unsafe budget has a gate
+
+- **`docs/decisions/0007` rule 1 had no enforcement of any kind**
+  (`docs/decisions/0048-a-kind-is-not-a-crate-name.md`, `draft`) — no script, no
+  recipe, no CI step, no lint, and the root `[workspace.lints.rust]` does not
+  name `unsafe_code`. `scripts/unsafe-budget.sh` is the first: a **compiler**
+  census (`RUSTFLAGS="--force-warn unsafe_code"`, which overrides
+  `#![forbid(unsafe_code)]` rather than being suppressed by it), taken over a
+  matrix read out of the justfile's own `cargo clippy … --all-targets` lines so
+  it cannot drift from them, compared against `scripts/unsafe-budget.txt` in both
+  directions. `just lint` depends on it. It pins a **file set**, not a kind —
+  the lint's output carries none — and its header says so.
+- **What the census found is not a fifth boundary.** `0007` rule 1 wrote a crate
+  name in brackets beside each kind and every downstream reader copied the
+  bracket, so three of the four existing kinds had been occurring in crates the
+  brackets do not name — for months, with every recipe green. `0048` makes the
+  kinds properties and moves the names into the register, widens kind 3 to *"a
+  foreign runtime **or library**"*, and admits two new ones: our own C ABI called
+  from Rust to exercise it, and a trait the language requires be implemented
+  unsafely in a target that never ships.
+- **The budget binds a crate ROOT, not a package.** `#![forbid(unsafe_code)]` on
+  a `src/lib.rs` governs no bin, test, bench or example of the same package.
+  Several claims in this repository rested on the other reading and are corrected
+  in place, each keeping what it used to say — including `docs/PHASE2.md` §0.0's
+  §11.4 row, which deferred an invariant on it. Every one of those design choices
+  survives on `0007`'s rule; none of them survives on the attribute.
+
+### Changed — `tf_tree_c`
+
+- **Four safe `blank()` constructors replace every
+  `unsafe { core::mem::zeroed() }` in this crate's tests and examples and in
+  `tf_tree_bench`'s bins.** `tft_error::blank()` and `tft_bridge_outcome::blank()`
+  existed privately; `tft_extrapolated::blank()` and `tft_bridge_stats::blank()`
+  are new. **`tft_bridge_outcome::blank()` fills its five string fields with the
+  static empty string, not NULL** — a `ptr::null()` twin would have put two
+  contradictory blanks in one crate and handed a C consumer a null where the
+  convention is a valid empty string. Three hand-rolled zeroing helpers in the
+  test and bench crates are deleted with them. No `extern "C"` symbol changes.
 
 ## [0.0.5] — 2026-08-29 (the entry paths that need no toolchain)
 

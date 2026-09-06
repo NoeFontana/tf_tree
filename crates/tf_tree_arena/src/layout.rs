@@ -75,7 +75,8 @@ pub struct ArenaLayout {
     computed: Computed,
 }
 
-// The eight regions in header order. These indices are used only internally.
+// The regions in header order, `N_REGIONS` of them. These indices are used
+// only internally.
 const R_HEADER: usize = 0;
 const R_FRAME_TABLE: usize = 1;
 const R_FRAME_HASH: usize = 2;
@@ -448,7 +449,19 @@ pub const fn layout_hash() -> u32 {
     // and *should* attach. The strides are appended because the hash should
     // describe the layout that exists, not because that scenario is live; if
     // the regions ever become conditional, this is already correct.
-    let strides: [u32; 12] = [
+    // **The length is `N_REGIONS + 1`, and the `+ 1` is `R_TOPO`**, which folds
+    // two values rather than one: the per-frame width `12` and the block count
+    // `TOPO_BLOCKS`. Writing the length as an expression over `N_REGIONS` is
+    // what makes a forgotten stride a compile error instead of a silent
+    // disagreement between this array and `compute`'s `sizes` — see
+    // `docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md`.
+    //
+    // It is a **cardinality** check and nothing more. It cannot see a stride
+    // written at the wrong index, a stride with the wrong value, or a second
+    // region that also folds two values — that region would make the constant
+    // `+ 2`. The `+ 1` is argued for in prose, here and in `0032` part 3, and
+    // by nothing the compiler reads.
+    let strides: [u32; N_REGIONS + 1] = [
         320,
         64,
         FRAME_HASH_STRIDE as u32,

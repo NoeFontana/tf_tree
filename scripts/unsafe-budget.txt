@@ -1,0 +1,66 @@
+# The unsafe register — `scripts/unsafe-budget.sh`, `docs/decisions/0007` rule 1
+# as amended by `docs/decisions/0048`.
+#
+#   <kind>  <path>  [out-of-reach]
+#
+# The KINDS are properties, not places. 0007 rule 1 wrote a crate name beside
+# each one and every downstream reader copied the crate name; 0048 rewrites the
+# rule so the criterion is the rule and this file is the index.
+#
+#   1  the arena's raw memory
+#   2  the OS
+#   3  a foreign runtime or library that owns its own objects
+#   4  a foreign caller
+#   5  our own C ABI, called from Rust to exercise or measure it
+#   6  a trait the language requires be implemented unsafely, in a target that
+#      never ships
+#   -  0017's single lifetime extension, which is its own record
+#
+# A file may carry more than one kind; the second column is the path and the
+# kind column is what a reviewer wrote down. **The check compares the PATH set
+# and reads no kind** — see the script's header. A row marked `out-of-reach`
+# names a crate outside the cargo workspace, which no `-p` selector reaches:
+# such a row is permitted in the census and not required.
+
+1  crates/tf_tree_arena/src/heap.rs
+1  crates/tf_tree_arena/src/mapped.rs
+1  crates/tf_tree_arena/src/frozen.rs
+1  crates/tf_tree_arena/src/check.rs
+1  crates/tf_tree_arena/tests/heap_alignment.rs
+1  crates/tf_tree_core/src/arena_view.rs
+1  crates/tf_tree_core/src/buffer.rs
+
+2  crates/tf_tree_ipc/src/fork.rs
+2  crates/tf_tree_ipc/src/ofd.rs
+2  crates/tf_tree_bench/src/bin/footprint.rs
+2  crates/tf_tree_bench/examples/mlock_probe.rs
+
+3  crates/tf_tree_py/src/tree.rs        out-of-reach
+3  crates/tf_tree_tf2_sys/src/lib.rs    out-of-reach
+
+4  crates/tf_tree_c/src/lib.rs
+4  crates/tf_tree_c/src/bridge.rs
+4  crates/tf_tree_c/src/publisher.rs
+4  crates/tf_tree_c/src/unstable.rs
+4  crates/tf_tree_c/src/error.rs
+
+5  crates/tf_tree_c/tests/abi.rs
+5  crates/tf_tree_c/tests/bridge.rs
+5  crates/tf_tree_c/tests/bridge_shared.rs
+5  crates/tf_tree_c/tests/live.rs
+5  crates/tf_tree_c/tests/publish.rs
+5  crates/tf_tree_c/tests/recovery.rs
+5  crates/tf_tree_c/examples/abi_cost.rs
+5  crates/tf_tree_c/examples/bridge_cost.rs
+5  crates/tf_tree_bench/src/bin/abi_attached.rs
+
+# `fork_child` is two kinds in one file and that is not a defect: its `libc::fork`
+# and `_exit` are kind 2 and its `bridge` mode drives the C ABI across that fork,
+# which is what `docs/decisions/0015`'s *Invariants to maintain* asks for.
+2,5  crates/tf_tree_bench/src/bin/fork_child.rs
+
+6  crates/tf_tree_bench/tests/zero_alloc.rs
+6  crates/tf_tree_bench/tests/relocation.rs
+6  crates/tf_tree_bridge/tests/steady_state_alloc.rs
+
+-  crates/tf_tree/src/tree.rs

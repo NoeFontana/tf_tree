@@ -55,6 +55,31 @@ changes.
    (`tf_tree_py`), and a foreign *caller* (`tf_tree_c`, new). Anything that is
    not one of those is not eligible, and a fifth kind needs a decision record.
 
+   > **Amended by [`0048`](./0048-a-kind-is-not-a-crate-name.md), which is this
+   > rule's first amendment and reads it exactly as this record's own *Rationale*
+   > asked to be read.** The kinds survive; **the parentheticals do not**. Each
+   > one was an example of where a kind lived on the day this was written, and
+   > every downstream reader — `CLAUDE.md`, `PROJECT.md` §6, `PHASE1.md` §0, and
+   > two crates' own module headers — copied the crate name instead of the
+   > criterion. This record's *Rationale* had already named that failure one
+   > level up: *"a rule that states the criterion survives; a list does not."* It
+   > then wrote a list in brackets beside the criterion.
+   >
+   > `0048` makes the kinds **properties**, moves the crate names into a
+   > non-normative index at `scripts/unsafe-budget.txt`, widens kind 3 from *"a
+   > foreign runtime"* to *"a foreign runtime or library"*, and admits a fifth —
+   > **our own C ABI, called from Rust to exercise or measure it** — which is not
+   > kind 4, because kind 4 is a *foreign* caller and this is a domestic one
+   > paying the same cost. A sixth covers a trait the language requires be
+   > implemented unsafely in a target that never ships.
+   >
+   > It also settles a question this rule's sentence never answered: **it binds
+   > every crate root, not every package.** `#![forbid(unsafe_code)]` on a
+   > `src/lib.rs` governs that crate root and no bin, test, bench or example of
+   > the same package — which is why the budget had been overtaken for months in
+   > two crates with every recipe green. `scripts/unsafe-budget.sh` is rule 1's
+   > first gate of any kind.
+
 2. **Everything else keeps `#![forbid(unsafe_code)]`** — `tf_tree_math`,
    `tf_tree`, `tf_tree_cli`. **`tf_tree` in particular does not move.** The
    facade staying provably safe is what lets a reader trust that the C ABI's

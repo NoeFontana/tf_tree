@@ -79,8 +79,9 @@ Three cautions specific to current work:
 - **`FORMAT_VERSION = 3` already happened** — for the **header**. Phase 6's
   header fields are reserved; its **region table is not**, so the region break
   is still owed ([`0032`](./docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md),
-  `draft`). **Do not add arena fields opportunistically** — that instruction is
-  unchanged, and `0032` gives it a queue to join rather than an indefinite wait.
+  `ready` — read its status line, not this word). **Do not add arena fields
+  opportunistically** — that instruction is unchanged, and the queue it joins is
+  `PROJECT.md` §5.1, the scheduled-break ledger `0032` part 2 opened.
 - **`PHASE5.md` §8 is a section about *not* building something.** Visualization
   is deliberately absent, argument recorded. **Do not propose a viewer
   integration without refuting §8.1 first.**
@@ -100,8 +101,11 @@ crates/tf_tree_bridge/  ROS-independent half of the /tf ingest bridge
 crates/tf_tree_ingest/  MCAP bag ingestion (§3); not in core/arena, not in the CLI
 crates/tf_tree_py/      PyO3; binds the Rust core directly, NOT the C ABI
 crates/tf_tree_c/       C ABI + header-only C++ wrapper
-crates/tf_tree_bench/   criterion + tf2 differential harness
-crates/tf_tree_tf2_sys/ tf2 side of the differential harness
+crates/tf_tree_bench/   criterion + tf2 differential harness. Its LIBRARY forbids
+                        unsafe; several of its bins and examples carry it — a bin is
+                        a separate crate root (0048; the register is
+                        scripts/unsafe-budget.txt)
+crates/tf_tree_tf2_sys/ tf2 side of the differential harness; unsafe = 0007 kind 3
 crates/tf_tree_cli/     binary `tf_tree` (alias `tft`)
 ros/tf_tree_ros/        ament_cmake: the §5 ingest bridge. NOT a cargo crate.
 ros/tf_tree_bench_ros/  ament_cmake: PHASE5 §9.1 DDS comparison. Benchmark-only.
@@ -122,15 +126,32 @@ cannot see it — **`just ros-build` and `just ros-test` are its entire gate**;
 - **Dependency budget:** `tf_tree_core` = `libm` + `bytemuck` + `blake3`.
   `tf_tree_math` = `libm` + `bytemuck`. Nothing else. No `serde`, `tokio`,
   `nalgebra`, or logging framework in the core (D14).
-- **Unsafe budget** ([`0007`](./docs/decisions/0007-the-unsafe-budget-and-the-c-abi.md)):
-  permitted **only at a boundary the compiler cannot see across**, and there are
-  four — arena memory (`tf_tree_arena`, `tf_tree_core::{buffer, arena_view}`),
-  the OS (`tf_tree_ipc`), a foreign runtime (`tf_tree_py`), a foreign caller
-  (`tf_tree_c`). A fifth kind needs a decision record.
-  `#![forbid(unsafe_code)]` stays on `tf_tree_math` and `tf_tree_cli`.
+- **Unsafe budget** ([`0007`](./docs/decisions/0007-the-unsafe-budget-and-the-c-abi.md),
+  rule 1 amended by [`0048`](./docs/decisions/0048-a-kind-is-not-a-crate-name.md)):
+  permitted **only at a boundary the compiler cannot see across**. The kinds are
+  **properties, and this bullet deliberately names no crate beside them** —
+  arena memory, the OS, a foreign runtime **or library** that owns its own
+  objects, a foreign caller, our own C ABI called from Rust to exercise or
+  measure it, and a trait the language requires be implemented unsafely in a
+  target that never ships. A new kind needs a decision record; a new *file*
+  needs a row in `scripts/unsafe-budget.txt`, which is the index. `just lint`
+  checks that index against a compiler census **over `crates/` and `xtask/`
+  only** — the script's own *What it does NOT prove* section is the list of what
+  that leaves out, and it is not short.
+  **This bullet used to write a crate name beside each kind, and that is what
+  `0048` is about**: `0007` rule 1 did the same, every downstream reader copied
+  the bracket rather than the criterion, and the budget was overtaken in two
+  crates for months with every recipe green.
+  **The budget binds a crate ROOT, not a package.** `#![forbid(unsafe_code)]` on
+  a `src/lib.rs` governs that root and no bin, test, bench or example of the same
+  package — several claims in this repository rested on the wrong scope until
+  `0048` measured it. `#![forbid(unsafe_code)]` stays on `tf_tree_math` and
+  `tf_tree_cli`'s libraries.
   Every `unsafe` block carries a `// SAFETY:` naming its invariant; every crate
-  with `unsafe` carries a module `// SAFETY:` block and
-  `#![deny(unsafe_op_in_unsafe_fn)]`.
+  **root** with `unsafe` declares its posture explicitly, carries a module
+  `// SAFETY:` block and `#![deny(unsafe_op_in_unsafe_fn)]`. **`0048`'s plan
+  landed that for the `tf_tree_bench` bins and `tf_tree_tf2_sys` and not for
+  `tf_tree_c`'s own tests and examples** — read its *Implementation plan*.
 - **`tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]`** —
   `OwnedWriter`'s lifetime extension ([`0017`](./docs/decisions/0017-owned-handles-and-the-lifetime-rule.md)),
   and it is **the only lifetime extension in the workspace**. `0017` steps 6–7
@@ -199,10 +220,10 @@ second opinion, not the first.
 |---|---|
 | `just build` | `cargo build --workspace --all-targets` |
 | `just test` | nextest `--workspace` + doctests + ingest-check. **Builds default features**, so anything `#[cfg]`-ed on `shm` is compiled out — that is `just shm-check`'s job |
-| `just lint` | `cargo fmt --check` + **ten** `clippy -D warnings` passes (workspace, then nine naming a feature the workspace pass compiles out), behind five dependencies: `no-build-output` (6 ms; rejects tracked build output by signature, after 358 MiB of it was merged across three PRs), then `no-conflict-markers`, then `py-compile` (fmt + clippy for the workspace-excluded `tf_tree_py`, against `.venv`'s interpreter or else the one on `PATH`; it skips only where there is no Python at all), then `evidence-audit` and `artifact-versions`, which cost under a second between them and are the only place either runs. **Not** `cargo deny` — that is `just audit` |
+| `just lint` | `cargo fmt --check` + one `clippy -D warnings` pass for the workspace and one for each feature configuration that pass compiles out — **the recipe is the list, and no count of it is kept here or in the justfile comment beside it, because the two disagreed** — behind these dependencies, in this order: `no-build-output` (6 ms; rejects tracked build output by signature, after 358 MiB of it was merged across three PRs), then `no-conflict-markers`, then `py-compile` (fmt + clippy for the workspace-excluded `tf_tree_py`, against `.venv`'s interpreter or else the one on `PATH`; it skips only where there is no Python at all), then `evidence-audit` and `artifact-versions`, which cost under a second between them and are the only place either runs, then `sbom`, which checks nothing and is there because its only other caller is a tag-gated release job that has never run, and last `unsafe-budget` — `0048`'s compiler-driven census, the only dependency that compiles anything (9 s warm, 55 s cold, ~1 GiB of extra `target/` because `RUSTFLAGS` is part of cargo's fingerprint). **Not** `cargo deny` — that is `just audit` |
 | `just shm-check` | fmt/clippy/tests for the default-off `shm` feature, named target by target. A new `shm`-only target belongs on that list in the commit that adds it |
 | `just stable-tier-check` | compiles `tf_tree`'s default tier with `unstable` **off** — the configuration `--workspace` unifies away |
-| `just artifact-versions` | version-skew gate: every hand-kept version site agrees, the publishable set is the five named crates, `CHANGELOG.md` has the current section, every `just <recipe>` reference in docs and workflows resolves, **and no version literal appears in prose on a crates.io front page** (#238 — four of the five said `0.0.1` for three releases), and **no Markdown table row disagrees with its header** — GFM deletes the extra cells silently, which hid a whole benchmark result and a stale number for five days (#208) |
+| `just artifact-versions` | version-skew gate: every hand-kept version site agrees **and so does every tracked `Cargo.lock`** (that set read from `git ls-files`, not listed in the script) (`crates/tf_tree_tf2_sys/Cargo.lock` stood at `0.0.1` four releases on, because cargo only rewrites a lock where somebody builds that crate and that one builds only in the ROS 2 container), the publishable set is the five named crates, `CHANGELOG.md` has the current section, every `just <recipe>` reference in docs and workflows resolves, **and no version literal appears in prose on a package-index front page** (#238 — four of the five crates.io pages said `0.0.1` for three releases; the root `README.md`, which `pyproject.toml` names as PyPI's, was outside the rule until 2026-09-05), and **no Markdown table row disagrees with its header** — GFM deletes the extra cells silently, which hid a whole benchmark result and a stale number for five days (#208) — **and every relative Markdown link resolves**, which nothing checked until 2026-09-05 and two did not |
 | `just quickstart` | `py-setup` → `maturin develop` → runs the README snippet and asserts its output. **Not** a clean clone; it builds both venvs from scratch but reuses the checkout |
 | `just doc` | rustdoc, warnings denied, three lines (nine crates at `--all-features --cfg docsrs`; `tf_tree_bench` at `shm,embed-probe`; `xtask`) |
 | `just py-cross-check` | `cargo check` for `tf_tree_py` at `{x86_64,aarch64}-apple-darwin` and `x86_64-pc-windows-msvc`, with `pure-hash`. The only thing that compiles that feature — `bindings-non-linux` uses native runners. Guards #180's 2027 fallback; `check` not `build`, because linking needs an Apple SDK no Linux host has |

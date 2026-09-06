@@ -61,6 +61,20 @@ dbg_macro = "deny"
 missing_docs = "warn"
 unreachable_pub = "warn"
 unused_must_use = "deny"
+# `docs/decisions/0007` rules 1 and 4, and `docs/decisions/0048`'s D4: a crate
+# that carries `unsafe` declares that posture explicitly rather than inheriting
+# rustc's default `allow`, and denies `unsafe_op_in_unsafe_fn`.
+#
+# **They live here rather than in `src/lib.rs` because this crate's lints do.**
+# It is outside the workspace (see the note at the top of this file), so it
+# cannot inherit `[workspace.lints]` and already spells its own; a `#![deny(…)]`
+# in the source beside a `[lints]` table would be a second place to look.
+#
+# `unsafe_op_in_unsafe_fn` is **vacuous today** — this crate declares no
+# `unsafe fn` of its own, only calls into `mod ffi`'s `extern "C"` block. It is
+# here so that the first one written is caught rather than the fourteenth.
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
 
 [dependencies]
 tf_tree_math = { path = "../tf_tree_math", version = "0.0.5" }

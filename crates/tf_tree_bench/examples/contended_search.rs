@@ -36,9 +36,16 @@
 //!
 //! Two cores, not one: the reader and the writer must actually run at the same
 //! time for the question to mean anything. Per-thread placement is the OS's
-//! choice — `tf_tree_bench` is `#![forbid(unsafe_code)]` and cannot call
-//! `sched_setaffinity`, which `docs/decisions/0007`'s budget would route to a
-//! decision record.
+//! choice, because nothing here calls `sched_setaffinity` — and the reason is
+//! `docs/decisions/0007` rule 1, not a lint posture. **This sentence read
+//! *"`tf_tree_bench` is `#![forbid(unsafe_code)]` and cannot call
+//! `sched_setaffinity`"* until 2026-09-05, which is the wrong scope**: the
+//! `forbid` is on `crates/tf_tree_bench/src/lib.rs` and an example is a
+//! separate crate root it does not govern. What holds is the rule: pinning a
+//! *thread* would be a new OS-boundary site whose only purpose is placement,
+//! and `taskset` places a *process* exactly, for free, from outside. Two
+//! sibling binaries (`contended_scaling`, `load_child`) chose a
+//! process-per-reader architecture on that same argument.
 #![allow(
     missing_docs,
     clippy::unwrap_used,

@@ -368,8 +368,45 @@ miri:
 #
 # **Where it runs:** `just lint` depends on it, so it is on every pull request
 # through `ci.yml`'s `lint` job and on every tag through `release.yml`'s. It has
-# no job of its own on purpose — 0.81 s measured, and a job's own checkout and
-# toolchain install cost more than the check does.
+# no job of its own on purpose: it is a text scan over the checkout, and a
+# job's own checkout and toolchain install cost more than the check does.
+
+# **`docs/decisions/0007` rule 1 had no gate at all until 2026-09-05**, and the
+# consequence is measured rather than argued: 0007's own Rationale says the
+# pre-0007 enumeration "had already been overtaken twice, without amendment",
+# and by the time `0048` took a census it had been overtaken a third time, in two
+# crates, for months, with every recipe green. There was nothing to notice it —
+# no script, no recipe, no CI step, no lint. Root `[workspace.lints.rust]` does
+# not name `unsafe_code`, and `#![forbid(unsafe_code)]` on a `src/lib.rs`
+# governs one crate root out of a package's many.
+#
+# **Compiler-driven, not a grep, and the difference is measured** — the table is
+# in `0048` with the command for every figure. Two greps over `crates/` are wrong
+# in opposite directions: a plain `grep unsafe` counts dozens of `unsafe_code`
+# and `unsafe_op_in_unsafe_fn` **attributes**, i.e. the rule's own enforcement,
+# and the word-boundary form drops those (no boundary before `_`) while still
+# over-counting the census by more than a hundred lines of `// SAFETY:` prose.
+#
+# **Where it runs:** `just lint` depends on it, so it is on every pull request
+# through `ci.yml`'s `lint` job and on every tag through `release.yml`'s.
+# **What it costs, both numbers, because they differ by six times.** On a
+# 4-core host: **9 s** with the `--force-warn` artifacts already in the target
+# directory, and **55 s** on the first run after they are not. `RUSTFLAGS`
+# is part of cargo's fingerprint, so this census keeps its own set of `check`
+# artifacts beside the ordinary ones — measured at about **1 GiB** of extra
+# `target/`. On a cold CI runner the first number is the one that does not
+# apply. It is a `lint` dependency rather than a job of its own because a gate a
+# contributor does not run before pushing is a gate that fails on somebody
+# else's branch, and it is **last** in that chain because it is the expensive
+# one.
+#
+# Its `--self-test` arm drives the comparison over synthetic inputs, including
+# an empty census, and asserts each verdict. Run it when you touch the script.
+
+# Every file carrying `unsafe` has a row in `scripts/unsafe-budget.txt`.
+unsafe-budget:
+    bash scripts/unsafe-budget.sh --self-test
+    bash scripts/unsafe-budget.sh
 
 # Every runnable artifact is executed by a recipe or registered as a probe.
 evidence-audit:
@@ -566,6 +603,108 @@ abi-attached:
 attach-bench:
     cargo build --release -q --features shm -p tf_tree_bench --bin attach_bench
     taskset -c 2 ./target/release/attach_bench
+
+# **PHASE5 §12 gate criterion 5: ingest throughput >= 10x real time on a
+# representative recording — the third §12 criterion nothing had ever run.**
+#
+# `docs/decisions/0050-what-ten-times-real-time-divides.md` is the record; it
+# answers what the ratio divides, what the density floor is for, why this may be
+# gated on a host that fails the timing probe, and at what pass count the
+# criterion is stated. Read it before changing any of the four.
+#
+# **The gated arm is the GROUPED one.** §12's own representative recording — four
+# hours at 100 Hz x 50 transforms — is 72e6 samples at 64 B, which does not fit
+# `DEFAULT_MAX_MEMORY_BYTES`, so pass two takes two groups and the recording is
+# read three times rather than twice. A gate measured at one fill pass and the
+# criterion as written are not the same claim, so this binary measures both and
+# gates the slower one. Each arm asserts the pass count it declares and REFUSES
+# if the run did not take it.
+#
+# **The corpus is generated, not committed.** `tf_tree_ingest::fixture` writes it
+# at run time, so nothing here adds megabytes of MCAP to a clone, and there is no
+# stale-fixture hazard for `rm -f` to defeat — the binary rewrites the file every
+# run unless a caller passes `--reuse-corpus`, which this recipe does not. The
+# zstd frames come from `ruzstd`'s own encoder, so this is a **round-trip**
+# corpus rather than a conformance one, and `testdata/zstd_conformance.mcap` is
+# what closes the conformance half for the decoder.
+#
+# **The density floor is what stops a vacuous pass**, and it is measured off the
+# survey rather than taken from the arguments: "10x real time" is a statement
+# about the corpus as much as about the code — at an identical per-transform cost
+# a 10 Hz x 5-transform recording reads a hundred times higher — so a gated run
+# on a corpus sparser than §12's own representative one REFUSES.
+#
+# **It publishes an absolute duration on a host that fails `Fitness::probe`**,
+# under §9.3's one-sided-budget amendment, in exactly the shape `just gate2`
+# uses it. Not a `bench_report` row and not `Sensitivity::Ratio` — that axis is
+# two engines interleaved within one round, and this is one engine against a
+# clock.
+#
+# **Not PHASE4 §6.3.** That section has a *different* "10x real time" criterion —
+# ROS 2 bag replay, no drops, bounded queue depth — which is unmet and which
+# nothing here touches.
+#
+# ~1.5 s with the release build warm; a few MB of scratch under `target/gate5`.
+gate5:
+    cargo build --release -q -p tf_tree_bench --bin ingest_throughput
+    ./target/release/ingest_throughput --corpus target/gate5/corpus.mcap --gate
+
+# **PHASE5 §12 gate criterion 2: `.tft` open time under 10 ms for a 233 MB index
+# — the other criterion nothing had ever run.**
+#
+# Next to `gate4` because the two rest on one fixture argument seen from two
+# sides: gate 4 needs the index large or its ratio is arithmetic about process
+# overhead (S >= 74p), gate 2 needs it large or a 10 ms budget is met by an
+# `mmap` of a small file for reasons that have nothing to do with this design.
+# Both land on the same ~338 MiB `Fleet`, and gate 4's own comment below already
+# points at "the 233 MB index §12 gate 2 names".
+#
+# **What is gated, and what is only reported.** Two cache states, and only one
+# of them is a claim about this code. The *resident* arm — page cache warm — is
+# the gate: `open_frozen` does the same O(1) work whatever the index size, so
+# the same measurement on a 2 MiB fixture and on the 338 MiB one must agree, and
+# that is the half §12's parenthesis is actually about ("anything more means
+# work is happening that should not"). The *evicted* arm is reported with the
+# host beside it and gates nothing: its size dependence is the storage device
+# fetching pages for the one major fault an open takes — the fault *count* does
+# not move between the two fixtures, and the binary prints it — so gating on it
+# would gate the disk under the runner.
+#
+# **It publishes an absolute duration on a host that fails `Fitness::probe`, and
+# §9.3's one-sided-budget amendment is what admits that.** Every check the probe
+# fails here can only make an open slower, so a PASS with margin is conservative
+# and a FAIL is not attributable to the code. The verdict line prints the
+# fitness reasons whichever way it goes. This is not a `bench_report` row and
+# not a new `Sensitivity`; read the amendment before copying the pattern.
+#
+# **The fixtures are deleted first, for `gate4`'s reason and after checking that
+# the reason transfers.** `frozen_open` reuses an existing `--tft`, so without
+# the `rm` this recipe times last week's file — and gate 2 is a claim about the
+# open of a `.tft` *this build* wrote. It costs ~1.4 s.
+#
+# **The falsifier is `--prefault`, not `--budget-ms`.** It reads every byte of
+# the index inside the timed region, which is the regression this gate exists to
+# catch (a populate arm reaching the frozen backing) and edits no threshold: it
+# puts the open tens of milliseconds over the 10 ms budget and an order of
+# magnitude past the 4x scale bound, so both gated halves go red and neither is
+# marginal. No interval is written here — run it. `crates/tf_tree_bench/tests/gate2.rs`
+# drives it through the shipped binary, in both directions and one half at a
+# time, and runs per-PR from `just shm-check`.
+#
+# **The fixtures are deleted again on the way out, and only on success.** The
+# `rm -f` above is what makes the measurement about this build; this one is
+# about the disk, because `nightly.yml` runs this recipe and `just gate4` in one
+# job and neither used to clean up, so the runner held two gate-scale indices at
+# once for the rest of the job. `just` stops the recipe at the first non-zero
+# exit, so a FAIL or a refusal leaves the fixtures in place to look at.
+#
+# A gate-scale index plus a small one; ~4 s wall with the release build warm.
+gate2:
+    cargo build --release -q --features shm -p tf_tree_bench --bin frozen_open
+    rm -f target/gate2/index.tft target/gate2/small.tft
+    ./target/release/frozen_open --tft target/gate2/index.tft \
+        --small-tft target/gate2/small.tft --robots 64 --history 40 --gate
+    rm -f target/gate2/index.tft target/gate2/small.tft
 
 # **PHASE5 §12 gate criterion 4: 16 workers sharing one `.tft`, total Pss within
 # 1.2x of one worker — the project's central memory claim, which nothing had
@@ -1011,6 +1150,18 @@ ingest-check:
         { echo "tf_tree_cli's default build has no zstd decoder: is 'compression' still in [features] default?"; exit 1; }
     cargo tree -q -p tf_tree_cli -e normal | grep -q lz4_flex || \
         { echo "tf_tree_cli's default build has no lz4 decoder: is 'compression' still in [features] default?"; exit 1; }
+    # **And the same graph read in the negative direction, for the feature that
+    # must *not* arrive.** `tf_tree_ingest/fixture` fabricates recordings; it is
+    # test scaffolding, not a product surface. `tf_tree_cli` names
+    # `tf_tree_bench` as a normal dependency, so a `features = ["fixture"]`
+    # written on *that* crate's dependency stanza travels the edge and turns the
+    # fabricator on inside the shipped `tf_tree` binary — which is what this
+    # line caught. A passthrough feature does not, because the workspace
+    # declares `tf_tree_bench` with `default-features = false`. Nothing else can
+    # see this: every test in every crate passes either way, and the two `grep
+    # -q` lines above only assert what is present.
+    cargo tree -q -p tf_tree_cli -e normal --format "{p} [{f}]" | grep tf_tree_ingest | grep -q fixture && \
+        { echo "tf_tree_cli's default build carries tf_tree_ingest/fixture: a dependency-level feature is travelling the tf_tree_bench edge"; exit 1; } || true
 
 # **Rustdoc, with warnings denied — the docs.rs shop window.**
 #
@@ -1099,16 +1250,30 @@ doc:
 # in the file and one of them caught a real defect: PHASE4 §7 gate criterion 1
 # was recorded as PASS for months while the benchmark that produces it ran in no
 # recipe at all. `just` runs dependencies left to right and before the body, so
-# ordering survives the move — `no-build-output`, then `py-compile`, then the
-# artifact audit, then the version audit, then eight clippy passes.
+# ordering survives the move. **The `lint:` line below is the order**, and this
+# comment deliberately does not re-spell it: a second copy of the list is what
+# drifted when `unsafe-budget` was added and the copy was not.
+#
+# **`sbom` is on that list for a different reason from the others.** They
+# check something. It only *runs* — the thing it produces is checked by nothing
+# here — and that is exactly what was missing: its one caller was a tag-gated
+# release job, added after the last tag, so the generator had never executed on
+# any path. A script first exercised during an irreversible release is a script
+# nobody has exercised. `just sbom` with no argument takes the workspace
+# version, so this line needs no number in it.
 #
 # `no-build-output` goes first because it is both the cheapest (6 ms measured,
 # 5 ms in CI) and the
 # one whose failure invalidates the rest: if the tree has build output committed
 # in it, what clippy thinks of the source is not the interesting news.
+# `unsafe-budget` goes **last** among the dependencies for the opposite reason:
+# it is the one that compiles anything, and a contributor whose tree fails
+# `no-build-output` should hear about it in six milliseconds rather than after a
+# census.
 
-# fmt + eight clippy configurations, behind the three cheap audits.
-lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-versions
+# fmt, then one `clippy -D warnings` pass per feature configuration the
+# workspace pass compiles out, behind the cheap audits on the line below.
+lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-versions sbom unsafe-budget
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     # The ingest-bridge seam (`docs/PHASE4.md` §5). Default-off, so the line
@@ -1724,11 +1889,21 @@ profile-cachegrind workload="robot":
 
 # `tf_tree_tf2_sys` is deliberately excluded from the workspace (it only builds
 # where ROS 2 is installed), which also excludes it from `cargo fmt --all`,
-# `cargo clippy --workspace` and `cargo nextest run --workspace`. It is the one
-# crate in the repo carrying `unsafe` with no lint coverage, and its unit tests —
-# the quaternion-convention guard and the Send/Sync justification among them —
-# run nowhere else. This recipe is where they run. Run it whenever anything under
-# `crates/tf_tree_tf2_sys/` or behind `tf_tree_bench`'s `tf2` feature changes.
+# `cargo clippy --workspace` and `cargo nextest run --workspace`. Nothing on a
+# host without ROS lints it or runs its unit tests — the quaternion-convention
+# guard and the Send/Sync justification among them. This recipe is where they
+# run, and `scripts/unsafe-budget.sh` marks its register row `out-of-reach` for
+# exactly this reason.
+#
+# **This comment called it "the one crate in the repo carrying `unsafe` with no
+# lint coverage" until 2026-09-05, and that superlative was never checked** — a
+# count written beside the thing that produces it. `crates/tf_tree_py` is also
+# workspace-excluded and also carries `unsafe`; what covers it is `just
+# py-compile`, which needs an interpreter. Recount with
+# `scripts/unsafe-budget.sh` rather than reading a claim here.
+#
+# Run this recipe whenever anything under `crates/tf_tree_tf2_sys/` or behind
+# `tf_tree_bench`'s `tf2` feature changes.
 #
 # `--manifest-path` is how the excluded crate is addressed: from the workspace
 # root, `-p tf_tree_tf2_sys` does not resolve.
@@ -1773,7 +1948,10 @@ profile-cachegrind workload="robot":
 # `lookup_ratio_vs_tf2` is the row that resolves here and nowhere else. It is a
 # `Sensitivity::Ratio` row, so the fitness probe's timing verdict does not reach
 # it: the arms are interleaved within every round, which is what makes ~2.5x
-# resolvable to a ~3% band on a host whose absolute latencies are unusable.
+# resolvable to a ~3% band on a host whose absolute latencies are unusable —
+# ~3% being one draw and not a width to expect back, since
+# `docs/decisions/0025-what-build-the-tf2-ratio-gate-speaks-for.md` measured
+# this row's band at 1.3-16.7% across three repeats of the same pinned harness.
 tf2-bench-report *ARGS:
     ./docker/tf2/run.sh 'cargo run --release -p tf_tree_bench --features tf2 --bin bench_report -- {{ARGS}}'
 
@@ -2146,9 +2324,15 @@ shm-check:
     # individually, on purpose.
     cargo nextest run -p tf_tree_bench --features shm --lib
     # **The `#[cfg(test)]` tests inside this crate's *binaries*, which no recipe
-    # a workflow invokes reached.** `--lib` above is the library target; every
-    # `[[bin]]` here carries `required-features = ["shm"]`, so `cargo nextest
-    # run --workspace` skips them whole and the line above does not reach them.
+    # a workflow invokes reached.** `--lib` above is the library target, so it
+    # reaches no binary's tests at all, whatever features that binary needs.
+    # Separately, the `[[bin]]`s gated on `required-features = ["shm"]` are
+    # skipped whole by `cargo nextest run --workspace`. **No count of either set
+    # is written here, and no sentence quantifying over every `[[bin]]` in this
+    # crate**: `ingest_throughput` is a `[[bin]]` with no `required-features`,
+    # and a claim of that shape had to be corrected in three files at once.
+    # `cargo nextest list -p tf_tree_bench --features shm --bins`, against the
+    # same command without the feature, is the instrument.
     #
     # **CORRECTION (2026-09-04, same day):** the first version of this comment
     # said "not one of them had ever been run by a recipe". That was false, and
@@ -2177,6 +2361,22 @@ shm-check:
     # the arithmetic; this covers the *process*, which is the half the nightly
     # job reads. ~0.03 s.
     cargo nextest run -p tf_tree_bench --features shm --test gate4
+    # **PHASE5 §12 gate 2's exit status and its two refusals** — that
+    # `--gate --prefault` turns the gate red without editing a threshold, that
+    # each of the two gated halves can fail on its own, that a **gated** run
+    # whose page-cache eviction did not take refuses rather than publishing a
+    # resident number as an evicted one, and that a fixture under the
+    # criterion's own 233 MB scale refuses rather than passing 10 ms trivially.
+    # Driven through the shipped binary, like the line above. ~5 s, of which
+    # ~1 s is one freeze of a 254 MiB index.
+    #
+    # **The fixtures go under the cargo target directory, not `$TMPDIR`.** The
+    # evicted arm needs a filesystem whose pages can be evicted; `$TMPDIR` is a
+    # tmpfs on a large share of hosts and containers, where nothing can be, and
+    # these tests went red for that and blamed `dd`. Under the target directory
+    # they fail exactly when `just gate2` would, which is one disclosure rather
+    # than a contradiction.
+    cargo nextest run -p tf_tree_bench --features shm --test gate2
     # `abi-probe` = `bridge` + `tf_tree_c/test-hooks`, the only configuration in
     # which `abi_attached` compiles. Without this line the binary that measures
     # the C ABI boundary is linted by nothing — the same hole `just lint`'s
@@ -2270,9 +2470,14 @@ shm-check:
     # this line is the only one that can run it. Until 0.0.1 the facade's
     # self-dev-dependency turned the feature on here for free; deleting it (see
     # `crates/tf_tree/Cargo.toml`) took the test out of every recipe at once and
-    # `--features shm` alone would leave it there. Measured:
-    # `cargo nextest list -p tf_tree --features shm --test frozen` lists 8 tests,
-    # `--features shm,unstable` lists 9.
+    # `--features shm` alone would leave it there.
+    #
+    # Measured by the two commands rather than by a tally, because the tally
+    # here went stale by one on each side while the argument stayed true —
+    # what matters is the *difference*, not either count:
+    # `cargo nextest list -p tf_tree --features shm --test frozen` against
+    # `cargo nextest list -p tf_tree --features shm,unstable --test frozen`
+    # differ by exactly one name, `freezing_carries_the_counter_regions`.
     #
     # The clippy line at the top of this recipe stays `--features shm` alone on
     # purpose: that is what compiles this crate's test targets with `unstable`
@@ -3150,8 +3355,37 @@ release-archive TARGET:
 # carries this one — in particular why the graph is walked from the *shipped*
 # roots over `normal` edges only, so a dev-dependency never appears in a bill of
 # materials for something that does not contain it.
-sbom VERSION:
-    python3 scripts/sbom.py --version {{ VERSION }} -o target/tf_tree-{{ VERSION }}-sbom.cdx.json
+# **`just lint` depends on it**, which is the whole of what changed on
+# 2026-09-05. Before that the generator ran in exactly one place — `release.yml`'s
+# `github-release` job, which is gated on `refs/tags/v*` — and the commit that
+# added it landed *after* the only tag it could have run on, so it had produced
+# nothing, ever, and no release carries an SBOM. A script whose first execution
+# is on a tag push is a script whose first execution is on the one occasion the
+# result cannot be fixed. It costs one `cargo metadata` (0.2 s here, no compile),
+# which is the same argument `artifact-versions` and `evidence-audit` are on that
+# list under.
+#
+# **`VERSION` defaults to the workspace number** via the `cargo pkgid` idiom
+# `release-archive` already uses, rather than a third hand-copied `tomllib`
+# one-liner. **It is a version, never a tag**: the argument lands in
+# `metadata.component.version` and in the purl, so `just sbom v0.0.5` writes a
+# document no release would — `release.yml` passes `${tag#v}`. With no argument
+# this recipe passes exactly what that job passes, and the only difference left
+# is the file name: the release's asset carries the `v`, this default does not.
+#
+# **`OUT` respects `CARGO_TARGET_DIR`**: hard-coding
+# `target/` made this recipe fail outright — `FileNotFoundError`, exit 1 — for
+# anybody who exports it, which is the class of defect `release-archive`'s own
+# comment records for two other gates.
+sbom VERSION=`cargo pkgid -p tf_tree_cli | sed 's/.*[@#]//'` OUT="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="{{ OUT }}"
+    if [ -z "${out}" ]; then
+      out="${CARGO_TARGET_DIR:-target}/tf_tree-{{ VERSION }}-sbom.cdx.json"
+    fi
+    mkdir -p "$(dirname "${out}")"
+    python3 scripts/sbom.py --version "{{ VERSION }}" -o "${out}"
 
 # `docs/PHASE2.md` §11.2 scenario 9, a thousand times — §15's box 6.
 #

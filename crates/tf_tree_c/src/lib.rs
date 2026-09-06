@@ -1337,6 +1337,26 @@ pub struct tft_extrapolated {
     pub edge: u32,
 }
 
+impl tft_extrapolated {
+    /// A well-formed "not extrapolated" value, with `struct_size` already set.
+    ///
+    /// `edge` is [`TFT_INVALID_ID`] rather than `0`, because that is what this
+    /// header already means by *"this field does not apply"* and `by_ns == 0`
+    /// is exactly that case — a zeroed value would hand a caller a plausible
+    /// edge id for an answer that was never extrapolated.
+    ///
+    /// **Public because the alternative is `unsafe { core::mem::zeroed() }` at
+    /// every caller**, which is the spelling `docs/decisions/0048` deletes.
+    #[must_use]
+    pub const fn blank() -> tft_extrapolated {
+        tft_extrapolated {
+            struct_size: core::mem::size_of::<tft_extrapolated>() as u32,
+            by_ns: 0,
+            edge: TFT_INVALID_ID,
+        }
+    }
+}
+
 /// [`tft_plan_at`], permitting extrapolation past the newest sample under
 /// `policy`, and reporting how far the answer was extrapolated.
 ///
