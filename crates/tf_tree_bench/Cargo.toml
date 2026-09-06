@@ -284,6 +284,14 @@ path = "src/bin/shm_torture.rs"
 name = "torture"
 required-features = ["shm"]
 
+# **`frozen_workers`'s exit status.** `required-features` for the same reason as
+# `torture` above: the driver carries `required-features = ["shm"]`, so
+# `cargo nextest run --workspace` builds no `CARGO_BIN_EXE_frozen_workers` for
+# this target to spawn. `just shm-check` runs it.
+[[test]]
+name = "gate4"
+required-features = ["shm"]
+
 [[bench]]
 name = "py_parity"
 harness = false

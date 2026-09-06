@@ -28,10 +28,21 @@
 //! `tf_tree_core`, `tf_tree_arena` or `tf_tree_ipc` can reach this code. The
 //! `AF_INET` socket lives in the CLI, is created only when an operator types
 //! `--web`, and binds loopback unless that operator types a different address.
-//! §11's proposed `socket(2)`-is-only-`AF_UNIX` assertion must therefore be
-//! scoped to the library's test suite; a version of it that ran over the CLI
-//! would have to encode this exception, which is why the distinction is written
-//! down here rather than discovered later.
+//! §11's `socket(2)`-is-only-`AF_UNIX` assertion must therefore be scoped to
+//! the library's test suite; a version of it that ran over the CLI would have
+//! to encode this exception, which is why the distinction is written down here
+//! rather than discovered later.
+//!
+//! **That assertion exists since 2026-09-04** — `just no-network`,
+//! `scripts/no-network.sh` — and this paragraph called it *proposed* until it
+//! did. It traces the five published crates' test binaries and requires every
+//! `socket(2)` in them to name `AF_UNIX`. The exception above is not encoded in
+//! its scanner: it is the recipe's **positive control**, a separate `strace`
+//! run over `crates/tf_tree_cli/tests/web.rs` that must find an `AF_INET`
+//! socket or the whole check refuses. So a scan that had been scoped so
+//! narrowly it could no longer see a network socket fails, rather than passing
+//! for the same reason a correct one does — and if this module ever stopped
+//! binding a listener, the check would say so.
 //!
 //! # Three things a two-route server still has to get right
 //!

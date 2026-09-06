@@ -85,12 +85,45 @@ see [`SUPPORT.md`](./SUPPORT.md) for the full policy.
 library is the Phase 2 `AF_UNIX` rendezvous socket, which is a filesystem path on
 the local host.
 
-Stated precisely, because the difference matters to anyone evaluating this: that
-is a **property of the code today, not yet an assertion in CI**.
-`docs/PHASE5.md` §5.1 requires a test that runs the suite under `strace` or a
-seccomp filter and fails if `socket(2)` is called with anything but `AF_UNIX`,
-and that test is **not implemented** — §0.0's status table is the source of
-truth. Until it exists, verify it yourself if it matters to you:
-`strace -f -e trace=socket cargo nextest run --workspace`.
+Stated precisely, because the difference matters to anyone evaluating this:
+since 2026-09-04 that is **an assertion in CI**, not only a property of the
+code. `docs/PHASE5.md` §5.1 requires a test that runs the suite under `strace`
+or a seccomp filter and fails if `socket(2)` is called with anything but
+`AF_UNIX`; `just no-network` (`scripts/no-network.sh`) is that test, and
+`.github/workflows/ci.yml`'s `shm` job runs it on both matrix rows. **This
+section said the test was "not implemented" until the day it was**, which is
+the shape of claim worth re-reading against the tree rather than trusting.
+
+Read the scope with it, because it is narrower than "everything in this
+repository":
+
+- **What is asserted:** every `socket(2)` issued by the test binaries of the
+  five published crates — `tf_tree`, `tf_tree_core`, `tf_tree_math`,
+  `tf_tree_arena`, `tf_tree_ipc` — names `AF_UNIX`. That is §11's scoping and
+  §5.1's amendment, not a narrowing made to get a green run: the sentence above
+  is about the library.
+- **`tf_tree_cli` is the check's positive control, not a gap.** `tf_tree top
+  --web` binds an `AF_INET` listener by construction, on purpose, when an
+  operator asks for it. The recipe traces that target *separately* and
+  **refuses** unless it finds `AF_INET` there — so "the library opens no network
+  socket" and "this check is scoped so narrowly it could not see one" are
+  distinguishable outcomes.
+- **What it does not cover:** a code path no test takes, a socket the library
+  *inherits* rather than creates (`tf_tree_ipc` passes the rendezvous fd, and
+  `connect(2)`/`sendto(2)` on a received fd are not traced), a non-Linux target,
+  and **every package in this repository other than the five above and
+  `tf_tree_cli`** — including `crates/tf_tree_tf2_sys`, the ROS 2
+  `tf2::BufferCore` bridge, which is worth naming rather than deriving because
+  ROS 2 middleware is DDS over UDP. Those are traced by nothing. (This
+  bullet used to enumerate the untraced crates by name; the list shipped
+  incomplete, which in a "what it does not cover" bullet is the worst place for
+  an omission, so it is stated as the rule the traced set generates.)
+  `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header.
+
+Verify it yourself if it matters to you: `just no-network` (it needs `strace`,
+and refuses rather than skips without it). Do not use
+`cargo nextest run --workspace` for this — the workspace suite includes the
+CLI's `--web` listener, so a bare `strace` over it reports `AF_INET` sockets
+that are the control rather than a violation.
 
 A build of this project that talks to a remote host is a report worth sending.

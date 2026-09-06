@@ -66,6 +66,76 @@ jobs:
       - name: just shm-torture
         run: just shm-torture
 
+  # **`docs/PHASE2.md` §11.4's other half — "a random crash point armed in 10%
+  # of children" — which ran in no workflow at all.**
+  #
+  # The `torture` job above is the `SIGKILL` half. §11.4 asks for both, and
+  # `SIGKILL` lands wherever the scheduler puts it: a real fault, and a much
+  # shallower set of mid-protocol states than §11.3's named ones. `just
+  # shm-torture-crash-points` arms a random site from
+  # `tf_tree_core::crash::SITES` and `tf_tree::CRASH_SITES` in about a tenth of
+  # children, so the run kills processes *at named instructions*. Until this job
+  # existed, that clause was measured by whoever remembered to type the recipe,
+  # and the number quoted for it came from a hand measurement in a justfile
+  # comment — a measurement with a date on it, not a gate.
+  #
+  # **Its own job rather than a row on `torture`, for two reasons that are both
+  # about not sharing.** The build is different: `--features shm,crash-points`,
+  # which the plain soak deliberately does not carry (a site compiled out of the
+  # driver is compiled out of every child, and the flag would arm nothing while
+  # looking like it had). And the parameters are different on purpose — 5
+  # minutes, 10 children, 2 Hz, longer and gentler than the soak's 30/6/6,
+  # because a high kill rate wins the race against the site more often than not.
+  # A matrix row would have to carry both, and the `gate4` job's argument
+  # applies as well: a five-minute run must not go unrun on a night the
+  # thirty-minute one fails early.
+  #
+  # **What makes the exit status worth reading.** The binary refuses a
+  # `--crash-points` run that armed nothing, and separately one that armed
+  # children and fired at none — because this job reads the status and nothing
+  # else, while the `§11.3:` line it prints was written for a human. Without
+  # those two refusals this job would be the vacuous green that
+  # `crates/tf_tree_bench/tests/torture.rs`'s
+  # `a_run_that_validates_nothing_fails_instead_of_passing` exists to prevent
+  # one level down.
+  #
+  # **25 minutes, and the number is what the two steps below cost rather than
+  # what the soak costs.** The soak itself is 5 minutes. Around it are *two*
+  # release builds that cargo cannot share, because `crash-points` is a
+  # passthrough to `tf_tree/crash-points` and `tf_tree_core/crash-points`
+  # (`crates/tf_tree_bench/Cargo.toml`), so the feature set differs all the way
+  # down: `--features shm --release` for `just shm-torture-self-test`, and
+  # `--features shm,crash-points --release` for `just shm-torture-crash-points`.
+  # The `shm,crash-points` build is produced by no other job in this file; the
+  # `shm` one is also built by the `torture` job above, but on a different
+  # runner with its own `Swatinem/rust-cache` key, so this job's cold cache
+  # still pays for both. (That sentence read "neither is produced by any other
+  # job here", which was false of the `shm` build.)
+  # The margin above that is for a slow runner, not for a longer run — a soak
+  # that needs more than 5 minutes is a change to the recipe's `*ARGS`, and this
+  # comment is what would have to move with it. (It read "10 minutes" beside a
+  # `timeout-minutes: 25` and accounted for one build; corrected 2026-09-04.)
+  crash-points:
+    name: shm_torture --crash-points (§11.3 sites)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      # The harness's own detector first, for the `torture` job's reason: this
+      # build cannot run it (the self-test binary is built without
+      # `crash-points`, which is what lets it assert the *refusal*), so what it
+      # buys here is the seconds-long check that the reader still reads before
+      # five minutes of soak that assumes it does.
+      - name: just shm-torture-self-test
+        run: just shm-torture-self-test
+      - name: just shm-torture-crash-points
+        run: just shm-torture-crash-points
+
   sanitizers:
     name: ${{ matrix.recipe }}
     runs-on: ubuntu-latest
