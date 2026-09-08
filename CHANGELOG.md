@@ -142,6 +142,36 @@ is a bug.
   (`6e8b19b`) — `docs/PHASE2.md` §11.2 scenario 9 a thousand times, and §12.3
   criterion 4's kill-to-re-claimable measurement.
 
+### Fixed — an ordering no model was watching
+
+- **`PHASE1.md` §10.2's mutation test has now been run, and one of the five
+  §6.2/§6.3 orderings was unguarded.** Weakening `SampleRing::push`'s
+  `self.head.store(h + 1, Release)` to `Relaxed` passed the **entire** loom
+  suite, while the other four each kill a model. The store is not unnecessary —
+  `sample`'s `stamp_at` reads stamps `Relaxed` and rests that on this edge in
+  its own doc, and `docs/design/fast-path.md` builds a proposed optimisation on
+  it — so this was §10.2's *"test coverage is insufficient"* branch, unanswered
+  since the models were written.
+- **No `sample`-shaped fixture could have caught it**, which is why the new
+  model is not a third one. `push`'s `fence(Release)` sits *before* that push's
+  stamp store, so observing `head == h` orders stamps `0 ..= h-2` and leaves the
+  newest unprotected — and `sample` reads exactly that one as `t_new`. A stale
+  stamp reads as the zero-initialised `0`, stamps only increase, so a stale
+  `t_new` is always low and every positive `t` leaves through the tolerated
+  `Extrapolation` arm before reaching an assertion.
+- **New loom model `head_publishes_every_stamp_below_it`** asserts the invariant
+  directly: observing `head == h` makes all `h` stamps visible. Verified both
+  ways — it fails under the `Relaxed` mutant and passes at `Release`. The loom
+  suite is 21 models, was 20.
+- **Two claims that were false are corrected rather than deleted.**
+  `buffer.rs`'s module doc said "Every ordering below is load-bearing and is
+  exercised by the loom tests"; it was true of four and asserted of five.
+  `sample.rs`'s `stamp_at` rested its `Relaxed` load on an edge nothing checked.
+  Both now name the model and record what they used to claim. The failure this
+  admitted is not an error return: a reader brackets against a stamp `head` had
+  not published and returns a finite, plausible, **wrong pose**, with `just
+  loom`, `just test`, `just miri` and both CI architectures green.
+
 ### Fixed — gates a caller could green, and one that could not see its subject
 
 - **`docs/PHASE5.md` §12 gates 2 and 5 refuse a loosened threshold under
