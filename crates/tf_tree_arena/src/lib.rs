@@ -1,6 +1,12 @@
 #![no_std]
 // `unsafe` boundary: raw arena memory. See `docs/decisions/0007`.
 #![deny(unsafe_op_in_unsafe_fn)]
+// `PHASE1.md` §13 asks for this at the root. The workspace sets
+// `missing_docs = "warn"` and `just lint`'s `-D warnings` promotes it, so the
+// gate was already effective — but only inside that recipe. At the root a
+// published consumer reads, and under a plain `cargo build`, it now says so
+// itself.
+#![deny(missing_docs)]
 //! `no_std + alloc` pointer-free arena abstraction and layout math for `tf_tree`.
 //!
 //! The arena is a single flat allocation holding every record and ring buffer.

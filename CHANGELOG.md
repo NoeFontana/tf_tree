@@ -23,15 +23,51 @@ Two consequences worth naming rather than leaving to be discovered:
 
 The single source of truth for what is implemented is the status tables in
 `docs/` — `## 0.0 Implementation status` at the head of `PHASE2.md`, `PHASE4.md`
-and `PHASE5.md`, and `## 0.0 Status` in `PHASE7.md`. `PHASE1.md` has none because
-Phase 1 is implemented whole; `PHASE3.md` has none because it records deviations
-inline, in the section each one belongs to — §5.5's buffer-protocol steps are the
-example. Where this file and one of those disagree, they are right and this file
+and `PHASE5.md`, and `## 0.0 Status` in `PHASE7.md`. `PHASE1.md` and `PHASE3.md` have no `0.0` heading, and their
+**definition-of-done lists — §13 and §14 — are their status tables**, with the
+same authority. `PHASE3.md` also records deviations inline, in the section each
+one belongs to; §5.5's buffer-protocol steps are the example.
+
+This paragraph read *"`PHASE1.md` has none because Phase 1 is implemented
+whole"* until 2026-09-09, and that was wrong in both directions at once: **six
+of §13's nine boxes were satisfied and had never been ticked**, and two were
+false — `loom` and `miri` ran on x86-64 only, and §11.2's cold-cache row is
+measured nowhere. A sentence asserting completeness is exactly what stops anyone
+from reading the list that would have said otherwise, which is why the list is
+now named as the status table rather than explained away. Where this file and one of those disagree, they are right and this file
 is a bug.
 
 ---
 
 ## [Unreleased]
+
+### Fixed — PHASE1 §13 was nine unticked boxes over a phase called "implemented whole"
+
+- **Six of the nine were satisfied and had never been ticked**: §11.3's written
+  explanation (it is `0013`'s *Resolution*), the unsafe attributes and the
+  single `#[allow]`, all seven `doctor` checks with a positive *and* negative
+  test each, the five §3.1 conventions, and `PHASE2.md`'s A1–A8. Two are
+  genuinely open and now say what is missing rather than nothing at all.
+- **`loom` and `miri` now run on aarch64.** Both jobs were `runs-on:
+  ubuntu-latest` with no matrix for the life of the project, while `test` and
+  `shm` have carried `ubuntu-24.04-arm` since aarch64 CI became real — so the
+  model checker that exists to catch `PROJECT.md` §6's *"weakening an atomic
+  ordering because a test passes on x86-64"* ran only on x86-64. Loom remains
+  the argument rather than a weak-memory proof; what the row buys is that the
+  argument is no longer produced solely on the architecture the smell names.
+  `just test-doc-error-codes` stays on one row: rustdoc diagnostics are
+  identical on both.
+- **`#![deny(missing_docs)]` is on the four publishable roots that lacked it.**
+  The workspace has set it to `warn` with `just lint`'s `-D warnings` promoting
+  it all along, so the gate was effective — but only inside that recipe, and
+  §13's box asks for the attribute at the root a published consumer reads.
+- **§11.2's cold-cache row is measured by nothing**, which is why the
+  bench-gate box stays open: a runner that "reports the full table" cannot exist
+  until that row has an artifact or the row is withdrawn.
+- **Box 5 cannot be closed as written**: 449 `unsafe` blocks against 463
+  `// SAFETY:` comments, but "naming a §2 invariant" is unsatisfiable for the
+  majority, whose subject is the OS, a foreign runtime or our own C ABI rather
+  than the arena. Restating it against `0007`'s kinds is an edit to the box.
 
 ### Changed
 

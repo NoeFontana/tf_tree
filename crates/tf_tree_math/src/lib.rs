@@ -1,5 +1,11 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+// `PHASE1.md` §13 asks for this at the root. The workspace sets
+// `missing_docs = "warn"` and `just lint`'s `-D warnings` promotes it, so the
+// gate was already effective — but only inside that recipe. At the root a
+// published consumer reads, and under a plain `cargo build`, it now says so
+// itself.
+#![deny(missing_docs)]
 //! `no_std` SE(3)/SO(3) and dual-quaternion math for the `tf_tree` engine.
 //!
 //! # Conventions (lock these in — every downstream bug traces back to one)

@@ -16,6 +16,12 @@
 // returns it and should return nothing else. A second site is a new kind of
 // boundary and needs its own record (`docs/decisions/0007`).
 #![deny(unsafe_op_in_unsafe_fn)]
+// `PHASE1.md` §13 asks for this at the root. The workspace sets
+// `missing_docs = "warn"` and `just lint`'s `-D warnings` promotes it, so the
+// gate was already effective — but only inside that recipe. At the root a
+// published consumer reads, and under a plain `cargo build`, it now says so
+// itself.
+#![deny(missing_docs)]
 //! `std` facade for the `tf_tree` transform engine.
 //!
 //! Re-exports the [`tf_tree_core`] engine and adds the ergonomic, allocating
