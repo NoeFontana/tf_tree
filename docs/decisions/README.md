@@ -122,8 +122,23 @@ Every decision has one of four statuses on a single document type. There are no
 folder moves and no archive subdirectory.
 
 - **draft** — being written; open questions present; under team review.
-- **ready** — open questions resolved; implementation plan concrete; can be
-  handed to an agent or engineer.
+  **A draft authorises nothing**: no spec §0.0 row, no amendment banner, no code
+  comment and no status table may cite one as settled. `docs/PROJECT.md` §5.1
+  says exactly this of `0031` in one ledger row; it is the rule for every
+  record, and `scripts/artifact-versions.py` now checks the one spelling of it a
+  script can see. **It was not held**: `0047`, `0048` and `0049` were cited as
+  settled declines and amendments at fourteen sites while all three read
+  `draft`, which is what added that check.
+- **ready** — every open question the *Decision* depends on is resolved;
+  implementation plan concrete; can be handed to an agent or engineer. A
+  question the record explicitly scopes as **not decision-affecting** may stay
+  open, and the record must say so where the question is written — `0047`
+  question 1, `0048` questions 1–2 and `0049` question 1 are the shape.
+  **This clause read *"open questions resolved"* until 2026-09-09, and the
+  folder at large did not satisfy it**: eight `ready` and five `implemented`
+  records carry numbered open questions. `grep -m1 -H '^\*\*Status:' docs/decisions/0*.md`
+  beside each record's *Open questions* heading is the count, and no number is
+  written here because it would be a second place to maintain.
 - **implemented** — code shipped; PRs linked; document frozen.
 - **superseded by NNNN** — replaced by a later decision. The doc stays in
   place as history.
@@ -138,6 +153,12 @@ Two transitions are gates:
 - **implemented** is the immutability lock. Once the document is marked
   implemented, it does not get edited to match what the code does. If reality
   has drifted, write a new decision that supersedes this one.
+
+  **One edit besides the status line is allowed: an amendment banner signed and
+  dated by a later record.** `0005` is `implemented` and carries two — `0017`'s
+  and `0048`'s. What the lock forbids is an *unsigned* edit made to match the
+  code. Where a correction has no banner to sit under, this file's own index row
+  is where it goes, which is why `0005`'s row carries three.
 
 ## Numbering
 

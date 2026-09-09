@@ -1,8 +1,8 @@
 # 0049: the flag that prefaults the arena
 
-**Status:** draft
+**Status:** implemented (2026-09-09; same wave as `0047`, same omission)
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #303 — all eight steps: `crates/tf_tree_bench/examples/mlock_probe.rs`, `docs/benchmarks/EVIDENCE.md`'s probe row, `TFT016`'s corrected finding message in `crates/tf_tree_cli/src/checks.rs` and its pin test, `crates/tf_tree_cli/src/hostfacts.rs`, `docs/API.md` §8.3, `docs/PHASE2.md` §7.4's banner and §0.0's row, `docs/PHASE5.md` §6's detection row. Open question 1 is explicitly **not decision-affecting**: the decline rests on `API.md` §8.3's second bullet, which the question does not touch.
 
 ## Context
 

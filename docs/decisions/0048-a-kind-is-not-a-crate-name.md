@@ -1,8 +1,8 @@
 # 0048: a kind is not a crate name
 
-**Status:** draft
+**Status:** ready — **D1–D6 are in force and gated**: `0007` rule 1 carries this record's amendment, `scripts/unsafe-budget.txt` is the index, and `just unsafe-budget` runs inside `just lint`. Plan steps 1–3 and the `CHANGELOG.md` entry landed in #303; **step 4 is the remaining work** — D4's postures over `tf_tree_c`'s own `tests/` and `examples/` roots — and until it lands, D4 holds for the roots step 3 names and no others. Both open questions are scoped by this record as not decision-affecting. `implemented` when step 4 lands. (This is `0013`'s qualified-status shape.)
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #303 (steps 1–3 and the CHANGELOG); step 4 unassigned
 
 ## Context
 

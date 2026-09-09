@@ -513,7 +513,7 @@ is a bug.
   defect this same change fixed.
 
 - **`PHASE2.md` §10's recorder is declined rather than pending**
-  (`docs/decisions/0047-the-recording-this-reader-would-refuse.md`, `draft`).
+  (`docs/decisions/0047-the-recording-this-reader-would-refuse.md`, now `implemented` — the plan had landed and the status line had not).
   There is no `tf_tree_record` crate and none is owed: §10's own MCAP channels
   carry no `tf2_msgs` schema, and `tf_tree_ingest` accepts a channel only by
   schema, so a recorder built as specified would emit a bag the only reader here
@@ -538,7 +538,7 @@ is a bug.
 
 - **`TFT016`'s finding stops predicting a call it cannot predict, and names the
   flag that does not undo `0024`**
-  (`docs/decisions/0049-the-flag-that-prefaults-the-arena.md`, `draft`). Its
+  (`docs/decisions/0049-the-flag-that-prefaults-the-arena.md`, now `implemented` — same wave, same omission). Its
   detection rule and severity are unchanged. Two things in the *message* were
   wrong. It recommended `mlockall(MCL_CURRENT|MCL_FUTURE)`, which — measured by
   the new `mlock_probe` example — takes an untouched 64 MiB `memfd` mapping from
@@ -570,7 +570,7 @@ is a bug.
 ### Added — the unsafe budget has a gate
 
 - **`docs/decisions/0007` rule 1 had no enforcement of any kind**
-  (`docs/decisions/0048-a-kind-is-not-a-crate-name.md`, `draft`) — no script, no
+  (`docs/decisions/0048-a-kind-is-not-a-crate-name.md`, now `ready`; D1-D6 are in force and gated, and its step 4 is the outstanding work) — no script, no
   recipe, no CI step, no lint, and the root `[workspace.lints.rust]` does not
   name `unsafe_code`. `scripts/unsafe-budget.sh` is the first: a **compiler**
   census (`RUSTFLAGS="--force-warn unsafe_code"`, which overrides
