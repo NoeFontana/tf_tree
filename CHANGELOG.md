@@ -159,12 +159,16 @@ is a bug.
   `Guard<'static>` — a second lifetime extension, which is a decision record
   (`0017`) and not a patch — and `0017`'s `Arc` soundness argument is not
   available to `Tree::lookup`, which takes `&self` on a `Send + Sync` type.
-- **And the cost it avoided is ~4 %**: the whole per-call `Guard` is 21.7–22.9 ns
-  against a 524–529 ns `Tree::lookup`, and counters cost a flat ~9 ns at 1, 2 and
-  4 threads on a shared `EdgeCounters` line — the contention the requirement
-  predicts does not appear at or below this host's physical core count. Stated
-  in the amendment as a **hand measurement with no producer**, with the
-  `counter_cost` arm that would make it re-derivable named as owed.
+- **The cost it avoided is real but not decisive**, and is quoted from the
+  registered artifact rather than by hand: `just guard-cost` reads **+38.3 ns**
+  on a heap arena with counters on (203.1 hoisted -> 241.4 per call), +29.3 on a
+  memfd one, and +19.1/+20.0 with counters off. An earlier revision of this
+  entry said 21.7–22.9 ns and called it 4 % — that was a hand measurement over a
+  **three-edge** plan, and `Guard::drop` credits an edge only when the batch went
+  through exactly one, so it priced the configuration in which the guard does
+  least work. Review caught it against `backing.rs`'s own summary. The
+  correction does not reopen the decision: a requirement that inverts a shipped
+  diagnostic is withdrawn whether it costs 4 % or 16 %.
 - **What the withdrawal keeps is now pinned**: the convenience path credits its
   denominator once per call, visible before any loop ends —
   `the_convenience_path_publishes_its_denominator_on_every_call`, whose

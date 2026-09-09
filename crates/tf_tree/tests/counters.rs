@@ -11,7 +11,7 @@
 //! is no stable-tier spelling of "what does this edge's `lookups_ok` say". Both
 //! of `Fixture`'s helpers go through the view, so every test below would be
 //! reduced to its setup. `cargo nextest run --workspace` unifies `unstable` in
-//! from `tf_tree_cli`/`tf_tree_c`/`tf_tree_bench`/`tf_tree_py`, so these five
+//! from `tf_tree_cli`/`tf_tree_c`/`tf_tree_bench`/`tf_tree_py`, so these six
 //! still run in `just test`; what they no longer do is break the build of a
 //! packager who runs `cargo test` on the published tarball.
 #![cfg(feature = "unstable")]

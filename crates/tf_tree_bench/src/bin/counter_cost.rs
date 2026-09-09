@@ -42,7 +42,15 @@
 //! measures the **same build** against a control loop that performs the
 //! identical lookups through a `Guard` that is dropped every iteration, so the
 //! flush happens N times instead of once. The difference between one flush per
-//! batch and one per lookup is exactly the design decision §5.4 made.
+//! batch and one per lookup is what §5.4 weighed.
+//!
+//! **§5.4's NORMATIVE requirement for a long-lived per-thread `Guard` was
+//! WITHDRAWN on 2026-09-09** — read its amendment before reading these numbers
+//! as an argument for one. The batched arm below is what a caller gets from
+//! `Plan::at` with a hoisted `Guard`; it is **not** what the convenience path
+//! ships, and after the withdrawal `Tree::lookup` builds a `Guard` per call
+//! deliberately. What the difference prices is the flush, which is still worth
+//! knowing; what it no longer argues for is a guard that never ends.
 //!
 //! Run pinned and on an idle machine:
 //!   `taskset -c 0-7 cargo run --release -p tf_tree_bench --bin counter_cost`
@@ -106,7 +114,7 @@ fn main() {
         }
     );
 
-    // --- one guard for the whole batch: the shipped path ---
+    // --- one guard for the whole batch: `Plan::at` with a hoisted guard ---
     let batched = median(
         (0..ROUNDS)
             .map(|_| {
@@ -147,14 +155,17 @@ fn main() {
     );
 
     println!("{:>34} {:>10}", "path", "ns/lookup");
-    println!("{:>34} {batched:>10.1}", "one guard per batch (shipped)");
+    println!("{:>34} {batched:>10.1}", "one guard per batch (Plan::at)");
     println!("{:>34} {per_lookup:>10.1}", "one guard per lookup");
     println!(
-        "\n  a flush per lookup costs {:+.1} ns — this is what §5.4 avoids,",
+        "\n  a flush per lookup costs {:+.1} ns — the price of the per-call",
         per_lookup - batched
     );
-    println!("  and it is an upper bound on the atomic it replaces (the guard's");
-    println!("  own construction is in there too).");
+    println!("  guard the convenience path keeps (PHASE5 §5.4's requirement for a");
+    println!("  long-lived one is WITHDRAWN; read its amendment). It is an upper");
+    println!("  bound on the atomic it replaces — the guard's own construction is");
+    println!("  in there too — and `just guard-cost` is the registered artifact");
+    println!("  for that decomposition.");
 
     // --- §5.7's second question: contention across sixteen readers ---
     //
