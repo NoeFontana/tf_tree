@@ -142,6 +142,83 @@ is a bug.
   (`6e8b19b`) — `docs/PHASE2.md` §11.2 scenario 9 a thousand times, and §12.3
   criterion 4's kill-to-re-claimable measurement.
 
+### Added — a gate outcome has three meanings and had two exit codes
+
+- **`tf_tree_bench::gate`** fixes the contract a gate binary leaves with:
+  `0` PASS, `1` FAIL, `2` REFUSED (not evaluated). This crate already classified
+  *rows* three ways — `Fitness` (can this host produce a trustworthy number),
+  `Ground` (the machine-checked claim a refusal rests on) and `Status`
+  (Measured/Indicative/Unavailable) — but the only interface CI reads, the exit
+  code, had no such split. `reclaim_latency` got it right and nothing else did:
+  every other gate binary leaves through `anyhow`'s `Termination` path or a bare
+  `exit(1)`, so **"this host cannot evaluate the criterion" and "the code
+  regressed" arrive at a workflow byte-identical**.
+- **A refusal is a measurement, not a literal.** Both refusal constructors quote
+  the probe's own reason string and return `Option<Outcome>` — `None` means the
+  host is fit and there are no grounds to refuse. Review caught the first
+  version returning a refusal unconditionally, so
+  `refused_on_host(&f, Sensitivity::HostIndependent)` produced
+  `REFUSED (HostFitness) — ` with an **empty** reason and exit 2: under
+  `may-refuse` a permanently green gate whose recorded reason is the empty
+  string. The test named for that property never called the constructor, so it
+  would have passed against the bug; it calls it now and fails against it.
+- **`scripts/gate-run.sh` and `just gate RECIPE POLICY`** are the only place an
+  exit code is interpreted, so a workflow cannot re-spell the reading and drift
+  from it. Three policies, and the third is the point: **`must-refuse` fails
+  when a gate that could not be evaluated suddenly can**, so a permanent refusal
+  cannot quietly go vacuous — the day a criterion is re-cut or a fixture grows,
+  the job goes red naming the document that still says it is unmeasurable.
+  `must-pass` treats a refusal as a failure; `may-refuse` passes on one and
+  emits a `::warning::`, and emits a `::notice::` when the refusal lifts.
+- **The reader has a nine-cell self-test** (`--self-test`), because a policy
+  runner that mis-reads one cell is invisible: every gate still prints its own
+  verdict and only the job colour is wrong. It earned its place immediately —
+  its first run reported six of nine cells wrong, which was its own stub not
+  modelling `just --show`.
+- **PHASE2 §12.3 criterion 4 is gated in CI** (`ci.yml`'s `shm` job, both matrix
+  rows) under **`may-refuse`**, because `reclaim_latency`'s exit 2 is its own
+  *"INVALID, not FAIL"* refusal about the runner rather than the code — and
+  `must-pass` would map it to exit 1, reproducing the very collapse this module
+  removes, in its first customer. It **was met and ungated for the life of the
+  project**: `just
+  reclaim-latency` existed, printed a verdict, and ran in no workflow, so
+  nothing would have gone red if a reap regressed to a timeout. Measured here at
+  200 trials, 200/200 contended, p50 0.112 ms, p99 0.159 ms in 0.2 s wall — a
+  ~60x margin against the 10 ms budget. An absolute duration is gateable on a
+  host that fails `Fitness::probe` because every check the probe fails makes a
+  reclaim *longer*: a PASS with margin is conservative, and a FAIL is not
+  attributable to the runner.
+
+### Fixed — an ordering no model was watching
+
+- **`PHASE1.md` §10.2's mutation test has now been run, and one of the five
+  §6.2/§6.3 orderings was unguarded.** Weakening `SampleRing::push`'s
+  `self.head.store(h + 1, Release)` to `Relaxed` passed the **entire** loom
+  suite, while the other four each kill a model. The store is not unnecessary —
+  `sample`'s `stamp_at` reads stamps `Relaxed` and rests that on this edge in
+  its own doc, and `docs/design/fast-path.md` builds a proposed optimisation on
+  it — so this was §10.2's *"test coverage is insufficient"* branch, unanswered
+  since the models were written.
+- **No `sample`-shaped fixture could have caught it**, which is why the new
+  model is not a third one. `push`'s `fence(Release)` sits *before* that push's
+  stamp store, so observing `head == h` orders stamps `0 ..= h-2` and leaves the
+  newest unprotected — and `sample` reads exactly that one as `t_new`. A stale
+  stamp reads as the zero-initialised `0`, stamps only increase, so a stale
+  `t_new` is always low and every positive `t` leaves through the tolerated
+  `Extrapolation` arm before reaching an assertion.
+- **New loom model `head_publishes_every_stamp_below_it`** asserts the invariant
+  directly: observing `head == h` makes all `h` stamps visible. Verified both
+  ways — it fails under the `Relaxed` mutant and passes at `Release`. The loom
+  suite is 21 models, was 20.
+- **Two claims that were false are corrected rather than deleted.**
+  `buffer.rs`'s module doc said "Every ordering below is load-bearing and is
+  exercised by the loom tests"; it was true of four and asserted of five.
+  `sample.rs`'s `stamp_at` rested its `Relaxed` load on an edge nothing checked.
+  Both now name the model and record what they used to claim. The failure this
+  admitted is not an error return: a reader brackets against a stamp `head` had
+  not published and returns a finite, plausible, **wrong pose**, with `just
+  loom`, `just test`, `just miri` and both CI architectures green.
+
 ### Fixed — gates a caller could green, and one that could not see its subject
 
 - **`docs/PHASE5.md` §12 gates 2 and 5 refuse a loosened threshold under
@@ -483,7 +560,7 @@ is a bug.
   defect this same change fixed.
 
 - **`PHASE2.md` §10's recorder is declined rather than pending**
-  (`docs/decisions/0047-the-recording-this-reader-would-refuse.md`, `draft`).
+  (`docs/decisions/0047-the-recording-this-reader-would-refuse.md`, now `implemented` — the plan had landed and the status line had not).
   There is no `tf_tree_record` crate and none is owed: §10's own MCAP channels
   carry no `tf2_msgs` schema, and `tf_tree_ingest` accepts a channel only by
   schema, so a recorder built as specified would emit a bag the only reader here
@@ -508,7 +585,7 @@ is a bug.
 
 - **`TFT016`'s finding stops predicting a call it cannot predict, and names the
   flag that does not undo `0024`**
-  (`docs/decisions/0049-the-flag-that-prefaults-the-arena.md`, `draft`). Its
+  (`docs/decisions/0049-the-flag-that-prefaults-the-arena.md`, now `implemented` — same wave, same omission). Its
   detection rule and severity are unchanged. Two things in the *message* were
   wrong. It recommended `mlockall(MCL_CURRENT|MCL_FUTURE)`, which — measured by
   the new `mlock_probe` example — takes an untouched 64 MiB `memfd` mapping from
@@ -540,7 +617,7 @@ is a bug.
 ### Added — the unsafe budget has a gate
 
 - **`docs/decisions/0007` rule 1 had no enforcement of any kind**
-  (`docs/decisions/0048-a-kind-is-not-a-crate-name.md`, `draft`) — no script, no
+  (`docs/decisions/0048-a-kind-is-not-a-crate-name.md`, now `ready`; D1-D6 are in force and gated, and its step 4 is the outstanding work) — no script, no
   recipe, no CI step, no lint, and the root `[workspace.lints.rust]` does not
   name `unsafe_code`. `scripts/unsafe-budget.sh` is the first: a **compiler**
   census (`RUSTFLAGS="--force-warn unsafe_code"`, which overrides

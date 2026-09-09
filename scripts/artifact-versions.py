@@ -1117,6 +1117,147 @@ def check_distribution_name() -> str:
     return f'the PyPI distribution is "{dist}"; the module it installs is tf_tree'
 
 
+DECISION_SETTLED_VERB = re.compile(
+    r"(?i)\b(?:declin|amend|supersed|retir|settl|withdraw|govern|remov)\w*"
+    r"[*_`]{0,2}\s+by\s+[*_`]{0,2}\[?[*_`]{0,2}(\d{4})[*_`]{0,2}\]?"
+)
+
+# Leading continuation markers stripped before the corpus is joined into one
+# line. Without this, a citation split across a blockquote or a `//!` doc block
+# is invisible to the scan — measured, see the docstring.
+_CONTINUATION = re.compile(r"^\s*(?:>|//!|///|//|#)+\s?")
+
+
+def check_decision_status_citations() -> str:
+    """A `draft` decision record may not be cited as settled.
+
+    `docs/decisions/README.md`'s lifecycle says a draft authorises nothing, and
+    `docs/PROJECT.md` §5.1 says it of `0031` in a ledger row. **It was not
+    held.** `0047`, `0048` and `0049` were cited as settled declines and
+    amendments at fourteen sites — spec §0.0 rows marking work "Declined, not
+    merely absent", amendment banners, and `CLAUDE.md`'s hard-rules bullet —
+    while all three records read `**Status:** draft`. Two `PHASE2.md` §0.0 rows
+    recorded work as *not owed* on that authority, which makes a phase's
+    completeness claim rest on an undecided document.
+
+    **Two normalisation steps are load-bearing and each was measured against
+    this repository rather than assumed.** Stripping leading continuation
+    markers (`>`, `//!`, `///`, `//`, `#`) before joining takes the count from
+    35 to 37, because a blockquote banner splits `are DECLINED by` from its
+    `[`0047`]` link across lines. Tolerating Markdown emphasis around the verb
+    and the link takes it from 33 to 35, because a bolded verb in front of a
+    bracketed, backticked id is otherwise invisible. The naive pattern misses
+    4 of the 14 sites this exists to find.
+
+    **What this does NOT prove.** It sees `<verb> by <NNNN>` and nothing else.
+    A citation with the verb *after* the link ("[`0047`] declines §10's ..."),
+    a dash form ("DECLINED - [`0047`]"), and bare adjacency ("(0048; the
+    register is ...)") are all outside it and stay held by review. The checked
+    spelling is the one §0.0 status rows and amendment banners actually use.
+    """
+    statuses: dict[str, str] = {}
+    for path in sorted((ROOT / "docs" / "decisions").glob("0*.md")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("**Status:**"):
+                word = line[len("**Status:**") :].strip().split()
+                if word:
+                    statuses[path.name[:4]] = word[0].strip("`*").lower()
+                break
+    if not statuses:
+        fail("no decision record statuses were read; this check would pass trivially")
+        return "decision-status citations: not checked"
+
+    listed = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "*.md",
+            "*.rs",
+            "*.toml",
+            "*.sh",
+            "*.py",
+            "*.yml",
+            "justfile",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    files = sorted(f for f in listed.split("\0") if f)
+    if not files:
+        fail("`git ls-files` listed no files for the decision-citation scan")
+        return "decision-status citations: not checked"
+
+    settled = 0
+    for rel in files:
+        # A record may discuss its OWN state, and only its own. Skipping the
+        # whole file was wrong and blinded the check to its own subject: a
+        # record citing a *different* record as settled is the amendment-banner
+        # form, and two of the fourteen sites this exists to find are exactly
+        # that: two records carried an amendment banner naming a third record
+        # that was `draft` at the time. The banner text is not quoted here,
+        # because this file is inside the corpus and a quoted example matches
+        # itself — which it did, twice, while this check was being written.
+        # The skip is per match, below, against this file's own id.
+        own = rel.rsplit("/", 1)[-1][:4] if rel.startswith("docs/decisions/") else None
+        try:
+            raw = (ROOT / rel).read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+        # Join into one normalised string, keeping an offset -> line-number map
+        # so a finding can be printed as file:line.
+        parts, offsets, pos = [], [], 0
+        for n, line in enumerate(raw, 1):
+            piece = _CONTINUATION.sub("", line).strip()
+            parts.append(piece)
+            offsets.append((pos, n))
+            pos += len(piece) + 1
+        joined = " ".join(parts)
+        for m in DECISION_SETTLED_VERB.finditer(joined):
+            rec = m.group(1)
+            if rec == own:
+                continue
+            status = statuses.get(rec)
+            if status is None:
+                continue
+            if status == "draft":
+                line_no = next(
+                    (n for off, n in reversed(offsets) if off <= m.start()), 1
+                )
+                fail(
+                    f"{rel}:{line_no} cites `{rec}` as settled "
+                    f'("{m.group(0).strip()}") but that record is `draft`. '
+                    f"A draft authorises nothing — promote the record or soften "
+                    f"the citation (docs/decisions/README.md, Lifecycle)."
+                )
+            else:
+                settled += 1
+
+    # Anti-vacuity floor. A pattern or corpus that stopped matching would
+    # otherwise report success on an empty subject set.
+    #
+    # **The number is measured at the tip, not remembered.** This comment first
+    # read "23 citations land on non-draft records today" against a check that
+    # reported 31 — 23 was counted before the three promotions in the same
+    # commit, and a floor 11 below the real count would not notice a corpus
+    # change that lost a third of its subject. Set just under the live count so
+    # it bites; raise it with the count, never independently.
+    floor = 34
+    if settled < floor:
+        fail(
+            f"the decision-citation scan found only {settled} settled citations "
+            f"on non-draft records (floor {floor}); the pattern or the corpus "
+            f"moved and this check is no longer looking at its subject"
+        )
+
+    return (
+        f"{settled} settled decision-record citations across {len(files)} tracked "
+        f"files, none of them on a `draft` record"
+    )
+
+
 def main() -> int:
     authority = load_toml("Cargo.toml")["workspace"]["package"]["version"]
     lines = [
@@ -1128,6 +1269,7 @@ def main() -> int:
         check_relative_links(),
         check_front_page_versions(),
         check_distribution_name(),
+        check_decision_status_citations(),
     ]
 
     if failures:

@@ -718,6 +718,40 @@ jobs:
       - name: just no-network
         run: just no-network
 
+      # PHASE2 §12.3 criterion 4 — SIGKILL a writer, measure the re-claim.
+      #
+      # **The one Phase 2 gate criterion this host class can actually hold**,
+      # and it ran in no workflow until now. It is licensed onto a runner that
+      # fails `Fitness::probe` by PHASE5 §9.3's one-sided-budget amendment: every
+      # check the probe fails makes a reclaim *longer*, so a PASS with margin is
+      # conservative and a FAIL is not attributable to the runner. The margin is
+      # ~60x (p99 0.16 ms against a 10 ms budget) and the run costs ~0.2 s, so
+      # scheduler noise cannot flip it, while a reap that had fallen back to a
+      # timeout would land in milliseconds-to-seconds.
+      #
+      # **`may-refuse`, not `must-pass`, and the reason is the whole point of
+      # `gate.rs`.** `reclaim_latency` exits 2 for its own non-vacuity refusal —
+      # *"N of 200 claims succeeded immediately; this run measured process
+      # teardown, not reclaim latency. INVALID, not FAIL."* — which is a
+      # statement about the runner, not the code. On a loaded 2-vCPU hosted
+      # runner the parent can be descheduled between `kill(2)` returning and the
+      # first `reap_dead()`/`claim()`, and `must-pass` would map that exit 2 to
+      # exit 1: a red job indistinguishable from a genuine p99 regression. That
+      # collapse is exactly what this module was written to prevent, so wiring
+      # it here would have been the bug in its own first customer.
+      #
+      # The refusal stays visible: `may-refuse` emits a `::warning::` on exit 2
+      # rather than passing silently. `scripts/gate-run.sh` is what reads the
+      # code, so this job cannot re-spell the contract and drift from it.
+      - name: just gate reclaim-latency may-refuse
+        run: just gate reclaim-latency may-refuse
+
+      # The reader itself, all nine (policy x exit code) cells against a stub.
+      # A policy runner that mis-reads one cell is invisible: every gate still
+      # prints its own verdict and only the job colour is wrong.
+      - name: gate-run self-test
+        run: ./scripts/gate-run.sh --self-test
+
   # Spelled as the recipe rather than as its body. It is one line either way,
   # and it is the *argument* half of the weak-memory defence — the aarch64 rows
   # above now execute and pass, but a green run on hardware corroborates an

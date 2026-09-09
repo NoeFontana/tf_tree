@@ -623,6 +623,20 @@ attach-bench:
     cargo build --release -q --features shm -p tf_tree_bench --bin attach_bench
     taskset -c 2 ./target/release/attach_bench
 
+# Run a gate recipe and read its exit code against a declared policy.
+#
+# `crates/tf_tree_bench/src/gate.rs` fixes what a gate binary leaves with —
+# 0 PASS, 1 FAIL, 2 REFUSED (not evaluated) — and `scripts/gate-run.sh` is the
+# only place that interprets those. A workflow that re-spells the reading drifts
+# from it, which is the failure recorded for `just lint`'s `test-hooks` clippy
+# row one layer down.
+#
+# POLICY is `must-pass`, `may-refuse` or `must-refuse`. The third is the
+# interesting one: it fails when a gate that could not be evaluated suddenly
+# can, so a permanent refusal cannot quietly go vacuous.
+gate RECIPE POLICY:
+    ./scripts/gate-run.sh "{{RECIPE}}" "{{POLICY}}"
+
 # **PHASE5 §12 gate criterion 5: ingest throughput >= 10x real time on a
 # representative recording — the third §12 criterion nothing had ever run.**
 #

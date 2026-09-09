@@ -23,6 +23,16 @@
 //! The `push`/`read_slot` protocol carries **normative** ordering annotations
 //! (`docs/PHASE1.md` §6.2–§6.3). Every ordering below is load-bearing and is exercised by
 //! the loom tests; do not weaken any to `Relaxed` because an x86 test passes.
+//!
+//! **Measured, not asserted**, which is `docs/PHASE1.md` §10.2's mutation test:
+//! weakening any one of the five to `Relaxed` makes a loom model fail. Four die
+//! against `writer_three_pushes_reader_never_torn` and
+//! `writer_wraps_reader_gets_valid_or_recycled`. The fifth — the `head` store
+//! at the end of [`SampleRing::push`] — dies only against
+//! `head_publishes_every_stamp_below_it`, **which exists because it survived
+//! both of the others**: this sentence was true of four orderings and asserted
+//! of five until 2026-09-08, and the survivor is why the third model is
+//! shaped as an invariant rather than as another `sample` fixture.
 #![allow(unsafe_code)]
 
 use tf_tree_math::Iso3;

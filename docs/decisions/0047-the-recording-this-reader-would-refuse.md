@@ -1,8 +1,8 @@
 # 0047: the recording this reader would refuse
 
-**Status:** draft
+**Status:** implemented (2026-09-09; the plan landed in #303 and the status line did not)
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** #303 — all eight plan steps, verified against the tree on 2026-09-09: `docs/PHASE2.md` §10's DECLINED banner, §0.0's row split, the strike-throughs, §15's box, `docs/PROJECT.md`'s three sites, `docs/benchmarks/tf2.md`, and `crates/tf_tree_cli/tests/replay_bit_identity.rs`'s module doc and inline comment. Open question 1 stays open and is **not decision-affecting** — the record itself scopes it that way (*"nothing in the tree currently owes it"*), which this folder's `ready`/`implemented` bar now states explicitly.
 
 ## Context
 

@@ -213,6 +213,84 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
     });
 }
 
+/// Loom test 3 (`docs/PHASE1.md` §10.2's *mutation test*): the invariant
+/// `head`'s `Release` store carries — that observing `head == h` makes the
+/// stamps of all `h` published samples visible.
+///
+/// # Why this model exists
+///
+/// §10.2 asks that weakening each §6.2/§6.3 ordering to `Relaxed`, one at a
+/// time, break a model, and that a **survivor be investigated rather than
+/// assumed benign**. Run over the five orderings, four die against the two
+/// models above. The fifth — [`SampleRing::push`]'s
+/// `self.head.store(h + 1, Release)` — survived the entire suite, because
+/// neither model above ever reads a *stamp*: `writer_three_pushes_...` calls
+/// `read_slot` directly, and `writer_wraps_...` does call `sample`, but cannot
+/// observe the difference for a reason worth writing down, because it is the
+/// reason this model is not simply a third `sample` fixture.
+///
+/// ## Why no `sample`-shaped fixture can catch it
+///
+/// In `push`, the `fence(Release)` sits *before* that push's stamp store. So a
+/// reader that observes `head == h` synchronises with push `h`'s release fence
+/// and is guaranteed stamps `0 ..= h-2` — every stamp except the newest.
+/// `stamps[h-1]` is the single unprotected one, and `sample` reads it as
+/// `t_new`. An unpublished stamp reads as the arena's zero-initialised `0`, and
+/// a lapped one reads as its previous era's value; stamps only increase, so a
+/// stale `t_new` is always *below* the fresh one. Every `t` above it therefore
+/// leaves through the tolerated `Extrapolation` arm instead of reaching a
+/// bit-equality assertion. Reaching it needs `t < 0` so the zero sentinel sits
+/// above `t` — a fixture that exists only to dodge the sentinel, and would pin
+/// the sentinel rather than the ordering.
+///
+/// So this model asserts the invariant directly, in the shape the reader
+/// actually uses it: [`SampleRing::sample`] loads `head` `Acquire`
+/// (`sample.rs`) and then loads stamps `Relaxed`, and `stamp_at`'s own doc
+/// rests that `Relaxed` on this edge — *"the `head` Acquire load in `sample`
+/// already ordered every stamp of a published sample into view"*. That sentence
+/// is the property below. The writer is the real [`SampleRing::push`]; only the
+/// reader is transcribed, which is the same division the reclaim model uses.
+///
+/// **Mutation-verified**: with `head.store(h + 1, Relaxed)` this fails on the
+/// assertion below; at `Release` it passes. That is what makes `buffer.rs`'s
+/// "every ordering below is load-bearing and is exercised by the loom tests"
+/// true of all five orderings rather than four.
+#[test]
+fn head_publishes_every_stamp_below_it() {
+    model(|| {
+        let hr = Arc::new(HeapRing::new(4));
+
+        let w = Arc::clone(&hr);
+        let writer = thread::spawn(move || {
+            let ring = w.ring();
+            // Four pushes into four slots: nothing laps, so every stamp
+            // location is written exactly once and a stale read can only be the
+            // zero-initialised value. That keeps the assertion unambiguous.
+            for i in 1..=4u64 {
+                ring.push(i as i64 * 10, &pose(i)).unwrap();
+            }
+        });
+
+        let r = Arc::clone(&hr);
+        let reader = thread::spawn(move || {
+            // Exactly `sample`'s first two steps: `head` Acquire, then the
+            // stamps of the samples it claims are published, Relaxed.
+            let h = r.head.load(Ordering::Acquire);
+            for i in 0..h {
+                let got = r.stamps[(i & 3) as usize].load(Ordering::Relaxed);
+                assert_eq!(
+                    got,
+                    (i as i64 + 1) * 10,
+                    "head published {h} samples but stamp {i} is not visible"
+                );
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
 /// The interning table's three parallel arrays plus its id allocator, on the heap
 /// and built from loom atomics — the same shape `ArenaView` hands `intern_core`.
 ///

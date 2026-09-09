@@ -917,6 +917,22 @@ Under `cargo xtask loom`, with a reduced buffer (capacity 4) so the state space 
 
 **Add a mutation test:** weaken each `Acquire`/`Release` in §6.2 and §6.3 to `Relaxed` one at a time and confirm the corresponding loom test fails. If weakening an ordering does not break any test, either the ordering is unnecessary or the test coverage is insufficient — investigate which.
 
+> **Run on 2026-09-08, and it found the second branch.** Each mutation was applied alone to a clean tree and run with `RUSTFLAGS='--cfg loom' LOOM_MAX_PREEMPTIONS=3 cargo test -p tf_tree_core --tests --release`, the shipped runner's settings (`xtask/src/main.rs`).
+>
+> | Mutation (`crates/tf_tree_core/src/buffer.rs`) | Result |
+> |---|---|
+> | `fence(Release)` before the payload stores — deleted | **fails** both writer models |
+> | `slot.seq.store(odd+1, Release)` → `Relaxed` | **fails** `writer_three_pushes_reader_never_torn` |
+> | `self.head.store(h + 1, Release)` → `Relaxed` | **passed the entire suite** — 20/20 |
+> | `slot.seq.load(Acquire)` → `Relaxed` | **fails** `writer_three_pushes_reader_never_torn` |
+> | `fence(Acquire)` before the second `seq` load — deleted | **fails** both writer models |
+>
+> **The survivor was insufficient coverage, not an unnecessary ordering**, and the ordering is relied on in code rather than only in prose: §7's `stamp_at` loads stamps `Relaxed` and rests that on this exact edge, and `docs/design/fast-path.md` builds a proposed optimisation on it.
+>
+> **Why no `sample`-shaped fixture could have caught it** — the part worth keeping, because it is a property of the protocol and not of the old models. `push` places its `fence(Release)` *before* that push's stamp store, so observing `head == h` orders stamps `0 ..= h-2` and leaves `stamps[h-1]`, the newest, as the single unprotected one. `sample` reads exactly that stamp as `t_new`. A stale stamp reads as the arena's zero-initialised `0` (or, after lapping, its previous era's value), and stamps only increase — so a stale `t_new` is always *below* the fresh one and every `t` above it leaves through the tolerated `Extrapolation` arm before reaching any assertion. Only `t < 0` reaches it, which pins the zero sentinel rather than the ordering.
+>
+> So the ordering is pinned by an invariant model instead: `head_publishes_every_stamp_below_it` asserts that observing `head == h` makes all `h` stamps visible — `sample`'s own first two steps, and the sentence `stamp_at` rests on. It fails under the `Relaxed` mutant and passes at `Release`, verified both ways. The three §6.2/§6.3 model names are now the answer to "which test covers this ordering", and `buffer.rs`'s module doc carries the same table's conclusion.
+
 ### 10.3 Miri
 
 `cargo +nightly miri test -p tf_tree_arena -p tf_tree_core` with strict provenance. Must be clean.

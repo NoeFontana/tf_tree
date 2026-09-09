@@ -319,6 +319,15 @@ impl SampleRing<'_> {
     /// the `head` Acquire load in [`Self::sample`] already ordered every stamp of
     /// a published sample into view, and the stamp arrays are atomic so even a
     /// racing overwrite of a since-lapped slot is not a data race.
+    ///
+    /// **That edge is pinned by a model, and was not until 2026-09-08**:
+    /// `head_publishes_every_stamp_below_it` (`loom_tests.rs`) is the test that
+    /// fails when `push`'s `head` store is weakened to `Relaxed`. Before it,
+    /// weakening that store passed the whole loom suite, so the sentence above
+    /// rested on nothing an automated check could see — and this is the load
+    /// that would have gone wrong: a stale stamp under an advanced `head`
+    /// brackets against the wrong pair and returns a finite, plausible, wrong
+    /// pose.
     #[inline]
     fn stamp_at(&self, logical: u64) -> i64 {
         self.stamps[(logical & self.mask()) as usize].load(Ordering::Relaxed)
