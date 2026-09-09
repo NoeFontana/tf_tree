@@ -60,8 +60,10 @@ paragraph failed, and it is why no list of open items is restated here.
 
 `tf_tree_core` is the source of truth. `tf_tree_math` and `tf_tree_arena` are
 separately publishable and separately testable — keeping the math crate free of
-`unsafe` and of the arena is what lets its property tests run under Miri in
-seconds. Phase 3 is implemented: the Python bindings live in `crates/tf_tree_py`
+`unsafe` and of the arena is what makes it cheap for Miri to interpret as a
+callee. **Its own tests are not run under Miri**, and this sentence said they
+were until 2026-09-09: `just miri` names `tf_tree_arena`, `tf_tree_core` and
+`tf_tree`, never `tf_tree_math`. Phase 3 is implemented: the Python bindings live in `crates/tf_tree_py`
 and are *excluded* from the cargo workspace, because they link libpython — so
 `cargo build --workspace` never sees them and `just py-test` / `just py-lint`
 are their gate.
