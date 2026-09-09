@@ -222,3 +222,101 @@ fn a_replay_into_heap_and_mapped_arenas_is_bit_identical() {
          any difference means the shared-memory read path is not the same code"
     );
 }
+
+/// **`docs/PHASE5.md` §11's three-way bit-identity, and §12 criterion 1.**
+/// *"Replay one recording into `HeapArena`, `MappedArena`, and `FrozenArena`;
+/// identical query set; assert bit-identical `f64`."*
+///
+/// # Why this is a separate test and not a widening of the one above
+///
+/// The test above is `docs/PHASE2.md` §10's NORMATIVE pair, heap against
+/// mapped, and §15's box cites it by name. This is a different and larger
+/// claim, so it gets its own name rather than silently changing what that box
+/// points at.
+///
+/// # Why it is not composed from the two tests that already existed
+///
+/// §12 criterion 1 was, until this landed, held by transitivity across two
+/// tests that share neither input:
+///
+/// * `a_replay_into_heap_and_mapped_arenas_is_bit_identical` (above) —
+///   `heap == mapped`, over a **replayed recording**, 5 edge pairs x 300
+///   stamps.
+/// * `a_frozen_lookup_is_bit_identical_to_the_live_one`
+///   (`crates/tf_tree/tests/frozen.rs`) — `live == frozen`, over a
+///   **hand-built** `Tree`, 3 edge pairs x 5 stamps.
+///
+/// Both are genuine `to_bits()` comparisons and both are worth keeping. But
+/// `H == M` on one recording and `H == F` on a *different* one, built a
+/// different way and queried at different stamps, implies nothing whatever
+/// about `M == F` — there is no common input for transitivity to run through.
+/// §11 asks for **one** recording and an **identical** query set, and that is
+/// what this test is: all three arenas hold the same replayed samples and are
+/// asked the same questions.
+///
+/// # One variable
+///
+/// The frozen arena is frozen **from the heap arena**, after the same `replay`
+/// that filled it, so the only difference between the three answers is how the
+/// bytes are held: a heap allocation, a `memfd` mapping, and a `PROT_READ`
+/// file mapping. That is §2.1's NORMATIVE claim — *"the frozen read path uses
+/// the identical `Plan::at` code as the online path"* — stated as an assertion.
+///
+/// **Mutation-verified**: freezing before `replay` instead of after (so the
+/// file holds a declared-but-empty arena) makes the frozen arena answer `None`
+/// at every probe and fails the last assertion. Run, not reasoned about.
+#[test]
+fn a_replay_into_heap_mapped_and_frozen_arenas_is_bit_identical() {
+    let scratch = Scratch::new("bitident3");
+    let msgs = small_recording();
+
+    let heap = builder_for(&msgs).build().expect("heap arena");
+    let mapped = builder_for(&msgs)
+        .build_shared("replay-bitident3")
+        .expect("mapped arena");
+    assert!(
+        mapped.is_shared(),
+        "the second arena must actually be mapped, or this compares heap to heap"
+    );
+
+    replay(&heap, &msgs);
+    replay(&mapped, &msgs);
+
+    // The third backend: the same filled arena, written out and mapped back
+    // read-only. Frozen *after* the replay — see the mutant above.
+    let tft = scratch.0.join("three-way.tft");
+    heap.freeze_to(
+        &tft,
+        Some("replay-bitident3"),
+        [0; 32],
+        1_700_000_000_000_000_000,
+    )
+    .expect("freeze the heap arena");
+    let frozen = Tree::open_frozen(&tft).expect("open the frozen arena");
+
+    let pairs = edges_of(&msgs);
+    let stamps = probe_stamps(&msgs);
+    let a = answers(&heap, &pairs, &stamps);
+    let b = answers(&mapped, &pairs, &stamps);
+    let c = answers(&frozen, &pairs, &stamps);
+
+    // The same two anti-vacuity guards the pair test carries, for the same
+    // reason: three empty vectors, or three vectors of `None`, are equal for
+    // any three arenas at all.
+    assert!(!a.is_empty(), "the query set must not be empty");
+    let hits = a.iter().filter(|x| x.is_some()).count();
+    assert!(
+        hits >= stamps.len(),
+        "too few lookups succeeded ({hits}) for this to prove anything"
+    );
+
+    assert_eq!(
+        a, b,
+        "heap and mapped must answer bit-identically over the three-way query set"
+    );
+    assert_eq!(
+        a, c,
+        "heap and frozen must answer bit-identically; any difference means the \
+         frozen read path is not the identical `Plan::at` code (§2.1)"
+    );
+}
