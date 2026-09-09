@@ -1,5 +1,18 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+// `PHASE1.md` §13 asks for this at the root. The workspace sets
+// `missing_docs = "warn"` and `just lint`'s `-D warnings` promotes it, so the
+// gate was already effective — but only inside that recipe. This makes a plain
+// `cargo build` of this repository say so too.
+//
+// **It does not bind a downstream consumer, and an earlier version of this
+// comment claimed it did.** Cargo builds registry dependencies with
+// `--cap-lints allow`, which caps an attribute-level `deny` as well, so for
+// somebody building `tf_tree` from crates.io this attribute has no effect at
+// all. What it binds is builds of this repository and its path dependents —
+// which is where a missing doc would be introduced, so the box is still worth
+// closing this way.
+#![deny(missing_docs)]
 //! `no_std` SE(3)/SO(3) and dual-quaternion math for the `tf_tree` engine.
 //!
 //! # Conventions (lock these in — every downstream bug traces back to one)

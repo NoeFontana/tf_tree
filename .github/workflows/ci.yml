@@ -579,9 +579,17 @@ jobs:
   # asymmetry is deliberate and unchanged; what changed is that it is now the only
   # difference between the two, instead of one difference among however many a
   # transcription had accumulated.
+  # **Both architectures since 2026-09-09.** This job was `ubuntu-latest` alone
+  # for the life of the project, while `test` and `shm` have carried
+  # `ubuntu-24.04-arm` since aarch64 CI became real. `PHASE1.md` §13's box asks
+  # for §10's tests "in CI" and the aarch64 half is the half it was written for.
   miri:
-    name: miri
-    runs-on: ubuntu-latest
+    name: miri (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     # Both of the recipe's lines, and only this job sets it. The recipe appends
     # its own `-Zmiri-disable-isolation` to whatever is here.
     env:
@@ -601,7 +609,10 @@ jobs:
       # and ignores it, so `just test-doc` cannot enforce them; this job already
       # has the nightly toolchain that can. Seconds, and it is here rather than
       # in `test` because that is the only place the toolchain exists.
+      # One row only: these are rustdoc diagnostics, identical on both
+      # architectures, and running them twice would say nothing new.
       - name: just test-doc-error-codes
+        if: matrix.os == 'ubuntu-latest'
         run: just test-doc-error-codes
 
   # The only job that needs a container, because it is the only job that needs
@@ -757,9 +768,21 @@ jobs:
   # above now execute and pass, but a green run on hardware corroborates an
   # ordering claim and does not prove one. This is the model checker, so it
   # should be impossible for it to drift from what a developer runs.
+  # **Both architectures since 2026-09-09**, and this is the job where that
+  # matters most. `PROJECT.md` §6's design smell is "weakening an atomic
+  # ordering because a test passes on x86-64", and until now the model checker
+  # that exists to catch it ran on x86-64 only. Loom is still the *argument* —
+  # it explores schedules under a memory model rather than measuring a CPU — so
+  # the aarch64 row is corroboration, not a weak-memory proof. What it does buy
+  # is that the argument is no longer produced solely on the architecture the
+  # smell names.
   loom:
-    name: loom
-    runs-on: ubuntu-latest
+    name: loom (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
