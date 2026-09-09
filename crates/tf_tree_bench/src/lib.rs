@@ -37,6 +37,7 @@ pub mod baseline;
 pub mod differential;
 pub mod embed;
 pub mod fixture;
+pub mod gate;
 pub mod mp;
 pub mod replay;
 pub mod report;

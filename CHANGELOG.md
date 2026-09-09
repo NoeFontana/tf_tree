@@ -142,6 +142,43 @@ is a bug.
   (`6e8b19b`) — `docs/PHASE2.md` §11.2 scenario 9 a thousand times, and §12.3
   criterion 4's kill-to-re-claimable measurement.
 
+### Added — a gate outcome has three meanings and had two exit codes
+
+- **`tf_tree_bench::gate`** fixes the contract a gate binary leaves with:
+  `0` PASS, `1` FAIL, `2` REFUSED (not evaluated). This crate already classified
+  *rows* three ways — `Fitness` (can this host produce a trustworthy number),
+  `Ground` (the machine-checked claim a refusal rests on) and `Status`
+  (Measured/Indicative/Unavailable) — but the only interface CI reads, the exit
+  code, had no such split. `reclaim_latency` got it right and nothing else did:
+  every other gate binary leaves through `anyhow`'s `Termination` path or a bare
+  `exit(1)`, so **"this host cannot evaluate the criterion" and "the code
+  regressed" arrive at a workflow byte-identical**.
+- **A refusal is a measurement, not a literal.** Both refusal constructors quote
+  the probe's own reason string (`Fitness::axis`'s third element), so a refusal
+  cannot be typed to make a job green and cannot go stale when the host changes.
+- **`scripts/gate-run.sh` and `just gate RECIPE POLICY`** are the only place an
+  exit code is interpreted, so a workflow cannot re-spell the reading and drift
+  from it. Three policies, and the third is the point: **`must-refuse` fails
+  when a gate that could not be evaluated suddenly can**, so a permanent refusal
+  cannot quietly go vacuous — the day a criterion is re-cut or a fixture grows,
+  the job goes red naming the document that still says it is unmeasurable.
+  `must-pass` treats a refusal as a failure; `may-refuse` passes on one and
+  emits a `::warning::`, and emits a `::notice::` when the refusal lifts.
+- **The reader has a nine-cell self-test** (`--self-test`), because a policy
+  runner that mis-reads one cell is invisible: every gate still prints its own
+  verdict and only the job colour is wrong. It earned its place immediately —
+  its first run reported six of nine cells wrong, which was its own stub not
+  modelling `just --show`.
+- **PHASE2 §12.3 criterion 4 is gated in CI** (`ci.yml`'s `shm` job, both matrix
+  rows) and **was met and ungated for the life of the project**: `just
+  reclaim-latency` existed, printed a verdict, and ran in no workflow, so
+  nothing would have gone red if a reap regressed to a timeout. Measured here at
+  200 trials, 200/200 contended, p50 0.112 ms, p99 0.159 ms in 0.2 s wall — a
+  ~60x margin against the 10 ms budget. An absolute duration is gateable on a
+  host that fails `Fitness::probe` because every check the probe fails makes a
+  reclaim *longer*: a PASS with margin is conservative, and a FAIL is not
+  attributable to the runner.
+
 ### Fixed — an ordering no model was watching
 
 - **`PHASE1.md` §10.2's mutation test has now been run, and one of the five
