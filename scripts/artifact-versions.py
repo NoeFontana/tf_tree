@@ -1146,8 +1146,8 @@ def check_decision_status_citations() -> str:
     35 to 37, because a blockquote banner splits `are DECLINED by` from its
     `[`0047`]` link across lines. Tolerating Markdown emphasis around the verb
     and the link takes it from 33 to 35, because a bolded verb in front of a
-    bracketed, backticked id is otherwise invisible. The naive pattern misses 4 of the 14 sites this exists
-    to find.
+    bracketed, backticked id is otherwise invisible. The naive pattern misses
+    4 of the 14 sites this exists to find.
 
     **What this does NOT prove.** It sees `<verb> by <NNNN>` and nothing else.
     A citation with the verb *after* the link ("[`0047`] declines §10's ..."),
@@ -1159,7 +1159,7 @@ def check_decision_status_citations() -> str:
     for path in sorted((ROOT / "docs" / "decisions").glob("0*.md")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.startswith("**Status:**"):
-                word = line[len("**Status:**"):].strip().split()
+                word = line[len("**Status:**") :].strip().split()
                 if word:
                     statuses[path.name[:4]] = word[0].strip("`*").lower()
                 break
@@ -1168,7 +1168,18 @@ def check_decision_status_citations() -> str:
         return "decision-status citations: not checked"
 
     listed = subprocess.run(
-        ["git", "ls-files", "-z", "*.md", "*.rs", "*.toml", "*.sh", "*.py", "*.yml", "justfile"],
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "*.md",
+            "*.rs",
+            "*.toml",
+            "*.sh",
+            "*.py",
+            "*.yml",
+            "justfile",
+        ],
         cwd=ROOT,
         capture_output=True,
         text=True,
