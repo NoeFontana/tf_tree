@@ -13,6 +13,13 @@
 //! the two touch disjoint edges, so the pushes never slide the queried edges'
 //! windows out from under the fixed query stamp.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// **`docs/decisions/0007` rule 1, kind 6 — a trait the language requires be
+// implemented unsafely, in a target that never ships** (`docs/decisions/0048`:
+// a kind is a property, not a crate name). Here that is `unsafe impl GlobalAlloc for CountingAllocator`. The posture is
+// declared rather than inherited, because a test is a **separate crate root**.
+// `0048` step 4.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

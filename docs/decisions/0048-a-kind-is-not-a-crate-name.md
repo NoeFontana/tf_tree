@@ -1,8 +1,8 @@
 # 0048: a kind is not a crate name
 
-**Status:** ready — **D1–D6 are in force and gated**: `0007` rule 1 carries this record's amendment, `scripts/unsafe-budget.txt` is the index, and `just unsafe-budget` runs inside `just lint`. Plan steps 1–3 and the `CHANGELOG.md` entry landed in #303; **step 4 is the remaining work** — D4's postures over `tf_tree_c`'s own `tests/` and `examples/` roots — and until it lands, D4 holds for the roots step 3 names and no others. Both open questions are scoped by this record as not decision-affecting. `implemented` when step 4 lands. (This is `0013`'s qualified-status shape.)
+**Status:** implemented (2026-09-09) — D1–D6 are in force and gated: `0007` rule 1 carries this record's amendment, `scripts/unsafe-budget.txt` is the index, and `just unsafe-budget` runs inside `just lint`. Step 4, the last outstanding one, landed on 2026-09-09. Both open questions are scoped by this record as not decision-affecting.
 **Owner:** @NoeFontana
-**Implementation:** #303 (steps 1–3 and the CHANGELOG); step 4 unassigned
+**Implementation:** #303 (steps 1–3 and the CHANGELOG); step 4 in the wave 6 backlog PR
 
 ## Context
 
@@ -363,13 +363,24 @@ Landed with this record:
    was red-tested by adding an `unsafe fn` with a bare deref and watching
    `E0133`, then restored.
 
-**Not landed, and named rather than implied:**
+**Landed 2026-09-09 — this heading read "Not landed, and named rather than
+implied" over step 4 until then:**
 
-4. **D4 is not applied to `tf_tree_c`'s own `tests/` and `examples/` roots**, nor
-   to `tf_tree_bench`/`tf_tree_bridge`'s test roots. That is the larger half of
-   D3's and D5's population, it is a sweep of its own, and the check covers those
-   files by *file set* today. Until it is done, D4 holds for the roots step 3
-   names and for nothing else.
+4. **D4 applied to `tf_tree_c`'s own `tests/` and `examples/` roots and to
+   `tf_tree_bench`/`tf_tree_bridge`'s test roots.** Twelve roots, each declaring
+   its posture rather than inheriting one — the parent library's attribute does
+   not govern a test or example, which is a **separate crate root**, and that is
+   this record's whole subject. Kinds, stated per root rather than per crate:
+   **kind 5** (our own C ABI, called from Rust to exercise or measure it) on the
+   eight `tf_tree_c` targets; **kind 6** (a trait the language requires be
+   implemented unsafely, in a target that never ships) on `zero_alloc.rs`,
+   `relocation.rs` and `steady_state_alloc.rs`, each naming its actual
+   `unsafe impl`; **kind 1** (the arena's raw memory) on `heap_alignment.rs`.
+   **No new register rows were needed** — `scripts/unsafe-budget.txt` already
+   covered every one of these files by file set, and `just unsafe-budget` was
+   green before and after at 30 files / 488 sites / 25 selectors. Step 4 was
+   posture, not coverage. D4 now holds for every root that carries `unsafe`,
+   which is what the sentence this replaced said it did not.
 5. **`docs/decisions/README.md`**'s index row. The `CHANGELOG.md` entry *is*
    landed; the index row is added centrally rather than on this branch, because
    four branches editing one index is a conflict with no useful three-way merge.

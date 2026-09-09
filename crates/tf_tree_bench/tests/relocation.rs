@@ -26,6 +26,13 @@
 // `panic`: a test asserting two arenas disagree has nothing to recover to, and
 // the match arm below reports *which* side declined, which `assert!` cannot.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// **`docs/decisions/0007` rule 1, kind 6 — a trait the language requires be
+// implemented unsafely, in a target that never ships** (`docs/decisions/0048`:
+// a kind is a property, not a crate name). Here that is `unsafe impl Send/Sync for RelocatedArena`. The posture is
+// declared rather than inherited, because a test is a **separate crate root**.
+// `0048` step 4.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
