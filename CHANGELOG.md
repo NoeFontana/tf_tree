@@ -41,6 +41,29 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — `0048` step 4: D4 now holds for every root that carries `unsafe`
+
+- **Twelve crate roots carried `unsafe` with no D4 posture**, and `0048` named
+  that as its own outstanding step: eight `tf_tree_c` tests and examples, plus
+  `heap_alignment.rs`, `zero_alloc.rs`, `relocation.rs` and
+  `steady_state_alloc.rs`. Each now declares `#![allow(unsafe_code)]` +
+  `#![deny(unsafe_op_in_unsafe_fn)]` with the kind stated **by number and name**,
+  and says why the posture is declared rather than inherited — the parent
+  library's attribute does not govern a test or example, which is a separate
+  crate root. That is `0048`'s whole subject.
+- **Kinds are per root, not per crate**, which is the amendment `0048` made to
+  `0007` rule 1: kind 5 (our own C ABI called from Rust to measure it) on the
+  eight `tf_tree_c` targets; kind 6 (a trait the language requires be
+  implemented unsafely, in a target that never ships) on the three allocator and
+  `Send`/`Sync` roots, each naming its actual `unsafe impl`; kind 1 (the arena's
+  raw memory) on `heap_alignment.rs`.
+- **No new register rows were needed.** `scripts/unsafe-budget.txt` already
+  covered every one of these files by file set, and `just unsafe-budget` was
+  green before and after at 30 files / 488 sites / 25 selectors — so step 4 was
+  posture, not coverage, and the census could not have caught its absence.
+- **`0048` is `implemented`.** It was promoted from `draft` to `ready` earlier in
+  this release with step 4 named as the remaining work; that work is done.
+
 ### Fixed — spec sections that describe an arena no participant would attach to
 
 Seven NORMATIVE or near-NORMATIVE claims in `PHASE1.md`, `PHASE2.md` and

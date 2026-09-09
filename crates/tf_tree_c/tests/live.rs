@@ -6,6 +6,13 @@
 //! the wrong order, using a freed handle, striding a batch write.
 #![cfg(feature = "test-hooks")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
+// exercise or measure it** (`docs/decisions/0048`: a kind is a property, not a
+// crate name). The posture is declared here rather than inherited:
+// `crates/tf_tree_c/src/lib.rs` does not govern this file, because a test or
+// example is a **separate crate root**. `0048` step 4 is what this closes.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use core::ffi::c_char;
 use core::ptr;

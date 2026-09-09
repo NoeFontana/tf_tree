@@ -25,6 +25,12 @@
 // cannot construct its input has nothing to assert, and a panic there is the
 // clearest possible failure.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// **`docs/decisions/0007` rule 1, kind 1 — the arena's raw memory**
+// (`docs/decisions/0048`: a kind is a property, not a crate name). The posture
+// is declared here rather than inherited, because a test is a **separate crate
+// root** and the library's attribute does not govern it. `0048` step 4.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use tf_tree_arena::{ArenaLayout, HeapArena};
 
