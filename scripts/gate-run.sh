@@ -16,11 +16,13 @@
 #                A host that could evaluate a gate and now cannot is a finding,
 #                not a free pass. Use where the gate is known to run here.
 #
-#   may-refuse   0 -> pass, and emit a ::notice:: — the refusal lifted and the
-#                     doc row recording it is now stale.
-#                1 -> fail.
-#                2 -> pass, and emit a ::warning:: naming the refusal.
-#                Use where the refusal is expected but not permanent.
+#   may-refuse   0 -> pass.  1 -> fail.  2 -> pass, and emit a ::warning::.
+#                Use where a PASS is expected but a refusal is a *host* fact
+#                rather than a regression — a binary whose exit 2 can be caused
+#                by the runner being loaded. The ::warning:: is what keeps a
+#                persistent refusal visible instead of silently green.
+#                The 0-arm deliberately emits no ::notice::: for a gate that is
+#                expected to pass, an annotation on every green run is noise.
 #
 #   must-refuse  2 -> pass.
 #                0 -> FAIL, naming the doc row to update.
@@ -118,8 +120,9 @@ must-pass:2)
     exit 1
     ;;
 may-refuse:0)
-    echo "::notice::'$recipe' PASSED under may-refuse — the refusal has lifted."
-    echo "gate-run: the document recording this as unmeasurable is now stale."
+    echo "gate-run: PASS — '$recipe' was evaluated and holds."
+    echo "  (policy is may-refuse; if this host is now reliably able to evaluate"
+    echo "   it, must-pass is the tighter policy.)"
     exit 0
     ;;
 may-refuse:2)

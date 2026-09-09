@@ -154,8 +154,14 @@ is a bug.
   `exit(1)`, so **"this host cannot evaluate the criterion" and "the code
   regressed" arrive at a workflow byte-identical**.
 - **A refusal is a measurement, not a literal.** Both refusal constructors quote
-  the probe's own reason string (`Fitness::axis`'s third element), so a refusal
-  cannot be typed to make a job green and cannot go stale when the host changes.
+  the probe's own reason string and return `Option<Outcome>` — `None` means the
+  host is fit and there are no grounds to refuse. Review caught the first
+  version returning a refusal unconditionally, so
+  `refused_on_host(&f, Sensitivity::HostIndependent)` produced
+  `REFUSED (HostFitness) — ` with an **empty** reason and exit 2: under
+  `may-refuse` a permanently green gate whose recorded reason is the empty
+  string. The test named for that property never called the constructor, so it
+  would have passed against the bug; it calls it now and fails against it.
 - **`scripts/gate-run.sh` and `just gate RECIPE POLICY`** are the only place an
   exit code is interpreted, so a workflow cannot re-spell the reading and drift
   from it. Three policies, and the third is the point: **`must-refuse` fails
@@ -170,7 +176,11 @@ is a bug.
   its first run reported six of nine cells wrong, which was its own stub not
   modelling `just --show`.
 - **PHASE2 §12.3 criterion 4 is gated in CI** (`ci.yml`'s `shm` job, both matrix
-  rows) and **was met and ungated for the life of the project**: `just
+  rows) under **`may-refuse`**, because `reclaim_latency`'s exit 2 is its own
+  *"INVALID, not FAIL"* refusal about the runner rather than the code — and
+  `must-pass` would map it to exit 1, reproducing the very collapse this module
+  removes, in its first customer. It **was met and ungated for the life of the
+  project**: `just
   reclaim-latency` existed, printed a verdict, and ran in no workflow, so
   nothing would have gone red if a reap regressed to a timeout. Measured here at
   200 trials, 200/200 contended, p50 0.112 ms, p99 0.159 ms in 0.2 s wall — a

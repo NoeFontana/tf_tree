@@ -67,34 +67,50 @@ pub enum Outcome {
 
 impl Outcome {
     /// Refused because this host cannot produce a trustworthy number on the
-    /// criterion's own sensitivity axis.
+    /// criterion's own sensitivity axis — or [`None`] if it can.
     ///
-    /// The reason is [`Fitness::axis`]'s third element — the same call the
-    /// `measured` arm makes, read the other way round — so a gate cannot claim
-    /// the host is unfit on an axis the host passes.
+    /// The reason is [`Fitness::axis`]'s third element, the same call the
+    /// `measured` arm makes, read the other way round.
+    ///
+    /// **`None` when the host is fit, and that is the whole signature.** An
+    /// earlier version returned an `Outcome` unconditionally and threw
+    /// `axis`'s verdict away, so `refused_on_host(&f, Sensitivity::HostIndependent)`
+    /// — fit on every host by definition — produced
+    /// `REFUSED (HostFitness) — ` with an **empty** reason and exit 2. Under
+    /// `may-refuse` that is a permanently green gate whose recorded reason is
+    /// the empty string; under `must-refuse` it is a gate that can never do
+    /// anything else. The doc claimed the opposite ("a gate cannot claim the
+    /// host is unfit on an axis the host passes") and the test named for it
+    /// never called this function, so it asserted `axis`'s bool and would have
+    /// passed against the bug. Returning `Option` makes the caller handle the
+    /// fit case instead of being handed a refusal it did not earn.
     #[must_use]
-    pub fn refused_on_host(fitness: &Fitness, sensitivity: Sensitivity) -> Outcome {
-        let (_fit, _axis, why) = fitness.axis(sensitivity);
-        Outcome::Refused {
+    pub fn refused_on_host(fitness: &Fitness, sensitivity: Sensitivity) -> Option<Outcome> {
+        let (fit, _axis, why) = fitness.axis(sensitivity);
+        if fit {
+            return None;
+        }
+        Some(Outcome::Refused {
             ground: Ground::HostFitness,
             why,
-        }
+        })
     }
 
     /// Refused because the host has fewer physical cores than the criterion's
-    /// own budget needs.
+    /// own budget needs — or [`None`] if it has enough.
     ///
-    /// Quotes [`Fitness::core_reason`], which is `None` on a host that has
-    /// enough — so a gate that reaches for this on a fit host produces an empty
-    /// reason rather than an invented one, and that is visible.
+    /// Quotes [`Fitness::core_reason`] and **only** that. It is `None` on a host
+    /// with enough cores, and this returns `None` in step rather than
+    /// substituting a hand-written string: a literal here would be the one
+    /// thing the module doc forbids, since it is exactly the text a fit host
+    /// would get. An earlier version carried such a literal while three
+    /// separate prose claims said both constructors quote the probe.
     #[must_use]
-    pub fn refused_on_cores(fitness: &Fitness) -> Outcome {
-        Outcome::Refused {
+    pub fn refused_on_cores(fitness: &Fitness) -> Option<Outcome> {
+        fitness.core_reason.clone().map(|why| Outcome::Refused {
             ground: Ground::HostCores,
-            why: fitness.core_reason.clone().unwrap_or_else(|| {
-                "the host has enough cores; this refusal names no reason".into()
-            }),
-        }
+            why,
+        })
     }
 
     /// The exit code this outcome leaves the process with.
@@ -177,30 +193,56 @@ mod tests {
     #[test]
     fn a_host_refusal_quotes_the_probe_and_not_a_literal() {
         let f = Fitness::probe(1);
-        let o = Outcome::refused_on_host(&f, Sensitivity::AbsoluteTiming);
-        let Outcome::Refused { ground, why } = &o else {
-            panic!("expected a refusal");
-        };
-        assert!(matches!(ground, Ground::HostFitness));
-        // The reason must be the probe's own third element, not a constant.
-        let (_, _, expected) = f.axis(Sensitivity::AbsoluteTiming);
-        assert_eq!(
-            why, &expected,
-            "the refusal text must come from Fitness::axis, so it moves when the host does"
+        let (fit, _, expected) = f.axis(Sensitivity::AbsoluteTiming);
+        match Outcome::refused_on_host(&f, Sensitivity::AbsoluteTiming) {
+            Some(Outcome::Refused { ground, why }) => {
+                assert!(!fit, "a refusal was produced for a fit host");
+                assert!(matches!(ground, Ground::HostFitness));
+                assert_eq!(
+                    why, expected,
+                    "the refusal text must come from Fitness::axis, so it moves                      when the host does"
+                );
+                assert!(!why.is_empty(), "a refusal must state a reason");
+            }
+            None => assert!(fit, "no refusal was produced for an unfit host"),
+            Some(other) => panic!("expected a refusal, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_host_independent_axis_cannot_be_refused_for_unfitness() {
+        // Anti-vacuity, and this test used to be vacuous itself: it asserted
+        // `axis()`'s bool and never called the constructor it is named for, so
+        // it passed while `refused_on_host` was throwing that bool away and
+        // returning `REFUSED (HostFitness) — ` with an empty reason. It calls
+        // the constructor now, which is the only form that could have failed.
+        let f = Fitness::probe(1);
+        assert!(
+            Outcome::refused_on_host(&f, Sensitivity::HostIndependent).is_none(),
+            "HostIndependent is fit on every host, so there are no grounds to refuse"
         );
     }
 
     #[test]
-    fn a_host_independent_axis_is_never_refused_for_unfitness() {
-        // Anti-vacuity: `refused_on_host` must not be usable to refuse a row
-        // that has nothing to be unfit about. If this ever starts producing a
-        // non-empty reason, an axis definition moved.
+    fn a_core_refusal_is_none_when_the_host_has_enough() {
+        // The same shape for the other constructor: `core_reason` is `None` on
+        // a host with enough cores, and that must produce no refusal rather
+        // than a refusal carrying an invented string.
         let f = Fitness::probe(1);
-        let (fit, _, _) = f.axis(Sensitivity::HostIndependent);
-        assert!(
-            fit,
-            "HostIndependent must be fit on every host, or the axis is mis-defined"
-        );
+        match Outcome::refused_on_cores(&f) {
+            None => assert!(
+                f.core_reason.is_none(),
+                "no refusal, but the probe named a core shortfall"
+            ),
+            Some(Outcome::Refused { why, .. }) => {
+                assert_eq!(
+                    Some(&why),
+                    f.core_reason.as_ref(),
+                    "the refusal must be the probe's own string"
+                );
+            }
+            Some(other) => panic!("expected a refusal, got {other}"),
+        }
     }
 
     #[test]

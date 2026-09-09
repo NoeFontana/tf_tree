@@ -1192,9 +1192,16 @@ def check_decision_status_citations() -> str:
 
     settled = 0
     for rel in files:
-        # A record may discuss its own state.
-        if rel.startswith("docs/decisions/") and rel.rsplit("/", 1)[-1][:4] in statuses:
-            continue
+        # A record may discuss its OWN state, and only its own. Skipping the
+        # whole file was wrong and blinded the check to its own subject: a
+        # record citing a *different* record as settled is the amendment-banner
+        # form, and two of the fourteen sites this exists to find are exactly
+        # that: two records carried an amendment banner naming a third record
+        # that was `draft` at the time. The banner text is not quoted here,
+        # because this file is inside the corpus and a quoted example matches
+        # itself — which it did, twice, while this check was being written.
+        # The skip is per match, below, against this file's own id.
+        own = rel.rsplit("/", 1)[-1][:4] if rel.startswith("docs/decisions/") else None
         try:
             raw = (ROOT / rel).read_text(encoding="utf-8").splitlines()
         except (UnicodeDecodeError, OSError):
@@ -1210,6 +1217,8 @@ def check_decision_status_citations() -> str:
         joined = " ".join(parts)
         for m in DECISION_SETTLED_VERB.finditer(joined):
             rec = m.group(1)
+            if rec == own:
+                continue
             status = statuses.get(rec)
             if status is None:
                 continue
@@ -1226,10 +1235,16 @@ def check_decision_status_citations() -> str:
             else:
                 settled += 1
 
-    # Anti-vacuity floor: this check exists because 14 findings were live, and
-    # 23 citations land on non-draft records today. A pattern or corpus that
-    # stopped matching would otherwise report success on an empty subject set.
-    floor = 20
+    # Anti-vacuity floor. A pattern or corpus that stopped matching would
+    # otherwise report success on an empty subject set.
+    #
+    # **The number is measured at the tip, not remembered.** This comment first
+    # read "23 citations land on non-draft records today" against a check that
+    # reported 31 — 23 was counted before the three promotions in the same
+    # commit, and a floor 11 below the real count would not notice a corpus
+    # change that lost a third of its subject. Set just under the live count so
+    # it bites; raise it with the count, never independently.
+    floor = 34
     if settled < floor:
         fail(
             f"the decision-citation scan found only {settled} settled citations "

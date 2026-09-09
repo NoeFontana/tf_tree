@@ -729,12 +729,22 @@ jobs:
       # scheduler noise cannot flip it, while a reap that had fallen back to a
       # timeout would land in milliseconds-to-seconds.
       #
-      # `must-pass` rather than `may-refuse`: a runner that stops being able to
-      # evaluate this is a finding, not a free pass. `scripts/gate-run.sh` is
-      # what reads the binary's exit code, so this job cannot re-spell the
-      # PASS/FAIL/REFUSED contract and drift from it.
-      - name: just gate reclaim-latency must-pass
-        run: just gate reclaim-latency must-pass
+      # **`may-refuse`, not `must-pass`, and the reason is the whole point of
+      # `gate.rs`.** `reclaim_latency` exits 2 for its own non-vacuity refusal —
+      # *"N of 200 claims succeeded immediately; this run measured process
+      # teardown, not reclaim latency. INVALID, not FAIL."* — which is a
+      # statement about the runner, not the code. On a loaded 2-vCPU hosted
+      # runner the parent can be descheduled between `kill(2)` returning and the
+      # first `reap_dead()`/`claim()`, and `must-pass` would map that exit 2 to
+      # exit 1: a red job indistinguishable from a genuine p99 regression. That
+      # collapse is exactly what this module was written to prevent, so wiring
+      # it here would have been the bug in its own first customer.
+      #
+      # The refusal stays visible: `may-refuse` emits a `::warning::` on exit 2
+      # rather than passing silently. `scripts/gate-run.sh` is what reads the
+      # code, so this job cannot re-spell the contract and drift from it.
+      - name: just gate reclaim-latency may-refuse
+        run: just gate reclaim-latency may-refuse
 
       # The reader itself, all nine (policy x exit code) cells against a stub.
       # A policy runner that mis-reads one cell is invisible: every gate still
