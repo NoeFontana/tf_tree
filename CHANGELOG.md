@@ -59,8 +59,10 @@ is a bug.
   identical on both.
 - **`#![deny(missing_docs)]` is on the four publishable roots that lacked it.**
   The workspace has set it to `warn` with `just lint`'s `-D warnings` promoting
-  it all along, so the gate was effective — but only inside that recipe, and
-  §13's box asks for the attribute at the root a published consumer reads.
+  it all along, so the gate was effective — but only inside that recipe, and the
+  box asks for it at the root. It binds this repository and its path dependents,
+  **not** a downstream consumer: cargo builds registry dependencies with
+  `--cap-lints allow`, which caps an attribute-level `deny` too.
 - **§11.2's cold-cache row is measured by nothing**, which is why the
   bench-gate box stays open: a runner that "reports the full table" cannot exist
   until that row has an artifact or the row is withdrawn.

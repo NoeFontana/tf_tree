@@ -3,9 +3,16 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 // `PHASE1.md` §13 asks for this at the root. The workspace sets
 // `missing_docs = "warn"` and `just lint`'s `-D warnings` promotes it, so the
-// gate was already effective — but only inside that recipe. At the root a
-// published consumer reads, and under a plain `cargo build`, it now says so
-// itself.
+// gate was already effective — but only inside that recipe. This makes a plain
+// `cargo build` of this repository say so too.
+//
+// **It does not bind a downstream consumer, and an earlier version of this
+// comment claimed it did.** Cargo builds registry dependencies with
+// `--cap-lints allow`, which caps an attribute-level `deny` as well, so for
+// somebody building `tf_tree` from crates.io this attribute has no effect at
+// all. What it binds is builds of this repository and its path dependents —
+// which is where a missing doc would be introduced, so the box is still worth
+// closing this way.
 #![deny(missing_docs)]
 //! `no_std + alloc` pointer-free arena abstraction and layout math for `tf_tree`.
 //!
