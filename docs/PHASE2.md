@@ -743,8 +743,12 @@ Write a test asserting `Tree` is generic over `A: Arena` with no `MappedArena`-s
 ```rust
 #[repr(C, align(64))]
 pub struct ParticipantRecord {
-    /// FREE = 0, RESERVED = 1, LIVE = 2. Published last. There is no
-    /// `detaching` state — see the note below.
+    /// **A packed word, not a plain enum.** `state_of(word) = word & 0b11` is
+    /// the lifecycle — FREE = 0, RESERVED = 1, LIVE = 2 — and the incarnation
+    /// occupies the bits above it: `live_word(inc) = (inc << 2) | LIVE`.
+    /// Testing `state == 2` finds nothing, because `fill_slot` publishes
+    /// `incarnation + 1` and every live participant therefore has a word
+    /// greater than 2. Published last. There is no `detaching` state.
     pub state: AtomicU32,
     pub pid: AtomicU32,
     pub start_time: AtomicU64,     // /proc/<pid>/stat field 22 — defeats PID reuse
@@ -758,8 +762,8 @@ pub struct ParticipantRecord {
 > **Six differences, and the listing above stood in its Phase 1 shape until 2026-09-09.** They are recorded rather than silently replaced, because two of them are load-bearing for protocols this document specifies elsewhere.
 >
 > * **`state`'s values were wrong in both halves.** They are `FREE`/`RESERVED`/`LIVE` = 0/1/2, and there is **no `3 = detaching`**. A departing participant goes straight to `FREE`; the reader that needs to distinguish "leaving" from "gone" uses the socket (D17), which is the whole point of making liveness the socket rather than a state word.
-> * **Every field is atomic.** The old listing had `pid`, `start_time` and `attach_nanos` as plain integers, which is not a stylistic difference: two processes read these while a third publishes them, so a non-atomic read is a data race and Miri would say so.
-> * **`incarnation` is new** and is what makes a reaped-then-reused slot distinguishable from the same slot still held — the claim-epoch argument in §6.
+> * **Every field is atomic.** The old listing had `pid`, `start_time` and `attach_nanos` as plain integers, which is not a stylistic difference: two processes read these while a third publishes them, so a non-atomic read is a data race. **Not one Miri would catch, and an earlier revision of this bullet said it would**: §11.1 of this document states that neither Miri nor loom crosses a process boundary, and `just miri` excludes `shm` precisely because Miri cannot execute `memfd_create` or `F_OFD_*`. What holds this is the type, plus the review rule that an arena field two processes touch is atomic by construction.
+> * **`incarnation` is new**, and it is what makes a reaped-then-reused slot distinguishable from the same slot still held — the claim-epoch argument in §6. **It also lives inside the `state` word**, which is the correction this bullet list itself needed: an earlier revision listed the state as a plain `0/1/2` enum beside `incarnation` as a separate field, and an implementer of an out-of-process or non-Rust reader who tested `state.load() == 2` would find no live participant for any incarnation `>= 1` — that is, always. `state_of` and `live_word` are the accessors; §11.3's `reclaim.probe_then_reoccupied` cell and `release` both rest on the packing.
 > * **`mode` and `name` are gone.** Read-only versus read-write is not in the record; the arena does not need it and D18's enforcement is the MMU, not a byte. The 32-byte name went with it.
 > * **`attach_nanos` is `attached_at_nanos`**, and the padding is one `_pad: [u8; 88]` rather than three fragments — with `size_of::<ParticipantRecord>() == 128` asserted at compile time, which is what actually holds the layout.
 
