@@ -41,6 +41,43 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — spec sections that describe an arena no participant would attach to
+
+Seven NORMATIVE or near-NORMATIVE claims in `PHASE1.md`, `PHASE2.md` and
+`CONTRIBUTING.md` were checked against code and are wrong. Each correction is
+recorded in place rather than overwritten.
+
+- **`PHASE1.md` §4.1 carried `**NORMATIVE layout**` over a `FORMAT_VERSION = 1`
+  header.** The shipped one is **3**, the struct is 320 bytes (was 256), and
+  nine fields are missing from the block. The block is kept as Phase 1 history;
+  `crates/tf_tree_arena/src/header.rs` is named as the normative source.
+- **§4.3's region table listed eight regions; there are eleven.** Missing: the
+  participant table and both counter regions. Wrong: the header (256 → 320), the
+  frame-hash stride (`8 + 4` → 16, widened by A8's `claiming` array), and the
+  topology stride (10 → 12 bytes/frame, because `edge_of_child` lives there).
+  `layout_hash` folds these strides, so a table that disagrees with them
+  describes an arena no participant would attach to.
+- **§5.2 said the topology is "two blocks, double-buffered"**; `TOPO_BLOCKS` is
+  **4** and A1 replaced the double-buffer.
+- **§4.3 asked for `ArenaLayout::from_edges`**, which does not exist; the
+  shipped constructor is `ArenaLayout::new`.
+- **§8's API snippet had four defects** — the block a reader copies, and nothing
+  checks it: `Interp::ScLerp` where the builder takes `InterpPolicy` (`Interp`
+  is a trait); `Publisher` annotated on `tree.claim`, which returns
+  `EdgeWriter<'_>`; `claim(odom, base)` inverted against `claim(child, parent)`;
+  and `plan(cam, map)` and `lookup("map", "camera_optical", …)` naming opposite
+  directions while both take `(target, source)`.
+- **`PHASE2.md` §5's `ParticipantRecord` was its Phase 1 shape.** Six
+  differences, two load-bearing: `state` has no `3 = detaching` (a departing
+  participant goes straight to `FREE`; the socket is the liveness signal, D17),
+  and every field is atomic — the old listing's plain `pid`/`start_time` would
+  be a data race, since two processes read them while a third publishes.
+  `incarnation` is new; `mode` and `name` are gone.
+- **`PHASE1.md` §1 and `CONTRIBUTING.md` both said `tf_tree_math`'s property
+  tests "run under Miri in seconds".** They never have: `just miri` names
+  `tf_tree_arena`, `tf_tree_core` and `tf_tree`. What the crate's freedom from
+  `unsafe` actually buys is being cheap for Miri to interpret as a *callee*.
+
 ### Fixed — PHASE1 §13 was nine unticked boxes over a phase called "implemented whole"
 
 - **Six of the nine were satisfied and had never been ticked**: §11.3's written

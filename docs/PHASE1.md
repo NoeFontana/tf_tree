@@ -101,7 +101,7 @@ tf_tree/
 
 Crate names use underscores throughout (as `serde_json` and `parking_lot` do), so the import path matches the project name: `use tf_tree::...`.
 
-`tf_tree_math` and `tf_tree_arena` are separately publishable and separately testable. Keeping the math crate free of unsafe and free of the arena means its property tests run under Miri in seconds.
+`tf_tree_math` and `tf_tree_arena` are separately publishable and separately testable. Keeping the math crate free of `unsafe` and free of the arena is what makes it cheap for Miri to interpret as a *callee* — no `unsafe`, no arena, no provenance to track. **Its own test suite is not run under Miri, and this sentence said it was until 2026-09-09**: `just miri` runs `-p tf_tree_arena -p tf_tree_core` and `-p tf_tree`, and has never named `tf_tree_math`. The crate is `#![forbid(unsafe_code)]`, so what Miri would check there is the standard library's own soundness.
 
 ---
 
@@ -257,7 +257,11 @@ The second row is a positive test that `LerpSlerp` is not right-invariant. Write
 
 ### 4.1 Header
 
-**NORMATIVE layout.** All offsets are byte offsets from arena base.
+**This block is Phase 1's header, and it is no longer the normative layout — it is two format bumps behind. This section said **NORMATIVE** over it until 2026-09-09.**
+
+The normative v3 header is `crates/tf_tree_arena/src/header.rs`: `FORMAT_VERSION` is **3**, the struct is **320 bytes** (256 before the bump), and its `key_field_offsets_are_stable` test pins every offset that a v3 reader depends on. Nine fields the block below does not have are declared there — the two counter-region offsets, `nominal_rate_mhz`'s and `declared_by_slot`'s consumers, Phase 6's four reserved header fields declared absent, and the receipt-time field `0036` added.
+
+**The block is kept rather than deleted**, because it is what Phase 1 built and the amendments that moved it are traceable only against it. Read it as history; read `header.rs` for the layout. All offsets below are byte offsets from arena base.
 
 ```rust
 pub const TF_TREE_MAGIC: [u8; 8] = *b"TF_TREE\0";  // byte array, not a u64 literal: no endianness ambiguity
@@ -323,16 +327,23 @@ Region sizes, each 64-byte aligned and laid out in header order:
 
 | Region | Size |
 |---|---|
-| header | 256 |
-| frame table | `max_frames * 64` |
-| frame hash | `next_pow2(2*max_frames) * (8 + 4)` |
-| topology blocks | `TOPO_BLOCKS * align64(max_frames * 10)` |
-| claim table | `max_edges * 64` |
-| edge table | `max_edges * 128` |
-| stamp arena | `sum(capacities) * 8` |
-| pose arena | `sum(capacities) * 64` |
+| header | **320** |
+| frame table | `align64(max_frames * 64)` |
+| frame hash | `align64(next_pow2(2*max_frames) * 16)` |
+| topology blocks | `TOPO_BLOCKS * align64(max_frames * 12)` |
+| claim table | `align64(max_edges * 64)` |
+| **participant table** | `align64(max_participants * 128)` |
+| edge table | `align64(max_edges * 128)` |
+| stamp arena | `align64(sum(capacities) * 8)` |
+| pose arena | `align64(sum(capacities) * 64)` |
+| **edge counters** | `align64(max_edges * 128)` |
+| **participant counters** | `align64(max_participants * 128)` |
 
-A 1000-frame, 1000-edge tree with 4096 samples per edge: ~260 MB of pose arena. Note that in a real robot only a handful of edges are dynamic, so size capacities per edge rather than uniformly. Provide `ArenaLayout::from_edges(&[(FrameName, EdgeKind, Capacity)])`.
+> **Eleven regions, not eight, and this table said eight until 2026-09-09.** The authority is `crates/tf_tree_arena/src/layout.rs`'s `sizes` array, whose length is `N_REGIONS` so a forgotten stride is a compile error. Four things moved: the header is **320** since `FORMAT_VERSION` 3 (was 256); the frame-hash stride is **16**, not `8 + 4` — A8 widened it by adding the `claiming` array (`FRAME_HASH_STRIDE`); the topology stride is **12 bytes per frame**, not 10, because `edge_of_child` lives in that block (§5.3); and three regions are simply absent from this table — the **participant table** (Phase 2) and the **two counter regions** (`FORMAT_VERSION` 3, `PHASE5.md` §5.5). D22 is why the counter regions are counted whether or not the `counters` feature is on.
+>
+> `layout_hash` folds these strides, so a table that disagrees with them is describing an arena no participant would attach to.
+
+A 1000-frame, 1000-edge tree with 4096 samples per edge: ~260 MB of pose arena. Note that in a real robot only a handful of edges are dynamic, so size capacities per edge rather than uniformly. The constructor that ships is `ArenaLayout::new` (`crates/tf_tree_arena/src/layout.rs`), which validates that each per-edge capacity is `0` (a static edge, no ring) or a power of two and that exactly `max_edges` of them were supplied. **`ArenaLayout::from_edges` does not exist and this line asked for it until 2026-09-09** — the per-edge sizing it was written for is what `new` takes, and the builder-side spelling is `0004`'s builder-time edge declaration.
 
 **Topology block stride is 10 bytes per frame, not 6.** §5.3 requires
 `edge_of_child[c]` to live *in the topology block* so plan compilation is a pure
@@ -401,7 +412,7 @@ pub struct TopologyBlock {
 }
 ```
 
-Two blocks, double-buffered. **`ArcSwap` is forbidden here** — `Arc` refcounts do not cross a process boundary and this is the single most tempting Phase-1 simplification.
+**Four** blocks, rotated (`TOPO_BLOCKS = 4`, A1 — this line said *two, double-buffered* until 2026-09-09, which is the Phase 1 shape A1 replaced). **`ArcSwap` is forbidden here** — `Arc` refcounts do not cross a process boundary and this is the single most tempting Phase-1 simplification.
 
 **Writer protocol (topology mutation):**
 
@@ -814,7 +825,7 @@ full argument.
 // construction — topology is declared on the builder, which is what lets
 // `build()` size the arena from exactly these edges
 let tree = TreeBuilder::new()
-    .default_interp(Interp::ScLerp)
+    .default_interp(InterpPolicy::ScLerp)   // `Interp` is a trait; the builder takes the policy
     .static_edge("base_link", "camera_mount", &iso)
     .dynamic_edge("odom", "base_link", EdgeCfg::new(Capacity::history(200.0, 10.0)))
     .frame_headroom(8)                        // only if names are interned later
@@ -825,17 +836,19 @@ let base: FrameId = tree.frame("base_link")?;
 let cam:  FrameId = tree.frame("camera_optical")?;
 
 // writing
-let mut pubr: Publisher = tree.claim(odom, base)?;   // exclusive; Drop releases
-pubr.push(stamp, &iso)?;                             // wait-free, no alloc
+let mut w: EdgeWriter = tree.claim(base, odom)?;      // (child, parent); Drop releases
+w.push(stamp, &iso)?;                                // wait-free, no alloc
 
 // reading
-let plan: Plan = tree.plan(cam, map)?;               // compile once
+let plan: Plan = tree.plan(cam, map)?;               // (target, source); compile once
 let g: Guard = tree.guard();                         // pins generation + arena
 let t = plan.at(&g, stamp)?;
 
 // convenience path — interned + plan-cached internally, for casual users
-let t = tree.lookup("map", "camera_optical", stamp)?;
+let t = tree.lookup("camera_optical", "map", stamp)?;   // (target, source), as above
 ```
+
+> **Four defects were corrected in the snippet above on 2026-09-09, and it is worth saying what they were, because it is the block a reader copies.** `.default_interp` took `Interp::ScLerp`, but `Interp` is a *trait* in `tf_tree_math` with unit-struct impls and the builder takes `InterpPolicy`. `tree.claim` was annotated `Publisher` and returns `EdgeWriter<'_>` — `Publisher` exists and is public, but it is not what `claim` hands back. Its arguments were `(odom, base)` against a signature of `claim(child, parent)`, and `.dynamic_edge("odom", "base_link", …)` above makes `odom` the *parent*, so the call was inverted. And `plan(cam, map)` and `lookup("map", "camera_optical", …)` named **opposite directions** while both take `(target, source)`. None of this is checked by anything: the block is not a doctest, and `just doc` cannot reach it.
 
 `Tree: Send + Sync`. `Plan: Send + Sync + Copy`. `Publisher: Send + !Sync` (single writer is a type-level property, not a convention). `Guard<'a>` borrows the tree.
 

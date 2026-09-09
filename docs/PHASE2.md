@@ -743,19 +743,25 @@ Write a test asserting `Tree` is generic over `A: Arena` with no `MappedArena`-s
 ```rust
 #[repr(C, align(64))]
 pub struct ParticipantRecord {
-    /// 0 = free, 1 = attaching, 2 = live, 3 = detaching. Published last.
+    /// FREE = 0, RESERVED = 1, LIVE = 2. Published last. There is no
+    /// `detaching` state — see the note below.
     pub state: AtomicU32,
-    pub mode: u8,                  // 0 RO, 1 RW
-    _pad0: [u8; 3],
-    pub pid: u32,
-    _pad1: u32,
-    pub start_time: u64,           // /proc/<pid>/stat field 22 — defeats PID reuse
-    pub attach_nanos: i64,
+    pub pid: AtomicU32,
+    pub start_time: AtomicU64,     // /proc/<pid>/stat field 22 — defeats PID reuse
+    pub incarnation: AtomicU64,
+    pub attached_at_nanos: AtomicI64,
     pub heartbeat: AtomicU64,
-    pub name: [u8; 32],
-    _pad2: [u8; 24],
+    _pad: [u8; 88],                // size asserted == 128 at compile time
 }
 ```
+
+> **Six differences, and the listing above stood in its Phase 1 shape until 2026-09-09.** They are recorded rather than silently replaced, because two of them are load-bearing for protocols this document specifies elsewhere.
+>
+> * **`state`'s values were wrong in both halves.** They are `FREE`/`RESERVED`/`LIVE` = 0/1/2, and there is **no `3 = detaching`**. A departing participant goes straight to `FREE`; the reader that needs to distinguish "leaving" from "gone" uses the socket (D17), which is the whole point of making liveness the socket rather than a state word.
+> * **Every field is atomic.** The old listing had `pid`, `start_time` and `attach_nanos` as plain integers, which is not a stylistic difference: two processes read these while a third publishes them, so a non-atomic read is a data race and Miri would say so.
+> * **`incarnation` is new** and is what makes a reaped-then-reused slot distinguishable from the same slot still held — the claim-epoch argument in §6.
+> * **`mode` and `name` are gone.** Read-only versus read-write is not in the record; the arena does not need it and D18's enforcement is the MMU, not a byte. The 32-byte name went with it.
+> * **`attach_nanos` is `attached_at_nanos`**, and the padding is one `_pad: [u8; 88]` rather than three fragments — with `size_of::<ParticipantRecord>() == 128` asserted at compile time, which is what actually holds the layout.
 
 **Slot assignment and record population are done by different processes, and this section used to say otherwise.** The *owner* assigns the slot: its accept loop scans for an index whose lock byte the kernel reports free and whose arena record is either absent or **collectable**, and returns it as `HelloResponse.participant_slot` (§3.7). "Collectable" is §5.1's predicate and not a reading of `state`: a record left behind by a participant that never ran its `Drop` is reclaimed — `reclamation_verdict` then `ParticipantTable::reclaim`, on the word that verdict was formed against — *before* the slot is granted. Deciding without reclaiming would be useless rather than merely incomplete, because `fill_slot` CASes from `FREE`: a slot correctly judged collectable and left `LIVE` is refused to the very joiner the grant is for ([`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) plan step 3, which is what replaced this loop's `identity(slot).is_some()` skip — the defect that record was opened about). The *joiner* writes the record — its own, **with a CAS**, and **after** it has taken the lock byte for that slot. A **creator** has no owner to ask, so it finds its own free record the same way and through the same CAS, again after its byte — on the *creator's* byte, which `Open::register_creator` takes rather than scans for ([`0035`](./decisions/0035-the-creators-slot-is-taken-not-found.md)). **There is no third registrant**, and this sentence named one — "a process taking ownership" — until 2026-08-27. A taker-over is already a participant and registers nothing: it keeps the slot, byte and arena record it has ([`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) question 3, resolved 2026-08-20), because a heir that acquired a *second* slot would arrange for its own live claims to be reaped. `Open` no longer has a path that could try — see [`0037`](./decisions/0037-a-takeover-is-not-a-second-open.md). **“After its byte” holds on every path that *has* a byte, and one public path still does not**: a directly-called `TreeBuilder::build_shared` (`crates/tf_tree/src/tree.rs:504`, registering at `:516`) opens no lock file, so there the CAS is the only ordering there is — which is what §11.3's `attach.after_slot_assigned_before_publish` row is distinguishing. That shape is supported and stays: it is how an arena gets created. **This sentence read “three public ones” until [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md)'s plan step 0b, and the other two have since stopped registering at all.** `Tree::attach_shared` / `attach_shared_at` (`:2227`, `:2254`) still open no lock file, but their `AttachMode::ReadWrite` arm now returns `ShmError::ReadWriteNeedsRendezvous` before the segment is mapped, and their `ReadOnly` arm writes no participant record — the `is_writable` branch at `:2302` hands a non-writable backing the `u32::MAX` sentinel (`:2313`) instead of registering — so neither has a record whose ordering could be at issue. `TreeBuilder::build` (`:460`) is a heap tree and never had one.
 
