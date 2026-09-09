@@ -11,7 +11,7 @@
 //! is no stable-tier spelling of "what does this edge's `lookups_ok` say". Both
 //! of `Fixture`'s helpers go through the view, so every test below would be
 //! reduced to its setup. `cargo nextest run --workspace` unifies `unstable` in
-//! from `tf_tree_cli`/`tf_tree_c`/`tf_tree_bench`/`tf_tree_py`, so these five
+//! from `tf_tree_cli`/`tf_tree_c`/`tf_tree_bench`/`tf_tree_py`, so these six
 //! still run in `just test`; what they no longer do is break the build of a
 //! packager who runs `cargo test` on the published tarball.
 #![cfg(feature = "unstable")]
@@ -340,4 +340,69 @@ fn a_read_only_view_records_nothing() {
             .unwrap();
     }
     assert_eq!(f.ok_count(e), 1);
+}
+
+/// **What `docs/PHASE5.md` §5.4's withdrawal keeps**: the convenience path
+/// credits its denominator on **every call**, visible before any loop ends.
+///
+/// # Why this test exists at all
+///
+/// §5.4 required a long-lived per-thread `Guard`, NORMATIVELY. That requirement
+/// is withdrawn, and this test is the guarantee the withdrawal keeps — so it is
+/// written to fail against the shape the requirement asked for, not merely to
+/// pass against the shape that ships.
+///
+/// `Guard`'s `Drop` is the **only** thing that publishes `lookups_ok`
+/// (`crates/tf_tree_core/src/plan.rs`, `impl Drop for Guard`), while `note_err`
+/// writes the error counters straight through by design. A guard that never
+/// ends therefore holds the denominator at zero while the numerator keeps
+/// publishing, and `TFT010` computes `errs / (errs + lookups_ok)` — so a
+/// healthy edge with a handful of extrapolation errors reads **100 %** and
+/// fires. `no_counter_evidence` has the mirror failure: it skips every counter
+/// check when the sum is zero, so a process hammering the tree looks like one
+/// that never ran.
+///
+/// # Why the assertion is per iteration
+///
+/// A single `assert_eq!(ok_count, 50)` after the loop passes just as well
+/// against a batched implementation — the batch flushes when the guard drops at
+/// the end of the function, and the final count is identical. The per-iteration
+/// assertion is the whole test: it is the only form that can see a denominator
+/// being *held*.
+///
+/// **Mutation-verified**: replacing the body with one hoisted `Plan::at` guard
+/// across the loop — the exact shape the withdrawn requirement asked for —
+/// fails on the **first** iteration, `left: 0, right: 1`.
+///
+/// # Why a single-edge pair
+///
+/// `Guard::drop` credits an edge only when the whole batch went through exactly
+/// one, so a two-edge plan (`base <- map` here) credits no edge at all and this
+/// would assert zero forever. `odom <- map` is one dynamic edge. The sibling
+/// test `a_read_only_view_records_nothing` documents the other half of that
+/// rule, and the `Plan::at` shape is covered by the test at the head of this
+/// file whose subject is that the denominator flushes once per *guard*.
+#[test]
+fn the_convenience_path_publishes_its_denominator_on_every_call() {
+    let f = Fixture::new();
+    let e = f.edge("odom");
+    assert_eq!(f.ok_count(e), 0, "the fixture must start from zero");
+
+    for i in 0..50i64 {
+        f.tree
+            .lookup(
+                "odom",
+                "map",
+                Stamp::<SystemDomain>::from_nanos(i * 10 * MS),
+            )
+            .unwrap();
+        assert_eq!(
+            f.ok_count(e),
+            (i + 1) as u64,
+            "the convenience path must publish its denominator per call, not \
+             batch it: after {} lookups the edge should read {}",
+            i + 1,
+            i + 1
+        );
+    }
 }

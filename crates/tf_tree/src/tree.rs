@@ -2752,6 +2752,27 @@ impl Tree {
     /// error — and, before either, wants [`Self::plan`], because this tier
     /// resolves the topology on every call (`docs/API.md` §1 R1).
     ///
+    /// # Why the guard is built per call
+    ///
+    /// It is a decision, not an oversight. `docs/PHASE5.md` §5.4 used to require
+    /// a **long-lived per-thread `Guard`** here, NORMATIVELY; that requirement
+    /// is withdrawn and its amendment carries the argument. Three things decide
+    /// it:
+    ///
+    /// * `Guard`'s `Drop` is the only thing that publishes `lookups_ok`, while
+    ///   `note_err` writes the error counters through immediately. A guard
+    ///   cached across calls would hold the denominator while the numerator
+    ///   kept publishing, and `TFT010` divides by their sum — a healthy edge
+    ///   with a few extrapolation errors would read 100 % and fire.
+    /// * Holding one needs a `Guard<'static>` in a `thread_local!`, which is a
+    ///   second lifetime extension and therefore a decision record
+    ///   (`docs/decisions/0017`), not a patch. This method takes `&self` and
+    ///   `Tree` is `Send + Sync`, so `0017`'s `Arc`-based soundness argument is
+    ///   not available to it.
+    /// * The cost is ~22 ns, about **4 %** of this call — measured, and quoted
+    ///   in §5.4's amendment so the next reader does not have to re-measure to
+    ///   find out whether it matters.
+    ///
     /// # Errors
     ///
     /// As [`Self::lookup`].

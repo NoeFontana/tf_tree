@@ -142,6 +142,44 @@ is a bug.
   (`6e8b19b`) — `docs/PHASE2.md` §11.2 scenario 9 a thousand times, and §12.3
   criterion 4's kill-to-re-claimable measurement.
 
+### Changed — PHASE5 §5.4's long-lived per-thread `Guard` is WITHDRAWN
+
+- **The requirement contradicted the paragraph that justified it.** §5.4 argues
+  batching over a `Guard` that *spans a batch of lookups* and then required one
+  with no end of batch. `Guard::drop` is the **only** publisher of `lookups_ok`
+  while `note_err` writes the error counters through by design, so a guard that
+  never ends holds the denominator and publishes the numerator.
+- **Two shipped checks would have inverted.** `TFT010` computes
+  `errs / (errs + lookups_ok)`, so a healthy edge with a handful of
+  extrapolation errors would read **100 %** and fire; `no_counter_evidence`
+  skips every counter check at a zero sum, so a process hammering the tree
+  would look like one that never ran. The catalogue tests perform no lookups,
+  so neither would have been caught.
+- **It was also unsound as specified**: a `thread_local!` needs a
+  `Guard<'static>` — a second lifetime extension, which is a decision record
+  (`0017`) and not a patch — and `0017`'s `Arc` soundness argument is not
+  available to `Tree::lookup`, which takes `&self` on a `Send + Sync` type.
+- **The cost it avoided is real but not decisive**, and is quoted from the
+  registered artifact rather than by hand: `just guard-cost` reads **+38.3 ns**
+  on a heap arena with counters on (203.1 hoisted -> 241.4 per call), +29.3 on a
+  memfd one, and +19.1/+20.0 with counters off. An earlier revision of this
+  entry said 21.7–22.9 ns and called it 4 % — that was a hand measurement over a
+  **three-edge** plan, and `Guard::drop` credits an edge only when the batch went
+  through exactly one, so it priced the configuration in which the guard does
+  least work. Review caught it against `backing.rs`'s own summary. The
+  correction does not reopen the decision: a requirement that inverts a shipped
+  diagnostic is withdrawn whether it costs 4 % or 16 %.
+- **What the withdrawal keeps is now pinned**: the convenience path credits its
+  denominator once per call, visible before any loop ends —
+  `the_convenience_path_publishes_its_denominator_on_every_call`, whose
+  per-iteration assertion is the whole test and which is mutation-verified
+  against one hoisted guard across the loop.
+- §11's bullet, §13's box 6 and `Tree::lookup_tagged`'s own doc now agree with
+  §5.4, and the standing disagreement between that box and
+  [`0022`](docs/decisions/0022-the-per-call-guard-and-the-unwatched-gate.md) is
+  resolved in `0022`'s favour. §11's bullet also asked for a symptom as if it
+  were a property — nothing counts atomic flushes.
+
 ### Added — a gate outcome has three meanings and had two exit codes
 
 - **`tf_tree_bench::gate`** fixes the contract a gate binary leaves with:
