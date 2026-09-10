@@ -426,6 +426,20 @@ fn main() {
         // `abort` rather than `exit`, for the reason §11.3's sites abort: no
         // destructor runs, so `OwnerServer::drop` does not unlink the socket and
         // the path is left stale exactly as a crashed owner leaves it (§3.9).
+        //
+        // **This mode binds a rendezvous path, which no other mode of this
+        // binary does, and the binary ships.** `OwnerServer::bind_at` renames
+        // over the resolved path, so pointed at a live arena's
+        // `TF_TREE_RUNTIME_DIR`/domain/name this replaces a serving owner's
+        // socket and then aborts on every client that attaches — with a
+        // descriptor carrying `arena_size: 0` and a zero uuid. It is inside
+        // §3.10's same-user-cooperating trust model, and this crate's manifest
+        // already records at length that `tf_tree_rendezvous_child` is installed
+        // by `cargo install --features shm` as a chosen residue, with
+        // `tf_tree_ipc_child hold-participant` cited in `docs/PHASE2.md` §0.0 as
+        // an existing public route to a bad state. Recorded here rather than
+        // left to be discovered because *binding* is a capability the other
+        // modes do not have: the earlier ones only hold bytes or read.
         "serve-then-die" => {
             // The rendezvous this resolves must be the *same* one the joiner
             // resolves, so it is built the way `tf_tree::Open` builds it rather
