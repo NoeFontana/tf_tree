@@ -2928,14 +2928,16 @@ shm-rendezvous:
     # reports how many times the predicate asked the kernel, which is the only
     # part of its read *order* a multiprocess test can observe.
     #
-    # **`unstable` buys eleven tests here, the same trade `just shm-check`'s
+    # **`unstable` buys twelve tests here, the same trade `just shm-check`'s
     # `--test frozen` line makes.** The enumeration below names the eight that
-    # existed when it was written; the other three —
+    # existed when it was written; the other four —
     # `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`,
-    # `a_byteless_publisher_is_evicted_from_the_edge_it_is_publishing_to` and
-    # `a_leased_publisher_keeps_its_edge_against_a_sweeper` — landed since, and
-    # are named rather than absorbed because a `comm` over two `nextest list`
-    # runs is how they were found and the next reader deserves the same list.
+    # `a_byteless_publisher_is_evicted_from_the_edge_it_is_publishing_to`,
+    # `a_leased_publisher_keeps_its_edge_against_a_sweeper` and
+    # `a_live_holder_that_proc_calls_dead_keeps_the_topology_lock` — landed
+    # since, and are named rather than absorbed because a `comm` over two
+    # `nextest list` runs is how they were found and the next reader deserves
+    # the same list.
     #
     # Two of the eight drive the helper's `join-rw-report` mode, which reads a
     # participant record's raw `state` word through
@@ -2968,8 +2970,8 @@ shm-rendezvous:
     # the feature only to *observe* — the raw `state` word is what separates "the
     # sweep collected the slot" from "the sweep left the wedge in place", and
     # `Tree::participant_alive` reads `false` for both. Without the feature all
-    # eleven and the helper mode are `#[cfg]`-ed out and the recipe runs eleven
-    # tests fewer, silently — eight enumerated above plus the three named at the
+    # twelve and the helper mode are `#[cfg]`-ed out and the recipe runs twelve
+    # tests fewer, silently — eight enumerated above plus the four named at the
     # top of this comment, which is the arithmetic that made both numbers here
     # wrong until they were re-measured.
     #
@@ -2992,11 +2994,16 @@ shm-rendezvous:
     # zero-byte handshake regression — which is +1 in every column and is not
     # what moved them.
     #
-    # **The `unstable` delta above is stale too, and is left named rather than
-    # rewritten**: `shm,unstable` minus `shm` measures **12** at `main` and on
-    # this branch, not the eleven the enumeration walks through, so one test has
-    # landed under that gate since the list was written and is not in it. The
-    # arithmetic, not the list, is what the recipe depends on.
+    # **The `unstable` delta measures 12 and the enumeration now names all
+    # twelve.** `shm,unstable` minus `shm` is 12 at `main` and on this branch
+    # (49−37, 55−43). An earlier revision of this paragraph recorded the
+    # discrepancy and left the twelfth unnamed, which is the same failure the
+    # paragraph above it records — a number corrected while the list beside it
+    # was not. It is
+    # `a_live_holder_that_proc_calls_dead_keeps_the_topology_lock`
+    # (`crates/tf_tree/tests/rendezvous.rs`, `#[cfg(feature = "unstable")]`),
+    # found by `comm` over the two `nextest list` runs, and it is now in the
+    # list at the top of this comment. The arithmetic and the list agree.
     cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.

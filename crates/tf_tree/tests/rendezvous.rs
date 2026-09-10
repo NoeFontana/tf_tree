@@ -101,8 +101,13 @@ impl Kid {
     /// stops firing, the armed child reaches its park instead of its abort and
     /// the test becomes a 180-second nextest timeout. A timeout says "something
     /// hung"; this says "the site did not fire", which is the actual finding.
-    /// Both new §11.3 tests use it, and both were verified to fail under a
-    /// deliberately disarmed site.
+    /// The two §11.3 tests use it, and both were verified to fail under a
+    /// deliberately disarmed site. **There is a third caller now and it is not a
+    /// §11.3 test** —
+    /// `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`,
+    /// whose child aborts inside its own slot assigner and arms nothing. Named
+    /// because `Self::wait`'s own doc, immediately above, records having gone
+    /// stale in precisely this way.
     ///
     /// **No longer gated on `crash-points`, and the gate was not load-bearing —
     /// it only kept the method from being dead code where the crash sites

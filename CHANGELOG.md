@@ -69,8 +69,12 @@ is a bug.
 - **`Absent` is safe for this arm, and the code now says why in place.** A
   spurious `Absent` cannot produce a second arena beside a live one: it leads to
   §3.4 step 2, where a live owner still holds byte 0, and step 4, which refuses
-  to create while any participant byte is held. The dangerous misfiling is a
-  *local* failure (`ClientSocketSetup`), and that arm is untouched.
+  to create while any participant byte is held — for every policy except
+  `CreatePolicy::Always`, which is written to skip step 4, so the argument is
+  not unconditional and the code says so where it is made. A forced create asked
+  to abandon whatever was there, so this arm does not make it less safe. The
+  dangerous misfiling is a *local* failure (`ClientSocketSetup`), and that arm is
+  untouched.
 - **Tested at both ends, and both tests were run against the mutant.** A unit
   test stages a real `accept(2)` and a close with no reply and pins the error and
   its verdict; `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`

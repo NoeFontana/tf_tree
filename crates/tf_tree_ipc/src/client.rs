@@ -195,7 +195,12 @@ pub fn attach(
     // the arm that must never be wrong.** A spurious `Absent` cannot produce a
     // second arena beside a live one: it leads to §3.4 step 2, where a live
     // owner still holds byte 0 and `try_take_ownership` therefore fails, and to
-    // step 4, which refuses to create while *any* participant byte is held. The
+    // step 4, which refuses to create while *any* participant byte is held —
+    // **under every policy but `CreatePolicy::Always`, which is written to skip
+    // that check** (`open.rs`: `self.create != CreatePolicy::Always &&
+    // lock.any_participant_held()`). A forced create asked to abandon whatever
+    // is there, so it is not made less safe by this arm; but the argument is not
+    // unconditional and a later reader must not quote it as though it were. The
     // dangerous direction is a *local* failure misfiled as `Absent`
     // (`ClientSocketSetup`), and this is not one — the peer answered the
     // `connect` and then went away, which is a fact about the arena.
@@ -321,7 +326,9 @@ fn verdict(e: &IpcError) -> Verdict {
         // `Absent` is safe for the two death arms for the reason `attach` states
         // at the zero-byte check: it leads to §3.4 step 2, where a live owner
         // still holds byte 0, and step 4, which refuses to create while any
-        // participant byte is held — so it cannot produce a second arena.
+        // participant byte is held — so it cannot produce a second arena, for
+        // every policy except `CreatePolicy::Always`, which skips step 4 by
+        // design. See the fuller statement at the zero-byte check in `attach`.
         IpcError::ServerUnreachable { .. }
         | IpcError::HandshakeIo { .. }
         | IpcError::HandshakeClosed => Verdict::Absent,
