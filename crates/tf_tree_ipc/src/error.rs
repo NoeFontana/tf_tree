@@ -556,7 +556,9 @@ impl fmt::Display for IpcError {
                      ownership before the deadline; refusing to create a second arena. The \
                      creator's slot 0 and the ownership byte are both free, which is the case \
                      PHASE2 §3.4's escape hatch is for: CreatePolicy::Always will create a fresh \
-                     arena and abandon this one"
+                     arena and abandon this one — and it needs a layout to create it from, so \
+                     pass Open::layout_if_creating too or the retry fails with `no layout was \
+                     supplied and the arena had to be created` instead"
                 ),
                 // A live holder of the ownership byte blocks the forced create
                 // before it ever reaches the participant bytes it may skip.
