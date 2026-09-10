@@ -556,7 +556,11 @@ impl fmt::Display for IpcError {
                      ownership before the deadline; refusing to create a second arena. The \
                      creator's slot 0 and the ownership byte are both free, which is the case \
                      PHASE2 §3.4's escape hatch is for: CreatePolicy::Always will create a fresh \
-                     arena and abandon this one"
+                     arena and abandon this one — and switching the policy is not the whole call, \
+                     because a create needs a layout to build from and a read-write mode to do it \
+                     in. Through the tf_tree facade that is Open::layout_if_creating and \
+                     AttachMode::ReadWrite; without them the retry fails with a second, different \
+                     error rather than creating"
                 ),
                 // A live holder of the ownership byte blocks the forced create
                 // before it ever reaches the participant bytes it may skip.

@@ -99,7 +99,14 @@ fn a_corrupt_transform_is_caught_by_a_process_that_did_not_write_it() {
 /// assertion fails.
 #[test]
 fn a_run_that_validates_nothing_fails_instead_of_passing() {
-    let out = torture(&["--duration", "3s", "--children", "2", "--readers-only"]);
+    // `--children 4`, not 2: the owner-kill arm is on by default and since
+    // 2026-09-10 refuses a fleet it cannot sustain
+    // (`MIN_ATTACHED_FOR_ORDINARY_KILL + 1`). At 2 this test stopped
+    // exercising its own subject — the parse-time refusal landed first and
+    // the run never reached the vacuity guard, so the assertion below was
+    // reading the wrong failure. The child count is incidental to what this
+    // test is about; `--readers-only` is what makes the run validate nothing.
+    let out = torture(&["--duration", "3s", "--children", "4", "--readers-only"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -132,8 +139,12 @@ fn an_injected_run_that_detects_nothing_says_so() {
     let out = torture(&[
         "--duration",
         "3s",
+        // 4, raised from 2 on 2026-09-10: the owner-kill arm refuses a fleet
+        // below `MIN_ATTACHED_FOR_ORDINARY_KILL + 1`, and below that this test
+        // stopped reaching its own subject — the parse-time refusal landed first,
+        // so the assertion below was reading a failure it did not mean to cause.
         "--children",
-        "2",
+        "4",
         "--readers-only",
         "--inject-violation",
     ]);
@@ -445,8 +456,12 @@ fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
     let out = torture(&[
         "--duration",
         "6s",
+        // 4, raised from 3 on 2026-09-10: the owner-kill arm refuses a fleet
+        // below `MIN_ATTACHED_FOR_ORDINARY_KILL + 1`, and below that this test
+        // stopped reaching its own subject — the parse-time refusal landed first,
+        // so the assertion below was reading a failure it did not mean to cause.
         "--children",
-        "3",
+        "4",
         "--kill-hz",
         "4",
         "--seed",
