@@ -1,8 +1,14 @@
 # 0021: the idle arena is resident because of its alignment, not its design
 
-**Status:** ready
+**Status:** implemented — all five plan steps have landed and been verified,
+step 4 last, on 2026-09-10. Frozen: a correction goes in
+[`decisions/README.md`](./README.md), not here.
 **Owner:** @NoeFontana
-**Implementation:** implemented — `crates/tf_tree_arena/src/heap.rs`, `crates/tf_tree_arena/tests/heap_alignment.rs`
+**Implementation:** `crates/tf_tree_arena/src/heap.rs`,
+`crates/tf_tree_arena/tests/heap_alignment.rs` (steps 1–3);
+`crates/tf_tree_bench/src/baseline.rs`, `crates/tf_tree_bench/src/report.rs`,
+`crates/tf_tree_bench/baseline/results.json` (step 4 — read *Step 4 was not a
+one-line change* below before assuming it was the one line it reads like)
 
 ## Context
 
@@ -229,3 +235,99 @@ touches no read path.
 own pointer, not the offset one. Mutating `Drop` to free `self.ptr` passes all
 four tests natively and aborts under Miri with *"deallocating 0x… which does not
 point to the beginning of an object"* — run, not assumed.
+
+### Step 4 was not a one-line change: the falsifier it names could not fire
+
+**Measured 2026-09-10.** Step 4 above reads *"give `idle_arena_resident_bytes` a
+direction and a tolerance, and regenerate the baseline in the same commit —
+verified by `just bench-check` passing, **and by a deliberate revert of step 2
+making it fail**."* The second half is the important one, and it could not
+happen. A direction on that metric gated **nothing at all**:
+
+* `arena_memory_floor` is a `where_we_are_worse` entry, not a row.
+  `baseline::compare` diffed the **set** of `where_we_are_worse` ids and never
+  looked inside one — `compare_column` was only ever called on a row's `tf_tree`
+  and `tf2` maps. A `Worse` entry's `metrics` were written to the artifact, read
+  by nobody, and compared against nothing.
+* `Report::validate`'s anti-rot rule — *a thing that prints numbers must give at
+  least one of them a direction, or nothing in it can ever be gated* — was
+  written over `self.rows` only. `arena_memory_floor` printed five numbers from
+  the day it was measured and gave none of them a direction, and no check
+  minded.
+* `Comparison::compared_nothing()` did not cover the hole either, and it is
+  instructive why: the *row* `differential_agreement` kept `checked` at 1, so
+  the report was never a zero-comparison run even though this entry contributed
+  nothing. A whole-artifact anti-vacuity check does not catch a per-entry one.
+
+**Run, not argued.** With `HeapArena::new`'s allocation request reverted to
+`from_size_align(len, 64)` — step 2 undone, the idle arena back to ~100%
+resident, `idle_arena_resident_bytes` at **2 412 544 B** — the committed gate on
+`main` printed:
+
+```text
+regression gate against crates/tf_tree_bench/baseline/results.json (PHASE5 §10):
+  PASS — 1 directional metric held.
+```
+
+Exit 0. The defect this record exists to remove passes the gate this record's own
+step 4 says will catch it. That is `docs/PROJECT.md` §6's anti-vacuity smell
+sitting inside the record that names it.
+
+### What step 4 actually took
+
+1. **`baseline::compare` descends into `where_we_are_worse` entries**
+   (`compare_worse`). `parse_metrics` and `compare_column` were keyed on
+   `(row id, column)`; both now take a pre-formatted `what` prefix, so a row
+   column and a §9.3 entry share one spelling of the six diagnostics instead of
+   growing a second.
+2. **`Report::validate` applies the direction rule to `Worse` entries**, and to
+   their tolerances. Scoped to a host whose **memory axis passes**, because
+   `worse_entries` withholds this entry's Pss metrics where Pss cannot be read —
+   and turning "this machine has no `smaps_rollup`" into "there is no artifact"
+   would be a worse answer than the one the rule prevents. The memory axis is
+   the only fitness axis that reaches a `Worse` entry today; a second one belongs
+   in that predicate.
+3. **A missing gated metric classifies its own absence.** A `Worse` entry carries
+   no per-metric sensitivity, so the gate cannot say which axis withheld a
+   number — but the report can say which axes this host failed, and the failure
+   line now quotes that. It stays a **failure** either way: a host-shaped absence
+   downgraded to a note would leave the gate green while it had silently stopped
+   checking, which is the rot `baseline.rs` exists against.
+4. **The tolerance is 300%, and that is not laziness.** `RESIDENCY_SLACK` carries
+   the argument; the short form is that the metric is *six pages* of a
+   whole-process, page-quantised Pss delta, and that CI's `bench-gate` job runs
+   this same comparison on `ubuntu-latest` against a baseline cut here — so this
+   is the **first host-dependent number the gate has ever compared across two
+   machines**, and the band has to cover a different libc or it becomes a gate
+   that fails for the machine. Thirty consecutive runs here returned 24 576 B
+   bit-identically and six more under full CPU load returned the same, so the
+   observed spread is zero and all of the slack is headroom. The failure it
+   guards is 588 pages — **24x the bound** it sets.
+
+**The falsifier, re-run against the finished gate:**
+
+```text
+where_we_are_worse `arena_memory_floor`.idle_arena_resident_bytes regressed:
+  2412544 B against a baseline of 24576 (+9716.7%), past the 300% the baseline
+  allows (bound 98304)
+```
+
+Exit 1. And `just bench-check` on the real tree: **`PASS — 2 directional metrics
+held`**, up from one.
+
+**What regenerating the baseline showed as a side effect.** The committed
+`results.json` was cut on 2026-08-14 under rustc 1.95; the regenerated one is
+2026-09-10 under 1.97.1. Across 27 days, a compiler bump and everything that
+landed between: **not one metric value moved, not one row status moved, and no id
+appeared or vanished.** The only semantic difference in the whole file is this
+record's `drift`/`tolerance` pair. Every other line of the diff is prose the gate
+ignores by construction, plus two provenance keys (`build_lto`,
+`transparent_hugepage_shmem`) added since — neither in `PORTABLE_FACTS`, which is
+why a baseline predating them still compared cleanly.
+
+**Open question 2 is unchanged and now has a gate.** That question asked whether
+`calloc`'s laziness may be relied on or is merely observed, and answered
+*observed — and the report keeps measuring it*. Until now nothing held the
+measurement to anything. `idle_arena_resident_bytes` is that hold, and a libc
+that stops eliding the fill fails it by two orders of magnitude rather than being
+noticed in a year.

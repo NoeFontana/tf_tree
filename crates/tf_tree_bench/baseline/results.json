@@ -1,12 +1,13 @@
 {
   "schema": "tf_tree.bench-report/2",
   "provenance": {
-    "generated_utc": "2026-08-14T03:55:33Z",
+    "generated_utc": "2026-09-10T22:08:00Z",
     "schema": "tf_tree.bench-report/2",
-    "git_commit": "8b1c5b770ad27de83ef15721eb5fc14c501a1238",
+    "git_commit": "00d48d84d97923ca9d8f346c89593c7eaaa9af25",
     "git_dirty": "true",
-    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
     "build_profile": "release",
+    "build_lto": "\"thin\"",
     "target": "x86_64",
     "counters_feature": "true",
     "shm_feature": "false",
@@ -18,10 +19,11 @@
     "physical_cores": "4",
     "logical_cpus": "8",
     "cpu_governor": "unknown",
-    "kernel": "6.8.0-136-generic",
+    "kernel": "6.8.0-138-generic",
     "transparent_hugepage": "always [madvise] never",
+    "transparent_hugepage_shmem": "always within_size advise [never] deny force",
     "perf_event_paranoid": "4",
-    "load_average": "2.80 2.85 2.10 2/371 2731688",
+    "load_average": "1.44 0.69 0.39 1/317 3526418",
     "container": "no",
     "ros_distro": "none (no ROS 2 in this run)",
     "tf2_version": "none — the tf2 columns are UNAVAILABLE, not zero",
@@ -37,7 +39,7 @@
     "core_reason": "4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler",
     "forced": false,
     "consumers": 16,
-    "busy_fraction": 0.04201680672268904,
+    "busy_fraction": 0.012499999999999956,
     "physical_cores": 4,
     "logical_cpus": 8,
     "warmup_discarded_s": 2,
@@ -51,7 +53,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
       "reproduce": "just mp-bench (tf_tree) / just mp-bench-tf2 (both, in the ROS container)",
       "tf_tree": {},
       "tf2": {}
@@ -59,11 +61,11 @@
     {
       "id": "total_rss_n_consumers",
       "title": "Total RSS across N consumers (MB)",
-      "note": "Both stacks, summed Pss from /proc/*/smaps_rollup. Memory is exact even on a loaded machine, so this row's gap is the missing tf2 column, not the host.",
+      "note": "Both stacks, summed Pss from /proc/*/smaps_rollup. Memory is exact even on a loaded machine, so this row's gap is the process count, not the host.",
       "timing_sensitive": false,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "the tf_tree column is measurable here, but the tf2 column needs a ROS 2 install this report cannot reach in-process; running both halves from one tool would mean linking tf2 into it. `just mp-bench-tf2` runs both in the container and prints Pss for each. A one-sided memory row is exactly the thumb on the scale §9.3 warns about, so it is a gap rather than a half-filled row",
+      "reason": "this row sums Pss across N consumer processes, and `bench_report` is one process — it stands up no consumers and has none to weigh. `just mp-bench-tf2` runs both stacks as processes and prints Pss for each; `just dds-bench` does the same over a real DDS. A one-sided memory row is exactly the thumb on the scale §9.3 warns about, so it is a gap rather than a half-filled row. The tf2 column additionally needs a ROS 2 install this build does not have: `tf_tree_bench` was compiled without `--features tf2`",
       "reproduce": "just mp-bench-tf2",
       "tf_tree": {},
       "tf2": {}
@@ -87,7 +89,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. This row also needs the `shm` feature and a second process per consumer, and its tf2 counterpart needs a DDS round trip that no configuration here provides",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. There is a further gap, and it is not the one this reason used to name: nothing in this repository times publish-to-visible end to end. `just dds-bench` is a real DDS round trip — one publisher, N tf2_ros listeners, §5.2's QoS — but `dds_report` reports `svc`, the engine call itself, so its number answers a different question. A cross-process publish additionally goes through the shared-memory backend, and this binary was compiled without `--features shm`",
       "reproduce": "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
       "tf_tree": {},
       "tf2": {}
@@ -99,7 +101,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
       "reproduce": "just tf2-scaling / just shm-scaling, on >= 16 physical cores",
       "tf_tree": {},
       "tf2": {}
@@ -112,7 +114,7 @@
       "needs_n_cores": true,
       "status": "unavailable",
       "reason": "mapping one .tft from sixteen worker processes needs `tf_tree`'s frozen backend, which is `#[cfg(all(feature = \"shm\", target_os = \"linux\"))]` and is therefore not compiled into this binary — `just bench-report` builds without `--features shm`. There is no `Tree::open_frozen` here to call",
-      "reproduce": "just bench-report-shm on >= 16 physical cores, with a .tft built by `tf_tree freeze --from-bag` from a representative recording",
+      "reproduce": "just gate4 (the Rust worker, which is what §12 criterion 4 is stated over; `just gate4-python` reports the same measurement with a CPython worker and does not gate)",
       "tf_tree": {},
       "tf2": {}
     },
@@ -123,7 +125,7 @@
       "timing_sensitive": true,
       "needs_n_cores": false,
       "status": "unavailable",
-      "reason": "timing `Tree::open_frozen` against a 233 MB index needs `tf_tree`'s frozen backend, which is `#[cfg(all(feature = \"shm\", target_os = \"linux\"))]` and is therefore not compiled into this binary — `just bench-report` builds without `--features shm`. There is no `Tree::open_frozen` here to call",
+      "reason": "timing `Tree::open_frozen` against a 233 MB index needs `tf_tree`'s frozen backend, which is `#[cfg(all(feature = \"shm\", target_os = \"linux\"))]` and is therefore not compiled into this binary — `just bench-report` builds without `--features shm`. There is no `Tree::open_frozen` here to call. The comparison itself is what is missing: the open time and an ingest time both have recipes, but no artifact holds them over one recording — the gated `.tft` is frozen from a generated fleet and was never a bag — so there is still nothing to divide the open time by",
       "reproduce": "just bench-report-shm against a .tft built by `tf_tree freeze --from-bag` from a recording large enough to produce §12 gate 2's 233 MB index",
       "tf_tree": {},
       "tf2": {}
@@ -155,7 +157,7 @@
     {
       "id": "lookup_ratio_vs_tf2",
       "title": "Depth-3 hot lookup, tf_tree vs tf2 (paired ratio)",
-      "note": "Both engines in one process, `LerpSlerp` on both sides (tf2's policy), depth 3 after constant folding, 256 off-grid stamps. `speedup_vs_tf2` is the MEDIAN PER-ROUND quotient, not the quotient of the two medians: the arms are timed back to back inside every round and the leading arm alternates, so drift common to both cancels and no arm always gets the colder cache. That pairing is what makes this resolvable where an absolute is not. The two engines are checked to agree on every stamp before either is timed. **The tf2 column goes through `tf_tree_tf2_sys` and therefore FLATTERS tf_tree** by the residual FFI boundary, ~21 ns / 8% at this depth; the binding-free comparison is `docker/tf2/native_scaling.cpp` and its headline is 2.7x. The floor is set well under both for that reason: this row catches an engine regression, it does not publish the headline. `ns_per_lookup` on either side is REPORTED, NEVER GATED — it is an absolute duration and this host cannot claim one. Single-threaded and uncontended, which is both engines' best case; the contended comparison, where tf2 anti-scales, is `just tf2-scaling`.",
+      "note": "Both engines in one process, `LerpSlerp` on both sides (tf2's policy), depth 3 after constant folding, 256 off-grid stamps. `speedup_vs_tf2` is the MEDIAN PER-ROUND quotient, not the quotient of the two medians: the arms are timed back to back inside every round and the leading arm alternates, so drift common to both cancels and no arm always gets the colder cache. That pairing is what makes this resolvable where an absolute is not. The two engines are checked to agree on every stamp before either is timed. **The tf2 column goes through `tf_tree_tf2_sys` and therefore FLATTERS tf_tree** by the residual FFI boundary, 45.3 ns / 10% at this depth (498.2 ns through the binding against 452.9 ns native — this figure used to read `~21 ns / 8%` here, which `docs/benchmarks/tf2.md` withdrew for having no derivation); the binding-free comparison is `docker/tf2/native_scaling.cpp` and its headline is 2.7x. The floor is set well under both for that reason: this row catches an engine regression, it does not publish the headline. **The floor speaks for the build in this report's `build_profile` / `build_lto` provenance fields, and `just tf2-bench-check` sets those to `release` / `\"thin\"` — NOT to what a consumer compiles, which is cargo's release defaults (no LTO) and measures 244 ns rather than 202 on this arm, a paired 2.07x rather than 2.49x. `just tf2-ratio-profiles` is that measurement.** That build is not a hypothetical and not an approximation: `[profile.*]` is honoured only in a workspace root, and the published crates declare none, so `cargo add tf_tree` AND `cargo install tf_tree_cli` both get `lto = false, codegen-units = 16` — `[profile.embedder]` on both knobs. **The 2.49x is reachable only by building inside this repository.** `docs/decisions/0025` is why there is nevertheless no second gated row for it, and the reason is a measurement rather than a preference: across three repeats the consumer median is stable (2.047-2.088) but its BAND STRADDLES THE FLOOR in two of the three, so `ratio.rs` returns `Unresolved` there. A threshold cannot be derived from a band that contains it, and one chosen low enough to pass would be a gate that always passes — worse than no gate, because it reads as evidence. With the binding bias above removed as well the consumer estimate is ~1.80x, under the floor; that is `UNBIASED_ESTIMATE_DEFAULT_RELEASE`, it is `pub` so a reader can reach it, and `ratio.rs`'s FLOOR doc comment is why it does not move the constant. `ns_per_lookup` on either side is REPORTED, NEVER GATED — it is an absolute duration and this host cannot claim one. Single-threaded and uncontended, which is both engines' best case; the contended comparison, where tf2 anti-scales, is `just tf2-scaling`.",
       "timing_sensitive": false,
       "needs_n_cores": false,
       "status": "unavailable",
@@ -170,25 +172,29 @@
       "id": "arena_memory_floor",
       "topic": "Arena memory floor",
       "statement": "A tf_tree arena is fixed-capacity and allocated up front, so an idle tree reserves its full size from the first second. A tf2 BufferCore starts near empty and grows into whatever the stream actually contains, so on a robot that publishes far less than it declared, tf2 reserves less and tf_tree is simply worse. The figure is for 64 frames, 64 edge slots and 32768 sample slots. `idle_arena_bytes` is arithmetic on the layout — what the arena *reserves* — and does not depend on this host. `idle_arena_resident_bytes` is the measured Pss an idle arena of that geometry actually costs, and it is now 1.0% of what the arena reserves (24576 B held against 2408384 B reserved by the arena actually built). **This row used to say the opposite.** The measurement was added expecting the resident figure to come out far below the reserved one, found the arena ~100% resident instead, and stood on that. Decision 0021 then found the cause — `HeapArena` asked the allocator for 64-byte alignment (`PoseSlot` is one cache line), and Rust's `alloc_zeroed` reaches `calloc` only at alignment <= 16, falling back above it to `posix_memalign` plus an explicit zero-fill that touches every page. The arena is now over-allocated at 16 and aligned to 64 by hand, so `calloc` returns demand-faulted pages the kernel already guarantees to be zero. The reservation is unchanged and this entry stands on the reservation: address space is still a cost tf2 does not pay, a fixed-capacity arena still cannot grow, and a machine under strict overcommit is still constrained. What is gone is the *residency*. `idle_arena_resident_bytes` is a delta of a *whole-process* Pss counter across building one tree, quantised to 4 KiB pages, so it also carries the tree's own non-arena allocations — which is most of what is left. The order of magnitude is the finding; the third digit is not.",
-      "metrics": {"idle_arena_bytes": {"value": 2405696, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_mib": {"value": 2.29425048828125, "unit": "MiB", "drift": "informational", "tolerance": 0}, "idle_arena_resident_bytes": {"value": 24576, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_measured_reserved_bytes": {"value": 2408384, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_resident_fraction": {"value": 0.010204352794238793, "unit": "of measured reserved", "drift": "informational", "tolerance": 0}}
+      "metrics": {"idle_arena_bytes": {"value": 2405696, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_mib": {"value": 2.29425048828125, "unit": "MiB", "drift": "informational", "tolerance": 0}, "idle_arena_resident_bytes": {"value": 24576, "unit": "B", "drift": "lower_is_better", "tolerance": 1}, "idle_arena_measured_reserved_bytes": {"value": 2408384, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_resident_fraction": {"value": 0.010204352794238793, "unit": "of measured reserved", "drift": "informational", "tolerance": 0}},
+      "metrics_absent_because": null
     },
     {
       "id": "attach_latency",
       "topic": "Attach latency",
-      "statement": "Joining a live arena is a rendezvous: open the runtime directory, take the lock file, receive the segment fd over a unix socket, map it, and validate the header. A tf2 consumer constructs a buffer in-process and is ready immediately. The cost is paid once per process, but it is real, and it is a cost tf2 does not have.",
-      "metrics": {}
+      "statement": "Joining a live arena is a rendezvous: open the runtime directory, take the lock file, receive the segment fd over a unix socket, map it, and validate the header. A tf2 consumer constructs a buffer in-process and is ready immediately. The cost is paid once per process, but it is real, and it is a cost tf2 does not have. **Measured on the §11.1 fixture** (`just attach-bench`, 201 attach/lookup cycles, ReadOnly). This entry carried no number at all until it was built, which made it an honesty section that could not regress. **The number improved seven- to eightfold, and that must not be read as the cost going away.** Attach was 99.8 us p50 on the commit before `docs/decisions/0024` landed — 99 791 ns, that record's own before column — almost all of it `populate_hot`; it is now **12.3-14.2 us p50**, which is 7.0x to 8.1x — `8x` is the best run, not the figure — because `0024` moved ring population out of attach and onto the moment an edge is taken up. The cost *moved*: first plan compile went 550 ns to **66.3-92.3 us p50** on this fixture, whose plan walks essentially every edge. Summed, **100.3 us before** — that is 99 791 + 550 ns, `0024`'s paired before column, and *not* the 97.5 us `docs/PHASE2.md` §12.2 used to carry, which was a different sitting on a different commit and never had 100.3 as its sum — against **79.3-106.4 us after**, per run and paired. On the fixture that gains no memory from the change, a wash. **The after ranges are observed extremes over 28 runs on one busy host, load average 4 to 7, rounded outward — what was seen, not a bound**; §12.2 carries the same spread and the reason for it, and the ranges printed here before these were falsified by the next nine runs. What tf2 does not pay is still what tf2 does not pay; it is now itemised at two line items instead of one, and a reader quoting only the first would be quoting a sevenfold improvement that this fixture did not deliver. §7.1's guarantee holds throughout: the **first** lookup after attach is 130 ns p50 before and 130-170 ns p50 after, indistinguishable from a steady-state one, and the fault *count* is zero. Recompiling a plan whose pages are already resident costs ~1.4 us (1.33 us at `0f17fb8`, 1.36-1.44 us across the sixteen runs since), which bounds the topology-change path — a `reparent` invalidates every cached plan, so that figure is the one standing between a reparent and a fault storm across every reader.",
+      "metrics": {},
+      "metrics_absent_because": "the figure is `just attach-bench`'s: a separate binary that opens a live shared arena over the §11.1 fixture and times the rendezvous. This report is produced in one process that never attaches — there is nothing here to attach *to* — so the number is stated above with its recipe rather than re-measured and gated here. It is a real measurement in the wrong binary, not a missing one."
     },
     {
       "id": "format_bump_cost",
       "topic": "Operational cost of a format bump",
-      "statement": "Every participant shares one arena layout, so a FORMAT_VERSION change (this build: 3) is a fleet-wide, all-at-once restart: mixed versions do not attach, by design. `docs/PHASE5.md` §1 bumps v2 to v3 for exactly this reason — to break it once. tf2 has no shared binary layout and no equivalent event. `tf_tree doctor --explain-version` prints what an operator meeting the refusal needs.",
-      "metrics": {}
+      "statement": "Every participant shares one arena layout, so a FORMAT_VERSION change (this build: 3) is a fleet-wide, all-at-once restart: mixed versions do not attach, by design. `docs/PHASE5.md` §1 bumps v2 to v3 for exactly this reason — to break it once. tf2 has no shared binary layout and no equivalent event. `tf_tree doctor --explain-version` prints what an operator meeting the refusal needs. **This cost is qualitative, and that is a finding rather than an omission** — see below.",
+      "metrics": {},
+      "metrics_absent_because": "this cost is not denominated in nanoseconds or bytes, and no run of this benchmark on any host would produce it. Its units are *participants* and *coordination*: every process sharing an arena must be rebuilt and restarted together, so the quantity is the size of a fleet and the length of the window in which it can all be down — properties of a deployment, not of a machine. There is no distribution to sample either, because the refusal is deterministic and total: a mismatched participant does not attach at all, so there is no latency, no failure rate and no tail to measure. The one number in reach — how long a single participant takes to restart — would be worse than none, because it is precisely the *together* that costs, and quoting a per-process figure would understate it while looking rigorous. What would genuinely quantify this is operating evidence from a deployment that has lived through a bump (how long the fleet was mixed, what it cost to hold it down), which is the same class of evidence `docs/PROJECT.md` D21 gates PHASE7 on and which this project does not have. Until then the honest artifact is the sentence, plus the version this build refuses to attach across, which is stated above."
     },
     {
       "id": "bridge_supervision",
       "topic": "The bridge is another process to supervise",
-      "statement": "The 16 consumers in this comparison read one arena, which somebody has to fill: the ROS 2 ingest bridge is a process that must be started, supervised, restarted and monitored. With tf2 there is no such process — every node subscribes to /tf directly. That is one more thing to page somebody about at 3 a.m., and it is the honest cost of the shared arena.",
-      "metrics": {}
+      "statement": "The 16 consumers in this comparison read one arena, which somebody has to fill: the ROS 2 ingest bridge is a process that must be started, supervised, restarted and monitored. With tf2 there is no such process — every node subscribes to /tf directly. That is one more thing to page somebody about at 3 a.m., and it is the honest cost of the shared arena. **It has been measured, over a real DDS**, by `just dds-bench` — one run, four consumers, a 15 s window, on this project's unpinned host (`docs/benchmarks/tf2.md`, the `tf_tree.processes` arm): the bridge process burns **0.362 s of CPU in 15 s, about 2.4% of one core**, and it burns it whatever N is. Against it a marginal tf_tree consumer costs 0.0186 s and a marginal tf2 listener 0.445 s over the same window, so the supervision cost pays for itself at **roughly one consumer** — the bridge is cheaper than the single tf2 listener it replaces. Two significant figures is what one run of four processes supports. Memory is the half that stays unattributed: `dds_report` sums Pss across an arm and the bridge is the process in it reporting `consumers 0`, so its footprint is inside the arm total (69.51 MiB over five processes, against tf2's 63.15 over four) and is **not** the 6.36 MiB difference — Pss divides a shared page by the number of processes mapping it, and those two arms map from four and five, so the difference is confounded before any bridge exists. **The curve settles what that one point could not.** Run at N = 8, 12 and 16 as well, the arm totals are 113.80/113.96, 168.39/167.41 and 219.06/226.59 MiB (tf_tree/tf2): the sign flips between 4 and 8, the two stacks are indistinguishable from 8 to 12, and by 16 tf_tree is 3.3% ahead. The mechanism is visible in the per-consumer column — tf_tree's marginal consumer falls 17.38 -> 13.69 MiB across the sweep while tf2's stays flat near 14.2 — which is this entry's cost seen from the other side: **one fixed process, amortised.** It is still not an arena result. The `composed` arms put both stacks in one process and differ by only 0.75-1.04 MiB; everything else in those totals is rclcpp and DDS, paid identically per process by both. What the CPU column shows is the operational shape of this trade: a fixed cost you must supervise, bought against a per-consumer cost you do not.",
+      "metrics": {},
+      "metrics_absent_because": "the number above exists, and it belongs to a different artifact. It takes ROS 2, a real DDS and five processes — `just dds-bench`, inside `docker/tf2` — and `bench_report` runs in one process on the host, where `rclcpp` is not linked and `ros/` is not even in the cargo workspace. That is the same reason the `.tft` rows in the table above are `unavailable` rather than guessed. Carrying the figure here as a `Metric` would be worse than leaving it out: metrics in this file are what `crate::baseline` compares run to run on one host, so a constant transcribed from another host's container run would sit in the gate looking measured and never move — a row that cannot regress, in the section whose entire purpose is to be the row that can. `dds_report` gates it where it is produced; this entry states it with its recipe."
     }
   ]
 }

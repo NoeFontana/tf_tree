@@ -18,8 +18,18 @@
 //! | `schema` | `generated_utc`, `git_commit`, `git_dirty` |
 //! | [`PORTABLE_FACTS`] — the build's identity, not the host's | `cpu_model`, `physical_cores`, `logical_cpus`, `kernel`, governor, THP, load |
 //! | the set of row ids, and of `where_we_are_worse` ids | every row's `reason`, `note` and `reproduce` prose |
-//! | each row's *status*, one-directionally (see below) | `host_fitness` |
+//! | each row's *status*, one-directionally (see below) | `host_fitness`, except as the *explanation* attached to a missing metric |
 //! | directional metric values inside rows both sides call `measured` | metrics whose `drift` is `informational` |
+//! | directional metric values inside `where_we_are_worse` entries | a `where_we_are_worse` entry's `statement` and `metrics_absent_because` prose |
+//!
+//! **The last row is the one that was missing.** Until it existed the
+//! comparison read a `where_we_are_worse` entry's *id* and nothing inside it, so
+//! giving one of its metrics a direction and a tolerance gated nothing —
+//! `docs/decisions/0021` step 4 asks for exactly that and names its own
+//! falsifier ("a deliberate revert of step 2 making it fail"), which could not
+//! fire. A `Worse` entry has no `status`, so there is no measured/unmeasured
+//! gate in front of its metrics the way there is for a row; the direction on the
+//! metric is the whole contract.
 //!
 //! The prose is ignored on purpose. `reason` strings embed measured host facts
 //! ("4 physical cores for 16 consumers"), so comparing them would make the gate
@@ -289,12 +299,72 @@ pub fn compare(baseline: &Value, current: &Report) -> Result<Comparison> {
         }
 
         for (column, cur_metrics) in [("tf_tree", &cur.tf_tree), ("tf2", &cur.tf2)] {
-            let b_metrics = parse_metrics(b_row, column, id)?;
-            compare_column(id, column, &b_metrics, cur_metrics, &mut out);
+            let what = format!("row `{id}`.{column}");
+            let b_metrics = parse_metrics(b_row, column, &what)?;
+            compare_metrics(&what, &b_metrics, cur_metrics, "", &mut out);
         }
     }
 
+    compare_worse(baseline, current, &mut out)?;
+
     Ok(out)
+}
+
+/// Compare the `where_we_are_worse` entries' **metrics**.
+///
+/// Split out because it is the half of §9.3 the gate could not see. Until this
+/// existed, [`compare`] compared the *set* of entry ids and nothing inside them
+/// — so a `where_we_are_worse` metric given a direction and a tolerance gated
+/// nothing at all, and the falsifier
+/// [`0021`](../../../docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md)
+/// step 4 names for itself ("a deliberate revert of step 2 making it fail")
+/// could not fail. An honesty section whose numbers cannot regress is the same
+/// defect [`crate::report::Worse::metrics_absent_because`] closes one level up.
+///
+/// The entry ids are already diffed by the caller, so a missing entry is not
+/// reported twice here.
+fn compare_worse(baseline: &Value, current: &Report, out: &mut Comparison) -> Result<()> {
+    let Some(b_worse) = baseline.get("where_we_are_worse").and_then(Value::as_array) else {
+        // The caller has already failed on this; reaching here means the array
+        // exists.
+        return Ok(());
+    };
+    // Why a metric could be absent, stated from *this* report rather than
+    // guessed. `Worse` entries carry no per-metric sensitivity, so the gate
+    // cannot say which axis withheld a number — but the report can say which
+    // axes this host failed, and that is what a reader meeting the failure
+    // needs. The memory axis is the one that reaches these entries today
+    // (`arena_memory_floor`'s Pss figures are guarded by it in
+    // `crate::report`), and it fails only on a debug build — already a
+    // `build_profile` mismatch above — or an unreadable
+    // `/proc/self/smaps_rollup`, which is a host that cannot run this half of
+    // the gate at all rather than a host on which the code got worse.
+    let absence_context = if current.fitness.fair_for_memory {
+        String::from(
+            ". This build's memory axis PASSED, so the host could have measured it: the              absence is the code's, not this machine's",
+        )
+    } else {
+        format!(
+            ". This build's memory axis FAILED, so the absence may be this host rather              than the code — it reports: {}",
+            if current.fitness.memory_reasons.is_empty() {
+                String::from("(no reason recorded, which is itself a bug)")
+            } else {
+                current.fitness.memory_reasons.join("; ")
+            }
+        )
+    };
+    for b_entry in b_worse {
+        let Some(id) = b_entry.get("id").and_then(Value::as_str) else {
+            bail!("a baseline `where_we_are_worse` entry has no `id`");
+        };
+        let Some(cur) = current.worse.iter().find(|w| w.id == id) else {
+            continue; // Already reported by `diff_ids`.
+        };
+        let what = format!("where_we_are_worse `{id}`");
+        let b_metrics = parse_metrics(b_entry, "metrics", &what)?;
+        compare_metrics(&what, &b_metrics, &cur.metrics, &absence_context, out);
+    }
+    Ok(())
 }
 
 /// Report ids present on one side and not the other.
@@ -317,12 +387,21 @@ fn diff_ids(what: &str, baseline: &[&str], current: &[&str], out: &mut Compariso
     }
 }
 
-/// Pull one column's metrics out of a baseline row.
-fn parse_metrics(row: &Value, column: &str, id: &str) -> Result<BTreeMap<String, BaselineMetric>> {
-    let obj = row
-        .get(column)
+/// Pull one metric map out of a baseline entry.
+///
+/// `field` is the object to read (`tf_tree`/`tf2` on a row, `metrics` on a
+/// `where_we_are_worse` entry) and `what` is how that map is named in every
+/// message this produces — already formatted by the caller, so the two kinds of
+/// container do not each need their own spelling of the same six diagnostics.
+fn parse_metrics(
+    entry: &Value,
+    field: &str,
+    what: &str,
+) -> Result<BTreeMap<String, BaselineMetric>> {
+    let obj = entry
+        .get(field)
         .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("baseline row `{id}` has no `{column}` object"))?;
+        .ok_or_else(|| anyhow!("baseline {what} has no `{field}` object"))?;
     let mut out = BTreeMap::new();
     for (key, v) in obj {
         // A `null` value is how the writer emits a non-finite number. It cannot
@@ -334,12 +413,12 @@ fn parse_metrics(row: &Value, column: &str, id: &str) -> Result<BTreeMap<String,
             Some("higher_is_better") => Drift::HigherIsBetter,
             Some("informational") => Drift::Informational,
             Some(other) => bail!(
-                "baseline row `{id}`.{column}.{key} has drift `{other}`, which this build \
-                 does not know how to compare"
+                "baseline {what}.{key} has drift `{other}`, which this build does not know \
+                 how to compare"
             ),
             None => bail!(
-                "baseline row `{id}`.{column}.{key} records no `drift`; it predates this \
-                 gate and must be regenerated"
+                "baseline {what}.{key} records no `drift`; it predates this gate and must \
+                 be regenerated"
             ),
         };
         let tolerance = v
@@ -358,25 +437,35 @@ fn parse_metrics(row: &Value, column: &str, id: &str) -> Result<BTreeMap<String,
     Ok(out)
 }
 
-/// Compare one column of one row.
-fn compare_column(
-    id: &str,
-    column: &str,
+/// Compare one metric map — a row column, or a `where_we_are_worse` entry's
+/// `metrics`.
+///
+/// `what` names the map in every message; `absence_context` is appended to the
+/// one message that reports a **gated metric this build no longer emits**, and
+/// it exists to classify that failure rather than to soften it. A metric can
+/// vanish because the code stopped producing it or because this host cannot
+/// measure it, and the two want different reactions from whoever reads the
+/// line. It stays a failure either way: a host-shaped absence that only made a
+/// note would leave the gate green while it silently stopped checking, which is
+/// the rot this module exists against.
+fn compare_metrics(
+    what: &str,
     baseline: &BTreeMap<String, BaselineMetric>,
     current: &[Metric],
+    absence_context: &str,
     out: &mut Comparison,
 ) {
     for (key, b) in baseline {
         let Some(c) = current.iter().find(|m| m.key == key) else {
             out.failures.push(format!(
-                "row `{id}`.{column} no longer emits `{key}`, which the baseline gates"
+                "{what} no longer emits `{key}`, which the baseline gates{absence_context}"
             ));
             continue;
         };
         if b.drift != c.drift {
             out.failures.push(format!(
-                "row `{id}`.{column}.{key} changed direction: baseline `{}`, this build \
-                 `{}`. One of the two is wrong about what an improvement looks like",
+                "{what}.{key} changed direction: baseline `{}`, this build `{}`. One of \
+                 the two is wrong about what an improvement looks like",
                 b.drift.as_str(),
                 c.drift.as_str()
             ));
@@ -387,14 +476,14 @@ fn compare_column(
         }
         if !b.value.is_finite() || !b.tolerance.is_finite() {
             out.failures.push(format!(
-                "row `{id}`.{column}.{key} is directional in the baseline but its value or \
-                 tolerance is not a finite number, so nothing can be compared"
+                "{what}.{key} is directional in the baseline but its value or tolerance \
+                 is not a finite number, so nothing can be compared"
             ));
             continue;
         }
         if !c.value.is_finite() {
             out.failures.push(format!(
-                "row `{id}`.{column}.{key} is {} here against a baseline of {}",
+                "{what}.{key} is {} here against a baseline of {}",
                 c.value, b.value
             ));
             continue;
@@ -415,8 +504,8 @@ fn compare_column(
                 format!("{:+.1}%", (c.value - b.value) / b.value.abs() * 100.0)
             };
             out.failures.push(format!(
-                "row `{id}`.{column}.{key} regressed: {} {} against a baseline of {} \
-                 ({pct}), past the {:.0}% the baseline allows (bound {bound})",
+                "{what}.{key} regressed: {} {} against a baseline of {} ({pct}), past \
+                 the {:.0}% the baseline allows (bound {bound})",
                 c.value,
                 c.unit,
                 b.value,
@@ -429,8 +518,8 @@ fn compare_column(
     for c in current {
         if !baseline.contains_key(c.key) && c.drift != Drift::Informational {
             out.failures.push(format!(
-                "row `{id}`.{column} emits a new directional metric `{}` that the baseline \
-                 does not gate; regenerate the baseline",
+                "{what} emits a new directional metric `{}` that the baseline does not \
+                 gate; regenerate the baseline",
                 c.key
             ));
         }
@@ -972,6 +1061,155 @@ mod tests {
         assert!(
             err.to_string().contains("must be regenerated"),
             "got: {err}"
+        );
+    }
+
+    /// A `where_we_are_worse` entry with one directional metric, and its
+    /// baseline.
+    ///
+    /// Deliberately built out of the same [`report_with`] the row tests use, so
+    /// the row and the entry are compared in one document and a fix that reaches
+    /// only one of them is visible.
+    fn report_with_worse(row_value: f64, worse_value: f64, tolerance: f64) -> Report {
+        let mut r = report_tuned(row_value, false, 0.10);
+        r.worse = vec![crate::report::Worse {
+            id: "arena_memory_floor",
+            topic: "Arena memory floor",
+            statement: "an idle arena reserves its whole size".to_owned(),
+            metrics: vec![
+                crate::report::Metric::new("idle_arena_bytes", 2_405_696.0, "B"),
+                crate::report::Metric::new("idle_arena_resident_bytes", worse_value, "B")
+                    .lower_is_better(tolerance),
+            ],
+            metrics_absent_because: None,
+        }];
+        r
+    }
+
+    /// **The defect `docs/decisions/0021` step 4 walked into.** A directional
+    /// metric inside a `where_we_are_worse` entry is compared, and a regression
+    /// in one fails the gate.
+    ///
+    /// Until [`compare_worse`] existed, [`compare`] read a `where_we_are_worse`
+    /// entry's *id* and nothing inside it, so `0021`'s own falsifier — "a
+    /// deliberate revert of step 2 making it fail" — could not fire. That was
+    /// measured through the binary, not argued: with the alignment fix reverted
+    /// the idle arena goes back to ~100% resident and `just bench-check` printed
+    /// `PASS - 1 directional metric held`.
+    ///
+    /// Mutant (applied, confirmed fatal): delete the `compare_worse(...)` call
+    /// in [`compare`] — the 4x growth below then passes and `checked` is 1
+    /// instead of 2, failing both halves.
+    #[test]
+    fn a_directional_metric_inside_a_worse_entry_is_gated() {
+        let base = baseline_of(&report_with_worse(100.0, 24_576.0, 3.0));
+
+        // The row's own metric is unchanged throughout, so every verdict below
+        // is about the entry.
+        let identical = compare(&base, &report_with_worse(100.0, 24_576.0, 3.0)).expect("baseline");
+        assert!(identical.passed(), "identical: {:?}", identical.failures);
+        assert_eq!(
+            identical.checked, 2,
+            "the row's metric and the entry's must both be compared, not just the row's"
+        );
+
+        // Inside the 300% band the real gate uses.
+        let within = compare(&base, &report_with_worse(100.0, 90_000.0, 3.0)).expect("baseline");
+        assert!(
+            within.passed(),
+            "3.7x under a 4x bound: {:?}",
+            within.failures
+        );
+
+        // Past it. 98x is what a revert of `0021` step 2 actually produces.
+        let over = compare(&base, &report_with_worse(100.0, 2_408_448.0, 3.0)).expect("baseline");
+        assert!(!over.passed(), "a 98x residency regression passed the gate");
+        assert!(
+            over.failures.iter().any(|f| {
+                f.contains("where_we_are_worse `arena_memory_floor`")
+                    && f.contains("idle_arena_resident_bytes")
+                    && f.contains("regressed")
+            }),
+            "the failure must name the entry and the metric: {:?}",
+            over.failures
+        );
+    }
+
+    /// A gated metric this build no longer emits is a failure, and the failure
+    /// **classifies itself** against the report's own memory axis.
+    ///
+    /// "The code stopped producing it" and "this host cannot measure it" want
+    /// different reactions from whoever reads the line, and a `Worse` entry
+    /// carries no per-metric sensitivity for the gate to read — so the report's
+    /// axis verdict is what the message quotes. It stays a failure either way:
+    /// a host-shaped absence that only made a note would leave the gate green
+    /// while it had silently stopped checking.
+    ///
+    /// Mutant (applied, confirmed fatal): drop `absence_context` from
+    /// [`compare_metrics`]'s missing-metric message — both halves below still
+    /// fail the gate, and both `contains` assertions fail.
+    #[test]
+    fn a_withheld_worse_metric_fails_and_names_which_kind_of_absence_it_is() {
+        let base = baseline_of(&report_with_worse(100.0, 24_576.0, 3.0));
+
+        let mut gone = report_with_worse(100.0, 24_576.0, 3.0);
+        gone.worse[0]
+            .metrics
+            .retain(|m| m.key != "idle_arena_resident_bytes");
+        gone.fitness.fair_for_memory = true;
+        let c = compare(&base, &gone).expect("baseline");
+        assert!(!c.passed(), "a gated metric vanished and the gate passed");
+        assert!(
+            c.failures
+                .iter()
+                .any(|f| f.contains("no longer emits") && f.contains("memory axis PASSED")),
+            "a host that could measure it must be told the absence is the code's: {:?}",
+            c.failures
+        );
+
+        let mut gone_unfit = gone.clone();
+        gone_unfit.fitness.fair_for_memory = false;
+        gone_unfit.fitness.memory_reasons =
+            vec!["/proc/self/smaps_rollup is unreadable".to_owned()];
+        let c = compare(&base, &gone_unfit).expect("baseline");
+        assert!(!c.passed(), "still a failure: the gate stopped checking");
+        assert!(
+            c.failures.iter().any(|f| {
+                f.contains("memory axis FAILED") && f.contains("smaps_rollup is unreadable")
+            }),
+            "a host that could not measure it must be told so, with the reason: {:?}",
+            c.failures
+        );
+    }
+
+    /// A `where_we_are_worse` entry present in both documents but carrying no
+    /// directional metric in the baseline is not silently "compared".
+    ///
+    /// This is the state the committed baseline was in for the whole life of the
+    /// `arena_memory_floor` entry, and it is why
+    /// [`Comparison::compared_nothing`] did not catch the hole: the *row*
+    /// `differential_agreement` kept `checked` at 1, so the report was never
+    /// zero-comparison even though this entry contributed nothing.
+    ///
+    /// Mutant (applied, confirmed fatal): make [`compare_metrics`] count an
+    /// informational metric into `out.checked` — the assertion below reads 2.
+    #[test]
+    fn an_all_informational_worse_entry_contributes_no_comparison() {
+        let mut r = report_with_worse(100.0, 24_576.0, 3.0);
+        // Exactly what the committed baseline held before `0021` step 4.
+        r.worse[0].metrics = vec![
+            crate::report::Metric::new("idle_arena_bytes", 2_405_696.0, "B"),
+            crate::report::Metric::new("idle_arena_resident_bytes", 24_576.0, "B"),
+        ];
+        let c = compare(&baseline_of(&r), &r).expect("baseline");
+        assert!(
+            c.passed(),
+            "informational metrics cannot fail: {:?}",
+            c.failures
+        );
+        assert_eq!(
+            c.checked, 1,
+            "only the row's metric is a comparison; the entry's two are context"
         );
     }
 }
