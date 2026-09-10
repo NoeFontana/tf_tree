@@ -2756,9 +2756,21 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
 #
 # Longer and gentler than the plain soak on purpose: a high kill rate wins the
 # race against the site more often than not. **It runs nightly** in
-# `.github/workflows/nightly.yml`'s `crash-points` job; until 2026-09-04 it ran
-# in no workflow at all, so §11.4's crash-point clause was measured only by
-# whoever remembered to type this.
+# `.github/workflows/nightly.yml`'s `crash-points` job; until **2026-09-06** it
+# ran in no workflow at all, so §11.4's crash-point clause was measured only by
+# whoever remembered to type this. *This comment read 2026-09-04*, which is the
+# date the recipe's refusals were added and not the date it was wired to a job:
+# `git log -S'shm-torture-crash-points' -- .github/workflows/nightly.yml` names
+# only `beabc3f`, and `beabc3f~1`'s workflow file contains no `crash` at all.
+#
+# **Its first three nightly runs (2026-09-07/08/09) all failed, so it has never
+# been green**, and the cause was not this recipe: the harness drove its own
+# eligible-heir population to zero while the ownership role was vacant, which is
+# an absorbing state. `kill_the_owner` censuses for a second eligible heir and
+# defers rather than killing the last one, and the ordinary victim draw no longer
+# takes the role holder — see `shm_torture.rs`. An armed abort at
+# `takeover.after_ownership_lock_before_bind` is what made this recipe reach the
+# state first: it destroys an attached heir at the one instant the role is vacant.
 shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
     cargo build --release --features shm,crash-points -p tf_tree_bench --bin shm_torture
     ./target/release/shm_torture --crash-points {{ARGS}}

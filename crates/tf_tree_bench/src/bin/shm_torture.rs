@@ -311,6 +311,57 @@ mod imp {
     /// nothing inherited at all — never recovers however long it waits.
     const OWNER_RECOVERY_DEADLINE: Duration = Duration::from_secs(10);
 
+    /// Operations one attachment performs before detaching and re-joining, so
+    /// no single lucky survivor holds the arena for a whole run.
+    const OPS_PER_ATTACHMENT: u32 = 2_000;
+
+    /// How many times the operation cap may be extended for a process that is
+    /// serving the rendezvous.
+    ///
+    /// Bounded rather than infinite: the predicate is the harness's own
+    /// `owner.pid` marker, and a marker that somehow named a live process which
+    /// was no longer serving would otherwise pin one child in its work loop for
+    /// the rest of the run. Ten extensions is 20 000 operations, comfortably
+    /// longer than any owner-kill interval this harness is run at, so in
+    /// practice the driver's `SIGKILL` arrives first — which is the intent.
+    const MAX_OWNER_CAP_EXTENSIONS: u32 = 10;
+
+    /// The attached read-write population below which the **ordinary** victim
+    /// draw stops taking anybody.
+    ///
+    /// Three, so that a kill still leaves the role holder plus one eligible
+    /// heir. That is the same precondition [`kill_the_owner`] censuses for, and
+    /// the reason it has to be enforced here too is that the two arms draw from
+    /// one pool: sparing the role holder is not enough if the ordinary draw is
+    /// free to take the fleet down to it.
+    ///
+    /// **Measured, not chosen.** With this floor absent, `--children 6
+    /// --kill-hz 6` runs clean (18 owner kills, 18 inheritances, 0 deferrals)
+    /// while `--children 4 --kill-hz 4` — the `shm-torture-asan` job's own
+    /// arguments — reaches zero attached participants inside 13 s: four workers
+    /// at 4 Hz means each survivor is drawn faster than a replacement can
+    /// `fork` and finish its handshake. Those parameters were viable before the
+    /// owner became a child, because the driver owned the arena and a
+    /// replacement could therefore always rejoin; they stopped being viable
+    /// when the role moved into the killable pool, and nothing said so.
+    ///
+    /// Skipped draws are counted and printed. A floor that silently throttled
+    /// the kill rate would be a gate quietly doing less than it claims.
+    const MIN_ATTACHED_FOR_ORDINARY_KILL: u64 = 3;
+
+    /// How many owner kills in a row may be deferred for want of a second
+    /// eligible heir before the run calls it a wedge.
+    ///
+    /// Three, not one: a single interval can legitimately catch the fleet mid
+    /// churn — a replacement is `fork`ed at the top of a round and still has a
+    /// handshake to finish — and failing on that would be a harness that fails
+    /// on its own scheduling. Three consecutive intervals is `3 × --owner-kill-
+    /// every` (24 s at the default) with no second participant ever attached,
+    /// which is not churn. It is deliberately a small number: the cost of being
+    /// wrong in this direction is one red run naming the population, and the
+    /// cost of being wrong in the other is a green run over a dead arena.
+    const MAX_CONSECUTIVE_DEFERRALS: usize = 3;
+
     /// How often the observer reads while a migration is in flight.
     ///
     /// **Throttled on purpose.** Each observation is a round, and the run-level
@@ -1078,6 +1129,26 @@ mod imp {
         counts
     }
 
+    /// [`trigger_tally`] as the one line both readers print.
+    ///
+    /// Two callers need this text — the teardown summary and the fail-fast
+    /// wedge report — and a second spelling of it would be a second spelling of
+    /// the run's own verdict (`docs/PROJECT.md` §6). The empty case is a
+    /// sentence rather than an empty string because *"no survivor ever
+    /// evaluated the trigger"* is the fact that separates a population
+    /// condition from an engine refusal.
+    fn trigger_tally_line(dir: &Path) -> String {
+        let counts = trigger_tally(dir);
+        if counts.is_empty() {
+            return "none recorded — no survivor ever evaluated the trigger".to_string();
+        }
+        counts
+            .iter()
+            .map(|(tag, n)| format!("{tag}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn inheritance_count(dir: &Path) -> usize {
         std::fs::read_to_string(inherited_path(dir))
             .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
@@ -1361,6 +1432,26 @@ mod imp {
 
         let deadline = Instant::now() + a.duration;
         let mut kills = 0usize;
+        // How many ordinary victim draws landed on the current role holder and
+        // were skipped. Reported rather than absorbed — see the draw itself.
+        let mut role_holder_draws_skipped = 0usize;
+        // How many owner kills were deferred for want of a second eligible
+        // heir. Reported for the same reason.
+        let mut owner_kills_deferred = 0usize;
+        // Deferrals since the last kill that actually happened. A deferral is
+        // meant to be transient; this is what stops it becoming a stall.
+        let mut consecutive_deferrals = 0usize;
+        // Ordinary draws skipped because the attached pool was at its floor.
+        let mut thin_pool_draws_skipped = 0usize;
+        // **A wedge is not a `violations` entry, and putting it there was a
+        // misdiagnosis of exactly the kind this harness exists to prevent.**
+        // `violations` bails as *"the arena is not crash-consistent
+        // (docs/PHASE2.md §12.3 gate 3)"*, which is a claim about the engine's
+        // mutation protocols. "This fleet ran out of attached participants" is a
+        // claim about the *population*, and reporting one as the other is the
+        // `INVALID`-is-not-`FAIL` collapse — a starved host reading as the code
+        // failing its gate. Its own channel, its own verdict.
+        let mut wedge: Option<String> = None;
         let mut reads = Reads::default();
         let mut rounds = 0u64;
         let mut violations = Vec::new();
@@ -1452,20 +1543,170 @@ mod imp {
                     reads.add(m.reads);
                     rounds += m.rounds;
                     println!("{}", m.line());
-                    migrations.push(m);
                     next_owner_kill = Some(Instant::now() + every);
-                    if !violations.is_empty() {
+                    // A deferral is a kill that never happened, so it is not one
+                    // of this run's migrations and must not enter the ledger the
+                    // verdict counts. It is reported through its own tally.
+                    if m.deferred {
+                        owner_kills_deferred += 1;
+                        consecutive_deferrals += 1;
+                        // **A deferral has to clear, or it is the wedge wearing
+                        // a politer name.** Two ways it never clears, and both
+                        // end the run here rather than at the duration:
+                        //
+                        // * `heirs_before == 0` — nothing is attached at all, so
+                        //   there is no heir to wait for. Absorbing on its face.
+                        // * the same deferral repeating past the bound — the
+                        //   population is not recovering between intervals, and
+                        //   waiting longer only buys a quieter log.
+                        //
+                        // Without this the arm reports ten good migrations and
+                        // then stalls, and the `migrations.is_empty()` floor
+                        // cannot fire because those ten were real — a green run
+                        // over an arena that has been dead most of the duration,
+                        // which this file already calls "strictly worse than the
+                        // red one the same wedge produced on CI".
+                        let starved = m.heirs_before == Some(0);
+                        if starved || consecutive_deferrals >= MAX_CONSECUTIVE_DEFERRALS {
+                            wedge = Some(format!(
+                                "owner kill {} could not be attempted and the deferral did not \
+                                 clear: {}. §3.5's trigger outcomes at this instant: {}. \
+                                 Last migration that recovered: {}. Deferrals so far: {}. \
+                                 Elapsed {:.1}s, round {}. A deferral exists so the arm never \
+                                 kills the last eligible heir; one that never clears is the \
+                                 absorbing state itself, and this run stops here rather than \
+                                 spending its remaining duration proving it again.",
+                                m.n,
+                                if starved {
+                                    "zero read-write participants were attached, so there was no \
+                                     heir to wait for — an ownerless arena admits no new one, so \
+                                     the population cannot recover on its own"
+                                } else {
+                                    "the fleet held only the role holder for every attempt in a \
+                                     row, so replacements are not completing their handshake \
+                                     between intervals"
+                                },
+                                trigger_tally_line(&dir),
+                                migrations
+                                    .iter()
+                                    .rev()
+                                    .find(|p| p.recovered.is_some())
+                                    .map_or_else(|| "none".to_string(), |p| p.n.to_string()),
+                                owner_kills_deferred,
+                                started.elapsed().as_secs_f64(),
+                                rounds,
+                            ));
+                        }
+                    } else {
+                        consecutive_deferrals = 0;
+                        // **Stop at the first unrecoverable wedge.**
+                        //
+                        // `recovered.is_none()` with `heirs_at_kill == 0` is
+                        // absorbing by construction, not slow: no attached
+                        // read-write participant remains to inherit, and nothing
+                        // outside can join an ownerless arena to become one. Every
+                        // later round then produces one refusal line per fresh
+                        // child and one `MIGRATION FAILURE` per kill that
+                        // signalled nothing, which is how one event became ~220
+                        // failures and 1054 refusals on CI with the first cause a
+                        // thousand lines above the verdict, printed 28 minutes
+                        // late.
+                        //
+                        // Classified from the census and the trigger tally, never
+                        // from `slots=Nreg/Malive` — that is a run-wide minimum
+                        // and necessarily reads 0 for *both* producers, which the
+                        // field's own comment records.
+                        if m.recovered.is_none() && m.heirs_at_kill == Some(0) {
+                            let tally = trigger_tally_line(&dir);
+                            let engine_refused = tally.contains("err-");
+                            wedge = Some(format!(
+                                "owner kill {} left the arena in an UNRECOVERABLE state, and the \
+                                 run stops here rather than reporting the same failure for every \
+                                 later kill. Classification: {}. Last migration that recovered: \
+                                 {}. Heirs attached at this kill: 0 (first round after: {}). \
+                                 §3.5 trigger outcomes at this instant: {}. Recorded owner pid: \
+                                 {}. Elapsed {:.1}s, round {}. \
+                                 Held participant bytes at the refusal are in the \
+                                 `ArenaHeldButUnreachable` text above, including this driver's \
+                                 own slot — it holds one for the life of the run and never \
+                                 inherits, by design.",
+                                m.n,
+                                if engine_refused {
+                                    "ENGINE — heirs remained and inheritance was refused"
+                                } else {
+                                    "POPULATION — no eligible heir remained to ask, so §3.5's \
+                                     trigger was never answered. This is the state the \
+                                     pre-kill census exists to prevent; reaching it means the \
+                                     census passed and the pool drained inside the vacancy"
+                                },
+                                migrations
+                                    .iter()
+                                    .rev()
+                                    .find(|p| p.recovered.is_some())
+                                    .map_or_else(|| "none".to_string(), |p| p.n.to_string()),
+                                m.heirs_first_round
+                                    .map_or_else(|| "?".to_string(), |c| c.to_string()),
+                                tally,
+                                read_owner_pid(&dir)
+                                    .map_or_else(|| "none".to_string(), |p| p.to_string()),
+                                started.elapsed().as_secs_f64(),
+                                rounds,
+                            ));
+                        }
+                        migrations.push(m);
+                    }
+                    // A wedge ends the run for the same reason a violation does,
+                    // and by a different verdict — see `wedge`'s declaration.
+                    if !violations.is_empty() || wedge.is_some() {
                         break;
                     }
                 }
             }
 
+            // **The ordinary draw does not take the role holder.**
+            //
+            // `kill_the_owner` above is the mechanism that kills an owner, and
+            // it does so having censused the heirs and with a `Migration`
+            // recorded for it. A draw that *also* takes the role holder kills
+            // owners **silently**: the role falls vacant with no migration
+            // recorded, nothing requires it to recover, and — because each such
+            // kill consumes an eligible heir at the worst instant — it is how
+            // the population reached zero while the role was vacant on the
+            // nightly runs from 2026-09-07.
+            //
+            // This does not make the workload gentler. Owners still die on the
+            // arm built to require what §3.5 owes for each death, and after a
+            // migration the heir is an ordinary worker that stays in `kids` and
+            // is drawable again the moment it stops holding the role. What it
+            // removes is an owner death that nothing observes.
+            //
+            // Skipped rather than redrawn, and **counted**: a redraw would keep
+            // the kill rate at the cost of a loop whose bound depends on how
+            // many children hold the role, and a skip nobody reports is a kill
+            // rate that cannot be audited.
+            // **And it does not draw the fleet down to the role holder.**
+            // Sparing the owner is not enough on its own: both arms draw from
+            // one pool, so an ordinary draw that empties it leaves
+            // `kill_the_owner` censusing a fleet of one and deferring forever.
+            // Censused per draw rather than inferred from `--children`, because
+            // what matters is who is *attached* — a replacement is `fork`ed at
+            // the top of a round and is not a participant until its handshake
+            // finishes.
+            let mut pool = RoundHealth::default();
+            census(&observer, &mut pool);
+            let role_holder = read_owner_pid(&dir);
             let victim = rng.below(a.children as u64) as usize;
-            if let Some(kid) = kids[victim].as_mut() {
-                let _ = kid.proc.kill();
-                let _ = kid.proc.wait();
-                kids[victim] = None;
-                kills += 1;
+            if pool.slots_alive < MIN_ATTACHED_FOR_ORDINARY_KILL {
+                thin_pool_draws_skipped += 1;
+            } else if let Some(kid) = kids[victim].as_mut() {
+                if Some(kid.proc.id()) == role_holder {
+                    role_holder_draws_skipped += 1;
+                } else {
+                    let _ = kid.proc.kill();
+                    let _ = kid.proc.wait();
+                    kids[victim] = None;
+                    kills += 1;
+                }
             }
         }
 
@@ -1706,7 +1947,12 @@ mod imp {
         // further down. Reading it there returns an empty tally on every run —
         // which is indistinguishable from the finding it exists to report, "no
         // survivor ever evaluated the trigger". Measured, on the first run.
-        let trigger_outcomes = trigger_tally(&dir);
+        // Formatted here too, not just read here: `trigger_tally_line` reads the
+        // ledger off disk, so calling it at the print site below would return
+        // the empty tally on every run for exactly the reason this comment
+        // gives. Holding the finished `String` is what makes the print site
+        // independent of the directory's lifetime.
+        let trigger_outcomes = trigger_tally_line(&dir);
         drop(scratch);
 
         println!(
@@ -1800,17 +2046,20 @@ mod imp {
             // inherited` with an empty tally is a population that had nobody
             // to ask, and the same line with `contended` or an `err-` tag is
             // the engine refusing heirs that did ask.
+            println!("shm_torture: §3.5 trigger outcomes: {trigger_outcomes}");
+            // Printed unconditionally, including the zeroes. Both of these
+            // *reduce* what the run did — a kill deferred for want of an heir,
+            // and an ordinary draw that spared the role holder — so a run that
+            // reports neither is a run whose kill rate cannot be audited, which
+            // is the shape of a gate quietly doing less than it claims.
             println!(
-                "shm_torture: §3.5 trigger outcomes: {}",
-                if trigger_outcomes.is_empty() {
-                    "none recorded — no survivor ever evaluated the trigger".to_string()
-                } else {
-                    trigger_outcomes
-                        .iter()
-                        .map(|(tag, n)| format!("{tag}={n}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                }
+                "shm_torture: §3.5 owner kills deferred for want of a second eligible heir: {}; \
+                 ordinary victim draws skipped — {} that landed on the role holder, {} against an \
+                 attached pool already at its floor of {}",
+                owner_kills_deferred,
+                role_holder_draws_skipped,
+                thin_pool_draws_skipped,
+                MIN_ATTACHED_FOR_ORDINARY_KILL
             );
             for m in &migrations {
                 if let Some(why) = m.failure() {
@@ -1841,6 +2090,25 @@ mod imp {
                 violations.len()
             );
         }
+        // **After the violations and before everything else.** A corrupt read is
+        // a claim about the engine and outranks this; but a wedge *causes* every
+        // check below it — no fresh process can join, killed children stay out,
+        // the rings freeze, and the read floor and the §3.5 failures all trip as
+        // consequences. Reporting one of those would name a symptom and bury the
+        // cause, which is the mistake this whole verdict path was rewritten to
+        // stop making.
+        //
+        // Deliberately **not** phrased as a §12.3 gate-3 failure: the arena is
+        // not being accused of anything. `docs/PHASE2.md` §11.4's workload
+        // requires a fleet, and this says the fleet stopped existing.
+        if let Some(why) = wedge {
+            bail!(
+                "the run stopped early because the arena became unrecoverable, which is a \
+                 statement about this fleet's population and NOT about the engine's \
+                 crash-consistency (docs/PHASE2.md §12.3 gate 3 is not what failed here):\n  \
+                 {why}"
+            );
+        }
         // **§3.5 before the read floor**, because a migration that did not
         // recover *causes* the floor to trip: no fresh process can join, every
         // killed child stays out, and the rings freeze. Reporting "the observer
@@ -1857,6 +2125,37 @@ mod imp {
                 failed.join("\n  ")
             );
         }
+        // **A run that killed nobody is not §11.4's workload**, and since
+        // 2026-09-10 there are two ways the ordinary draw can decline to kill:
+        // the victim held the rendezvous role, or the attached pool was already
+        // at [`MIN_ATTACHED_FOR_ORDINARY_KILL`]. Both are deliberate and both
+        // *reduce* what the run did, so the floor that makes them auditable has
+        // to exist in the same change that introduced them — an unfailable
+        // throttle is the shape of a gate that quietly stops testing, which is
+        // the defect the rest of this file is about.
+        //
+        // "At least one" rather than a fraction of `duration × --kill-hz`: the
+        // draw is paced against a scheduler on a host that is also running the
+        // fleet, so any ratio here would be a tuned number that expires. The
+        // printed skip tallies are what a reader uses to judge *how much* the
+        // throttle bit; this is only the bound that says the churn happened.
+        if kills == 0 && a.duration >= interval {
+            bail!(
+                "no participant was killed in {:?} at --kill-hz {}, so this run is not \
+                 docs/PHASE2.md §11.4's workload — it validated an arena nobody was tearing \
+                 down. Ordinary draws skipped: {} that landed on the rendezvous role holder, \
+                 {} against an attached pool at its floor of {}. If the second number is \
+                 large the fleet never sustained {} attached participants: raise --children, \
+                 or lower --kill-hz so a replacement finishes its handshake before the next \
+                 draw.",
+                a.duration,
+                a.kill_hz,
+                role_holder_draws_skipped,
+                thin_pool_draws_skipped,
+                MIN_ATTACHED_FOR_ORDINARY_KILL,
+                MIN_ATTACHED_FOR_ORDINARY_KILL
+            );
+        }
         // **A run that never killed the owner must not be quoted as §3.5
         // coverage**, and the only way to know it should have is arithmetic on
         // its own schedule. Silence here was the whole defect: §12.3 gate 3 read
@@ -1867,11 +2166,19 @@ mod imp {
                 bail!(
                     "the owner-kill arm is on and ran {} time(s) in {:?}, which is fewer than \
                      the schedule (first at {:?}, then every {:?}) requires. This run covers \
-                     none of docs/PHASE2.md §3.5 and must not be quoted as if it did.",
+                     none of docs/PHASE2.md §3.5 and must not be quoted as if it did. \
+                     {} owner kill(s) were DEFERRED for want of a second eligible heir — \
+                     deferrals are deliberately not counted as migrations, precisely so that a \
+                     run which deferred every one of them lands here instead of printing PASS \
+                     over an arm that never fired. A nonzero deferral count with zero migrations \
+                     means the fleet never held two read-write participants at once: raise \
+                     `--children`, or lower `--kill-hz` so a replacement finishes its handshake \
+                     before the next draw.",
                     migrations.len(),
                     a.duration,
                     OWNER_KILL_FIRST,
-                    every
+                    every,
+                    owner_kills_deferred
                 );
             }
         }
@@ -2040,6 +2347,47 @@ mod imp {
         reads: Reads,
         rounds: u64,
         read_before: bool,
+        /// The kill was **not performed**, because censusing first showed no
+        /// read-write survivor besides the role holder itself.
+        ///
+        /// §11.3's row for `takeover.after_ownership_lock_before_bind` reads
+        /// *"ownership released; another participant takes over; joiners
+        /// retry"*, and `another participant` is a **precondition**, not an
+        /// outcome. Killing the last eligible heir tests nothing §3.5 claims:
+        /// it produces an arena that is ownerless with no process able to
+        /// inherit and no process able to join, which is absorbing rather than
+        /// slow. So the kill is deferred to the next interval and recorded here.
+        ///
+        /// A deferral is **not** a failure and is **not** a weakened gate — it
+        /// is the difference between
+        /// `a_killed_heir_leaves_the_role_for_the_next_survivor`
+        /// (`crates/tf_tree/tests/rendezvous.rs`), which deliberately keeps a
+        /// second heir attached, and a run that kills the only one. After this,
+        /// a wedge *is* an engine finding and the gate can fail for the right
+        /// reason. The count is printed, because a deferral that happened
+        /// silently would be a kill rate nobody could audit.
+        ///
+        /// **A deferral is transient or it is a wedge, and the caller must
+        /// separate the two.** Deferring indefinitely is not a safe default: the
+        /// first version of this field did exactly that, and on the run that
+        /// introduced it the arm recorded ten healthy migrations and then
+        /// deferred *every* later kill against a population that had reached
+        /// zero — the arena dead for four fifths of the duration, with the
+        /// `migrations.is_empty()` floor unable to fire because those ten were
+        /// real. It converted a loud permanent failure into a silent permanent
+        /// stall. See [`Migration::heirs_before`] and the bound at the call site.
+        deferred: bool,
+        /// Read-write participants attached **before** the kill, the role holder
+        /// included — the census the deferral decision is taken on, and `None`
+        /// when no census ran because the marker named nobody.
+        ///
+        /// `Some(0)` is not a thin fleet, it is the absorbing state itself: no
+        /// attached participant means none can inherit, and an ownerless arena
+        /// admits no new one. `Some(1)` is a fleet holding only the role holder,
+        /// where deferring is the right move *provided the arena is otherwise
+        /// healthy* — which is why the caller bounds how long it may persist
+        /// rather than trusting it to clear.
+        heirs_before: Option<u64>,
         /// Live participants other than this driver's own observer, censused
         /// the instant the victim was reaped — i.e. **the heirs that existed
         /// when the role fell vacant**.
@@ -2077,6 +2425,16 @@ mod imp {
                 ..
             } = self;
             let unknown = || "?".to_string();
+            if self.deferred {
+                return format!(
+                    "shm_torture: §3.5 owner kill {n} DEFERRED: no read-write survivor besides \
+                     the role holder was attached, and §11.3's row for this migration presumes \
+                     one (\"another participant takes over\"). Killing the last eligible heir \
+                     would produce an arena that is ownerless, uninheritable and unjoinable — \
+                     absorbing, not slow — which tests nothing §3.5 claims. Retrying at the \
+                     next interval."
+                );
+            }
             format!(
                 "shm_torture: §3.5 owner kill {n}: killed pid {}; {}; {inherits} survivor(s) \
                  inherited; {} heir(s) attached at the kill, {} on the first round after; the \
@@ -2098,6 +2456,12 @@ mod imp {
         /// `Some(why)` if this migration failed the run.
         fn failure(&self) -> Option<String> {
             let n = self.n;
+            // Checked before `victim`, which a deferral also leaves `None`. A
+            // deferred kill is a migration that was never attempted, so there
+            // is nothing for §3.5 to owe and nothing here to fail.
+            if self.deferred {
+                return None;
+            }
             if self.victim.is_none() {
                 return Some(format!(
                     "owner kill {n}: the recorded owner pid names no live process of this \
@@ -2191,11 +2555,46 @@ mod imp {
             read_before,
             heirs_at_kill: None,
             heirs_first_round: None,
+            deferred: false,
+            heirs_before: None,
         };
         let before = inheritance_count(dir);
         let Some(pid) = read_owner_pid(dir) else {
             return m;
         };
+
+        // **§3.5's precondition is established, not raced for.**
+        //
+        // §11.3's row for `takeover.after_ownership_lock_before_bind` is
+        // *"ownership released; another participant takes over; joiners
+        // retry"*. `another participant` has to exist for the row to say
+        // anything, and this is the only instant at which whether it does is
+        // decidable. Censused *before* the kill, so the count includes the role
+        // holder that is about to die; `census` already skips this driver's own
+        // observer slot, so `>= 2` is "the role holder plus at least one other
+        // read-write survivor". Erring toward deferral is the safe direction: a
+        // deferral only postpones a kill, whereas killing the last heir ends
+        // the run's ability to test anything.
+        //
+        // Without this the harness reddened three nightly jobs from
+        // 2026-09-07: the population reached zero attached heirs while the role
+        // was vacant, and that state is **absorbing** rather than slow — only an
+        // already-joined participant can inherit
+        // (`crates/tf_tree/src/open.rs`, `NotApplicable` unless `is_joined()`),
+        // the segment is an unnamed `memfd` handed over only by a *serving*
+        // owner (`docs/PHASE2.md` §3.6), and §3.4 step 4 refuses to create
+        // while any participant byte is held — and this driver holds one for the
+        // life of the run. Measured over two runs on stock engine code with no
+        // crash points: the §3.5 trigger tally was
+        // `inherited=1956 owner-alive=11 contended=10` with **zero** `err-*`, so
+        // the engine refused no heir; there was none left to ask.
+        let mut before_kill = RoundHealth::default();
+        census(observer, &mut before_kill);
+        m.heirs_before = Some(before_kill.slots_alive);
+        if before_kill.slots_alive < 2 {
+            m.deferred = true;
+            return m;
+        }
 
         let mut killed = false;
         if owner_kid.as_ref().is_some_and(|k| k.proc.id() == pid) {
@@ -3389,8 +3788,11 @@ mod imp {
         let mut reported = false;
 
         loop {
-            // `Never`, in every child: the driver creates and serves the arena
-            // (see [`attach_observer`]), so there is always one to join, and a
+            // `Never`, in every child: the **owner child** creates and serves
+            // the arena (see [`spawn_owner`]; the driver only *joins* it, via
+            // [`attach_observer`], and this comment said the driver did both
+            // until 2026-09-10 — it had been false since the owner became a
+            // child), so there is normally one to join, and a
             // child that created a second one would silently split the run in
             // two — half the participants publishing where the observer cannot
             // see them, which is a *green* run that validates nothing. `Never`
@@ -3470,7 +3872,26 @@ mod imp {
         // A bounded number of operations per attachment, so every child
         // re-attaches regularly instead of one lucky survivor holding the arena
         // for the whole run.
-        for _ in 0..2_000 {
+        //
+        // **The cap is extended, not waived, while this process serves the
+        // rendezvous.** Returning here drops the attachment exactly as the
+        // detach arm does, so it is the same unobserved owner death — see that
+        // arm. A serving process keeps working until the driver kills it, which
+        // is the event this harness is built to require a recovery for. The
+        // extension is bounded rather than infinite so a marker that somehow
+        // named a corpse forever cannot pin one child in this loop for the
+        // whole run.
+        let mut extensions = 0u32;
+        let mut ops_left: u32 = OPS_PER_ATTACHMENT;
+        while ops_left > 0 {
+            ops_left -= 1;
+            if ops_left == 0
+                && extensions < MAX_OWNER_CAP_EXTENSIONS
+                && read_owner_pid(dir) == Some(std::process::id())
+            {
+                extensions += 1;
+                ops_left = OPS_PER_ATTACHMENT;
+            }
             // **Pacing, and it is not politeness.** A 64-slot ring filled by an
             // unthrottled loop covers about nine *microseconds* of history, and
             // six children spinning on `push` is a busy-wait on every core the
@@ -3568,8 +3989,38 @@ mod imp {
                 17 => {
                     let _ = tree.reap_participants();
                 }
-                // Detach and re-join.
-                18..=19 => return Ok(()),
+                // Detach and re-join — **unless this process is the one serving
+                // the rendezvous.**
+                //
+                // The role holder abdicating here is an owner death that nothing
+                // observes: dropping `Attachment::Owner` stops the serving
+                // thread and releases byte 0, so the role falls vacant with no
+                // `Migration` recorded and nothing requiring it to recover. It
+                // is the same defect as an ordinary victim draw taking the role
+                // holder, one layer in, and it is the larger of the two — the
+                // arm fires on ~2% of operations, so a worker abdicates roughly
+                // every fifty, against an owner-kill interval measured in
+                // seconds.
+                //
+                // Asked of the harness's own `owner.pid` marker rather than of
+                // the engine: `Tree::is_joined` is `pub(crate)`, and adding a
+                // public predicate for a harness's benefit would be an API
+                // change (`docs/API.md` §7). The marker is written by the heir
+                // before it logs the inheritance, so it is never behind. Read
+                // only on this arm and at the operation cap — about one file
+                // read per fifty operations — because reading it per operation
+                // would be 2000 of them per attachment and would change the
+                // workload being measured.
+                //
+                // §11.4's attach/detach churn is unaffected: every participant
+                // that is *not* serving still detaches on this arm, and the
+                // owner still dies several times a minute on the arm built to
+                // require what §3.5 owes for each death.
+                18..=19 => {
+                    if read_owner_pid(dir) != Some(std::process::id()) {
+                        return Ok(());
+                    }
+                }
                 // Publish.
                 20..=59 => {
                     if let Some((edge, w)) = &held {
