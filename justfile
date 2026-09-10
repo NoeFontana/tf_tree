@@ -2758,19 +2758,35 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
 # race against the site more often than not. **It runs nightly** in
 # `.github/workflows/nightly.yml`'s `crash-points` job; until **2026-09-06** it
 # ran in no workflow at all, so §11.4's crash-point clause was measured only by
-# whoever remembered to type this. *This comment read 2026-09-04*, which is the
-# date the recipe's refusals were added and not the date it was wired to a job:
+# whoever remembered to type this. *This comment read 2026-09-04*, and the
+# wiring date is what it names, so it was wrong:
 # `git log -S'shm-torture-crash-points' -- .github/workflows/nightly.yml` names
-# only `beabc3f`, and `beabc3f~1`'s workflow file contains no `crash` at all.
+# only `beabc3f` (2026-09-06), and `beabc3f~1`'s workflow file contains no
+# `crash` at all. **No commit exists in this repository between 2026-09-03 and
+# 2026-09-06**, so the old date cannot correspond to any change and no
+# explanation is offered for it — a first attempt at this correction guessed one
+# ("the date the recipe's refusals were added"), and that is false too:
+# `beabc3f` added those refusals, in the recipe and in the binary.
 #
-# **Its first three nightly runs (2026-09-07/08/09) all failed, so it has never
-# been green**, and the cause was not this recipe: the harness drove its own
-# eligible-heir population to zero while the ownership role was vacant, which is
-# an absorbing state. `kill_the_owner` censuses for a second eligible heir and
-# defers rather than killing the last one, and the ordinary victim draw no longer
-# takes the role holder — see `shm_torture.rs`. An armed abort at
-# `takeover.after_ownership_lock_before_bind` is what made this recipe reach the
-# state first: it destroys an attached heir at the one instant the role is vacant.
+# **This job's own history, per job and not per run, because the two disagree
+# and a first version of this comment quoted the wrong one.** The nightly *run*
+# was red on 2026-09-07, -08 and -09; this *job* inside it was **green on
+# 09-07 and 09-08** and first failed on **09-09**
+# (`gh run view <id> --json jobs`). So the claim that it "has never been green"
+# was false, and it is a regression like the other two rather than a job that
+# never worked. What made it look otherwise is that the plain-soak and ASan jobs
+# in the same run failed all three nights, so the run's colour is not this job's.
+#
+# The cause is shared with those two: the harness drove its own eligible-heir
+# population to zero while the ownership role was vacant, which is an absorbing
+# state. `kill_the_owner` censuses for a second eligible heir and defers rather
+# than killing the last one; the ordinary victim draw no longer takes the role
+# holder or draws a pool down to its floor; and a worker serving the rendezvous
+# no longer abdicates voluntarily — see `shm_torture.rs`. **This recipe reaches
+# the state probabilistically rather than reliably**, which is why it took three
+# nights: an armed abort at `takeover.after_ownership_lock_before_bind` destroys
+# an attached heir at the one instant the role is vacant, and that has to
+# coincide with a thin pool.
 shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
     cargo build --release --features shm,crash-points -p tf_tree_bench --bin shm_torture
     ./target/release/shm_torture --crash-points {{ARGS}}

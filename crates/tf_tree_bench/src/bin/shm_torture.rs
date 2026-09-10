@@ -671,18 +671,40 @@ mod imp {
                  the probe would report every site unreachable while arming none of them."
             );
         }
-        // **A run with one child cannot exercise §3.5 and must say so rather
-        // than pass.** The owner is a child; killing it leaves `children - 1`
-        // survivors, and with none of them left there is nobody to inherit —
-        // the run would then report "nothing inherited" as a defect of the
-        // engine when it is a defect of the population.
-        if a.owner_kill_every.is_some() && a.children < 2 {
+        // **A run with too few children cannot exercise §3.5 and must say so
+        // rather than pass.** The owner is a child; killing it leaves
+        // `children - 1` survivors, and with none of them left there is nobody
+        // to inherit — the run would then report "nothing inherited" as a
+        // defect of the engine when it is a defect of the population.
+        //
+        // **The floor is `MIN_ATTACHED_FOR_ORDINARY_KILL`, not 2, and this
+        // check said 2 while the draw needed 3.** The ordinary victim draw
+        // stops against a pool at that floor, so at `--children 2` the fleet
+        // can never be above it, the draw is unreachable, and the run fails at
+        // the `kills == 0` floor after burning its whole duration — a refusal
+        // arriving at the end of a soak rather than at the start of one, for a
+        // configuration decidable before a single process is forked. The old
+        // text also *recommended* the value that cannot work ("Use --children 2
+        // or more").
+        //
+        // One above the floor rather than equal to it: at exactly the floor the
+        // pool has no slack for a replacement's handshake, so every draw during
+        // one would be throttled and the run would trip the thin-pool bound
+        // instead. Both bounds are named in the message, because a reader who
+        // hits this is choosing a number and deserves to see what constrains it.
+        let children_floor = MIN_ATTACHED_FOR_ORDINARY_KILL as usize + 1;
+        if a.owner_kill_every.is_some() && a.children < children_floor {
             bail!(
-                "--children {} with the owner-kill arm on leaves no survivor to inherit: the \
-                 owner is a child, so the property would be untestable and the run would fail \
-                 for a reason that says nothing about the arena. Use --children 2 or more, or \
-                 --no-kill-owner.",
-                a.children
+                "--children {} with the owner-kill arm on cannot sustain the workload: the \
+                 owner is a child, so a kill has to leave both a survivor eligible to inherit \
+                 and an attached pool at or above MIN_ATTACHED_FOR_ORDINARY_KILL ({}), below \
+                 which the ordinary victim draw stops. At this setting §3.5 would be untestable \
+                 and the run would fail at its `kills == 0` floor after burning the whole \
+                 duration, for a reason that says nothing about the arena. Use --children {} or \
+                 more, or --no-kill-owner.",
+                a.children,
+                MIN_ATTACHED_FOR_ORDINARY_KILL,
+                children_floor
             );
         }
         if !(0.1..=100.0).contains(&a.kill_hz) {
@@ -1616,9 +1638,21 @@ mod imp {
                         // from `slots=Nreg/Malive` — that is a run-wide minimum
                         // and necessarily reads 0 for *both* producers, which the
                         // field's own comment records.
+                        //
+                        // **POPULATION is entailed by the branch condition, not
+                        // inferred from the ledger.** `heirs_at_kill == Some(0)`
+                        // is a census taken after the victim was reaped, so on
+                        // this branch there provably was no heir to ask. An
+                        // earlier version classified *inside* here and carried an
+                        // arm reading "ENGINE — heirs remained and inheritance
+                        // was refused" — a label asserting the negation of the
+                        // condition it was nested in, reachable only by a stray
+                        // `err-` earlier in the run. The label is now what the
+                        // branch already proves; `err-` entries elsewhere in the
+                        // ledger are reported in the tally below rather than
+                        // silently re-labelling this verdict.
                         if m.recovered.is_none() && m.heirs_at_kill == Some(0) {
                             let tally = trigger_tally_line(&dir);
-                            let engine_refused = tally.contains("err-");
                             wedge = Some(format!(
                                 "owner kill {} left the arena in an UNRECOVERABLE state, and the \
                                  run stops here rather than reporting the same failure for every \
@@ -1631,9 +1665,7 @@ mod imp {
                                  own slot — it holds one for the life of the run and never \
                                  inherits, by design.",
                                 m.n,
-                                if engine_refused {
-                                    "ENGINE — heirs remained and inheritance was refused"
-                                } else {
+                                {
                                     "POPULATION — no eligible heir remained to ask, so §3.5's \
                                      trigger was never answered. This is the state the \
                                      pre-kill census exists to prevent; reaching it means the \
@@ -2139,6 +2171,7 @@ mod imp {
         // fleet, so any ratio here would be a tuned number that expires. The
         // printed skip tallies are what a reader uses to judge *how much* the
         // throttle bit; this is only the bound that says the churn happened.
+
         if kills == 0 && a.duration >= interval {
             bail!(
                 "no participant was killed in {:?} at --kill-hz {}, so this run is not \
@@ -3912,9 +3945,19 @@ mod imp {
             // `owner_lost` never becomes owner and the arena stays ownerless —
             // which is precisely the state `kill_the_owner` probes for from the
             // outside. This loop is what the design means by "the caller's own
-            // loop", and every child runs it, so the property is never left to
-            // whether the surviving population happened to include a read-write
-            // participant.
+            // loop", and every child runs it.
+            //
+            // **It does not follow that the property is independent of the
+            // population, and this comment said it did.** It read "so the
+            // property is never left to whether the surviving population
+            // happened to include a read-write participant" — the same sentence
+            // `docs/PHASE2.md` §0.0 carried, and both were false for the same
+            // reason: every child running this loop is worth nothing at an
+            // instant when no child is *attached*. Only a joined participant can
+            // inherit, and an ownerless arena admits no new one, so a vacancy
+            // that finds the pool empty is absorbing. That is why
+            // `kill_the_owner` censuses before it kills and why the ordinary
+            // draw will not take the pool to its floor.
             //
             // The cost in the healthy case is one non-blocking `poll` of one
             // descriptor: `owner_lost` only reaches its `F_OFD_GETLK` once the
