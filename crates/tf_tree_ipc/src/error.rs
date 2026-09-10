@@ -295,7 +295,34 @@ pub enum IpcError {
         /// The errno.
         raw_os_error: i32,
     },
+    /// The owner accepted the connection and then closed it without replying.
+    ///
+    /// `recvmsg` returned **zero bytes**, which on a `SOCK_SEQPACKET` connection
+    /// is the orderly end of the peer's writing end and not an error: the owner
+    /// was there at `accept(2)` and gone before its `sendmsg`. Measured, because
+    /// the two halves of "the owner went away" reach the client differently — an
+    /// *accepted* connection whose peer dies gives this 0-byte read, while a
+    /// connection the listener never accepted gives `ECONNRESET`, which arrives
+    /// as [`IpcError::HandshakeIo`]. Both are the same fact about the arena, and
+    /// [`crate::SocketProbe`] classifies them together.
+    ///
+    /// **Deliberately distinct from [`IpcError::HandshakeMalformed`], which is
+    /// what this used to be reported as.** Handing an empty datagram to
+    /// `HelloResponse::from_bytes` yields
+    /// [`crate::WireError::BadLength`]` { got: 0 }` — a *protocol violation*,
+    /// which §3.4 treats as terminal — so an owner that died inside the
+    /// handshake failed the joiner's whole `open()` instead of being retried
+    /// inside its deadline. `docs/decisions/0005`'s client-reachability table has
+    /// answered `Absent` for "peer HUPs or times out mid-handshake" since it was
+    /// written; this variant is the half of that row the code was missing.
+    ///
+    /// Carries nothing: there is no errno, and the pid on the far end is exactly
+    /// what a dead owner cannot be asked for.
+    HandshakeClosed,
     /// The peer's datagram was not a well-formed handshake message.
+    ///
+    /// **A protocol violation, and therefore terminal.** An owner that merely
+    /// went away mid-handshake is [`IpcError::HandshakeClosed`] instead.
     HandshakeMalformed(crate::wire::WireError),
     /// The owner refused this client, and named its own side of the comparison.
     HandshakeRejected {
@@ -405,6 +432,10 @@ impl fmt::Display for IpcError {
             IpcError::HandshakeIo { raw_os_error } => {
                 write!(f, "attach handshake failed (errno {raw_os_error})")
             }
+            IpcError::HandshakeClosed => f.write_str(
+                "the arena owner accepted this attach and then closed the connection without \
+                 replying, so it went away mid-handshake; retrying is the right response",
+            ),
             IpcError::HandshakeMalformed(e) => {
                 write!(f, "attach handshake reply was not well-formed: {e:?}")
             }

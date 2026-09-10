@@ -35,6 +35,9 @@
 //!                  §11.3's takeover crash point with TF_TREE_CRASH_AT to kill
 //!                  it mid-inherit) "<owner_lost> <inheritance> <slot>" —
 //!                  serving, if it inherited (§3.5)
+//! serve-then-die -> "serving", then "dying" and `abort` on the first client,
+//!                  from inside the slot assigner — i.e. an owner that died
+//!                  between `accept(2)` and its reply, with no crash point
 //! ```
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(
@@ -405,6 +408,82 @@ fn main() {
             loop {
                 std::thread::park();
             }
+        }
+        // **An owner that dies between `accept(2)` and its reply** — a window a
+        // real owner passes through in microseconds, so a `SIGKILL` from outside
+        // cannot be aimed at it. Nothing here is a §11.3 crash point and none is
+        // needed: `OwnerServer::serve` calls the slot assigner *after* it has
+        // accepted the connection and read the `HelloRequest`, and *before* it
+        // builds or sends any response, so aborting inside the assigner is
+        // exactly that window — and it is reached through public API only.
+        //
+        // The client then reads **zero bytes**: an accepted connection whose
+        // peer's descriptors are torn down gives an orderly end-of-stream, not
+        // an error. Handing that to `HelloResponse::from_bytes` used to produce
+        // `WireError::BadLength { got: 0 }`, which §3.4 treats as a protocol
+        // violation and therefore as terminal.
+        //
+        // `abort` rather than `exit`, for the reason §11.3's sites abort: no
+        // destructor runs, so `OwnerServer::drop` does not unlink the socket and
+        // the path is left stale exactly as a crashed owner leaves it (§3.9).
+        //
+        // **This mode binds a rendezvous path, which no other mode of this
+        // binary does, and the binary ships.** `OwnerServer::bind_at` renames
+        // over the resolved path, so pointed at a live arena's
+        // `TF_TREE_RUNTIME_DIR`/domain/name this replaces a serving owner's
+        // socket and then aborts on every client that attaches — with a
+        // descriptor carrying `arena_size: 0` and a zero uuid. It is inside
+        // §3.10's same-user-cooperating trust model, and this crate's manifest
+        // already records at length that `tf_tree_rendezvous_child` is installed
+        // by `cargo install --features shm` as a chosen residue, with
+        // `tf_tree_ipc_child hold-participant` cited in `docs/PHASE2.md` §0.0 as
+        // an existing public route to a bad state. Recorded here rather than
+        // left to be discovered because *binding* is a capability the other
+        // modes do not have: the earlier ones only hold bytes or read.
+        "serve-then-die" => {
+            // The rendezvous this resolves must be the *same* one the joiner
+            // resolves, so it is built the way `tf_tree::Open` builds it rather
+            // than from a path argument.
+            let rd = tf_tree_ipc::RuntimeDir::resolve().expect("runtime dir");
+            let domain =
+                tf_tree_ipc::domain_from_env(&tf_tree_ipc::SystemEnv).expect("domain from env");
+            let name = tf_tree_ipc::name_from_env(&tf_tree_ipc::SystemEnv).expect("name from env");
+            let rv = tf_tree_ipc::Rendezvous::new(rd, domain, name);
+            rv.ensure_dir().expect("runtime dir");
+
+            // The descriptor must pass §3.7's `check` — version, layout hash,
+            // boot id — or the owner would *reject* the client instead of
+            // reaching the assigner, and a rejection is terminal by design. The
+            // three fields are the ones a joiner sends, from the same constants.
+            let desc = tf_tree_ipc::SegmentDescriptor {
+                format_version: tf_tree_arena::FORMAT_VERSION,
+                layout_hash: tf_tree_arena::layout_hash(),
+                // Never sent: this process dies before a response is built.
+                arena_size: 0,
+                instance_uuid: [0; 16],
+                boot_id: tf_tree_ipc::boot_id().unwrap_or([0; 16]),
+            };
+            let server =
+                tf_tree_ipc::OwnerServer::bind_at(rv.sock_path(), desc, std::process::id())
+                    .expect("bind the rendezvous socket");
+            // `/dev/null` stands in for the segment for the same reason: it is
+            // the argument `serve` needs and never reaches a client. If the
+            // ordering above ever changed, a joiner would fail loudly on the
+            // `fstat` rather than quietly map something plausible.
+            let devnull = std::fs::File::open("/dev/null").expect("/dev/null");
+            say("serving");
+            let outcome = server.serve(
+                std::os::fd::AsFd::as_fd(&devnull),
+                |_req| {
+                    say("dying");
+                    std::process::abort();
+                },
+                |_slot| {},
+            );
+            // Only reachable if the assigner was never called, which means no
+            // client ever arrived — the parent must see that rather than read a
+            // silent exit as a window that opened.
+            say(&format!("server-stopped {outcome:?}"));
         }
         // `docs/PHASE2.md` §11.2 scenarios 7 and 9. Both turn on one fact —
         // every process on one `(runtime_dir, domain, name)` must see the *same*
