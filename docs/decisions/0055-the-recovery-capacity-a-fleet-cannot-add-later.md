@@ -204,6 +204,53 @@ read-only consumer remains, and a fresh
 `Open::new().mode(ReadWrite).create(Never).open()` is refused with
 `ArenaHeldButUnreachable`.
 
+#### It happened again after the harness was repaired, and this time it was measured here
+
+**2026-09-10, `nightly` run 34453737033.** Six of seven jobs green;
+`shm-torture-asan` red. Judged per job, not by the run's colour. The repair
+landed in #310 worked exactly as designed — the harness **classified** the
+failure itself:
+
+```text
+Classification: POPULATION — no eligible heir remained to ask, so §3.5's trigger
+was never answered. This is the state the pre-kill census exists to prevent;
+reaching it means the census passed and the pool drained inside the vacancy.
+```
+
+§3.5 trigger tally `inherited=9`, **zero `err-*`**, over ten owner kills. The
+engine refused no heir; there was none left to ask. That is this record's state,
+reached by a fleet that had been *checked* for capacity moments earlier.
+
+**Reproduced on this host rather than cited, which is what the paragraph above
+could not do.** Four runs at the failing job's own parameters
+(`--duration 120s --children 4 --kill-hz 4`):
+
+| Run | ASan | Result |
+|---|---|---|
+| 1–3 | no | **PASS**, 15/15 owner kills inherited, 0 deferrals |
+| 4 | yes | **PASS**, 15 inherited + 1 contended, 0 deferrals |
+
+And the number that settles the mechanism: the attached fraction is
+`writers=1.6–1.7/4` **identically in CI and on this host**. So it is not that
+ASan starves the pool. It is that `--children 4` is exactly the harness's own
+`children_floor`, ~42% of children are attached at any instant, and
+`heirs_before` is therefore essentially always **exactly 2** — the role holder
+plus one. Every owner kill runs at zero margin, the nightly's thirty minutes is
+about fifteen times the exposure of these runs, and one kill loses the race.
+
+**Why this belongs in *this* record and not in a harness patch.** The census
+`kill_the_owner` performs is a correct reading of eligibility at the instant it
+is taken, and the vacancy has *duration*. That is [*The gap: eligibility is an
+instant, not a census*](#the-gap-eligibility-is-an-instant-not-a-census) stated
+about a real fleet rather than about a staged test — and the harness is now a
+**first consumer** of whatever open question 1 answers, because what it needs is
+precisely a supported way to hold recovery capacity that cannot evaporate between
+two syscalls. Every fix available without that is either probabilistic (more
+children, longer attachments — which lowers the failure rate and proves nothing)
+or a redesign of what the harness pins, which is a decision and not a patch.
+Until this record is `ready`, `shm-torture-asan` stays red on the nightly and the
+classification line is what a reader should trust: **POPULATION, not engine.**
+
 ### What holds this today: one paragraph of prose, and a gate that stops half way
 
 - **No type.** `AttachMode::ReadWrite` is a fact about the mapping's protection
