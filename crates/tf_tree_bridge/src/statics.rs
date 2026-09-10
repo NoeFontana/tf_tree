@@ -97,6 +97,22 @@ pub struct StaticStore {
     /// hand at the one place it is read, so the two owned `String`s that probe
     /// used to build are gone from the conflict path entirely.
     reported: Vec<u64>,
+    /// The **intruder** of an edge's first conflict, kept so
+    /// [`StaticStore::conflicts_by_edge`] can name both publishers the way
+    /// [`crate::Authority::conflicts`] does. `None` until an edge is
+    /// contradicted; `values[slot]` already holds the owner.
+    ///
+    /// **One clone per edge, ever**, not one per observation: it is written only
+    /// where `reported[slot]` goes from 0 to 1. The reason `reported` is a `Vec`
+    /// rather than a keyed map is that the conflict path must not allocate two
+    /// `String`s per sample, and this keeps that property — a latched static
+    /// redelivered to a hundred late joiners clones nothing.
+    ///
+    /// **Why the intruder and not the whole verdict.** The owner and the declared
+    /// pose are already in `values`; the offered pose is *not* kept, because
+    /// §5.4's clause asks for the edge and its two publishers, and a second pose
+    /// per edge would be state nothing reads.
+    first_intruder: Vec<Option<Publisher>>,
     conflicts: u64,
 }
 
@@ -215,6 +231,11 @@ impl StaticStore {
         let seen = &mut self.reported[slot.get()];
         let first_time = *seen == 0;
         *seen += 1;
+        if first_time {
+            // The one clone this path ever makes for a given edge. See
+            // `first_intruder`.
+            self.first_intruder[slot.get()] = Some(publisher.clone());
+        }
         self.conflicts += 1;
         StaticVerdict::Conflict {
             owner,
@@ -240,6 +261,7 @@ impl StaticStore {
         self.kinds.push(kind);
         self.values.push(None);
         self.reported.push(0);
+        self.first_intruder.push(None);
         slot
     }
 
@@ -273,40 +295,64 @@ impl StaticStore {
         self.conflicts
     }
 
-    /// Every static edge this store has recorded a conflict on, with how many
-    /// conflicting observations that one edge has seen.
+    /// Every static edge this store has recorded a conflict on, as
+    /// `(parent, child, owner, intruder, count)` — **the same shape
+    /// [`crate::Authority::conflicts`] yields**, deliberately, because
+    /// `docs/PHASE4.md` §5.4 asks one thing of both halves and a caller building
+    /// that report should not meet two shapes.
     ///
     /// **The iterator's length is the fault count; the `u64` beside each edge is
     /// how loud that one fault was.** `/tf_static` is `transient_local`, so a
     /// misconfigured publisher's latched sample is re-delivered to every late
     /// joiner: [`StaticStore::conflicts`] counts ten redeliveries of one
     /// misconfiguration as ten, and a startup report quoting it would send an
-    /// operator looking for ten faults. That is the same distinction
-    /// `docs/PHASE4.md` §5.4's amendment draws about *when* a static conflict is
-    /// observed being a DDS discovery artefact rather than a fault time.
+    /// operator looking for ten faults. That is the same distinction §5.4's
+    /// amendment draws about *when* a static conflict is observed being a DDS
+    /// discovery artefact rather than a fault time.
+    ///
+    /// **Both publishers, because §5.4:1403 is normative that they are named:**
+    /// *"the seam's `detail` enumerates **every** recorded edge with both of its
+    /// publishers, not the first."* The first revision of this accessor yielded
+    /// `(parent, child, count)` and could not satisfy that clause — and the data
+    /// was not recoverable afterwards either, since `values[slot]` holds only the
+    /// owner. Naming the edge without naming who disagreed about it is a report
+    /// an operator cannot act on: the whole fault *is* which two nodes disagree.
     ///
     /// [`docs/decisions/0011`](../../../docs/decisions/0011-the-bridge-clock-guard-and-the-static-conflict-disposition.md)'s
     /// implementation step 5 named this accessor and **it did not land with the
     /// rest of that step.** `Ingest` stood in for it with a private counter
     /// incremented off the `first_time` flag, which could count the faults but
-    /// could not name them — so §5.4's normative *"the seam's `detail`
-    /// enumerates **every** recorded edge with both of its publishers, not the
-    /// first"* had no way to reach the static half at all, and the C seam's
-    /// `detail` carries counts only.
+    /// could not name them at all.
     ///
-    /// Reading `reported` is exactly equivalent to the counter it replaces
-    /// rather than merely close to it, and the reason is that `Strict` closes
-    /// its window **once**: at the close, a non-zero `reported[slot]` is a
-    /// conflict seen before the close, which is what the counter accumulated.
-    /// After the close `Strict` has degraded and nothing reads this for a halt.
-    pub fn conflicts_by_edge(&self) -> impl Iterator<Item = (&str, &str, u64)> + '_ {
-        self.reported
+    /// Reading `reported` is exactly equivalent to the counter it replaces rather
+    /// than merely close to it, and the reason is that `Strict` closes its window
+    /// **once**: at the close, a non-zero `reported[slot]` is a conflict seen
+    /// before the close, which is what the counter accumulated. After the close
+    /// `Strict` has degraded and nothing reads this for a halt.
+    pub fn conflicts_by_edge(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, &Publisher, &Publisher, u64)> {
+        // **Membership is `first_intruder`, and the count is `reported`.** An
+        // earlier revision filtered on `reported[slot] > 0` *and* then reached
+        // for the publishers with `?`, and the `reported` filter turned out to be
+        // dead: the two are written in the same breath, so `filter_map` already
+        // dropped every slot the filter would have. A predicate no mutation can
+        // distinguish is the vacuity smell `docs/PROJECT.md` §6 names, so there is
+        // one predicate now — "an intruder was recorded for this edge" — and it
+        // is the one that also makes the publishers available.
+        //
+        // `?` on the owner rather than an `expect`: the conflict arm reaches
+        // `values[slot]` to find the owner it compares against, so it is `Some`
+        // wherever an intruder is, and a panic in a diagnostic accessor would
+        // take down the bridge that was reporting the misconfiguration.
+        self.first_intruder
             .iter()
             .enumerate()
-            .filter(|&(_, seen)| *seen > 0)
-            .map(|(slot, seen)| {
+            .filter_map(|(slot, intruder)| {
+                let intruder = intruder.as_ref()?;
+                let (_, owner) = self.values[slot].as_ref()?;
                 let (parent, child) = self.index.key(slot);
-                (parent, child, *seen)
+                Some((parent, child, owner, intruder, self.reported[slot]))
             })
     }
 
@@ -522,15 +568,29 @@ mod tests {
     /// `ingest::tests::the_startup_halt_counts_faults_not_observations` uses one
     /// level up.
     ///
-    /// Mutant (applied, confirmed fatal): drop the `.filter(|&(_, seen)| *seen > 0)`
-    /// — every declared edge is then yielded, including the two that never
-    /// conflicted, and this fails at 4 entries against 2. It is fatal to five
-    /// tests in all: the other four are `ingest`'s startup-window tests, which
-    /// is the cross-check that the halt reads this accessor rather than a ledger
-    /// of its own.
+    /// Mutant (applied, confirmed fatal): write `first_intruder[slot]` on every
+    /// conflict rather than only the first — `base -> cam`'s intruder then reads
+    /// `/latecomer` instead of `/intruder`, the publisher that opened the fault.
+    /// The fixture puts two distinct intruders on one edge for exactly that.
+    ///
+    /// Mutant (applied, confirmed fatal): set `first_intruder[slot]` in
+    /// `slot_for`, where every other parallel vector is grown — the two
+    /// never-contradicted edges then appear, and this fails at 5 entries
+    /// against 3. Fatal to five tests: the other four are `ingest`'s
+    /// startup-window tests, which is the cross-check that the halt reads this
+    /// accessor rather than a ledger of its own.
+    ///
+    /// **Mutant (applied, SURVIVED, and the code changed rather than the note):**
+    /// an earlier revision of the accessor filtered on `reported[slot] > 0`
+    /// before reaching for the publishers with `?`. Dropping that filter was
+    /// fatal to five tests *before* the publishers were added and to none after
+    /// — `filter_map` already dropped every slot the filter would have, because
+    /// the two are written in the same breath. The filter is gone; membership is
+    /// the intruder. A predicate no mutation can distinguish is not a predicate.
     #[test]
-    fn conflicts_by_edge_names_every_contradicted_edge_and_no_others() {
+    fn conflicts_by_edge_names_every_contradicted_edge_its_publishers_and_no_others() {
         const OTHER: [f64; 7] = [1.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0];
+        const THIRD: [f64; 7] = [1.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0];
         let mut s = StaticStore::new();
 
         // Two edges that are declared and never contradicted. They must not
@@ -567,35 +627,80 @@ mod tests {
                 StaticVerdict::Conflict { .. }
             ));
         }
+        // A *second* intruder on the same edge. The recorded one must stay the
+        // publisher that opened the fault — that is the one whose launch file
+        // changed — and `first_intruder` is written once for that reason.
+        assert!(matches!(
+            s.observe_static("base", "cam", THIRD, &node("/latecomer")),
+            StaticVerdict::Conflict { .. }
+        ));
         for _ in 0..2 {
             assert!(matches!(
-                s.observe_static("base", "arm", OTHER, &node("/intruder")),
+                s.observe_static("base", "arm", OTHER, &node("/intruder2")),
                 StaticVerdict::Conflict { .. }
             ));
         }
+        // And one contradicted **exactly once**, which is the boundary: an
+        // off-by-one in the membership predicate drops precisely this row, and a
+        // fixture whose smallest count is 2 could not see that.
+        assert_eq!(
+            s.observe_static("base", "gps", ID, &node("/rsp")),
+            StaticVerdict::Declare
+        );
+        assert!(matches!(
+            s.observe_static("base", "gps", OTHER, &node("/intruder3")),
+            StaticVerdict::Conflict { .. }
+        ));
 
-        // The count that already existed sees seven observations...
-        assert_eq!(s.conflicts(), 7, "observations");
+        // The count that already existed sees nine observations...
+        assert_eq!(s.conflicts(), 9, "observations");
 
-        // ...and the accessor sees two faults, and can name them.
-        let mut found: Vec<(String, String, u64)> = s
+        // ...and the accessor sees two faults, names them, and names who
+        // disagreed — which is what §5.4:1403 asks for and what the private
+        // counter this replaced structurally could not do.
+        let mut found: Vec<(String, String, Publisher, Publisher, u64)> = s
             .conflicts_by_edge()
-            .map(|(p, c, n)| (p.to_owned(), c.to_owned(), n))
+            .map(|(p, c, owner, intruder, n)| {
+                (
+                    p.to_owned(),
+                    c.to_owned(),
+                    owner.clone(),
+                    intruder.clone(),
+                    n,
+                )
+            })
             .collect();
-        found.sort();
+        // Sorted on the edge only: `Publisher` is not `Ord`, and the edge is
+        // what makes a row identifiable anyway.
+        found.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         assert_eq!(
             found,
             vec![
-                ("base".to_owned(), "arm".to_owned(), 2),
-                ("base".to_owned(), "cam".to_owned(), 5),
+                (
+                    "base".to_owned(),
+                    "arm".to_owned(),
+                    node("/rsp"),
+                    node("/intruder2"),
+                    2
+                ),
+                (
+                    "base".to_owned(),
+                    "cam".to_owned(),
+                    node("/rsp"),
+                    node("/intruder"),
+                    6
+                ),
+                (
+                    "base".to_owned(),
+                    "gps".to_owned(),
+                    node("/rsp"),
+                    node("/intruder3"),
+                    1
+                ),
             ],
-            "every contradicted edge, named, with how loud it was — and neither \
-             of the two that never conflicted"
-        );
-        assert_eq!(
-            found.len(),
-            2,
-            "the iterator's length is the fault count, which is what a halt quotes"
+            "every contradicted edge with both of its publishers and how loud it \
+             was — neither of the two that never conflicted, and `cam`'s intruder \
+             is the publisher that opened the fault rather than the latecomer"
         );
     }
 }

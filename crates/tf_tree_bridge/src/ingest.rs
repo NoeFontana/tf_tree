@@ -1078,15 +1078,23 @@ impl Ingest {
     ///
     /// # What a caller does with the answer
     ///
-    /// The counts are a summary, and **both halves can be expanded into the
+    /// The counts are a summary, and **both halves can now be expanded into the
     /// per-edge report §5.4 wants CI to print** — one run, every
-    /// misconfiguration. [`Ingest::authority`]'s [`Authority::conflicts`]
-    /// enumerates every offending authority edge with both of its publishers,
-    /// and [`Ingest::statics`]'s [`StaticStore::conflicts_by_edge`] does the
-    /// same for the value disagreements. Until that second accessor existed the
-    /// static half could only be counted, which is why §5.4's normative
-    /// "enumerates **every** recorded edge" reached the authority half and no
-    /// further.
+    /// misconfiguration. [`Ingest::authority`]'s [`Authority::conflicts`] yields
+    /// `(parent, child, owner, intruder, count)`, and [`Ingest::statics`]'s
+    /// [`StaticStore::conflicts_by_edge`] yields the same shape for the value
+    /// disagreements; the shapes match on purpose, because §5.4 asks one thing of
+    /// both halves.
+    ///
+    /// **Nothing prints it yet, and that is `docs/decisions/0011` step 6 rather
+    /// than a gap here.** §5.4:1403 is normative that "the seam's `detail`
+    /// enumerates **every** recorded edge with both of its publishers, not the
+    /// first", and the C seam's `StartupConflicts` arm formats the two *counts*
+    /// and names no edge — on **either** half. Until this accessor existed, step
+    /// 6 could not have satisfied the static half even if it had landed: the
+    /// intruder was not retained anywhere, so the data did not exist to print.
+    /// That is what step 5's gap cost — not the clause being unmet, which step 6
+    /// owns.
     pub fn close_startup_window(&mut self) -> Option<Action> {
         if !self.startup_window_open {
             return None;

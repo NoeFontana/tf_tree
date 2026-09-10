@@ -2012,14 +2012,22 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                     // the closest true one — but `statics` counts §5.7 value
                     // disagreements, which that code does not name. A dedicated
                     // `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` is
-                    // `docs/decisions/0011`'s implementation step 6 and cannot
-                    // land here: an unstable constant has to be added to
-                    // `UNSTABLE` in `xtask/src/headers.rs` in the same commit,
-                    // because the stable tier's cbindgen config is
-                    // exclude-by-complement and an unclassified constant is
-                    // emitted into the **frozen** `tf_tree.h` with nothing
-                    // failing. Until then both counts are in `detail`, which is
-                    // what the `rclcpp` HALT arm prints anyway.
+                    // `docs/decisions/0011`'s implementation step 6. It has to
+                    // be added to `UNSTABLE` in `xtask/src/headers.rs` in the
+                    // same commit, because the stable tier's cbindgen config is
+                    // exclude-by-complement, so an unclassified constant is
+                    // emitted into the **frozen** `tf_tree.h`.
+                    //
+                    // **This comment used to say "with nothing failing", and
+                    // that is false.** `xtask::headers::check_overlap` reads
+                    // `#define` names out of both generated headers and refuses
+                    // any symbol defined by both — which is exactly what an
+                    // unclassified constant becomes, since the complement puts
+                    // it in each. Measured on 2026-09-10: exit 1, naming the
+                    // symbol. The emission is real; the silence is not, and the
+                    // difference is the whole force of the sentence. Until step
+                    // 6 lands, both counts are in `detail`, which is what the
+                    // `rclcpp` HALT arm prints anyway.
                     o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT;
                     // **No `name_the_edge` here, deliberately.** The other two
                     // arms are judgments *about the arriving sample*, so the
