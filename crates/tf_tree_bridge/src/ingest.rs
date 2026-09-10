@@ -480,18 +480,6 @@ pub struct Ingest {
     /// Under [`AuthorityPolicy::Strict`] the close is the only thing that
     /// halts.
     startup_window_open: bool,
-    /// Distinct static edges contradicted while the window was open.
-    ///
-    /// The window reads the conflicts already recorded rather than keeping a
-    /// second ledger — [`Authority::conflicts`] enumerates the authority half
-    /// exactly. [`StaticStore`] has no equivalent: it exposes a `u64` of
-    /// conflicting *observations*, and a latched static re-delivered to ten
-    /// late joiners is ten observations of one misconfiguration. So the count
-    /// of distinct edges is taken here, off the `first_time` flag the store
-    /// already computes. A `StaticStore::conflicts_by_edge()` accessor would
-    /// remove this field and let the halt name the edges as well as count
-    /// them; that is a change to a file this commit does not own.
-    startup_static_conflicts: u32,
     stats: BridgeStats,
     /// Undeclared edges seen, and how many times — the rate limiter behind
     /// `Action::UndeclaredEdge`'s `first_time`, and `doctor`'s list of what the
@@ -595,7 +583,6 @@ impl Ingest {
             clock,
             offsets: OffsetTable::new(clock),
             startup_window_open: true,
-            startup_static_conflicts: 0,
             stats: BridgeStats {
                 queue_capacity: 100, // §5.2's KeepLast(100)
                 ..BridgeStats::default()
@@ -807,11 +794,14 @@ impl Ingest {
                     // publisher it had never matched finally appeared.
                     self.stats.static_conflicts += 1;
                     self.stats.dropped_authority += 1;
-                    // Distinct edges, not observations: see the field's doc.
-                    if first_time && self.startup_window_open {
-                        self.startup_static_conflicts =
-                            self.startup_static_conflicts.saturating_add(1);
-                    }
+                    // **No startup bookkeeping here, and its absence is the
+                    // point.** This arm used to increment a private
+                    // `startup_static_conflicts` off `first_time`, which is a
+                    // second ledger of something `StaticStore` already knows —
+                    // and one that could count the faults without being able to
+                    // name them. `close_startup_window` now reads
+                    // `StaticStore::conflicts_by_edge()` instead, which is where
+                    // `docs/decisions/0011` step 5 said the count belonged.
                     let (parent, child) = self.edge_names(slot);
                     return Action::StaticConflict {
                         parent,
@@ -1088,10 +1078,15 @@ impl Ingest {
     ///
     /// # What a caller does with the answer
     ///
-    /// The counts are a summary. [`Ingest::authority`]'s
-    /// [`Authority::conflicts`] enumerates every offending edge with both of
-    /// its publishers, which is the report §5.4 wants CI to print — one run,
-    /// every misconfiguration.
+    /// The counts are a summary, and **both halves can be expanded into the
+    /// per-edge report §5.4 wants CI to print** — one run, every
+    /// misconfiguration. [`Ingest::authority`]'s [`Authority::conflicts`]
+    /// enumerates every offending authority edge with both of its publishers,
+    /// and [`Ingest::statics`]'s [`StaticStore::conflicts_by_edge`] does the
+    /// same for the value disagreements. Until that second accessor existed the
+    /// static half could only be counted, which is why §5.4's normative
+    /// "enumerates **every** recorded edge" reached the authority half and no
+    /// further.
     pub fn close_startup_window(&mut self) -> Option<Action> {
         if !self.startup_window_open {
             return None;
@@ -1106,7 +1101,12 @@ impl Ingest {
         // Read at close, and no filtering: nothing recorded so far can have
         // happened after a window that is only now closing.
         let authority = u32::try_from(self.authority.conflicts().count()).unwrap_or(u32::MAX);
-        let statics = self.startup_static_conflicts;
+        // `.count()` of distinct edges, not `StaticStore::conflicts()`, which is
+        // observations — a latched static redelivered to ten late joiners is ten
+        // of those and one fault. `the_startup_halt_counts_faults_not_observations`
+        // is the guard, and its fixture keeps the two numbers far apart (4
+        // observations across 1 edge) so the substitution cannot pass by luck.
+        let statics = u32::try_from(self.statics.conflicts_by_edge().count()).unwrap_or(u32::MAX);
         if authority == 0 && statics == 0 {
             return None;
         }
@@ -3123,10 +3123,13 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     /// `StartupConflicts { authority: 8, statics: 1 }` against
     /// `{ authority: 2, statics: 1 }`.
     ///
-    /// Mutant: `self.stats.static_conflicts` in place of
-    /// `self.startup_static_conflicts` — applied, and this failed at
+    /// Mutant: `self.statics.conflicts()` in place of
+    /// `self.statics.conflicts_by_edge().count()` — applied, and this failed at
     /// `StartupConflicts { authority: 2, statics: 4 }`, which is the
-    /// late-joiner count and not a fault count at all.
+    /// late-joiner count and not a fault count at all. (Before
+    /// `StaticStore::conflicts_by_edge` existed the same mutant was written
+    /// against a private `startup_static_conflicts` field, which is the ledger
+    /// that accessor replaced.)
     #[test]
     fn the_startup_halt_counts_faults_not_observations() {
         let mut i = Ingest::with(&topo(), AuthorityPolicy::Strict, OnClockReset::Halt, None);

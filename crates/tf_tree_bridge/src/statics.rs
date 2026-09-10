@@ -265,9 +265,49 @@ impl StaticStore {
     }
 
     /// Static conflicts seen (§5.9).
+    ///
+    /// **Observations, not faults** — see [`StaticStore::conflicts_by_edge`] for
+    /// why the two differ and which one a report should quote.
     #[must_use]
     pub fn conflicts(&self) -> u64 {
         self.conflicts
+    }
+
+    /// Every static edge this store has recorded a conflict on, with how many
+    /// conflicting observations that one edge has seen.
+    ///
+    /// **The iterator's length is the fault count; the `u64` beside each edge is
+    /// how loud that one fault was.** `/tf_static` is `transient_local`, so a
+    /// misconfigured publisher's latched sample is re-delivered to every late
+    /// joiner: [`StaticStore::conflicts`] counts ten redeliveries of one
+    /// misconfiguration as ten, and a startup report quoting it would send an
+    /// operator looking for ten faults. That is the same distinction
+    /// `docs/PHASE4.md` §5.4's amendment draws about *when* a static conflict is
+    /// observed being a DDS discovery artefact rather than a fault time.
+    ///
+    /// [`docs/decisions/0011`](../../../docs/decisions/0011-the-bridge-clock-guard-and-the-static-conflict-disposition.md)'s
+    /// implementation step 5 named this accessor and **it did not land with the
+    /// rest of that step.** `Ingest` stood in for it with a private counter
+    /// incremented off the `first_time` flag, which could count the faults but
+    /// could not name them — so §5.4's normative *"the seam's `detail`
+    /// enumerates **every** recorded edge with both of its publishers, not the
+    /// first"* had no way to reach the static half at all, and the C seam's
+    /// `detail` carries counts only.
+    ///
+    /// Reading `reported` is exactly equivalent to the counter it replaces
+    /// rather than merely close to it, and the reason is that `Strict` closes
+    /// its window **once**: at the close, a non-zero `reported[slot]` is a
+    /// conflict seen before the close, which is what the counter accumulated.
+    /// After the close `Strict` has degraded and nothing reads this for a halt.
+    pub fn conflicts_by_edge(&self) -> impl Iterator<Item = (&str, &str, u64)> + '_ {
+        self.reported
+            .iter()
+            .enumerate()
+            .filter(|&(_, seen)| *seen > 0)
+            .map(|(slot, seen)| {
+                let (parent, child) = self.index.key(slot);
+                (parent, child, *seen)
+            })
     }
 
     /// The declared kind of an edge, if any.
@@ -464,5 +504,98 @@ mod tests {
         assert_eq!(s2.observe_dynamic("base", "lidar"), Err(StaticKind::Static));
         // A kind change must not overwrite the declaration.
         assert_eq!(s2.kind_of("base", "lidar"), Some(StaticKind::Static));
+    }
+
+    /// **`conflicts_by_edge` names the edges; `conflicts` only counts
+    /// observations — and the gap between the two is the whole reason the
+    /// accessor exists.**
+    ///
+    /// `docs/PHASE4.md` §5.4's amendment is normative that a `Strict` startup
+    /// halt's `detail` "enumerates **every** recorded edge with both of its
+    /// publishers, not the first". Until this accessor landed the static half of
+    /// that had no way to be enumerated at all: `Ingest` kept a private `u32` of
+    /// distinct edges, which could say *how many* and never *which*.
+    ///
+    /// The fixture keeps the two numbers apart on purpose — 2 contradicted edges
+    /// against 7 conflicting observations — so a substitution of one for the
+    /// other cannot pass by coincidence, the same shape
+    /// `ingest::tests::the_startup_halt_counts_faults_not_observations` uses one
+    /// level up.
+    ///
+    /// Mutant (applied, confirmed fatal): drop the `.filter(|&(_, seen)| *seen > 0)`
+    /// — every declared edge is then yielded, including the two that never
+    /// conflicted, and this fails at 4 entries against 2. It is fatal to five
+    /// tests in all: the other four are `ingest`'s startup-window tests, which
+    /// is the cross-check that the halt reads this accessor rather than a ledger
+    /// of its own.
+    #[test]
+    fn conflicts_by_edge_names_every_contradicted_edge_and_no_others() {
+        const OTHER: [f64; 7] = [1.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0];
+        let mut s = StaticStore::new();
+
+        // Two edges that are declared and never contradicted. They must not
+        // appear: a report that named them would send an operator to look at
+        // correct configuration.
+        assert_eq!(
+            s.observe_static("base", "lidar", ID, &node("/rsp")),
+            StaticVerdict::Declare
+        );
+        assert_eq!(
+            s.observe_static("base", "imu", ID, &node("/rsp")),
+            StaticVerdict::Declare
+        );
+        for _ in 0..10 {
+            assert_eq!(
+                s.observe_static("base", "lidar", ID, &node("/rsp2")),
+                StaticVerdict::Idempotent
+            );
+        }
+
+        // Two that are, at different loudnesses: a latched static redelivered to
+        // five late joiners is five observations of one misconfiguration.
+        assert_eq!(
+            s.observe_static("base", "cam", ID, &node("/rsp")),
+            StaticVerdict::Declare
+        );
+        assert_eq!(
+            s.observe_static("base", "arm", ID, &node("/rsp")),
+            StaticVerdict::Declare
+        );
+        for _ in 0..5 {
+            assert!(matches!(
+                s.observe_static("base", "cam", OTHER, &node("/intruder")),
+                StaticVerdict::Conflict { .. }
+            ));
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                s.observe_static("base", "arm", OTHER, &node("/intruder")),
+                StaticVerdict::Conflict { .. }
+            ));
+        }
+
+        // The count that already existed sees seven observations...
+        assert_eq!(s.conflicts(), 7, "observations");
+
+        // ...and the accessor sees two faults, and can name them.
+        let mut found: Vec<(String, String, u64)> = s
+            .conflicts_by_edge()
+            .map(|(p, c, n)| (p.to_owned(), c.to_owned(), n))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("base".to_owned(), "arm".to_owned(), 2),
+                ("base".to_owned(), "cam".to_owned(), 5),
+            ],
+            "every contradicted edge, named, with how loud it was — and neither \
+             of the two that never conflicted"
+        );
+        assert_eq!(
+            found.len(),
+            2,
+            "the iterator's length is the fault count, which is what a halt quotes"
+        );
     }
 }
