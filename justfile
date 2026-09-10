@@ -2974,20 +2974,29 @@ shm-rendezvous:
     # wrong until they were re-measured.
     #
     # Measured on this branch, `cargo nextest list -p tf_tree --test rendezvous`
-    # per feature set: `shm` 18, `shm,unstable` 29, `shm,test-hooks` 24,
-    # `shm,test-hooks,unstable` **35** — the line below. (Earlier revisions of
+    # per feature set: `shm` 37, `shm,unstable` 49, `shm,test-hooks` 43,
+    # `shm,test-hooks,unstable` **55** — the line below. (Earlier revisions of
     # this comment said 16/18, then 16/19/22/25, then 16/21/22/27 on `0028` plan
-    # step 5's branch and 17/23/23/29 on steps 3 and 4's; each was written
-    # before the next tests landed, which is why the numbers here are
+    # step 5's branch, 17/23/23/29 on steps 3 and 4's, and 18/29/24/35; each was
+    # written before the next tests landed, which is why the numbers here are
     # re-measured rather than added together.)
     #
-    # **Two of the four were already stale before this branch touched them**,
-    # and that is worth one sentence because it is the failure mode the
-    # re-measuring exists to catch: at 09efc9b the same command reports
-    # 17/28/23/34, not 17/25/23/31, so the `unstable` columns had drifted by
-    # three while the other two were exact. This branch adds one ungated test —
-    # `a_stopped_and_continued_owner_still_serves_the_rendezvous`, the `EINTR`
-    # regression — which is +1 in every column and not what moved them.
+    # **All four were stale again before this branch touched them, and by
+    # eighteen or nineteen apiece** — the same failure mode the paragraph above
+    # recorded once already, at a much larger size. At `main` (0fa78ae) the four
+    # commands report 36/48/42/54 against the 18/29/24/35 that was written here,
+    # so the narrowest column had recorded exactly half the tests that existed
+    # while the sentence recording it stayed put. This branch adds one ungated
+    # test —
+    # `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`, the
+    # zero-byte handshake regression — which is +1 in every column and is not
+    # what moved them.
+    #
+    # **The `unstable` delta above is stale too, and is left named rather than
+    # rewritten**: `shm,unstable` minus `shm` measures **12** at `main` and on
+    # this branch, not the eleven the enumeration walks through, so one test has
+    # landed under that gate since the list was written and is not in it. The
+    # arithmetic, not the list, is what the recipe depends on.
     cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.

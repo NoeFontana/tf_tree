@@ -41,6 +41,46 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — an owner that died mid-handshake failed the joiner instead of being retried
+
+- **A zero-byte handshake reply was reported as a protocol violation.** The §3.7
+  client read the owner's response with `recvmsg` and handed whatever arrived to
+  `HelloResponse::from_bytes`. When the owner died between `accept(2)` and its
+  `sendmsg`, what arrived was **nothing**: on a `SOCK_SEQPACKET` connection a
+  0-byte read is the orderly end of the peer's writing end, not an error. Parsing
+  it produced `WireError::BadLength { got: 0, expected: 56 }`, so the failure
+  reached §3.4 as `IpcError::HandshakeMalformed` — which is **terminal by
+  design** — and an `open()` with its whole deadline left failed in milliseconds,
+  blaming the owner for breaking the protocol. Seen once as `BadLength { got: 0 }`
+  in a twelve-minute `shm_torture` run.
+- **`IpcError::HandshakeClosed` is the new spelling, and it is a transient.** It
+  classifies with `HandshakeIo` as "no server", so §3.4 goes round its loop and
+  joins whatever serves the arena next. A new `IpcError` variant on a published
+  crate, taken deliberately on the `0.0.x` line, rather than an errno nobody
+  produced stuffed into `HandshakeIo`: there is no OS error here to report, and
+  the two ways a dying owner reaches a client are worth telling apart — a
+  connection the dead listener never accepted gives `ECONNRESET`, one it did
+  gives this. Both were measured before the variant was written.
+- **`docs/decisions/0005` had already specified this**, in its client-reachability
+  table: *"`connect` succeeds, peer HUPs or times out mid-handshake"* → *"`Absent`.
+  The ownership byte will be free and the §3.4 loop proceeds."* The timeout half
+  was implemented and the HUP half was not, so no spec changed here — the code
+  moved to the record.
+- **`Absent` is safe for this arm, and the code now says why in place.** A
+  spurious `Absent` cannot produce a second arena beside a live one: it leads to
+  §3.4 step 2, where a live owner still holds byte 0, and step 4, which refuses
+  to create while any participant byte is held. The dangerous misfiling is a
+  *local* failure (`ClientSocketSetup`), and that arm is untouched.
+- **Tested at both ends, and both tests were run against the mutant.** A unit
+  test stages a real `accept(2)` and a close with no reply and pins the error and
+  its verdict; `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`
+  drives the whole §3.4 loop across real processes — an owner killed, a survivor
+  holding a byte, and a child that aborts *inside its own slot assigner* — and
+  asserts the joiner reaches the heir's arena and reads what the dead owner
+  published. **No §11.3 crash point was added**: the assigner runs after the
+  accept and before any response is built, so a child aborting there is the
+  window, through public API only.
+
 ### Fixed — `0048` step 4: D4 now holds for every root that carries `unsafe`
 
 - **Twelve crate roots carried `unsafe` with no D4 posture**, and `0048` named

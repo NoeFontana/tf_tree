@@ -101,6 +101,8 @@ pub fn peer_hung_up(socket: BorrowedFd<'_>) -> Result<bool, IpcError> {
 ///   is an expected state (§3.9), and the ownership byte is the real
 ///   discriminator.
 /// - [`IpcError::HandshakeIo`] on a send/receive failure or timeout.
+/// - [`IpcError::HandshakeClosed`] if the owner closed the connection without
+///   replying — it died between `accept(2)` and its `sendmsg`.
 /// - [`IpcError::HandshakeMalformed`] if the reply is not a `HelloResponse`.
 /// - [`IpcError::HandshakeRejected`] if the owner said no.
 /// - [`IpcError::NoFdReceived`] if the owner accepted but sent no fd.
@@ -177,6 +179,32 @@ pub fn attach(
                 }
             }
         }
+    }
+
+    // **Zero bytes is the owner dying mid-handshake, not a malformed reply.**
+    // On a `SOCK_SEQPACKET` connection a 0-byte `recvmsg` is the orderly end of
+    // the peer's writing end — the owner was there at `accept(2)` and its
+    // descriptors were torn down before it reached `sendmsg`. Handing `&[]` to
+    // `from_bytes` produces `WireError::BadLength { got: 0 }`, and that spelling
+    // is a *protocol violation*: `verdict` calls it terminal, so a §3.4 loop
+    // that should have absorbed a transient inside its deadline instead failed
+    // the caller's whole `open()`. Observed once as `BadLength { got: 0 }` in a
+    // twelve-minute torture run.
+    //
+    // **Why `Absent` — which this becomes — is safe, stated here because it is
+    // the arm that must never be wrong.** A spurious `Absent` cannot produce a
+    // second arena beside a live one: it leads to §3.4 step 2, where a live
+    // owner still holds byte 0 and `try_take_ownership` therefore fails, and to
+    // step 4, which refuses to create while *any* participant byte is held. The
+    // dangerous direction is a *local* failure misfiled as `Absent`
+    // (`ClientSocketSetup`), and this is not one — the peer answered the
+    // `connect` and then went away, which is a fact about the arena.
+    //
+    // Placed after the fd drain above rather than straight after `recvmsg`: EOF
+    // cannot carry ancillary data, so there is nothing here to leak, and doing
+    // it in this order keeps that from resting on a `Drop` in another crate.
+    if recv.bytes == 0 {
+        return Err(IpcError::HandshakeClosed);
     }
 
     let response =
@@ -284,12 +312,25 @@ enum Verdict {
 /// *second arena beside a live one* — divergence, not an error message.
 fn verdict(e: &IpcError) -> Verdict {
     match e {
-        // Nobody listening, or an owner that died mid-handshake. §3.9 makes a
-        // stale socket path expected, so both are simply "no server".
-        IpcError::ServerUnreachable { .. } | IpcError::HandshakeIo { .. } => Verdict::Absent,
+        // Nobody listening, or an owner that went away mid-handshake — which
+        // reaches a client two ways, and both are here: `ECONNRESET` on a
+        // connection the dead listener never accepted (`HandshakeIo`), and a
+        // 0-byte `recvmsg` on one it did (`HandshakeClosed`). §3.9 makes a stale
+        // socket path expected, so all three are simply "no server".
+        //
+        // `Absent` is safe for the two death arms for the reason `attach` states
+        // at the zero-byte check: it leads to §3.4 step 2, where a live owner
+        // still holds byte 0, and step 4, which refuses to create while any
+        // participant byte is held — so it cannot produce a second arena.
+        IpcError::ServerUnreachable { .. }
+        | IpcError::HandshakeIo { .. }
+        | IpcError::HandshakeClosed => Verdict::Absent,
         // The owner answered. A version or layout disagreement cannot be fixed
         // by waiting, and burning the §3.4 deadline on it would replace a
-        // precise message with a timeout.
+        // precise message with a timeout. `HandshakeMalformed` belongs here
+        // because it is now only reachable for a datagram that *arrived* and was
+        // not a `HelloResponse`; the empty one that used to land on it is
+        // `HandshakeClosed` above.
         IpcError::HandshakeRejected { .. }
         | IpcError::HandshakeMalformed(_)
         | IpcError::RejectionCarriedFd { .. }
@@ -303,6 +344,8 @@ fn verdict(e: &IpcError) -> Verdict {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     /// The arm that must never move.
@@ -320,8 +363,20 @@ mod tests {
         );
     }
 
+    /// The three arms that mean "no server".
+    ///
+    /// **This test said `..._exactly_the_two_...` and listed two.** The third is
+    /// [`IpcError::HandshakeClosed`], and its absence is the defect the variant
+    /// was added for: an owner that died between `accept(2)` and its `sendmsg`
+    /// reached this function as `HandshakeMalformed(BadLength { got: 0 })` and
+    /// was classified **terminal**, so §3.4 failed the caller's whole `open()`
+    /// on a transient it was built to absorb.
+    ///
+    /// `ServerUnreachable` is `connect` finding nothing; the other two are the
+    /// two ways a *dying* owner reaches a client — `ECONNRESET` on a connection
+    /// it never accepted, a 0-byte `recvmsg` on one it did.
     #[test]
-    fn the_no_server_arms_are_exactly_the_two_that_mean_no_server() {
+    fn the_no_server_arms_are_exactly_the_three_that_mean_no_server() {
         assert_eq!(
             verdict(&IpcError::ServerUnreachable { raw_os_error: 2 }),
             Verdict::Absent
@@ -330,8 +385,19 @@ mod tests {
             verdict(&IpcError::HandshakeIo { raw_os_error: 110 }),
             Verdict::Absent
         );
+        assert_eq!(verdict(&IpcError::HandshakeClosed), Verdict::Absent);
     }
 
+    /// Every arm that means "the owner answered" is terminal.
+    ///
+    /// **`HandshakeMalformed` was the case this list was missing**, and it is the
+    /// one that matters now: the variant's meaning narrowed when
+    /// [`IpcError::HandshakeClosed`] took the empty datagram off it, so what is
+    /// left is a reply that *arrived* and was not a `HelloResponse`. That is a
+    /// protocol violation, waiting cannot repair it, and it must stay terminal —
+    /// while the length error `from_bytes` produces for zero bytes must never
+    /// reach here at all. `BadMagic` is the case that can only be a real
+    /// violation, which is why it is the one written down.
     #[test]
     fn an_owner_that_answered_is_terminal() {
         for e in [
@@ -344,8 +410,93 @@ mod tests {
             IpcError::RejectionCarriedFd {
                 status: crate::wire::HelloStatus::VersionMismatch,
             },
+            IpcError::HandshakeMalformed(crate::wire::WireError::BadMagic),
         ] {
             assert_eq!(verdict(&e), Verdict::Rejected, "{e:?}");
         }
+    }
+
+    /// **An owner that closes after accepting is `Absent`, not malformed.**
+    ///
+    /// Staged against real sockets because the fact under test belongs to the
+    /// kernel, and the two halves of "the owner went away" are not the same
+    /// syscall result: an **accepted** connection whose peer's descriptors are
+    /// torn down gives the client a 0-byte `recvmsg`, while a connection the
+    /// listener never accepted gives `ECONNRESET`. Measured both ways before this
+    /// was written — so a staging that skips the `accept(2)` would exercise the
+    /// `HandshakeIo` arm, which was already right, and prove nothing.
+    ///
+    /// The thread below therefore accepts, reads the request, and closes without
+    /// replying: byte for byte what the owner's descriptors do when it dies
+    /// inside `OwnerServer::accept_one`, between the `accept` and the `sendmsg`.
+    ///
+    /// Mutant — delete the `recv.bytes == 0` guard in [`attach`] ⇒ applied, and
+    /// this fails on the **first** assertion, with
+    /// `left: HandshakeMalformed(BadLength { got: 0, expected: 56 })`. The second
+    /// assertion is what that error costs and is asserted separately rather than
+    /// reached: the panic stops the test before it, and
+    /// `the_no_server_arms_are_exactly_the_three_that_mean_no_server` is where
+    /// the classification is pinned on its own.
+    #[test]
+    fn an_owner_that_closes_after_accepting_is_absent_not_malformed() {
+        use crate::wire::HELLO_REQUEST_LEN;
+        use rustix::net::{accept_with, bind, listen};
+
+        let dir =
+            std::env::temp_dir().join(format!("tf_tree_ipc_cli-{}-zero-byte", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock_path = dir.join("a.sock");
+
+        // Bound and listening *before* the thread exists, so `connect` cannot
+        // race the listen and land on the `ServerUnreachable` arm instead.
+        let listener = socket_with(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(&listener, &socket_addr(&sock_path).unwrap()).unwrap();
+        listen(&listener, 4).unwrap();
+
+        let dying_owner = std::thread::spawn(move || {
+            let accepted = accept_with(&listener, SocketFlags::CLOEXEC).unwrap();
+            let mut buf = [0u8; HELLO_REQUEST_LEN];
+            // Read the request, as the real accept loop does, and then let both
+            // descriptors close with no reply written.
+            let _ = recvmsg(
+                &accepted,
+                &mut [std::io::IoSliceMut::new(&mut buf)],
+                &mut Default::default(),
+                RecvFlags::empty(),
+            );
+        });
+
+        let request = HelloRequest {
+            format_version: 3,
+            layout_hash: 0xDEAD_BEEF,
+            mode: crate::identity::AccessMode::ReadOnly,
+            client_pid: std::process::id(),
+            client_start_time: 0,
+            client_boot_id: [0; 16],
+            client_name: [0; 32],
+        };
+        let err = attach(&sock_path, &request, Duration::from_secs(5))
+            .expect_err("the staged owner never replies, so the attach cannot succeed");
+
+        assert_eq!(
+            err,
+            IpcError::HandshakeClosed,
+            "a 0-byte reply was read as something other than the owner going away"
+        );
+        assert_eq!(
+            verdict(&err),
+            Verdict::Absent,
+            "the §3.4 loop would not retry an owner that died mid-handshake"
+        );
+
+        dying_owner.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

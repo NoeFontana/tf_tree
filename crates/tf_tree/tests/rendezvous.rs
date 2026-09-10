@@ -103,7 +103,14 @@ impl Kid {
     /// hung"; this says "the site did not fire", which is the actual finding.
     /// Both new §11.3 tests use it, and both were verified to fail under a
     /// deliberately disarmed site.
-    #[cfg(feature = "crash-points")]
+    ///
+    /// **No longer gated on `crash-points`, and the gate was not load-bearing —
+    /// it only kept the method from being dead code where the crash sites
+    /// compile out.** `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`
+    /// is a caller that arms nothing: the child it waits for aborts inside a
+    /// closure the child itself supplies, so the method is live in every
+    /// configuration this file compiles in. Without this, that test would not
+    /// build under `just shm-check`'s `shm,test-hooks,unstable` line.
     fn wait_within(&mut self, bound: std::time::Duration) -> Option<std::process::ExitStatus> {
         let deadline = std::time::Instant::now() + bound;
         loop {
@@ -4345,6 +4352,166 @@ fn a_survivor_inherits_ownership_and_the_arena_becomes_joinable_again() {
         expected.to_bits(),
         "the inherited arena served different bytes than the dead owner wrote"
     );
+}
+
+/// **An owner that dies *inside* the handshake is a transient, and §3.4 absorbs
+/// it.**
+///
+/// One window later than the sibling above, and the difference is the whole
+/// test. There the owner is dead before the joiner connects, so `connect` fails
+/// on §3.9's stale path — an arm that was always classified as "no server".
+/// Here the owner is alive at `accept(2)`, reads the request, and is gone before
+/// it can reply. The client's `recvmsg` then returns **zero bytes**, which on a
+/// `SOCK_SEQPACKET` connection is an orderly end-of-stream and not an error, and
+/// `HelloResponse::from_bytes` turned that into
+/// `WireError::BadLength { got: 0 }` — i.e. `IpcError::HandshakeMalformed`, a
+/// *protocol violation*, which §3.4 hands straight back to the caller. So an
+/// `open()` with twenty seconds of deadline left failed in milliseconds, and
+/// what it reported was that the owner had broken the protocol. Seen once as
+/// `BadLength { got: 0 }` in a twelve-minute `shm_torture` run.
+///
+/// **No §11.3 crash point is involved and none was added.** `serve-then-die`
+/// reaches the window through public API: `OwnerServer::serve` runs the slot
+/// assigner *after* the accept and the request read and *before* it builds any
+/// response, so a child that aborts inside its own assigner is in exactly that
+/// window. The existing sites were checked first and none of them is here:
+/// `attach.after_slot_assigned_before_publish` is inside `fill_slot`, which a
+/// joiner reaches only *after* the response has arrived and an owner only at its
+/// own creation, before it serves anybody; both `open.*` sites are on the
+/// creator's path to its `bind`.
+///
+/// **The heir is poked in a loop, unlike the sibling's single poke, and the
+/// competitor is the joiner itself.** A retrying `open()` takes byte 0 on every
+/// pass through §3.4 step 2 and releases it a few microseconds later, so one
+/// `inherit_ownership` can find the byte held by a process that is about to let
+/// go and answer `Contended` with nobody serving. Neither half of the sibling's
+/// `"true Inherited "` is stable here for the same reason: `owner_lost` reads
+/// that byte too.
+///
+/// **Mutant: delete the `recv.bytes == 0` guard in `tf_tree_ipc::client::attach`**
+/// ⇒ applied, and the joiner comes back
+/// `Rendezvous(HandshakeMalformed(BadLength { got: 0, expected: 56 }))` in
+/// milliseconds; the final assertion fails with it.
+#[test]
+fn an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use tf_tree::{AttachMode, Stamp};
+    use tf_tree_ipc::CreatePolicy;
+
+    let dir = Scratch::new("die-mid-handshake");
+
+    let mut owner = Kid::spawn(&dir.0, &["own"]);
+    let published = owner.line();
+    assert!(
+        published.starts_with("owning "),
+        "the owner did not come up: {published}"
+    );
+    let owner_value = published.strip_prefix("owning ").unwrap().to_string();
+
+    // A survivor, attached before the owner dies: it holds the participant byte
+    // that keeps a `create = Never` joiner retrying instead of reporting
+    // `ArenaAbsent`, and it is the one process that can inherit the role.
+    let mut heir = Kid::spawn(&dir.0, &["join-heir"]);
+    assert!(
+        heir.line().starts_with("joined "),
+        "the survivor did not attach"
+    );
+
+    owner.kill();
+
+    // The owner that will die mid-handshake. It binds the rendezvous path the
+    // dead owner left stale and holds no lock byte of its own, so the only thing
+    // it changes about the arena is that a joiner's `connect` now succeeds.
+    let mut doomed = Kid::spawn(&dir.0, &["serve-then-die"]);
+    assert_eq!(
+        doomed.line(),
+        "serving",
+        "the doomed owner never bound the rendezvous socket"
+    );
+
+    // The joiner runs on a worker thread because `open()` blocks for as long as
+    // it retries, and this thread has to drive the takeover meanwhile. It sends
+    // back the transform it read, formatted exactly as the child's `own` arm
+    // prints it, so a success proves *which* arena it reached.
+    let (tx, rx) = mpsc::channel();
+    let joiner = std::thread::spawn(move || {
+        let outcome = tf_tree::Open::new()
+            .mode(AttachMode::ReadWrite)
+            .create(CreatePolicy::Never)
+            .timeout(Duration::from_secs(20))
+            .open()
+            .map(|tree| {
+                let g = tree.guard();
+                let target = tree.frame("map").unwrap();
+                let source = tree.frame("base").unwrap();
+                let plan = tree.plan(target, source).unwrap();
+                let iso = plan
+                    .at(&g, Stamp::<tf_tree::SystemDomain>::from_nanos(1_500))
+                    .unwrap();
+                iso.to_bits()
+                    .iter()
+                    .map(|w| format!("{w:016x}"))
+                    .collect::<Vec<_>>()
+                    .join(":")
+            })
+            .map_err(|e| format!("{e:?}"));
+        let _ = tx.send(outcome);
+    });
+
+    // **The window opened, and the doomed process dying is the proof.** Its
+    // assigner runs only when a client's request has been accepted and read, so
+    // there is nothing to time here and no sleep that could stand in.
+    assert_eq!(
+        doomed.line(),
+        "dying",
+        "the doomed owner never reached its slot assigner, so no client's request \
+         was accepted and read"
+    );
+    let status = doomed.wait_within(Duration::from_secs(20)).expect(
+        "the doomed owner announced the window and then did not die, so what the \
+         joiner met was not an owner going away mid-handshake",
+    );
+    assert_eq!(
+        status.code(),
+        None,
+        "the doomed owner exited normally instead of aborting, which would have \
+         run its destructors and unlinked the socket: {status:?}"
+    );
+
+    // The repair the joiner is waiting for: the survivor takes the vacant role
+    // and republishes the socket over the dead pair's path.
+    let mut report = String::new();
+    for _ in 0..40 {
+        heir.poke();
+        report = heir.line();
+        if report.contains("Inherited") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        report.contains("Inherited"),
+        "the survivor never took the vacant owner role, so nothing came back to \
+         serve the joiner: {report}"
+    );
+
+    match rx.recv_timeout(Duration::from_secs(40)).expect(
+        "the joiner thread never reported; its own 20 s deadline should have ended \
+         it either way",
+    ) {
+        Ok(bits) => assert_eq!(
+            bits, owner_value,
+            "the joiner attached to something other than the arena the dead owner \
+             created and published into"
+        ),
+        Err(e) => panic!(
+            "the joiner was refused instead of retrying past an owner that died \
+             mid-handshake: {e}"
+        ),
+    }
+    joiner.join().unwrap();
 }
 
 /// **Two survivors race for the vacant owner role, and the loser keeps its slot.**
