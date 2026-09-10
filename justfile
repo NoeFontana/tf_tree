@@ -1822,11 +1822,29 @@ embed-cost-check:
 # every machine and a gate that fails for the CPU model is a gate people learn
 # to ignore. `src/baseline.rs` carries the full split.
 #
-# On this host exactly one row is a claim — the LerpSlerp differential, which is
-# host-independent by construction — so this gate holds one number today. That
-# is not a placeholder: `Report::validate` refuses any row that prints numbers
-# without giving at least one of them a direction, so a row that starts being
-# measurable arrives already gated or not at all.
+# **How many numbers this gate holds is not written here, and its absence is the
+# correction.** This comment said "exactly one row is a claim... so this gate
+# holds one number today", and that went stale the day a second number was
+# gated. The recipe prints the count it actually compared, and
+# `Comparison::compared_nothing` refuses a run that compared none, so the run is
+# the instrument — the same rule the `lint` row states about counts kept in two
+# places.
+#
+# What *is* worth stating is which kinds of claim are gated, because the set is
+# narrower than a green tick suggests: every comparison row is UNAVAILABLE on
+# this host, so the LerpSlerp differential's `max_deviation` — host-independent
+# by construction — was for a long time the only survivor.
+#
+# **The second gated number is not a row.** It is `arena_memory_floor`'s
+# `idle_arena_resident_bytes`, a PHASE5 §9.3 "where we are worse" metric, and
+# reaching it was not the one-line change `docs/decisions/0021` step 4 described.
+# `Report::validate`'s rule that a thing printing numbers must give one of them a
+# direction was written over *rows* only, and `baseline::compare` read a §9.3
+# entry's **id** and nothing inside it — so a direction on such a metric gated
+# nothing, and that record's own falsifier ("a deliberate revert of step 2 making
+# it fail") could not fire. Measured rather than argued: with the alignment fix
+# reverted the idle arena goes back to ~100% resident and this recipe printed
+# `PASS - 1 directional metric held`. Both halves are closed now.
 #
 # `--out target/bench-report` and not `report/`: this is a check, and it should
 # not clobber a report somebody generated to look at.
@@ -2099,6 +2117,24 @@ tf2-bench-report *ARGS:
     ./docker/tf2/run.sh 'cargo run --release -p tf_tree_bench --features tf2 --bin bench_report -- {{ARGS}}'
 
 # The tf2-side regression gate. Container-only, like everything else here.
+#
+# **Its `arena_memory_floor.idle_arena_resident_bytes` bound is wide, and this is
+# the disclosure rather than a silence.** `docs/decisions/0021` step 4 gave that
+# metric a direction, and `baseline::compare` now descends into
+# `where_we_are_worse` entries — so this file's copy had to gain the same
+# `drift`/`tolerance` or every run here would fail on a direction mismatch caused
+# by a commit that could not run this recipe. Those two fields were therefore
+# edited by hand, which is defensible because they are a **policy** choice and
+# not a measurement: no number in this file was touched.
+#
+# What was not fixed by hand is the **value**, because inventing one would be.
+# This baseline predates `0021` step 2 — its figure is `2408448`, the ~100%
+# resident arena the alignment fix removed — so the bound it sets is roughly
+# 9.6 MB and a post-fix container run clears it by two orders of magnitude. The
+# gate is real but weak here until somebody runs `tf2-bench-baseline-update`
+# below, at which point it tightens to the same 4x band the host baseline has.
+# `crates/tf_tree_bench/tests/baseline_file.rs` holds the *host* baseline to the
+# build's own `RESIDENCY_SLACK`; nothing on this host can hold this one.
 tf2-bench-check:
     ./docker/tf2/run.sh 'cargo run --release -p tf_tree_bench --features tf2 --bin bench_report -- \
         --out target/tf2-bench-report \

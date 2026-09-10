@@ -139,6 +139,54 @@ pub const DEVIATION_SLACK: f64 = 9.0;
 /// back in the bracket search — cost tens of percent or more.
 pub const LATENCY_SLACK: f64 = 0.25;
 
+/// Relative slack the regression gate allows on the idle arena's resident
+/// footprint.
+///
+/// 300% — the metric may quadruple before the gate fires. Looser than
+/// [`LATENCY_SLACK`] for three reasons, all properties of the quantity rather
+/// than of the code it gates.
+///
+/// **It is six pages of a whole-process counter.**
+/// `idle_arena_resident_bytes` is a *delta* of `/proc/self/smaps_rollup`'s Pss
+/// across building one tree, which the kernel reports in whole KiB and which
+/// therefore quantises to the host's page size. On this host it is 24 576 B —
+/// six 4 KiB pages, most of them the tree's own non-arena allocation rather than
+/// the arena. One page either way is 17% of that.
+///
+/// **The page size is not 4 KiB everywhere.** At a 100% band the bound would be
+/// 49 152 B, and a host with 64 KiB base pages — aarch64 is configured that way
+/// on several distributions — exceeds it on its *first* page and reads as a
+/// +166% regression with nothing about the code having changed. That is not a
+/// hypothetical about libc versions; it is arithmetic on the unit the kernel
+/// reports in. 300% clears one 64 KiB page with room to spare.
+///
+/// **The baseline is cut on one host and this gate also runs on another.** CI's
+/// `bench-gate` job runs `just bench-check` on `ubuntu-latest` against the
+/// committed baseline, and until this metric there was nothing host-dependent
+/// left for it to compare — the one claim it held,
+/// `differential_agreement.max_deviation`, is host-independent by construction.
+/// So this is the first number in the artifact whose comparison spans two
+/// machines, and the band has to cover that or it becomes a gate that fails for
+/// the machine. The exposure is deliberate and worth having: if a runner ever
+/// exceeds the bound, the failure prints both numbers and the finding is that
+/// this residency figure is not portable, which nobody currently knows either
+/// way.
+///
+/// **Measured before choosing it, not assumed.** Thirty consecutive runs of
+/// `bench_report` on this host returned 24 576 B bit-identically, and six more
+/// with all eight logical CPUs spinning returned the same, so the *observed*
+/// spread here is zero and every bit of this slack is headroom. What it must not
+/// do is stop catching the regression it exists for: `docs/decisions/0021`'s
+/// before column is **2 408 448 B** (and a re-measurement on 2026-09-10 with the
+/// fix reverted read 2 412 544 B — the same page count, a different sitting), so
+/// the failure this gates against sits at 98x the baseline and **24x the bound
+/// this slack sets** (98 304 B). It still fires on anything above 24 pages.
+///
+/// `0021`'s own words on the number: *"The order of magnitude is the finding;
+/// the third digit is not."* A tolerance that pretended to gate the third digit
+/// would contradict the row it gates.
+pub const RESIDENCY_SLACK: f64 = 3.0;
+
 /// The "where `tf_tree` is worse" topics `docs/PHASE5.md` §9.3 names, verbatim.
 pub const REQUIRED_WORSE: &[&str] = &[
     "arena_memory_floor",
@@ -693,6 +741,26 @@ pub struct Worse {
     /// to it" is not one of them — that is what `attach_latency` used to be,
     /// and the answer was to go and measure it.
     pub metrics_absent_because: Option<String>,
+    /// Metric keys this entry would carry and deliberately did **not**, with the
+    /// reason stated in [`Worse::statement`] rather than here.
+    ///
+    /// **Rust-side only: it has no JSON representation, and that is a constraint
+    /// rather than a preference.** `results.json`'s schema is a compatibility
+    /// surface — `docs/PHASE5.md` §12 gate 7 diffs it across machines — so a new
+    /// field is a `SCHEMA` bump, and a bump invalidates
+    /// `baseline/results-tf2.json` as well, which can only be regenerated inside
+    /// `docker/tf2`. So the reason a metric is absent reaches
+    /// [`Report::validate`], which runs in the same process, and cannot reach
+    /// [`crate::baseline`], which reads the committed file.
+    ///
+    /// It exists because the direction rule below would otherwise turn a *missing
+    /// measurement* into **no artifact at all**: `measure_idle_arena_resident`
+    /// withholds the residency figure both where Pss is unreadable and where the
+    /// whole-process delta comes out non-positive, and the second is not a
+    /// fitness failure. Without this the floor entry would then be two
+    /// informational metrics, `validate` would refuse the report, and the message
+    /// would tell the author to add a direction the code already has.
+    pub metrics_withheld: Vec<&'static str>,
 }
 
 /// Whether this host can produce a timing number that means anything.
@@ -1557,15 +1625,63 @@ impl Report {
                 w.metrics_absent_because.as_deref().map(str::trim),
             ) {
                 (true, None | Some("")) => bad.push(format!(
-                    "`worse` entry `{}` carries no metrics and no                      `metrics_absent_because`. §9.3's section is the one a reader is                      entitled to quote against us, and an entry with an empty metric                      list reads as an oversight whether or not it is one. Either give                      it a number, or say — in the entry — why the cost has none",
+                    "`worse` entry `{}` carries no metrics and no `metrics_absent_because`. §9.3's section is the one a reader is entitled to quote against us, and an entry with an empty metric list reads as an oversight whether or not it is one. Either give it a number, or say — in the entry — why the cost has none",
                     w.id
                 )),
                 (false, Some(_)) => bad.push(format!(
-                    "`worse` entry `{}` carries {} metric(s) *and* a reason they are                      absent. One of the two is wrong, and a reader has no way to tell                      which",
+                    "`worse` entry `{}` carries {} metric(s) *and* a reason they are absent. One of the two is wrong, and a reader has no way to tell which",
                     w.id,
                     w.metrics.len()
                 )),
                 _ => {}
+            }
+            // The rule the rows above already carry, applied to the section
+            // whose entire purpose is to be the row that *can* regress.
+            //
+            // **This is the defect `docs/decisions/0021` step 4 walked into.**
+            // `arena_memory_floor` printed five numbers for its whole life and
+            // gave none of them a direction, so `crate::baseline` — which until
+            // then compared only the *set* of entry ids — had nothing to
+            // compare, and the falsifier that record names for itself ("a
+            // deliberate revert of step 2 making it fail") passed. Measured, not
+            // argued: with the alignment fix reverted the arena goes back to
+            // ~100% resident and `just bench-check` printed
+            // `PASS - 1 directional metric held`.
+            //
+            // Scoped to a host that could have produced the number.
+            // `worse_entries` withholds `arena_memory_floor`'s Pss metrics when
+            // the memory axis fails, and refusing to emit a report at all on
+            // such a host would turn "this machine cannot read
+            // `smaps_rollup`" into "there is no artifact" — a worse answer than
+            // the one this rule prevents. The memory axis is the only fitness
+            // axis that reaches a `Worse` entry today; a second one belongs in
+            // this predicate.
+            if self.fitness.fair_for_memory
+                && w.metrics_withheld.is_empty()
+                && !w.metrics.is_empty()
+                && !w.metrics.iter().any(|m| m.drift != Drift::Informational)
+            {
+                bad.push(format!(
+                    "`worse` entry `{}` prints numbers and every one of them is \
+                     informational, so nothing in it can ever be gated. §9.3's section is \
+                     the one a reader is entitled to quote against us, and a cost that \
+                     cannot regress is not a cost anybody is holding us to. Give at least \
+                     one metric a direction with \
+                     `Metric::lower_is_better`/`higher_is_better`",
+                    w.id
+                ));
+            }
+            for m in &w.metrics {
+                if m.drift != Drift::Informational
+                    && !(m.tolerance.is_finite() && m.tolerance >= 0.0)
+                {
+                    bad.push(format!(
+                        "`worse` entry `{}` metric `{}` is directional with tolerance {} \
+                         — a negative or non-finite tolerance makes the gate either always \
+                         or never fire",
+                        w.id, m.key, m.tolerance
+                    ));
+                }
             }
         }
 
@@ -2824,6 +2940,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
         ),
         metrics: Vec::new(),
         metrics_absent_because: None,
+        metrics_withheld: Vec::new(),
     };
     // The arithmetic and the measurement are independent facts, so they are
     // emitted independently: a `from_totals` failure must not discard a Pss
@@ -2847,12 +2964,34 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
     } else {
         None
     };
+    // Recorded, not silent. Both reasons a residency figure can be absent land
+    // here — an unreadable `smaps_rollup`, and a whole-process delta that came
+    // out non-positive — and `Report::validate`'s direction rule stands down on
+    // it rather than refusing to write any artifact at all. See
+    // `Worse::metrics_withheld` for why this cannot also reach the gate.
+    if resident.is_none() {
+        floor.metrics_withheld.push("idle_arena_resident_bytes");
+        floor
+            .metrics_withheld
+            .push("idle_arena_measured_reserved_bytes");
+        floor.metrics_withheld.push("idle_arena_resident_fraction");
+    }
     if let Some((resident_bytes, arena_bytes)) = resident {
-        floor.metrics.push(Metric::new(
-            "idle_arena_resident_bytes",
-            resident_bytes,
-            "B",
-        ));
+        // The one gated number in this entry, and the reason
+        // `crate::baseline::compare_worse` exists: a direction here did nothing
+        // at all until the gate learned to look inside a `where_we_are_worse`
+        // entry. `0021` step 4 asks for this metric specifically, and its
+        // falsifier is a revert of the alignment fix — which lands at 98x this
+        // value.
+        //
+        // The *fraction* below is deliberately left informational. It is this
+        // divided by the reserved bytes on the same line, so gating both would
+        // be two spellings of one claim, and the second would fail for a change
+        // to the geometry rather than to the residency.
+        floor.metrics.push(
+            Metric::new("idle_arena_resident_bytes", resident_bytes, "B")
+                .lower_is_better(RESIDENCY_SLACK),
+        );
         // Both sides of this quotient describe the arena the measurement
         // actually built. Dividing the measured residency by `from_totals`'s
         // arithmetic would mix two different arenas — they differ by a few KiB
@@ -2877,7 +3016,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
     // statement because only this point knows whether anything was pushed.
     if floor.metrics.is_empty() {
         floor.metrics_absent_because = Some(
-            "neither half landed on this run: `ArenaLayout::from_totals` did not return a              layout for the stated geometry, and the Pss measurement was unavailable or              was withheld because this host failed the memory axis of the fitness probe.              The reservation arithmetic is host-independent, so this state is a bug or a              hostile /proc, not a property of the machine — `just bench-report` on any              Linux host that passes `Fitness::probe` fills both in."
+            "neither half landed on this run: `ArenaLayout::from_totals` did not return a layout for the stated geometry, and the Pss measurement was unavailable or was withheld because this host failed the memory axis of the fitness probe. The reservation arithmetic is host-independent, so this state is a bug or a hostile /proc, not a property of the machine — `just bench-report` on any Linux host that passes `Fitness::probe` fills both in."
                 .to_owned(),
         );
     }
@@ -2928,6 +3067,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  across every reader."
                 .to_owned(),
             metrics: Vec::new(),
+            metrics_withheld: Vec::new(),
             metrics_absent_because: Some(
                 "the figure is `just attach-bench`'s: a separate binary that opens a live \
                  shared arena over the §11.1 fixture and times the rendezvous. This report \
@@ -2952,6 +3092,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                 tf_tree::arena_format_version()
             ),
             metrics: Vec::new(),
+            metrics_withheld: Vec::new(),
             metrics_absent_because: Some(
                 "this cost is not denominated in nanoseconds or bytes, and no run of this \
                  benchmark on any host would produce it. Its units are *participants* and \
@@ -3013,6 +3154,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                 opts.consumers
             ),
             metrics: Vec::new(),
+            metrics_withheld: Vec::new(),
             metrics_absent_because: Some(
                 "the number above exists, and it belongs to a different artifact. It takes \
                  ROS 2, a real DDS and five processes — `just dds-bench`, inside \
@@ -3481,6 +3623,7 @@ mod tests {
                 statement: "a stated cost".to_owned(),
                 metrics: Vec::new(),
                 metrics_absent_because: Some("a stated reason".to_owned()),
+                metrics_withheld: Vec::new(),
             })
             .collect();
         Report {
@@ -4414,6 +4557,164 @@ mod tests {
         assert!(
             errs.iter().any(|e| e.contains(REQUIRED_WORSE[1])),
             "the violation must name the offending entry: {errs:?}"
+        );
+    }
+
+    /// **A `where_we_are_worse` entry whose numbers are all informational is
+    /// refused.** The section whose whole purpose is to be the cost a reader may
+    /// quote against us must be a cost that can *move*.
+    ///
+    /// This is the rule the rows have carried all along, arriving three months
+    /// late for the entries — and `arena_memory_floor` is why. It printed five
+    /// numbers from the day it was measured and gave none of them a direction,
+    /// so `crate::baseline` had nothing to compare and
+    /// `docs/decisions/0021` step 4's own falsifier could not fire. Run, not
+    /// argued: with `0021` step 2 reverted the idle arena returns to ~100%
+    /// resident and `just bench-check` printed `PASS - 1 directional metric
+    /// held`.
+    ///
+    /// The rule is scoped to a host whose memory axis passed, because
+    /// [`worse_entries`] withholds that entry's Pss metrics when it does not —
+    /// and refusing to emit any artifact at all on a host that cannot read
+    /// `smaps_rollup` would be a worse answer than the one being prevented.
+    ///
+    /// Mutant (applied, confirmed fatal): delete the `fair_for_memory` conjunct
+    /// and the whole `!w.metrics.iter().any(...)` arm — the first half below
+    /// then validates cleanly and the test fails.
+    #[test]
+    fn a_worse_entry_whose_numbers_are_all_informational_cannot_be_gated_and_fails() {
+        let mut r = skeleton(true, false);
+        r.worse[0].metrics = vec![
+            Metric::new("idle_arena_bytes", 2_405_696.0, "B"),
+            Metric::new("idle_arena_resident_bytes", 24_576.0, "B"),
+        ];
+        r.worse[0].metrics_absent_because = None;
+        let errs = r
+            .validate()
+            .expect_err("an entry whose numbers cannot regress must fail");
+        assert!(
+            errs.iter().any(|e| {
+                e.contains(REQUIRED_WORSE[0]) && e.contains("every one of them is informational")
+            }),
+            "the violation must name the entry: {errs:?}"
+        );
+
+        // One direction is enough, and it is what the shipped entry now carries.
+        let mut ok = skeleton(true, false);
+        ok.worse[0].metrics = vec![
+            Metric::new("idle_arena_bytes", 2_405_696.0, "B"),
+            Metric::new("idle_arena_resident_bytes", 24_576.0, "B")
+                .lower_is_better(RESIDENCY_SLACK),
+        ];
+        ok.worse[0].metrics_absent_because = None;
+        assert!(
+            ok.validate().is_ok(),
+            "one directional metric satisfies it: {:?}",
+            ok.validate()
+        );
+
+        // A direction with a tolerance that makes the gate always or never fire
+        // is not a gate. Same rule the rows carry.
+        let mut bad_tol = skeleton(true, false);
+        bad_tol.worse[0].metrics =
+            vec![Metric::new("idle_arena_resident_bytes", 24_576.0, "B").lower_is_better(-1.0)];
+        bad_tol.worse[0].metrics_absent_because = None;
+        let errs = bad_tol
+            .validate()
+            .expect_err("a negative tolerance must fail");
+        assert!(errs.iter().any(|e| e.contains("either always")), "{errs:?}");
+
+        // On a host that cannot weigh anything, the rule stands down rather than
+        // suppressing the artifact — `worse_entries` has withheld the number
+        // this rule would ask for a direction on.
+        let mut unfit = skeleton(true, false);
+        unfit.fitness.fair_for_memory = false;
+        unfit.fitness.memory_reasons = vec!["/proc/self/smaps_rollup is unreadable".to_owned()];
+        unfit.worse[0].metrics = vec![Metric::new("idle_arena_bytes", 2_405_696.0, "B")];
+        unfit.worse[0].metrics_absent_because = None;
+        assert!(
+            unfit.validate().is_ok(),
+            "a host that cannot measure Pss must still get an artifact: {:?}",
+            unfit.validate()
+        );
+    }
+
+    /// **The shipped `arena_memory_floor` entry carries a direction.** The rule
+    /// above is satisfiable in the abstract; this is the one assertion that says
+    /// the *real* entry satisfies it, which is what `docs/decisions/0021` step 4
+    /// actually asks for.
+    ///
+    /// **`Fitness::assess`, not `Fitness::probe`, and that is the whole reason
+    /// this test works.** The first version of it called `probe` and skipped
+    /// early when the memory axis failed — and a test binary is built with
+    /// `debug_assertions`, so `probe`'s `debug_build` input is *always* true
+    /// here and the memory axis is *always* false. The test therefore returned
+    /// before its first assertion on every run, and dropping
+    /// `.lower_is_better(RESIDENCY_SLACK)` from `worse_entries` left it green:
+    /// an anti-vacuity test that was itself vacuous, which is the failure mode
+    /// this repository has recorded three times. `assess` takes the host facts
+    /// as arguments, so the axis can be made to pass here.
+    ///
+    /// Mutant (applied, re-run 2026-09-10): drop
+    /// `.lower_is_better(RESIDENCY_SLACK)` from `worse_entries` — this test
+    /// fails on `the residency figure must be gated`. Before the `probe` ->
+    /// `assess` fix the same mutant was caught only by
+    /// `a_host_with_no_obstacle_still_grounds_every_n_way_row`, by accident: it
+    /// is the one test that hands `validate` a fitness with the memory axis
+    /// passing.
+    #[test]
+    fn the_arena_memory_floor_entry_gates_its_residency_figure() {
+        let opts = Options::default();
+        // `debug_build: false, pss_readable: true` — the host facts a release
+        // run on this machine has, handed in rather than probed.
+        let fitness = Fitness::assess(
+            opts.consumers,
+            32,
+            Some(32),
+            0.0,
+            Some(vec!["performance".to_owned(); 32]),
+            false,
+            true,
+        );
+        // Non-degenerate: without this the test could go back to passing for the
+        // reason it used to pass for.
+        assert!(
+            fitness.fair_for_memory,
+            "the axis this test needs must pass: {:?}",
+            fitness.memory_reasons
+        );
+        let entries = worse_entries(&opts, &fitness);
+        let floor = entries
+            .iter()
+            .find(|w| w.id == "arena_memory_floor")
+            .expect("§9.3 requires the entry");
+        let resident = floor
+            .metrics
+            .iter()
+            .find(|m| m.key == "idle_arena_resident_bytes")
+            .expect("a host whose memory axis passed must publish the figure");
+        assert_eq!(
+            resident.drift,
+            Drift::LowerIsBetter,
+            "the residency figure must be gated, not merely printed"
+        );
+        assert!(
+            resident.tolerance.is_finite() && resident.tolerance > 0.0,
+            "tolerance {} would make the gate always or never fire",
+            resident.tolerance
+        );
+        // The quotient stays context on purpose: it is this metric divided by
+        // the reserved bytes on the same line, so gating it too would be two
+        // spellings of one claim.
+        let fraction = floor
+            .metrics
+            .iter()
+            .find(|m| m.key == "idle_arena_resident_fraction")
+            .expect("the fraction is published");
+        assert_eq!(
+            fraction.drift,
+            Drift::Informational,
+            "gating the quotient as well would be a second spelling of the same claim"
         );
     }
 
