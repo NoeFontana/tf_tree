@@ -18,7 +18,7 @@
 
 use serde_json::Value;
 use tf_tree_bench::baseline::BASELINE_PATH;
-use tf_tree_bench::report::{REQUIRED_ROWS, REQUIRED_WORSE, SCHEMA};
+use tf_tree_bench::report::{REQUIRED_ROWS, REQUIRED_WORSE, RESIDENCY_SLACK, SCHEMA};
 
 /// The committed baseline, parsed.
 fn baseline() -> Value {
@@ -120,5 +120,62 @@ fn the_committed_baseline_still_gates_at_least_one_number() {
         directional > 0,
         "the committed baseline gates no number at all, so `just bench-check` is green \
          without comparing anything"
+    );
+}
+
+/// **The committed baseline gates the residency figure, at the tolerance this
+/// build names.**
+///
+/// This is the cheap guard against the way `docs/decisions/0021` step 4 can come
+/// undone, and both halves have already happened once:
+///
+/// * the code emitting a direction the committed baseline records as
+///   `informational`, so the metric is not gated at all — the state the artifact
+///   was in for the whole life of the `arena_memory_floor` entry; and
+/// * the constant and the committed file drifting apart, which is what a
+///   file-level revert during a falsifier experiment did to this very PR:
+///   `RESIDENCY_SLACK` went back to `1.0` while every document explaining it said
+///   300%, and nothing failed.
+///
+/// `just bench-check` cannot catch either. It compares a *fresh report* against
+/// the committed file, and both of those states compare cleanly — the first
+/// because a direction the baseline does not carry is only a direction mismatch
+/// if the baseline carries one, the second because the tolerance the gate reads
+/// is the baseline's own by design (`baseline`'s module docs say why). This test
+/// reads the file and the constant and asserts they agree.
+///
+/// Mutant (applied, confirmed fatal): change `RESIDENCY_SLACK` without running
+/// `just bench-baseline-update` — this fails naming both numbers.
+#[test]
+fn the_committed_baseline_gates_the_idle_arena_residency_at_this_builds_tolerance() {
+    let b = baseline();
+    let entry = b["where_we_are_worse"]
+        .as_array()
+        .expect("`where_we_are_worse` array")
+        .iter()
+        .find(|w| w["id"].as_str() == Some("arena_memory_floor"))
+        .expect("PHASE5 §9.3 requires the `arena_memory_floor` entry");
+    let m = entry["metrics"]
+        .get("idle_arena_resident_bytes")
+        .unwrap_or_else(|| {
+            panic!(
+                "the committed baseline carries no `idle_arena_resident_bytes`; it was cut \
+                 on a host that could not measure Pss, and this gate has nothing to hold. \
+                 Regenerate it on a Linux host with `just bench-baseline-update`"
+            )
+        });
+    assert_eq!(
+        m["drift"].as_str(),
+        Some("lower_is_better"),
+        "`0021` step 4 gates this metric, and the committed baseline records it as `{}` — \
+         so nothing is gated. Run `just bench-baseline-update`",
+        m["drift"].as_str().unwrap_or("(absent)")
+    );
+    let tolerance = m["tolerance"].as_f64().expect("a numeric tolerance");
+    assert!(
+        (tolerance - RESIDENCY_SLACK).abs() < f64::EPSILON,
+        "the committed baseline allows {tolerance} and this build's `RESIDENCY_SLACK` is \
+         {RESIDENCY_SLACK}. The gate reads the baseline's, so the number every doc \
+         explains is not the number in force. Run `just bench-baseline-update`"
     );
 }

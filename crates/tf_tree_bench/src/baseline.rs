@@ -18,7 +18,7 @@
 //! | `schema` | `generated_utc`, `git_commit`, `git_dirty` |
 //! | [`PORTABLE_FACTS`] — the build's identity, not the host's | `cpu_model`, `physical_cores`, `logical_cpus`, `kernel`, governor, THP, load |
 //! | the set of row ids, and of `where_we_are_worse` ids | every row's `reason`, `note` and `reproduce` prose |
-//! | each row's *status*, one-directionally (see below) | `host_fitness`, except as the *explanation* attached to a missing metric |
+//! | each row's *status*, one-directionally (see below) | `host_fitness`, except as the classification of a **missing** metric, which decides refusal vs failure |
 //! | directional metric values inside rows both sides call `measured` | metrics whose `drift` is `informational` |
 //! | directional metric values inside `where_we_are_worse` entries | a `where_we_are_worse` entry's `statement` and `metrics_absent_because` prose |
 //!
@@ -167,6 +167,25 @@ impl Comparison {
     }
 }
 
+/// Why a metric the baseline records could be missing from this build.
+///
+/// **The INVALID/FAIL split, for the one comparison that can meet a host which
+/// cannot run it.** "The code stopped producing this number" and "this machine
+/// cannot produce it" are different answers and want different verdicts, and
+/// collapsing them is how a gate ends up either permanently red on a host or
+/// quietly green about a withdrawn claim.
+#[derive(Debug, Clone, Copy)]
+enum Absence<'a> {
+    /// Nothing the running build says about its host explains an absence, so an
+    /// absence here is the code's. Every row uses this: a row is status-gated
+    /// first, and a row that is `measured` on both sides has already asserted the
+    /// host could measure it.
+    CodeIsTheOnlyExplanation,
+    /// This build's own fitness probe says the host cannot produce the figure,
+    /// with the reason it gave.
+    HostCannotMeasure(&'a str),
+}
+
 /// One metric as the baseline file records it.
 #[derive(Debug, Clone, Copy)]
 struct BaselineMetric {
@@ -301,7 +320,16 @@ pub fn compare(baseline: &Value, current: &Report) -> Result<Comparison> {
         for (column, cur_metrics) in [("tf_tree", &cur.tf_tree), ("tf2", &cur.tf2)] {
             let what = format!("row `{id}`.{column}");
             let b_metrics = parse_metrics(b_row, column, &what)?;
-            compare_metrics(&what, &b_metrics, cur_metrics, "", &mut out);
+            // A row is status-gated above: reaching here means both sides call it
+            // `measured`, which is already an assertion that this host could
+            // measure it. There is no host explanation left to offer.
+            compare_metrics(
+                &what,
+                &b_metrics,
+                cur_metrics,
+                Absence::CodeIsTheOnlyExplanation,
+                &mut out,
+            );
         }
     }
 
@@ -329,29 +357,31 @@ fn compare_worse(baseline: &Value, current: &Report, out: &mut Comparison) -> Re
         // exists.
         return Ok(());
     };
-    // Why a metric could be absent, stated from *this* report rather than
-    // guessed. `Worse` entries carry no per-metric sensitivity, so the gate
-    // cannot say which axis withheld a number — but the report can say which
-    // axes this host failed, and that is what a reader meeting the failure
-    // needs. The memory axis is the one that reaches these entries today
-    // (`arena_memory_floor`'s Pss figures are guarded by it in
-    // `crate::report`), and it fails only on a debug build — already a
-    // `build_profile` mismatch above — or an unreadable
-    // `/proc/self/smaps_rollup`, which is a host that cannot run this half of
-    // the gate at all rather than a host on which the code got worse.
-    let absence_context = if current.fitness.fair_for_memory {
-        String::from(
-            ". This build's memory axis PASSED, so the host could have measured it: the              absence is the code's, not this machine's",
-        )
+    // Read from *this* report rather than guessed. `Worse` entries carry no
+    // per-metric sensitivity, so the gate cannot say which axis withheld a
+    // number — but the report says which axes this host failed, and the memory
+    // axis is the one that reaches these entries today (`arena_memory_floor`'s
+    // Pss figures are guarded by it in `crate::report`). It fails on a debug
+    // build — already a `build_profile` mismatch above — or an unreadable
+    // `/proc/self/smaps_rollup`.
+    //
+    // **A passing axis is not proof the absence is the code's, and an earlier
+    // revision of this said it was.** `measure_idle_arena_resident` also
+    // withholds the figure when the whole-process Pss delta across building one
+    // tree comes out non-positive, and that is *not* a fitness failure —
+    // `fair_for_memory` stays true. The gate cannot tell the two apart, because
+    // the reason has no JSON representation to read
+    // (`crate::report::Worse::metrics_withheld` records why it cannot get one),
+    // so the message names both possibilities instead of picking the wrong one.
+    let memory_reasons = if current.fitness.memory_reasons.is_empty() {
+        String::from("(no reason recorded, which is itself a bug)")
     } else {
-        format!(
-            ". This build's memory axis FAILED, so the absence may be this host rather              than the code — it reports: {}",
-            if current.fitness.memory_reasons.is_empty() {
-                String::from("(no reason recorded, which is itself a bug)")
-            } else {
-                current.fitness.memory_reasons.join("; ")
-            }
-        )
+        current.fitness.memory_reasons.join("; ")
+    };
+    let absence = if current.fitness.fair_for_memory {
+        Absence::CodeIsTheOnlyExplanation
+    } else {
+        Absence::HostCannotMeasure(&memory_reasons)
     };
     for b_entry in b_worse {
         let Some(id) = b_entry.get("id").and_then(Value::as_str) else {
@@ -362,7 +392,7 @@ fn compare_worse(baseline: &Value, current: &Report, out: &mut Comparison) -> Re
         };
         let what = format!("where_we_are_worse `{id}`");
         let b_metrics = parse_metrics(b_entry, "metrics", &what)?;
-        compare_metrics(&what, &b_metrics, &cur.metrics, &absence_context, out);
+        compare_metrics(&what, &b_metrics, &cur.metrics, absence, out);
     }
     Ok(())
 }
@@ -440,26 +470,43 @@ fn parse_metrics(
 /// Compare one metric map — a row column, or a `where_we_are_worse` entry's
 /// `metrics`.
 ///
-/// `what` names the map in every message; `absence_context` is appended to the
-/// one message that reports a **gated metric this build no longer emits**, and
-/// it exists to classify that failure rather than to soften it. A metric can
-/// vanish because the code stopped producing it or because this host cannot
-/// measure it, and the two want different reactions from whoever reads the
-/// line. It stays a failure either way: a host-shaped absence that only made a
-/// note would leave the gate green while it silently stopped checking, which is
-/// the rot this module exists against.
+/// `what` names the map in every message; `absence` says what could explain a
+/// metric the baseline records and this build does not emit, and it decides
+/// whether that absence is a **failure** or a **refusal**. See [`Absence`].
 fn compare_metrics(
     what: &str,
     baseline: &BTreeMap<String, BaselineMetric>,
     current: &[Metric],
-    absence_context: &str,
+    absence: Absence<'_>,
     out: &mut Comparison,
 ) {
     for (key, b) in baseline {
         let Some(c) = current.iter().find(|m| m.key == key) else {
-            out.failures.push(format!(
-                "{what} no longer emits `{key}`, which the baseline gates{absence_context}"
-            ));
+            // **What the baseline does with this key decides the wording, and the
+            // old wording was wrong about two thirds of the cases it met.** It
+            // said "which the baseline gates" of every absent key, including the
+            // informational ones — and a `where_we_are_worse` entry publishes its
+            // Pss figures as a group, so a host that cannot read Pss drops one
+            // gated metric and two context ones and got three identical
+            // "the baseline gates this" failures.
+            let gated = if b.drift == Drift::Informational {
+                "which the baseline records as context rather than gating, so the artifact \
+                 is smaller than the baseline describes"
+            } else {
+                "which the baseline gates"
+            };
+            match absence {
+                Absence::HostCannotMeasure(why) => out.notes.push(format!(
+                    "{what} no longer emits `{key}`, {gated} — and this build's own fitness \
+                     probe says this host cannot produce it: {why}. So the comparison was \
+                     REFUSED here, not passed. On a host that can measure it the same \
+                     absence is a failure; regenerate the baseline only if the metric is \
+                     meant to be gone"
+                )),
+                Absence::CodeIsTheOnlyExplanation => out
+                    .failures
+                    .push(format!("{what} no longer emits `{key}`, {gated}")),
+            }
             continue;
         };
         if b.drift != c.drift {
@@ -798,6 +845,7 @@ mod tests {
             statement: String::from("we are slower to attach"),
             metrics: Vec::new(),
             metrics_absent_because: Some(String::from("this fixture states no numbers")),
+            metrics_withheld: Vec::new(),
         });
         let c = compare(&base, &worse).expect("baseline");
         assert!(!c.passed(), "an ungated new `worse` entry passed");
@@ -1082,6 +1130,7 @@ mod tests {
                     .lower_is_better(tolerance),
             ],
             metrics_absent_because: None,
+            metrics_withheld: Vec::new(),
         }];
         r
     }
@@ -1135,21 +1184,33 @@ mod tests {
         );
     }
 
-    /// A gated metric this build no longer emits is a failure, and the failure
-    /// **classifies itself** against the report's own memory axis.
+    /// A gated metric this build no longer emits is a **failure** on a host that
+    /// could have measured it and a **refusal** on one that could not.
     ///
-    /// "The code stopped producing it" and "this host cannot measure it" want
-    /// different reactions from whoever reads the line, and a `Worse` entry
-    /// carries no per-metric sensitivity for the gate to read — so the report's
-    /// axis verdict is what the message quotes. It stays a failure either way:
-    /// a host-shaped absence that only made a note would leave the gate green
-    /// while it had silently stopped checking.
+    /// "The code stopped producing this number" and "this machine cannot produce
+    /// it" are different answers. A `Worse` entry carries no per-metric
+    /// sensitivity for the gate to read, so the report's own axis verdict is what
+    /// decides — the same fact [`crate::report::Report::validate`] stands down
+    /// on, and the gate contradicting `validate` about the same host was the
+    /// defect this arm closes.
     ///
-    /// Mutant (applied, confirmed fatal): drop `absence_context` from
-    /// [`compare_metrics`]'s missing-metric message — both halves below still
-    /// fail the gate, and both `contains` assertions fail.
+    /// **A refusal is not a pass, and the note says so.** It leaves the gate
+    /// green on a host where this comparison could not run, which is the honest
+    /// answer there and is why every failing axis also turns every memory *row*
+    /// `unavailable`. On a Linux release host — every machine that runs
+    /// `just bench-check`, including CI's `bench-gate` — the axis passes and the
+    /// absence is a failure.
+    ///
+    /// The informational half matters too: a `where_we_are_worse` entry
+    /// publishes its Pss figures as a group, so one gated metric and two context
+    /// ones vanish together, and all three used to be reported as
+    /// "which the baseline gates".
+    ///
+    /// Mutant (applied, confirmed fatal): collapse both [`Absence`] arms into
+    /// `out.failures.push(...)` — the second half below then fails, because the
+    /// refusal it asserts is reported as a regression.
     #[test]
-    fn a_withheld_worse_metric_fails_and_names_which_kind_of_absence_it_is() {
+    fn a_withheld_worse_metric_is_a_failure_or_a_refusal_depending_on_the_host() {
         let base = baseline_of(&report_with_worse(100.0, 24_576.0, 3.0));
 
         let mut gone = report_with_worse(100.0, 24_576.0, 3.0);
@@ -1158,26 +1219,59 @@ mod tests {
             .retain(|m| m.key != "idle_arena_resident_bytes");
         gone.fitness.fair_for_memory = true;
         let c = compare(&base, &gone).expect("baseline");
-        assert!(!c.passed(), "a gated metric vanished and the gate passed");
+        assert!(
+            !c.passed(),
+            "a gated metric vanished on a fit host and the gate passed"
+        );
         assert!(
             c.failures
                 .iter()
-                .any(|f| f.contains("no longer emits") && f.contains("memory axis PASSED")),
-            "a host that could measure it must be told the absence is the code's: {:?}",
+                .any(|f| f.contains("no longer emits") && f.contains("which the baseline gates")),
+            "a host that could measure it must be told the absence is gated: {:?}",
             c.failures
         );
 
-        let mut gone_unfit = gone.clone();
-        gone_unfit.fitness.fair_for_memory = false;
-        gone_unfit.fitness.memory_reasons =
-            vec!["/proc/self/smaps_rollup is unreadable".to_owned()];
-        let c = compare(&base, &gone_unfit).expect("baseline");
-        assert!(!c.passed(), "still a failure: the gate stopped checking");
+        // The same absence on a host whose memory axis failed is a refusal: a
+        // note naming the host's reason, and no failure.
+        let mut unfit = gone.clone();
+        unfit.fitness.fair_for_memory = false;
+        unfit.fitness.memory_reasons = vec!["/proc/self/smaps_rollup is unreadable".to_owned()];
+        let c = compare(&base, &unfit).expect("baseline");
+        assert!(
+            c.passed(),
+            "a host that cannot measure Pss must not read as a code regression: {:?}",
+            c.failures
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| { n.contains("REFUSED") && n.contains("smaps_rollup is unreadable") }),
+            "the refusal must be recorded, with the host's own reason: {:?}",
+            c.notes
+        );
+
+        // An *informational* metric that vanishes is still reported, and no
+        // longer claims to have been gated.
+        //
+        // `fair_for_memory` is set by hand here and above for the same reason
+        // `report::tests::the_arena_memory_floor_entry_gates_its_residency_figure`
+        // uses `Fitness::assess`: this fixture's fitness comes from
+        // `Fitness::probe`, a test binary is built with `debug_assertions`, and
+        // `probe` fails **every** axis on a debug build — so without this line
+        // the comparison takes the `HostCannotMeasure` arm and the assertion
+        // below tests the opposite of what it says it does.
+        let mut ctx_gone = report_with_worse(100.0, 24_576.0, 3.0);
+        ctx_gone.fitness.fair_for_memory = true;
+        ctx_gone.worse[0]
+            .metrics
+            .retain(|m| m.key != "idle_arena_bytes");
+        let c = compare(&base, &ctx_gone).expect("baseline");
+        assert!(!c.passed(), "the artifact shrank and the gate passed");
         assert!(
             c.failures.iter().any(|f| {
-                f.contains("memory axis FAILED") && f.contains("smaps_rollup is unreadable")
+                f.contains("idle_arena_bytes") && f.contains("context rather than gating")
             }),
-            "a host that could not measure it must be told so, with the reason: {:?}",
+            "a context metric must not be described as gated: {:?}",
             c.failures
         );
     }

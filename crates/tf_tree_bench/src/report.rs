@@ -142,30 +142,50 @@ pub const LATENCY_SLACK: f64 = 0.25;
 /// Relative slack the regression gate allows on the idle arena's resident
 /// footprint.
 ///
-/// 100% — the metric may double before the gate fires — and that is deliberately
-/// loose for a reason the quantity itself supplies.
-/// `idle_arena_resident_bytes` is a **delta of a whole-process Pss counter**
-/// across building one tree, reported by the kernel in whole KiB and therefore
-/// quantised to 4 KiB pages. On this host it is 24 576 B: six pages, most of
-/// which is the tree's own non-arena allocation rather than the arena. So an
-/// unrelated change to what `bench_report` allocates before the measurement
-/// moves it by a page or two, which is tens of percent of six pages, and a tight
-/// band would flap on changes that have nothing to do with residency.
+/// 300% — the metric may quadruple before the gate fires. Looser than
+/// [`LATENCY_SLACK`] for three reasons, all properties of the quantity rather
+/// than of the code it gates.
+///
+/// **It is six pages of a whole-process counter.**
+/// `idle_arena_resident_bytes` is a *delta* of `/proc/self/smaps_rollup`'s Pss
+/// across building one tree, which the kernel reports in whole KiB and which
+/// therefore quantises to the host's page size. On this host it is 24 576 B —
+/// six 4 KiB pages, most of them the tree's own non-arena allocation rather than
+/// the arena. One page either way is 17% of that.
+///
+/// **The page size is not 4 KiB everywhere.** At a 100% band the bound would be
+/// 49 152 B, and a host with 64 KiB base pages — aarch64 is configured that way
+/// on several distributions — exceeds it on its *first* page and reads as a
+/// +166% regression with nothing about the code having changed. That is not a
+/// hypothetical about libc versions; it is arithmetic on the unit the kernel
+/// reports in. 300% clears one 64 KiB page with room to spare.
+///
+/// **The baseline is cut on one host and this gate also runs on another.** CI's
+/// `bench-gate` job runs `just bench-check` on `ubuntu-latest` against the
+/// committed baseline, and until this metric there was nothing host-dependent
+/// left for it to compare — the one claim it held,
+/// `differential_agreement.max_deviation`, is host-independent by construction.
+/// So this is the first number in the artifact whose comparison spans two
+/// machines, and the band has to cover that or it becomes a gate that fails for
+/// the machine. The exposure is deliberate and worth having: if a runner ever
+/// exceeds the bound, the failure prints both numbers and the finding is that
+/// this residency figure is not portable, which nobody currently knows either
+/// way.
 ///
 /// **Measured before choosing it, not assumed.** Thirty consecutive runs of
 /// `bench_report` on this host returned 24 576 B bit-identically, and six more
 /// with all eight logical CPUs spinning returned the same, so the *observed*
-/// spread is zero and the slack is entirely headroom against future drift in the
-/// binary. What it must not do is stop catching the regression it exists for:
-/// `docs/decisions/0021`'s before column is **2 408 448 B**, so the failure this
-/// gates against sits at 98x the baseline and **49x the bound this slack sets**
-/// (49 152 B). Two orders of magnitude of margin on the signal, one page of
-/// margin on the noise.
+/// spread here is zero and every bit of this slack is headroom. What it must not
+/// do is stop catching the regression it exists for: `docs/decisions/0021`'s
+/// before column is **2 408 448 B** (and a re-measurement on 2026-09-10 with the
+/// fix reverted read 2 412 544 B — the same page count, a different sitting), so
+/// the failure this gates against sits at 98x the baseline and **24x the bound
+/// this slack sets** (98 304 B). It still fires on anything above 24 pages.
 ///
 /// `0021`'s own words on the number: *"The order of magnitude is the finding;
 /// the third digit is not."* A tolerance that pretended to gate the third digit
 /// would contradict the row it gates.
-pub const RESIDENCY_SLACK: f64 = 1.0;
+pub const RESIDENCY_SLACK: f64 = 3.0;
 
 /// The "where `tf_tree` is worse" topics `docs/PHASE5.md` §9.3 names, verbatim.
 pub const REQUIRED_WORSE: &[&str] = &[
@@ -721,6 +741,26 @@ pub struct Worse {
     /// to it" is not one of them — that is what `attach_latency` used to be,
     /// and the answer was to go and measure it.
     pub metrics_absent_because: Option<String>,
+    /// Metric keys this entry would carry and deliberately did **not**, with the
+    /// reason stated in [`Worse::statement`] rather than here.
+    ///
+    /// **Rust-side only: it has no JSON representation, and that is a constraint
+    /// rather than a preference.** `results.json`'s schema is a compatibility
+    /// surface — `docs/PHASE5.md` §12 gate 7 diffs it across machines — so a new
+    /// field is a `SCHEMA` bump, and a bump invalidates
+    /// `baseline/results-tf2.json` as well, which can only be regenerated inside
+    /// `docker/tf2`. So the reason a metric is absent reaches
+    /// [`Report::validate`], which runs in the same process, and cannot reach
+    /// [`crate::baseline`], which reads the committed file.
+    ///
+    /// It exists because the direction rule below would otherwise turn a *missing
+    /// measurement* into **no artifact at all**: `measure_idle_arena_resident`
+    /// withholds the residency figure both where Pss is unreadable and where the
+    /// whole-process delta comes out non-positive, and the second is not a
+    /// fitness failure. Without this the floor entry would then be two
+    /// informational metrics, `validate` would refuse the report, and the message
+    /// would tell the author to add a direction the code already has.
+    pub metrics_withheld: Vec<&'static str>,
 }
 
 /// Whether this host can produce a timing number that means anything.
@@ -1585,11 +1625,11 @@ impl Report {
                 w.metrics_absent_because.as_deref().map(str::trim),
             ) {
                 (true, None | Some("")) => bad.push(format!(
-                    "`worse` entry `{}` carries no metrics and no                      `metrics_absent_because`. §9.3's section is the one a reader is                      entitled to quote against us, and an entry with an empty metric                      list reads as an oversight whether or not it is one. Either give                      it a number, or say — in the entry — why the cost has none",
+                    "`worse` entry `{}` carries no metrics and no `metrics_absent_because`. §9.3's section is the one a reader is entitled to quote against us, and an entry with an empty metric list reads as an oversight whether or not it is one. Either give it a number, or say — in the entry — why the cost has none",
                     w.id
                 )),
                 (false, Some(_)) => bad.push(format!(
-                    "`worse` entry `{}` carries {} metric(s) *and* a reason they are                      absent. One of the two is wrong, and a reader has no way to tell                      which",
+                    "`worse` entry `{}` carries {} metric(s) *and* a reason they are absent. One of the two is wrong, and a reader has no way to tell which",
                     w.id,
                     w.metrics.len()
                 )),
@@ -1617,6 +1657,7 @@ impl Report {
             // axis that reaches a `Worse` entry today; a second one belongs in
             // this predicate.
             if self.fitness.fair_for_memory
+                && w.metrics_withheld.is_empty()
                 && !w.metrics.is_empty()
                 && !w.metrics.iter().any(|m| m.drift != Drift::Informational)
             {
@@ -2899,6 +2940,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
         ),
         metrics: Vec::new(),
         metrics_absent_because: None,
+        metrics_withheld: Vec::new(),
     };
     // The arithmetic and the measurement are independent facts, so they are
     // emitted independently: a `from_totals` failure must not discard a Pss
@@ -2922,6 +2964,18 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
     } else {
         None
     };
+    // Recorded, not silent. Both reasons a residency figure can be absent land
+    // here — an unreadable `smaps_rollup`, and a whole-process delta that came
+    // out non-positive — and `Report::validate`'s direction rule stands down on
+    // it rather than refusing to write any artifact at all. See
+    // `Worse::metrics_withheld` for why this cannot also reach the gate.
+    if resident.is_none() {
+        floor.metrics_withheld.push("idle_arena_resident_bytes");
+        floor
+            .metrics_withheld
+            .push("idle_arena_measured_reserved_bytes");
+        floor.metrics_withheld.push("idle_arena_resident_fraction");
+    }
     if let Some((resident_bytes, arena_bytes)) = resident {
         // The one gated number in this entry, and the reason
         // `crate::baseline::compare_worse` exists: a direction here did nothing
@@ -2962,7 +3016,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
     // statement because only this point knows whether anything was pushed.
     if floor.metrics.is_empty() {
         floor.metrics_absent_because = Some(
-            "neither half landed on this run: `ArenaLayout::from_totals` did not return a              layout for the stated geometry, and the Pss measurement was unavailable or              was withheld because this host failed the memory axis of the fitness probe.              The reservation arithmetic is host-independent, so this state is a bug or a              hostile /proc, not a property of the machine — `just bench-report` on any              Linux host that passes `Fitness::probe` fills both in."
+            "neither half landed on this run: `ArenaLayout::from_totals` did not return a layout for the stated geometry, and the Pss measurement was unavailable or was withheld because this host failed the memory axis of the fitness probe. The reservation arithmetic is host-independent, so this state is a bug or a hostile /proc, not a property of the machine — `just bench-report` on any Linux host that passes `Fitness::probe` fills both in."
                 .to_owned(),
         );
     }
@@ -3013,6 +3067,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                  across every reader."
                 .to_owned(),
             metrics: Vec::new(),
+            metrics_withheld: Vec::new(),
             metrics_absent_because: Some(
                 "the figure is `just attach-bench`'s: a separate binary that opens a live \
                  shared arena over the §11.1 fixture and times the rendezvous. This report \
@@ -3037,6 +3092,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                 tf_tree::arena_format_version()
             ),
             metrics: Vec::new(),
+            metrics_withheld: Vec::new(),
             metrics_absent_because: Some(
                 "this cost is not denominated in nanoseconds or bytes, and no run of this \
                  benchmark on any host would produce it. Its units are *participants* and \
@@ -3098,6 +3154,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
                 opts.consumers
             ),
             metrics: Vec::new(),
+            metrics_withheld: Vec::new(),
             metrics_absent_because: Some(
                 "the number above exists, and it belongs to a different artifact. It takes \
                  ROS 2, a real DDS and five processes — `just dds-bench`, inside \
@@ -3566,6 +3623,7 @@ mod tests {
                 statement: "a stated cost".to_owned(),
                 metrics: Vec::new(),
                 metrics_absent_because: Some("a stated reason".to_owned()),
+                metrics_withheld: Vec::new(),
             })
             .collect();
         Report {

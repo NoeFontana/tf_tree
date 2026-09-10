@@ -1,9 +1,9 @@
 {
   "schema": "tf_tree.bench-report/2",
   "provenance": {
-    "generated_utc": "2026-09-10T22:08:00Z",
+    "generated_utc": "2026-09-10T22:38:17Z",
     "schema": "tf_tree.bench-report/2",
-    "git_commit": "00d48d84d97923ca9d8f346c89593c7eaaa9af25",
+    "git_commit": "0cabaec3ae2458c54bf0c371d546eebded0fdf10",
     "git_dirty": "true",
     "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
     "build_profile": "release",
@@ -23,7 +23,7 @@
     "transparent_hugepage": "always [madvise] never",
     "transparent_hugepage_shmem": "always within_size advise [never] deny force",
     "perf_event_paranoid": "4",
-    "load_average": "1.44 0.69 0.39 1/317 3526418",
+    "load_average": "2.56 1.23 1.01 2/337 3739872",
     "container": "no",
     "ros_distro": "none (no ROS 2 in this run)",
     "tf2_version": "none — the tf2 columns are UNAVAILABLE, not zero",
@@ -33,17 +33,17 @@
   },
   "host_fitness": {
     "fair_for_timing": false,
-    "fair_for_ratios": true,
+    "fair_for_ratios": false,
     "fair_for_memory": true,
     "enough_cores": false,
     "core_reason": "4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler",
     "forced": false,
     "consumers": 16,
-    "busy_fraction": 0.012499999999999956,
+    "busy_fraction": 0.15000000000000002,
     "physical_cores": 4,
     "logical_cpus": 8,
     "warmup_discarded_s": 2,
-    "reasons": ["SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing", "CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out"]
+    "reasons": ["SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing", "CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out", "machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock"]
   },
   "rows": [
     {
@@ -53,7 +53,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
       "reproduce": "just mp-bench (tf_tree) / just mp-bench-tf2 (both, in the ROS container)",
       "tf_tree": {},
       "tf2": {}
@@ -77,7 +77,7 @@
       "timing_sensitive": true,
       "needs_n_cores": false,
       "status": "unavailable",
-      "reason": "this row is single-threaded and in-process, so the only thing between it and a number is the host, and the host failed the fitness probe: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reason": "this row is single-threaded and in-process, so the only thing between it and a number is the host, and the host failed the fitness probe: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
       "reproduce": "cargo bench -p tf_tree_bench --bench lookup (or this tool on a quiet, non-SMT, performance-governor host)",
       "tf_tree": {},
       "tf2": {}
@@ -89,7 +89,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. There is a further gap, and it is not the one this reason used to name: nothing in this repository times publish-to-visible end to end. `just dds-bench` is a real DDS round trip — one publisher, N tf2_ros listeners, §5.2's QoS — but `dds_report` reports `svc`, the engine call itself, so its number answers a different question. A cross-process publish additionally goes through the shared-memory backend, and this binary was compiled without `--features shm`",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock. There is a further gap, and it is not the one this reason used to name: nothing in this repository times publish-to-visible end to end. `just dds-bench` is a real DDS round trip — one publisher, N tf2_ros listeners, §5.2's QoS — but `dds_report` reports `svc`, the engine call itself, so its number answers a different question. A cross-process publish additionally goes through the shared-memory backend, and this binary was compiled without `--features shm`",
       "reproduce": "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
       "tf_tree": {},
       "tf2": {}
@@ -101,7 +101,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
       "reproduce": "just tf2-scaling / just shm-scaling, on >= 16 physical cores",
       "tf_tree": {},
       "tf2": {}
@@ -149,7 +149,7 @@
       "timing_sensitive": true,
       "needs_n_cores": false,
       "status": "unavailable",
-      "reason": "the pair was measured, but the host failed the fitness probe, so neither half of the ratio is a claim: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out",
+      "reason": "the pair was measured, but the host failed the fitness probe, so neither half of the ratio is a claim: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
       "reproduce": "just embed-cost",
       "tf_tree": {},
       "tf2": {}
@@ -172,7 +172,7 @@
       "id": "arena_memory_floor",
       "topic": "Arena memory floor",
       "statement": "A tf_tree arena is fixed-capacity and allocated up front, so an idle tree reserves its full size from the first second. A tf2 BufferCore starts near empty and grows into whatever the stream actually contains, so on a robot that publishes far less than it declared, tf2 reserves less and tf_tree is simply worse. The figure is for 64 frames, 64 edge slots and 32768 sample slots. `idle_arena_bytes` is arithmetic on the layout — what the arena *reserves* — and does not depend on this host. `idle_arena_resident_bytes` is the measured Pss an idle arena of that geometry actually costs, and it is now 1.0% of what the arena reserves (24576 B held against 2408384 B reserved by the arena actually built). **This row used to say the opposite.** The measurement was added expecting the resident figure to come out far below the reserved one, found the arena ~100% resident instead, and stood on that. Decision 0021 then found the cause — `HeapArena` asked the allocator for 64-byte alignment (`PoseSlot` is one cache line), and Rust's `alloc_zeroed` reaches `calloc` only at alignment <= 16, falling back above it to `posix_memalign` plus an explicit zero-fill that touches every page. The arena is now over-allocated at 16 and aligned to 64 by hand, so `calloc` returns demand-faulted pages the kernel already guarantees to be zero. The reservation is unchanged and this entry stands on the reservation: address space is still a cost tf2 does not pay, a fixed-capacity arena still cannot grow, and a machine under strict overcommit is still constrained. What is gone is the *residency*. `idle_arena_resident_bytes` is a delta of a *whole-process* Pss counter across building one tree, quantised to 4 KiB pages, so it also carries the tree's own non-arena allocations — which is most of what is left. The order of magnitude is the finding; the third digit is not.",
-      "metrics": {"idle_arena_bytes": {"value": 2405696, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_mib": {"value": 2.29425048828125, "unit": "MiB", "drift": "informational", "tolerance": 0}, "idle_arena_resident_bytes": {"value": 24576, "unit": "B", "drift": "lower_is_better", "tolerance": 1}, "idle_arena_measured_reserved_bytes": {"value": 2408384, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_resident_fraction": {"value": 0.010204352794238793, "unit": "of measured reserved", "drift": "informational", "tolerance": 0}},
+      "metrics": {"idle_arena_bytes": {"value": 2405696, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_mib": {"value": 2.29425048828125, "unit": "MiB", "drift": "informational", "tolerance": 0}, "idle_arena_resident_bytes": {"value": 24576, "unit": "B", "drift": "lower_is_better", "tolerance": 3}, "idle_arena_measured_reserved_bytes": {"value": 2408384, "unit": "B", "drift": "informational", "tolerance": 0}, "idle_arena_resident_fraction": {"value": 0.010204352794238793, "unit": "of measured reserved", "drift": "informational", "tolerance": 0}},
       "metrics_absent_because": null
     },
     {

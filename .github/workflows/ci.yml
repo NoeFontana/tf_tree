@@ -797,9 +797,22 @@ jobs:
   #
   # Runs `just bench-check`, which regenerates the §9 artifact and compares it
   # against `crates/tf_tree_bench/baseline/results.json`. Deliberately
-  # single-runner and `ubuntu-latest` only: the comparison ignores host facts by
-  # construction (`crates/tf_tree_bench/src/baseline.rs`), so an extra
-  # architecture would re-run the same one host-independent claim.
+  # single-runner and `ubuntu-latest` only.
+  #
+  # **The reason for that used to be "the comparison ignores host facts by
+  # construction, so an extra architecture would re-run the same one
+  # host-independent claim", and half of it expired on 2026-09-10.** It ignores
+  # every host fact in the *provenance header* — CPU model, cores, kernel,
+  # governor, load, and all `reason` prose — and that part is unchanged. But
+  # `docs/decisions/0021` step 4 gated `arena_memory_floor`'s
+  # `idle_arena_resident_bytes`, a whole-process, page-quantised Pss delta, and
+  # this job compares it against a baseline cut on the maintainer's machine. That
+  # is the first host-*dependent* number this gate has ever held, and it is
+  # deliberately banded wide enough (`RESIDENCY_SLACK`, 300%) to clear a 64 KiB
+  # base page. So the surviving reason for one runner is narrower: a second
+  # architecture would add one more draw of that same figure and nothing else.
+  # If this job ever fails on it, the finding is that the residency figure is not
+  # portable — read the two numbers it prints before assuming a regression.
   #
   # **A green tick here is not evidence of a performance claim**, and that is
   # true now that runs happen rather than in spite of it. A shared runner's

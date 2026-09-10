@@ -287,12 +287,48 @@ sitting inside the record that names it.
    would be a worse answer than the one the rule prevents. The memory axis is
    the only fitness axis that reaches a `Worse` entry today; a second one belongs
    in that predicate.
-3. **A missing gated metric classifies its own absence.** A `Worse` entry carries
-   no per-metric sensitivity, so the gate cannot say which axis withheld a
-   number — but the report can say which axes this host failed, and the failure
-   line now quotes that. It stays a **failure** either way: a host-shaped absence
-   downgraded to a note would leave the gate green while it had silently stopped
-   checking, which is the rot `baseline.rs` exists against.
+3. **A missing gated metric classifies its own absence, as a failure or a
+   refusal.** A `Worse` entry carries no per-metric sensitivity, so the gate
+   cannot say which axis withheld a number — but the report says which axes this
+   host failed. On a host whose memory axis passed, an absent gated metric is a
+   **failure**. On one whose memory axis failed it is a **refusal**: a note
+   saying the comparison did not run, which is the honest answer on a machine
+   where every memory *row* is `unavailable` for the same reason, and which is
+   what `Report::validate` already does about the same host. The first revision
+   of this made it a failure either way and argued that a downgrade would leave
+   the gate green — true, and outweighed by the gate contradicting `validate`
+   about one host and going permanently red on it. Every machine that actually
+   runs `just bench-check`, CI's `bench-gate` included, is on the failure side.
+
+   Two smaller corrections in the same place, both found by review rather than
+   by me. The absence message claimed a passing axis proved the absence was the
+   code's — it does not: `measure_idle_arena_resident` also withholds the figure
+   when the whole-process Pss delta comes out non-positive, which is not a
+   fitness failure. And the message said *"which the baseline gates"* of every
+   absent key including the informational ones, so a host that cannot read Pss
+   got three identical "the baseline gates this" failures for one gated metric
+   and two context ones.
+
+   `Report::validate` had the mirror-image bug and it was worse: on a fit host
+   whose Pss delta came out non-positive, the floor entry would be two
+   informational metrics, the new direction rule would fire, and `bench_report`
+   would write **no artifact at all** — telling the author to add a direction the
+   code already has. `Worse::metrics_withheld` closes it. It is deliberately
+   Rust-side only: a JSON field is a `SCHEMA` bump, and a bump invalidates
+   `baseline/results-tf2.json`, which can only be regenerated inside
+   `docker/tf2`.
+
+5. **The second committed baseline had to be brought along, and could not be
+   regenerated.** `baseline/results-tf2.json` carried the same entry as
+   `informational`, so descending into `where_we_are_worse` made
+   `just tf2-bench-check` fail deterministically on a direction mismatch caused
+   by a commit that cannot run that recipe. Its `drift` and `tolerance` were
+   therefore edited by hand — defensible because they are a policy choice and
+   not a measurement, and **no number in that file was touched**. Its *value* is
+   pre-step-2 (`2408448`), so the bound it sets is ~9.6 MB and the gate is real
+   but weak there until somebody runs `just tf2-bench-baseline-update` in the
+   container. That is disclosed in the recipe's own comment rather than left to
+   be discovered.
 4. **The tolerance is 300%, and that is not laziness.** `RESIDENCY_SLACK` carries
    the argument; the short form is that the metric is *six pages* of a
    whole-process, page-quantised Pss delta, and that CI's `bench-gate` job runs
@@ -314,6 +350,19 @@ where_we_are_worse `arena_memory_floor`.idle_arena_resident_bytes regressed:
 
 Exit 1. And `just bench-check` on the real tree: **`PASS — 2 directional metrics
 held`**, up from one.
+
+**The number that ships and the number every document explains must be the same
+one, and for a while they were not.** During the falsifier experiment above the
+whole of `report.rs` was restored from a copy taken before `RESIDENCY_SLACK` was
+raised, so `1.0` shipped while this record, the constant's own doc and the
+pasted gate output all said 300% — and the baseline was then regenerated *from
+the reverted code*, which made the committed file agree with the wrong number
+and every gate pass. `just bench-check` structurally cannot catch that: the
+tolerance it reads is the baseline's own, by design. So
+`tests/baseline_file.rs::the_committed_baseline_gates_the_idle_arena_residency_at_this_builds_tolerance`
+reads the committed file and the constant and asserts they agree, and it runs in
+`just test`. Mutant applied: change `RESIDENCY_SLACK` without regenerating, and
+it fails naming both numbers.
 
 **What regenerating the baseline showed as a side effect.** The committed
 `results.json` was cut on 2026-08-14 under rustc 1.95; the regenerated one is
