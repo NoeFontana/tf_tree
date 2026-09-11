@@ -490,6 +490,107 @@ fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
     );
 }
 
+/// **The kill-window class, held open on purpose and required to survive it.**
+///
+/// The driver's `kill()`-to-`wait()` interval is exactly the interval in which
+/// the owner is dead and *undetectably* dead — `Tree::owner_lost` is a socket
+/// hangup, and a `SIGKILL`ed process releases its socket and its participant
+/// lock byte in `exit_files()`, which `do_exit` runs after `exit_mm()`. For that
+/// whole interval nothing can inherit, every survivor keeps drawing its
+/// 2 %-per-operation detach arm, and a survivor that leaves cannot return: §3.4
+/// step 4 refuses `CreatePolicy::Never` against held participant bytes. If every
+/// survivor leaves inside it, the arena is ownerless with nobody attached, which
+/// is absorbing rather than slow.
+///
+/// # Why `--stop-owner-ms` and not `--victim-ballast-mb`
+///
+/// Both widen that window. The ballast does it by making the victim's teardown
+/// slow, which is what ASan does by accident at 43-49 MB resident per child —
+/// and it is **not portable**: it depends on the victim's pages being 4 KiB. The
+/// first revision of this test used it and **failed on CI**, because GitHub's
+/// runners set `transparent_hugepage=always`, 256 MiB becomes 128 huge pages
+/// instead of 65 536 small ones, and the reap dropped from ~25 ms here to
+/// 1.2-1.8 ms there. Chunking the allocation does not help: glibc serves 1 MiB
+/// requests out of one ~64 MiB arena heap, which is huge-page eligible, with or
+/// without `MALLOC_MMAP_THRESHOLD_` (both measured). So a test built on the
+/// ballast is vacuous on exactly the host it has to run on.
+///
+/// `SIGSTOP` reaches the same state with no memory physics in it. A stopped owner
+/// holds its rendezvous socket open, so nothing can inherit; it has stopped
+/// serving, so nothing can join; survivors keep churning. The window is as long
+/// as the flag says, on any host.
+///
+/// **Mutant, measured rather than asserted (2026-09-12):** remove the
+/// `kill_window_open` check from the detach arm and this configuration wedges at
+/// **owner kill 1** with `4 heir(s) attached before the kill, 0 after it` —
+/// every survivor gone inside one window. With the check, 20 of 20 owner kills
+/// recovered and 251 detaches were suppressed.
+#[test]
+fn a_kill_window_wide_enough_to_drain_the_pool_does_not_wedge_the_arena() {
+    let out = torture(&[
+        "--duration",
+        "20s",
+        // `MIN_ATTACHED_FOR_ORDINARY_KILL + 1`, i.e. the thinnest fleet the
+        // owner-kill arm accepts — which is the configuration the nightly ASan
+        // job runs and the one this class actually bit.
+        "--children",
+        "4",
+        "--kill-hz",
+        "4",
+        "--seed",
+        "424242",
+        // Four seconds rather than eight, so a 20-second run still contains
+        // several owner kills. The unfixed harness wedges on the first one, so
+        // the count is margin rather than a requirement.
+        "--owner-kill-every",
+        "4s",
+        // Two orders of magnitude past the ~0.3 ms a plain reap takes here, so
+        // the detach arm (one draw per ~50 operations, ~1.2 ms each) fires
+        // several times inside every window. That is what makes the suppression
+        // assertion below reliable rather than probabilistic.
+        "--stop-owner-ms",
+        "300",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a fleet at the owner-kill arm's own floor did not survive a widened kill window. \
+         That is the 2026-09-11 nightly failure, reproduced deliberately.\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("UNRECOVERABLE"),
+        "the arena reached the absorbing state.\n{stdout}"
+    );
+    // The control has to be *seen* to have fired. A `/bin/kill` that is absent or
+    // refuses prints a line saying the control did not fire, and a run that
+    // reports it proves nothing about the window.
+    assert!(
+        !stdout.contains("could not stop pid"),
+        "the positive control did not fire, so this run says nothing about the kill \
+         window.\n{stdout}"
+    );
+    // **The anti-vacuity half, and this test is worth nothing without it.** A
+    // window that was never actually held open, or a marker that was never
+    // written, would both leave a green run that proved nothing — the same shape
+    // as the `0 violations` a harness that stopped reading prints. A non-zero
+    // suppression count is the evidence that the window was wide and that the
+    // exemption is what carried the run.
+    let suppressed = stdout
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("shm_torture: detaches suppressed inside an owner-kill window: ")
+        })
+        .and_then(|n| n.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("the run printed no suppression tally at all.\n{stdout}"));
+    assert!(
+        suppressed > 0,
+        "the run suppressed no detaches, so no survivor drew its detach arm inside a \
+         300 ms window — which cannot happen at one draw per ~50 operations unless the \
+         marker is not being read.\n{stdout}"
+    );
+}
+
 /// `--crash-site` is refused without `--crash-points`.
 ///
 /// The probe forces one §11.3 site in every child so a person can answer "can
