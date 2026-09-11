@@ -263,9 +263,21 @@ fn the_json_summary_agrees_with_the_exit_status() {
 /// publishers, so `frames` and `edges` are both genuinely non-zero and the
 /// assertion is about the *absent* row rather than about an empty arena.
 ///
+/// **What this test does NOT cover, measured rather than reasoned.** Feed the
+/// participants row from the *arena participant table* instead of the header
+/// counter and this test still **passes**: its fixture is an in-process arena
+/// whose own process holds a record, so `used > 0` and the row looks like a real
+/// measurement. That numerator is wrong for a different reason — a read-only
+/// attachment writes no arena record (D18), so it under-reports by the whole
+/// consumer population — and the assertion added *because* the row was untested
+/// does not reach the likeliest wrong answer to it. The guard for that is
+/// `crates/tf_tree_cli/tests/attach.rs`'s
+/// `the_two_participant_censuses_disagree_by_the_read_only_population`, which
+/// needs a live arena and so cannot live here.
+///
 /// Mutant: restore the `("participants", h.participant_count, h.max_participants)`
-/// row in `occupancy_of`. Applied: `used = 0` for it and this fails with
-/// "occupancy row \"participants\" reads 0 used".
+/// row in `occupancy_of`. Applied: *"occupancy row \"participants\" reads 0 used
+/// of 64 on a fully populated arena"*.
 #[test]
 fn no_occupancy_row_is_permanently_zero() {
     let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");

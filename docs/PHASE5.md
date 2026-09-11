@@ -1215,7 +1215,7 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 | `TFT012` | Disconnected subtree | error | topology walk |
 | `TFT013` | Frame declared but never published | info | head == 0 after a grace period |
 | `TFT014` | Participant or claim slot leak | warn | Phase 2 lock file vs arena records |
-| `TFT015` | Arena occupancy > 80% (frames, edges, participants) | warn | header counters |
+| `TFT015` | Arena occupancy > 80% (frames, edges, participants) | warn | header counters for frames and edges; **participants is the lock file's, not the header's** (amended below) |
 | `TFT016` | THP disabled, or `RLIMIT_MEMLOCK` below arena size | info | `/sys`, `/proc/self/limits` |
 | `TFT017` | Dynamic edge with no live writer | warn | claim table (added by the amendment below) |
 | `TFT018` | Stamps arriving out of monotonic order | error | observed push stream (added by the amendment below) |
@@ -1224,6 +1224,32 @@ Publish the cost of the non-atomic `Guard` increment, and confirm under sixteen 
 **`TFT016`'s evidence column read `getrlimit` until 2026-09-05 and the code has never called it.** `crates/tf_tree_cli/src/hostfacts.rs` text-parses `/proc/self/limits`, because `tf_tree_cli` is `#![forbid(unsafe_code)]` with no `libc` and its own header gives that reason. **The check's *message* changed in the same pass** ([`0049`](./decisions/0049-the-flag-that-prefaults-the-arena.md)): its detection rule and severity are unchanged, but it no longer predicts that `mlockall` will fail, because it cannot — `mlockall` charges the process's whole address space and this compares a limit against the **arena**. Measured, the call returns `ENOMEM` at limits well above a small arena while this check is silent, so the finding now says outright that its silence is not a clearance, and it names `MCL_ONFAULT` — without which the call prefaults the whole over-provisioned arena.
 
 Output modes: human (default, coloured, grouped by severity), `--json` (stable schema, for CI), and `--exit-code[=error|warn]` so `doctor` can gate a robot's startup or a CI job.
+
+> **Amendment — `TFT015`'s participants row is not the header's to give, and the
+> evidence column said it was.**
+>
+> Settled in part by
+> [`0056`](./decisions/0056-the-participant-numerator-is-the-lock-files.md),
+> which is `draft`: **what is settled is that the two arena-side sources are both
+> invalid**, and which lock-file population replaces them is that record's open
+> question. The row is absent today and its absence is disclosed to the operator
+> in `Meta.notes`.
+>
+> `ArenaHeader::participant_count` is never incremented by anything in the
+> workspace, and it cannot be: a participant that is **killed** cannot decrement
+> it, which is the whole reason §3 keeps liveness in a lock byte the kernel
+> releases (D17). The substitute an implementer reaches for next — the arena
+> participant table — fails in the *same direction*, because a read-only
+> attachment is D18's default and Python's, its mapping is `PROT_READ`, and it
+> therefore takes a lock byte and writes **no arena record at all**. Measured at
+> one publisher and one read-only consumer: **2 held lock bytes against 1 arena
+> record**, and the gap grows with every consumer, so an arena-table row would
+> read 1/64 on a fleet with **three** slots left.
+>
+> `TFT014`'s evidence column two rows up already reads *"Phase 2 lock file vs
+> arena records"*. That is the same answer arrived at for the same reason, one
+> rule earlier, which is why this is a correction to a stale cell rather than a
+> new idea.
 
 > **Amendment (2026-08-29): `--exit-code` gained a `warn` tier, and the reason is that its error tier is narrower on a live arena than it reads.** Six ids carry `Error`, and on a live arena four of them structurally skip — `TFT001`, `TFT002`, `TFT003` and `TFT018` all need evidence an arena does not carry — so `--exit-code` reduced to `TFT006` (impossible stamps) and `TFT012` (cycle or disconnected subtree). Those are the right *errors*; both make every lookup fail. But almost everything an operator is paged about is `Warn`: a dynamic edge with no live writer, an undersized ring, rate collapse, gaps, clock skew, a slot leak, an arena at 100% capacity. All of it exited 0.
 >

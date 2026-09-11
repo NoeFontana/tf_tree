@@ -396,6 +396,93 @@ fn top_shows_the_live_arena_and_its_own_read_only_row() {
     );
 }
 
+/// **The two participant censuses disagree, and the gap is the whole read-only
+/// population.**
+///
+/// `TFT015` is *"arena occupancy > 80% (frames, edges, **participants**)"*, and
+/// its participants row is absent. `no_occupancy_row_is_permanently_zero` explains
+/// the absence by `ArenaHeader::participant_count` never being incremented —
+/// true, and **not the whole reason**, which is what this test exists to pin.
+/// (`crate::checks::occupancy_of`'s doc explained it the same way until the commit
+/// that added this test; it now carries the lock-file half, and cites this test
+/// for it.) The obvious
+/// substitute numerator, the arena participant table, is wrong in the same
+/// direction and for a deeper reason: a read-only attachment is D18's default
+/// and Python's, its mapping is `PROT_READ`, and it therefore holds a lock-file
+/// byte and writes **no arena record at all**. So a fleet whose consumers are
+/// all read-only — the shape the design recommends — fills the slot table while
+/// the arena table stays as empty as the header counter.
+///
+/// One publisher and one read-only consumer are enough to separate them: the
+/// arena table knows about one participant and the lock file about two. That
+/// factor grows with every consumer, so the arena-table numerator under-reports
+/// without bound, which is the same silent `pass` the header counter would give.
+///
+/// The `held > arena` direction is asserted rather than an exact pair, because
+/// the pair is what the fixture happens to arrange and the *inequality* is the
+/// property. Both counts are printed on failure: if this ever reads equal, the
+/// interesting possibility is that read-only attachments started writing
+/// records, which would be a change to D18 and not to this test.
+///
+/// Measured on this fixture: **the lock file holds 2 participant bytes and the
+/// arena table has 1 record.**
+///
+/// Mutant: count `table.capacity()` instead of the live identities ⇒ *"the lock
+/// file holds 2 participant byte(s) and the arena table has 64 record(s)"* — the
+/// assertion fails, and it fails naming a census that has started measuring the
+/// denominator.
+#[test]
+fn the_two_participant_censuses_disagree_by_the_read_only_population() {
+    let scratch = Scratch::new("censuses");
+    let publisher = publish(&scratch);
+
+    // D18's default, and the shape a `PROT_READ` mapping arrives in: a byte, and
+    // no arena record of its own.
+    let consumer = tf_tree::Open::new()
+        .mode(AttachMode::ReadOnly)
+        .create(CreatePolicy::Never)
+        .timeout(std::time::Duration::from_secs(2))
+        .open()
+        .expect("join the arena read-only");
+    assert_eq!(
+        consumer.participant_slot(),
+        u32::MAX,
+        "the consumer registered an arena record, so this test would prove nothing"
+    );
+
+    // Census A — the arena's participant table, which is what a numerator read
+    // from the arena would count. `identity` withholds a slot unless its record
+    // is `LIVE`, which is exactly the population an occupancy row would want.
+    let view = publisher.arena_view();
+    let table = view.participants();
+    let arena = (0..table.capacity() as u32)
+        .filter(|slot| table.identity(*slot).is_some())
+        .count();
+
+    // Census B — the lock file's held bytes, which is what decides whether
+    // another process can attach at all.
+    let lock =
+        tf_tree_ipc::LockFile::open(&scratch.0.join("0/default.lock")).expect("open the lock file");
+    let held = (0..tf_tree_ipc::MAX_PARTICIPANTS)
+        .filter(|slot| {
+            lock.probe_participant(*slot)
+                .map(|p| p.held)
+                .unwrap_or(false)
+        })
+        .count();
+
+    assert!(
+        held > arena,
+        "the lock file holds {held} participant byte(s) and the arena table has \
+         {arena} record(s); equal counts would mean a read-only attachment now \
+         writes a record, which is a change to D18"
+    );
+    assert!(
+        arena > 0,
+        "the publisher has no record, so nothing is compared"
+    );
+}
+
 /// **`top` refuses `--rw` rather than quietly downgrading it.**
 ///
 /// D18 is why a diagnostic tool maps `PROT_READ`: the MMU is what stops a bug

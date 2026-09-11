@@ -3176,8 +3176,50 @@ fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
 /// whole premise is that a check without evidence says so rather than passing,
 /// and a permanently-`0%` row passes silently and looks like a real result. So
 /// the row is dropped and the gap is disclosed in `Meta.notes`, which exists
-/// for exactly this "ran, but half blind" case. Restore the row in the same
-/// commit that makes the engine maintain the counter.
+/// for exactly this "ran, but half blind" case.
+///
+/// # The numerator is not the arena's to give, and that is the part to read
+///
+/// **This doc used to end "restore the row in the same commit that makes the
+/// engine maintain the counter", and that is the wrong remedy twice over.**
+///
+/// First, a header counter cannot be maintained. A participant that is *killed*
+/// cannot decrement it, so it would drift up for the life of the arena — which
+/// is the whole reason `docs/PHASE2.md` holds liveness in a lock byte the kernel
+/// releases (D17) instead of in a count somebody has to remember to undo.
+///
+/// Second, and less obvious: **the arena participant table is not a valid
+/// numerator either, and it is wrong in the same direction.** A read-only
+/// attachment is D18's default and Python's; its mapping is `PROT_READ`, so it
+/// takes a lock-file byte and writes **no arena record at all**. A fleet whose
+/// consumers are all read-only — the shape this project recommends — therefore
+/// fills the slot table while the arena table stays as empty as the counter.
+/// Measured at `crates/tf_tree_cli/tests/attach.rs`'s
+/// `the_two_participant_censuses_disagree_by_the_read_only_population`: one
+/// publisher and one read-only consumer, **2 held lock bytes against 1 arena
+/// record**, and the gap grows with every consumer.
+///
+/// **`no_occupancy_row_is_permanently_zero` does not catch that substitution**,
+/// which is why the test above exists. Measured: feed the row from the arena
+/// table and that test still passes, because its fixture is an in-process arena
+/// whose own process *does* hold a record, so `used > 0` and the row looks real.
+/// The guard added because this was untested does not cover the likeliest wrong
+/// answer to it.
+///
+/// So the numerator is the **lock file's**, and choosing exactly which lock-file
+/// population is a decision rather than a detail — a byte can be held with no
+/// arena record (a read-only attach), and a `LIVE` record can outlive its byte
+/// (either a leaked slot, which `docs/decisions/0028`'s assigner reclaims and
+/// grants on the next hello, or a live `build_shared` participant that never took
+/// one at all). Those two are indistinguishable from outside the process, which is
+/// what makes the choice a decision.
+///
+/// **`docs/decisions/0056` is a `draft` and settles none of that yet.** What it
+/// records is the measurement above, the exclusion of both arena-side sources, and
+/// a recommendation — held lock bytes, on the ground that the owner's slot
+/// assigner is the only authority on whether a slot can be granted. Restore the
+/// row when that record is `ready`, and take the numerator it names then rather
+/// than the one recommended now.
 #[must_use]
 pub fn occupancy_of(tree: &Tree) -> Vec<(&'static str, u32, u32)> {
     let view = tree.arena_view();
@@ -3197,9 +3239,11 @@ pub fn occupancy_of(tree: &Tree) -> Vec<(&'static str, u32, u32)> {
 
 /// The disclosure that pairs with [`occupancy_of`]'s missing `participants` row.
 pub const PARTICIPANT_OCCUPANCY_NOTE: &str =
-    "TFT015 covers frames and edges only: ArenaHeader::participant_count is never \
-     incremented by the engine, so a participants row would read 0% on every arena \
-     and pass even with the slot table full";
+    "TFT015 covers frames and edges only: participant occupancy lives in the lock \
+     file, not the arena — ArenaHeader::participant_count is never incremented, and \
+     the arena participant table misses every read-only attachment (D18's default \
+     writes a lock byte and no record) — so either arena-side row would read far \
+     under the truth and pass with the slot table full. See docs/decisions/0056";
 
 /// Every edge's newest stamp — the sample [`Clock::decide`] votes over.
 ///

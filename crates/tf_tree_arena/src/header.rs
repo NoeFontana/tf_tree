@@ -167,6 +167,16 @@ pub struct ArenaHeader {
     /// Number of edges declared so far.
     pub edge_count: AtomicU32,
     /// Number of participant slots in use (A6).
+    ///
+    /// **Vestigial: nothing in the workspace ever increments it, and nothing
+    /// should read it.** The only writes are the zero it is initialised with.
+    /// A count of live participants cannot be maintained here, because a
+    /// participant that is *killed* cannot decrement it — which is why liveness
+    /// is a lock byte the kernel releases (D17) and not a number somebody has to
+    /// remember to undo. `docs/decisions/0056` has the measurement and the two
+    /// censuses that do answer the question; the field survives only because it
+    /// sits at a pinned offset, so removing it moves every offset after it and is
+    /// a format break for the ledger `docs/decisions/0032` part 2 opened.
     pub participant_count: AtomicU32,
     /// PID of the process that created the arena.
     pub creator_pid: u32,
