@@ -3214,6 +3214,33 @@ py-test-freethreaded:
     VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
     .venv-t/bin/python -m pytest tests/python -q
 
+# **`docs/PHASE3.md` §12.2 criterion 4, and §7.3's scaling test.** The criterion
+# is *"thread scaling >= 6x from 1 to 8 threads on `3.14t`"* and nothing measured
+# it until this recipe existed; `tests/python/test_freethreading.py` runs eight
+# threads and asserts **correctness**, which would pass on a build that serialised
+# every call.
+#
+# **It reports rather than gates, and `--gate` refuses on this host rather than
+# failing.** The criterion names 8 threads and the scaling it wants is a statement
+# about cores; a 4-physical-core host cannot reach 6x arithmetically, so a FAIL
+# here would charge the core count to the code. The binary prints INVALID with the
+# core count and exits 0. On a host with 8 physical cores, `--gate` is the
+# criterion.
+#
+# `--serialize` is the control: one lock around every call, which must read a flat
+# curve. A harness that cannot produce one on demand is not measuring one.
+#
+# **Do not shorten the window to make the sweep quick.** At `--seconds 1` the
+# 4-thread arm reads 3.29x where the documented 2 s window reads 3.96-3.99x, so a
+# short run understates scaling and does it silently. The defaults are the
+# measured configuration; `docs/benchmarks/EVIDENCE.md` states the window beside
+# the number for the same reason.
+
+# `plan.at` on 1/2/4/8 threads under `python3.14t` — PHASE3 §12.2 criterion 4.
+py-thread-scaling *ARGS:
+    VIRTUAL_ENV=.venv-t PYO3_PYTHON=/home/dev/src/tf_tree/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
+    .venv-t/bin/python crates/tf_tree_bench/python/thread_scaling.py {{ARGS}}
+
 # **The fmt and clippy halves are `py-compile`, depended on rather than
 # repeated.** Both lines were spelled here as well, byte for byte, and one
 # recipe restating another is the same defect as a workflow restating one
