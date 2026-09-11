@@ -1244,7 +1244,7 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > therefore takes a lock byte and writes **no arena record at all**. Measured at
 > one publisher and one read-only consumer: **2 held lock bytes against 1 arena
 > record**, and the gap grows with every consumer, so an arena-table row would
-> read 1/64 on a fleet with four slots left.
+> read 1/64 on a fleet with **three** slots left.
 >
 > `TFT014`'s evidence column two rows up already reads *"Phase 2 lock file vs
 > arena records"*. That is the same answer arrived at for the same reason, one

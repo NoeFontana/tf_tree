@@ -400,10 +400,12 @@ fn top_shows_the_live_arena_and_its_own_read_only_row() {
 /// population.**
 ///
 /// `TFT015` is *"arena occupancy > 80% (frames, edges, **participants**)"*, and
-/// its participants row is absent. `crate::checks::occupancy_of` and
-/// `no_occupancy_row_is_permanently_zero` both explain the absence by
-/// `ArenaHeader::participant_count` never being incremented — true, and **not
-/// the whole reason**, which is what this test exists to pin. The obvious
+/// its participants row is absent. `no_occupancy_row_is_permanently_zero` explains
+/// the absence by `ArenaHeader::participant_count` never being incremented —
+/// true, and **not the whole reason**, which is what this test exists to pin.
+/// (`crate::checks::occupancy_of`'s doc explained it the same way until the commit
+/// that added this test; it now carries the lock-file half, and cites this test
+/// for it.) The obvious
 /// substitute numerator, the arena participant table, is wrong in the same
 /// direction and for a deeper reason: a read-only attachment is D18's default
 /// and Python's, its mapping is `PROT_READ`, and it therefore holds a lock-file

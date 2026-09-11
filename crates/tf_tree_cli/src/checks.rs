@@ -3208,9 +3208,18 @@ fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
 ///
 /// So the numerator is the **lock file's**, and choosing exactly which lock-file
 /// population is a decision rather than a detail — a byte can be held with no
-/// record (read-only), and a record can outlive its byte (a leaked slot), so the
-/// count depends on which of those an occupancy warning is about.
-/// `docs/decisions/0056` settles it; restore the row when it is `ready`.
+/// arena record (a read-only attach), and a `LIVE` record can outlive its byte
+/// (either a leaked slot, which `docs/decisions/0028`'s assigner reclaims and
+/// grants on the next hello, or a live `build_shared` participant that never took
+/// one at all). Those two are indistinguishable from outside the process, which is
+/// what makes the choice a decision.
+///
+/// **`docs/decisions/0056` is a `draft` and settles none of that yet.** What it
+/// records is the measurement above, the exclusion of both arena-side sources, and
+/// a recommendation — held lock bytes, on the ground that the owner's slot
+/// assigner is the only authority on whether a slot can be granted. Restore the
+/// row when that record is `ready`, and take the numerator it names then rather
+/// than the one recommended now.
 #[must_use]
 pub fn occupancy_of(tree: &Tree) -> Vec<(&'static str, u32, u32)> {
     let view = tree.arena_view();
