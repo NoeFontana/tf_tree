@@ -204,6 +204,107 @@ read-only consumer remains, and a fresh
 `Open::new().mode(ReadWrite).create(Never).open()` is refused with
 `ArenaHeldButUnreachable`.
 
+#### It happened again after the harness was repaired, and this time the margin was measured
+
+**2026-09-10, `nightly` run 34453737033.** Six of seven jobs green;
+`shm-torture-asan` red. Judged per job, not by the run's colour. The repair
+landed in #310 worked exactly as designed — the harness **classified** the
+failure itself, and this is an excerpt of the one sentence it emits (the full
+line also gives the recovering migration, the recorded owner pid and the elapsed
+time):
+
+```text
+owner kill 10 left the arena in an UNRECOVERABLE state ... Classification:
+POPULATION — no eligible heir remained to ask, so §3.5's trigger was never
+answered. This is the state the pre-kill census exists to prevent; reaching it
+means the census passed and the pool drained inside the vacancy ... Heirs
+attached at this kill: 0 (first round after: 0).
+```
+
+§3.5 trigger tally `inherited=9`, **zero `err-*`**, over ten owner kills. The
+engine refused no heir; there was none left to ask. That is this record's state,
+reached by a fleet that had been *checked* for capacity moments earlier.
+
+**The margin, measured on this host.** Four runs at the failing job's
+`--children 4 --kill-hz 4` — its duration is 30 minutes
+(`.github/workflows/nightly.yml`), and these are 120–150 s, so a fifteenth of it:
+
+| Run | ASan | Cores | Owner kills | Result |
+|---|---|---|---|---|
+| 1–3 | no | 8 | 15 each | **PASS**, all recovered |
+| 4 | yes | 8 | 15 | **PASS**, all recovered |
+| 5 | yes | **2** (`taskset`) | 18 | **PASS**, all recovered |
+
+Ninety-three consecutive owner kills recovered. What matters is not that they
+passed but the **per-kill heir census the harness prints beside each one**, which
+is the population instrument here. Run 5's eighteen kills read:
+
+```text
+heirs attached at the kill: 2 1 3 3 2 1 2 2 2 2 2 2 3 3 1 2 2 3
+```
+
+**Three of eighteen ran with exactly one heir left.** `heirs_at_kill == 1` means
+that after the role holder died, precisely one attached read-write survivor
+remained to answer §3.5 — and it did, every time. The nightly saw **0**. So the
+distribution's left tail already touches one process, the failure is one step
+further out, and a 30-minute run at this cadence draws roughly 225 owner kills
+against these 15–18. Nothing about that requires ASan or a two-core runner to be
+the cause, and nothing here excludes them either.
+
+**Two arguments that were made for this and are withdrawn**, recorded rather than
+quietly replaced, because both were built on numbers that do not say what they
+were read as saying:
+
+- *"The attached fraction is `writers=1.6–1.7/4`, identically in CI and here, so
+  ~42% of children are attached and `heirs_before` is essentially always exactly
+  2."* **`writers=N/4` is not a fraction of children.** It is `writers_live` over
+  the **four `CHAIN` edges**, and the `4` in that format string is `CHAIN.len()`
+  — the harness's own long form says *"{:.2} of the 4 chain edges had a live
+  writer"*. It is bounded by 4 whatever `--children` is, and a child that is
+  attached while holding no claim contributes nothing to it. `--children 4`
+  coinciding with `CHAIN.len() == 4` is exactly what hid that. The population
+  instruments are `slots=Nreg/Malive` and the per-migration `heirs_before` /
+  `heirs_at_kill` / `heirs_first_round` above.
+- *"A 30-minute run is fifteen times the exposure, and one kill loses the race."*
+  True of the number of draws and misleading as stated: a POPULATION wedge ends
+  the run, so the nightly's failure on its **tenth** owner kill puts it at
+  t ≈ 80 s, inside the window every local run above covered. Ninety-three clean
+  local kills against a failure on the nightly's tenth is *consistent* with a low
+  per-kill rate — it does not establish that CI differs, and does not exclude it.
+  The two-core ASan run above was taken to test one concrete mechanism for a
+  difference and did not reproduce it.
+
+**What is established, and what is not.** Established: the state recurs after the
+census-and-defer remedy; the engine is clear by tally; and the harness's own
+classification — the census passed and the pool drained inside the vacancy — is
+entailed by `heirs_at_kill == 0`, not inferred. Not established: why *that* kill
+and not the ninety-three. The reap-plus-census interval is the obvious candidate,
+since `heirs_at_kill` is taken after the victim's `kill()` and `wait()` and that
+is precisely the window in which the surviving heir must not leave — and it is
+untested at CI's core count and load.
+
+**Why this belongs in *this* record and not in a harness patch.** The census
+`kill_the_owner` performs is a correct reading of eligibility at the instant it is
+taken, and the vacancy has *duration* — which is [*The gap: eligibility is an
+instant, not a census*](#the-gap-eligibility-is-an-instant-not-a-census) stated
+about a real fleet rather than a staged test. `heirs_at_kill == 1` on one kill in
+six is that gap with a number on it. The harness is now a **first consumer** of
+whatever open question 1 answers, because what it needs is a supported way to
+hold recovery capacity that cannot evaporate between two syscalls; everything
+available without that either lowers the rate and proves nothing (more children,
+longer attachments) or redesigns what the harness pins, which is a decision.
+
+**Until this record is `ready`, `shm-torture-asan` is expected to fail on some
+nightlies, and this is the discriminator.** It is safe to attribute a failure to
+this record **only** when the run's final error carries
+`Classification: POPULATION`, `Heirs attached at this kill: 0`, and a §3.5 trigger
+tally with **no `err-` entry**. Anything else in that job — a `violation`, an ASan
+report, `Classification:` naming anything but POPULATION, or any `err-` in the
+tally — is a different failure and must not be read as this one. Nothing notifies
+on a red nightly, so a job left red is a job whose next real failure is invisible;
+that is a cost this record is accepting knowingly and it is the strongest argument
+for answering open question 1 rather than deferring it.
+
 ### What holds this today: one paragraph of prose, and a gate that stops half way
 
 - **No type.** `AttachMode::ReadWrite` is a fact about the mapping's protection
