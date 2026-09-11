@@ -65,13 +65,18 @@ half the physical cores its "8 threads" implies — but the margin is inside thi
 instrument's own spread, so **this host cannot settle the criterion either way**.
 One with eight physical cores could. That is a more useful statement than a verdict.
 
-**The GIL half reads consistently below the floor, and the host is not the
-explanation.** Its 1->4 arm is as high as the free-threaded one or higher; the gap
-opens only at 8 threads, where SMT siblings contend on GIL-held work. There is
-code-side GIL-held work to suspect — `Plan::at` allocates its `(N,4,4)` output
-before `fill` detaches — so attributing this to the core count without an `at_into`
-arm, which has no per-call allocation, would be blaming an arm nobody measured.
-Left unresolved on purpose.
+**The GIL half reads consistently below the floor, the host is not the explanation,
+and since 2026-09-11 the arm that says so has been run.** Its 1->4 arm is as high
+as the free-threaded one or higher; the gap opens only at 8 threads, where SMT
+siblings contend on GIL-held work. The code-side suspect was `Plan::at` allocating
+its `(N,4,4)` output before `fill` detaches, and `--call at_into` prices it: the
+same sweep, a caller-owned buffer, nothing allocated per call. It reads **higher at
+1->8 in every interleaved pair taken** and **still short of the floor**. So part of
+the gap is a GIL-held allocation and the rest is unattributed — a narrower and
+more useful statement than either "the host blocks it" or "the allocation is the
+cause", both of which this file has published and neither of which survived
+measurement. `--gate --call at_into` is refused: §7.3 names `plan.at`, and a
+criterion re-pointed at the faster call stops meaning anything.
 
 **The control falls and keeps falling.** `--serialize` reads below 1.0x at every
 thread count and lower at each step, the way lock contention does. Against an
@@ -237,6 +242,7 @@ def one_arm(
     seconds: float,
     warmup: float,
     lock: threading.Lock | None,
+    into: bool = False,
 ) -> tuple[float, int]:
     """Aggregate samples per second over `threads` threads, and the call count.
 
@@ -256,28 +262,66 @@ def one_arm(
 
     def worker(slot: int) -> None:
         try:
+            # **The `at_into` arm's buffer is per thread and allocated here**,
+            # outside both loops, which is the entire point of the arm: `at`
+            # allocates its (N,4,4) result on every call while the GIL is held,
+            # and `at_into` writes into a buffer the caller already owns. One
+            # shared buffer would make the threads race on the output and
+            # measure something else entirely.
+            #
+            # Shaped by `np.empty_like(plan.at(stamps))` rather than from a
+            # hard-coded (N,4,4): the shape and dtype then come from the binding
+            # that is being measured, so a layout change cannot leave this arm
+            # silently allocating the wrong buffer and falling back.
+            out = np.empty_like(plan.at(stamps)) if into else None
+
             # Warm-up runs in the same thread on the same objects, and its
             # iterations are **not counted** - the timed loop starts from zero
             # once `go` is set. Scaling a mixed count by a time fraction was the
             # first shape here and it is a guess; this is exact, and the
             # per-iteration `is_set` it costs is present in both loops so it
             # cannot bias one thread count against another.
-            while not go.is_set():
+            #
+            # **Both arms call the binding directly**, rather than through one
+            # selected callable. A shared `call()` indirection would be fair
+            # between the two — the same Python frame on each side — but it adds
+            # a frame to the `at` numbers already published in
+            # `docs/benchmarks/EVIDENCE.md`, and the whole subject here is a
+            # per-call cost. Four loops repeated is the cheaper honesty.
+            if into:
+                while not go.is_set():
+                    if lock is None:
+                        plan.at_into(stamps, out)
+                    else:
+                        with lock:
+                            plan.at_into(stamps, out)
+                n = 0
                 if lock is None:
-                    plan.at(stamps)
+                    while not stop.is_set():
+                        plan.at_into(stamps, out)
+                        n += 1
                 else:
-                    with lock:
-                        plan.at(stamps)
-            n = 0
-            if lock is None:
-                while not stop.is_set():
-                    plan.at(stamps)
-                    n += 1
+                    while not stop.is_set():
+                        with lock:
+                            plan.at_into(stamps, out)
+                        n += 1
             else:
-                while not stop.is_set():
-                    with lock:
+                while not go.is_set():
+                    if lock is None:
                         plan.at(stamps)
-                    n += 1
+                    else:
+                        with lock:
+                            plan.at(stamps)
+                n = 0
+                if lock is None:
+                    while not stop.is_set():
+                        plan.at(stamps)
+                        n += 1
+                else:
+                    while not stop.is_set():
+                        with lock:
+                            plan.at(stamps)
+                        n += 1
             counts[slot] = n
         except BaseException as e:  # noqa: BLE001 - re-raised by the caller
             errors.append(e)
@@ -323,6 +367,15 @@ def main() -> int:
         help="the falsifier: one lock around every call; must read flat or falling",
     )
     ap.add_argument(
+        "--call",
+        choices=("at", "at_into"),
+        default="at",
+        help=(
+            "which binding the threads call. `at` is the criterion's own wording; "
+            "`at_into` is the no-per-call-allocation comparison the GIL half owes."
+        ),
+    )
+    ap.add_argument(
         "--gate",
         action="store_true",
         help="exit non-zero on a miss. Refused where the verdict would be INVALID.",
@@ -344,6 +397,18 @@ def main() -> int:
             "--gate --serialize is refused: --serialize is the deliberate "
             "flat-curve control, and gating it would report the control as a "
             "regression"
+        )
+    # **`--gate --call at_into` is refused for `--serialize`'s reason**, one
+    # level up: §7.3's criterion says *"1/2/4/8 threads calling `plan.at`"*, so a
+    # verdict taken on `at_into` would be a pass/fail about a call the criterion
+    # does not name. The arm exists to explain a shortfall, not to replace the
+    # measurement that found one — and a criterion quietly re-pointed at the
+    # faster call is how a gate stops meaning anything.
+    if args.gate and args.call == "at_into":
+        ap.error(
+            "--gate --call at_into is refused: PHASE3 §7.3's criterion names "
+            "`plan.at`, so gating `at_into` would settle the criterion with a "
+            "call it does not describe. Run it ungated as the comparison arm."
         )
 
     gil = getattr(sys, "_is_gil_enabled", lambda: True)()
@@ -367,6 +432,14 @@ def main() -> int:
     )
     print(f"  batch            {args.batch} stamps")
     print(
+        f"  call             plan.{args.call}"
+        + (
+            ""
+            if args.call == "at"
+            else "  (no per-call allocation — the comparison arm, never the gate)"
+        )
+    )
+    print(
         f"  window           {args.seconds:g}s after {args.warmup:g}s warm-up,"
         " discarded"
     )
@@ -383,7 +456,9 @@ def main() -> int:
 
     rows: list[tuple[int, float]] = []
     for n in THREAD_COUNTS:
-        rate, calls = one_arm(plan, stamps, n, args.seconds, args.warmup, lock)
+        rate, calls = one_arm(
+            plan, stamps, n, args.seconds, args.warmup, lock, args.call == "at_into"
+        )
         rows.append((n, rate))
         # ns/sample is printed because it is what makes a wrong build profile
         # visible: this host reads ~300 ns/sample at `--release` on one thread
@@ -399,6 +474,9 @@ def main() -> int:
             f"  {n:2d} thread(s)  {rate / 1e6:8.3f} M samples/s"
             f"   {per:7.1f} ns/sample aggregate   ({calls} calls){note}"
         )
+
+    # The verdict distinguishes the two arms, so it needs to know which one ran.
+    into = args.call == "at_into"
 
     base = rows[0][1]
     if base <= 0.0:
@@ -468,22 +546,47 @@ def main() -> int:
             "code."
         )
         if gil:
-            # **The host cannot be the whole story for the GIL arm, and saying it
-            # was is the mistake this paragraph replaces.** The free-threaded arm
-            # clears the floor on this same host, window and batch, so these cores
-            # demonstrably can deliver it; and the GIL arm's 1->4 reads *higher*
-            # than the free-threaded one, so the gap appears only where SMT
-            # siblings contend on GIL-held work. There is code-side GIL-held work
-            # to suspect: `Plan::at` allocates its (N,4,4) output before `fill`
-            # detaches. Charging this to the host without an `at_into` arm — no
-            # per-call allocation — is blaming an arm nobody measured.
-            print(
-                "  And it is not the whole story here: the free-threaded arm "
-                "clears the floor on this same host, so these cores can deliver "
-                "it. The GIL arm needs an `at_into` comparison — no per-call "
-                "allocation, so no GIL-held allocation — before the shortfall is "
-                "attributed anywhere. Unresolved, deliberately."
-            )
+            # **The host is not the whole story for the GIL arm, and the arm that
+            # says so has now been run.** The free-threaded half clears the floor
+            # on this same host, window and batch, so these cores demonstrably
+            # can deliver it. The suspect was code-side GIL-held work — `Plan::at`
+            # allocates its (N,4,4) output before `fill` detaches — and
+            # `--call at_into`, which writes into a caller-owned buffer and
+            # allocates nothing per call, is the comparison that prices it.
+            #
+            # Measured 2026-09-11 by interleaved pairs, so the comparison
+            # survives a host that drifted between windows. `at_into` read
+            # higher at this width in every pair, by a margin that is large
+            # beside the single-thread difference between the two calls — the
+            # shape of a cost that is cheap alone and serialises under
+            # contention. **And it still does not reach the floor.** So neither
+            # "the host blocks it" nor "the allocation is the cause" survives:
+            # the allocation is a real, measured contributor to part of the gap,
+            # and the remainder is unattributed.
+            #
+            # **No readings here.** `docs/benchmarks/EVIDENCE.md`'s probe row is
+            # deliberately their only copy — an earlier version of this comment
+            # restated six of them byte for byte and then closed by saying the
+            # figures lived in EVIDENCE.md, which was false of the four lines
+            # above it and is the exact drift that row exists to stop.
+            if not into:
+                print(
+                    "  And it is not the whole story: the free-threaded arm "
+                    "clears the floor on this same host, so these cores can "
+                    "deliver it. `--call at_into` — no per-call allocation, so "
+                    "no GIL-held allocation — reads higher at this width in "
+                    "every paired run taken so far, and still short of the "
+                    "floor. Roughly half the gap is the allocation; the rest is "
+                    "unattributed. Re-run with `--call at_into` to see the pair."
+                )
+            else:
+                print(
+                    "  This is the no-allocation arm and it is still short, so "
+                    "the GIL-held allocation in `Plan::at` does not account for "
+                    "the whole gap. What remains is unattributed — not the host, "
+                    "which the free-threaded half clears, and not the allocation, "
+                    "which this arm removed."
+                )
         else:
             print(
                 f"  The number is the finding; re-take it on >= {widest} "
@@ -516,6 +619,10 @@ def main() -> int:
                 "usable_cpus": len(usable),
                 "quota_cores": quota,
                 "batch": args.batch,
+                # **Which call this row measured.** A row that cannot say is a
+                # row that gets compared against one taken the other way, which
+                # is the four-way drift `EVIDENCE.md`'s register exists to stop.
+                "call": args.call,
                 "serialize": args.serialize,
                 "floor": FLOOR,
                 f"scaling_1_to_{widest}": round(scaling, 4),

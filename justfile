@@ -3272,8 +3272,15 @@ py-test-freethreaded:
 # `tree.rs`'s documented release figure so a wrong profile is unmissable. It is
 # also the profile a `pip install` gets.
 #
-# **`.venv-t`, so this is the free-threaded half.** Run the same script under
-# `.venv/bin/python` for the GIL half; the script reports which one it answered.
+# **`.venv-t`, so this is the free-threaded half; `py-thread-scaling-gil` below is
+# the other one.** This comment used to say "run the same script under
+# `.venv/bin/python`", which walks straight into the trap the paragraph above it
+# describes: `.venv` carries whatever `just py-test` last installed there, and
+# that install line has no `--release`. A reader following the old sentence would
+# have taken the GIL half against a debug build and read a different *curve*, not
+# merely slower numbers. The second recipe carries the `--release` line so the two
+# halves cannot be built differently by accident. The script reports which
+# interpreter it answered either way.
 #
 # `--serialize` is the control: one lock around every call, which must read a
 # falling curve. A harness that cannot produce one on demand is not measuring one.
@@ -3287,6 +3294,21 @@ py-test-freethreaded:
 py-thread-scaling *ARGS:
     VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q --release
     .venv-t/bin/python crates/tf_tree_bench/python/thread_scaling.py {{ARGS}}
+
+# **The GIL half of the same criterion**, which had no recipe and was run by hand.
+# Criterion 4 asks for >= 6x on `3.14t` *and* on the GIL build for batches above
+# the release threshold, so this is half of a criterion and not a curiosity.
+#
+# Identical to the recipe above but for the interpreter — same script, same
+# defaults, same `--release`. `--call at_into` is the arm the GIL half owes: `at`
+# allocates its (N,4,4) result on every call while the GIL is held, and until the
+# no-allocation comparison is taken, a shortfall at 8 threads cannot be charged to
+# the core count. `--gate --call at_into` is refused, because §7.3's criterion
+# names `plan.at` and a criterion quietly re-pointed at the faster call stops
+# meaning anything.
+py-thread-scaling-gil *ARGS:
+    VIRTUAL_ENV=.venv PYO3_PYTHON=$PWD/.venv/bin/python .venv/bin/maturin develop --uv -q --release
+    .venv/bin/python crates/tf_tree_bench/python/thread_scaling.py {{ARGS}}
 
 # **The fmt and clippy halves are `py-compile`, depended on rather than
 # repeated.** Both lines were spelled here as well, byte for byte, and one
