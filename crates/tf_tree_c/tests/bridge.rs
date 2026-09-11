@@ -928,8 +928,11 @@ fn a_halted_bridge_refuses_every_later_offer() {
     // so a §5.7 disagreement has to be charged somewhere or `assert_balanced`
     // breaks. One collision plus two disagreements reads 3.
     // `tf_tree_bridge`'s `strict_accumulates_conflicts_inside_the_window_and_halts_once_at_its_close`
-    // pins the same combination one crate down at `(1, 2, 1)`; this is the C
-    // seam's view of it, and the two must not drift.
+    // reads `(1, 2, 1)` on *its* fixture, and the two are **supposed** to differ:
+    // that one makes a single static observation and this one makes two, on
+    // purpose, so the `s.static_conflicts > 1` assertion below can separate
+    // observations from faults. Do not reconcile them — the shared rule is one
+    // bucket per drop, not one pair of numbers.
     assert_eq!(
         (s.applied, s.dropped_authority, s.static_conflicts),
         (1, 3, 2),

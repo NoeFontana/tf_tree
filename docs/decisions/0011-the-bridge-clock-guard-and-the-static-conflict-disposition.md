@@ -802,6 +802,27 @@ Steps 2–4 are (1); 5–7 are (2); 8 is (3). Each is one PR.
    through `report()`. Not a `tft_bridge_options` field — that would change
    `sizeof`. A gtest that two conflicting publishers under `Strict` produce one
    `RCLCPP_FATAL` naming both. — verified by `just ros-test`.
+
+   **Two cautions, both found while step 6 landed and neither visible from this
+   step's own text.**
+
+   *The timer must be created on `group_`.* `BridgeHandle` makes its callback
+   group with `automatically_add_to_executor_with_node = false` and spins that
+   group alone on a dedicated executor on the bridge's thread, so a
+   `create_wall_timer` with no `callback_group` argument lands in the node's
+   default group and fires on whichever thread spins the node — §3.2's affinity
+   assertion `abort()`s a debug build, and a release build gets
+   `TFT_ERR_WRONG_THREAD` and never closes the window at all, degrading `Strict`
+   at the backstop with no diagnostic.
+
+   *5.0 s is a coverage decision, not a latency one.* `/tf_static` is
+   `transient_local`, and §5.4 itself puts a latched sample's arrival at "seconds
+   after either process started". A window that closes first reports nothing, and
+   outside the window `Strict` is `FirstWriterWins` plus counters for the life of
+   the process — so the two-different-URDFs fault the policy exists for passes.
+   Whether 5.0 is defensible, and whether the close should be deferred while no
+   `/tf_static` has been seen at all, is a question this step should answer rather
+   than inherit from a default written before step 6 existed.
 8. **(3) in ROS.** Split the `TFT_BRIDGE_DROPPED` tail into three
    `RCLCPP_WARN_THROTTLE` call sites, one per reason, and add a `reason_name()`.
    Preserve `BAD_POSE`'s existing `detail`. — verified by `just ros-test`.

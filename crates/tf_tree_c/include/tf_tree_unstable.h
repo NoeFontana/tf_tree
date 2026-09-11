@@ -1301,6 +1301,24 @@ tft_status tft_bridge_note_time_jump(tft_bridge *b,
  * which is a count and not a duration, so a bridge on a quiet robot could sit
  * with the window open for as long as it took to see 4096 transforms.
  *
+ * # Closing too early costs the whole policy, and the caller owns that choice
+ *
+ * **A window that closes before the conflicting sample arrives reports nothing,
+ * and `STRICT` is then degraded for the life of the process** — §5.4 is explicit
+ * that outside the window it becomes `FirstWriterWins` plus counters, so the CI
+ * run the policy exists for goes *green* on the misconfiguration.
+ *
+ * That is not hypothetical, and it is the mirror of §5.4's own argument for
+ * having a window: `/tf_static` is `transient_local`, so a latched sample
+ * reaches a subscriber when DDS discovery matches it — which §5.4 puts at
+ * "seconds after either process started and arbitrarily long after the fault was
+ * introduced". Two `robot_state_publisher`s with different URDFs is the
+ * motivating fault, and the second one's latched sample can easily land after a
+ * short window has closed. Deciding the duration is therefore deciding how much
+ * of the fault class the policy still covers; this entry point does not pick it,
+ * and a caller choosing a small number should know it is trading coverage and
+ * not just start-up latency.
+ *
  * # What it does and does not charge
  *
  * Nothing. Like [`tft_bridge_note_time_jump`], and for the same reason: this
@@ -1321,12 +1339,34 @@ tft_status tft_bridge_note_time_jump(tft_bridge *b,
  *   distinct code, because a caller's next act is the same either way and a
  *   code it had to learn in order to ignore is a code that will be checked
  *   wrong.
- * * **Called twice** — the second call is the "none were" arm, not an error.
- *   The window does not reopen (`Ingest::close_startup_window` is idempotent),
- *   and a one-shot timer that fires after a manual close is a legitimate
- *   sequence rather than a caller mistake.
+ * * **Called twice** — never an error, and *which* of the arms above the second
+ *   call takes depends on what the first one found. After a close that halted,
+ *   the bridge is latched and the second call replays
+ *   [`TFT_BRIDGE_REASON_ALREADY_HALTED`], exactly like the bullet below. After a
+ *   close that found nothing, it is the "none were" arm again, because
+ *   `Ingest::close_startup_window` is idempotent and the window does not reopen.
+ *   A one-shot timer firing after a manual close is a legitimate sequence rather
+ *   than a caller mistake, and a handler that treats the latched replay as
+ *   unexpected is reading this bullet and not the one below it.
  * * **Already halted** — [`TFT_BRIDGE_REASON_ALREADY_HALTED`], replaying the
  *   latched action, exactly as [`tft_bridge_note_time_jump`] does.
+ *
+ * # It must be called from the bridge's own thread, and a `rclcpp` timer is the
+ * easy way to get that wrong
+ *
+ * §3.2's affinity applies here as to every other entry point, and the *documented
+ * caller* is where it bites. `ros/tf_tree_ros/src/bridge_handle.cpp` creates its
+ * callback group with `automatically_add_to_executor_with_node = false` and spins
+ * that group alone on a dedicated `SingleThreadedExecutor` on the bridge's own
+ * thread, precisely so the node's executor can never run a bridge callback. A
+ * one-shot timer made with `node_->create_wall_timer(...)` and **no**
+ * `callback_group` argument lands in the node's default group instead, so it
+ * fires on whichever thread spins the node: a debug build `abort()`s the process
+ * through the affinity assertion, and a release build returns
+ * [`TFT_ERR_WRONG_THREAD`](crate::TFT_ERR_WRONG_THREAD) — after which the window
+ * is never closed at all and `STRICT` silently degrades at the backstop instead.
+ * `tft_bridge_note_time_jump` carries the analogous warning for the jump
+ * callback; this is the same hazard reached by a different route.
  *
  * # Safety
  *

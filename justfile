@@ -991,7 +991,7 @@ c-header-check:
     cargo xtask headers --check
     # **`bridge` is in this build, and the smoke test is compiled with
     # `-DTFT_HAVE_BRIDGE`.** The bridge declarations are emitted inside
-    # `#if defined(TFT_HAVE_BRIDGE)`, so without both halves the ten §5 entry
+    # `#if defined(TFT_HAVE_BRIDGE)`, so without both halves the §5 entry
     # points would be in the committed header and compiled by nothing — which is
     # exactly the state that let a function and a typedef share the name
     # `tft_bridge_stats` through a whole revision. A header nobody compiles is

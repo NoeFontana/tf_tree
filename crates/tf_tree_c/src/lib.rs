@@ -223,18 +223,23 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// a statement about whether the symbol may later be **withdrawn** and not about
 /// whether it is there.
 ///
-/// **A `0.7` caller can observe nothing at all.** Like `6` → `7` and unlike
-/// `5` → `6`, nothing here changes the behaviour of any call that existed
-/// before — with one qualification that is worth stating because it is visible
-/// through an existing call. A `STRICT` startup halt used to be reported as
-/// `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` (5), which was the closest true code
-/// and named the wrong thing whenever the record contained a §5.7 static-value
-/// disagreement; it is now `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` (9). A caller
-/// that switched on 5 and printed it will now fall through to its default arm
-/// for that halt. It cannot have been *relying* on 5 in a way that broke,
-/// because the halt reaches it only from the window closing, and the window
-/// could only close on the 4096-transform backstop until this version added the
-/// call that closes it deliberately.
+/// **Unlike `6` → `7`, a `0.7` caller CAN observe this one through a call it
+/// already makes, and the retest it may owe is one `switch` arm.** A `STRICT`
+/// startup halt used to be reported as
+/// `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` (5) — the closest true code, and the
+/// wrong name whenever the record contained a §5.7 static-value disagreement,
+/// which is a config-versus-robot fault and not an authority one. It is now
+/// `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` (9).
+///
+/// That halt reaches a `0.7` caller through **`tft_bridge_offer`**, whose
+/// signature and every other outcome are unchanged: on `STRICT`, with a conflict
+/// recorded, the 4096-transform backstop closes the window from inside an offer.
+/// So a `0.7` caller that reached the backstop did receive 5 and now receives 9,
+/// and one that switched on 5 to print it falls through to its default arm. The
+/// action is `TFT_BRIDGE_HALT` either way and the `detail` string carries the
+/// diagnosis, so nothing a caller *does* changes — but "observes nothing" was
+/// false, and this paragraph asserted it directly above the sentences that refute
+/// it. Nothing else here is reachable without naming a new symbol.
 pub const TFT_ABI_VERSION_MINOR: u32 = 8;
 
 /// The library's major ABI version.
