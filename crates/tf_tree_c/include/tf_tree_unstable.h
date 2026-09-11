@@ -778,12 +778,13 @@ typedef int32_t tft_bridge_evidence;
 /**
  * `STRICT`, and a conflict was recorded on an edge (§5.4).
  *
- * On a [`TFT_BRIDGE_HALT`] this is `STRICT`'s startup window closing with
- * conflicts in it. `detail` carries how many of each kind — authority (§5.4)
- * **and** static-value (§5.7) — because the halt is about a set of edges and
- * this POD has room for one. `owner` and `intruder` are empty there, and so are
- * `parent`/`child`: the window closed on transforms counted long before the one
- * in hand, so there is no edge to name that would not be the wrong one.
+ * **This is the per-sample judgment only.** `owner` and `intruder` name the two
+ * publishers and `parent`/`child` name the edge, because the sample in hand *is*
+ * what was judged. The startup window closing with conflicts in it is a
+ * different event about a *set* of edges and has its own code,
+ * [`TFT_BRIDGE_REASON_STARTUP_CONFLICTS`] — this doc used to carry both, which
+ * meant a §5.7 static-value disagreement was reported under a code whose name
+ * says "authority".
  */
 #define TFT_BRIDGE_REASON_AUTHORITY_CONFLICT 5
 #endif
@@ -832,6 +833,33 @@ typedef int32_t tft_bridge_evidence;
  * **before** this one.
  */
 #define TFT_BRIDGE_REASON_ALREADY_HALTED 8
+#endif
+
+#if defined(TFT_HAVE_BRIDGE)
+/**
+ * `STRICT`'s startup window closed with conflicts recorded in it (§5.4), so the
+ * bridge refused to start.
+ *
+ * **A judgment about a *set* of edges, not about the sample in hand**, which is
+ * why it is not [`TFT_BRIDGE_REASON_AUTHORITY_CONFLICT`]: it covers both kinds
+ * at once — authority (§5.4) and static-value (§5.7) — and reporting a static
+ * disagreement under a code whose name says "authority" is what this code was
+ * added to stop. `docs/decisions/0011` implementation step 6.
+ *
+ * `detail` states the two counts and then **enumerates every recorded edge with
+ * both of its publishers**, which §5.4's amendment requires in those words:
+ * *"the seam's `detail` enumerates **every** recorded edge with both of its
+ * publishers, not the first."* `Strict` exists for CI, and one run reporting
+ * four misconfigurations is the whole reason the window accumulates instead of
+ * halting on the first sample.
+ *
+ * `owner`, `intruder`, `parent` and `child` are **empty**, and that is not an
+ * omission: the window closed on transforms counted long before the one in
+ * hand, so a POD with room for one edge would name whichever happened to be
+ * next on the wire — an innocent edge printed as the cause. The edges are in
+ * `detail`, where there is room for all of them.
+ */
+#define TFT_BRIDGE_REASON_STARTUP_CONFLICTS 9
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
@@ -1259,6 +1287,53 @@ tft_status tft_bridge_note_time_jump(tft_bridge *b,
                                      int64_t delta_nanos,
                                      tft_bridge_jump_kind kind,
                                      tft_bridge_outcome *out);
+#endif
+
+#if defined(TFT_HAVE_BRIDGE)
+/**
+ * Close `STRICT`'s startup window (§5.4), halting once if conflicts were
+ * recorded in it.
+ *
+ * `docs/decisions/0011` implementation step 6, and the **primary** mechanism
+ * §5.4's amendment names: *"an explicit `close_startup_window()` — the primary
+ * mechanism, and how a caller that owns a real clock supplies a real
+ * duration."* Without it the window closes only on the 4096-transform backstop,
+ * which is a count and not a duration, so a bridge on a quiet robot could sit
+ * with the window open for as long as it took to see 4096 transforms.
+ *
+ * # What it does and does not charge
+ *
+ * Nothing. Like [`tft_bridge_note_time_jump`], and for the same reason: this
+ * call is not a transform, `refused_after_halt` is a term in a ledger whose
+ * total is `transforms`, and counting a non-transform there would unbalance the
+ * ledger to keep a counter looking busy.
+ *
+ * # Outcomes
+ *
+ * * **Conflicts were recorded** — [`TFT_BRIDGE_HALT`] with
+ *   [`TFT_BRIDGE_REASON_STARTUP_CONFLICTS`], and `detail` enumerating every
+ *   recorded edge with both of its publishers. The bridge is latched: every
+ *   later call reports [`TFT_BRIDGE_REASON_ALREADY_HALTED`], exactly as a halt
+ *   from any other path does.
+ * * **None were, or the policy is not `STRICT`** — [`TFT_BRIDGE_DROPPED`] with
+ *   [`TFT_BRIDGE_REASON_NONE`], which is `tft_bridge_outcome::blank`'s state.
+ *   "Nothing happened" is reported as nothing having happened rather than as a
+ *   distinct code, because a caller's next act is the same either way and a
+ *   code it had to learn in order to ignore is a code that will be checked
+ *   wrong.
+ * * **Called twice** — the second call is the "none were" arm, not an error.
+ *   The window does not reopen (`Ingest::close_startup_window` is idempotent),
+ *   and a one-shot timer that fires after a manual close is a legitimate
+ *   sequence rather than a caller mistake.
+ * * **Already halted** — [`TFT_BRIDGE_REASON_ALREADY_HALTED`], replaying the
+ *   latched action, exactly as [`tft_bridge_note_time_jump`] does.
+ *
+ * # Safety
+ *
+ * `b` must be a live handle used from the thread that created it. `out` must
+ * point to a writable `tft_bridge_outcome` with `struct_size` set.
+ */
+tft_status tft_bridge_close_startup_window(tft_bridge *b, tft_bridge_outcome *out);
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)

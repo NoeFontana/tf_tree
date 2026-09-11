@@ -11,7 +11,7 @@
 #      features, and a different failure for each** (see `just test`'s comment
 #      for why default-off keeps biting):
 #
-#        * without `bridge` the nine §5 entry points are not in the archive and
+#        * without `bridge` the §5 entry points are not in the archive and
 #          the colcon link fails with a list of undefined `tft_bridge_*` symbols;
 #        * without `shm` there is no `tft_tree_open`, so `docs/decisions/0015`'s
 #          `arena_name` has no `tf_tree::Open` behind it, `tft_bridge_create`

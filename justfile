@@ -13,7 +13,7 @@ test: test-rust test-doc ingest-check
 test-rust:
     cargo nextest run --workspace --no-tests=pass
     # **`tf_tree_c`'s `bridge` feature is default-off, so `--workspace` compiles
-    # none of it.** `crates/tf_tree_c/src/bridge.rs` — **ten** `extern "C"` entry
+    # none of it.** `crates/tf_tree_c/src/bridge.rs` — the `extern "C"` entry
     # points, the only ones that both decide and write — could be replaced with
     # literal garbage and `cargo build --workspace --all-targets`, this
     # `nextest` line above and `cargo clippy --workspace --all-targets` all
@@ -2204,7 +2204,7 @@ tf2-check:
 #
 # `ros/build.sh` says what the three steps are and which of them is easy to get
 # wrong; the short version is that the staticlib must carry
-# `--features bridge,shm` — `bridge` for the nine §5 entry points, `shm` for
+# `--features bridge,shm` — `bridge` for the §5 entry points, `shm` for
 # `docs/decisions/0015`'s `tft_tree_open`, and the script checks one symbol per
 # feature because they fail in different places — and that colcon must be told
 # every output directory or it litters the repo root.

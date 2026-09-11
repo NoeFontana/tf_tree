@@ -210,7 +210,32 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// moved a refusal earlier on arenas that were already failing, nothing here
 /// changes the behaviour of any call that existed before: the new policy is
 /// reachable only through a symbol an older caller cannot name.
-pub const TFT_ABI_VERSION_MINOR: u32 = 7;
+///
+/// **`7` → `8`: `tft_bridge_close_startup_window` and
+/// `TFT_BRIDGE_REASON_STARTUP_CONFLICTS`.** `docs/decisions/0011`
+/// implementation step 6.
+///
+/// The bump is for an added **unstable** symbol, and the precedent for doing
+/// that is `1` → `2`, which bumped for `tft_bridge_note_time_jump` — also a
+/// bridge entry point, also unstable-tier. The rule this follows is the one
+/// `3` → `4` states: the minor version answers *"can I name this symbol?"*, and
+/// a caller that needs the answer cannot get it from a tier, because the tier is
+/// a statement about whether the symbol may later be **withdrawn** and not about
+/// whether it is there.
+///
+/// **A `0.7` caller can observe nothing at all.** Like `6` → `7` and unlike
+/// `5` → `6`, nothing here changes the behaviour of any call that existed
+/// before — with one qualification that is worth stating because it is visible
+/// through an existing call. A `STRICT` startup halt used to be reported as
+/// `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` (5), which was the closest true code
+/// and named the wrong thing whenever the record contained a §5.7 static-value
+/// disagreement; it is now `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` (9). A caller
+/// that switched on 5 and printed it will now fall through to its default arm
+/// for that halt. It cannot have been *relying* on 5 in a way that broke,
+/// because the halt reaches it only from the window closing, and the window
+/// could only close on the 4096-transform backstop until this version added the
+/// call that closes it deliberately.
+pub const TFT_ABI_VERSION_MINOR: u32 = 8;
 
 /// The library's major ABI version.
 #[no_mangle]

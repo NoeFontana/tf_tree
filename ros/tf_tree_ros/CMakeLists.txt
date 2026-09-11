@@ -37,7 +37,7 @@ find_package(tf2_msgs REQUIRED)
 # gives the process exactly one copy of the arena's globals.
 #
 # The staticlib must have been built `--features bridge,shm`, and the two fail
-# differently. Without `bridge` none of the nine §5 entry points is in it and
+# differently. Without `bridge` none of the §5 entry points is in it and
 # this fails at link time with a list of missing `tft_bridge_*` symbols. Without
 # `shm` there is no `tft_tree_open`, so the `nm` probe in `crates/tf_tree_c`'s
 # CMakeLists leaves `TFT_HAVE_SHM` off on the imported target and
