@@ -358,9 +358,16 @@ jobs:
             -f description='The scheduled nightly run has a failing job' \
             >/dev/null 2>&1 || true
 
-          standing=$(gh api "repos/$REPO/issues?state=open&labels=nightly-red&per_page=1")
-          number=$(printf '%s' "$standing" | jq -r '.[0].number // empty')
-          author=$(printf '%s' "$standing" | jq -r '.[0].user.login // empty')
+          # **`select(.pull_request == null)`, because this endpoint returns
+          # pull requests too.** GitHub's issues API treats a PR as an issue, so
+          # a PR that happened to carry this label would be picked up and
+          # commented on — and, on a green night, *closed*. Filtering here is
+          # cheaper than discovering it the once it happens.
+          standing=$(gh api "repos/$REPO/issues?state=open&labels=nightly-red&per_page=10")
+          number=$(printf '%s' "$standing" |
+            jq -r 'map(select(.pull_request == null)) | .[0].number // empty')
+          author=$(printf '%s' "$standing" |
+            jq -r 'map(select(.pull_request == null)) | .[0].user.login // empty')
 
           # Built with printf rather than a multi-line shell string: every line
           # of this script lives inside a YAML block scalar, so a continuation
