@@ -24,19 +24,25 @@
 # order. An assertion that named the owner would pass or fail on process
 # start-up ordering.
 #
-# # The `<unknown publisher>` window is real and is designed around
+# # Two discovery windows, not one, and only one of them closes on its own
 #
-# The §5.4 log fires on `first_time` **per edge** — once. A GID that has not yet
-# been resolved to a node name at that instant is logged as
-# `<unknown publisher>`, and the log line is never re-emitted, though the
-# internal record is rewritten when the names resolve. So a fixture whose second
-# broadcaster starts publishing before it is discoverable tests discovery
-# latency and fails intermittently with a message about attribution. The second
-# broadcaster therefore carries `start_delay_s`: it creates its publisher, waits
-# for discovery, and only then publishes. That is a property of the diagnostic
-# worth knowing about rather than a trick to make a test pass — an operator
-# whose two nodes start simultaneously can get `<unknown publisher>` in the one
-# line they are given.
+# The §5.4 log fires on `first_time` **per edge** — once. A GID not yet resolved
+# to a node name at that instant is rendered `<unattributed>`
+# (`crates/tf_tree_bridge/src/lib.rs:285`; note `docs/PHASE4.md` §5.4 and several
+# source comments spell this `<unknown publisher>`, which appears as a literal
+# nowhere in the Rust), and the line is never re-emitted.
+#
+# The **intruder**'s window closes on its own: its name only has to be resolved
+# at the instant the line fires, so waiting before its first sample is enough.
+# The **owner**'s does not. `authority.rs:246` clones the publisher into the
+# owner slot on the first accepted sample and never updates it, so a first
+# sample that lands before the graph lists that node freezes an unattributed
+# owner for the life of the bridge — and the line fires later, naming it.
+#
+# So both broadcasters wait before publishing, for different reasons. This is a
+# property of the diagnostic worth knowing about rather than a trick to make a
+# test pass: an operator whose two nodes start simultaneously can get
+# `<unattributed>` in the one line they are given.
 
 import os
 import unittest
@@ -75,12 +81,28 @@ def generate_test_description():
         output="screen",
         parameters=[{"topology_config": TOPOLOGY}],
     )
+    # **The owner needs a discovery delay too, and for a different reason than
+    # the intruder.** The intruder's name has to be resolved at the instant the
+    # one-shot §5.4 line fires. The owner's is captured earlier and *frozen*: the
+    # authority table clones the publisher's name when it accepts the first
+    # sample on the edge, so a first sample that lands before the graph lists
+    # this node freezes an unattributed owner for the life of the bridge, and the
+    # line fires later naming it. An earlier revision delayed only the second
+    # broadcaster and left the first publishing at t=0 — mitigating the window
+    # that closes on its own and not the one that does not.
     first = launch_ros.actions.Node(
         package="tf_tree_ros",
         executable="conflicting_broadcaster",
         name=FIRST,
         output="screen",
-        parameters=[{"parent": PARENT, "child": CHILD, "rate_hz": 50.0}],
+        parameters=[
+            {
+                "parent": PARENT,
+                "child": CHILD,
+                "rate_hz": 50.0,
+                "start_delay_s": 1.0,
+            }
+        ],
     )
     # The deliberate break: a second broadcaster on the same edge. The delay is
     # for discovery, not for sequencing the authority decision — see the header.
@@ -131,12 +153,31 @@ class TestTwoBroadcastersOnOneEdge(unittest.TestCase):
         )
         # Both names, in either order: which one owns the edge is decided by
         # whichever sample the bridge ingested first.
-        self.assertIn(f"/{FIRST}", line, line)
-        self.assertIn(f"/{SECOND}", line, line)
-        # The window this fixture is built to stay out of. If this fires, the
-        # diagnostic reached the operator without a name in it, which is the
-        # failure mode `start_delay_s` exists to avoid.
-        self.assertNotIn("<unknown publisher>", line, line)
+        # **The window this fixture is built to stay out of — and the string
+        # here is the one the code actually emits.** An earlier revision asserted
+        # `<unknown publisher>`, which is the spelling `docs/PHASE4.md` §5.4 and
+        # several source comments use and which appears as a **literal nowhere in
+        # the Rust**: `grep -rn '<unknown publisher>' crates/ --include=*.rs`
+        # matches only comments. `crates/tf_tree_bridge/src/lib.rs:285` is the
+        # emitted value, and it is `<unattributed>`. So that assertion could
+        # never have fired — an anti-vacuity check that was itself vacuous, which
+        # is this repository's most-repeated defect and was introduced here in
+        # the same commit that mutated the test to prove it could fail.
+        # **Two placeholders, because the code has two.** A publisher with no
+        # GID at all is `<unattributed>`; a publisher whose GID the graph has not
+        # resolved to a name renders as its **full GID key**, `<gid:...>` —
+        # `lib.rs:368-374`, whose own comment says it is deliberately "not
+        # `<unknown publisher>`" so that two unnamed publishers stay
+        # distinguishable in a diagnostic about two publishers. In this fixture
+        # the RMW supplies GIDs, so the unresolved case is the second one.
+        self.assertNotIn("<unattributed>", line, line)
+        self.assertNotIn("<gid:", line, line)
+        # Positive form, and it is the assertion that carries the weight: the
+        # sentence has exactly two publisher slots, so if a placeholder took one
+        # of them a name is missing. A negative-only check is satisfied by any
+        # placeholder a future change might add.
+        for name in (FIRST, SECOND):
+            self.assertIn(f"/{name}", line, line)
 
 
 @launch_testing.post_shutdown_test()

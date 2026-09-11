@@ -30,11 +30,13 @@
 // yet.** The bridge resolves a GID to a node name by walking
 // `get_publishers_info_by_topic`, and an endpoint can lag its own first sample.
 // The §5.4 diagnostic fires on `first_time` per edge, so a conflict caught
-// inside that window is logged as `<unknown publisher>` **and never logged
-// again** — the record is rewritten when the names resolve, the log line is
-// not. `start_delay_s` exists so the second broadcaster is discoverable before
-// its first sample lands, which is the difference between a fixture that tests
-// §5.4 and one that tests discovery latency.
+// inside that window is logged as `<unattributed>` **and never logged again**.
+// The owner's case is worse: `authority.rs:246` clones the publisher into the
+// owner slot on its first accepted sample and never updates it, so an owner
+// that published before the graph listed it stays unattributed for the life of
+// the bridge. `start_delay_s` therefore exists for **both** broadcasters — it
+// is the difference between a fixture that tests §5.4 and one that tests
+// discovery latency.
 
 #include <chrono>
 #include <cstdint>

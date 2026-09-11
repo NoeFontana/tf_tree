@@ -164,8 +164,13 @@ if(BUILD_TESTING)
   # exercised by that gtest at all.
   #
   # The broadcaster is installed into `lib/${PROJECT_NAME}` so `launch_ros`'s
-  # `Node` action can find it by `executable=`. It is inside `if(BUILD_TESTING)`,
-  # so a release install does not carry a test fixture.
+  # `Node` action can find it by `executable=` — that action resolves through the
+  # *install* tree, so a test-only target has to be installed to be launchable.
+  # `if(BUILD_TESTING)` scopes it to builds that asked for tests, **which is not
+  # the same as "no release install carries it"**: `BUILD_TESTING` defaults ON in
+  # a plain `colcon build`, so an installer who does not pass
+  # `--cmake-args -DBUILD_TESTING=OFF` gets this binary. That is the ament
+  # convention for test nodes and is why the name says what it is.
   find_package(launch_testing_ament_cmake REQUIRED)
   add_executable(conflicting_broadcaster test/conflicting_broadcaster.cpp)
   target_link_libraries(conflicting_broadcaster
