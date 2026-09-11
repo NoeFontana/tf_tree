@@ -2481,13 +2481,20 @@ mod imp {
             } = self;
             let unknown = || "?".to_string();
             if self.deferred {
+                // The census that decided this is the whole content of the
+                // line, so it is in it. Without the number a reader cannot tell
+                // a fleet holding only the role holder from one holding nobody
+                // at all — a thin population and the absorbing state
+                // respectively, which the caller's `starved` test already
+                // separates and this line did not.
                 return format!(
-                    "shm_torture: §3.5 owner kill {n} DEFERRED: no read-write survivor besides \
-                     the role holder was attached, and §11.3's row for this migration presumes \
-                     one (\"another participant takes over\"). Killing the last eligible heir \
-                     would produce an arena that is ownerless, uninheritable and unjoinable — \
-                     absorbing, not slow — which tests nothing §3.5 claims. Retrying at the \
-                     next interval."
+                    "shm_torture: §3.5 owner kill {n} DEFERRED: {} read-write participant(s) \
+                     attached including the role holder, below the floor this arm needs, and \
+                     §11.3's row for this migration presumes a survivor (\"another participant \
+                     takes over\"). Killing the last eligible heir would produce an arena that \
+                     is ownerless, uninheritable and unjoinable — absorbing, not slow — which \
+                     tests nothing §3.5 claims. Retrying at the next interval.",
+                    heirs_before.map_or_else(unknown, |c| c.to_string()),
                 );
             }
             // **`heirs_before` and the reap window are printed because their
