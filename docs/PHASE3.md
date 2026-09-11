@@ -477,7 +477,7 @@ The per-thread plan cache behind `tree.lookup` must be genuinely per-thread (`th
 
 - The full test suite on both `3.14` and `3.14t`.
 - The `sys._is_gil_enabled()` assertion from §1.2.
-- A scaling test: 1/2/4/8 threads calling `plan.at` on a shared `Tree`, asserting near-linear aggregate throughput on `3.14t` — this is the claim the phase exists to make.
+- A scaling test: 1/2/4/8 threads calling `plan.at` on a shared `Tree`, asserting near-linear aggregate throughput on `3.14t` — this is the claim the phase exists to make. **This one does not exist, and the test that looks like it is a different claim.** `tests/python/test_freethreading.py` runs eight threads over one plan and asserts *correctness* (`test_threads_share_one_plan_without_corruption`); it measures no throughput and would pass on a build that serialised every call. `just py-test-freethreaded` runs it on `3.14t`, so the interpreter arm of this bullet is met and the scaling arm is empty. It is the same gap as §12.2 criterion 4 — see that criterion for what this host can and cannot say about it, and why the missing piece is a measurement rather than a machine.
 - **ThreadSanitizer**, via `just tsan` — real threads over the real generated
   code, eight readers against a live writer. It complements `just loom`, which
   model-checks the protocols exhaustively but over `loom::sync` substitutes with
@@ -628,7 +628,7 @@ Two upgrades in this set change *default* behaviour, and both intersect somethin
 1. **Scalar `plan.at` p50 under 250 ns** (≈ 31 ns call + 150 ns work + margin).
 2. **`at_many` at n = 4096 within 1.3× of native per-sample cost.** This is the central claim: batch work through Python is essentially free.
 3. **`at_into` eliminates the full ~270 ns allocation**, visible at n = 64.
-4. **Thread scaling ≥ 6× from 1 to 8 threads on `3.14t`**, and ≥ 6× on the GIL build for batches above the release threshold.
+4. **Thread scaling ≥ 6× from 1 to 8 threads on `3.14t`**, and ≥ 6× on the GIL build for batches above the release threshold. **UNMEASURED — and that is not the same as blocked, which is what it had been recorded as.** The interpreter is here: `python3.14t` 3.14.2 on the development host reports `sysconfig.get_config_var("Py_GIL_DISABLED") == 1` and `sys._is_gil_enabled() == False`, so the free-threaded build this criterion is about is available and nothing has ever run the sweep against it. The **threshold** is the part the host blocks, and it blocks it arithmetically rather than for want of tuning: 8 threads over **4 physical cores** with SMT on cannot reach 6× — the second thread of a pair adds a fraction of a core, not a core — so a reading here can refute the criterion and can never satisfy it. **Split the two:** the 1→8 curve is a measurement this host can take and publish with its core count beside it, and the ≥ 6× verdict is `INVALID` on it rather than `FAIL` (`docs/PHASE5.md` §9.3's rule that a host condition must not read as the code failing). Whether the criterion should be re-cut against *physical cores* — so that it is evaluable on any host instead of only on one with eight of them — is a decision and not an edit to this line.
 5. **`import tf_tree` does not re-enable the GIL**, asserted in CI.
 6. **TSan clean** on the free-threaded build.
 7. Zero leaks over 10⁶ calls.

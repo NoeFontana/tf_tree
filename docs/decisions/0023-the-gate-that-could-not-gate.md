@@ -184,8 +184,26 @@ performance target.
 5. **Re-measure on a quiet host** and re-derive R1 by open question 4's rule —
    verified by twelve runs each recording busy ≤ `mp::QUIET_ENOUGH`, which
    requires `abi_cost.rs` to measure and print a busy fraction (it does not
-   today). Blocked on a machine this repository does not have; the printing half
-   is not blocked on anything.
+   today).
+
+   **This step said "Blocked on a machine this repository does not have", and
+   that is false.** The requirement is `busy ≤ mp::QUIET_ENOUGH`, which is
+   **0.10**, and `crate::mp::busy_fraction` on the development host reads
+   **0.000–0.021** at rest — measured 2026-09-11 through `Fitness::probe` in a
+   release build, three readings. The same host records `fair_for_ratios: true`,
+   and R1 is a ratio.
+
+   What the step is blocked on is the **instrument**, which its own last clause
+   already said is blocked on nothing: `abi_cost.rs` does not measure or print a
+   busy fraction, so no run can be *shown* to have been quiet. The committed
+   `baseline/results.json`'s `busy_fraction: 0.15` is what made this look like a
+   host property — that is one run's reading, above the threshold, and the two
+   permanent faults this host does have (SMT on, no cpufreq sysfs) reach the
+   timing axis and **not** the ratio axis.
+
+   So: build the printing half, then run twelve. Neither half needs a different
+   machine, and the one thing that can still stop a run is a reading above 0.10 at
+   the time — which is a run to discard, not a host to acquire.
 
 **Steps 6 and 7 are what the open questions' recommendations would add, listed
 here so a ratifier sees the whole cost. They are proposals, like everything else
@@ -209,9 +227,24 @@ under *Decision*.**
 
 ## Open questions
 
-Each carries a **recommendation** written in below. They are recommendations and
-not decisions because this record is `draft`: a human ratifies by merging, and
-until then `docs/PHASE4.md` §7's normative gate list is untouched.
+Each carries a **recommendation** written in below.
+
+**This preamble described a record that no longer exists, in both of its halves,
+and is corrected in place rather than deleted.** It read *"They are
+recommendations and not decisions because this record is `draft`: a human
+ratifies by merging, and until then `docs/PHASE4.md` §7's normative gate list is
+untouched."* This record's `**Status:**` line says **`ready`**, not `draft` — and
+§7's gate list is **not** untouched: implementation step 4 is *"edit
+`docs/PHASE4.md` §7's gate list to the wording under *Decision*"* and it is
+marked *Landed*, which the Implementation line above repeats. So the sentence
+asserted a status the header contradicts and a spec state its own plan
+contradicts.
+
+What survives is the distinction it was reaching for: the recommendations under
+each question below were written before the measurements in steps 3, 5 and 6, and
+where a later step contradicts one, **the step is what happened and the
+recommendation is what was expected**. Step 6 is the worked example: its falsifier
+named ~18 ns, the measurement came out at 30–44 ns, and both readings are kept.
 
 1. **Is rung 1 the right denominator for R1?** It charges the ABI only for what
    the boundary does, and charges the per-call guard to R3. The alternative —
