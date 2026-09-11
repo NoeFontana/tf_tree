@@ -748,18 +748,39 @@ fn an_unreported_gid_degrades_rather_than_failing() {
 /// private constant and this seam only forwards to it, so the loop was buying
 /// 4096 offers' worth of runtime for coverage one crate down.
 ///
-/// Mutant: delete `inner.stopped = Some(…)` from the `Action::Halt` arm ⇒ the
-/// offers after the halt are processed and the `TFT_BRIDGE_HALT` assertion in
-/// the replay loop fails. Mutant: drop `+ inner.refused_after_halt` from
-/// `transforms` in `tft_bridge_get_stats` ⇒ the offered-transform assertion
-/// fails first (4096 against 4099), and `assert_balanced` would too, short by 3.
-/// Mutant: restore the unconditional `set(&mut inner.strings.detail, "the bridge
-/// halted; …")` after the `Action::Halt` match — the shape this arm had before,
-/// and the one the halt's numbers cannot survive ⇒ the `"1 authority"`
-/// assertion fails on an outcome that says only that something halted. Mutant:
-/// call `name_the_edge(inner, o)` in the `StartupConflicts` arm ⇒ the halt names
-/// whichever edge happened to be next on the wire as its cause and the
-/// empty-name assertion fails.
+/// **Nine mutants, each applied and run.** Quoted numbers are this fixture's,
+/// re-measured after step 6 changed it; the two that carried the 4096-transform
+/// loop's figures had gone stale, which is what re-running them was for.
+///
+/// Mutant: delete `inner.stopped = Some(…)` from the `Action::Halt` arm ⇒ *"the
+/// latch holds", left: 2, right: 5* — the **second** `close_startup_window()`
+/// comes back `TFT_BRIDGE_DROPPED`, because with nothing latched the idempotent
+/// `Ingest::close_startup_window` returns `None` and the blank outcome stands.
+/// It fails there rather than in the replay loop, which is earlier than this note
+/// used to claim. Mutant: drop `+ inner.refused_after_halt` from `transforms` in
+/// `tft_bridge_get_stats` ⇒ the offered-transform assertion, *left: 4, right: 7*,
+/// and `assert_balanced` would too, short by 3. Mutant: restore the unconditional
+/// `set(&mut inner.strings.detail, "the bridge halted; …")` after the
+/// `Action::Halt` match — the shape this arm had before, and the one the halt's
+/// numbers cannot survive ⇒ *"the close reports how many of each kind it found,
+/// or CI learns nothing from it: \"the bridge halted; free it and build a new
+/// one\""*. Mutant: call `name_the_edge(inner, o)` in the `StartupConflicts` arm
+/// ⇒ *left: ("base", "lidar"), right: ("", "")* — the halt names the static edge
+/// that happened to be last on the wire as its cause, which is an innocent edge
+/// printed as the fault.
+///
+/// The five that are about step 6's own code. Mutant: delete the authority
+/// enumeration loop ⇒ *"every recorded edge must be enumerated, both kinds"*, on
+/// a `detail` carrying `"; static base->lidar: …"` and no authority clause.
+/// Mutant: delete the static loop ⇒ the same assertion, mirrored. Mutant:
+/// `o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` — the code this step
+/// replaced ⇒ *left: 5, right: 9*. Mutant: make the `inner.stopped` early return
+/// unreachable in `tft_bridge_close_startup_window` ⇒ *"the latch holds", left:
+/// 2, right: 5*, the same reading as deleting the latch, because a second close
+/// with nothing to report is indistinguishable from a bridge that never halted.
+/// Mutant: `inner.refused_after_halt += 1` on that early return ⇒ *left: 4,
+/// right: 3* — the call is not a transform, and charging it a bucket is the
+/// failure the "# What it does and does not charge" heading exists to prevent.
 #[test]
 fn a_halted_bridge_refuses_every_later_offer() {
     let b = Bridge::new(TFT_BRIDGE_AUTHORITY_STRICT, TFT_BRIDGE_ON_CLOCK_RESET_HALT);
