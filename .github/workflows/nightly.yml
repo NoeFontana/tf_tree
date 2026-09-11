@@ -327,7 +327,14 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     continue-on-error: true
+    # **`actions: read` is not optional here.** A job-level `permissions:` block
+    # *replaces* the workflow default rather than adding to it, so naming only
+    # `contents` and `issues` leaves `actions` at none — and this job's first
+    # call is `GET /repos/{o}/{r}/actions/runs/{id}/jobs`, which needs it. The
+    # failure would be a 403 inside the one job whose purpose is to tell somebody
+    # when things break.
     permissions:
+      actions: read
       contents: read
       issues: write
     steps:
@@ -347,8 +354,25 @@ jobs:
           # is added above. This job is itself in the listing with a null
           # conclusion, so select on `failure` rather than on "not success" —
           # which also keeps `cancelled` and `skipped` out of the report.
-          failed=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs" \
-            --jq '.jobs[] | select(.conclusion == "failure") | "- **\(.name)** — \(.html_url)"')
+          jobs=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs")
+
+          # A job that **timed out** is a red job: `shm_torture` runs for 30
+          # minutes against a 90-minute budget, so a timeout there is a wedge
+          # that stopped making progress, not a scheduling accident.
+          failed=$(printf '%s' "$jobs" | jq -r \
+            '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out")
+             | "- **\(.name)** — \(.html_url)"')
+
+          # **Cancelled is not green, and `if: always()` means this job runs on a
+          # cancelled run too.** Without this, a run somebody stopped by hand has
+          # no job with conclusion `failure`, `failed` comes back empty, and the
+          # green branch below would **close the standing alert** on the strength
+          # of a run that proved nothing. `null` is excluded deliberately: it is
+          # this job, still in progress, looking at its own listing.
+          inconclusive=$(printf '%s' "$jobs" | jq -r \
+            '[.jobs[] | select(.conclusion != null)
+              | select(.conclusion == "cancelled" or .conclusion == "action_required"
+                       or .conclusion == "stale")] | length')
 
           # The label the query below filters on. Idempotent: the 422 this
           # returns once the label exists is the steady state, not an error.
@@ -374,6 +398,13 @@ jobs:
           # line at column 0 leaves the scalar and a line indented to match it
           # reaches Markdown as an indented code block. printf is the spelling
           # that is correct in both.
+          if [ -z "$failed" ] && [ "$inconclusive" != "0" ]; then
+            echo "nightly neither passed nor failed ($inconclusive job(s) cancelled or"
+            echo "awaiting action). Leaving any standing issue alone: a run that was"
+            echo "stopped is not evidence the nightly is healthy."
+            exit 0
+          fi
+
           if [ -z "$failed" ]; then
             if [ -n "$number" ] && [ "$author" = "github-actions[bot]" ]; then
               body=$(printf '%s\n' \
