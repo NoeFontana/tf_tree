@@ -456,7 +456,10 @@ is a call per step.
 > nothing about the withdrawn-claim comparison changes. **What this amendment
 > does not do is restore the variable**: that is a trade between item 1's
 > normative placement list and item 3's ability to fail, and it needs
-> `just embed-cost` plus `just bench-ab` on a host that passes `Fitness::probe`.
+> `just embed-cost` plus `just bench-ab` on a host whose `fair_for_timing` is true
+> ([`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md) step 6:
+> `Fitness::probe` has four axes, this host passes two of them, and only the timing
+> one blocks this).
 
 ### 2.4 Two things that are not going to exist
 

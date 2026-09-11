@@ -201,9 +201,38 @@ performance target.
    permanent faults this host does have (SMT on, no cpufreq sysfs) reach the
    timing axis and **not** the ratio axis.
 
-   So: build the printing half, then run twelve. Neither half needs a different
-   machine, and the one thing that can still stop a run is a reading above 0.10 at
-   the time — which is a run to discard, not a host to acquire.
+   **Two corrections to what "build the printing half" means, both of which would
+   have made it print an unusable number.**
+
+   *The sample must be taken **before** the run, not during it.*
+   `mp::busy_fraction` reads `/proc/stat`'s aggregate line, which includes the
+   measuring process — and `QUIET_ENOUGH`'s own doc justifies 0.10 by the mp
+   harness's load being *"a fraction of one core"*. `abi_cost` saturates one core,
+   which on 8 logical CPUs is ~12.5 %, so a fraction sampled inside its timed loop
+   can **never** satisfy the threshold, for a reason that has nothing to do with
+   the host. `mp::require_quiet_machine` is the shape to copy: one 300 ms sample
+   before anything starts, an error naming the top consumers, and
+   `TF_TREE_BENCH_FORCE` as the documented override.
+
+   *And the sampler is in the wrong crate to just call.* It is
+   `tf_tree_bench::mp`, while `abi_cost.rs` is an example of `tf_tree_c`, which
+   has no dependency on `tf_tree_bench` — dev or otherwise — and cannot gain one
+   without a cycle, since `tf_tree_bench` depends on `tf_tree_c`. So the printing
+   half is one of: a small `tf_tree_bench` entry point that `just abi-cost`
+   brackets the run with, or a second implementation of the sampler. The first
+   keeps one spelling and is what this step should do; the second is the defect
+   `docs/PROJECT.md` §6 names. Either way it is a **crate-boundary** choice and not
+   a two-line print, which is what calling it "the printing half" concealed.
+
+   **And "quiet" is a real cost on this host rather than a formality.** This
+   record's own host note records the machine as shared with other tenants at load
+   average 1.3–2.5 *during its own runs*, and the committed baseline was cut at
+   15 %. Sampled during review: 0.22 over 2 s and 0.96 over 300 ms, with an
+   unrelated `cargo-clippy` running. The step wants **twelve** runs each at or
+   below 0.10, so the honest statement is not "a run to discard" — it is that the
+   twelve have to be collected in a window when nothing else on the box is
+   building, and that a multi-tenant host may not offer one on demand. What is
+   still true is that this is a scheduling problem and not a missing machine.
 
 **Steps 6 and 7 are what the open questions' recommendations would add, listed
 here so a ratifier sees the whole cost. They are proposals, like everything else

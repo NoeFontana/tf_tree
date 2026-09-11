@@ -489,9 +489,11 @@ separate labelled row precisely because it is the best case.
    passes — *"PASS — 1 directional metric held"* — run without `--embed-cost`,
    which both sides of the gate normally pass and which was skipped here only
    because that recipe builds a third 166 MiB target tree and this host is at
-   98 % disk. **On a host that passes `Fitness::probe` this step is real and is
+   98 % disk. **On a host whose `fair_for_timing` is true this step is real and is
    still owed**, and it is the step that turns these numbers into a baseline
-   rather than a record.
+   rather than a record. (This note said *"a host that passes `Fitness::probe`"*;
+   step 6 below is why that phrasing is wrong, and it is corrected here too,
+   because a correction in one step of a plan is a correction nobody reads.)
 3. ✅ **Amend `docs/PHASE1.md` §11.3** per *Resolution*: the two absolute ceilings
    with the on-grid history beside them, the regression clause, the NORMATIVE
    call-shape sentence, and the re-cut third criterion — verified by reading it
@@ -555,8 +557,21 @@ because it is what step 6's measurement turned up, and a ratifier should see it
 beside the step whose scope it narrows.
 
 7. **The §11.3 ceilings are one-sided budgets, and they can be gated on this host
-   today.** Item 3 of the *Decision* — the remaining work named in this
-   record's status line — is the two absolute ceilings §11.3 now states. A ceiling
+   today.**
+
+   **First, "item 3" needs disambiguating, because this record has let it acquire
+   three meanings and the header is the stale one.** *Decision* item 3 is marked
+   **✅ Done at ratification** and the process note above says §11.3 *is* amended;
+   `docs/PHASE1.md` reads "`0013` item 3" as the **re-baseline**, which is plan
+   step 6; and this record's `**Status:**` line still says *"item 3 (the §11.3
+   thresholds) is the remaining work"*, which is true of neither. **The status line
+   is what is wrong.** The thresholds landed; what remains is step 6's re-baseline,
+   and — proposed here — a holder for the ceilings that can run on an unfit host.
+   An earlier draft of this step cited the status line as its authority and would
+   have added a fourth meaning, in the record whose subject is exactly this kind of
+   drift.
+
+   What this step is about is **the two absolute ceilings §11.3 states**. A ceiling
    is a **budget**, and `docs/PHASE5.md` §9.3's *one-sided-budget* amendment is a
    ratified licence to gate exactly that shape on exactly this host: every check
    `Fitness::probe` fails here can only make a duration **longer**, so a PASS with
@@ -573,8 +588,17 @@ beside the step whose scope it narrows.
    it, and step 6 above stands unchanged. What the amendment admits is the ceiling
    held **outside** the report, in its own binary and recipe, which is `just
    gate2`'s and `just gate4`'s shape, printing its margin and the fitness reasons
-   on every run. Nothing in this repository does that for §11.3 yet, and it needs
-   no other machine.
+   on every run.
+
+   **This must not become a second spelling of an existing gate, and one exists.**
+   `cargo xtask bench-gate` (`just bench`) already *is* §11.3's gate and already
+   prints both ceilings — as `UNAVAILABLE`, with the reason that p50 latency needs
+   dedicated core-pinned hardware. So the proposal is to **change that row**, not
+   to add a holder beside it: the row stops printing `UNAVAILABLE` and starts
+   printing the worst reading against the budget plus the fitness verdict and its
+   reasons, on the one-sided argument above. A second binary would put two answers
+   to one question in the tree, which `docs/PROJECT.md` §6 forbids in as many
+   words.
 
 ## Resolution
 
