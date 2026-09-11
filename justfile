@@ -3214,6 +3214,42 @@ py-test-freethreaded:
     VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
     .venv-t/bin/python -m pytest tests/python -q
 
+# **`docs/PHASE3.md` §12.2 criterion 4, and §7.3's scaling test.** The criterion
+# has two halves — *">= 6x from 1 to 8 threads on `3.14t`, and >= 6x on the GIL
+# build for batches above the release threshold"* — and nothing measured either
+# until this recipe existed. `tests/python/test_freethreading.py` runs eight
+# threads and asserts **correctness**, which would pass on a build that serialised
+# every call.
+#
+# **No figures here.** `docs/benchmarks/EVIDENCE.md`'s probe row is their only
+# copy: they were written into four places at once and the copies disagreed in the
+# third digit within one revision.
+#
+# **`--release`, where `just py-test-freethreaded`'s otherwise identical install
+# line is not, and this recipe shipped without it first.** `just gate4-python`
+# carries the same note for the same reason. A debug build is not a slower release
+# build but a different program: it reads about six times worse *and moves the
+# scaling curve*, so the first revision of this recipe published a debug curve as
+# the finding and blamed the host for it. The harness prints ns/sample against
+# `tree.rs`'s documented release figure so a wrong profile is unmissable. It is
+# also the profile a `pip install` gets.
+#
+# **`.venv-t`, so this is the free-threaded half.** Run the same script under
+# `.venv/bin/python` for the GIL half; the script reports which one it answered.
+#
+# `--serialize` is the control: one lock around every call, which must read a
+# falling curve. A harness that cannot produce one on demand is not measuring one.
+# `--gate --serialize` is refused rather than reporting the control as a regression.
+#
+# **The defaults are the measured configuration.** A shorter window is a worse
+# sample of the same thing rather than a different measurement, and the readings
+# here sit close enough to the criterion's floor that the sample matters.
+
+# `plan.at` on 1/2/4/8 threads under `python3.14t` — PHASE3 §12.2 criterion 4.
+py-thread-scaling *ARGS:
+    VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q --release
+    .venv-t/bin/python crates/tf_tree_bench/python/thread_scaling.py {{ARGS}}
+
 # **The fmt and clippy halves are `py-compile`, depended on rather than
 # repeated.** Both lines were spelled here as well, byte for byte, and one
 # recipe restating another is the same defect as a workflow restating one
