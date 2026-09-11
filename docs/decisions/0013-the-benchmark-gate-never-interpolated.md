@@ -1,8 +1,17 @@
 # 0013: The benchmark gate never interpolated, and what §11.3's numbers should be
 
 **Status:** ready — items 1 and 2 of the *Decision* have landed (see the process
-note below); all four open questions are resolved in *Resolution* at the end of
-this record, and item 3 (the §11.3 thresholds) is the remaining work
+note below) and all four open questions are resolved in *Resolution* at the end
+of this record. **This line used to end *"and item 3 (the §11.3 thresholds) is
+the remaining work"*, and that was true of no reading of "item 3"** — plan step 7
+sets out the three meanings the phrase had acquired and names this line as the
+stale one. *Decision* item 3 is marked ✅ Done at ratification and the process
+note says §11.3 *is* amended; `docs/PHASE1.md` reads "`0013` item 3" as the
+**re-baseline**, which is plan step 6. What actually remains is **step 6's
+re-baseline**, and **step 7, which is a proposal and not yet ratified**: it would
+change `cargo xtask bench-gate`'s §11.3 row from `UNAVAILABLE` to a one-sided
+budget verdict. Correcting the line rather than leaving it is the point of the
+record — its subject is exactly this drift
 **Owner:** @NoeFontana
 **Implementation:** `crates/tf_tree_bench` (`fixture::QUERY_NS`, both call sites,
 one test), `crates/tf_tree_py` (`NS_PER_STEP_ESTIMATE` 55 → 64, per `API.md`

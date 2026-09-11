@@ -25,6 +25,14 @@
        authoritative jump path. The library itself never touches it — it reads
        the time source through `rclcpp::Clock`, not through the message. -->
   <test_depend>rosgraph_msgs</test_depend>
+  <!-- test only: PHASE4 §9's multi-publisher launch fixture. `launch_ros`
+       starts the bridge and two broadcaster processes; `launch_testing` reads
+       the bridge's log for §5.4's "<A> and <B> have both been publishing"
+       sentence. Nothing in the library depends on any of them. -->
+  <test_depend>launch</test_depend>
+  <test_depend>launch_ros</test_depend>
+  <test_depend>launch_testing</test_depend>
+  <test_depend>launch_testing_ament_cmake</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

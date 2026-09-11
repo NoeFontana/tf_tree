@@ -155,6 +155,34 @@ if(BUILD_TESTING)
   if(TARGET test_executor)
     target_link_libraries(test_executor tf_tree_ros)
   endif()
+
+  # **`docs/PHASE4.md` §9's multi-publisher launch fixture** — the box that asks
+  # for detection "verified against a deliberately broken launch file", and the
+  # one thing `test_attribution.cpp` structurally cannot supply: two publishers
+  # in *separate processes*. Two `rclcpp::Node`s in one process typically share
+  # a DDS participant, so the cross-process GID agreement §5.3 depends on is not
+  # exercised by that gtest at all.
+  #
+  # The broadcaster is installed into `lib/${PROJECT_NAME}` so `launch_ros`'s
+  # `Node` action can find it by `executable=` — that action resolves through the
+  # *install* tree, so a test-only target has to be installed to be launchable.
+  # `if(BUILD_TESTING)` scopes it to builds that asked for tests, **which is not
+  # the same as "no release install carries it"**: `BUILD_TESTING` defaults ON in
+  # a plain `colcon build`, so an installer who does not pass
+  # `--cmake-args -DBUILD_TESTING=OFF` gets this binary. That is the ament
+  # convention for test nodes and is why the name says what it is.
+  find_package(launch_testing_ament_cmake REQUIRED)
+  add_executable(conflicting_broadcaster test/conflicting_broadcaster.cpp)
+  target_link_libraries(conflicting_broadcaster
+    rclcpp::rclcpp
+    ${geometry_msgs_TARGETS}
+    ${tf2_msgs_TARGETS})
+  install(TARGETS conflicting_broadcaster DESTINATION lib/${PROJECT_NAME})
+
+  # Long, and deliberately: three processes discover each other over a real RMW
+  # and the second broadcaster waits for discovery before its first sample, so
+  # the useful part of the run does not start for several seconds.
+  add_launch_test(test/test_two_broadcasters.launch.py TIMEOUT 180)
 endif()
 
 ament_package()
