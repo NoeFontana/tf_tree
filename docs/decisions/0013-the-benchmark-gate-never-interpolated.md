@@ -489,9 +489,11 @@ separate labelled row precisely because it is the best case.
    passes — *"PASS — 1 directional metric held"* — run without `--embed-cost`,
    which both sides of the gate normally pass and which was skipped here only
    because that recipe builds a third 166 MiB target tree and this host is at
-   98 % disk. **On a host that passes `Fitness::probe` this step is real and is
+   98 % disk. **On a host whose `fair_for_timing` is true this step is real and is
    still owed**, and it is the step that turns these numbers into a baseline
-   rather than a record.
+   rather than a record. (This note said *"a host that passes `Fitness::probe`"*;
+   step 6 below is why that phrasing is wrong, and it is corrected here too,
+   because a correction in one step of a plan is a correction nobody reads.)
 3. ✅ **Amend `docs/PHASE1.md` §11.3** per *Resolution*: the two absolute ceilings
    with the on-grid history beside them, the regression clause, the NORMATIVE
    call-shape sentence, and the re-cut third criterion — verified by reading it
@@ -502,8 +504,101 @@ separate labelled row precisely because it is the best case.
 5. ✅ **Add the `depth3/sclerp/exact_hit` row** to `benches/lookup.rs`, labelled as
    the on-grid best case — verified by `cargo bench -p tf_tree_bench --bench
    lookup` listing it, and by its ~4.7× gap to the off-grid row.
-6. ⛔ **Re-baseline on a host that passes `Fitness::probe`.** Still owed, and still
-   not this host; see step 2's note.
+6. ⛔ **Re-baseline on a host whose `fair_for_timing` is true.** Still owed and
+   still not this host — but *"a host that passes `Fitness::probe`"* was the wrong
+   way to say it, and it overstated what such a host buys by a factor of nine.
+   Measured on this host on 2026-09-11, release build, at rest:
+
+   | axis | verdict here | what fails it |
+   |---|---|---|
+   | `fair_for_timing` | **false** | SMT is on (8 logical over 4 physical cores); no cpufreq sysfs, so the governor is unreadable |
+   | `fair_for_ratios` | **true** | nothing — `busy_fraction` reads 0.000–0.021 against `mp::QUIET_ENOUGH` = 0.10 |
+   | `fair_for_memory` | **true** | nothing; `smaps_rollup` is readable |
+   | `enough_cores` | true at 1 consumer, false at 4 and at 16 | 4 physical cores against `consumers + 1` |
+
+   `Fitness::probe` is **four axes, not one boolean**, and only the first is
+   blocked here. The committed `baseline/results.json` records
+   `fair_for_ratios: false`, and its third reason is why: *"machine is 15% busy
+   before the run starts (threshold 10%)"*. That was the **moment** the baseline
+   was cut, not the machine — SMT and the missing governor reach `reasons` and
+   never `ratio_reasons`, so neither of this host's two permanent faults touches
+   the ratio axis at all.
+
+   **And of the nine `unavailable` rows in the committed baseline, a fit host
+   changes two.** Each row's own `reason` field says which, and they do not agree:
+
+   | row | why it is `unavailable` | fixed by a fit host? |
+   |---|---|---|
+   | `lookup_latency` | the host failed the fitness probe on its own axis | **yes** |
+   | `embedding_cross_crate` | same — `Sensitivity::AbsoluteTiming`, and the pair *was* measured | **yes** |
+   | `cpu_per_consumer`, `publish_to_visible`, `scaling_curve` | `bench_report` is one process and stands up none of the consumers | no — "not measured here on any host" |
+   | `total_rss_n_consumers` | same, and a one-sided memory row is the thumb §9.3 warns about | no |
+   | `tft_16_workers_rss`, `tft_open_vs_bag_parse` | not done in this process at all; `just gate4` / `just gate2` take them | no |
+   | `lookup_ratio_vs_tf2` | no ROS 2 in the build — and its own reason says *"It is the build and not the host"* | no |
+
+   So this step is worth exactly `lookup_latency` and `embedding_cross_crate`, and
+   the machine it needs is one with **SMT disabled and a readable cpufreq
+   governor** — not a faster or larger one. Stating that is the difference between
+   a step somebody can go and satisfy and a step that reads as a wish.
+
+   **A build-configuration hypothesis was tested here and refuted, which is why
+   it is written down rather than left for the next reader to try.**
+   `bench-baseline-update` runs `bench_report` without `--features shm`, and the
+   committed baseline's two `.tft` rows blame exactly that: *"needs `tf_tree`'s
+   frozen backend, which is `#[cfg(all(feature = \"shm\", target_os = \"linux\"))]`
+   and is therefore not compiled"*. Re-cutting **with** `--features shm` on this
+   host leaves both rows `unavailable` and changes their reason to the true one —
+   `bench_report` is one process and maps no `.tft`, and `just gate2` / `just
+   gate4` are what measure them. The feature was never the obstacle; the
+   *committed reason* was misattributing the obstacle to it.
+
+**Step 7 is a proposal, not a ratified addition to this plan** — written in
+because it is what step 6's measurement turned up, and a ratifier should see it
+beside the step whose scope it narrows.
+
+7. **The §11.3 ceilings are one-sided budgets, and they can be gated on this host
+   today.**
+
+   **First, "item 3" needs disambiguating, because this record has let it acquire
+   three meanings and the header is the stale one.** *Decision* item 3 is marked
+   **✅ Done at ratification** and the process note above says §11.3 *is* amended;
+   `docs/PHASE1.md` reads "`0013` item 3" as the **re-baseline**, which is plan
+   step 6; and this record's `**Status:**` line still says *"item 3 (the §11.3
+   thresholds) is the remaining work"*, which is true of neither. **The status line
+   is what is wrong.** The thresholds landed; what remains is step 6's re-baseline,
+   and — proposed here — a holder for the ceilings that can run on an unfit host.
+   An earlier draft of this step cited the status line as its authority and would
+   have added a fourth meaning, in the record whose subject is exactly this kind of
+   drift.
+
+   What this step is about is **the two absolute ceilings §11.3 states**. A ceiling
+   is a **budget**, and `docs/PHASE5.md` §9.3's *one-sided-budget* amendment is a
+   ratified licence to gate exactly that shape on exactly this host: every check
+   `Fitness::probe` fails here can only make a duration **longer**, so a PASS with
+   margin is conservative and a FAIL is not attributable to the code. `just gate2`
+   and `just gate5` both already run under it.
+
+   **Read the amendment's own limits before taking it, because they rule out the
+   obvious application.** It says in terms that it is *"not a new `Sensitivity`
+   variant and not a `bench_report` row"*, that `tft_open_vs_bag_parse` stays
+   `AbsoluteTiming` and stays `unavailable`, and that applying it to a **two-sided**
+   comparison — where a host effect in either direction is a finding — is what
+   would make it laundering. `lookup_latency` as a report row is compared against a
+   committed baseline and is therefore two-sided: the amendment does **not** admit
+   it, and step 6 above stands unchanged. What the amendment admits is the ceiling
+   held **outside** the report, in its own binary and recipe, which is `just
+   gate2`'s and `just gate4`'s shape, printing its margin and the fitness reasons
+   on every run.
+
+   **This must not become a second spelling of an existing gate, and one exists.**
+   `cargo xtask bench-gate` (`just bench`) already *is* §11.3's gate and already
+   prints both ceilings — as `UNAVAILABLE`, with the reason that p50 latency needs
+   dedicated core-pinned hardware. So the proposal is to **change that row**, not
+   to add a holder beside it: the row stops printing `UNAVAILABLE` and starts
+   printing the worst reading against the budget plus the fitness verdict and its
+   reasons, on the one-sided argument above. A second binary would put two answers
+   to one question in the tree, which `docs/PROJECT.md` §6 forbids in as many
+   words.
 
 ## Resolution
 

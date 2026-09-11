@@ -184,8 +184,55 @@ performance target.
 5. **Re-measure on a quiet host** and re-derive R1 by open question 4's rule —
    verified by twelve runs each recording busy ≤ `mp::QUIET_ENOUGH`, which
    requires `abi_cost.rs` to measure and print a busy fraction (it does not
-   today). Blocked on a machine this repository does not have; the printing half
-   is not blocked on anything.
+   today).
+
+   **This step said "Blocked on a machine this repository does not have", and
+   that is false.** The requirement is `busy ≤ mp::QUIET_ENOUGH`, which is
+   **0.10**, and `crate::mp::busy_fraction` on the development host reads
+   **0.000–0.021** at rest — measured 2026-09-11 through `Fitness::probe` in a
+   release build, three readings. The same host records `fair_for_ratios: true`,
+   and R1 is a ratio.
+
+   What the step is blocked on is the **instrument**, which its own last clause
+   already said is blocked on nothing: `abi_cost.rs` does not measure or print a
+   busy fraction, so no run can be *shown* to have been quiet. The committed
+   `baseline/results.json`'s `busy_fraction: 0.15` is what made this look like a
+   host property — that is one run's reading, above the threshold, and the two
+   permanent faults this host does have (SMT on, no cpufreq sysfs) reach the
+   timing axis and **not** the ratio axis.
+
+   **Two corrections to what "build the printing half" means, both of which would
+   have made it print an unusable number.**
+
+   *The sample must be taken **before** the run, not during it.*
+   `mp::busy_fraction` reads `/proc/stat`'s aggregate line, which includes the
+   measuring process — and `QUIET_ENOUGH`'s own doc justifies 0.10 by the mp
+   harness's load being *"a fraction of one core"*. `abi_cost` saturates one core,
+   which on 8 logical CPUs is ~12.5 %, so a fraction sampled inside its timed loop
+   can **never** satisfy the threshold, for a reason that has nothing to do with
+   the host. `mp::require_quiet_machine` is the shape to copy: one 300 ms sample
+   before anything starts, an error naming the top consumers, and
+   `TF_TREE_BENCH_FORCE` as the documented override.
+
+   *And the sampler is in the wrong crate to just call.* It is
+   `tf_tree_bench::mp`, while `abi_cost.rs` is an example of `tf_tree_c`, which
+   has no dependency on `tf_tree_bench` — dev or otherwise — and cannot gain one
+   without a cycle, since `tf_tree_bench` depends on `tf_tree_c`. So the printing
+   half is one of: a small `tf_tree_bench` entry point that `just abi-cost`
+   brackets the run with, or a second implementation of the sampler. The first
+   keeps one spelling and is what this step should do; the second is the defect
+   `docs/PROJECT.md` §6 names. Either way it is a **crate-boundary** choice and not
+   a two-line print, which is what calling it "the printing half" concealed.
+
+   **And "quiet" is a real cost on this host rather than a formality.** This
+   record's own host note records the machine as shared with other tenants at load
+   average 1.3–2.5 *during its own runs*, and the committed baseline was cut at
+   15 %. Sampled during review: 0.22 over 2 s and 0.96 over 300 ms, with an
+   unrelated `cargo-clippy` running. The step wants **twelve** runs each at or
+   below 0.10, so the honest statement is not "a run to discard" — it is that the
+   twelve have to be collected in a window when nothing else on the box is
+   building, and that a multi-tenant host may not offer one on demand. What is
+   still true is that this is a scheduling problem and not a missing machine.
 
 **Steps 6 and 7 are what the open questions' recommendations would add, listed
 here so a ratifier sees the whole cost. They are proposals, like everything else
@@ -209,9 +256,24 @@ under *Decision*.**
 
 ## Open questions
 
-Each carries a **recommendation** written in below. They are recommendations and
-not decisions because this record is `draft`: a human ratifies by merging, and
-until then `docs/PHASE4.md` §7's normative gate list is untouched.
+Each carries a **recommendation** written in below.
+
+**This preamble described a record that no longer exists, in both of its halves,
+and is corrected in place rather than deleted.** It read *"They are
+recommendations and not decisions because this record is `draft`: a human
+ratifies by merging, and until then `docs/PHASE4.md` §7's normative gate list is
+untouched."* This record's `**Status:**` line says **`ready`**, not `draft` — and
+§7's gate list is **not** untouched: implementation step 4 is *"edit
+`docs/PHASE4.md` §7's gate list to the wording under *Decision*"* and it is
+marked *Landed*, which the Implementation line above repeats. So the sentence
+asserted a status the header contradicts and a spec state its own plan
+contradicts.
+
+What survives is the distinction it was reaching for: the recommendations under
+each question below were written before the measurements in steps 3, 5 and 6, and
+where a later step contradicts one, **the step is what happened and the
+recommendation is what was expected**. Step 6 is the worked example: its falsifier
+named ~18 ns, the measurement came out at 30–44 ns, and both readings are kept.
 
 1. **Is rung 1 the right denominator for R1?** It charges the ABI only for what
    the boundary does, and charges the per-call guard to R3. The alternative —
