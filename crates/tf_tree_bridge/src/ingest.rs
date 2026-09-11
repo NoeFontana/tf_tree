@@ -1086,15 +1086,22 @@ impl Ingest {
     /// disagreements; the shapes match on purpose, because §5.4 asks one thing of
     /// both halves.
     ///
-    /// **Nothing prints it yet, and that is `docs/decisions/0011` step 6 rather
-    /// than a gap here.** §5.4:1403 is normative that "the seam's `detail`
-    /// enumerates **every** recorded edge with both of its publishers, not the
-    /// first", and the C seam's `StartupConflicts` arm formats the two *counts*
-    /// and names no edge — on **either** half. Until this accessor existed, step
-    /// 6 could not have satisfied the static half even if it had landed: the
-    /// intruder was not retained anywhere, so the data did not exist to print.
-    /// That is what step 5's gap cost — not the clause being unmet, which step 6
-    /// owns.
+    /// **Both halves are printed, since `docs/decisions/0011` step 6.** §5.4:1403
+    /// is normative that "the seam's `detail` enumerates **every** recorded edge
+    /// with both of its publishers, not the first", and the C seam's
+    /// `StartupConflicts` arm now enumerates from these two accessors
+    /// (`crates/tf_tree_c/src/bridge.rs`); before step 6 it formatted the two
+    /// *counts* and named no edge on **either** half. **This paragraph said
+    /// "nothing prints it yet" for exactly as long as that was true and one commit
+    /// longer**, which is the drift `docs/decisions/README.md`'s `0011` row
+    /// records about step 5's own debt comment — so if you are reading this
+    /// because you are changing either accessor, the enumeration is a caller and
+    /// the shapes are load-bearing.
+    ///
+    /// Until this accessor existed, step 6 could not have satisfied the static
+    /// half even if it had landed: the intruder was not retained anywhere, so the
+    /// data did not exist to print. That is what step 5's gap cost — not the
+    /// clause being unmet, which step 6 owned.
     pub fn close_startup_window(&mut self) -> Option<Action> {
         if !self.startup_window_open {
             return None;

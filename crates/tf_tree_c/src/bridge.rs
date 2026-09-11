@@ -43,6 +43,7 @@
 //! [`TFT_ERR_WRONG_THREAD`](crate::TFT_ERR_WRONG_THREAD).
 
 use core::ffi::c_char;
+use core::fmt::Write as _;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -161,12 +162,13 @@ pub const TFT_BRIDGE_REASON_NON_MONOTONIC: tft_bridge_reason = 3;
 pub const TFT_BRIDGE_REASON_KIND_CHANGE: tft_bridge_reason = 4;
 /// `STRICT`, and a conflict was recorded on an edge (§5.4).
 ///
-/// On a [`TFT_BRIDGE_HALT`] this is `STRICT`'s startup window closing with
-/// conflicts in it. `detail` carries how many of each kind — authority (§5.4)
-/// **and** static-value (§5.7) — because the halt is about a set of edges and
-/// this POD has room for one. `owner` and `intruder` are empty there, and so are
-/// `parent`/`child`: the window closed on transforms counted long before the one
-/// in hand, so there is no edge to name that would not be the wrong one.
+/// **This is the per-sample judgment only.** `owner` and `intruder` name the two
+/// publishers and `parent`/`child` name the edge, because the sample in hand *is*
+/// what was judged. The startup window closing with conflicts in it is a
+/// different event about a *set* of edges and has its own code,
+/// [`TFT_BRIDGE_REASON_STARTUP_CONFLICTS`] — this doc used to carry both, which
+/// meant a §5.7 static-value disagreement was reported under a code whose name
+/// says "authority".
 pub const TFT_BRIDGE_REASON_AUTHORITY_CONFLICT: tft_bridge_reason = 5;
 /// The clock was judged to have moved (§5.5). `delta_nanos` is by how much —
 /// **negative for a rewind** — and `detail` names *which rung of §5.5's ladder
@@ -199,6 +201,28 @@ pub const TFT_BRIDGE_REASON_BAD_POSE: tft_bridge_reason = 7;
 /// publishers' names, if it was an authority conflict — on the outcome
 /// **before** this one.
 pub const TFT_BRIDGE_REASON_ALREADY_HALTED: tft_bridge_reason = 8;
+/// `STRICT`'s startup window closed with conflicts recorded in it (§5.4), so the
+/// bridge refused to start.
+///
+/// **A judgment about a *set* of edges, not about the sample in hand**, which is
+/// why it is not [`TFT_BRIDGE_REASON_AUTHORITY_CONFLICT`]: it covers both kinds
+/// at once — authority (§5.4) and static-value (§5.7) — and reporting a static
+/// disagreement under a code whose name says "authority" is what this code was
+/// added to stop. `docs/decisions/0011` implementation step 6.
+///
+/// `detail` states the two counts and then **enumerates every recorded edge with
+/// both of its publishers**, which §5.4's amendment requires in those words:
+/// *"the seam's `detail` enumerates **every** recorded edge with both of its
+/// publishers, not the first."* `Strict` exists for CI, and one run reporting
+/// four misconfigurations is the whole reason the window accumulates instead of
+/// halting on the first sample.
+///
+/// `owner`, `intruder`, `parent` and `child` are **empty**, and that is not an
+/// omission: the window closed on transforms counted long before the one in
+/// hand, so a POD with room for one edge would name whichever happened to be
+/// next on the wire — an innocent edge printed as the cause. The edges are in
+/// `detail`, where there is room for all of them.
+pub const TFT_BRIDGE_REASON_STARTUP_CONFLICTS: tft_bridge_reason = 9;
 
 /// One `geometry_msgs/TransformStamped`, in the ABI's terms.
 ///
@@ -2006,29 +2030,7 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                     )
                 }
                 HaltReason::StartupConflicts { authority, statics } => {
-                    // **Reported under the authority reason, and that is a
-                    // limitation rather than a claim.** §5.4's `Strict` is what
-                    // raised this and a conflict is what it found, so the code is
-                    // the closest true one — but `statics` counts §5.7 value
-                    // disagreements, which that code does not name. A dedicated
-                    // `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` is
-                    // `docs/decisions/0011`'s implementation step 6. It has to
-                    // be added to `UNSTABLE` in `xtask/src/headers.rs` in the
-                    // same commit, because the stable tier's cbindgen config is
-                    // exclude-by-complement, so an unclassified constant is
-                    // emitted into the **frozen** `tf_tree.h`.
-                    //
-                    // **This comment used to say "with nothing failing", and
-                    // that is false.** `xtask::headers::check_overlap` reads
-                    // `#define` names out of both generated headers and refuses
-                    // any symbol defined by both — which is exactly what an
-                    // unclassified constant becomes, since the complement puts
-                    // it in each. Measured on 2026-09-10: exit 1, naming the
-                    // symbol. The emission is real; the silence is not, and the
-                    // difference is the whole force of the sentence. Until step
-                    // 6 lands, both counts are in `detail`, which is what the
-                    // `rclcpp` HALT arm prints anyway.
-                    o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT;
+                    o.reason = TFT_BRIDGE_REASON_STARTUP_CONFLICTS;
                     // **No `name_the_edge` here, deliberately.** The other two
                     // arms are judgments *about the arriving sample*, so the
                     // scratch names are that sample's and naming it is the
@@ -2037,13 +2039,51 @@ fn fill(inner: &mut BridgeInner, action: &Action, iso: tf_tree::Iso3, o: &mut tf
                     // was never processed, so `scratch` holds whichever edge
                     // happened to be next on the wire. Printing it would name an
                     // innocent edge as the cause of the halt. `parent`/`child`
-                    // stay at `tft_bridge_outcome::blank`'s `""`, which is the documented
-                    // "does not apply to this outcome".
-                    format!(
+                    // stay at `tft_bridge_outcome::blank`'s `""`, which is the
+                    // documented "does not apply to this outcome" — the edges go
+                    // in `detail`, which is a growable buffer and has room for
+                    // all of them.
+                    let mut d = format!(
                         "STRICT: the startup window closed with {authority} authority and \
                          {statics} static conflict(s); this deployment is misconfigured and \
                          the bridge will not start"
-                    )
+                    );
+                    // **§5.4's amendment, in its own words: "the seam's `detail`
+                    // enumerates **every** recorded edge with both of its
+                    // publishers, not the first".** `Strict` is for CI, and the
+                    // entire reason the window accumulates rather than halting on
+                    // the first colliding sample is that four misconfigured
+                    // publishers should cost one run to diagnose instead of four.
+                    // A `detail` that carried only the counts made the window's
+                    // accumulation pointless from the caller's side.
+                    //
+                    // Both halves, in one shape. `Authority::conflicts` and
+                    // `StaticStore::conflicts_by_edge` both yield
+                    // `(parent, child, owner, intruder, count)`; the static one
+                    // did not exist until `0011` step 5's missing accessor
+                    // landed, which is why this could not be written before.
+                    for (parent, child, owner, intruder, n) in inner.ingest.authority().conflicts()
+                    {
+                        let _ = write!(
+                            d,
+                            "; authority {parent}->{child}: {owner} vs {intruder} \
+                             ({n} sample(s) dropped)"
+                        );
+                    }
+                    for (parent, child, owner, intruder, n) in
+                        inner.ingest.statics().conflicts_by_edge()
+                    {
+                        // Observations rather than drops, and the distinction is
+                        // §5.7's: `/tf_static` is `transient_local`, so one
+                        // misconfiguration redelivered to ten late joiners is ten
+                        // of these and one fault.
+                        let _ = write!(
+                            d,
+                            "; static {parent}->{child}: {owner} vs {intruder} \
+                             ({n} observation(s))"
+                        );
+                    }
+                    d
                 }
             };
             inner.stopped = Some(Stopped {
@@ -2513,6 +2553,158 @@ pub unsafe extern "C" fn tft_bridge_note_time_jump(
         fill(inner, &action, tf_tree::Iso3::IDENTITY, &mut o);
         // SAFETY: as the first write above.
         unsafe { core::ptr::write(out, o) };
+        TFT_OK
+    })
+}
+
+/// Close `STRICT`'s startup window (§5.4), halting once if conflicts were
+/// recorded in it.
+///
+/// `docs/decisions/0011` implementation step 6, and the **primary** mechanism
+/// §5.4's amendment names: *"an explicit `close_startup_window()` — the primary
+/// mechanism, and how a caller that owns a real clock supplies a real
+/// duration."* Without it the window closes only on the 4096-transform backstop,
+/// which is a count and not a duration, so a bridge on a quiet robot could sit
+/// with the window open for as long as it took to see 4096 transforms.
+///
+/// # Closing too early costs the whole policy, and the caller owns that choice
+///
+/// **A window that closes before the conflicting sample arrives reports nothing,
+/// and `STRICT` is then degraded for the life of the process** — §5.4 is explicit
+/// that outside the window it becomes `FirstWriterWins` plus counters, so the CI
+/// run the policy exists for goes *green* on the misconfiguration.
+///
+/// That is not hypothetical, and it is the mirror of §5.4's own argument for
+/// having a window: `/tf_static` is `transient_local`, so a latched sample
+/// reaches a subscriber when DDS discovery matches it — which §5.4 puts at
+/// "seconds after either process started and arbitrarily long after the fault was
+/// introduced". Two `robot_state_publisher`s with different URDFs is the
+/// motivating fault, and the second one's latched sample can easily land after a
+/// short window has closed. Deciding the duration is therefore deciding how much
+/// of the fault class the policy still covers; this entry point does not pick it,
+/// and a caller choosing a small number should know it is trading coverage and
+/// not just start-up latency.
+///
+/// # What it does and does not charge
+///
+/// Nothing. Like [`tft_bridge_note_time_jump`], and for the same reason: this
+/// call is not a transform, `refused_after_halt` is a term in a ledger whose
+/// total is `transforms`, and counting a non-transform there would unbalance the
+/// ledger to keep a counter looking busy.
+///
+/// # Outcomes
+///
+/// * **Conflicts were recorded** — [`TFT_BRIDGE_HALT`] with
+///   [`TFT_BRIDGE_REASON_STARTUP_CONFLICTS`], and `detail` enumerating every
+///   recorded edge with both of its publishers. The bridge is latched: every
+///   later call reports [`TFT_BRIDGE_REASON_ALREADY_HALTED`], exactly as a halt
+///   from any other path does.
+/// * **None were, or the policy is not `STRICT`** — [`TFT_BRIDGE_DROPPED`] with
+///   [`TFT_BRIDGE_REASON_NONE`], which is `tft_bridge_outcome::blank`'s state.
+///   "Nothing happened" is reported as nothing having happened rather than as a
+///   distinct code, because a caller's next act is the same either way and a
+///   code it had to learn in order to ignore is a code that will be checked
+///   wrong.
+/// * **Called twice** — never an error, and *which* of the arms above the second
+///   call takes depends on what the first one found. After a close that halted,
+///   the bridge is latched and the second call replays
+///   [`TFT_BRIDGE_REASON_ALREADY_HALTED`], exactly like the bullet below. After a
+///   close that found nothing, it is the "none were" arm again, because
+///   `Ingest::close_startup_window` is idempotent and the window does not reopen.
+///   A one-shot timer firing after a manual close is a legitimate sequence rather
+///   than a caller mistake, and a handler that treats the latched replay as
+///   unexpected is reading this bullet and not the one below it.
+/// * **Already halted** — [`TFT_BRIDGE_REASON_ALREADY_HALTED`], replaying the
+///   latched action, exactly as [`tft_bridge_note_time_jump`] does.
+///
+/// # It must be called from the bridge's own thread, and a `rclcpp` timer is the
+/// easy way to get that wrong
+///
+/// §3.2's affinity applies here as to every other entry point, and the *documented
+/// caller* is where it bites. `ros/tf_tree_ros/src/bridge_handle.cpp` creates its
+/// callback group with `automatically_add_to_executor_with_node = false` and spins
+/// that group alone on a dedicated `SingleThreadedExecutor` on the bridge's own
+/// thread, precisely so the node's executor can never run a bridge callback. A
+/// one-shot timer made with `node_->create_wall_timer(...)` and **no**
+/// `callback_group` argument lands in the node's default group instead, so it
+/// fires on whichever thread spins the node: a debug build `abort()`s the process
+/// through the affinity assertion, and a release build returns
+/// [`TFT_ERR_WRONG_THREAD`](crate::TFT_ERR_WRONG_THREAD) — after which the window
+/// is never closed at all and `STRICT` silently degrades at the backstop instead.
+/// `tft_bridge_note_time_jump` carries the analogous warning for the jump
+/// callback; this is the same hazard reached by a different route.
+///
+/// # Safety
+///
+/// `b` must be a live handle used from the thread that created it. `out` must
+/// point to a writable `tft_bridge_outcome` with `struct_size` set.
+#[no_mangle]
+pub unsafe extern "C" fn tft_bridge_close_startup_window(
+    b: *mut tft_bridge,
+    out: *mut tft_bridge_outcome,
+) -> tft_status {
+    guard(|| {
+        if out.is_null() {
+            return null_arg("out");
+        }
+        // SAFETY: `out` is non-null and the caller contracts `struct_size` set.
+        let declared = unsafe { core::ptr::addr_of!((*out).struct_size).read_unaligned() };
+        if declared as usize != core::mem::size_of::<tft_bridge_outcome>() {
+            return bad_struct_size("tft_bridge_outcome");
+        }
+        // A blank outcome before the handle is validated, for the same reason
+        // and with the same promise as `tft_bridge_offer`'s.
+        //
+        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
+        // invariants, so a bitwise write is a complete initialisation.
+        let mut o = tft_bridge_outcome::blank();
+        unsafe { core::ptr::write(out, o) };
+
+        // SAFETY: the caller contracts a live handle.
+        let h = match unsafe { bridge_of(b) } {
+            Ok(h) => h,
+            Err(rc) => return rc,
+        };
+        let inner = &mut *h.inner;
+
+        // A stopped bridge stops, charging nothing. Same shape as
+        // `tft_bridge_note_time_jump`'s; the wording differs only in that this
+        // path can never have produced a `RECREATE`.
+        if let Some(st) = inner.stopped {
+            o.action = st.action;
+            o.reason = TFT_BRIDGE_REASON_ALREADY_HALTED;
+            o.by_nanos = st.by_nanos;
+            o.delta_nanos = st.delta_nanos;
+            set(
+                &mut inner.strings.detail,
+                if st.action == TFT_BRIDGE_RECREATE {
+                    "the clock moved past the reset threshold; free this bridge, \
+                     build a new one, and re-plan"
+                } else {
+                    "the bridge halted; free it and build a new one"
+                },
+            );
+            o.detail = ptr(&inner.strings.detail);
+            // SAFETY: as the first write above.
+            unsafe { core::ptr::write(out, o) };
+            return TFT_OK;
+        }
+
+        // **Through `fill`, like every other action-producing path.** The latch,
+        // the `first_time` rate limiter and the halt's wording live there and
+        // must not exist twice — that is the same argument
+        // `tft_bridge_note_time_jump` makes for routing an action that can only
+        // ever be a `Halt`. `Iso3::IDENTITY` is the argument the unreachable
+        // pose-writing arm would ignore.
+        //
+        // `None` means the window was already closed, or nothing was recorded, or
+        // the policy is not `STRICT`. The blank outcome written above is the
+        // answer in all three cases and `fill` is not called at all.
+        if let Some(action) = inner.ingest.close_startup_window() {
+            fill(inner, &action, tf_tree::Iso3::IDENTITY, &mut o);
+            // SAFETY: as the first write above.
+            unsafe { core::ptr::write(out, o) };
+        }
         TFT_OK
     })
 }

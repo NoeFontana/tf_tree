@@ -59,6 +59,20 @@ const POSE: [f64; 7] = [
     0.75,
 ];
 
+/// A pose that is a valid transform and **not** [`POSE`], for a §5.7 value
+/// disagreement. The translation differs; the rotation is deliberately identical,
+/// so a comparison that only looked at the quaternion would call the two the same
+/// and the conflict this drives would not be detected at all.
+const OTHER_POSE: [f64; 7] = [
+    0.965_925_826_289_068_3,
+    0.0,
+    0.0,
+    0.258_819_045_102_520_74,
+    -9.5,
+    4.75,
+    -0.25,
+];
+
 const MS: i64 = 1_000_000;
 
 #[derive(Debug)]
@@ -160,6 +174,17 @@ impl Bridge {
                 &mut out,
             )
         };
+        assert_eq!(rc, TFT_OK, "the call was malformed: {}", last_message());
+        out
+    }
+
+    /// Close `STRICT`'s startup window — §5.4's primary close, with no transform
+    /// in hand.
+    fn close_startup_window(&self) -> tft_bridge_outcome {
+        let mut out = poisoned_outcome();
+        // SAFETY: live handle on its creating thread; `out` is a live local with
+        // `struct_size` set.
+        let rc = unsafe { tft_bridge_close_startup_window(self.0, &mut out) };
         assert_eq!(rc, TFT_OK, "the call was malformed: {}", last_message());
         out
     }
@@ -714,24 +739,48 @@ fn an_unreported_gid_degrades_rather_than_failing() {
 /// conflicts accumulate while the window is open, and **one** halt at its close
 /// reports how many of each kind were found.
 ///
-/// This fixture drives the window's **backstop** — 4096 transforms, a private
-/// constant of `tf_tree_bridge` — because that is the only close a C caller can
-/// reach today: `Ingest::close_startup_window` has no ABI entry point yet
-/// (`docs/decisions/0011`'s implementation step 6). Hence the loop rather than a
-/// third offer.
+/// This fixture drives §5.4's **primary** close — `tft_bridge_close_startup_window`,
+/// `docs/decisions/0011` implementation step 6 — where it used to loop 4096
+/// transforms to reach the backstop, because until step 6 landed the backstop was
+/// the only close a C caller could reach at all. The backstop itself is still
+/// covered, in `tf_tree_bridge`'s own
+/// `the_startup_window_closes_itself_after_the_backstop`: it is that crate's
+/// private constant and this seam only forwards to it, so the loop was buying
+/// 4096 offers' worth of runtime for coverage one crate down.
 ///
-/// Mutant: delete `inner.stopped = Some(…)` from the `Action::Halt` arm ⇒ the
-/// offers after the halt are processed and the `TFT_BRIDGE_HALT` assertion in
-/// the replay loop fails. Mutant: drop `+ inner.refused_after_halt` from
-/// `transforms` in `tft_bridge_get_stats` ⇒ the offered-transform assertion
-/// fails first (4096 against 4099), and `assert_balanced` would too, short by 3.
-/// Mutant: restore the unconditional `set(&mut inner.strings.detail, "the bridge
-/// halted; …")` after the `Action::Halt` match — the shape this arm had before,
-/// and the one the halt's numbers cannot survive ⇒ the `"1 authority"`
-/// assertion fails on an outcome that says only that something halted. Mutant:
-/// call `name_the_edge(inner, o)` in the `StartupConflicts` arm ⇒ the halt names
-/// whichever edge happened to be next on the wire as its cause and the
-/// empty-name assertion fails.
+/// **Nine mutants, each applied and run.** Quoted numbers are this fixture's,
+/// re-measured after step 6 changed it; the two that carried the 4096-transform
+/// loop's figures had gone stale, which is what re-running them was for.
+///
+/// Mutant: delete `inner.stopped = Some(…)` from the `Action::Halt` arm ⇒ *"the
+/// latch holds", left: 2, right: 5* — the **second** `close_startup_window()`
+/// comes back `TFT_BRIDGE_DROPPED`, because with nothing latched the idempotent
+/// `Ingest::close_startup_window` returns `None` and the blank outcome stands.
+/// It fails there rather than in the replay loop, which is earlier than this note
+/// used to claim. Mutant: drop `+ inner.refused_after_halt` from `transforms` in
+/// `tft_bridge_get_stats` ⇒ the offered-transform assertion, *left: 4, right: 7*,
+/// and `assert_balanced` would too, short by 3. Mutant: restore the unconditional
+/// `set(&mut inner.strings.detail, "the bridge halted; …")` after the
+/// `Action::Halt` match — the shape this arm had before, and the one the halt's
+/// numbers cannot survive ⇒ *"the close reports how many of each kind it found,
+/// or CI learns nothing from it: \"the bridge halted; free it and build a new
+/// one\""*. Mutant: call `name_the_edge(inner, o)` in the `StartupConflicts` arm
+/// ⇒ *left: ("base", "lidar"), right: ("", "")* — the halt names the static edge
+/// that happened to be last on the wire as its cause, which is an innocent edge
+/// printed as the fault.
+///
+/// The five that are about step 6's own code. Mutant: delete the authority
+/// enumeration loop ⇒ *"every recorded edge must be enumerated, both kinds"*, on
+/// a `detail` carrying `"; static base->lidar: …"` and no authority clause.
+/// Mutant: delete the static loop ⇒ the same assertion, mirrored. Mutant:
+/// `o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` — the code this step
+/// replaced ⇒ *left: 5, right: 9*. Mutant: make the `inner.stopped` early return
+/// unreachable in `tft_bridge_close_startup_window` ⇒ *"the latch holds", left:
+/// 2, right: 5*, the same reading as deleting the latch, because a second close
+/// with nothing to report is indistinguishable from a bridge that never halted.
+/// Mutant: `inner.refused_after_halt += 1` on that early return ⇒ *left: 4,
+/// right: 3* — the call is not a transform, and charging it a bucket is the
+/// failure the "# What it does and does not charge" heading exists to prevent.
 #[test]
 fn a_halted_bridge_refuses_every_later_offer() {
     let b = Bridge::new(TFT_BRIDGE_AUTHORITY_STRICT, TFT_BRIDGE_ON_CLOCK_RESET_HALT);
@@ -744,17 +793,25 @@ fn a_halted_bridge_refuses_every_later_offer() {
             TFT_OK
         );
     }
-    // Every `tft_bridge_offer` call this test makes, counted, because the
-    // ledger assertion at the end is about one specific offer that is
-    // deliberately **not** counted by the bridge.
+    // **Every `tft_bridge_offer` call this test makes, counted** — all of them,
+    // which is itself the shape step 6 changed. While the 4096-transform
+    // backstop was the only close a C caller could reach, the halting *offer*
+    // was refused before `transforms += 1` and the assertion at the end had to
+    // subtract it. §5.4's primary close is a separate call, so there is no
+    // uncounted offer left to explain.
     let mut offers = 0u64;
-    let mut offer = |stamp: i64, gid: &[u8; 16]| {
+    let mut offer = |topic: tft_bridge_topic,
+                     parent: &str,
+                     child: &str,
+                     stamp: i64,
+                     pose: [f64; 7],
+                     gid: &[u8; 16]| {
         offers += 1;
-        b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", stamp, POSE, Some(gid))
+        b.offer(topic, parent, child, stamp, pose, Some(gid))
     };
 
-    offer(1_000 * MS, &a);
-    let o = offer(1_010 * MS, &z);
+    offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 1_000 * MS, POSE, &a);
+    let o = offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 1_010 * MS, POSE, &z);
     assert_eq!(
         o.action,
         TFT_BRIDGE_DROPPED,
@@ -768,32 +825,74 @@ fn a_halted_bridge_refuses_every_later_offer() {
         "and it still names both publishers, which is what the close will count"
     );
 
-    // The backstop. Every offer until it fires is the owner's and is written;
-    // the bound is generous so that a changed constant fails the `expect` below
-    // rather than silently passing on a rewritten rule.
-    let mut halt = None;
-    for k in 0..16_384i64 {
-        let o = offer(2_000 * MS + k * MS, &a);
-        if o.action == TFT_BRIDGE_HALT {
-            halt = Some(o);
-            break;
-        }
-        assert_eq!(
-            o.action,
-            TFT_BRIDGE_APPLIED,
-            "the owner keeps working while the window is open: {} / {}",
-            o.reason,
-            text(o.detail)
-        );
-    }
-    let o = halt.expect("the startup window's backstop must close it and halt");
-    assert_eq!(o.reason, TFT_BRIDGE_REASON_AUTHORITY_CONFLICT);
+    // A §5.7 static disagreement as well, so the halt has to report **both**
+    // kinds. It is what made `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` the wrong
+    // code for this event: the record contains a value conflict and that name
+    // says nothing about one.
+    offer(TFT_BRIDGE_TOPIC_TF_STATIC, "base", "lidar", 0, POSE, &a);
+    let o = offer(
+        TFT_BRIDGE_TOPIC_TF_STATIC,
+        "base",
+        "lidar",
+        0,
+        OTHER_POSE,
+        &z,
+    );
+    assert_eq!(
+        o.action,
+        TFT_BRIDGE_STATIC_CONFLICT,
+        "inside the window a STRICT static disagreement is reported and not halted          on — §5.7's own action, disposed of exactly as FIRST_WRITER_WINS would: {}",
+        text(o.detail)
+    );
+
+    // **§5.4's primary close.** One call, no transform in hand, no bucket
+    // charged.
+    let o = b.close_startup_window();
+    assert_eq!(
+        o.action,
+        TFT_BRIDGE_HALT,
+        "a window closing over a non-empty record must halt: {} / {}",
+        o.reason,
+        text(o.detail)
+    );
+    assert_eq!(o.reason, TFT_BRIDGE_REASON_STARTUP_CONFLICTS);
     assert_eq!(o.first_time, 1, "the transition is the loud one");
     let detail = text(o.detail);
     assert!(
-        detail.contains("1 authority") && detail.contains("0 static"),
+        detail.contains("1 authority") && detail.contains("1 static"),
         "the close reports how many of each kind it found, or CI learns nothing \
          from it: {detail:?}"
+    );
+    // §5.4:1403, in its own words: *"the seam's `detail` enumerates **every**
+    // recorded edge with both of its publishers, not the first."* Both halves,
+    // because a report that named only the authority edges would send a CI
+    // operator to fix half a misconfiguration.
+    assert!(
+        detail.contains("authority odom->base") && detail.contains("static base->lidar"),
+        "every recorded edge must be enumerated, both kinds: {detail:?}"
+    );
+    // **"with both of its publishers"** taken literally: one `X vs Y` pair per
+    // recorded edge and no more, so a `detail` that named an edge and only the
+    // publisher that arrived last would fail here.
+    assert_eq!(
+        detail.matches(" vs ").count(),
+        2,
+        "one publisher pair per recorded edge, and exactly the recorded ones: \
+         {detail:?}"
+    );
+    assert!(
+        detail.contains("authority odom->base: /a vs /b"),
+        "the authority edge names the owner and the intruder: {detail:?}"
+    );
+    // The static half's "owner" is the **declared constant**, not a node, because
+    // the fixture's topology declares `base -> lidar` static and both offers
+    // disagreed with it. That is §5.7's URDF-disagreement shape rather than a
+    // second publisher's, and it is the reading a CI operator needs: the config
+    // and the robot disagree, and the robot is `/a`.
+    assert!(
+        detail.contains("static base->lidar: <topology config> vs /a"),
+        "the static edge names what declared the constant and who contradicted \
+         it: {detail:?}"
     );
     assert_eq!(
         (text(o.parent), text(o.child)),
@@ -802,23 +901,59 @@ fn a_halted_bridge_refuses_every_later_offer() {
          edge rather than an innocent one"
     );
 
+    // Called twice is not an error and does not reopen anything; the second call
+    // takes the already-halted path, like every other call now does.
+    let again = b.close_startup_window();
+    assert_eq!(again.action, TFT_BRIDGE_HALT, "the latch holds");
+    assert_eq!(again.reason, TFT_BRIDGE_REASON_ALREADY_HALTED);
+
     for k in 0..3i64 {
-        let o = offer(90_000 * MS + k * MS, &a);
+        let o = offer(
+            TFT_BRIDGE_TOPIC_TF,
+            "odom",
+            "base",
+            90_000 * MS + k * MS,
+            POSE,
+            &a,
+        );
         assert_eq!(o.action, TFT_BRIDGE_HALT, "a halt does not wear off");
         assert_eq!(o.reason, TFT_BRIDGE_REASON_ALREADY_HALTED);
         assert_eq!(o.first_time, 0, "and the replay is rate-limited");
     }
     let s = b.stats();
     assert_eq!(s.refused_after_halt, 3);
+    // **Three drops for one authority collision, and the arithmetic is the
+    // point.** `dropped_authority` is the ledger's only term for a static value
+    // conflict too — `static_conflicts` is a side count and *not* a ledger term,
+    // so a §5.7 disagreement has to be charged somewhere or `assert_balanced`
+    // breaks. One collision plus two disagreements reads 3.
+    // `tf_tree_bridge`'s `strict_accumulates_conflicts_inside_the_window_and_halts_once_at_its_close`
+    // reads `(1, 2, 1)` on *its* fixture, and the two are **supposed** to differ:
+    // that one makes a single static observation and this one makes two, on
+    // purpose, so the `s.static_conflicts > 1` assertion below can separate
+    // observations from faults. Do not reconcile them — the shared rule is one
+    // bucket per drop, not one pair of numbers.
     assert_eq!(
-        s.dropped_authority, 1,
-        "the collision was counted once, by the message that made it"
+        (s.applied, s.dropped_authority, s.static_conflicts),
+        (1, 3, 2),
+        "one write, three drops in one bucket, two static observations"
+    );
+    // **Two observations, one fault** — and the `"1 static"` assertion above is
+    // what separates them. `StaticStore::conflicts()` would say 2 here; the
+    // close counts edges, via `conflicts_by_edge()`, because `/tf_static` is
+    // `transient_local` and a latched misconfiguration is redelivered to every
+    // late joiner. A fixture where the two numbers were equal could not tell
+    // which one the halt quotes.
+    assert!(
+        s.static_conflicts > 1,
+        "the fixture must keep observations and faults apart: {}",
+        s.static_conflicts
     );
     assert_eq!(
-        s.transforms,
-        offers - 1,
-        "a window-close halt is caused by transforms already counted, so it \
-         charges no bucket and is not itself an offered transform"
+        s.transforms, offers,
+        "the close charges no bucket and refuses no offer, so every offer this \
+         test made is counted — the `- 1` this assertion used to carry was the \
+         backstop swallowing the offer it halted on"
     );
     assert_balanced(&s);
 }

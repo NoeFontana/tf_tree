@@ -210,7 +210,37 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// moved a refusal earlier on arenas that were already failing, nothing here
 /// changes the behaviour of any call that existed before: the new policy is
 /// reachable only through a symbol an older caller cannot name.
-pub const TFT_ABI_VERSION_MINOR: u32 = 7;
+///
+/// **`7` → `8`: `tft_bridge_close_startup_window` and
+/// `TFT_BRIDGE_REASON_STARTUP_CONFLICTS`.** `docs/decisions/0011`
+/// implementation step 6.
+///
+/// The bump is for an added **unstable** symbol, and the precedent for doing
+/// that is `1` → `2`, which bumped for `tft_bridge_note_time_jump` — also a
+/// bridge entry point, also unstable-tier. The rule this follows is the one
+/// `3` → `4` states: the minor version answers *"can I name this symbol?"*, and
+/// a caller that needs the answer cannot get it from a tier, because the tier is
+/// a statement about whether the symbol may later be **withdrawn** and not about
+/// whether it is there.
+///
+/// **Unlike `6` → `7`, a `0.7` caller CAN observe this one through a call it
+/// already makes, and the retest it may owe is one `switch` arm.** A `STRICT`
+/// startup halt used to be reported as
+/// `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` (5) — the closest true code, and the
+/// wrong name whenever the record contained a §5.7 static-value disagreement,
+/// which is a config-versus-robot fault and not an authority one. It is now
+/// `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` (9).
+///
+/// That halt reaches a `0.7` caller through **`tft_bridge_offer`**, whose
+/// signature and every other outcome are unchanged: on `STRICT`, with a conflict
+/// recorded, the 4096-transform backstop closes the window from inside an offer.
+/// So a `0.7` caller that reached the backstop did receive 5 and now receives 9,
+/// and one that switched on 5 to print it falls through to its default arm. The
+/// action is `TFT_BRIDGE_HALT` either way and the `detail` string carries the
+/// diagnosis, so nothing a caller *does* changes — but "observes nothing" was
+/// false, and this paragraph asserted it directly above the sentences that refute
+/// it. Nothing else here is reachable without naming a new symbol.
+pub const TFT_ABI_VERSION_MINOR: u32 = 8;
 
 /// The library's major ABI version.
 #[no_mangle]

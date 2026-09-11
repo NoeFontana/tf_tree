@@ -3,7 +3,20 @@
 **Status:** ready — **its clock half is superseded by
 [`0012`](./0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)**
 **Owner:** @NoeFontana
-**Implementation:** (filled in as work lands)
+**Implementation:** **step 6 has landed** —
+`tft_bridge_close_startup_window`, `TFT_BRIDGE_REASON_STARTUP_CONFLICTS = 9`,
+`TFT_ABI_VERSION_MINOR` 7 → 8. Steps 1–4 landed in `336bc27`, and their clock
+half was then **partly deleted** by
+[`0012`](./0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)
+(`cd5295d`): read the scoping note below before treating any of steps 1–3 as a
+description of the code. Step 5 landed in `336bc27` **except**
+`StaticStore::conflicts_by_edge()`, which it names and which did not arrive until
+#314 — so for the whole of that interval §5.4's *"enumerates **every** recorded
+edge with both of its publishers"* clause was unmet on both halves, the static
+one for want of the accessor and the authority one for want of step 6's caller.
+**Steps 7–9 are outstanding**, and steps 7 and 8 plus two rows of step 9 are
+`ros/` or container-only: nothing on the development host can run `just ros-test`
+or `just tf2-check`.
 
 > **Read this scoping note before anything below it.** This record carries three
 > decisions and only the first is retired.
@@ -768,13 +781,48 @@ Steps 2–4 are (1); 5–7 are (2); 8 is (3). Each is one PR.
    edge. Rewrite `a_halted_bridge_refuses_every_later_offer` to close the window
    and then assert the halt, keeping its coverage of `stopped` and
    `refused_after_halt`. — verified by `just c-header-check` (which fails on
-   drift), `just test`, `just c-abi-check`, and by `grep TFT_BRIDGE_REASON_STARTUP
-   crates/tf_tree_c/include/tf_tree.h` finding **nothing**.
+   drift), `just test`, `just c-abi-check`, and by the stable header carrying no
+   **declaration** of either new symbol:
+
+   ```sh
+   grep -E '^#define TFT_BRIDGE_REASON_STARTUP|tft_bridge_close_startup_window *\(' \
+       crates/tf_tree_c/include/tf_tree.h
+   ```
+
+   **Not the plain `grep TFT_BRIDGE_REASON_STARTUP` this step first named, which
+   the landed change falsifies while leaving the promise intact.** That grep
+   returns 2 — both hits inside `TFT_ABI_VERSION_MINOR`'s doc comment, which
+   cbindgen copies into `tf_tree.h` and which has to name the new code, because
+   the one thing a `0.7` caller can observe is a `STRICT` startup halt changing
+   from reason 5 to reason 9. §3.1's promise is about declarations; prose
+   explaining a version bump is not a declaration, and a falsifier that cannot
+   tell them apart would have been answered by deleting the explanation.
 7. **(2) in ROS.** A `startup_window_sec` parameter (default 5.0) and a one-shot
    `RCL_STEADY_TIME` timer calling the new entry point, routing its outcome
    through `report()`. Not a `tft_bridge_options` field — that would change
    `sizeof`. A gtest that two conflicting publishers under `Strict` produce one
    `RCLCPP_FATAL` naming both. — verified by `just ros-test`.
+
+   **Two cautions, both found while step 6 landed and neither visible from this
+   step's own text.**
+
+   *The timer must be created on `group_`.* `BridgeHandle` makes its callback
+   group with `automatically_add_to_executor_with_node = false` and spins that
+   group alone on a dedicated executor on the bridge's thread, so a
+   `create_wall_timer` with no `callback_group` argument lands in the node's
+   default group and fires on whichever thread spins the node — §3.2's affinity
+   assertion `abort()`s a debug build, and a release build gets
+   `TFT_ERR_WRONG_THREAD` and never closes the window at all, degrading `Strict`
+   at the backstop with no diagnostic.
+
+   *5.0 s is a coverage decision, not a latency one.* `/tf_static` is
+   `transient_local`, and §5.4 itself puts a latched sample's arrival at "seconds
+   after either process started". A window that closes first reports nothing, and
+   outside the window `Strict` is `FirstWriterWins` plus counters for the life of
+   the process — so the two-different-URDFs fault the policy exists for passes.
+   Whether 5.0 is defensible, and whether the close should be deferred while no
+   `/tf_static` has been seen at all, is a question this step should answer rather
+   than inherit from a default written before step 6 existed.
 8. **(3) in ROS.** Split the `TFT_BRIDGE_DROPPED` tail into three
    `RCLCPP_WARN_THROTTLE` call sites, one per reason, and add a `reason_name()`.
    Preserve `BAD_POSE`'s existing `detail`. — verified by `just ros-test`.
