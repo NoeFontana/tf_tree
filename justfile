@@ -3215,30 +3215,39 @@ py-test-freethreaded:
     .venv-t/bin/python -m pytest tests/python -q
 
 # **`docs/PHASE3.md` §12.2 criterion 4, and §7.3's scaling test.** The criterion
-# is *"thread scaling >= 6x from 1 to 8 threads on `3.14t`"* and nothing measured
-# it until this recipe existed; `tests/python/test_freethreading.py` runs eight
+# has two halves — *">= 6x from 1 to 8 threads on `3.14t`, and >= 6x on the GIL
+# build for batches above the release threshold"* — and nothing measured either
+# until this recipe existed. `tests/python/test_freethreading.py` runs eight
 # threads and asserts **correctness**, which would pass on a build that serialised
 # every call.
 #
-# **It reports rather than gates, and `--gate` refuses on this host rather than
-# failing.** The criterion names 8 threads and the scaling it wants is a statement
-# about cores; a 4-physical-core host cannot reach 6x arithmetically, so a FAIL
-# here would charge the core count to the code. The binary prints INVALID with the
-# core count and exits 0. On a host with 8 physical cores, `--gate` is the
-# criterion.
+# **`--release`, where `just py-test-freethreaded`'s otherwise identical install
+# line is not, and this recipe shipped without it first.** `just gate4-python`
+# carries the same note for the same reason. Measured on this host, same script,
+# same window: `develop`'s default profile reads 0.52 M samples/s on one thread
+# against 3.33 M at release, and the *scaling curve* moves with it — 4.4-5.1x
+# against 6.17-6.23x. A debug build is not a slower release build, it is a
+# different program, and the first revision of this recipe published the debug
+# curve as the finding and an `INVALID` verdict that release turns into a **PASS**.
+# It is also the profile a `pip install` gets.
+#
+# **`.venv-t`, so this is the free-threaded half.** Run the same script under
+# `.venv/bin/python` for the GIL half; the script reports which one it answered.
 #
 # `--serialize` is the control: one lock around every call, which must read a flat
-# curve. A harness that cannot produce one on demand is not measuring one.
+# or falling curve. A harness that cannot produce one on demand is not measuring
+# one. `--gate --serialize` is refused rather than reporting the control as a
+# regression.
 #
-# **Do not shorten the window to make the sweep quick.** At `--seconds 1` the
-# 4-thread arm reads 3.29x where the documented 2 s window reads 3.96-3.99x, so a
-# short run understates scaling and does it silently. The defaults are the
-# measured configuration; `docs/benchmarks/EVIDENCE.md` states the window beside
-# the number for the same reason.
+# **Do not shorten the window to make the sweep quick**, but do not attribute the
+# instrument's spread to it either: at `--seconds 1` a 4-thread arm read 3.29x,
+# and so did one run at the 2 s default, so the short window is a worse sample
+# rather than a different measurement. The defaults are the measured
+# configuration.
 
 # `plan.at` on 1/2/4/8 threads under `python3.14t` — PHASE3 §12.2 criterion 4.
 py-thread-scaling *ARGS:
-    VIRTUAL_ENV=.venv-t PYO3_PYTHON=/home/dev/src/tf_tree/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
+    VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q --release
     .venv-t/bin/python crates/tf_tree_bench/python/thread_scaling.py {{ARGS}}
 
 # **The fmt and clippy halves are `py-compile`, depended on rather than
