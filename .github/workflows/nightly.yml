@@ -306,8 +306,13 @@ jobs:
   # red job among six green ones reds the run, and an issue saying "nightly
   # failed" sends the reader back to the log-digging this job exists to spare
   # them. The body names each failed job and links straight to it, read from the
-  # jobs API rather than from `needs.*.result`, so a job added above needs no
-  # edit here and cannot be silently dropped from the report.
+  # jobs API rather than from `needs.*.result`, so a job added above is reported
+  # without an edit here. **That is not the same as "cannot be dropped", and the
+  # `needs` list is still hand-maintained**: a job missing from it may not have
+  # finished when this one runs, and an unfinished job has a `null` conclusion,
+  # which is counted as neither failed nor inconclusive — it is this job reading
+  # its own listing that forces that exclusion. So a new job must still be added
+  # to `needs`; what it does not need is a second entry in the reporting code.
   #
   # **One issue, not one per night.** A fresh issue every 24 h for the same
   # standing failure is noise that gets muted, so a later run appends a comment
@@ -324,7 +329,15 @@ jobs:
   notify:
     name: report the night's result
     needs: [torture, crash-points, sanitizers, tf2-differential, cpp-sanitizers, gate4]
-    if: always()
+    # **The ref guard is load-bearing, and `always()` alone is not enough.**
+    # `workflow_dispatch` above exists so a change to these recipes can be tried
+    # without waiting a day, and it can be fired against **any** ref — this
+    # repository already dispatches it. Without this condition, a green run on a
+    # feature branch takes the green path below and **closes the standing alert
+    # for a red `main`**, and a red one opens an issue whose body says "the
+    # scheduled nightly" about a branch. A manual re-run of `main` is legitimate
+    # and still reports, which is why this gates on the ref and not on the event.
+    if: always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     continue-on-error: true
     # **`actions: read` is not optional here.** A job-level `permissions:` block
@@ -354,11 +367,23 @@ jobs:
           # is added above. This job is itself in the listing with a null
           # conclusion, so select on `failure` rather than on "not success" —
           # which also keeps `cancelled` and `skipped` out of the report.
-          jobs=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs")
+          # **`--slurp` with `--paginate`.** Without it, a run with more jobs
+          # than one page emits several concatenated JSON objects, and a `jq`
+          # program ending in `| length` then prints one number *per page* — so
+          # `inconclusive` becomes "0\n0" and every `[ "$inconclusive" != "0" ]`
+          # test below takes the wrong branch. The nightly has seven jobs today
+          # and would not paginate; `ci.yml` has twenty and is two thirds of the
+          # way there. `--slurp` returns one array of pages, which flattens.
+          jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$RUN_ID/jobs" |
+            jq '{jobs: [.[].jobs[]]}')
 
-          # A job that **timed out** is a red job: `shm_torture` runs for 30
-          # minutes against a 90-minute budget, so a timeout there is a wedge
-          # that stopped making progress, not a scheduling accident.
+          # A job that **timed out** is a red job: every long job here runs a
+          # bounded-duration recipe inside a larger `timeout-minutes`, so a
+          # timeout is a recipe that stopped making progress rather than a
+          # scheduling accident. (An earlier revision of this comment said
+          # `shm_torture` had "a 90-minute budget"; 90 is the *sanitizers* job's
+          # and `torture`'s is 50. No number is quoted now — the `timeout-minutes`
+          # keys above are the register and nothing here audits a copy of them.)
           failed=$(printf '%s' "$jobs" | jq -r \
             '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out")
              | "- **\(.name)** — \(.html_url)"')
@@ -371,8 +396,8 @@ jobs:
           # this job, still in progress, looking at its own listing.
           inconclusive=$(printf '%s' "$jobs" | jq -r \
             '[.jobs[] | select(.conclusion != null)
-              | select(.conclusion == "cancelled" or .conclusion == "action_required"
-                       or .conclusion == "stale")] | length')
+              | select(.conclusion != "success" and .conclusion != "failure"
+                       and .conclusion != "timed_out")] | length')
 
           # The label the query below filters on. Idempotent: the 422 this
           # returns once the label exists is the steady state, not an error.
@@ -387,11 +412,17 @@ jobs:
           # a PR that happened to carry this label would be picked up and
           # commented on — and, on a green night, *closed*. Filtering here is
           # cheaper than discovering it the once it happens.
-          standing=$(gh api "repos/$REPO/issues?state=open&labels=nightly-red&per_page=10")
-          number=$(printf '%s' "$standing" |
-            jq -r 'map(select(.pull_request == null)) | .[0].number // empty')
-          author=$(printf '%s' "$standing" |
-            jq -r 'map(select(.pull_request == null)) | .[0].user.login // empty')
+          # **Select the issue this workflow opened, not the newest one wearing
+          # the label.** The query is sorted newest-created-first by default, so
+          # a human who opens their own `nightly-red` issue *after* the bot's
+          # becomes `.[0]` — and then the author test below fails forever, the
+          # bot's issue can never be closed, and every later red night comments
+          # on the human's. Filtering by author at selection time makes the two
+          # independent: ours is found whatever else carries the label.
+          standing=$(gh api "repos/$REPO/issues?state=open&labels=nightly-red&per_page=100")
+          number=$(printf '%s' "$standing" | jq -r '
+            map(select(.pull_request == null and .user.login == "github-actions[bot]"))
+            | .[0].number // empty')
 
           # Built with printf rather than a multi-line shell string: every line
           # of this script lives inside a YAML block scalar, so a continuation
@@ -406,7 +437,7 @@ jobs:
           fi
 
           if [ -z "$failed" ]; then
-            if [ -n "$number" ] && [ "$author" = "github-actions[bot]" ]; then
+            if [ -n "$number" ]; then
               body=$(printf '%s\n' \
                 "Nightly is green again on \`$SHA\`, so this is closed." \
                 "" \

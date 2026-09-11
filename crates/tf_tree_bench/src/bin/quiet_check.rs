@@ -5,19 +5,32 @@
 //!
 //! [`tf_tree_bench::mp::require_quiet_machine`] is the one spelling of this
 //! check, and every harness that owns its own `main` simply calls it. The
-//! `docs/PHASE4.md` §7 gate cannot: its instrument is
-//! `crates/tf_tree_c/examples/abi_cost.rs`, an **example of `tf_tree_c`**, and
-//! `tf_tree_bench` depends on `tf_tree_c` — so a dev-dependency the other way
-//! is a cycle. The two ways out were a second implementation of the sampler,
-//! which is the duplicate-spelling defect `docs/PROJECT.md` §6 names, and this:
-//! one entry point that a recipe brackets the run with. `0023` step 5 chose
-//! this one, and the choice is a **crate boundary**, not a two-line print.
+//! `docs/PHASE4.md` §7 gate does not: its instrument is
+//! `crates/tf_tree_c/examples/abi_cost.rs`, an **example of `tf_tree_c`**,
+//! while `tf_tree_bench` depends on `tf_tree_c`.
+//!
+//! **The reason is not that cargo forbids the dev-dependency, and saying so
+//! was wrong.** `0023` step 5 argues `tf_tree_c` "cannot gain one without a
+//! cycle", and an earlier version of this comment repeated it. Cargo **permits**
+//! a dev-dependency cycle: a package's dev-dependencies may depend back on it,
+//! because dev-dependencies do not participate in the library's own build
+//! graph. Measured rather than reasoned about — a two-crate scratch workspace
+//! in exactly this shape (`a` dev-depends on `b`, `b` depends on `a`, an
+//! *example* of `a` calls into `b`) compiles.
+//!
+//! What is true, and is the reason: a dev-dependency would pull `tf_tree_bench`
+//! and its whole tree into every `tf_tree_c` example build, for a 300 ms read of
+//! `/proc/stat`; and — the load-bearing half — the sampler must not run **inside
+//! the measured process**, which is the next section. A separate entry point the
+//! recipe brackets the run with satisfies both. The alternative rejected is a
+//! second implementation of the sampler, which is the duplicate-spelling defect
+//! `docs/PROJECT.md` §6 names.
 //!
 //! # The sample is taken BEFORE the run, and that is the whole point
 //!
-//! [`busy_fraction`] reads the aggregate `cpu` line of `/proc/stat`, which
-//! includes *the measuring process*. `abi_cost` saturates one core; on an
-//! 8-logical-CPU host that is ~12.5%, already above
+//! [`tf_tree_bench::mp::busy_fraction`] reads the aggregate `cpu` line of
+//! `/proc/stat`, which includes *the measuring process*. `abi_cost` saturates
+//! one core; on an 8-logical-CPU host that is ~12.5%, already above
 //! [`QUIET_ENOUGH`] (0.10). So a fraction sampled inside the timed loop can
 //! **never** pass, for a reason that has nothing to do with the host — and a
 //! threshold that can never be met is the same defect as one that can never
@@ -38,8 +51,12 @@
 //!
 //! | exit | meaning |
 //! |---|---|
-//! | 0 | quiet — the reading that follows is admissible |
+//! | 0 | quiet, **or** loud with `TF_TREE_BENCH_FORCE` set — see below |
 //! | 2 | too loud — no number should be recorded from this run |
+//!
+//! The two cases behind 0 are distinguished in the printed line, not in the
+//! status, because the override's whole purpose is to let a run proceed. A
+//! caller that must tell them apart reads the line for `FORCED`.
 //!
 //! # The override announces itself
 //!
@@ -56,7 +73,7 @@
 // the measurement so the recorded number carries the host state it was taken at.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use tf_tree_bench::mp::{busy_fraction, require_quiet_machine, QUIET_ENOUGH};
+use tf_tree_bench::mp::{require_quiet_machine, QUIET_ENOUGH};
 
 fn main() {
     // A label so the two samples in a bracket are distinguishable in a log that
@@ -84,14 +101,15 @@ fn main() {
             );
         }
         Err(msg) => {
-            // Re-read for the headline so the number appears in the same shape
-            // as the passing line; the refusal text below names the consumers.
-            let busy = busy_fraction(std::time::Duration::from_millis(300));
-            println!(
-                "quiet_check[{label}]: busy {:.1}% (threshold {:.0}%) — NOT QUIET",
-                busy * 100.0,
-                QUIET_ENOUGH * 100.0
-            );
+            // **No second sample.** An earlier version re-read `busy_fraction`
+            // here so the headline would have the same shape as the passing
+            // line — which printed a *different reading* from the one that
+            // failed the threshold, 300 ms later and on a machine whose load
+            // was by then demonstrably moving. A refusal that quotes a number
+            // other than the one it refused on is worse than one that quotes
+            // none. `require_quiet_machine`'s message carries the reading it
+            // actually took, and the top consumers with it.
+            println!("quiet_check[{label}]: NOT QUIET — the reading is below");
             eprintln!("quiet_check: {msg}");
             // 2, not 1: see the exit-code table above.
             std::process::exit(2);

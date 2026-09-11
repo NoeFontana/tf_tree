@@ -216,8 +216,23 @@ performance target.
 
    *And the sampler is in the wrong crate to just call.* It is
    `tf_tree_bench::mp`, while `abi_cost.rs` is an example of `tf_tree_c`, which
-   has no dependency on `tf_tree_bench` — dev or otherwise — and cannot gain one
-   without a cycle, since `tf_tree_bench` depends on `tf_tree_c`. So the printing
+   has no dependency on `tf_tree_bench` — dev or otherwise.
+
+   **This step said it "cannot gain one without a cycle, since `tf_tree_bench`
+   depends on `tf_tree_c`", and that is false.** Cargo *permits* a
+   dev-dependency cycle: dev-dependencies do not participate in the library's
+   own build graph, so a package's may depend back on it. Measured on
+   2026-09-11 rather than reasoned about — a two-crate scratch workspace in
+   exactly this shape (`a` dev-depends on `b`, `b` depends on `a`, an **example**
+   of `a` calls into `b`) compiles. So the dev-dependency was available and the
+   record ruled it out on a rule that does not exist.
+
+   The conclusion survives on two reasons that do hold, and they are weaker and
+   worth stating as such: a dev-dependency pulls `tf_tree_bench` and its whole
+   tree into every `tf_tree_c` example build for a 300 ms read of `/proc/stat`;
+   and — the load-bearing one — the sampler must not run **inside the measured
+   process**, which is the paragraph above this one and is a property of *where
+   the sample is taken*, not of which crate owns the code. So the printing
    half is one of: a small `tf_tree_bench` entry point that `just abi-cost`
    brackets the run with, or a second implementation of the sampler. The first
    keeps one spelling and is what this step should do; the second is the defect

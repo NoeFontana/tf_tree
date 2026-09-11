@@ -929,12 +929,31 @@ abi-cost:
     taskset -c 2 "$T/release/examples/abi_cost" release
     echo
     echo "=== embedder profile (lto = false — a REAL boundary; THIS one gates) ==="
+    # **Not under `set -e`, and that is the whole point of the bracket.**
+    # `abi_cost` exits 1 when the §7 ratio misses, and under `set -e` that would
+    # abort the recipe *before* the closing quiet sample ran — so a run that
+    # missed because the host went loud mid-measurement would be reported as an
+    # ABI regression, which is exactly the INVALID-read-as-FAIL this instrument
+    # exists to prevent. Only the `embedder` arm can exit 1 (`abi_cost`'s
+    # `gate_failed` is `&& boundary_real`), so the contrast arm above needs no
+    # such treatment.
+    set +e
     taskset -c 2 "$T/embedder/examples/abi_cost" embedder
+    gate=$?
+    set -e
     echo
     # The closing half of the bracket, after `abi_cost` has exited so its own
     # load is out of the window. quiet-then-loud means somebody else started
     # work *during* the run, which one pre-run sample cannot see.
-    "$T/release/quiet_check" after
+    #
+    # **INVALID outranks FAIL.** If the machine was loud at either end, no
+    # number from this run is admissible and the exit code says 2 whatever the
+    # ratio did — a miss on an unusable measurement is not evidence about the
+    # ABI. `quiet_check` prints its own reason before this line is reached.
+    if ! "$T/release/quiet_check" after; then
+      exit 2
+    fi
+    exit "$gate"
 
 # The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
 c-abi-check:
