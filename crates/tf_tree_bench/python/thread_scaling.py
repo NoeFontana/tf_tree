@@ -16,13 +16,18 @@ magnitude at depth 3.
 
 **It must be run against a `--release` extension and `just py-thread-scaling`
 builds one.** This is not a formality and it was got wrong first: at `develop`'s
-default profile the same script on the same host reads **0.52 M samples/s** on one
-thread against **3.33 M** at release, and — the part that matters — the *scaling
-curve* changes too, 4.4-5.1x against 6.17-6.23x. A debug build is not a slower
-release build, it is a different program, which is the sentence
-`tf_tree_bench::report::Fitness::probe` carries for exactly this reason. Every arm
-prints ns/sample so a run against the wrong profile is visible rather than
-plausible.
+default profile the same script on the same host reads roughly a sixth of the
+release throughput and — the part that matters — the *scaling curve* moves with it,
+by enough to cross the criterion's floor. A debug build is not a slower release
+build, it is a different program, which is the sentence
+`tf_tree_bench::report::Fitness::probe` carries for exactly this reason.
+
+**The detector for that is printed rather than invented.** Every arm prints
+ns/sample, and the single-thread arm prints it beside `tree.rs`'s own documented
+**328 ns/elem** for a release, pinned, depth-3 `at` — a figure this repository
+already maintains. A release run lands near it; a `develop` run reads about six
+times it, which is unmissable. It is a comparison and not a floor, because the
+reference is a differently shaped measurement.
 
 **The verdict is one-sided and that is what makes a PASS here real.** This is a
 scaling *floor*, and every way a host can be unfair to it — fewer physical cores
@@ -45,25 +50,32 @@ a `Plan` that was not `Sync` - would behave. It must read a flat or falling curv
 A harness that cannot produce one on demand is not measuring one. `--gate` is
 refused beside it rather than allowed to report the control as a regression.
 
-Measured on the development host - 4 physical cores, 8 logical, `--release`, this
-file's default window. Four runs on `3.14t` and three on the GIL build:
+**The figures are in `docs/benchmarks/EVIDENCE.md`'s probe row and deliberately not
+restated here.** They were written into four places at once — this docstring, the
+recipe comment, `PHASE3.md` §12.2 and that row — and within one revision the four
+copies disagreed in the third digit, which is the drift this repository keeps
+finding in exactly this shape. The register holds the numbers; what follows is what
+they mean.
 
-* **`3.14t`: 1->8 reads 6.17-6.23x, above the criterion's 6x in every run.**
-  Criterion 4's free-threaded half **passes**, and it passes on a host with half
-  the physical cores the "8 threads" in that criterion implies - which under the
-  one-sided argument above makes it a stronger result rather than a weaker one.
-* **GIL build: 1->8 reads 5.79-5.94x**, a miss of 1-4%. Reported with its margin
-  and `INVALID`: the shortfall is smaller than what this host's own core count
-  contributes, so it is not attributable to the code.
-* **1->4 reads 3.92-3.93x (`3.14t`) and 3.97-4.03x (GIL)** - linear to the
-  physical core count on both.
-* **Control**: `--serialize` falls below 1.0x at every thread count and keeps
-  falling as threads are added, the way lock contention does.
+**Criterion 4's free-threaded half straddles the floor on the development host, and
+"passes" would be too strong.** Over five runs the 1->8 reading sits either side of
+6x, most of them above it. Under the one-sided argument each clearing run is a
+conservative pass, so the criterion is *met at least conservatively* on a host with
+half the physical cores its "8 threads" implies — but the margin is inside this
+instrument's own spread, so **this host cannot settle the criterion either way**.
+One with eight physical cores could. That is a more useful statement than a verdict.
 
-**No interval is quoted as this instrument's spread**, per
-`docs/benchmarks/EVIDENCE.md`'s rule: the ranges above are the runs that were
-taken, and re-running walks outside them without anything having changed. The
-recipe prints each run's own numbers.
+**The GIL half reads consistently below the floor, and the host is not the
+explanation.** Its 1->4 arm is as high as the free-threaded one or higher; the gap
+opens only at 8 threads, where SMT siblings contend on GIL-held work. There is
+code-side GIL-held work to suspect — `Plan::at` allocates its `(N,4,4)` output
+before `fill` detaches — so attributing this to the core count without an `at_into`
+arm, which has no per-call allocation, would be blaming an arm nobody measured.
+Left unresolved on purpose.
+
+**The control falls and keeps falling.** `--serialize` reads below 1.0x at every
+thread count and lower at each step, the way lock contention does. Against an
+almost-4x 4-thread arm there is no reading of the noise that confuses the two.
 """
 
 from __future__ import annotations
@@ -94,54 +106,112 @@ DEFAULT_SECONDS = 2.0
 DEFAULT_WARMUP = 0.5
 # Criterion 4's floor, for both halves.
 FLOOR = 6.0
+# **The wrong-profile detector, and it is a maintained figure rather than one
+# invented here.** `crates/tf_tree_py/src/tree.rs` documents `at`'s per-element
+# cost as **328 ns/elem** for `layout="quat"` at depth 3 in a *release* build,
+# pinned, best of five, and `docs/PHASE3.md` §6.1 repeats it. This sweep's
+# single-thread arm is the same shape unpinned over a window, so it should land
+# near that; a `develop`-profile build reads roughly six times worse. Printed as a
+# comparison rather than enforced as a floor: the reference is a differently
+# shaped measurement, so it is a sanity check a reader applies, not a gate.
+DOCUMENTED_NS_PER_ELEM = 328.0
 
 
-def usable_cpus() -> int:
-    """CPUs this process may actually run on.
+def usable_cpus() -> set[int]:
+    """The CPUs this process may run on, as ids.
 
     `os.sched_getaffinity` and **not** `os.cpu_count()`: the latter ignores CPU
-    affinity and cgroup quota, so under `taskset -c 0,1` or `docker --cpus=2` it
-    reports the machine and the verdict would be about a host this process cannot
-    reach. The Rust side uses `available_parallelism()` for the same reason.
+    affinity, so under `taskset -c 0,1` it reports the machine and any verdict
+    would be about a host this process cannot reach.
+
+    **It does not see a cgroup CPU *bandwidth* quota, and this used to claim it
+    did.** `docker --cpus=2` writes `cpu.max`, not `cpuset.cpus`, so the affinity
+    mask is unchanged by it and nothing below can tell. `cpu.max` is read
+    separately by [`quota_cores`]; where a quota is in force it is the binding
+    limit and the affinity mask is not.
     """
     try:
-        return len(os.sched_getaffinity(0))
+        return set(os.sched_getaffinity(0))
     except AttributeError:  # pragma: no cover - not Linux
-        return os.cpu_count() or 1
+        return set(range(os.cpu_count() or 1))
+
+
+def quota_cores() -> float | None:
+    """Cores this process's cgroup bandwidth quota allows, or `None` if unlimited.
+
+    cgroup v2's `cpu.max` is `"<quota> <period>"` in microseconds, or `"max
+    <period>"` when unlimited. `docker --cpus=2` writes `200000 100000`. This is
+    the limit `os.sched_getaffinity` cannot see, and without it a container on a
+    large host evaluates an 8-thread arm it has two cores' worth of budget for.
+    """
+    for path in ("/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read().split()
+        except OSError:
+            continue
+        if not text or text[0] in ("max", "-1"):
+            return None
+        try:
+            quota = float(text[0])
+            period = float(text[1]) if len(text) > 1 else 100_000.0
+        except ValueError:
+            return None
+        if quota > 0 and period > 0:
+            return quota / period
+    return None
 
 
 def physical_cores() -> int | None:
-    """Distinct `(physical id, core id)` pairs, capped by this process's affinity.
+    """Physical cores this process can actually use, or `None` if undecidable.
 
-    The pair-counting rule is `tf_tree_bench::report::physical_cores`'s, and
-    deliberately **not** `os.cpu_count()`: that counts SMT siblings, which would
-    make the core budget vacuously satisfied and report a verdict about a host
-    nothing was learned from.
+    Distinct `(physical id, core id)` pairs — the rule
+    `tf_tree_bench::report::physical_cores` uses, and deliberately **not**
+    `os.cpu_count()`, which counts SMT siblings and would make the core budget
+    vacuously satisfied.
 
-    **Capped by affinity, because `/proc/cpuinfo` reports the machine's topology
-    and not this container's.** Inside `docker --cpus=2`, or under `taskset`, the
-    file still lists every core on the box, so an uncapped reading would let an
-    8-thread arm be *evaluated* on two usable CPUs and print a FAIL that is
-    entirely the cgroup's - the exact collapse of `INVALID` into `FAIL` this
-    file's verdict exists to prevent.
+    **Counted only over the CPUs in this process's affinity mask, per processor.**
+    An earlier revision took every pair in `/proc/cpuinfo` and then capped the
+    *count* by the number of usable **logical** CPUs, which overstates by up to
+    the SMT width: on this host `taskset -c 0,1` selects two siblings of one
+    physical core, and that arithmetic returned **2**. The failure it admits is
+    the one this function exists to prevent — 16 sibling-paired logical CPUs are
+    8 real cores, `min(16, 16)` is 16, and an 8-thread shortfall would take the
+    `FAIL` branch and be charged to the code.
+
+    **A cgroup bandwidth quota also binds**, and the affinity mask cannot see it,
+    so [`quota_cores`] is applied as a floor on the answer.
     """
     try:
         with open("/proc/cpuinfo", encoding="utf-8") as f:
             text = f.read()
     except OSError:
         return None
-    pairs, phys, core = set(), None, None
+    mask = usable_cpus()
+    pairs, cpu, phys, core = set(), None, None, None
     for line in text.splitlines():
-        if line.startswith("physical id"):
+        if line.startswith("processor"):
+            # A new block: whatever the previous one had is already recorded.
+            cpu, phys, core = line.split(":")[-1].strip(), None, None
+        elif line.startswith("physical id"):
             phys = line.split(":")[-1].strip()
         elif line.startswith("core id"):
             core = line.split(":")[-1].strip()
-        if phys is not None and core is not None:
-            pairs.add((phys, core))
+        if cpu is not None and phys is not None and core is not None:
+            try:
+                if int(cpu) in mask:
+                    pairs.add((phys, core))
+            except ValueError:
+                return None
             phys = core = None
     if not pairs:
         return None
-    return min(len(pairs), usable_cpus())
+    n = len(pairs)
+    quota = quota_cores()
+    if quota is not None:
+        # Floor, not round: two cores' budget cannot run a third thread's work.
+        n = min(n, max(1, int(quota)))
+    return n
 
 
 def build_tree() -> tf_tree.Tree:
@@ -218,8 +288,16 @@ def one_arm(
     for t in pool:
         t.start()
     time.sleep(warmup)
-    go.set()
+    # **`started` before `go.set()`, and the order is the whole point.** Taken
+    # after, the main thread can be descheduled between the two statements — at 8
+    # threads there are 9 runnable threads on 4 cores and no GIL to serialise them
+    # — and the work done in that gap is counted in `counts` but not in `elapsed`,
+    # which inflates the rate. The bias grows with thread count while the
+    # 1-thread denominator has spare cores and sees almost none of it, so it pushes
+    # the ratio *up*, the unsafe direction for a floor with a single-digit margin.
+    # This order errs low instead.
     started = time.perf_counter()
+    go.set()
     time.sleep(seconds)
     stop.set()
     elapsed = time.perf_counter() - started
@@ -278,7 +356,15 @@ def main() -> int:
     print(f"  interpreter      {sys.version.split()[0]}  GIL enabled: {gil}")
     print(f"  criterion half   {half}")
     print(f"  physical cores   {cores if cores is not None else 'unknown'}")
-    print(f"  usable CPUs      {usable} (affinity- and cgroup-aware)")
+    quota = quota_cores()
+    print(
+        f"  usable CPUs      {len(usable)} by affinity"
+        + (
+            f", {quota:g} cores by cgroup quota"
+            if quota is not None
+            else ", no cgroup quota"
+        )
+    )
     print(f"  batch            {args.batch} stamps")
     print(
         f"  window           {args.seconds:g}s after {args.warmup:g}s warm-up,"
@@ -303,12 +389,32 @@ def main() -> int:
         # visible: this host reads ~300 ns/sample at `--release` on one thread
         # and ~1900 ns under `develop`'s default profile.
         per = 1e9 / rate if rate > 0 else float("inf")
+        note = ""
+        if n == 1:
+            note = (
+                f"   [release reference {DOCUMENTED_NS_PER_ELEM:.0f} ns/elem;"
+                f" this is {per / DOCUMENTED_NS_PER_ELEM:.1f}x it]"
+            )
         print(
             f"  {n:2d} thread(s)  {rate / 1e6:8.3f} M samples/s"
-            f"   {per:7.1f} ns/sample aggregate   ({calls} calls)"
+            f"   {per:7.1f} ns/sample aggregate   ({calls} calls){note}"
         )
 
     base = rows[0][1]
+    if base <= 0.0:
+        # **The division `--batch 0` and `--seconds 0` are rejected to protect,
+        # reached by a route they do not cover.** A 1-thread arm can complete zero
+        # calls on legal arguments — `--batch 4000000 --seconds 0.001` does it —
+        # and `rate / base` then raises `ZeroDivisionError`, which exits 1: the
+        # same code this file reserves for "the shortfall is the code's", so a
+        # starved run would be indistinguishable from a real FAIL under `--gate`.
+        print(
+            "  INVALID — the 1-thread arm completed no calls, so there is no "
+            "denominator. Lower --batch or raise --seconds; a window shorter than "
+            "one call measures nothing.",
+            file=sys.stderr,
+        )
+        return 2
     print()
     for n, rate in rows:
         print(f"  1 -> {n:<2d} scaling   {rate / base:6.3f}x")
@@ -322,8 +428,8 @@ def main() -> int:
         print(
             "  INVALID — this host publishes no physical core count, so a "
             f"{widest}-thread reading cannot be placed against anything "
-            f"({usable} usable CPUs counts SMT siblings and answers the wrong "
-            "question)."
+            f"({len(usable)} usable CPUs counts SMT siblings and answers the "
+            "wrong question)."
         )
         verdict = "INVALID"
     elif args.serialize:
@@ -335,9 +441,13 @@ def main() -> int:
         verdict = "CONTROL"
     elif scaling >= FLOOR:
         margin = (scaling / FLOOR - 1.0) * 100.0
+        # **"this run clears it", not "the criterion is met".** On a host whose
+        # reading straddles the floor, one clearing run is one conservative
+        # observation and not a settled answer; the register says which.
         print(
             f"  PASS — {scaling:.3f}x over {widest} threads against a floor of "
-            f"{FLOOR:g}x, {margin:+.1f}%. Criterion 4's {half} half is met."
+            f"{FLOOR:g}x, {margin:+.1f}%. This run clears criterion 4's {half} "
+            "half."
         )
         if cores < widest:
             print(
@@ -354,10 +464,31 @@ def main() -> int:
         )
         print(
             f"  Not FAIL: this host has {cores} physical cores for {widest} "
-            "threads, so the shortfall is not attributable to the code. The "
-            f"number is the finding; re-take it on >= {widest} physical cores to "
-            "decide the criterion."
+            "threads, so a shortfall here is not on its own attributable to the "
+            "code."
         )
+        if gil:
+            # **The host cannot be the whole story for the GIL arm, and saying it
+            # was is the mistake this paragraph replaces.** The free-threaded arm
+            # clears the floor on this same host, window and batch, so these cores
+            # demonstrably can deliver it; and the GIL arm's 1->4 reads *higher*
+            # than the free-threaded one, so the gap appears only where SMT
+            # siblings contend on GIL-held work. There is code-side GIL-held work
+            # to suspect: `Plan::at` allocates its (N,4,4) output before `fill`
+            # detaches. Charging this to the host without an `at_into` arm — no
+            # per-call allocation — is blaming an arm nobody measured.
+            print(
+                "  And it is not the whole story here: the free-threaded arm "
+                "clears the floor on this same host, so these cores can deliver "
+                "it. The GIL arm needs an `at_into` comparison — no per-call "
+                "allocation, so no GIL-held allocation — before the shortfall is "
+                "attributed anywhere. Unresolved, deliberately."
+            )
+        else:
+            print(
+                f"  The number is the finding; re-take it on >= {widest} "
+                "physical cores to decide the criterion."
+            )
         verdict = "INVALID"
     else:
         # **The one place a miss is the code's, and it has to exist.** The
@@ -382,7 +513,8 @@ def main() -> int:
                 "criterion_half": "gil" if gil else "freethreaded",
                 "gil_enabled": gil,
                 "physical_cores": cores,
-                "usable_cpus": usable,
+                "usable_cpus": len(usable),
+                "quota_cores": quota,
                 "batch": args.batch,
                 "serialize": args.serialize,
                 "floor": FLOOR,

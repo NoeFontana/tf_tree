@@ -3221,29 +3221,29 @@ py-test-freethreaded:
 # threads and asserts **correctness**, which would pass on a build that serialised
 # every call.
 #
+# **No figures here.** `docs/benchmarks/EVIDENCE.md`'s probe row is their only
+# copy: they were written into four places at once and the copies disagreed in the
+# third digit within one revision.
+#
 # **`--release`, where `just py-test-freethreaded`'s otherwise identical install
 # line is not, and this recipe shipped without it first.** `just gate4-python`
-# carries the same note for the same reason. Measured on this host, same script,
-# same window: `develop`'s default profile reads 0.52 M samples/s on one thread
-# against 3.33 M at release, and the *scaling curve* moves with it — 4.4-5.1x
-# against 6.17-6.23x. A debug build is not a slower release build, it is a
-# different program, and the first revision of this recipe published the debug
-# curve as the finding and an `INVALID` verdict that release turns into a **PASS**.
-# It is also the profile a `pip install` gets.
+# carries the same note for the same reason. A debug build is not a slower release
+# build but a different program: it reads about six times worse *and moves the
+# scaling curve*, so the first revision of this recipe published a debug curve as
+# the finding and blamed the host for it. The harness prints ns/sample against
+# `tree.rs`'s documented release figure so a wrong profile is unmissable. It is
+# also the profile a `pip install` gets.
 #
 # **`.venv-t`, so this is the free-threaded half.** Run the same script under
 # `.venv/bin/python` for the GIL half; the script reports which one it answered.
 #
-# `--serialize` is the control: one lock around every call, which must read a flat
-# or falling curve. A harness that cannot produce one on demand is not measuring
-# one. `--gate --serialize` is refused rather than reporting the control as a
-# regression.
+# `--serialize` is the control: one lock around every call, which must read a
+# falling curve. A harness that cannot produce one on demand is not measuring one.
+# `--gate --serialize` is refused rather than reporting the control as a regression.
 #
-# **Do not shorten the window to make the sweep quick**, but do not attribute the
-# instrument's spread to it either: at `--seconds 1` a 4-thread arm read 3.29x,
-# and so did one run at the 2 s default, so the short window is a worse sample
-# rather than a different measurement. The defaults are the measured
-# configuration.
+# **The defaults are the measured configuration.** A shorter window is a worse
+# sample of the same thing rather than a different measurement, and the readings
+# here sit close enough to the criterion's floor that the sample matters.
 
 # `plan.at` on 1/2/4/8 threads under `python3.14t` — PHASE3 §12.2 criterion 4.
 py-thread-scaling *ARGS:
