@@ -234,6 +234,32 @@ performance target.
    building, and that a multi-tenant host may not offer one on demand. What is
    still true is that this is a scheduling problem and not a missing machine.
 
+   **The instrument landed 2026-09-11; the twelve readings did not.** The
+   crate-boundary choice above was taken the way this step names it — one entry
+   point, not a second copy of the sampler: `tf_tree_bench`'s `quiet_check` bin
+   calls `mp::require_quiet_machine` and `just abi-cost` brackets the two
+   `abi_cost` runs with it (`before`, then `after` once the binary has exited so
+   its own core is out of the window). It exits **2**, where `abi_cost` exits 1
+   for a missed ratio, so a loud host cannot be read as the ABI regressing —
+   `docs/PROJECT.md` §6's *INVALID is not FAIL*. All three branches were
+   exercised on 2026-09-11: QUIET at 1.7 %, NOT QUIET at 15.6 % and at 100 %
+   (exit 2, naming the top consumers), and the `TF_TREE_BENCH_FORCE` override at
+   100 %, which passes and **says so in the line** — an override that is silently
+   unfailable is the defect this record is named after, one layer down.
+
+   What is still owed is the *measurement*: twelve runs each recording
+   `busy <= 0.10`. That needs a window in which nothing else on this box is
+   building, and this session's own agents put the host at 15.6 % while the check
+   was being written. The step stays open on that, and it is now open on
+   something a log can settle rather than on an instrument that did not exist.
+
+   **A bound worth stating rather than discovering later**: `busy_fraction` reads
+   `/proc/stat`'s aggregate line, while `abi_cost` is `taskset -c 2`. A machine
+   at 8 % aggregate could in principle be one neighbour pinned to CPU 2, which
+   the check would pass and the run would feel. `QUIET_ENOUGH` at 0.10 of 8 CPUs
+   is 0.8 of a core, so the case is narrow and real; per-CPU sampling is not
+   built and is not claimed.
+
 **Steps 6 and 7 are what the open questions' recommendations would add, listed
 here so a ratifier sees the whole cost. They are proposals, like everything else
 under *Decision*.**

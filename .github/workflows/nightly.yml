@@ -291,3 +291,115 @@ jobs:
       # job publishes should be the shipped one.
       - name: just gate5
         run: just gate5
+
+  # **Nothing here notified anybody, and that is how four red nightlies in five
+  # nights went unnoticed.**
+  #
+  # The jobs above have exited non-zero since 2026-09-04 and the run goes red,
+  # but a red run on a schedule nobody watches is a tree falling in a forest: on
+  # 2026-09-11 the state was found because a human *guessed* to look. A gate
+  # whose failure reaches no one is the defect class this repository keeps
+  # finding in its own assertions, one layer out — it cannot fail in the only
+  # sense that matters.
+  #
+  # **It reports jobs, not the run.** A run's colour is not a job's colour: one
+  # red job among six green ones reds the run, and an issue saying "nightly
+  # failed" sends the reader back to the log-digging this job exists to spare
+  # them. The body names each failed job and links straight to it, read from the
+  # jobs API rather than from `needs.*.result`, so a job added above needs no
+  # edit here and cannot be silently dropped from the report.
+  #
+  # **One issue, not one per night.** A fresh issue every 24 h for the same
+  # standing failure is noise that gets muted, so a later run appends a comment
+  # to the open `nightly-red` issue instead. And it **closes** that issue when
+  # the nightly comes back green: an alert that never clears stops being read,
+  # which is the failure mode one layer up from the one this job fixes. Only an
+  # issue this workflow itself opened is closed — a human's issue carrying the
+  # same label is commented on and left alone.
+  #
+  # `always()`: every `needs` job failing would otherwise skip this one, which is
+  # exactly the case it exists for. `continue-on-error` so a permissions problem
+  # or a rate limit reports itself without turning a green nightly red — this job
+  # is the messenger and must never become the message.
+  notify:
+    name: report the night's result
+    needs: [torture, crash-points, sanitizers, tf2-differential, cpp-sanitizers, gate4]
+    if: always()
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: open, update or close the nightly-red issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Read the night's result from the jobs API rather than from this
+          # job's own `needs` bookkeeping: it is the same source a human would
+          # open, it carries per-job URLs, and it does not go stale when a job
+          # is added above. This job is itself in the listing with a null
+          # conclusion, so select on `failure` rather than on "not success" —
+          # which also keeps `cancelled` and `skipped` out of the report.
+          failed=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | "- **\(.name)** — \(.html_url)"')
+
+          # The label the query below filters on. Idempotent: the 422 this
+          # returns once the label exists is the steady state, not an error.
+          gh api -X POST "repos/$REPO/labels" \
+            -f name=nightly-red \
+            -f color=B60205 \
+            -f description='The scheduled nightly run has a failing job' \
+            >/dev/null 2>&1 || true
+
+          standing=$(gh api "repos/$REPO/issues?state=open&labels=nightly-red&per_page=1")
+          number=$(printf '%s' "$standing" | jq -r '.[0].number // empty')
+          author=$(printf '%s' "$standing" | jq -r '.[0].user.login // empty')
+
+          # Built with printf rather than a multi-line shell string: every line
+          # of this script lives inside a YAML block scalar, so a continuation
+          # line at column 0 leaves the scalar and a line indented to match it
+          # reaches Markdown as an indented code block. printf is the spelling
+          # that is correct in both.
+          if [ -z "$failed" ]; then
+            if [ -n "$number" ] && [ "$author" = "github-actions[bot]" ]; then
+              body=$(printf '%s\n' \
+                "Nightly is green again on \`$SHA\`, so this is closed." \
+                "" \
+                "Run: $RUN_URL")
+              gh api -X POST "repos/$REPO/issues/$number/comments" -f body="$body" >/dev/null
+              gh api -X PATCH "repos/$REPO/issues/$number" -f state=closed >/dev/null
+              echo "nightly green — closed #$number"
+            else
+              echo "nightly green — no standing issue of ours to clear"
+            fi
+            exit 0
+          fi
+
+          body=$(printf '%s\n' \
+            "The scheduled nightly has failing job(s) on \`$SHA\`." \
+            "" \
+            "$failed" \
+            "" \
+            "Run: $RUN_URL" \
+            "" \
+            "Judge **per job**. The rest of this run passed, and a red run is not" \
+            "a red job — each link above goes to that job's own log.")
+
+          if [ -n "$number" ]; then
+            gh api -X POST "repos/$REPO/issues/$number/comments" -f body="$body" >/dev/null
+            echo "commented on #$number"
+          else
+            n=$(gh api -X POST "repos/$REPO/issues" \
+              -f title='Nightly is red' \
+              -f body="$body" \
+              -f 'labels[]=nightly-red' \
+              --jq '.number')
+            echo "opened #$n"
+          fi

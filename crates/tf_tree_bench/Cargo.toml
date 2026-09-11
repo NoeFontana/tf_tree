@@ -469,3 +469,14 @@ required-features = ["tf2"]
 name = "owner_migration"
 path = "src/bin/owner_migration.rs"
 required-features = ["shm"]
+
+# **`docs/decisions/0023` step 5's instrument.** The §7 ABI gate's own harness is
+# an *example of `tf_tree_c`*, and `tf_tree_bench` depends on `tf_tree_c`, so it
+# cannot call `mp::require_quiet_machine` without a dependency cycle. This is the
+# entry point `just abi-cost` brackets the run with instead of the second copy of
+# the sampler that the alternative would have been. No `required-features`:
+# `/proc/stat` needs neither `shm` nor ROS, and the recipe that calls it builds
+# `tf_tree_c` with default features.
+[[bin]]
+name = "quiet_check"
+path = "src/bin/quiet_check.rs"
