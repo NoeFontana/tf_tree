@@ -71,8 +71,8 @@ as the free-threaded one or higher; the gap opens only at 8 threads, where SMT
 siblings contend on GIL-held work. The code-side suspect was `Plan::at` allocating
 its `(N,4,4)` output before `fill` detaches, and `--call at_into` prices it: the
 same sweep, a caller-owned buffer, nothing allocated per call. It reads **higher at
-1->8 in six of six interleaved pairs** and **still short of the floor**. So roughly
-half the gap is a GIL-held allocation and the rest is unattributed — a narrower and
+1->8 in every interleaved pair taken** and **still short of the floor**. So part of
+the gap is a GIL-held allocation and the rest is unattributed — a narrower and
 more useful statement than either "the host blocks it" or "the allocation is the
 cause", both of which this file has published and neither of which survived
 measurement. `--gate --call at_into` is refused: §7.3 names `plan.at`, and a
@@ -554,18 +554,21 @@ def main() -> int:
             # `--call at_into`, which writes into a caller-owned buffer and
             # allocates nothing per call, is the comparison that prices it.
             #
-            # Measured 2026-09-11, six interleaved pairs on a host `quiet_check`
-            # passed at 5.9-7.1%: `at_into` read higher at 1->8 in **6 of 6**
-            # pairs, by +0.22 to +1.69, and its spread was 0.36 against `at`'s
-            # 1.27. On one thread the two are within ~2%, which is the shape of a
-            # cost that is cheap alone and serialises under contention.
+            # Measured 2026-09-11 by interleaved pairs, so the comparison
+            # survives a host that drifted between windows. `at_into` read
+            # higher at this width in every pair, by a margin that is large
+            # beside the single-thread difference between the two calls — the
+            # shape of a cost that is cheap alone and serialises under
+            # contention. **And it still does not reach the floor.** So neither
+            # "the host blocks it" nor "the allocation is the cause" survives:
+            # the allocation is a real, measured contributor to part of the gap,
+            # and the remainder is unattributed.
             #
-            # **And it still does not reach the floor** — `at_into` topped out at
-            # 5.64 against 6.0. So neither "the host blocks it" nor "the
-            # allocation is the cause" survives: the allocation is a real,
-            # measured contributor worth roughly half the gap, and the remainder
-            # is unattributed. The figures live in `docs/benchmarks/EVIDENCE.md`,
-            # not here.
+            # **No readings here.** `docs/benchmarks/EVIDENCE.md`'s probe row is
+            # deliberately their only copy — an earlier version of this comment
+            # restated six of them byte for byte and then closed by saying the
+            # figures lived in EVIDENCE.md, which was false of the four lines
+            # above it and is the exact drift that row exists to stop.
             if not into:
                 print(
                     "  And it is not the whole story: the free-threaded arm "
