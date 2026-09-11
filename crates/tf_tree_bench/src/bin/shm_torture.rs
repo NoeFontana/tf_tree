@@ -2441,6 +2441,26 @@ mod imp {
         /// against an arena no owner is serving — so a run that recovers late
         /// has two different populations, and only the pair says which.
         heirs_first_round: Option<u64>,
+        /// Wall time from `kill()` to `wait()` returning — **the blind window**
+        /// in which the pool can drain without the census being able to see it.
+        ///
+        /// This is the number the 2026-09-11 investigation turned on and the
+        /// one the log could not report. `heirs_before` is censused, then the
+        /// victim is killed and reaped, then `heirs_at_kill` is censused; a
+        /// survivor running its 2 %-per-operation detach arm during that
+        /// interval leaves, and the `owner.pid` guard does not protect it
+        /// because the marker still names the corpse. So the hazard is
+        /// proportional to this duration, and it is **not** a constant of the
+        /// harness: it is dominated by the victim's teardown, which scales with
+        /// its RSS. Measured on this host, three reps each, `--children 4
+        /// --kill-hz 4`: a plain release child is 2.8 MB and reaps in
+        /// **0.224–0.263 ms**; the same child under ASan is **43–49 MB** and
+        /// reaps in **4.720–5.868 ms**, about 21× the window. ASan RSS also
+        /// grows 5–9 MB/s from ~11 MB at spawn, and the victim is always the
+        /// *oldest* child, because the ordinary draw spares the role holder and
+        /// the role holder extends its operation cap — so the window grows with
+        /// the owner's tenure, which `owner_kill_every` sets.
+        kill_to_reaped: Option<Duration>,
     }
 
     impl Migration {
@@ -2453,8 +2473,10 @@ mod imp {
                 victim,
                 recovered,
                 inherits,
+                heirs_before,
                 heirs_at_kill,
                 heirs_first_round,
+                kill_to_reaped,
                 ..
             } = self;
             let unknown = || "?".to_string();
@@ -2468,11 +2490,25 @@ mod imp {
                      next interval."
                 );
             }
+            // **`heirs_before` and the reap window are printed because their
+            // absence is what made the 2026-09-11 nightly undiagnosable from
+            // its own log.** `heirs_before` was recorded and read by exactly
+            // one consumer — the `starved` test at the call site — and never
+            // printed, so a failing kill could not say how many heirs it had to
+            // lose: `heirs_at_kill = heirs_before - 1 - departures`, and with
+            // only the left-hand side in the log the departure count is not
+            // recoverable. With both, plus the window they departed in, the
+            // whole hypothesis is decidable from one nightly instead of from a
+            // local reproduction.
             format!(
-                "shm_torture: §3.5 owner kill {n}: killed pid {}; {}; {inherits} survivor(s) \
-                 inherited; {} heir(s) attached at the kill, {} on the first round after; the \
-                 observer validated {} transform(s) while the role was vacant",
+                "shm_torture: §3.5 owner kill {n}: killed pid {}{}; {}; {inherits} survivor(s) \
+                 inherited; {} heir(s) attached before the kill, {} after it, {} on the first \
+                 round after; the observer validated {} transform(s) while the role was vacant",
                 victim.map_or_else(unknown, |p| p.to_string()),
+                kill_to_reaped.map_or_else(String::new, |d| format!(
+                    " (reaped in {:.1} ms)",
+                    d.as_secs_f64() * 1e3
+                )),
                 recovered.map_or_else(
                     || format!("NO fresh process joined within {OWNER_RECOVERY_DEADLINE:?}"),
                     |d| format!(
@@ -2480,6 +2516,7 @@ mod imp {
                         d.as_secs_f64() * 1e3
                     )
                 ),
+                heirs_before.map_or_else(unknown, |c| c.to_string()),
                 heirs_at_kill.map_or_else(unknown, |c| c.to_string()),
                 heirs_first_round.map_or_else(unknown, |c| c.to_string()),
                 self.reads.total(),
@@ -2590,6 +2627,7 @@ mod imp {
             heirs_first_round: None,
             deferred: false,
             heirs_before: None,
+            kill_to_reaped: None,
         };
         let before = inheritance_count(dir);
         let Some(pid) = read_owner_pid(dir) else {
@@ -2630,6 +2668,9 @@ mod imp {
         }
 
         let mut killed = false;
+        // Bracketing both arms rather than each, so the number printed is the
+        // whole interval between the two censuses and not a part of it.
+        let kill_started = Instant::now();
         if owner_kid.as_ref().is_some_and(|k| k.proc.id() == pid) {
             if let Some(kid) = owner_kid.as_mut() {
                 let _ = kid.proc.kill();
@@ -2656,6 +2697,7 @@ mod imp {
             return m;
         }
         m.victim = Some(pid);
+        m.kill_to_reaped = Some(kill_started.elapsed());
 
         // **Censused here and nowhere else, because this is the only instant
         // the number means what the verdict needs.** `drive` observes at the
