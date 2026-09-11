@@ -893,8 +893,11 @@ gate4-python: py-setup
 # was added to the same file. The comparands are pinned now
 # (`#[inline(never)]` + `black_box`) and the binary carries a standing control
 # row that fails if the pin ever stops holding. The three rungs it gates and
-# their allowances are `docs/decisions/0023` — draft, so read them as a proposal
-# a human ratifies by merging it.
+# their allowances are `docs/decisions/0023`, whose status line reads **`ready`**
+# — so they are decided and this recipe implements them as stated. *This comment
+# said `draft` and told the reader to treat them as a proposal*; it was one of
+# three sites that had not been carried forward when the record was ratified, the
+# others being the paragraph twenty lines below and `EVIDENCE.md`'s §7 row.
 #
 # **Why this is not in a workflow when `just gate4` now is**, since the two look
 # like siblings — both are §7-style gate criteria that no job used to run. They
@@ -903,19 +906,54 @@ gate4-python: py-setup
 # columns, and whether it stays resolvable under a hosted runner's neighbours is
 # not something this repository has measured — and a gate that flaps is a gate
 # people learn to pass by editing the gate. Wiring it needs that number first,
-# from repeated runs on a runner, not from an argument. `0023` being draft is a
-# second reason and not the main one: the thresholds it would gate against are
-# still a proposal.
+# from repeated runs on a runner, not from an argument. *This paragraph carried a
+# second reason — "`0023` being draft ... the thresholds it would gate against
+# are still a proposal" — and that reason has expired*: the record is `ready`, so
+# the allowances are decided. The runner-variance reason above is now the only
+# one, and it is the one that was always doing the work.
 abi-cost:
     #!/usr/bin/env bash
     set -euo pipefail
+    T="${CARGO_TARGET_DIR:-target}"
     cargo build --release -q -p tf_tree_c --features test-hooks --example abi_cost
     cargo build --profile embedder -q -p tf_tree_c --features test-hooks --example abi_cost
+    cargo build --release -q -p tf_tree_bench --bin quiet_check
+    # `0023` step 5: the run has to be SHOWN to have been quiet, and the sample
+    # has to be taken outside the workload — `busy_fraction` reads /proc/stat's
+    # aggregate, which includes `abi_cost` saturating a core (~12.5% of 8 CPUs),
+    # so an in-run sample could never pass. Exit 2 here is INVALID, not FAIL:
+    # `abi_cost` exits 1 when the ratio misses, and the two must not read alike.
+    "$T/release/quiet_check" before
+    echo
     echo "=== release profile (lto = \"thin\" — the boundary is ERASED; contrast only) ==="
-    taskset -c 2 ./target/release/examples/abi_cost release
+    taskset -c 2 "$T/release/examples/abi_cost" release
     echo
     echo "=== embedder profile (lto = false — a REAL boundary; THIS one gates) ==="
-    taskset -c 2 ./target/embedder/examples/abi_cost embedder
+    # **Not under `set -e`, and that is the whole point of the bracket.**
+    # `abi_cost` exits 1 when the §7 ratio misses, and under `set -e` that would
+    # abort the recipe *before* the closing quiet sample ran — so a run that
+    # missed because the host went loud mid-measurement would be reported as an
+    # ABI regression, which is exactly the INVALID-read-as-FAIL this instrument
+    # exists to prevent. Only the `embedder` arm can exit 1 (`abi_cost`'s
+    # `gate_failed` is `&& boundary_real`), so the contrast arm above needs no
+    # such treatment.
+    set +e
+    taskset -c 2 "$T/embedder/examples/abi_cost" embedder
+    gate=$?
+    set -e
+    echo
+    # The closing half of the bracket, after `abi_cost` has exited so its own
+    # load is out of the window. quiet-then-loud means somebody else started
+    # work *during* the run, which one pre-run sample cannot see.
+    #
+    # **INVALID outranks FAIL.** If the machine was loud at either end, no
+    # number from this run is admissible and the exit code says 2 whatever the
+    # ratio did — a miss on an unusable measurement is not evidence about the
+    # ABI. `quiet_check` prints its own reason before this line is reached.
+    if ! "$T/release/quiet_check" after; then
+      exit 2
+    fi
+    exit "$gate"
 
 # The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
 c-abi-check:

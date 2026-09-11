@@ -216,8 +216,23 @@ performance target.
 
    *And the sampler is in the wrong crate to just call.* It is
    `tf_tree_bench::mp`, while `abi_cost.rs` is an example of `tf_tree_c`, which
-   has no dependency on `tf_tree_bench` — dev or otherwise — and cannot gain one
-   without a cycle, since `tf_tree_bench` depends on `tf_tree_c`. So the printing
+   has no dependency on `tf_tree_bench` — dev or otherwise.
+
+   **This step said it "cannot gain one without a cycle, since `tf_tree_bench`
+   depends on `tf_tree_c`", and that is false.** Cargo *permits* a
+   dev-dependency cycle: dev-dependencies do not participate in the library's
+   own build graph, so a package's may depend back on it. Measured on
+   2026-09-11 rather than reasoned about — a two-crate scratch workspace in
+   exactly this shape (`a` dev-depends on `b`, `b` depends on `a`, an **example**
+   of `a` calls into `b`) compiles. So the dev-dependency was available and the
+   record ruled it out on a rule that does not exist.
+
+   The conclusion survives on two reasons that do hold, and they are weaker and
+   worth stating as such: a dev-dependency pulls `tf_tree_bench` and its whole
+   tree into every `tf_tree_c` example build for a 300 ms read of `/proc/stat`;
+   and — the load-bearing one — the sampler must not run **inside the measured
+   process**, which is the paragraph above this one and is a property of *where
+   the sample is taken*, not of which crate owns the code. So the printing
    half is one of: a small `tf_tree_bench` entry point that `just abi-cost`
    brackets the run with, or a second implementation of the sampler. The first
    keeps one spelling and is what this step should do; the second is the defect
@@ -233,6 +248,32 @@ performance target.
    twelve have to be collected in a window when nothing else on the box is
    building, and that a multi-tenant host may not offer one on demand. What is
    still true is that this is a scheduling problem and not a missing machine.
+
+   **The instrument landed 2026-09-11; the twelve readings did not.** The
+   crate-boundary choice above was taken the way this step names it — one entry
+   point, not a second copy of the sampler: `tf_tree_bench`'s `quiet_check` bin
+   calls `mp::require_quiet_machine` and `just abi-cost` brackets the two
+   `abi_cost` runs with it (`before`, then `after` once the binary has exited so
+   its own core is out of the window). It exits **2**, where `abi_cost` exits 1
+   for a missed ratio, so a loud host cannot be read as the ABI regressing —
+   `docs/PROJECT.md` §6's *INVALID is not FAIL*. All three branches were
+   exercised on 2026-09-11: QUIET at 1.7 %, NOT QUIET at 15.6 % and at 100 %
+   (exit 2, naming the top consumers), and the `TF_TREE_BENCH_FORCE` override at
+   100 %, which passes and **says so in the line** — an override that is silently
+   unfailable is the defect this record is named after, one layer down.
+
+   What is still owed is the *measurement*: twelve runs each recording
+   `busy <= 0.10`. That needs a window in which nothing else on this box is
+   building, and this session's own agents put the host at 15.6 % while the check
+   was being written. The step stays open on that, and it is now open on
+   something a log can settle rather than on an instrument that did not exist.
+
+   **A bound worth stating rather than discovering later**: `busy_fraction` reads
+   `/proc/stat`'s aggregate line, while `abi_cost` is `taskset -c 2`. A machine
+   at 8 % aggregate could in principle be one neighbour pinned to CPU 2, which
+   the check would pass and the run would feel. `QUIET_ENOUGH` at 0.10 of 8 CPUs
+   is 0.8 of a core, so the case is narrow and real; per-CPU sampling is not
+   built and is not claimed.
 
 **Steps 6 and 7 are what the open questions' recommendations would add, listed
 here so a ratifier sees the whole cost. They are proposals, like everything else
