@@ -72,8 +72,8 @@ pub const SCHEMA: &str = "tf_tree.bench-report/2";
 ///
 /// Named once, so the HTML's "Reproducing this" line and the test that checks it
 /// against the real `justfile` cannot disagree. It is **not**
-/// `cargo xtask bench-report`: `xtask` dispatches `loom | miri | bench-gate |
-/// headers` and nothing else, so that spelling exits non-zero. In an artifact
+/// `cargo xtask bench-report`: `xtask` dispatches `loom | bench-gate | headers`
+/// and nothing else, so that spelling exits non-zero. In an artifact
 /// whose whole thesis is that a benchmark nobody can reproduce persuades nobody,
 /// the reproduce line is the last place a wrong command can be afforded.
 pub const REPRODUCE_RECIPE: &str = "just bench-report";

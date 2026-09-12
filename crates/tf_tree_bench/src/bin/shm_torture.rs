@@ -642,7 +642,7 @@ mod imp {
                 // harness prove it can see a violation and a missing migration;
                 // this one makes it prove it can see — and then stop — a pool
                 // that drains inside the interval where nobody can inherit.
-                // See [`Args::victim_ballast_mb`]. 512 buys roughly a 46 ms
+                // See [`Args::victim_ballast_mb`]. 512 buys roughly a 49 ms
                 // window on the development host, which wedges an unfixed
                 // `--children 4` run within a handful of kills rather than
                 // within a nightly.

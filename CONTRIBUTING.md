@@ -24,7 +24,7 @@ crates/
 ├── tf_tree_bench/         criterion benches + tf2 differential harness
 └── tf_tree_cli/           binary `tf_tree` (alias `tft`)
 ros/                       ament_cmake packages; not cargo crates (`just ros-build`)
-xtask/                     loom / miri / bench-gate runners
+xtask/                     loom / bench-gate / headers runners
 docs/PROJECT.md            overview, roadmap, decision log D1–D22 (§5)
 docs/PHASE1.md             normative Phase 1 spec (implemented whole)
 docs/PHASE2.md             normative Phase 2 spec; §1 = Phase 1 amendments A1–A8

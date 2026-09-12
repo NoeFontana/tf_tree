@@ -2,9 +2,12 @@
 //! Workspace automation runner (`cargo xtask <task>`).
 //!
 //! `loom` and `bench-gate` are wired up (steps 5 and 9 of `docs/PHASE1.md`'s
-//! implementation order; §10.2 and §11.3); `miri`
-//! is wired up by its own Phase 1 PR. `headers` generates and drift-checks the
-//! C ABI's committed headers (`docs/PHASE4.md` §3.1, `docs/decisions/0007`).
+//! implementation order; §10.2 and §11.3). `headers` generates and drift-checks
+//! the C ABI's committed headers (`docs/PHASE4.md` §3.1, `docs/decisions/0007`).
+//!
+//! No `miri` task: the one that used to be here returned `ExitCode::SUCCESS`
+//! having run nothing, so the only documented way to reach it was also the only
+//! way to get a false green. Miri is `just miri` and `just c-abi-check`.
 
 mod headers;
 
@@ -17,12 +20,9 @@ fn main() -> ExitCode {
         Some("bench-gate") => run_bench_gate(),
         // `--check` fails on drift instead of rewriting; that is the form CI runs.
         Some("headers") => headers::run(std::env::args().any(|a| a == "--check")),
-        Some("miri") => {
-            eprintln!("xtask: 'miri' is wired up by its Phase 1 PR");
-            ExitCode::SUCCESS
-        }
         _ => {
-            eprintln!("usage: cargo xtask <loom|miri|bench-gate|headers [--check]>");
+            eprintln!("usage: cargo xtask <loom|bench-gate|headers [--check]>");
+            eprintln!("       (Miri is `just miri` and `just c-abi-check`, not a task here)");
             ExitCode::FAILURE
         }
     }

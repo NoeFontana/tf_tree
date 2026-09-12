@@ -96,7 +96,7 @@ tf_tree/
 │   ├── tf_tree/                # std facade. Re-exports + ergonomic helpers.
 │   ├── tf_tree_bench/          # criterion, incl. tf2 comparison harness
 │   └── tf_tree_cli/            # binary `tf_tree` (alias `tft`)
-└── xtask/                        # loom, miri, bench-gate runners
+└── xtask/                        # loom, bench-gate, headers runners
 ```
 
 Crate names use underscores throughout (as `serde_json` and `parking_lot` do), so the import path matches the project name: `use tf_tree::...`.

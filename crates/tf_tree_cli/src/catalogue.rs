@@ -116,154 +116,94 @@ impl Severity {
     }
 }
 
-/// A stable diagnostic identifier (`docs/PHASE5.md` §6). The numbering is the
-/// specification's and does not change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tft {
+/// The catalogue, declared once.
+///
+/// Four parallel 19-entry lists — the variants, `ALL`, `id`, `title`,
+/// `severity` — used to be written out by hand, and `ALL` was the only one the
+/// compiler did not enforce, so a new check could be declared, given an id and a
+/// title, and still never run. Two hand-written tests failed to close that: both
+/// derived what to expect from a second hand-written list, and both passed with
+/// a twentieth variant missing from `ALL`. Generating all four from one row
+/// removes the gap instead of guarding it.
+macro_rules! catalogue {
+    ($( $(#[$m:meta])* $variant:ident => { id: $id:literal, title: $title:literal, severity: $sev:ident } ),+ $(,)?) => {
+        /// A stable diagnostic identifier (`docs/PHASE5.md` §6). The numbering is
+        /// the specification's and does not change.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum Tft {
+            $( $(#[$m])* $variant, )+
+        }
+
+        impl Tft {
+            /// Every check, in id order. [`crate::checks::run`] walks this.
+            pub const ALL: [Tft; [$(Tft::$variant),+].len()] = [$(Tft::$variant),+];
+
+            /// The stable identifier, e.g. `"TFT010"`. **Never changes.**
+            #[must_use]
+            pub fn id(self) -> &'static str {
+                match self { $( Tft::$variant => $id, )+ }
+            }
+
+            /// A one-line description, for the human report's header.
+            #[must_use]
+            pub fn title(self) -> &'static str {
+                match self { $( Tft::$variant => $title, )+ }
+            }
+
+            /// Fixed per id rather than per finding: `--exit-code` is only a
+            /// usable gate if the set of ids that can fail it is knowable from
+            /// the documentation, without running anything.
+            #[must_use]
+            pub fn severity(self) -> Severity {
+                match self { $( Tft::$variant => Severity::$sev, )+ }
+            }
+        }
+    };
+}
+
+catalogue! {
     /// Multi-publisher conflict on an edge.
-    Tft001,
+    Tft001 => { id: "TFT001", title: "multi-publisher conflict on an edge", severity: Error },
     /// Static transform republished with a different value.
-    Tft002,
+    Tft002 => { id: "TFT002", title: "static transform republished with a different value", severity: Error },
     /// Edge kind changed (static <-> dynamic).
-    Tft003,
+    Tft003 => { id: "TFT003", title: "edge kind changed (static <-> dynamic)", severity: Error },
     /// Clock skew between publishers.
-    Tft004,
+    Tft004 => { id: "TFT004", title: "clock skew between publishers", severity: Warn },
     /// Stamps in the future.
-    Tft005,
+    Tft005 => { id: "TFT005", title: "stamps in the future", severity: Warn },
     /// Zero or absurd stamps.
-    Tft006,
+    Tft006 => { id: "TFT006", title: "zero or absurd stamps", severity: Error },
     /// Publish rate deviates from the declared nominal rate.
-    Tft007,
+    Tft007 => { id: "TFT007", title: "publish rate deviates from nominal", severity: Warn },
     /// Jitter: the inter-arrival distribution is far from its own centre.
-    Tft008,
+    Tft008 => { id: "TFT008", title: "jitter: inter-arrival spread", severity: Warn },
     /// Gaps / dropouts.
-    Tft009,
+    Tft009 => { id: "TFT009", title: "gaps / dropouts", severity: Warn },
     /// Extrapolation hotspot.
-    Tft010,
+    Tft010 => { id: "TFT010", title: "extrapolation hotspot", severity: Warn },
     /// Ring capacity too small for the observed consumer lag.
-    Tft011,
+    Tft011 => { id: "TFT011", title: "ring capacity too small for observed consumer lag", severity: Warn },
     /// Disconnected subtree.
-    Tft012,
+    Tft012 => { id: "TFT012", title: "disconnected subtree", severity: Error },
     /// Frame declared but never published.
-    Tft013,
+    Tft013 => { id: "TFT013", title: "frame declared but never published", severity: Info },
     /// Participant or claim slot leak.
-    Tft014,
+    Tft014 => { id: "TFT014", title: "participant or claim slot leak", severity: Warn },
     /// Arena occupancy above 80%.
-    Tft015,
+    Tft015 => { id: "TFT015", title: "arena occupancy above 80%", severity: Warn },
     /// Transparent huge pages disabled, or `RLIMIT_MEMLOCK` below the arena size.
-    Tft016,
+    Tft016 => { id: "TFT016", title: "transparent huge pages off, or RLIMIT_MEMLOCK below the arena size", severity: Info },
     /// A dynamic edge with no live writer holding its claim.
-    Tft017,
+    Tft017 => { id: "TFT017", title: "dynamic edge with no live writer", severity: Warn },
     /// Stamps arriving out of monotonic order on an edge.
-    Tft018,
-    /// A wall-clock domain stepped backwards — [`Tft::Tft018`]'s cause, not a
+    Tft018 => { id: "TFT018", title: "stamps arriving out of order", severity: Error },
+    /// A wall-clock domain stepped backwards — [`Tft::Tft019`]'s cause, not a
     /// publisher fault.
-    Tft019,
+    Tft019 => { id: "TFT019", title: "a wall-clock domain stepped backwards", severity: Warn },
 }
 
 impl Tft {
-    /// Every check, in id order. [`crate::checks::run`] walks this, so a new
-    /// variant cannot be added and then silently never executed.
-    pub const ALL: [Tft; 19] = [
-        Tft::Tft001,
-        Tft::Tft002,
-        Tft::Tft003,
-        Tft::Tft004,
-        Tft::Tft005,
-        Tft::Tft006,
-        Tft::Tft007,
-        Tft::Tft008,
-        Tft::Tft009,
-        Tft::Tft010,
-        Tft::Tft011,
-        Tft::Tft012,
-        Tft::Tft013,
-        Tft::Tft014,
-        Tft::Tft015,
-        Tft::Tft016,
-        Tft::Tft017,
-        Tft::Tft018,
-        Tft::Tft019,
-    ];
-
-    /// The stable identifier, e.g. `"TFT010"`. **Never changes.**
-    #[must_use]
-    pub fn id(self) -> &'static str {
-        match self {
-            Tft::Tft001 => "TFT001",
-            Tft::Tft002 => "TFT002",
-            Tft::Tft003 => "TFT003",
-            Tft::Tft004 => "TFT004",
-            Tft::Tft005 => "TFT005",
-            Tft::Tft006 => "TFT006",
-            Tft::Tft007 => "TFT007",
-            Tft::Tft008 => "TFT008",
-            Tft::Tft009 => "TFT009",
-            Tft::Tft010 => "TFT010",
-            Tft::Tft011 => "TFT011",
-            Tft::Tft012 => "TFT012",
-            Tft::Tft013 => "TFT013",
-            Tft::Tft014 => "TFT014",
-            Tft::Tft015 => "TFT015",
-            Tft::Tft016 => "TFT016",
-            Tft::Tft017 => "TFT017",
-            Tft::Tft018 => "TFT018",
-            Tft::Tft019 => "TFT019",
-        }
-    }
-
-    /// A one-line title, matching §6's *Check* column.
-    #[must_use]
-    pub fn title(self) -> &'static str {
-        match self {
-            Tft::Tft001 => "multi-publisher conflict on an edge",
-            Tft::Tft002 => "static transform republished with a different value",
-            Tft::Tft003 => "edge kind changed (static <-> dynamic)",
-            Tft::Tft004 => "clock skew between publishers",
-            Tft::Tft005 => "stamps in the future",
-            Tft::Tft006 => "zero or absurd stamps",
-            Tft::Tft007 => "publish rate deviates from nominal",
-            Tft::Tft008 => "jitter: inter-arrival spread",
-            Tft::Tft009 => "gaps / dropouts",
-            Tft::Tft010 => "extrapolation hotspot",
-            Tft::Tft011 => "ring capacity too small for observed consumer lag",
-            Tft::Tft012 => "disconnected subtree",
-            Tft::Tft013 => "frame declared but never published",
-            Tft::Tft014 => "participant or claim slot leak",
-            Tft::Tft015 => "arena occupancy above 80%",
-            Tft::Tft016 => "transparent huge pages off, or RLIMIT_MEMLOCK below the arena size",
-            Tft::Tft017 => "dynamic edge with no live writer",
-            Tft::Tft018 => "stamps arriving out of order",
-            Tft::Tft019 => "a wall-clock domain stepped backwards",
-        }
-    }
-
-    /// The severity this check reports at, from §6's table.
-    ///
-    /// Fixed per id rather than per finding: `--exit-code` is only a usable
-    /// gate if the set of ids that can fail it is knowable from the
-    /// documentation, without running anything.
-    #[must_use]
-    pub fn severity(self) -> Severity {
-        match self {
-            Tft::Tft001 | Tft::Tft002 | Tft::Tft003 | Tft::Tft006 | Tft::Tft012 | Tft::Tft018 => {
-                Severity::Error
-            }
-            Tft::Tft004
-            | Tft::Tft005
-            | Tft::Tft007
-            | Tft::Tft008
-            | Tft::Tft009
-            | Tft::Tft010
-            | Tft::Tft011
-            | Tft::Tft014
-            | Tft::Tft015
-            | Tft::Tft017
-            | Tft::Tft019 => Severity::Warn,
-            Tft::Tft013 | Tft::Tft016 => Severity::Info,
-        }
-    }
-
     /// Parse an identifier for `--suppress`. Case-insensitive; `"TFT10"` and
     /// `"10"` are **not** accepted, because a near-miss that silently suppresses
     /// nothing is worse than an error.
