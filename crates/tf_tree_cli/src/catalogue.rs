@@ -162,8 +162,12 @@ pub enum Tft {
 }
 
 impl Tft {
-    /// Every check, in id order. [`crate::checks::run`] walks this, so a new
-    /// variant cannot be added and then silently never executed.
+    /// Every check, in id order. [`crate::checks::run`] walks this, so a check
+    /// missing here never executes.
+    ///
+    /// Hand-kept: the length is a literal, so a twentieth variant leaves
+    /// `[Tft; 19]` compiling and unexecuted. `all_contains_every_variant` is what
+    /// closes that; the compiler does not.
     pub const ALL: [Tft; 19] = [
         Tft::Tft001,
         Tft::Tft002,
@@ -876,6 +880,59 @@ mod tests {
 
     fn fired(check: Tft, findings: Vec<Finding>) -> CheckOutcome {
         CheckOutcome::ran(check, findings)
+    }
+
+    /// `ALL` lists every variant — the one completeness property the type system
+    /// does not supply.
+    ///
+    /// The chain, not the length: `succ` is exhaustive, so a new variant must be
+    /// named there, and the walk then out-counts `ALL` until it is added there
+    /// too. Sizing a `seen` array from `ALL.len()` instead is vacuous — both
+    /// sides move together, and that version passed the mutant below.
+    ///
+    /// Mutant (confirmed fatal): drop `Tft019` from `ALL` and its length to 18.
+    #[test]
+    fn all_contains_every_variant() {
+        // A new variant makes this non-exhaustive. Point the current last one
+        // at it and give it `None`.
+        const fn succ(c: Tft) -> Option<Tft> {
+            match c {
+                Tft::Tft001 => Some(Tft::Tft002),
+                Tft::Tft002 => Some(Tft::Tft003),
+                Tft::Tft003 => Some(Tft::Tft004),
+                Tft::Tft004 => Some(Tft::Tft005),
+                Tft::Tft005 => Some(Tft::Tft006),
+                Tft::Tft006 => Some(Tft::Tft007),
+                Tft::Tft007 => Some(Tft::Tft008),
+                Tft::Tft008 => Some(Tft::Tft009),
+                Tft::Tft009 => Some(Tft::Tft010),
+                Tft::Tft010 => Some(Tft::Tft011),
+                Tft::Tft011 => Some(Tft::Tft012),
+                Tft::Tft012 => Some(Tft::Tft013),
+                Tft::Tft013 => Some(Tft::Tft014),
+                Tft::Tft014 => Some(Tft::Tft015),
+                Tft::Tft015 => Some(Tft::Tft016),
+                Tft::Tft016 => Some(Tft::Tft017),
+                Tft::Tft017 => Some(Tft::Tft018),
+                Tft::Tft018 => Some(Tft::Tft019),
+                Tft::Tft019 => None,
+            }
+        }
+
+        let mut chain = vec![Tft::Tft001];
+        while let Some(next) = succ(*chain.last().unwrap()) {
+            assert!(!chain.contains(&next), "succ loops at {}", next.id());
+            chain.push(next);
+        }
+
+        let listed: Vec<Tft> = Tft::ALL.to_vec();
+        for c in &chain {
+            assert!(listed.contains(c), "{} is not in Tft::ALL", c.id());
+        }
+        assert_eq!(
+            listed, chain,
+            "Tft::ALL and the variant chain disagree — in content or in order"
+        );
     }
 
     /// **Every identifier is distinct, parses back to itself, and appears in

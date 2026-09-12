@@ -41,6 +41,415 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — the one stored-name decode in `tf_tree` that did not clamp
+
+- **`Tree::frame_name` sliced `&rec.name[..rec.name_len as usize]` directly.**
+  `FrameRecord::name` is 48 bytes and `name_len` is a `u8`, so any stored length
+  above 48 panics on that slice. `FrameRecord::for_name` clamps at intern time, so
+  this is not reachable by writing a long name — but the bytes are read back out
+  of a shared segment or a `.tft` on disk, and `validate_arena_header` validates
+  the header, not per-record fields. **Six sites in the workspace decode a stored
+  name and five already clamped**; this was the sixth, and it is on the
+  *error-display* path reached through `Tree::describe`, which is where a caller
+  looking at a bad arena already is.
+- **It now goes through the file-local `stored_name`**, which is the same helper
+  the other in-crate sites use, so the fix removes a third spelling as well as the
+  panic. **One visible change**: an invalid-UTF-8 stored name used to collapse the
+  whole name to `"<invalid-utf8>"` and now gets `from_utf8_lossy`'s per-byte
+  replacement, which is what the other five already did and what a reader staring
+  at one corrupt frame among ninety needs.
+
+### Fixed — `Tft::ALL` is the one list a new check can be left out of, and its doc said the opposite
+
+- **The guarantee the doc claimed is not one the type gives.** `Tft::ALL`'s
+  comment read *"[`crate::checks::run`] walks this, so a new variant cannot be
+  added and then silently never executed"*. `Tft::id`'s exhaustive `match` does
+  refuse to compile until a new variant is named, so it cannot be added
+  *unnamed* — but `ALL` is a hand-written `[Tft; 19]`, and a twentieth variant
+  leaves it compiling at nineteen and never executed. Since `checks::run` walks
+  `ALL`, that check would simply not exist, and `--json` consumers would see one
+  fewer outcome with nothing reporting why.
+- **`all_contains_every_variant` closes it by construction**: a `succ` chain that
+  is an exhaustive `match`, walked from `TFT001` and compared against `ALL`. A new
+  variant does not compile until it is named in `succ`, the walk then yields
+  twenty against `ALL`'s nineteen, and the comparison fails until it is added
+  there too.
+- **The first version of this test was vacuous, and the mutant is what said so.**
+  It sized a `seen` array from `Tft::ALL.len()` and asserted every slot was
+  filled. Dropping `TFT019` from `ALL` *and* its length to `18` moved both sides
+  together and it **passed** — a completeness check whose denominator is the thing
+  being checked cannot fail. Against the chain version the same mutant fails,
+  naming `TFT019`. Both runs are in the test's own doc comment.
+
+### Fixed — two Miri gates: one that reported success having run nothing, and one that could not be made strict
+
+- **`cargo xtask miri` printed a sentence and returned `ExitCode::SUCCESS`.** The
+  arm read *"'miri' is wired up by its Phase 1 PR"* and did nothing else, while
+  `main`'s usage line advertised `miri` beside `loom`, `bench-gate` and `headers`
+  — so the one documented way to reach it was also the one way to get a false
+  green from it. **Miri itself was never missing**: `just miri` runs
+  `cargo +nightly miri test` over `tf_tree_arena`/`tf_tree_core` and `tf_tree`
+  directly, and `just c-abi-check` runs four more rows over the C ABI. Nothing in
+  the repository ever called the stub — its only reference anywhere was that usage
+  string, which is why it survived. Deleted; `cargo xtask miri` now exits 1 and
+  names the two recipes that are real.
+- **`just c-abi-check` assigned `MIRIFLAGS` where `just miri` appends to it, and
+  that is the gate it mattered on.** `ci.yml`'s `miri` job sets
+  `-Zmiri-strict-provenance` at the job level and the recipe folds it in; the
+  argument for doing so is written out over that job at length. All four of
+  `c-abi-check`'s Miri rows still spelled `MIRIFLAGS=-Zmiri-disable-isolation`
+  outright, discarding whatever the environment set — so the **C ABI**, kind 4 of
+  the unsafe budget, a foreign caller, and the highest-risk `unsafe` surface in
+  the workspace, was the one Miri gate that could not be asked for the stricter
+  run its sibling already gets. All four now append. This only makes the flag
+  reachable; no job sets it there yet, and turning it on is a measurement, not an
+  edit.
+
+### Added — `tft_bridge_close_startup_window`, and a reason code that does not say "authority"
+
+- **The C ABI minor version is `0.8`.** `docs/decisions/0011` implementation
+  step 6. The bump is for an added **unstable-tier** symbol, and the precedent
+  is `1` → `2`, which bumped for `tft_bridge_note_time_jump` — also a bridge
+  entry point, also unstable. The rule is `3` → `4`'s: the minor version answers
+  *"can I name this symbol?"*, and a tier cannot answer that, because a tier is a
+  statement about whether a symbol may later be **withdrawn**.
+- **`tft_bridge_close_startup_window(b, out)` is the primary mechanism `PHASE4.md`
+  §5.4 is normative about, and no C caller could reach it.** The only close the
+  seam exposed was the 4096-transform backstop — a count, not a duration — so a
+  bridge on a quiet robot sat with its window open for as long as it took to see
+  4096 transforms, and the `rclcpp` node §5.4 says drives the close from a
+  one-shot steady timer had nothing to call. It charges no counter, for
+  `tft_bridge_note_time_jump`'s reason: it is not a transform, and
+  `refused_after_halt` is a term in a ledger whose total is `transforms`. It
+  routes through `fill` rather than formatting its own halt, so the latch, the
+  `first_time` rate limiter and the halt's wording exist once. Called twice, with
+  nothing recorded, or under a policy that is not `STRICT`, it reports the blank
+  outcome — "nothing happened" as nothing having happened, not as a code a caller
+  must learn in order to ignore.
+- **`TFT_BRIDGE_REASON_STARTUP_CONFLICTS = 9`, because reason 5 named the wrong
+  fault — and a `0.7` caller CAN observe this one.** A window-close halt was
+  reported as `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` (5): the closest true code,
+  and false as soon as the record contained a §5.7 static-value disagreement,
+  which is a config-versus-robot fault and not an authority one. The two events
+  also differ in shape — reason 5 is a judgment about the sample in hand and
+  names both publishers in `owner`/`intruder`, while the close is about a *set* of
+  edges counted long before, so it names none and leaves `parent`/`child` empty
+  rather than printing whichever edge happened to be next on the wire. **The
+  retest a `0.7` caller may owe is one `switch` arm**: that halt reaches it
+  through `tft_bridge_offer`, whose signature and every other outcome are
+  unchanged, so a caller that reached the 4096-transform backstop received 5 and
+  now receives 9, and one that switched on 5 to print it falls through to its
+  default arm. The action is `TFT_BRIDGE_HALT` either way.
+
+### Added — `StaticStore::conflicts_by_edge()`, the accessor `0011` step 5 named and did not land
+
+- **`Ingest` kept a second ledger of something `StaticStore` already knew.**
+  `docs/decisions/0011` step 5 lists `StaticStore::conflicts_by_edge()` among the
+  things it lands; it did not. A private `startup_static_conflicts: u32`,
+  incremented off the store's `first_time` flag, stood in for it — and it could
+  count the contradicted edges without being able to say *which* they were. The
+  field's own doc comment recorded the debt by name.
+- **The accessor yields `(parent, child, owner, intruder, count)`**, the shape
+  `Authority::conflicts` already yields, because `docs/PHASE4.md` §5.4 asks one
+  thing of both halves. **The iterator's length is the fault count; the `u64`
+  beside each edge is how loud that one fault was** — `/tf_static` is
+  `transient_local`, so one misconfigured publisher's latched sample is
+  re-delivered to every late joiner, and `StaticStore::conflicts()` counts ten
+  redeliveries of one misconfiguration as ten.
+- **Reading `reported` is exactly equivalent to the counter it replaces**, because
+  `Strict` closes its window once: at the close, a non-zero `reported[slot]` is a
+  conflict seen before the close, which is what the counter accumulated.
+- **The first shape was insufficient for the clause it claimed to enable.** It
+  yielded `(parent, child, count)` and carried no publishers, while §5.4 is
+  normative that the halt's `detail` enumerates every recorded edge *with both of
+  its publishers* — and the data was not recoverable later either, since
+  `StaticStore` retained only the owner. It now keeps the intruder of an edge's
+  first conflict: **one clone per edge ever**, not one per observation.
+
+### Fixed — the interval in which nobody can inherit, and the two controls that make it fail on purpose
+
+- **`shm-torture-asan` was red on four of the last five nightlies, and the engine
+  was never implicated.** The §3.5 trigger tally read `inherited=N` with zero
+  `err-*` on every failing run, and a detached process cannot even ask
+  (`NotApplicable` unless `is_joined()`). What drained was the population.
+- **The mechanism is an interval in which the owner is dead and *undetectably*
+  dead.** `kill_the_owner` censuses `heirs_before`, kills and `wait()`s the owner,
+  then censuses `heirs_at_kill`. Linux `do_exit` runs `exit_mm()` **before**
+  `exit_files()`, so the victim's page tables are torn down first and its
+  rendezvous socket and participant lock byte are released only after — and
+  `Tree::owner_lost` is a socket hangup. For the whole of that interval every
+  survivor's trigger answers `false`, nothing can inherit, every survivor keeps
+  drawing its 2 %-per-operation detach arm, and a survivor that leaves **cannot
+  come back**, because §3.4 step 4 refuses `CreatePolicy::Never` against held
+  participant bytes. If all of them leave, the census after the reap reads 0 and
+  the arena is absorbing. The `kill()`-to-`wait()` timer *is* that blindness
+  window — hangup and `wait4` measured equal to within 0.01–0.02 ms at every
+  working-set size — so the census comment is right that the `wait()` cannot be
+  moved.
+- **It scales with dirty pages, not with ASan**: about 0.09 ms per resident MB. A
+  plain torture child is 2.8 MB and reaps in **0.3 ms** median; an ASan child is
+  43–49 MB and reaps in **6.7 ms**, about **22×** — and the victim is
+  systematically the *oldest and largest* child, because the ordinary draw spares
+  the role holder and the role holder extends its operation cap. **The plain build
+  wedges too**: the ASan job's own `--children 4 --kill-hz 4`, no sanitizer,
+  reached the same state at **900 s**. So the green `shm_torture` job is green for
+  its `--children 6`, the two rows move two variables at once, and they were never
+  a controlled comparison.
+- **The fix is a `kill.in_progress` marker**, written before the signal and
+  removed after the post-reap census, which a child checks immediately before
+  leaving and stays instead. **Its cost is stated rather than implied**: §11.4's
+  attach/detach churn pauses for the width of one reap — tens of microseconds
+  normally, tens of milliseconds under ballast — against a detach arm that fires
+  about every fiftieth operation. It suppresses a *detach*, never a kill, an
+  inheritance or a violation, and the run prints how many it suppressed, so a run
+  leaning on it says so. The operation cap is the detach arm's quieter twin and
+  had to answer the same question; that was missed in the first revision.
+  Ninety-three consecutive owner kills recovered across four configurations including
+  two-core ASan, and `--no-inherit` still fails naming §3.5.
+- **Two positive controls, because this class had none and the obvious one is not
+  portable.** Without one, a defect firing on ~1 % of kills is unfalsifiable in
+  any run a person will wait for, and a fix can only ever be shown *not to have
+  stopped it yet*. Both are siblings of `--inject-violation` and `--no-inherit`:
+  deliberate failures.
+- **`--victim-ballast-mb` gives each child N MB of dirty anonymous memory**,
+  dirtied a page at a time because a `calloc`'d allocation sits on the shared zero
+  page and an untouched page costs nothing to tear down. 512 buys a ~49 ms window
+  on a plain release build and wedges an unfixed `--children 4` run at the
+  **third** owner kill, in 25 seconds instead of once a night — that is how this
+  was found. **It depends on the victim's pages being 4 KiB, and GitHub's runners
+  set `transparent_hugepage=always`**: 256 MB becomes 128 huge pages rather than
+  65 536 small ones, the reap drops from ~25 ms to **1.2–1.8 ms**, and the control
+  silently does nothing. The first revision of the regression test was built on it
+  and failed on CI for exactly that reason. Chunking does not rescue it — glibc
+  serves 1 MiB requests from one ~64 MiB arena heap, which is huge-page eligible,
+  with and without `MALLOC_MMAP_THRESHOLD_` (both measured).
+- **`--stop-owner-ms` is the portable one, and it is what the regression test
+  uses.** `SIGSTOP` the owner for N ms before killing it and the same state
+  arrives with no memory physics in it at all: a stopped owner holds its
+  rendezvous socket open, so no survivor's `owner_lost` answers `true` and nothing
+  can inherit, and it has stopped serving, so no fresh process can join. At 300 ms
+  an unfixed `--children 4` run wedges on its **first** owner kill, with `4 heir(s)
+  attached before the kill, 0 after it`; with the fix, 20 of 20 recovered and 251
+  detaches were suppressed.
+- **Two diagnostic lines that a failing nightly could not print.** `heirs_before`
+  was recorded, read by exactly one consumer (the `starved` test) and never
+  printed, so a failing kill could not say how many heirs it had to lose —
+  `heirs_at_kill = heirs_before - 1 - departures`, and with only the left-hand
+  side in the log the departure count is not recoverable. And a DEFERRED line said
+  "no read-write survivor besides the role holder was attached" without the number,
+  so a reader could not tell a fleet holding only the role holder from one holding
+  nobody at all.
+
+### Added — a deliberately broken launch file, over a real RMW and across processes
+
+- **`docs/PHASE4.md` §9's box asked for multi-publisher detection "verified against
+  a deliberately broken launch file", and `find . -name '*.launch*'` found nothing
+  anywhere in this repository**, `ros/` included. The box said so.
+- **What `test_attribution.cpp` could not supply.** It constructs two publishers on
+  one edge and asserts the second is dropped and both nodes are named — **in one
+  process**. Two `rclcpp::Node`s in one process typically share a DDS participant,
+  so the half of §5.3 that matters — that `rmw_message_info_t::publisher_gid` and
+  `TopicEndpointInfo::endpoint_gid()` are the same sixteen bytes *across
+  processes* — is not exercised by it at all. That is the configuration an operator
+  actually misconfigures, and it had no test.
+- **Three processes now**: `tf_tree_bridge` plus two `conflicting_broadcaster`s on
+  `odom -> base_link`, over a real RMW, asserted through §5.4's operator-visible
+  `RCLCPP_ERROR` in the bridge's own log. Run in `docker/tf2`; `just ros-test` is
+  its gate, because `cargo` cannot see `ros/`.
+
+### Added — PHASE3 §12.2 criterion 4 is measured, and this host cannot settle it either way
+
+- **Neither half of criterion 4 had ever been run.** §12.2 criterion 4 is *"thread
+  scaling >= 6x from 1 to 8 threads on `3.14t`"* and §7.3 requires *"a scaling
+  test: 1/2/4/8 threads calling `plan.at` on a shared `Tree`, asserting near-linear
+  aggregate throughput"*. The item had been classified as hardware-blocked; the
+  interpreter is on this host — `python3.14t` 3.14.2, `Py_GIL_DISABLED == 1`,
+  `sys._is_gil_enabled() == False` — so it was **unmeasured**, not blocked.
+  `crates/tf_tree_bench/python/thread_scaling.py`, run by `just py-thread-scaling`
+  and `just py-thread-scaling-gil`. **The readings live in
+  [`docs/benchmarks/EVIDENCE.md`](docs/benchmarks/EVIDENCE.md) and are deliberately
+  not repeated here** — they were written into four places at once and the copies
+  disagreed in the third digit within one revision.
+- **The verdict is the third state: not met, not failed, not producible on this
+  host.** The free-threaded half *straddles* the 6× floor and the GIL build's
+  1→8 arm sits below it. Under the one-sided argument each clearing run is a
+  conservative pass on a host with half the cores the criterion's "8 threads"
+  implies — but the margin is inside this instrument's own spread, so **this host
+  cannot settle criterion 4 either way**; eight physical cores would. **"Passes" is
+  too strong and "the host blocks it" is false — both were published in the
+  evidence row and both were wrong**, which is why the row now carries the third
+  state rather than a verdict.
+- **The `at_into` arm the GIL half owed, priced by interleaved pairs.** The
+  code-side suspect for the GIL shortfall was `Plan::at` allocating its (N,4,4)
+  output before `fill` detaches; `--call at_into` prices exactly that with a
+  caller-owned per-thread buffer and nothing allocated per call. Alternating
+  `at`/`at_into` so both share the window, `at_into` is higher at 1→8 in **6 of 6**
+  pairs and has a quarter of `at`'s spread, while sitting within ~2 % of it on
+  *one* thread — the shape of a cost that is cheap alone and serialises under
+  contention. **It still misses the floor.** So neither "the host blocks it" nor
+  "the allocation is the cause" survives, and both had been published.
+  **`--gate --call at_into` is refused**: §7.3's criterion names `plan.at`, and a
+  criterion re-pointed at the faster call stops meaning anything.
+- **Verdicts and refusals, all exercised**: `PASS`; `INVALID` on a shortfall where
+  cores < threads; `FAIL` where the host has a core per thread, which `--gate`
+  exits 1 on, because a verdict with no failing state is a gate that cannot fail;
+  `INVALID` where no physical core count is derivable; a `--gate --serialize`
+  refusal; `--batch 0` and `--seconds 0` rejected at parse time; and a 1-thread arm
+  completing zero calls refused with exit 2 rather than dying of
+  `ZeroDivisionError`, which would have exited 1 and read as a FAIL. Core counting
+  is per-processor over `sched_getaffinity` **and** floored by cgroup `cpu.max` —
+  `taskset -c 0,1` (two SMT siblings) reads **1** core and `-c 0,2` reads 2, where
+  an earlier cap by *logical* count read 2 for the first and would have let 16
+  sibling-paired CPUs pass as 16 cores.
+- **Two earlier revisions of the evidence row were wrong in opposite directions**,
+  and the detector for the first is now printed. The first published a **debug**
+  build's curve and concluded the host blocked the criterion; the second published
+  a clean PASS taken with the timer started *after* the workers were released,
+  which counts work outside `elapsed` and inflates the ratio with thread count. The
+  single-thread arm now prints ns/sample beside `tree.rs`'s documented **328
+  ns/elem** for a release, pinned, depth-3 `at`, so a release run reads ~0.9× it and
+  a `develop` run ~5.8×.
+
+### Added — two measurements nobody could see: the quiet-host precondition and a nightly that notifies
+
+- **Both halves are the same defect one layer out from the code: a result that
+  reaches no reader cannot fail in the only sense that matters.**
+- **`0023` step 5's instrument.** `docs/PHASE4.md` §7's gate wants twelve runs each
+  recording `busy <= 0.10`, and nothing in `abi_cost` measured or printed a busy
+  fraction, so no run could be *shown* to have been quiet. The step's own text
+  settled the two traps: the sample must be taken **before** the run, because
+  `mp::busy_fraction` reads `/proc/stat`'s aggregate line and `abi_cost`
+  saturating one core is already ~12.5 % of eight CPUs — an in-run sample could
+  never pass, for a reason that has nothing to do with the host; and the sampler is
+  in the wrong crate to call, `abi_cost` being an *example of `tf_tree_c`* while
+  `tf_tree_bench` depends on `tf_tree_c`. So: one entry point (`tf_tree_bench`'s
+  `quiet_check`), not a second copy of the sampler, with `just abi-cost`
+  bracketing the two runs — `after` once `abi_cost` has exited so its own core is
+  out of the window, which is how a host that went loud *during* the run gets
+  caught.
+- **It exits `2`, where `abi_cost` exits `1` on a missed ratio: INVALID is not
+  FAIL.** All three branches exercised: QUIET at 1.7 %, NOT QUIET at 15.6 % and at
+  100 % (naming the top consumers), and `TF_TREE_BENCH_FORCE` at 100 %, which
+  passes and **says so in its line** — a silently unfailable override is this
+  entry's own subject, one layer down. What is still owed is the measurement:
+  twelve readings at or below 0.10 need a window when nothing else is building on
+  this multi-tenant box.
+- **The nightly notified nobody.** Four of the last five nightlies were red and it
+  was found on 2026-09-11 because a human guessed to look. The new `notify` job
+  reports **jobs, not the run** — read from the jobs API, so a job added later
+  cannot be silently dropped from the report, and so a reader is not sent back to
+  the log-digging the job exists to spare them (the 2026-09-11 run was six green
+  and one red). One standing issue rather than one per night, and it **closes**
+  when the nightly comes back green, because an alert that never clears stops being
+  read. `continue-on-error`: the messenger must never become the message. A first
+  cut of the query returned **pull requests as well as issues** — GitHub's
+  `GET /repos/{o}/{r}/issues` does — so a green night would have closed one.
+- **`just abi-cost` hard-coded `./target/`**, so a set `CARGO_TARGET_DIR` sent the
+  build elsewhere and the recipe ran a stale binary or none — the same trap
+  `bench-check` and `c-header-check` carry.
+- **`0023` is `ready`, and three sites still called it `draft`** — two justfile
+  paragraphs and `EVIDENCE.md`'s §7 row, one of which told the reader to treat the
+  ratified allowances as "a proposal a human ratifies by merging". A second reason
+  for not wiring `abi-cost` into a workflow ("the thresholds are still a proposal")
+  has expired outright and is marked as expired rather than deleted; the
+  runner-variance reason was always the one doing the work.
+
+### Fixed — PHASE5 §9.3's honesty section had a falsifier that could not fire
+
+- **`docs/decisions/0021` step 4 asks for a deliberate revert to make the gate
+  fail, and the second half could not happen.** The step says "give
+  `idle_arena_resident_bytes` a direction and a tolerance … verified by
+  `just bench-check` passing, **and by a deliberate revert of step 2 making it
+  fail**."
+- **`arena_memory_floor` is a `where_we_are_worse` *entry*, not a row.**
+  `baseline::compare` diffed the *set* of those entries' ids and never looked
+  inside one; `Report::validate`'s "prints numbers, gates none of them" rule was
+  written over `self.rows` only; and `Comparison::compared_nothing()` missed it
+  because the one gated *row* kept `checked` at 1 — a whole-artifact anti-vacuity
+  check does not catch a per-entry one.
+- **Run, not argued.** With the alignment fix reverted — the idle arena back to
+  ~100 % resident — `main`'s gate printed `PASS — 1 directional metric held`, exit
+  0: the defect the record exists to remove passes the gate the record says will
+  catch it. After the fix, the same revert fails, far past the `RESIDENCY_SLACK`
+  the baseline allows. `just bench-check` now holds two directional metrics
+  instead of one, and the second is the first host-dependent number the gate has
+  ever compared across two machines — CI's `bench-gate` on `ubuntu-latest`
+  confirms it holds there too. The readings stay in
+  [`docs/benchmarks/EVIDENCE.md`](docs/benchmarks/EVIDENCE.md); this entry does not
+  repeat them.
+- **The tolerance that shipped was not the tolerance every document explained.**
+  Restoring `report.rs` wholesale after the falsifier experiment reverted
+  `RESIDENCY_SLACK` 3.0 → 1.0, and the baseline was then regenerated *from the
+  reverted code*, so the committed file agreed with the wrong number and every gate
+  passed. `bench-check` structurally cannot catch that — the tolerance it reads is
+  the baseline's own, by design — so `tests/baseline_file.rs` now pins the
+  committed file against the constant.
+
+### Fixed — documentation (2)
+
+- **`TFT015`'s participant numerator is the lock file's, and the code said the
+  opposite.** `docs/PHASE5.md` §6 defines `TFT015` as *"arena occupancy > 80 %
+  (frames, edges, **participants**)"*. The participants row is absent, disclosed to
+  the operator in `Meta.notes`, and the codebase was honest about the gap and
+  **wrong about the remedy**: `checks::occupancy_of`'s doc closed with *"restore the
+  row in the same commit that makes the engine maintain the counter"*. That
+  instruction produces a wrong row twice over. **A header counter cannot be
+  maintained** — a participant that is *killed* cannot decrement
+  `ArenaHeader::participant_count`, so it drifts up for the life of the arena and
+  never comes back down, which is the whole reason `PHASE2.md` keeps liveness in a
+  lock byte the kernel releases (D17). **And the arena participant table is not a
+  numerator either**, failing in the same direction: a read-only attachment is
+  D18's default and Python's. [`0056`](docs/decisions/0056-the-participant-numerator-is-the-lock-files.md)
+  (`draft`) records the correction: the numerator is the lock file's held
+  bytes, which is the same source D17 already trusts for liveness.
+- **The four "hardware-blocked" items, measured — three were misclassified and the
+  fourth by a factor of nine.** Four items across `0013`, `0023`, `PHASE3` and
+  `PHASE4` were recorded as blocked on hardware this repository does not have.
+  Measured on the development host on 2026-09-11, in release builds: **one is
+  genuinely blocked and much narrower than its text said, two are not blocked at
+  all, and the fourth is half-blocked in a way its box does not distinguish.**
+  `Fitness::probe` is four axes and every one of these items read it as a boolean —
+  on this host `fair_for_timing` is **false** (SMT on, 8 logical / 4 physical, no
+  cpufreq sysfs), `fair_for_ratios` **true** (`busy_fraction` 0.000–0.021 against
+  `QUIET_ENOUGH` = 0.10), `fair_for_memory` **true** (`smaps_rollup` readable), and
+  `enough_cores` yes for 1 consumer and no for 4 and 16.
+
+### Added — decision records (2)
+
+- [`0055`](docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
+  (`draft`) — **recovery capacity cannot be added after the role falls vacant.** The three-night
+  `shm_torture` nightly failure was root-caused on 2026-09-10 and **the ownership
+  path is not defective**: §3.5 fired correctly nearly two thousand times in the
+  investigation's own tally with zero errors. What the harness does is drive its
+  eligible-heir population to zero while the ownership role is vacant, and that
+  state is **absorbing**. An ownerless arena with any participant byte held admits
+  no new rendezvous attachment — nothing is serving so §3.7's join cannot start,
+  and the create path is refused by §3.4's split-brain check — and the rendezvous is
+  the only door a would-be heir can come through, because `attach_shared`/
+  `attach_shared_at` refuse `AttachMode::ReadWrite`, `attach_joined_at` is
+  `pub(crate)` and reachable only from `Open`'s `Joined` arm, and
+  `inherit_ownership` requires `is_joined()`. **So the set of processes that could
+  inherit is fixed at the instant the role falls vacant and can only shrink.** The
+  axis is **eligibility, not mode**: a candidate must be attached, read-write *and*
+  actually polling `owner_lost()` at that instant, so `RUNBOOK.md`'s "open one
+  process read-write even if it never publishes" is necessary and **not
+  sufficient** — a fleet whose one read-write attachment never polls satisfies it as
+  written and is squarely in the absorbing state.
+- **The absorbing state happened again after the harness repair, measured here this
+  time.** `nightly` run 34453737033 (2026-09-10): six of seven jobs green,
+  `shm-torture-asan` red, and the harness classified the failure itself as
+  **POPULATION, not engine**, with `inherited=9` and **zero `err-*`** over ten owner
+  kills. `0055`'s *What forced it now* had cited the earlier failure with an
+  explicit caveat that its numbers were quoted rather than reproduced; they are
+  reproduced now at the failing job's own parameters (`--duration 120s --children 4
+  --kill-hz 4`), where three runs without ASan pass 15/15 owner kills with zero
+  deferrals and one *with* ASan passes too. **The number that settles the mechanism
+  is the attached fraction**: `writers=1.6-1.7/4`, identically in CI and on this
+  host, so ASan does not starve the pool. `--children 4` is exactly the harness's
+  own `children_floor`, so `heirs_before` is essentially always **exactly 2** — the
+  role holder plus one — every owner kill runs at zero margin, and the nightly's
+  thirty minutes is ~15x the exposure of these runs.
+
 ### Fixed — an owner that died mid-handshake failed the joiner instead of being retried
 
 - **A zero-byte handshake reply was reported as a protocol violation.** The §3.7
@@ -84,6 +493,29 @@ is a bug.
   published. **No §11.3 crash point was added**: the assigner runs after the
   accept and before any response is built, so a child aborting there is the
   window, through public API only.
+
+### Changed — the error a wedged joiner reads now says what the retry actually needs
+
+- **`IpcError::ArenaHeldButUnreachable`'s operator text named a policy switch and
+  stopped there.** It said to "create a fresh arena and abandon this one", which is
+  the right advice and not a runnable instruction: a create also needs a layout to
+  build from and a read-write mode to build it in. Through the `tf_tree` facade
+  those are `Open::layout_if_creating` and `AttachMode::ReadWrite`, and without
+  them the retry the message recommends fails with a second, different error. The
+  message now names all three. Operator-facing text on a published crate, so it is
+  recorded here rather than left to the diff.
+- **The torture harness drove its own eligible-heir population to zero**, and
+  three arms drew from one pool with none of them knowing it: `kill_the_owner` now
+  censuses *before* the kill and **defers** rather than taking the last eligible
+  heir; the ordinary victim draw no longer takes the role holder and stops against
+  a pool already at its floor; and a worker that is serving the rendezvous no
+  longer abdicates on its detach arm or its operation cap — that arm fires on ~2 %
+  of operations, so a worker abdicated roughly every fifty against an owner-kill
+  interval measured in seconds. Every reduction is counted and printed, **including
+  the zeroes**, and a run that killed nobody now fails: an unfailable throttle is
+  the shape of a gate that has quietly stopped testing. That remedy did not end the
+  condition — see the entry above on the `kill()`-to-`wait()` window, which is where
+  it went next.
 
 ### Fixed — `0048` step 4: D4 now holds for every root that carries `unsafe`
 
@@ -2810,6 +3242,14 @@ for the first time.
 `.github/workflows/ci.yml`'s header carries the evidence for the outage and the
 diagnosis. Do not read a green check as verification.
 
-<!-- The tag does not exist until the release commit creates it, so this link
-     404s until then. That is the accurate state, not a broken link to fix. -->
+<!-- One definition per released heading, because the headings use reference
+     syntax and an undefined one renders as literal `[0.0.4]` on github.com —
+     which is what four of these five did. `[Unreleased]` is deliberately absent:
+     the tag it would point at does not exist until the release commit creates
+     it, and a link that 404s is worse than a heading that is plainly not one.
+     Add the new version's line in the same commit that moves the heading. -->
 [0.0.1]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.1
+[0.0.2]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.2
+[0.0.3]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.3
+[0.0.4]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.4
+[0.0.5]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.5

@@ -123,6 +123,23 @@ def fail(message: str) -> None:
     failures.append(message)
 
 
+# One spelling of the `subprocess.run` boilerplate that was written out five
+# times.
+def _git(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=ROOT, capture_output=True, text=True, check=True
+    ).stdout
+
+
+# NUL-split so a path with a space survives; sorted so reporting order is the
+# repository's, not git's. Cached so the two rules that ask for `*.md` cannot be
+# handed different corpora — not for speed, which it does not measurably change.
+@functools.cache
+def tracked(*globs: str) -> tuple[str, ...]:
+    listed = _git("ls-files", "-z", *globs)
+    return tuple(sorted(f for f in listed.split("\0") if f))
+
+
 def load_toml(rel: str) -> dict:
     with (ROOT / rel).open("rb") as handle:
         return tomllib.load(handle)
@@ -142,15 +159,8 @@ def local_crate_names() -> frozenset[str]:
     either — it sees the workspace, and `tf_tree_py`/`tf_tree_tf2_sys` are
     excluded from it by design.
     """
-    listed = subprocess.run(
-        ["git", "ls-files", "-z", "*Cargo.toml"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
     names = set()
-    for rel in (f for f in listed.split("\0") if f):
+    for rel in tracked("*Cargo.toml"):
         package = load_toml(rel).get("package", {})
         name = package.get("name")
         if isinstance(name, str):
@@ -191,14 +201,7 @@ def tracked_lockfiles() -> tuple[str, ...]:
     would otherwise be comparing to itself; a lockfile list has no such
     problem.
     """
-    listed = subprocess.run(
-        ["git", "ls-files", "-z", "*Cargo.lock"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    found = tuple(sorted(f for f in listed.split("\0") if f))
+    found = tracked("*Cargo.lock")
     if not found:
         fail("no tracked Cargo.lock found; the scan is broken")
     return found
@@ -828,14 +831,7 @@ def check_markdown_tables() -> str:
     was written — across every tracked Markdown file the only findings were
     `PHASE2.md` §12.2's two rows, which #208 fixed.
     """
-    listed = subprocess.run(
-        ["git", "ls-files", "-z", "*.md"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    files = sorted(f for f in listed.split("\0") if f)
+    files = tracked("*.md")
     if not files:
         fail("`git ls-files '*.md'` listed nothing; this check would pass trivially")
 
@@ -911,14 +907,7 @@ def check_relative_links() -> str:
     The floor below is the point of the exercise: a scan of these documents that
     silently matched nothing would print the same "all resolve" as a clean one.
     """
-    listed = subprocess.run(
-        ["git", "ls-files", "-z", "*.md"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    files = sorted(f for f in listed.split("\0") if f)
+    files = tracked("*.md")
 
     checked = 0
     for rel in files:
@@ -1167,25 +1156,7 @@ def check_decision_status_citations() -> str:
         fail("no decision record statuses were read; this check would pass trivially")
         return "decision-status citations: not checked"
 
-    listed = subprocess.run(
-        [
-            "git",
-            "ls-files",
-            "-z",
-            "*.md",
-            "*.rs",
-            "*.toml",
-            "*.sh",
-            "*.py",
-            "*.yml",
-            "justfile",
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    files = sorted(f for f in listed.split("\0") if f)
+    files = tracked("*.md", "*.rs", "*.toml", "*.sh", "*.py", "*.yml", "justfile")
     if not files:
         fail("`git ls-files` listed no files for the decision-citation scan")
         return "decision-status citations: not checked"
@@ -1258,6 +1229,139 @@ def check_decision_status_citations() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# 10. The changelog is not behind the code a user can observe.
+# ---------------------------------------------------------------------------
+
+# Paths whose contents reach somebody who never clones this repository.
+# `publish = false` is not the criterion — shipping inside something is, which is
+# why the bridge (via `tf_tree_c`/`tf_tree_ros`) and ingest (via the CLI and the
+# wheel) are here. Not the whole tree: `docs/`, `xtask/`, the justfile and
+# `tf_tree_bench` change on most branches, and a rule that fires on everything is
+# the flapping this file's header refuses.
+RELEASE_VISIBLE = (
+    "crates/tf_tree/src/",
+    "crates/tf_tree_arena/src/",
+    "crates/tf_tree_core/src/",
+    "crates/tf_tree_ipc/src/",
+    "crates/tf_tree_math/src/",
+    "crates/tf_tree_bridge/src/",
+    "crates/tf_tree_c/src/",
+    "crates/tf_tree_c/include/",
+    "crates/tf_tree_cli/src/",
+    "crates/tf_tree_ingest/src/",
+    "crates/tf_tree_py/src/",
+    "python/",
+)
+
+# Reported in the summary line rather than swallowed — a silently unfailable
+# override is the defect `0023` step 5 is about.
+NO_CHANGELOG = "[no changelog]"
+
+
+def check_changelog_freshness() -> str:
+    """`CHANGELOG.md` must not sit behind a release-visible commit.
+
+    `check_changelog` only asks whether a section for the *current* version
+    exists, which stays true while the version has not moved — so `#312`-`#323`
+    went unrecorded with every gate green, `#316` among them, which took the C
+    ABI from `7` to `8`.
+
+    An ordering, not a per-commit rule: batching entries is normal, leaving them
+    unwritten is not. A dirty `CHANGELOG.md` counts as current — that is somebody
+    writing them now.
+
+    **What this does NOT prove.** That the entries are correct, only that the file
+    was edited after the last observable change — so a gap *behind* that edit is
+    invisible (`#310` changed a published error's text and `#311` edited the
+    changelog after it). Reads paths, not diffs. Scoped to commits since the most
+    recent `v*` tag, and reports *not checked* without one rather than passing
+    quietly. `git log --name-only` prints nothing for a merge commit; the history
+    is squash-only.
+    """
+    try:
+        tag = _git("describe", "--tags", "--abbrev=0", "--match", "v*", "HEAD").strip()
+    except subprocess.CalledProcessError:
+        return "changelog freshness: NOT CHECKED — no `v*` tag is reachable from HEAD"
+
+    rng = f"{tag}..HEAD"
+    order = {c: i for i, c in enumerate(_git("log", "--format=%H", rng).split())}
+    if not order:
+        return f"changelog freshness: no commits since {tag}"
+
+    # One walk, two answers. `--name-only` with an empty format prints the hash
+    # on its own line ahead of that commit's paths.
+    newest: dict[str, str] = {}
+    touches_visible: set[str] = set()
+    current = ""
+    for line in _git("log", "--format=%H", "--name-only", rng).splitlines():
+        if line in order:
+            current = line
+        elif line.strip() and current:
+            key = None
+            if line == "CHANGELOG.md":
+                key = "changelog"
+            elif line.startswith(RELEASE_VISIBLE):
+                key = "visible"
+                touches_visible.add(current)
+            if key and (key not in newest or order[current] < order[newest[key]]):
+                newest[key] = current
+
+    visible = newest.get("visible")
+    if visible is None:
+        return (
+            f"changelog freshness: nothing release-visible changed in the "
+            f"{len(order)} commit(s) since {tag}"
+        )
+
+    changelog = newest.get("changelog")
+    if changelog is not None and order[visible] >= order[changelog]:
+        return (
+            f"changelog freshness: CHANGELOG.md is at or ahead of the newest "
+            f"release-visible commit, over {len(order)} commit(s) since {tag}"
+        )
+
+    if "CHANGELOG.md" in _git("status", "--porcelain", "--", "CHANGELOG.md"):
+        return (
+            "changelog freshness: CHANGELOG.md is modified in the working tree "
+            "and counts as current"
+        )
+
+    # Read from the walk above rather than a `git show` per commit: `git show` on
+    # a merge prints no paths, so a second derivation would disagree.
+    cut = order[changelog] if changelog is not None else len(order)
+    waived, owed = [], []
+    for h, i in sorted(order.items(), key=lambda kv: kv[1]):
+        if i >= cut or h not in touches_visible:
+            continue
+        subject = _git("log", "-1", "--format=%h %s", h).strip()
+        body = _git("log", "-1", "--format=%B", h)
+        (waived if NO_CHANGELOG in body else owed).append(subject)
+
+    if owed:
+        listing = "\n".join(f"      {s}" for s in owed)
+        last = (
+            "none"
+            if changelog is None
+            else _git("log", "-1", "--format=%h %s", changelog).strip()
+        )
+        fail(
+            f"CHANGELOG.md is behind the code: {len(owed)} commit(s) since {tag} "
+            f"changed a release-visible path after the last changelog edit "
+            f"({last}).\n"
+            f"    A release cut here would ship them undocumented, and no other "
+            f"check in this file can see it.\n{listing}\n"
+            f"    Write the entries, or mark a commit `{NO_CHANGELOG}` if it "
+            f"genuinely owes none."
+        )
+        return "changelog freshness: BEHIND"
+
+    return (
+        f"changelog freshness: {len(waived)} release-visible commit(s) since {tag} "
+        f"are marked `{NO_CHANGELOG}` and none is unaccounted for"
+    )
+
+
 def main() -> int:
     authority = load_toml("Cargo.toml")["workspace"]["package"]["version"]
     lines = [
@@ -1270,6 +1374,7 @@ def main() -> int:
         check_front_page_versions(),
         check_distribution_name(),
         check_decision_status_citations(),
+        check_changelog_freshness(),
     ]
 
     if failures:

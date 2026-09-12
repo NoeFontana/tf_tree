@@ -956,25 +956,29 @@ abi-cost:
     exit "$gate"
 
 # The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
+#
+# Rows append to `$MIRIFLAGS` rather than assigning it, so a caller can add
+# `-Zmiri-strict-provenance` without losing `-Zmiri-disable-isolation` — the fix
+# `just miri` already had. No job sets it here yet.
 c-abi-check:
-    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+    MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test abi
-    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+    MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test live
     # The publish surface. Separate because `--test` takes one target: this is
     # where a foreign *write* into the arena is checked, which is the half where
     # a mistake corrupts somebody else's transform tree rather than only
     # returning this process a bad answer.
-    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+    MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test publish
     # The ingest-bridge seam (§5), behind the default-off `bridge` feature. It
     # is the only entry point that both *decides* and *writes*, and its outcome
     # POD hands C a fistful of `const char *` borrowed from the handle — a
     # lifetime rule no compiler on either side enforces. Miri is what checks it.
-    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test \
+    MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_c/bridge,tf_tree_core/miri-soft-float \
         --test bridge

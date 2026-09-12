@@ -3606,14 +3606,16 @@ impl Tree {
     }
 
     /// Resolve a frame id to its stored (truncated) name.
+    ///
+    /// Through [`stored_name`] because `name_len` is a `u8` over 48 bytes and a
+    /// corrupt arena panics an unclamped slice — on the error-display path, which
+    /// is exactly where a bad arena is being looked at. Nothing validates
+    /// per-record fields on read.
     fn frame_name(&self, id: FrameId) -> String {
         let Some(rec) = self.view().frame_record(id) else {
             return std::format!("frame#{}", id.get());
         };
-        let n = rec.name_len as usize;
-        std::str::from_utf8(&rec.name[..n])
-            .unwrap_or("<invalid-utf8>")
-            .to_owned()
+        stored_name(&rec.name, rec.name_len)
     }
 
     /// Resolve an edge id to a `"parent->child"` label.
