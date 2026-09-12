@@ -319,7 +319,7 @@ crates/
 └── tf_tree_cli/     binary `tf_tree` (alias `tft`): tree / echo / doctor / top /
                      ingest / freeze / topology / participants / bench
 ros/                 ament_cmake packages: the §5 rclcpp bridge, and the DDS comparison
-xtask/               loom, miri, and bench-gate runners
+xtask/               loom, bench-gate, and headers runners
 docs/                PROJECT.md, API.md, PHASE1-5.md, RUNBOOK.md, benchmarks/, decisions/
 ```
 

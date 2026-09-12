@@ -1252,6 +1252,12 @@ RELEASE_VISIBLE = (
     "crates/tf_tree_ingest/src/",
     "crates/tf_tree_py/src/",
     "python/",
+    # A `find_package(tf_tree CONFIG)` consumer installs these; `cmake-check`
+    # exists because three packaging defects hid in them.
+    "crates/tf_tree_c/CMakeLists.txt",
+    "crates/tf_tree_c/cmake/",
+    # The rclcpp bridge node ROS users build against. #322 touched only `ros/`.
+    "ros/",
 )
 
 # Reported in the summary line rather than swallowed — a silently unfailable

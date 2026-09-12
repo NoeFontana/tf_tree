@@ -7,8 +7,8 @@
 //! just bench-report --out dir/ --consumers 8
 //! ```
 //!
-//! There is no `cargo xtask bench-report`: `xtask` dispatches `loom | miri |
-//! bench-gate | headers` only.
+//! There is no `cargo xtask bench-report`: `xtask` dispatches
+//! `loom | bench-gate | headers` only.
 //!
 //! §9.1 spells the entry point `tf_tree bench compare --bag run.mcap ...`. That
 //! spelling is **not wired up.** The reason is no longer the one an earlier

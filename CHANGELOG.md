@@ -59,6 +59,48 @@ is a bug.
   replacement, which is what the other five already did and what a reader staring
   at one corrupt frame among ninety needs.
 
+### Fixed — the catalogue is one table, so a check can no longer be declared and never run
+
+- **`Tft::ALL` was the one of five parallel 19-entry lists the compiler did not
+  enforce.** The variants, `ALL`, `id()`, `title()` and `severity()` were written
+  out by hand; four are exhaustive `match`es, so a new variant does not compile
+  until it is named in each. `ALL` is an array literal, and a twentieth variant
+  left it at nineteen, compiling and never executed — `checks::run` walks `ALL`.
+  Its doc claimed the opposite: *"a new variant cannot be added and then silently
+  never executed"*.
+- **Two hand-written tests failed to close it, and the second failure is the
+  reason this is a macro.** The first sized a `seen` array from `Tft::ALL.len()`;
+  dropping `TFT019` from `ALL` and its length to 18 moved both sides together and
+  it passed. The second walked an exhaustive `succ` chain — but the arm rustc's
+  error actually demands for a new variant is `Tft020 => None`, not the chained
+  `Tft019 => Some(Tft020)` the comment asked for, and with it the walk still stops
+  at nineteen and the test is green while `TFT020` never runs. Measured both
+  times, not argued.
+- **A `catalogue!` macro generates all four lists from one row per check**, so
+  `ALL` cannot disagree with the enum. Verified by adding a twentieth row: the
+  only errors are `checks::run`'s dispatch and one test's exhaustive match, which
+  are the two places a new check genuinely needs per-check logic. The
+  completeness test is deleted rather than kept — its premise is now structural,
+  and a test that cannot fail is the thing this entry is about. Net 53 lines.
+
+### Fixed — the one stored-name decode in `tf_tree` that did not clamp
+
+- **`Tree::frame_name` sliced `&rec.name[..rec.name_len as usize]` directly.**
+  `FrameRecord::name` is 48 bytes and `name_len` is a `u8`, so any stored length
+  above 48 panics on that slice. `FrameRecord::for_name` clamps at intern time, so
+  this is not reachable by writing a long name — but the bytes are read back out
+  of a shared segment or a `.tft` on disk, and `validate_arena_header` validates
+  the header, not per-record fields. **Six sites in the workspace decode a stored
+  name and five already clamped**; this was the sixth, and it is on the
+  *error-display* path reached through `Tree::describe`, which is where a caller
+  looking at a bad arena already is.
+- **It now goes through the file-local `stored_name`**, which is the same helper
+  the other in-crate sites use, so the fix removes a third spelling as well as the
+  panic. **One visible change**: an invalid-UTF-8 stored name used to collapse the
+  whole name to `"<invalid-utf8>"` and now gets `from_utf8_lossy`'s per-byte
+  replacement, which is what the other five already did and what a reader staring
+  at one corrupt frame among ninety needs.
+
 ### Fixed — `Tft::ALL` is the one list a new check can be left out of, and its doc said the opposite
 
 - **The guarantee the doc claimed is not one the type gives.** `Tft::ALL`'s
@@ -89,10 +131,13 @@ is a bug.
   — so the one documented way to reach it was also the one way to get a false
   green from it. **Miri itself was never missing**: `just miri` runs
   `cargo +nightly miri test` over `tf_tree_arena`/`tf_tree_core` and `tf_tree`
-  directly, and `just c-abi-check` runs four more rows over the C ABI. Nothing in
-  the repository ever called the stub — its only reference anywhere was that usage
-  string, which is why it survived. Deleted; `cargo xtask miri` now exits 1 and
-  names the two recipes that are real.
+  directly, and `just c-abi-check` runs four more rows over the C ABI. Nothing
+  *executed* the stub, but **nine documents and comments advertised it** —
+  `.cargo/config.toml`, `CLAUDE.md`, `README.md`, `CONTRIBUTING.md`,
+  `docs/PHASE1.md`, `xtask/Cargo.toml` and two `tf_tree_bench` doc comments, all
+  corrected here. (`docs/decisions/0003` keeps its copy: it is superseded and
+  frozen.) Deleted; `cargo xtask miri` now exits 1 and names the two real
+  recipes.
 - **`just c-abi-check` assigned `MIRIFLAGS` where `just miri` appends to it, and
   that is the gate it mattered on.** `ci.yml`'s `miri` job sets
   `-Zmiri-strict-provenance` at the job level and the recipe folds it in; the
@@ -104,6 +149,12 @@ is a bug.
   run its sibling already gets. All four now append. This only makes the flag
   reachable; no job sets it there yet, and turning it on is a measurement, not an
   edit.
+- **`RELEASE_VISIBLE` also covers `ros/` and the CMake package files.** Review
+  found the first list blind to two surfaces that reach people who never clone
+  the repository: the rclcpp bridge node, and what a `find_package(tf_tree
+  CONFIG)` consumer installs. `#322` in this same release touched only `ros/` and
+  the rule did not see it; it does now, and the flagged set over the 33 commits
+  since `v0.0.5` grows by exactly that one commit.
 
 ### Added — `tft_bridge_close_startup_window`, and a reason code that does not say "authority"
 

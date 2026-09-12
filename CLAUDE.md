@@ -113,7 +113,7 @@ crates/tf_tree_tf2_sys/ tf2 side of the differential harness; unsafe = 0007 kind
 crates/tf_tree_cli/     binary `tf_tree` (alias `tft`)
 ros/tf_tree_ros/        ament_cmake: the §5 ingest bridge. NOT a cargo crate.
 ros/tf_tree_bench_ros/  ament_cmake: PHASE5 §9.1 DDS comparison. Benchmark-only.
-xtask/                  loom / miri / bench-gate runners
+xtask/                  loom / bench-gate / headers runners (Miri is `just miri`)
 ```
 
 **Five crates publish:** `tf_tree`, `tf_tree_core`, `tf_tree_math`,
