@@ -220,11 +220,6 @@ pub(crate) fn write_twist6(t: &Iso3, twist: &Twist, dst: &mut [u8]) {
 }
 
 /// The canonical `[qw qx qy qz tx ty tz]` payload.
-///
-/// Shared by [`TFT_LAYOUT_QVEC7_WXYZ`] and the pose half of
-/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`], so the two cannot drift into different
-/// quaternion orders — which, per this module's first paragraph, is a drift
-/// nothing downstream can detect.
 #[inline]
 fn put_qvec7_wxyz(t: &Iso3, dst: &mut [u8]) {
     put_f64(dst, &[t.q.w, t.q.x, t.q.y, t.q.z, t.t.x, t.t.y, t.t.z]);
@@ -237,9 +232,7 @@ pub(crate) fn put_f64(dst: &mut [u8], vals: &[f64]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The publish direction — §3.2's `tft_publisher`
-// ---------------------------------------------------------------------------
+// The publish direction — §3.2's `tft_publisher`.
 
 /// Why a caller's transform was refused.
 ///
@@ -393,8 +386,6 @@ fn quat7(v: [f64; 7], wxyz: [usize; 4]) -> Result<Iso3, ReadError> {
         return Err(ReadError::NotFinite);
     }
     let q = tf_tree::Quat::new(v[wxyz[0]], v[wxyz[1]], v[wxyz[2]], v[wxyz[3]]);
-    // Catches the all-zeros buffer, which is what an uninitialized struct looks
-    // like and is otherwise a division by zero inside `normalize`.
     if (q.norm_squared() - 1.0).abs() > NORM2_TOL {
         return Err(ReadError::NotAUnitQuaternion);
     }
@@ -609,9 +600,7 @@ mod tests {
         }
     }
 
-    /// Every defined layout has a size, and an undefined one has none — so an
-    /// unknown discriminant from a newer header is an error rather than a
-    /// silent fallback.
+    /// Every defined layout has a size, and an undefined one has none.
     #[test]
     fn payload_sizes_are_defined_exactly_for_known_layouts() {
         assert_eq!(payload_bytes(TFT_LAYOUT_QVEC7_WXYZ), Some(56));
@@ -694,9 +683,8 @@ mod tests {
 
     /// **`write` refuses a twist-carrying layout rather than half-filling it.**
     ///
-    /// The split into `write`/[`write_twist6`] means every caller decides once,
-    /// from [`carries_twist`], which one it needs. The `debug_assert` is what
-    /// catches a caller that forgot — and *a `debug_assert` nothing trips is a
+    /// The `debug_assert` catches a caller that forgot which of the two
+    /// [`carries_twist`] selects — and *a `debug_assert` nothing trips is a
     /// `debug_assert` nobody has checked exists*, which is why this calls the
     /// wrong function on purpose rather than trusting the attribute.
     ///
@@ -747,8 +735,6 @@ mod tests {
     /// `2.0 * (.. - ..)` term ⇒ fails here while every test above still passes.
     #[test]
     fn rot3_matches_an_independent_construction_for_a_general_rotation() {
-        // A rotation whose axis has three comparable components, so every one
-        // of the nine products in `rot3` is live.
         let w = Vec3::new(0.62, -0.51, 0.74);
         let t = Iso3::new(tf_tree::exp_so3(w), Vec3::new(1.0, 2.0, 3.0));
 

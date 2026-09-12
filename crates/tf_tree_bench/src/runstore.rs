@@ -34,13 +34,9 @@
 //! # A differing *build* fact is not surfaced — it is refused
 //!
 //! [`HOST_CRITICAL_FACTS`] and [`BUILD_CRITICAL_FACTS`] are two lists because
-//! they earn two different responses. A different CPU makes the absolute
-//! numbers untrustworthy while leaving the ratios worth reading, so it is a
-//! warning above the table. A different `[profile.*]` makes the two runs
-//! *measurements of different programs* — this workspace's `[profile.release]`
-//! sets `lto = "thin"`, which inlines across the crate boundary that
-//! `[profile.embedder]` leaves standing — so there is nothing worth reading and
-//! [`render`] prints no table at all. See [`Diff::comparable`].
+//! they earn two different responses: a warning above the table, and no table
+//! at all. See [`BUILD_CRITICAL_FACTS`] for the argument and
+//! [`Diff::comparable`] for the flag.
 //!
 //! # Which emitted artifacts this covers, and which need nothing
 //!
@@ -58,10 +54,10 @@
 //! | `bin/native_arena.rs` | a `.tfstream` | **not applicable, and deliberately given no machinery**: it is the *input* both engines replay, not a measurement. Two of them differing is a fixture change, which `dump_stream`'s own comment covers |
 //! | every other `bin/` | stdout only | **not applicable**: nothing diffs two runs of `footprint`, `attach_bench`, `counter_cost`, `shm_scaling`, `tf2_scaling`, `mp_bench`, `shm_torture`, `frozen_workers`, `arena_backing`, `abi_attached` or `tf2_ratio`. They print a result an operator reads once. A one-shot report is not made safer by refusing to be a thing it is not |
 //!
-//! The last row is the one worth stating explicitly, because the alternative
-//! reading — "add the check everywhere, it is cheap" — costs a reader of each of
-//! those binaries a paragraph explaining a comparison that never happens. If one
-//! of them grows a `--json`, it grows a [`Run`] and this covers it.
+//! The last row is stated explicitly because the alternative reading — "add the
+//! check everywhere, it is cheap" — costs a reader of each of those binaries a
+//! paragraph explaining a comparison that never happens. If one of them grows a
+//! `--json`, it grows a [`Run`] and this covers it.
 //!
 //! # Schema
 //!
@@ -87,8 +83,7 @@ use crate::workload::Shape;
 /// unreadable, which is the same damage renaming a row or metric id does — see
 /// `bin/scale_sweep.rs`'s note on why `rss`/`pss` was not renamed. An older run
 /// file simply carries no `build_lto`, and [`diff`] already treats an absent
-/// build fact as a mismatch rather than as agreement, so nothing reads such a
-/// file as if it had made a claim it never made.
+/// build fact as a mismatch rather than as agreement.
 pub const SCHEMA: &str = "tf_tree.bench-run/1";
 
 /// The provenance facts a timing comparison is only meaningful within.
@@ -112,18 +107,16 @@ pub const HOST_CRITICAL_FACTS: &[&str] = &[
     // the two default differently — `[madvise]` against `[never]` on the
     // development host. Comparing only the first says two runs measured the same
     // machine when the arena's huge-page eligibility changed underneath them;
-    // `crates/tf_tree_cli/src/hostfacts.rs` records what that cost `TFT016`. A
-    // run file written before this key existed reads `absent` and therefore as
-    // drift, which is the correct reading rather than a regression.
+    // `crates/tf_tree_cli/src/hostfacts.rs` records what that cost `TFT016`.
     //
     // **Both are here, and the first is not redundant.** An earlier revision of
     // this list replaced `transparent_hugepage` with the shmem key rather than
-    // adding it, which silently retired drift detection on the knob the DEFAULT
-    // build depends on: `just bench-report` builds without `--features shm`, so
-    // the arena it measures is a heap — an anonymous mapping, governed by the
-    // first key and not the second. Two runs whose anonymous setting had flipped
-    // compared as the same machine. `every_host_critical_fact_is_diffed` below
-    // is what makes the next such removal a test failure.
+    // adding it, retiring drift detection on the knob the DEFAULT build depends
+    // on: `just bench-report` builds without `--features shm`, so the arena it
+    // measures is a heap — an anonymous mapping, governed by the first key and
+    // not the second. Two runs whose anonymous setting had flipped compared as
+    // the same machine. `every_host_critical_fact_is_pinned_and_diffed` below is
+    // what makes the next such removal a test failure.
     "transparent_hugepage",
     "transparent_hugepage_shmem",
 ];
@@ -145,15 +138,12 @@ pub const HOST_CRITICAL_FACTS: &[&str] = &[
 /// boundary a boundary measurement is trying to price, so the same binary built
 /// the two ways does not measure the same thing — twice in one week that
 /// difference was reported as a property of the code (`docs/PHASE4.md` §0.0
-/// records both). A warning printed above a table of per-row verdicts is not
-/// enough for that: the table is the thing that misleads, and it was still
-/// printed.
+/// records both).
 ///
 /// `build_lto` is here as well even though it is currently a function of
-/// `build_profile`. It is not redundant: it is what fires if a future edit to
-/// `[profile.embedder]` or `[profile.release]` changes what a profile *means*
-/// while leaving its name alone, which is exactly the change nobody would think
-/// to regenerate a comparison for.
+/// `build_profile`: it is what fires if a future edit to `[profile.embedder]`
+/// or `[profile.release]` changes what a profile *means* while leaving its name
+/// alone — the change nobody would think to regenerate a comparison for.
 ///
 /// # The three `dds_*` keys, and why a generic list names a specific harness
 ///
@@ -531,8 +521,7 @@ fn parse_metric(key: &str, m: &serde_json::Value, row: usize) -> Result<Metric> 
         // could not be measured is not a metric that measured zero.
         .unwrap_or(f64::NAN);
     // Leaked for the same reason the key is: `Metric` holds `&'static str`
-    // because the emitting side's units are literals, and this is a CLI that
-    // reads at most two files before exiting.
+    // because the emitting side's units are literals.
     let unit: &'static str = m
         .get("unit")
         .and_then(serde_json::Value::as_str)
@@ -574,10 +563,6 @@ fn jshape(shape: Option<&Shape>) -> String {
         ),
     }
 }
-
-// ---------------------------------------------------------------------------
-// The comparison
-// ---------------------------------------------------------------------------
 
 /// What a metric did between two runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -750,10 +735,9 @@ pub fn diff(a: &Run, b: &Run) -> Diff {
 }
 
 fn compare(row: &str, a: &Metric, b: &Metric) -> Delta {
-    // The direction is taken from the **baseline**, not from `b`. A change that
-    // retyped a metric would otherwise be judged by its own new rules, which is
-    // exactly the case a reviewer most wants flagged — and it shows up as a
-    // mismatch here rather than as a silent re-interpretation.
+    // The direction is taken from the **baseline**, not from `b`: a change that
+    // retyped a metric would otherwise be judged by its own new rules, silently
+    // re-interpreting the case a reviewer most wants flagged.
     let drift = a.drift;
     let tolerance = a.tolerance;
 
@@ -825,10 +809,9 @@ pub fn render(d: &Diff) -> String {
              in the binary. A cost measured under one is not the cost under the other.\n\
              Re-run both halves at the same profile.\n",
         );
-        // A run file written before a build fact existed reads as `absent`, and
-        // that lands here rather than being waved through — but it is not the
-        // same news as a profile that changed, so it says so instead of leaving
-        // a reader to infer a build change from a missing field.
+        // `absent` is not the same news as a profile that changed, so it says
+        // so instead of leaving a reader to infer a build change from a missing
+        // field.
         if d.build_mismatch
             .iter()
             .any(|(_, a, b)| a == "absent" || b == "absent")
@@ -971,8 +954,7 @@ mod tests {
     #[test]
     fn an_identical_run_is_all_noise() {
         // The property that makes this tool worth running: two runs of the same
-        // build must produce no verdict at all. A differ that reports change on
-        // identical input teaches its reader to ignore it.
+        // build must produce no verdict at all.
         let a = run(vec![row("n=1", 100.0, 0.25), row("n=2", 200.0, 0.25)]);
         let b = run(vec![row("n=1", 100.0, 0.25), row("n=2", 200.0, 0.25)]);
         let d = diff(&a, &b);
@@ -1008,8 +990,6 @@ mod tests {
 
     #[test]
     fn the_baselines_direction_wins_when_a_metric_was_retyped() {
-        // A change that flipped a metric's direction must not be judged by its
-        // own new rules — that is precisely the change a reviewer wants to see.
         let a = run(vec![row("n=1", 100.0, 0.10)]);
         let b = run(vec![RunRow::new("h", "robot", "tf_tree", "n=1")
             .metric(Metric::new("p99_ns", 200.0, "ns").higher_is_better(0.10))]);
@@ -1099,9 +1079,8 @@ mod tests {
         let d = diff(&a, &b);
         assert!(d.host_drift.iter().any(|(k, _, _)| k == "cpu_model"));
         assert!(render(&d).contains("HOST DRIFT"));
-        // Host drift is a *warning*: the table is still printed, because a
-        // ratio between two rows of the same run survives a different CPU.
-        // This is the half that distinguishes it from a build mismatch below.
+        // Host drift is a *warning*: the table is still printed, which is the
+        // half that distinguishes it from a build mismatch below.
         assert!(d.comparable(), "a different CPU is not a build mismatch");
         assert!(
             render(&d).contains("row / metric"),
@@ -1112,22 +1091,17 @@ mod tests {
     /// [`HOST_CRITICAL_FACTS`]'s membership is pinned here, and every key in it
     /// is separately shown to be diffed.
     ///
-    /// **This test exists because a key was silently deleted from that list.**
-    /// A revision adding `transparent_hugepage_shmem` *replaced*
-    /// `transparent_hugepage` rather than joining it, so two runs whose
-    /// anonymous huge-page setting had flipped compared as the same machine.
-    /// Nothing failed: the const had three references in the crate — its
-    /// definition, its doc, and the single `drift()` call site — and no test
-    /// named a key.
+    /// **This test exists because a key was silently deleted from that list**
+    /// (the story is on [`HOST_CRITICAL_FACTS`]). Nothing failed: the const had
+    /// three references in the crate — its definition, its doc, and the single
+    /// `drift()` call site — and no test named a key.
     ///
-    /// **The expected list is spelled out rather than derived, and that is the
-    /// whole mechanism.** The first version of this test looped over
-    /// `HOST_CRITICAL_FACTS` and asserted each key drifted. It passed with a key
-    /// deleted — removing the key removes the arm that would have caught it, so
-    /// it could not fail on the defect it was written for. A membership pin has
-    /// to compare against a list the change under test does not edit; changing
-    /// what this crate treats as host-critical now costs a deliberate edit in
-    /// two places, which is the cost being bought.
+    /// **The expected list is spelled out rather than derived.** The first
+    /// version of this test looped over `HOST_CRITICAL_FACTS` and asserted each
+    /// key drifted. It passed with a key deleted — removing the key removes the
+    /// arm that would have caught it, so it could not fail on the defect it was
+    /// written for. A membership pin has to compare against a list the change
+    /// under test does not edit.
     ///
     /// **Three doors, and the third was open until 2026-09-06.** The list can
     /// be retired by deleting a key (the membership pin), the *differ* can be
@@ -1151,7 +1125,6 @@ mod tests {
     /// an aarch64 run compare as the same machine.
     #[test]
     fn every_host_critical_fact_is_pinned_and_diffed() {
-        // Keep in step with `HOST_CRITICAL_FACTS` above, deliberately.
         const EXPECTED: &[&str] = &[
             "cpu_model",
             "physical_cores",
@@ -1171,15 +1144,11 @@ mod tests {
              `transparent_hugepage` went missing"
         );
 
-        // **The other half of the same door, and it was open.** The loop below
-        // writes each key into BOTH synthetic runs before comparing, so it
-        // never consults the producer — and `drift` reports a difference, so a
-        // key absent from both runs compares EQUAL. Retiring a fact from
-        // `Provenance::collect` (a rename, a deleted `push`) therefore made
-        // every future pair of runs agree on it forever, with the membership
-        // pin above still green: measured on the shipped `bench_ab`, an
-        // x86_64 run and an aarch64 run would compare with no `HOST DRIFT`
-        // banner at all.
+        // **The third door, and it was open.** Retiring a fact from
+        // `Provenance::collect` (a rename, a deleted `push`) made every future
+        // pair of runs agree on it forever with the membership pin above still
+        // green: measured on the shipped `bench_ab`, an x86_64 run and an
+        // aarch64 run would compare with no `HOST DRIFT` banner at all.
         //
         // PRESENCE only, never a value: `physical_cores` is `unknown` on
         // aarch64 and `cpu_governor` is `unknown` on any host with no cpufreq
@@ -1206,8 +1175,7 @@ mod tests {
             let mut a = run(vec![row("n=1", 1.0, 0.1)]);
             let mut b = run(vec![row("n=1", 1.0, 0.1)]);
             // Pin both sides to a known value first: whether *this* host
-            // records the key is not what is under test, and a key absent from
-            // both runs would otherwise read as agreement.
+            // records the key is not what is under test.
             for (r, v) in [(&mut a, "before"), (&mut b, "after")] {
                 match r.provenance.facts.iter_mut().find(|f| &f.key == key) {
                     Some(f) => f.value = v.to_owned(),
@@ -1238,11 +1206,10 @@ mod tests {
     /// `"thin"`, so the two agreed, no mismatch was detected, and the assertion
     /// fired. The bug was in the test, not the differ.
     ///
-    /// It is worth naming what caught it: the failing configuration is
-    /// `--features tf2 --release`, which only the container recipe compiles.
-    /// `just test` builds default features in debug and cannot see it. That is
-    /// the same shape as every other feature-gated hole this repository has
-    /// found, and it is why the container gate is not optional.
+    /// The failing configuration is `--features tf2 --release`, which only the
+    /// container recipe compiles — the same shape as every other feature-gated
+    /// hole this repository has found, and why the container gate is not
+    /// optional.
     fn differing_value(r: &Run, key: &str) -> String {
         let real = r
             .provenance
@@ -1262,8 +1229,8 @@ mod tests {
     }
 
     /// A run taken at `--profile embedder` and a run taken at `--release`
-    /// measure different programs — thin LTO inlines across the crate boundary
-    /// the embedder profile leaves standing — so there is no comparison to make.
+    /// measure different programs (see [`BUILD_CRITICAL_FACTS`]), so there is
+    /// no comparison to make.
     ///
     /// Mutant (applied, observed): delete `"build_profile"` from
     /// [`BUILD_CRITICAL_FACTS`], leaving only `build_lto`. This test fails with
@@ -1291,8 +1258,7 @@ mod tests {
             .iter()
             .any(|(k, _, _)| k == "build_profile"));
 
-        // **The numbers are withheld, not annotated.** A banner over a table of
-        // verdicts loses to the table; somebody quotes the percentage.
+        // **The numbers are withheld, not annotated.**
         let text = render(&d);
         assert!(text.contains("REFUSED"), "{text}");
         assert!(
@@ -1301,9 +1267,8 @@ mod tests {
         );
     }
 
-    /// The other build fact, and the one that catches a profile whose *meaning*
-    /// changed while its name did not — an edit to `[profile.embedder]`'s `lto`,
-    /// say, which nobody would think to regenerate a comparison for.
+    /// The other build fact: the one that catches a profile whose *meaning*
+    /// changed while its name did not.
     ///
     /// Mutant (applied, observed): delete `"build_lto"` from
     /// [`BUILD_CRITICAL_FACTS`]. This test fails on the `!d.comparable()`
@@ -1328,8 +1293,7 @@ mod tests {
     }
 
     /// A run file written before `build_lto` existed must read as a mismatch,
-    /// not as agreement. Silence is not consent for a build fact: the whole
-    /// hazard is a number whose profile nobody wrote down.
+    /// not as agreement: the hazard is a number whose profile nobody wrote down.
     ///
     /// Mutant (applied, observed): change [`diff`]'s `drift` closure to skip a
     /// fact absent from either side (`if va.is_none() || vb.is_none() { return

@@ -16,19 +16,14 @@
 //! So a [`Workload`] is the whole description, and [`Workload::build`] is the
 //! only way to turn one into a running tree.
 //!
-//! # What a row must state, and why the shape is returned rather than logged
+//! # What a row must state
 //!
 //! `docs/PHASE1.md` §11.3 is normative about this: **"Every reported latency row
 //! must state its dynamic-step count, not just its nominal depth. A row labelled
 //! only 'depth 3' is not interpretable."** A static edge folds to one multiply;
 //! a chain that folds to a single dynamic step measures almost nothing. The same
 //! argument applies to a row labelled only `fleet_64` — it is a name, not a
-//! measurement.
-//!
-//! [`Shape`] therefore carries the frame, edge, sample and byte counts *and* the
-//! post-folding dynamic-step count of the deepest query, and every harness in
-//! this crate prints it next to its numbers rather than treating it as
-//! commentary.
+//! measurement. [`Shape`] is what carries it.
 //!
 //! # The three limits a scale sweep will find, named here rather than hit
 //!
@@ -46,13 +41,9 @@
 //! * `BuildError::TooManyFrames` / `TooManyEdges`: both counts are `u32`.
 //! * **`LayoutError::ArenaTooLarge`: the whole arena must fit a `u32` offset
 //!   model**, so 4 GiB is a hard ceiling regardless of frame and edge counts.
-//!   No catalogue entry is near it — the largest is 85 MiB — and that is worth
-//!   stating rather than implying: what bounds the entries below is population
-//!   *time*, and the byte ceiling is found deliberately by `scale_sweep`.
-//!
-//! [`Workload::estimate`] exists as a separate, *cheap* call so a harness can
-//! ask what a workload would cost — and be refused by any of the three limits
-//! above — before spending a minute populating it.
+//!   No catalogue entry is near it — the largest is 85 MiB. What bounds the
+//!   entries below is population *time*; the byte ceiling is found deliberately
+//!   by `scale_sweep`.
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -492,9 +483,6 @@ impl Workload {
     /// for `Recorded` it parses the file, which is the only way to know how many
     /// samples it holds.
     ///
-    /// `dyn_steps` is always `None` here: folding is a property of the compiled
-    /// plan, so it can only be filled in once a tree exists.
-    ///
     /// # Errors
     ///
     /// If a recording cannot be read, or if the implied arena exceeds the `u32`
@@ -527,10 +515,10 @@ impl Workload {
             publishers: plan.publishers,
         };
 
-        // Fill in the one number that needed a compiled plan. The *deepest*
-        // query is the one the row is labelled with, so this is a max and not
-        // an average: a mixed set whose worst plan is 4 dynamic steps is not
-        // interpretable as "1 step" because most of its pairs are shallow.
+        // The *deepest* query is the one the row is labelled with, so this is
+        // a max, not an average: a mixed set whose worst plan is 4 dynamic
+        // steps is not interpretable as "1 step" because most of its pairs are
+        // shallow.
         let compiled = built.plans()?;
         shape.dyn_steps = compiled.iter().map(dyn_steps).max();
 
@@ -597,10 +585,6 @@ impl Workload {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The intermediate form
-// ---------------------------------------------------------------------------
-
 /// A static edge, ready to declare.
 struct StaticEdge {
     parent: String,
@@ -646,10 +630,9 @@ fn shape_of(plan: &BuildPlan) -> Result<Shape> {
         .sum();
 
     // `TreeBuilder` adds one frame and one edge of slack plus any headroom, and
-    // `ArenaLayout` is what actually decides whether this fits. Asking it here —
-    // with the totals rather than the split, which is exactly what `from_totals`
-    // is for — is what turns a 4 GiB overrun into a message instead of a build
-    // that runs for a minute and then fails.
+    // `ArenaLayout` is what actually decides whether this fits. Asking it here
+    // with the totals rather than the split (`from_totals`) turns a 4 GiB
+    // overrun into a message instead of a minute of population that then fails.
     let max_frames = u32::try_from(frames + 1).map_err(|_| anyhow!("too many frames: {frames}"))?;
     let max_edges = u32::try_from(edges + 1).map_err(|_| anyhow!("too many edges: {edges}"))?;
     let total_slots = u32::try_from(slots).map_err(|_| anyhow!("too many ring slots: {slots}"))?;
@@ -750,10 +733,6 @@ fn populate(tree: &Tree, plan: &BuildPlan) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Topology expansion
-// ---------------------------------------------------------------------------
-
 fn fixture_plan(queries: QuerySpec) -> Result<BuildPlan> {
     let mut statics = Vec::new();
     let mut dynamics = Vec::new();
@@ -801,10 +780,8 @@ fn recorded_plan(rel_path: &str, queries: QuerySpec) -> Result<BuildPlan> {
         .join("../..")
         .join(rel_path);
     let stream = TfStream::load(&path).with_context(|| format!("loading {}", path.display()))?;
-    // A recording's rate is not declared, so it is measured: the median
-    // interval over the samples of each edge. A *mean* would be dragged by the
-    // gaps §3.2 says every real recording has, and a rate is only used here to
-    // pace a live publisher and to fill `nominal_rate_hz`.
+    // The measured rate is used only to pace a live publisher and to fill
+    // `nominal_rate_hz`.
     stream_plan(&stream, queries, None)
 }
 
@@ -1008,10 +985,6 @@ fn median_rate_hz(samples: &[(i64, Iso3)]) -> f64 {
     1e9 / mid as f64
 }
 
-// ---------------------------------------------------------------------------
-// Query selection
-// ---------------------------------------------------------------------------
-
 fn resolve_pairs(
     queries: QuerySpec,
     statics: &[StaticEdge],
@@ -1024,11 +997,8 @@ fn resolve_pairs(
             Ok(vec![(leaf, root)])
         }
         QuerySpec::CrossFleet => {
-            // The whole point of this spec: a pair whose path leaves one
-            // robot's subtree, crosses the fleet root and descends into
-            // another's, so the plan composes two spines' worth of dynamic
-            // steps. Querying within one robot would measure the `robot` row
-            // with extra frames in the arena.
+            // Querying within one robot would measure the `robot` row with
+            // extra frames in the arena.
             let robots = fleet_robot_count(statics);
             if robots < 2 {
                 bail!("CrossFleet needs at least two robots; found {robots}");
@@ -1143,8 +1113,7 @@ impl SplitMix {
 impl Shape {
     /// A one-line description for a harness header.
     ///
-    /// Every harness prints this next to its numbers. `docs/PHASE1.md` §11.3:
-    /// a row that does not state its dynamic-step count is not interpretable.
+    /// Every harness prints this next to its numbers (`docs/PHASE1.md` §11.3).
     #[must_use]
     pub fn describe(&self) -> String {
         let steps = self

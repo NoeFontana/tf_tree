@@ -67,13 +67,9 @@ pub(crate) struct LivenessProbe {
     /// **`#[cfg(feature = "test-hooks")]`, absent from every shipped build**,
     /// and it exists for one reason: it is the only part of
     /// [`reclamation_verdict`]'s third constraint that a test in this workspace
-    /// can observe. *Which* of the two reads happened first is not visible in
-    /// any sequence of stable slot states — only in an interleaving, which is
-    /// `loom`'s job (0028 plan step 1) — but *whether the byte was read at all*
-    /// is visible, and a predicate that decides a `FREE` word without a syscall
-    /// is a predicate that reached the word first. See
-    /// [`reclamation_verdict_for_test`], which renders this, and
-    /// `a_free_word_is_decided_without_asking_the_kernel`, which asserts it.
+    /// can observe — see *What pins it here* there for why the verdict alone is
+    /// not. [`reclamation_verdict_for_test`] renders this, and
+    /// `a_free_word_is_decided_without_asking_the_kernel` asserts it.
     #[cfg(feature = "test-hooks")]
     probes: std::sync::atomic::AtomicU32,
 }
@@ -201,25 +197,21 @@ pub(crate) enum Reclamation {
 ///
 /// **Step 0c buys *the byte at index `slot` is the byte of the record at index
 /// `slot`***, and nothing else does. The two indices are chosen by code that
-/// cannot see the other: the byte by `tf_tree_ipc`, which has no arena
-/// dependency, and the record by the first `FREE` slot of a fresh arena. On every ordinary path they agree by construction; under
-/// `CreatePolicy::Always`, which skips §3.4 step 4's guard by design, they
-/// diverged — *measured*, in
+/// cannot see the other, and under `CreatePolicy::Always` they diverged. That
+/// is *measured*, in
 /// `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`. `0035`
 /// has since put the create path on `register_creator`, which takes byte 0
 /// atomically, and issue #201 closed the **takeover** arm by deleting it
 /// ([`0037`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0037-a-takeover-is-not-a-second-open.md)).
-/// What this still buys is
-/// hand-rolled `tf_tree_ipc::Open` plus `TreeBuilder::build_shared`
-/// construction, where the two numbers are chosen by two callers and nothing
-/// pairs them — the route the [`OpenError::ParticipantSlotDiverged`] doc names
-/// as reachable. **Do not delete 0c on the strength of the takeover arm being
-/// fixed.** This
-/// function reads one at the index of the other, so without 0c's assertion
-/// every verdict below is about a different process than the one it names, and
-/// a `Reclaimable` verdict then frees a live participant's record. The
-/// assertion is in [`Open::attempt`]'s `Created` arm, before the owner server
-/// is spawned.
+/// What this still buys is hand-rolled `tf_tree_ipc::Open` plus
+/// `TreeBuilder::build_shared` construction, where the two numbers are chosen
+/// by two callers and nothing pairs them — the route the
+/// [`OpenError::ParticipantSlotDiverged`] doc names as reachable. **Do not
+/// delete 0c on the strength of the takeover arm being fixed.** This function
+/// reads one at the index of the other, so without 0c's assertion every verdict
+/// below is about a different process than the one it names, and a
+/// `Reclaimable` verdict then frees a live participant's record. The assertion
+/// is in [`Open::attempt`]'s `Created` arm, before the owner server is spawned.
 ///
 /// # The three constraints, each of which an earlier revision got wrong
 ///
@@ -740,12 +732,11 @@ pub enum OpenError {
     /// [`OpenOutcome::Joined`] — somebody else's arena is already live.
     ///
     /// The refusal `docs/decisions/0019` §3 question 1 settles for the ROS
-    /// bridge, and `0015` depends on it: [`CreatePolicy`] has no
-    /// "create, or refuse if one is already live" variant, so a second bridge
-    /// would take the *join* path and start claiming edges in an arena it did
-    /// not size. The session is dropped before this is returned, so the
-    /// participant lock byte is released and the socket closed — a refused
-    /// attach leaves nothing behind.
+    /// bridge, and `0015` depends on it: a second bridge would otherwise take
+    /// the *join* path and start claiming edges in an arena it did not size
+    /// ([`Open::require_create`] carries the missing-variant argument). The
+    /// session is dropped before this is returned, so a refused attach leaves
+    /// nothing behind.
     #[error("an arena is already live at this rendezvous and require_create was set")]
     ArenaAlreadyLive,
     /// This process's participant **lock byte** and its arena participant
@@ -1299,14 +1290,11 @@ impl Open {
 /// (`docs/decisions/0019` plan step 2). Both describe the publisher-mid-start
 /// window: [`IpcError::ArenaAbsent`] is "nothing is there", and
 /// [`IpcError::ArenaHeldButUnreachable`] is "something took the ownership byte
-/// and has not begun serving". `docs/decisions/0018` puts "not yet" and "never
-/// started" on one branch because a waiter cannot distinguish them and does the
-/// same thing about both.
+/// and has not begun serving" — one branch, per `docs/decisions/0018`.
 ///
 /// Everything else — a `FORMAT_VERSION` or layout-hash disagreement, a missing
 /// runtime directory, a mapping failure, a builder misconfiguration — is
-/// terminal. Retrying cannot change any of them, and burning the budget would
-/// hand the caller a timeout where it had a precise message.
+/// terminal, at the cost [`Open::await_open`] states.
 fn is_retryable(err: OpenError) -> bool {
     matches!(
         err,
@@ -1392,8 +1380,7 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
 
     // A second mapping so the serving thread can reach the participant table
     // without borrowing the `Tree`. One extra mapping of an already-resident
-    // segment costs page-table entries and nothing else, and it keeps the
-    // thread's lifetime independent of the handle a caller holds.
+    // segment costs page-table entries and nothing else.
     //
     // **Read-write, and it used to be read-only.** §3.9 says that when a
     // participant dies "the owner reaps its arena-side records"; the hangup
@@ -1406,14 +1393,11 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
     };
     let table_arena = tf_tree_arena::MappedArena::attach(table_fd, AttachMode::ReadWrite)?;
 
-    // **The owner's own slot, which no sweep may collect.**
+    // **The owner's own slot, which no sweep may collect** —
     // `reclamation_verdict`'s second constraint skips it unconditionally and
-    // first — `F_OFD_GETLK` reports only *conflicting* locks, so a description
-    // does not see its own byte, and a sweep that leant on this probe's
-    // separate description happening to make ours visible would be one refactor
-    // away from reclaiming its own live record. One integer indexes both tables
-    // (§3.7), and `Open::attempt`'s `Created` arm is what asserts that here
-    // (`docs/decisions/0028` plan step 0c) rather than assuming it.
+    // first. One integer indexes both tables (§3.7), and `Open::attempt`'s
+    // `Created` arm is what asserts that here (`docs/decisions/0028` plan step
+    // 0c) rather than assuming it.
     let own_slot = tree.participant_slot();
 
     let running = Arc::new(AtomicBool::new(true));
@@ -1499,14 +1483,11 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                                     // for. Reclaim first, grant second.
                                     //
                                     // `observed` comes from the verdict rather
-                                    // than from a fresh load, which is what
-                                    // `Reclamation::Reclaimable` carries it
-                                    // for: it is the word read *before* the
-                                    // byte was probed, and `reclaim`'s ordering
-                                    // obligation is about that word. A reload
-                                    // here would build the CAS guard out of a
-                                    // word read *after* the probe — the failing
-                                    // order, which erases a published record.
+                                    // than from a fresh load — see
+                                    // `Reclamation::Reclaimable`, which carries
+                                    // the word because a reload here builds the
+                                    // CAS guard out of a word read *after* the
+                                    // probe: the failing order.
                                     //
                                     // **And nothing in this crate would catch
                                     // one**, which is why it is written down
@@ -1599,15 +1580,13 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                         }
                         // **And the lock byte must be free too.** A read-only
                         // participant takes its byte but writes no arena
-                        // record — `attach_shared` cannot register a
-                        // `PROT_READ` mapping — so the table alone reports its
-                        // slot empty. `mode="ro"` is the consumer default
-                        // (D18) *and* the Python default, so this is the
-                        // common case, not a corner. Granting such a slot
-                        // hands the joiner a byte it cannot take; the
-                        // `granted` bitmask hides that until an owner restart
-                        // or a takeover clears it, after which the owner names
-                        // the same slot forever and the joiner loops.
+                        // record, so the table alone reports its slot empty —
+                        // the consumer default (D18), and the common case, not
+                        // a corner. Granting such a slot hands the joiner a
+                        // byte it cannot take; the `granted` bitmask hides that
+                        // until an owner restart or a takeover clears it, after
+                        // which the owner names the same slot forever and the
+                        // joiner loops.
                         //
                         // **A slot just reclaimed is probed twice**, and that
                         // is deliberate rather than overlooked. The verdict
@@ -1633,12 +1612,10 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                     //
                     // A participant that is `SIGKILL`ed never runs `Tree`'s
                     // `Drop`, so its record stays `LIVE` until somebody else
-                    // clears it — and when this was written nobody did: `assign`
-                    // above skipped a `LIVE` slot while `register_at` fills only
-                    // a `FREE` one, so that slot could never be granted to
-                    // anybody again. (`assign` no longer skips it; that is plan
-                    // step 3, and this callback is now the O(1) fast path for
-                    // the same collection rather than the only one.)
+                    // clears it — and when this was written nobody did.
+                    // (`assign` no longer skips it; that is plan step 3, and
+                    // this callback is now the O(1) fast path for the same
+                    // collection rather than the only one.)
                     // Measured before this existed, with
                     // `shm_torture --kill-hz 6`: 63 of the 64 slots held records
                     // for dead pids after thirty seconds, every subsequent
@@ -1718,14 +1695,13 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                     let view = tf_tree_core::arena_view::ArenaView::new(&table_arena);
 
                     // **`docs/PHASE2.md` §3.9's other half, and it had no
-                    // caller.** The section says a dead participant's *"arena-side
-                    // records"* are the owner's to reap; this callback freed the
-                    // participant record and left every **claim** that
-                    // participant held. `Tree::reap_participant` was written for
-                    // exactly this site — its doc says "the owner learns a
-                    // participant died from `EPOLLHUP` … and therefore knows
-                    // which slot went away" — and nothing in the workspace
-                    // called it outside a benchmark and a test helper.
+                    // caller.** This callback freed the participant record and
+                    // left every **claim** that participant held.
+                    // `Tree::reap_participant` was written for exactly this
+                    // site — its doc says "the owner learns a participant died
+                    // from `EPOLLHUP` … and therefore knows which slot went
+                    // away" — and nothing in the workspace called it outside a
+                    // benchmark and a test helper.
                     //
                     // What that cost is the ordinary supervised restart: a
                     // killed publisher's edges stay claimed, the supervisor

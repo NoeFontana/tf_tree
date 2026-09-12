@@ -2,10 +2,9 @@
 //!
 //! # What this measures, and the two ways it used to fail to
 //!
-//! §7 gate criterion 1 asks whether `tft_plan_at` costs a caller more than
-//! native Rust, and for a long time this file could not answer it, for two
-//! compounding reasons — both fixed here, both worth knowing about before
-//! trusting any number below.
+//! For a long time this file could not answer criterion 1 at all, for two
+//! compounding reasons — both fixed here, both worth knowing before trusting
+//! any number below.
 //!
 //! **1. It was built at the workspace `release` profile, which is
 //! `lto = "thin"`.** That inlines `tft_plan_at` into a Rust caller, so the C
@@ -62,10 +61,6 @@
 //!   ablation rows are there because three separate hypotheses about it were
 //!   measured and all three were wrong.
 //!
-//! Every arm evaluates the **same plan on the same tree at the same stamps** and
-//! writes the same 128 bytes, so a difference between two rungs is the one thing
-//! that changed between them.
-//!
 //! Run through `just abi-cost`, which pins to a core: an unpinned run migrates
 //! cores and swings by >30%, which is more than any allowance here.
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::expect_used)]
@@ -121,12 +116,11 @@ const ROUNDS: usize = 41;
 /// tightening it, which is the better outcome and the one `0023` invites.
 const ABI_OVER_GUARDED: f64 = 1.10;
 
-/// **R2 — `catch_unwind` on the happy path.** §3.4 asserts this is ~zero
-/// because it emits landing pads rather than a runtime check, and the ABI's own
-/// body with the guard removed (`tft_test_plan_at_unguarded`) is the subtraction
-/// that says so on a real call. Measured 0.999–1.006 across the same nine runs,
-/// i.e. indistinguishable from free, exactly as §3.4 predicts. 1.05 fails if the
-/// landing pads ever stop being free on this target.
+/// **R2 — `catch_unwind` on the happy path.** §3.4 asserts this is ~zero, and
+/// the ABI's own body with the guard removed (`tft_test_plan_at_unguarded`) is
+/// the subtraction that says so on a real call. Measured 0.999–1.006 across the
+/// same nine runs, i.e. indistinguishable from free. 1.05 fails if the landing
+/// pads ever stop being free on this target.
 const PANIC_GUARD: f64 = 1.05;
 
 /// **R3 — what a guard per lookup costs**, against one hoisted out of the loop.
@@ -178,12 +172,10 @@ const PANIC_GUARD: f64 = 1.05;
 /// (~41 ns of a ~302 ns scalar call at n = 256) rather than with new API.
 const PER_CALL_GUARD: f64 = 1.25;
 
-/// **C — the control**, and the reason this file can gate at all. Two
-/// structurally identical native arms, two symbols, two call sites: if the
-/// compiler still specialised the comparand per call site the way it did when
-/// the old gate swung 43% on an unrelated edit, these two would disagree. The
-/// allowance is a *symmetric* band — |ratio - 1| < 0.02 — because either
-/// direction is the same failure.
+/// **C — the control**, and the reason this file can gate at all. If the
+/// compiler still specialised the comparand per call site, rung 1 and its twin
+/// would disagree. The allowance is a *symmetric* band — |ratio - 1| < 0.02 —
+/// because either direction is the same failure.
 ///
 /// **2% is more than twice the spread these two arms actually show**: twelve
 /// runs gave 0.992–1.002, and the widest excursion was 0.8%. It is deliberately much
@@ -264,11 +256,8 @@ fn ratio(num: &[f64], den: &[f64]) -> f64 {
 
 // --- the pinned native comparands ---------------------------------------
 //
-// **These three functions are the fix for a gate that could not gate.** §7 gate
-// criterion 1 is a ratio, and its denominator used to be an inlined loop whose
-// cost was at LLVM's discretion: adding a second, wholly unrelated
-// `Tree::guard()` call site to this file moved it 133 -> 190 ns (43%) and the
-// verdict FAIL -> PASS, while the ABI arm never moved. See `docs/PHASE4.md` §7.
+// **These three functions are the fix for a gate that could not gate** — the
+// module doc's failure 2, also recorded in `docs/PHASE4.md` §7.
 //
 // Each is `#[inline(never)]` with `black_box` on the stamp going in and on the
 // scalar coming out, so:
@@ -336,10 +325,9 @@ fn native_per_call_guard(
 /// **The pin's self-check, measured on every run.**
 ///
 /// A structural twin of [`native_per_call_guard`]: same work, different symbol,
-/// different call site. If the compiler were still specialising the comparand
-/// per call site — the failure that made the old gate move 43% on an unrelated
-/// edit — these two would not agree. They are printed side by side and their
-/// difference is the ladder's own error bar.
+/// different call site, so a disagreement is per-call-site specialisation
+/// returning ([`CONTROL`]). They are printed side by side and their difference
+/// is the ladder's own error bar.
 ///
 /// It reads `buf[15]` rather than `buf[0]` **so that identical-code folding
 /// cannot merge the two symbols**, which would make the control vacuous by
@@ -375,10 +363,9 @@ fn native_per_call_guard_twin(
 /// This is the same fact `tf_tree_bench`'s `build.rs` gets from `OUT_DIR`, read
 /// a weaker way: `OUT_DIR` is what cargo told the build, while this is where the
 /// file ended up, so a copied binary answers `None` here and `build.rs`'s answer
-/// would have travelled with it. `None` is the honest reply for a copied
-/// binary — it is *why* an unverified `embedder` claim is not allowed to gate —
-/// and the weaker mechanism is the right trade for a published crate that
-/// should not grow a build script to serve one benchmark example.
+/// would have travelled with it. `None` is the honest reply for a copied binary,
+/// and the weaker mechanism is the right trade for a published crate that should
+/// not grow a build script to serve one benchmark example.
 fn profile_dir_of_this_binary() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let parts: Vec<String> = exe
@@ -447,20 +434,12 @@ fn main() {
     // comment far below), argv[1] is a claim that gets checked against where
     // cargo actually put this binary.
     //
-    // It used to be only a claim. `just abi-cost` builds twice and passes
-    // `release` to one and `embedder` to the other, and the binary believed
-    // whichever string it got; swapping the two lines of that recipe would have
-    // moved the gate onto the `lto = "thin"` run — the one where rustc inlines
-    // `tft_plan_at` into its Rust caller, so the boundary being priced is not in
-    // the binary — and nothing in the output would have said so. That is the
-    // same shape as the two wrong attributions `docs/PHASE4.md` §0.0 records.
-    //
-    // `tf_tree_c` is a published crate and does not get a `build.rs` for this
-    // (`tf_tree_bench`'s bakes `OUT_DIR`'s profile directory in, which is the
-    // better fact when it is available). `current_exe` is the version that costs
-    // the shipped crate nothing: cargo lays an example out at
-    // `<target>/[<triple>/]<profile-dir>/examples/<name>`, so the component
-    // before `examples` is the profile directory.
+    // It used to be only a claim: `just abi-cost` passes `release` to one build
+    // and `embedder` to the other, and the binary believed whichever string it
+    // got. Swapping those two lines of the recipe would have moved the gate onto
+    // the `lto = "thin"` run, where the boundary is erased, and nothing in the
+    // output would have said so — the same shape as the two wrong attributions
+    // `docs/PHASE4.md` §0.0 records.
     let claimed = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "unstated".to_owned());
@@ -517,8 +496,7 @@ fn main() {
     let mut ubuf = [0u8; 128];
 
     // Rung 0. The guard is built once per *round* — 4096 lookups — so its cost
-    // is 1/4096th of anything below, which is the "hoisted out of the loop"
-    // shape a Rust embedder writes.
+    // is 1/4096th of anything below.
     let mut arm_hoisted = || {
         let g = native.guard();
         let mut acc = 0.0;
@@ -545,8 +523,7 @@ fn main() {
     };
     // Rung 2. The ABI's own body with `catch_unwind` removed and nothing else
     // changed, so the panic guard is a subtraction on a real, non-inlinable
-    // call. (`tft_guarded_noop` further down measures an *inlined* body and
-    // answers a different question.)
+    // call.
     let mut arm_unguarded = || {
         let mut acc = 0.0;
         for &t in &stamps {
@@ -596,7 +573,6 @@ fn main() {
     let unguarded_ns = median(m[3].clone());
     let abi_ns = median(m[4].clone());
 
-    // The quotients that matter, each the median of per-round quotients.
     let r_control = ratio(&m[2], &m[1]);
     let r_guard = ratio(&m[1], &m[0]);
     let r_abi = ratio(&m[4], &m[1]);

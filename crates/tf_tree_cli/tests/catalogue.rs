@@ -142,9 +142,6 @@ fn every_id_is_reported_and_every_skip_states_a_reason() {
     });
 }
 
-/// **The JSON carries every catalogue id, and its summary agrees with the exit
-/// status.**
-///
 /// **`--exit-code` has two tiers, and the default one is unchanged.**
 ///
 /// Six ids carry `Error`, and on a *live* arena four of them structurally skip —
@@ -159,10 +156,9 @@ fn every_id_is_reported_and_every_skip_states_a_reason() {
 /// and `Report::is_healthy` was written and unit-tested for it with **no
 /// caller**. This connects them.
 ///
-/// The three assertions are the three things that had to stay true: a bare
-/// `--exit-code` means what it always meant, `error` is that spelled out, and
-/// `warn` is *warn-and-above* rather than warn-only — an arena with a cycle in
-/// it must not pass `--exit-code warn` just because nothing warned.
+/// One thing the assertions below do not spell out: the `warn` tier is
+/// warn-and-above rather than warn-only, so an arena with a cycle in it must
+/// not pass `--exit-code warn` just because nothing warned.
 ///
 /// **Mutant:** write the `warn` arm as `report.count_at(Severity::Warn) > 0`.
 /// The first two assertions still hold and the tier stops being a ladder; this
@@ -182,8 +178,6 @@ fn the_exit_code_gate_has_a_warn_tier_and_an_unchanged_default() {
             .success()
     };
 
-    // The fixture is healthy at error severity and not at warn — which is what
-    // makes it a fixture that can tell the two tiers apart at all.
     assert!(run(&["--exit-code"]), "a bare --exit-code must still pass");
     assert!(
         run(&["--exit-code", "error"]),
@@ -228,8 +222,6 @@ fn the_json_summary_agrees_with_the_exit_status() {
         assert!(!report.has_error());
     });
 
-    // Forced: an id-less error must appear in the summary count, or a CI job
-    // reading the JSON disagrees with the process it just ran.
     let mut report = tf_tree_cli::catalogue::Report::default();
     report
         .uncatalogued
@@ -433,10 +425,8 @@ capacity = 64
 /// lock byte instead; both are `Tree::participant_alive`, which is the point of
 /// routing through it rather than spelling a third predicate here.
 ///
-/// Non-vacuity is the whole risk in a test like this, so three things are
-/// asserted about the *healthy* half of the same arena: the table is fully
-/// captured, this process's own slot reads alive, and the live writers'
-/// claims produce no edge finding.
+/// Non-vacuity is the whole risk in a test like this, so the *healthy* half of
+/// the same arena is asserted about too.
 ///
 /// Mutant: in `tft014`, drop the participant loop. Applied: `left: Pass,
 /// right: Fired` — which is exactly the state `tf_tree doctor` was in before
@@ -454,9 +444,9 @@ fn a_stale_live_participant_record_is_reported_on_a_real_arena() {
     let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
     let (writers, samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
 
-    // Slot 0 is this process. Slot 1 is the record a killed writer leaves: the
-    // publication protocol is the same one `register` runs, because the state
-    // being simulated is a *complete* registration whose process then died.
+    // Slot 1 is the record a killed writer leaves: the publication protocol is
+    // the same one `register` runs, because the state being simulated is a
+    // *complete* registration whose process then died.
     tree.arena_view()
         .participants()
         .register_at(1, GONE, 1, 0)
@@ -605,10 +595,9 @@ fn a_publishers_clock_offset_reaches_a_tft004_finding_on_a_real_arena() {
     let tree = TreeBuilder::new()
         .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::slots(64)))
         .dynamic_edge("odom", "base", EdgeCfg::new(Capacity::slots(64)))
-        // **Never claimed and never pushed**, so its `clock_offset_nanos` stays
-        // at the arena's zero. It is here to make the `0 -> None` mapping in
-        // `Snapshot::capture` load-bearing: without a never-sampled edge in the
-        // snapshot, a capture that passed the raw value through would be
+        // **Never claimed and never pushed**, which makes the `0 -> None`
+        // mapping in `Snapshot::capture` load-bearing: without a never-sampled
+        // edge, a capture that passed the raw value through would be
         // indistinguishable from one that maps the sentinel.
         .dynamic_edge("base", "sensor", EdgeCfg::new(Capacity::slots(64)))
         .build()
@@ -970,13 +959,6 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
         "tool_version",
         "uncatalogued",
     ];
-    // **The literal is held to the block, and only then to the bytes.** The
-    // sentence above claimed the emitted document was compared against
-    // `render_json`'s schema block; nothing read that block, so what was
-    // compared was the bytes against this literal, and a key added to the
-    // emitter and to the literal in one commit left the block silently behind.
-    // Measured: emitting one extra key and adding it here left the crate green,
-    // and `cargo test --doc` never runs the block because it is fenced ```text.
     assert_eq!(
         documented_top_level_keys(),
         expected_keys.to_vec(),
@@ -1045,13 +1027,8 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
         ]
     );
 
-    // Every id, exactly once, in id order. The expected sequence is written
-    // out here rather than folded from `Tft::ALL`, because `render_json`
-    // iterates `Tft::ALL` too: a comparison against it pins whatever order that
-    // array happens to be in, and swapping two of its entries reorders the wire
-    // document with the assertion still green. The literal is the wire
-    // contract's own source; the sorted check below is what keeps the literal
-    // itself from encoding a wrong order.
+    // Every id, exactly once, in id order. The expected sequence is a literal
+    // and not a fold over `Tft::ALL` — this test's doc has the reason.
     let checks = doc["checks"].as_array().expect("checks is an array");
     let ids: Vec<&str> = checks
         .iter()
@@ -1071,9 +1048,6 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
         ids, wire_order,
         "the checks array must carry every catalogue id, once, in id order"
     );
-    // And the literal is held to the catalogue from the other side: an id added
-    // to `Tft::ALL` that never reaches the wire would satisfy the sequence
-    // assertion above, since both the emitter and a stale literal would omit it.
     let mut catalogued: Vec<&str> = Tft::ALL.iter().map(|c| c.id()).collect();
     catalogued.sort_unstable();
     let mut on_the_wire = wire_order.to_vec();
@@ -1084,10 +1058,7 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
     );
 
     let (mut pass, mut fired, mut skipped) = (0usize, 0usize, 0usize);
-    // Findings by severity — all three, because `summary.error`, `warn` and
-    // `info` are one denominator and `passed`/`fired`/`not_run` are another,
-    // and a test that checks only `warn` leaves the other two agreeing with
-    // nothing. (It checked only `warn` until a review said so.)
+    // Findings by severity, all three of them (this test's doc says why).
     let mut findings_at: BTreeMap<&str, usize> = BTreeMap::new();
     for c in checks {
         let id = c["id"].as_str().unwrap();
@@ -1150,7 +1121,6 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
         }
     }
 
-    // Two different denominators in one object: checks, and findings.
     let s = &doc["summary"];
     let mut sk: Vec<&str> = s.as_object().unwrap().keys().map(String::as_str).collect();
     sk.sort_unstable();
@@ -1169,9 +1139,6 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
     assert_eq!(s["passed"], pass, "summary.passed disagrees with the array");
     assert_eq!(s["fired"], fired, "summary.fired disagrees with the array");
     assert_eq!(s["not_run"], skipped, "summary.not_run disagrees");
-    // `summary.error`/`warn`/`info` count `uncatalogued` findings too, which is
-    // what makes them agree with the process exit status, so they go into the
-    // same buckets.
     for f in doc["uncatalogued"]
         .as_array()
         .expect("uncatalogued is an array")
@@ -1350,9 +1317,7 @@ fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_
     }
 
     // The other arena that reaches the same variant: a 512-slot ring with one
-    // push in it, which is every `doctor --attach` issued at bringup. The
-    // obstacle here is the stream, not the ring, and a ring-size remedy printed
-    // over it is the sentence this whole test exists to keep out of the report.
+    // push in it, which is every `doctor --attach` issued at bringup.
     let tree = TreeBuilder::new()
         .dynamic_edge("odom", "base_footprint", EdgeCfg::new(Capacity::slots(512)))
         .dynamic_edge(
@@ -1370,8 +1335,7 @@ fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_
     let snap = Snapshot::capture(&tree);
     let obs = Observations::from_arena(&tree, &snap);
     let stats = checks::collect_edge_stats(&tree, &snap);
-    // Non-vacuity: the ring is large and the stream is what is short, or this
-    // arena is not the one the second half of the finding is about.
+    // Non-vacuity: the ring is large and the stream is what is short.
     assert_eq!(
         snap.edges.iter().map(|e| e.head).max(),
         Some(1),

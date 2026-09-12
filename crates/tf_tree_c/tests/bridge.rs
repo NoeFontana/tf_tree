@@ -363,8 +363,6 @@ fn assert_balanced(s: &tft_bridge_stats) {
     );
 }
 
-// ---------------------------------------------------------------------------
-
 /// **The seam writes the arena, and the arena is readable through the handle it
 /// hands back.** Both halves of `docs/PHASE4.md` §5 in one call: the pipeline
 /// decides, and Rust — not the C++ node — performs the write.
@@ -794,11 +792,8 @@ fn a_halted_bridge_refuses_every_later_offer() {
         );
     }
     // **Every `tft_bridge_offer` call this test makes, counted** — all of them,
-    // which is itself the shape step 6 changed. While the 4096-transform
-    // backstop was the only close a C caller could reach, the halting *offer*
-    // was refused before `transforms += 1` and the assertion at the end had to
-    // subtract it. §5.4's primary close is a separate call, so there is no
-    // uncounted offer left to explain.
+    // which is itself the shape step 6 changed: §5.4's primary close is a
+    // separate call, so there is no uncounted offer left to explain.
     let mut offers = 0u64;
     let mut offer = |topic: tft_bridge_topic,
                      parent: &str,
@@ -971,12 +966,11 @@ fn a_halted_bridge_refuses_every_later_offer() {
 /// **The stop arrives through [`tft_bridge_note_time_jump`], and it has to.**
 /// This fixture is one publisher on one dynamic edge, and under §5.5's ladder a
 /// single source *never* promotes its own regression, however far back it goes
-/// — that is the whole correction: a lone node restarting is observationally
-/// identical to a bag loop, and the previous rule's floor turned it into a
-/// latched bridge on a healthy robot. What a lone bag loop really has is the
-/// authoritative signal, because `rcl` reports the `/clock` rewind to the node
-/// directly. So the fixture uses it, and the latch is exercised through the
-/// entry point a real replay deployment would use.
+/// (`a_lone_publisher_regressing_is_never_promoted_however_far_it_goes`). What
+/// a lone bag loop really has is the authoritative signal, because `rcl`
+/// reports the `/clock` rewind to the node directly. So the fixture uses it,
+/// and the latch is exercised through the entry point a real replay deployment
+/// would use.
 ///
 /// Mutant: delete `inner.stopped = Some(…)` from the `RecreateArena` arm ⇒ the
 /// next offer comes back **`TFT_BRIDGE_REJECTED`** (*"left: 7, right: 6"*), not
@@ -1102,7 +1096,7 @@ fn a_lone_publisher_regressing_is_never_promoted_however_far_it_goes() {
 /// §5.5's fallback rung at the seam, in the shape the rest of this file cannot
 /// express: `TOPO` declares one dynamic edge, so nothing else here can put two
 /// distinct publishers inside one correlation window. Hence a local topology
-/// with a second dynamic edge and a second publisher — the pair the rule was
+/// with a second dynamic edge and a second publisher — the pair `0011` was
 /// opened about, a localizer's `map -> odom` and a wheel driver's `odom ->
 /// base`.
 ///
@@ -1139,8 +1133,6 @@ fn a_lone_publisher_regressing_is_never_promoted_however_far_it_goes() {
 /// the counter goes back to meaning "regressions" instead of "promotions".
 #[test]
 fn a_clock_reset_needs_a_second_publisher_and_reports_how_many_corroborated() {
-    /// Two dynamic edges from two nodes — the pair 0011 was opened about: a
-    /// localizer's `map -> odom` and a wheel driver's `odom -> base`.
     const TWO_PUBLISHERS: &str = r#"
 [[edge]]
 parent = "map"
@@ -1209,9 +1201,7 @@ capacity = 256
     let s = b.stats();
     assert_eq!((s.dropped_non_monotonic, s.clock_resets), (1, 0));
 
-    // The wheel driver's offset steps by the same five seconds, 10 ms after
-    // that. Two independent publishers do not restart in lockstep *and by the
-    // same amount*, so the only cause left is the clock they share.
+    // The wheel driver's offset steps by the same five seconds, 10 ms later.
     let o = b.offer_at(
         TFT_BRIDGE_TOPIC_TF,
         "odom",
@@ -1275,9 +1265,6 @@ capacity = 256
 /// so the fixture uses it — and it also proves the new entry point latches
 /// through exactly the same machinery `offer` does, which is why it goes through
 /// `fill` rather than growing a second copy of the halt wording.
-///
-/// The `clock_resets` assertion is what says a promotion happened rather than a
-/// bare drop — that counter counts promotions, not regressions.
 ///
 /// Mutant: delete `o.first_time = 1` from the `Action::Halt` arm ⇒ the halting
 /// call reports 0 and a caller has no way to tell the transition from the
@@ -1666,10 +1653,6 @@ fn a_jittered_stamp_is_dropped_and_names_the_edge() {
 /// the handle is the thing that was wrong, which is the likeliest way a C
 /// caller gets here at all.
 ///
-/// The fixture poisons every byte with 0xAA, so a struct the ABI never wrote is
-/// caught: zeroing would let `TFT_BRIDGE_APPLIED == 0` pass by accident, and a
-/// NULL string would read as empty here while crashing `printf("%s")`.
-///
 /// Mutant: delete the blank `core::ptr::write(out, o)` that precedes
 /// `bridge_of` ⇒ the poisoned struct survives untouched, `action` reads
 /// 0xAAAAAAAA, and this fails.
@@ -1772,9 +1755,8 @@ fn a_struct_size_from_another_build_is_refused() {
     );
 }
 
-/// **A caller built before `received_steady_nanos` existed still works** — §3.6's
-/// append rule, which the exact-equality check had promised and never
-/// implemented.
+/// **A caller built before `received_steady_nanos` existed still works** —
+/// §3.6's append rule.
 ///
 /// §3.6 says fields may be appended to a `struct_size`-versioned struct without
 /// a major bump. Until this test there was nothing behind that sentence: every
@@ -1814,8 +1796,7 @@ fn a_sample_from_before_the_receipt_clock_is_read_as_a_prefix() {
         TFT_BRIDGE_ON_CLOCK_RESET_HALT,
     );
     let (p, c) = (CString::new("odom").unwrap(), CString::new("base").unwrap());
-    // The size a caller compiled against ABI 0.1 sends: everything up to but
-    // not including the appended field.
+    // The size a caller compiled against ABI 0.1 sends.
     let v1_size = core::mem::offset_of!(tft_bridge_sample, received_steady_nanos);
     assert!(v1_size < core::mem::size_of::<tft_bridge_sample>());
 
@@ -1891,10 +1872,8 @@ fn a_sample_from_before_the_receipt_clock_is_read_as_a_prefix() {
 ///
 /// The fixture allocates **exactly** the old struct's bytes, for the reason
 /// `a_sample_from_before_the_receipt_clock_is_read_as_a_prefix` allocates its
-/// own tightly: a narrowed size check over a full-size struct would let a
-/// restored whole-struct read pass unnoticed, and only a real short allocation
-/// makes that read an overrun a sanitizer can see. `just c-abi-check`'s ASan row
-/// now runs this file with `bridge,shm`.
+/// own tightly. `just c-abi-check`'s ASan row now runs this file with
+/// `bridge,shm`.
 ///
 /// The prefix's **last** field is the one at risk of arriving at the wrong
 /// offset, so the assertion is on `tf_prefix`: a remap table that renames
@@ -1913,8 +1892,7 @@ fn a_sample_from_before_the_receipt_clock_is_read_as_a_prefix() {
 /// string — and under `just c-abi-check`'s ASan row it is diagnosed properly:
 /// *"AddressSanitizer: heap-buffer-overflow … READ of size 32 at … is located 0
 /// bytes after 24-byte region"*. **The crash is luck; the ASan report is the
-/// gate.** Relaxing the size check without narrowing the read is the trap this
-/// pair of mutants exists to mark, and it is the same pair
+/// gate.** It is the same trap, and the same pair of mutants, that
 /// `a_sample_from_before_the_receipt_clock_is_read_as_a_prefix` carries.
 #[test]
 fn an_options_struct_from_before_the_arena_name_is_read_as_a_prefix() {
@@ -1977,7 +1955,6 @@ fn an_options_struct_from_before_the_arena_name_is_read_as_a_prefix() {
     // untouched, and the zero it is left at is NULL — the documented "private
     // heap arena, as before". Had it been left undefined the create would have
     // walked a garbage pointer as a C string instead of applying transforms.
-    // The wire carries the robot's own names; the arena knows the prefixed ones.
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 1_000 * MS, POSE, None);
     assert_eq!(o.action, TFT_BRIDGE_APPLIED, "{}", text(o.detail));
     let got = b

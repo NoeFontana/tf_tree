@@ -136,10 +136,7 @@
 //! state they name cannot exist. That is a statement about this workload and not
 //! about the sites — every one of the thirteen has a targeted test in
 //! `tf_tree_core::crash_tests` or `tf_tree/tests/rendezvous.rs`, which is where
-//! §11.3's per-site coverage lives. The run prints the sites it armed and the
-//! sites that fired, so eight of these rows are checkable from a run's own
-//! output; the other five are checkable from the child's abort line on stderr,
-//! for the reason the split above gives.
+//! §11.3's per-site coverage lives.
 //!
 //! **A forced `--crash-site` can fail a run for the probe's own reasons.**
 //! Arming *every* child at `hangup.after_probe_before_cas:1` makes each new
@@ -399,8 +396,7 @@ mod imp {
     /// What a reader checks on every single transform it receives.
     ///
     /// §11.4: "no reader ever observes a non-unit quaternion or a NaN". Both are
-    /// checked here, on every read, in every child, with no way to turn them
-    /// off — which is what `TF_TREE_PARANOID=1` was for.
+    /// checked here, on every read, in every child, with no way to turn them off.
     ///
     /// The quaternion bound is loose (1e-6) on purpose. A composed chain of four
     /// interpolated rotations accumulates float error, so a tight bound would
@@ -508,21 +504,13 @@ mod imp {
         /// and which nobody could re-run before this existed.
         crash_site: Option<String>,
         /// Megabytes of dirty anonymous memory each child holds — **the positive
-        /// control for the kill-window class**, and zero by default.
+        /// control for the kill-window class**, and zero by default. See
+        /// [`kill_window_path`] for the window and how it scales.
         ///
-        /// The driver's `kill()`-to-`wait()` interval is exactly the interval in
-        /// which the owner is dead and no survivor can see it yet, because a
-        /// `SIGKILL`ed process releases its lock byte and its rendezvous socket
-        /// in `exit_files()`, which `do_exit` runs *after* `exit_mm()`. That
-        /// interval scales with the victim's **dirty pages** — about 0.09 ms per
-        /// resident MB on the development host — and not with its mappings.
-        ///
-        /// So this reproduces on a plain release build what ASan reproduces by
-        /// accident: an ASan torture child is 43-49 MB resident against a plain
-        /// one's 2.8, which is a 6.7 ms reap window against 0.3 ms. Without a
-        /// control, a defect that fires on ~1 % of kills is unfalsifiable in any
-        /// run a person will wait for, and a fix for it can only be shown *not
-        /// to have stopped it yet*.
+        /// It reproduces on a plain release build what ASan reproduces by
+        /// accident. Without a control, a defect that fires on ~1 % of kills is
+        /// unfalsifiable in any run a person will wait for, and a fix for it can
+        /// only be shown *not to have stopped it yet*.
         victim_ballast_mb: usize,
         /// Milliseconds to hold the owner **stopped** before killing it — the
         /// portable positive control for the same window, and zero by default.
@@ -657,19 +645,11 @@ mod imp {
                 "--stop-owner-ms" => {
                     a.stop_owner_ms = value("--stop-owner-ms")?.parse()?;
                 }
-                // **This used to refuse unconditionally**, on the grounds that
-                // "the `crash-points` feature and `TF_TREE_CRASH_AT` are
-                // recorded as not implemented in §0.0, so there is nothing to
-                // arm". That was true when written and stopped being true when
-                // the sites landed; the §0.0 row it cited had gone stale too.
-                //
-                // What survives from that refusal is the part that was never
-                // about implementation status: **`SIGKILL` is not §11.3
-                // coverage.** It lands wherever the scheduler puts it, which is
-                // a different and much shallower set of mid-protocol states, so
-                // a run *without* this flag still must not be quoted as §11.3.
-                // The flag is what makes the difference real rather than
-                // rhetorical.
+                // This used to refuse unconditionally, because the sites had
+                // not landed: see the header's correction 2, and the
+                // "`SIGKILL` is still not §11.3 coverage" paragraph that is
+                // what survives of that refusal. The flag is what makes the
+                // difference real rather than rhetorical.
                 "--crash-points" => {
                     if !cfg!(feature = "crash-points") {
                         bail!(
@@ -844,10 +824,8 @@ mod imp {
         /// counted.
         ///
         /// Without it the run can say "4 of 11 armed children aborted" and
-        /// cannot say at which sites, so a site this workload never reaches is
-        /// indistinguishable from one whose race the driver's `SIGKILL` keeps
-        /// winning — and the module doc's reachability table would be
-        /// unfalsifiable from a run.
+        /// cannot say at which sites (see [`CrashLedger`]), so the module doc's
+        /// reachability table would be unfalsifiable from a run.
         crash_at: Option<String>,
     }
 
@@ -949,10 +927,8 @@ mod imp {
     /// would never be sampled.
     #[cfg(feature = "crash-points")]
     fn armed_site(rng: &mut Rng, forced: Option<&str>) -> Option<String> {
-        // `--crash-site` arms every child at the named site: the question it
-        // asks is whether this workload reaches the site at all, and a tenth of
-        // children at a random site answers it only in expectation over a soak
-        // far longer than a probe.
+        // `--crash-site` arms every child at the named site; see
+        // [`Args::crash_site`].
         if let Some(site) = forced {
             // An explicit `NAME:nth` passes through unchanged; a bare `NAME`
             // draws its hit count as the §11.4 path does.
@@ -1180,9 +1156,7 @@ mod imp {
     /// Where a child records **a detach it skipped because a kill window was
     /// open** — one line per skip, `<pid>`.
     ///
-    /// Append-only for [`inherited_path`]'s reason: the writers are processes
-    /// this harness `SIGKILL`s, and a counter read-modify-written by one of them
-    /// would lose exactly the events being counted. The driver counts the lines
+    /// Append-only for [`inherited_path`]'s reason. The driver counts the lines
     /// at teardown, so **a run that leaned on the exemption says how hard**.
     /// Without it the fix is invisible in the output and a reader cannot tell a
     /// run that never needed it from one that needed it on every kill.
@@ -1527,9 +1501,8 @@ mod imp {
         if spec.ballast_mb > 0 {
             cmd.arg("--ballast-mb").arg(spec.ballast_mb.to_string());
         }
-        // **Per child, not per run.** §11.4 asks for a random site in 10% of
-        // children, and `crash::spec` parses the variable once per process, so
-        // the environment is the only place this can go.
+        // **Per child, not per run**: `crash::spec` parses the variable once
+        // per process, so the environment is the only place this can go.
         // `site`, not `spec`: `spec` is this function's `ChildSpec` parameter now,
         // and shadowing it here would put two unrelated meanings on one name in a
         // function whose whole subject is which flags a child gets.
@@ -1569,18 +1542,10 @@ mod imp {
             );
         }
 
-        // How many children died at an armed §11.3 site, and how many were armed
-        // at all. Both, because "armed 4, none fired" and "armed 4, all fired"
-        // are different runs and only one of them exercised anything — and the
-        // site names beside them, because "armed and never reached" and "armed
-        // and lost the race" are also different runs.
         let mut ledger = CrashLedger::default();
 
-        // **The owner is a child, and it comes up first.** It creates the arena
-        // and serves the rendezvous and does nothing else, so killing it is an
-        // owner's death rather than a writer's — which is the distinction §3.5
-        // is about and the one this harness could not draw while the driver
-        // owned the arena. See [`spawn_owner`] and [`attach_observer`].
+        // **The owner is a child, and it comes up first** — see [`spawn_owner`]
+        // and [`attach_observer`].
         let mut owner_kid = Some(spawn_owner(
             &exe,
             &dir,
@@ -1608,9 +1573,6 @@ mod imp {
         // common case, because the role turns over an order of magnitude faster
         // than the driver's round.
         let creating_owner_pid = owner_kid.as_ref().map(|k| k.proc.id());
-        // The driver keeps two of the three roles it had: it holds the segment
-        // alive for `check_recovery`, and it is the never-killed reader. It
-        // serves nothing and never inherits.
         let observer = attach_observer()?;
 
         // Kids are held in fixed slots, not a list, so "slot 0 injects" survives
@@ -1909,10 +1871,10 @@ mod imp {
             // the kill rate at the cost of a loop whose bound depends on how
             // many children hold the role, and a skip nobody reports is a kill
             // rate that cannot be audited.
-            // **And it does not draw the fleet down to the role holder.**
-            // Sparing the owner is not enough on its own: both arms draw from
-            // one pool, so an ordinary draw that empties it leaves
-            // `kill_the_owner` censusing a fleet of one and deferring forever.
+            // **And it does not draw the fleet down to the role holder**
+            // ([`MIN_ATTACHED_FOR_ORDINARY_KILL`]): an ordinary draw that
+            // empties the shared pool leaves `kill_the_owner` censusing a fleet
+            // of one and deferring forever.
             // Censused per draw rather than inferred from `--children`, because
             // what matters is who is *attached* — a replacement is `fork`ed at
             // the top of a round and is not a participant until its handshake
@@ -2201,12 +2163,9 @@ mod imp {
             "shm_torture: {kills} kills, {} violation(s)",
             violations.len()
         );
-        // **`--crash-points` says what it did, and both numbers are needed.**
-        // "armed 4, fired 0" and "armed 4, fired 4" are different runs, and only
-        // the second exercised §11.3 at all — an armed child that the driver's
-        // `SIGKILL` reached first never got to its site. Printing only "armed"
-        // would be the flag-that-arms-nothing failure this replaces, one level
-        // up.
+        // **`--crash-points` says what it did, and both numbers are needed** —
+        // see [`CrashLedger`]. Printing only "armed" would be the
+        // flag-that-arms-nothing failure this replaces, one level up.
         if a.crash_points {
             let mut distinct_armed: Vec<&str> =
                 ledger.armed_sites.iter().map(String::as_str).collect();
@@ -2479,16 +2438,11 @@ mod imp {
             );
         }
         // **A run nobody was writing to proves nothing either, and it does not
-        // trip the floor above.** A ring outlives its writer, so four frozen
-        // rings that happen to overlap answer all 256 composed reads a round
-        // forever — measured on this host at 256.0 per round with every child
-        // locked out of the arena and the last write 28 minutes old. That is a
-        // green run over a dead arena, and it is strictly worse than the red one
-        // the same wedge produced on CI. Both faces of that coin were run on
-        // `ubuntu-latest` at the same seed on identical code — 256.00 composed
-        // reads a round and 2.02 — so which one a nightly gets says nothing
-        // about the arena (`RoundHealth`). This is the check that does not care
-        // which way they fell.
+        // trip the floor above.** Four frozen rings that happen to overlap
+        // answer all 256 composed reads a round forever (see [`RoundHealth`]):
+        // that is a green run over a dead arena, and it is strictly worse than
+        // the red one the same wedge produced on CI. This is the check that does
+        // not care which way they fell.
         //
         // Half the rounds, not all of them: `--kill-hz` guarantees stretches
         // with no writer on a given edge, and that is the state under test.
@@ -2852,13 +2806,11 @@ mod imp {
             return m;
         };
 
-        // **§3.5's precondition is established, not raced for.**
-        //
-        // §11.3's row for `takeover.after_ownership_lock_before_bind` is
-        // *"ownership released; another participant takes over; joiners
-        // retry"*. `another participant` has to exist for the row to say
-        // anything, and this is the only instant at which whether it does is
-        // decidable. Censused *before* the kill, so the count includes the role
+        // **§3.5's precondition is established, not raced for.** §11.3's row
+        // for `takeover.after_ownership_lock_before_bind` presumes another
+        // participant (see [`Migration::deferred`]), and this is the only
+        // instant at which whether one exists is decidable. Censused *before*
+        // the kill, so the count includes the role
         // holder that is about to die; `census` already skips this driver's own
         // observer slot, so `>= 2` is "the role holder plus at least one other
         // read-write survivor". Erring toward deferral is the safe direction: a
@@ -2886,10 +2838,8 @@ mod imp {
         }
 
         let mut killed = false;
-        // **Opened before the signal, and that order is the whole point.** A
-        // child must not be able to observe a dead owner without also observing
-        // this — see [`kill_window_path`]. Opening it after `kill()` would leave
-        // exactly the interval the marker exists to close.
+        // Opening it after `kill()` would leave exactly the interval the marker
+        // exists to close — see [`kill_window_path`].
         open_kill_window(dir, pid);
         // Bracketing both arms rather than each, so the number printed is the
         // whole interval between the two censuses and not a part of it — and
@@ -2899,12 +2849,7 @@ mod imp {
         let kill_started = Instant::now();
 
         // **`SIGSTOP` before `SIGKILL`, when asked: the portable positive
-        // control.** See [`Args::stop_owner_ms`]. A stopped owner holds its
-        // rendezvous socket open, so every survivor's `owner_lost` answers
-        // `false` and nothing can inherit; it has stopped serving, so no fresh
-        // process can join; and every survivor keeps drawing its detach arm.
-        // That is the blind window this whole class is about, for exactly as
-        // long as the flag says, with no dependence on the victim's page size.
+        // control.** See [`Args::stop_owner_ms`].
         //
         // **Sent through `/bin/kill` rather than `libc::kill`**, which would put
         // the first `unsafe` into this file and change a posture
@@ -2980,9 +2925,8 @@ mod imp {
         let mut at_kill = RoundHealth::default();
         census(observer, &mut at_kill);
         m.heirs_at_kill = Some(at_kill.slots_alive);
-        // Closed here rather than after `wait()`: the census is the number the
-        // verdict reads, so the window has to span it. From this instant the
-        // survivors churn again, and one of them is about to inherit.
+        // From this instant the survivors churn again, and one of them is about
+        // to inherit; see [`close_kill_window`] for why it closes here.
         close_kill_window(dir);
 
         // **Read and probe in one loop.** The observer keeps validating while
@@ -3820,9 +3764,8 @@ mod imp {
             }
         }
 
-        // §11.4's "participant ... slots never leak", and it needs **both**
-        // predicates, because the two can disagree and the disagreement *is* the
-        // leak.
+        // §11.4's "participant ... slots never leak", which needs **both**
+        // predicates (see [`census`]).
         //
         // `participant_alive` is the kernel's answer: `state == LIVE` *and* the
         // participant's OFD lock byte still held. A `SIGKILL`ed child's byte is
@@ -3899,9 +3842,8 @@ mod imp {
         // exit, because a reachable one would be the weaker check: a record
         // whose kernel teardown has not finished reads as *alive*, is therefore
         // absent from `dead_participant_slots`, and an early exit would take the
-        // verdict before it appears. [`dead_participant_slots`]'s own doc says
-        // it: a wait that polls a different predicate from the one that fails
-        // the run is a wait that can finish early on the wrong evidence. The
+        // verdict before it appears — which is the hazard
+        // [`dead_participant_slots`]'s own doc names. The
         // unreachable exit was what guaranteed the maximum settle; the constant
         // makes that deliberate instead of accidental, and shortening it is a
         // measurement rather than an edit.
@@ -3919,24 +3861,11 @@ mod imp {
         // teardown one in `drive`, which is where an early exit belongs.
         // **After a migration, one of the two automatic collectors is not
         // coming for *some* records, and this is where that is paid for — for
-        // those records and no others.**
-        //
-        // `docs/decisions/0043` records the residue in as many words: a survivor
-        // of a migration keeps its slot, its byte and its mapping, but its
-        // attach socket still points at the dead owner and it never registers
-        // with the new one — "that owner never learns this process exists". So
-        // when such a survivor dies, the new owner's hangup callback has no
-        // socket to notice, and the record is collected only by a byte-keyed
-        // collector: the slot assigner, a grant later, or `reap_participants`,
-        // a sweep later. The same is true of every process that has *held* the
-        // role, for a different reason: nothing runs its own hangup callback.
-        //
-        // `unreachable_by_hangup` is the driver's list of exactly those pids —
-        // built from which owner each child last *attached* under
-        // ([`record_attachment`], written by the child, because re-attaching is
-        // an operation in `work` and only the child knows when it happened) and
-        // from which processes have published themselves as owner — and this
-        // function partitions on it **before** sweeping anything.
+        // those records and no others.** `unreachable_by_hangup` is the driver's
+        // list of exactly those pids — see its construction in [`drive`], and
+        // [`record_attachment`] for why only the child knows which owner it
+        // attached under — and this function partitions on it **before**
+        // sweeping anything.
         //
         // **Two earlier versions of this, both recorded rather than quietly
         // replaced, because each was wrong in the opposite direction and the
@@ -3967,12 +3896,8 @@ mod imp {
         std::thread::sleep(SETTLE_WINDOW);
         let mut leaked = dead_participant_slots(tree);
         // **The records no hangup callback can reach are separated by pid, and
-        // separated *first*.** Two kinds, both named by the driver: a process
-        // that held the rendezvous (nothing runs its own hangup callback), and a
-        // child that attached under an owner which has since died (`0043`'s
-        // residue). Everything else — every child that attached under the owner
-        // still serving at teardown, which the teardown kill batch has just
-        // produced a fleet of — stays on the strict path.
+        // separated *first*.** The two kinds, and what stays on the strict path
+        // instead, are named where `unreachable_by_hangup` is built.
         //
         // The partition is taken from `leaked`, which was computed **before**
         // any sweep, so a record outside it fails this run whatever
@@ -3995,10 +3920,9 @@ mod imp {
         // that the owner's hangup callback was its collector — which presumes an
         // owner was alive and serving while these processes' sockets closed.
         // After a migration that presumption is usually wrong: the heir is an
-        // ordinary worker, its `work` loop ends on a detach arm or on its
-        // operation cap, and with every other child already dead nothing remains
-        // to inherit, so the arena spends most of the teardown with no owner at
-        // all. `drive` measured that directly before this branch was written.
+        // ordinary worker whose `work` loop ends, leaving the arena with no
+        // owner for most of the teardown. `drive` measured that directly before
+        // this branch was written.
         //
         // **The first version of this shipped the strict verdict on the
         // migrating arm and it failed healthy runs**, intermittently, on a
@@ -4132,43 +4056,23 @@ mod imp {
             }
         }
         // **The positive control for the kill-window class, and it is the whole
-        // reason this class is testable in seconds rather than in nights.**
-        //
-        // A `SIGKILL`ed process releases its participant lock byte and its
-        // rendezvous socket in `exit_files()`, which `do_exit` runs *after*
-        // `exit_mm()` — so the driver's `kill()`-to-`wait()` interval is exactly
-        // the interval in which the owner is dead and no survivor can yet see
-        // it (`Tree::owner_lost` is a socket hangup). Every survivor keeps
-        // running its 2 %-per-operation detach arm through it, blind, and a
-        // survivor that leaves cannot return: an ownerless arena with a held
-        // participant byte refuses `CreatePolicy::Never`.
-        //
-        // That interval scales with the victim's **dirty pages** — measured on
-        // this host at roughly 0.09 ms per resident MB, and *not* with its
-        // mappings. Which is why ASan turns a 0.3 ms window into a 6.7 ms one:
-        // an ASan torture child is 43-49 MB resident against a plain one's 2.8,
-        // and it is always the oldest child that dies, because the ordinary draw
-        // spares the role holder and the role holder extends its operation cap.
-        //
-        // `--ballast-mb` buys the same window on a **plain release build**, in
-        // one flag, with no sanitizer and no nightly. It is `--inject-violation`
-        // and `--no-inherit`'s sibling: a control that makes a failure happen on
-        // purpose, so that a fix can be shown to stop it rather than shown not
-        // to have stopped it yet. Without one, a fix for a defect that fires on
-        // ~1 % of kills is unfalsifiable in any run anybody will wait for.
+        // reason this class is testable in seconds rather than in nights.** See
+        // [`kill_window_path`] for the window and how it scales, and
+        // [`Args::victim_ballast_mb`] for why a control is needed at all;
+        // `--ballast-mb` buys that window on a **plain release build**, in one
+        // flag, with no sanitizer and no nightly.
         //
         // Dirtied a page at a time on purpose: a zeroed allocation can be backed
         // by the shared zero page until written, and an untouched page costs
         // nothing to tear down — which is the quantity being inflated.
         //
         // **And allocated in 1 MiB chunks rather than one block, because
-        // transparent huge pages defeat the whole control otherwise.** Measured
-        // 2026-09-12: one 256 MiB `Vec` gives a ~25 ms reap on a host with
-        // `transparent_hugepage=madvise` (4 KiB pages, 65 536 of them) and a
-        // **1.2–1.8 ms** reap on a GitHub runner, where it is `always` — 2 MiB
-        // huge pages, ~500x fewer to tear down, and the control silently does
-        // nothing. The regression test failed on CI for exactly that reason and
-        // passed here.
+        // transparent huge pages defeat the whole control otherwise.** One
+        // 256 MiB `Vec` gives a ~25 ms reap where the pages are 4 KiB and a
+        // **1.2–1.8 ms** reap on a `transparent_hugepage=always` host, ~500x
+        // fewer of them to tear down, and the control silently does nothing
+        // (measured 2026-09-12; see [`Args::stop_owner_ms`]). The regression
+        // test failed on CI for exactly that reason and passed here.
         //
         // A chunk of 1 MiB is above glibc's 128 KiB `MMAP_THRESHOLD`, so each one
         // is its own `mmap` VMA, and **a 1 MiB VMA cannot contain a 2 MiB-aligned
@@ -4288,10 +4192,8 @@ mod imp {
         // rendezvous.** Returning here drops the attachment exactly as the
         // detach arm does, so it is the same unobserved owner death — see that
         // arm. A serving process keeps working until the driver kills it, which
-        // is the event this harness is built to require a recovery for. The
-        // extension is bounded rather than infinite so a marker that somehow
-        // named a corpse forever cannot pin one child in this loop for the
-        // whole run.
+        // is the event this harness is built to require a recovery for; see
+        // [`MAX_OWNER_CAP_EXTENSIONS`] for why the extension is bounded.
         let mut extensions = 0u32;
         let mut ops_left: u32 = OPS_PER_ATTACHMENT;
         // Whether this attachment is already parked at its cap waiting for a
@@ -4374,14 +4276,10 @@ mod imp {
             // The cost in the healthy case is one non-blocking `poll` of one
             // descriptor: `owner_lost` only reaches its `F_OFD_GETLK` once the
             // poll reports a hangup.
-            //
-            // `Contended` and `OwnerAlive` are **not** errors — a loser keeps
-            // its slot and stops asking by itself (`0043`) — so only `Inherited`
-            // is recorded.
             if !no_inherit && tree.owner_lost() {
                 // **The answer is recorded before it is filtered.** `Contended`
-                // and `OwnerAlive` are still not errors and still not counted
-                // as inheritances — a loser keeps its slot and stops asking by
+                // and `OwnerAlive` are not errors and are not counted as
+                // inheritances — a loser keeps its slot and stops asking by
                 // itself (`0043`) — but "not an error" is not "not worth
                 // recording": `if let Ok(Inheritance::Inherited)` threw away
                 // the one fact that says whether §3.5's trigger was ever
@@ -4437,10 +4335,7 @@ mod imp {
                 // `check_recovery`'s own comment recorded that this harness
                 // never called the sweep.
                 //
-                // It has a cost, and [`drive`]'s teardown names it: after a
-                // migration the process holding the role is one of these
-                // children, so the collector the leak check is aimed at and a
-                // sweeper that hides its absence are the same process.
+                // It has a cost, and [`drive`]'s teardown names it.
                 17 => {
                     let _ = tree.reap_participants();
                 }
@@ -4531,11 +4426,9 @@ mod imp {
                         // probe. `check_recovery` still runs, and answers the
                         // different question of whether every claim came back.
                         // **`w.edge()`, never the chain index.** `EdgeId` is
-                        // **1-based** — `TreeBuilder::build_with` sizes the edge
-                        // table as `declared + 1` and writes capacities at
-                        // `i + 1`, reserving id 0 as a sentinel — so the chain's
-                        // four edges are `EdgeId(1)..=EdgeId(4)` and an index
-                        // used as an id reads the *neighbouring* edge's claim
+                        // 1-based (see [`census`]), so the chain's four edges
+                        // are `EdgeId(1)..=EdgeId(4)` and an index used as an id
+                        // reads the *neighbouring* edge's claim
                         // word. Measured: the first version of this check did
                         // exactly that and reported three two-writer violations
                         // in twenty seconds on a healthy arena. `EdgeWriter`

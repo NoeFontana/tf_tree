@@ -144,10 +144,8 @@ thread_local! {
 /// [`tests::the_low_bit_mask_wins_on_a_small_tree_and_ties_on_a_large_one`]
 /// re-measures the first two rows in-crate, so the choice is not defended by a
 /// number in a comment alone; it draws its own working sets and reads 0.722
-/// against 0.510, then 0.717 against 0.726. It asserts only the *relative*
-/// claim in each — the win, and the tie — because the absolute figures are
-/// tuning, and a test that pins tuning fails on a retune that regressed
-/// nothing.
+/// against 0.510, then 0.717 against 0.726, and asserts only the *relative*
+/// claim in each — the win, and the tie.
 ///
 /// The mask wins where a tree is small enough for its ids to fit in the mask
 /// and ties elsewhere; one pair looked up across 16 consecutive arena ids lands
@@ -344,12 +342,11 @@ pub(crate) fn with_plan<R>(
             let slots = c.borrow();
             if let Some(entry) = &slots[idx] {
                 if entry.key == key {
-                    // `&entry.result`, and the `&` is the same load-bearing one
-                    // the section above is about: matching through the
-                    // reference yields a `&Plan` pointing into the slot, where
-                    // matching the value would lift the whole `Plan` — 2064
-                    // bytes, and 4160 when this comment was written — out of it
-                    // just to decide which variant it is.
+                    // The `&` is the load-bearing one the doc's own section is
+                    // about: matching through the reference yields a `&Plan`
+                    // pointing into the slot, where matching the value would
+                    // lift the whole `Plan` — 2064 bytes, and 4160 when this
+                    // comment was written — out just to decide the variant.
                     return match &entry.result {
                         Ok(plan) => (Ok(f(plan)), true),
                         Err(e) => (Err(*e), true),
@@ -392,16 +389,15 @@ pub(crate) fn with_plan<R>(
 ///
 /// # Why `ChildDetached` is matched by name
 ///
-/// It is the one refusal [`Tree::plan`] produces without reading the arena, so
-/// it describes the *process* after a `fork` and not the key. This condition
-/// used to be spelled `!tree.detached()`, which is equivalent — `Tree::plan`
-/// returns `ChildDetached` if and only if it is detached, that being its first
-/// statement — and equivalent in the way that cannot be tested: reaching it
-/// needs a `fork` landing between `Tree::lookup`'s own detached check and
-/// `Tree::plan`'s, and the workspace's only `fork()` lives in another crate's
-/// test binary. Matching the value says the same thing about the thing it is
-/// actually about, and [`tests::store_refusal_declines_what_the_key_does_not_determine`]
-/// can then pin both arms with no fork at all.
+/// This condition used to be spelled `!tree.detached()`, which is equivalent —
+/// `Tree::plan` returns `ChildDetached` if and only if it is detached, that
+/// being its first statement — and equivalent in the way that cannot be tested:
+/// reaching it needs a `fork` landing between `Tree::lookup`'s own detached
+/// check and `Tree::plan`'s, and the workspace's only `fork()` lives in another
+/// crate's test binary. Matching the value says the same thing about the thing
+/// it is actually about, and
+/// [`tests::store_refusal_declines_what_the_key_does_not_determine`] can then
+/// pin both arms with no fork at all.
 ///
 /// Reading the generation is safe either way and that is not what changed:
 /// [`Tree::view`] answers from a *poison arena* once detached — a real, mapped,
@@ -475,14 +471,8 @@ mod tests {
     }
 
     /// **Caching a refusal costs no bytes** — the claim [`super::Entry`] makes,
-    /// pinned rather than asserted.
-    ///
-    /// `Plan` is `[Step; MAX_DEPTH]` and `Step` is an enum with spare
-    /// discriminant encodings, so `Result<Plan, LookupError>` puts its `Err`
-    /// variant in a niche inside that array and `LookupError`'s 32 bytes fit
-    /// there. Nothing guarantees that survives a new `LookupError` variant with
-    /// a wider payload, and the failure mode if it does not is silent: every
-    /// slot grows by an alignment step and the per-thread table with it.
+    /// pinned rather than asserted, because nothing guarantees the niche it
+    /// rests on survives a new `LookupError` variant with a wider payload.
     ///
     /// The equality is the assertion; the absolute numbers are recorded in the
     /// message so a failure says which way it moved. They are `MAX_DEPTH = 32`
@@ -520,10 +510,6 @@ mod tests {
     }
 
     /// **A refused pair compiles once, not once per lookup** (#259).
-    ///
-    /// The defect: `with_plan` propagated a failed compile with `?`, which
-    /// returned before the store, so nothing on that path ever reached the
-    /// cache. The second probe below missed forever.
     ///
     /// **Mutant: restore the `?`** — i.e. delete the `store_refusal` arm and let
     /// the `Err` return without storing ⇒ `hit2` is `false` and this fails on
@@ -674,19 +660,13 @@ mod tests {
     }
 
     /// **An evaluation error is not a compile refusal, and is not cached as
-    /// one.**
+    /// one.** Caching one would pin "this edge has no data" for the life of a
+    /// generation, which is the one class of staleness this cache has never been
+    /// able to produce.
     ///
-    /// `NoData`, `Extrapolation`, `SlotRecycled` and `TopologyChanged` come from
-    /// `Plan::at` — from `f` — and describe the sample history, which the key
-    /// says nothing about. Caching one would pin "this edge has no data" for the
-    /// life of a generation, which is the one class of staleness this cache has
-    /// never been able to produce.
-    ///
-    /// It is structural rather than filtered: an error from `f` travels inside
-    /// `with_plan`'s `R`, which is opaque to this module, and has no path to an
-    /// `Entry`. The test spends [`LookupError::WrongElementType`] to say so,
-    /// precisely because `compile` cannot produce it — so a copy of it coming
-    /// back out of the cache could only have been stored from `f`.
+    /// The test spends [`LookupError::WrongElementType`] precisely because
+    /// `compile` cannot produce it — so a copy of it coming back out of the
+    /// cache could only have been stored from `f`.
     ///
     /// **No mutant, and that is the honest report.** Because the property is
     /// carried by the *type* rather than by a line, no single-line edit to
@@ -729,19 +709,13 @@ mod tests {
     /// its slot, so the metric is the fraction of a working set whose slot is
     /// its own, averaged over 2000 synthetic sets from a fixed seed.
     ///
-    /// **Two rows, and the second one is the honest one.** The mask wins where
-    /// a tree's ids fit inside the four bits it keeps and *ties* once they do
-    /// not, so a test carrying only the winning row would read as a claim that
-    /// the mask is better everywhere. Neither assertion is absolute: pinning
-    /// "the mask scores 0.72" would fail the build on a retune of [`super::MIX`]
-    /// or [`super::SLOTS`] that regressed nothing, and pinning "the alternative
-    /// scores under 0.55" would make the *rejected* arm part of the contract.
-    /// The claim is relative, per row, which is the claim the choice rests on.
-    ///
-    /// The alternative arm reads [`super::MIX`] rather than declaring its own
-    /// copy. With a copy, changing the shipped constant compared the new mask
-    /// against a baseline built from the old one — two different functions,
-    /// green either way.
+    /// **Two rows, and the second one is the honest one.** A test carrying only
+    /// the winning row would read as a claim that the mask is better everywhere.
+    /// Neither assertion is absolute: pinning "the mask scores 0.72" would fail
+    /// the build on a retune of [`super::MIX`] or [`super::SLOTS`] that
+    /// regressed nothing, and pinning "the alternative scores under 0.55" would
+    /// make the *rejected* arm part of the contract. The claim is relative, per
+    /// row, which is the claim the choice rests on.
     #[test]
     fn the_low_bit_mask_wins_on_a_small_tree_and_ties_on_a_large_one() {
         // The alternative arm, not the shipped one: `super::index`'s fold with
@@ -798,8 +772,7 @@ mod tests {
         };
 
         // Eight frames: every id fits in the mask's four bits, so the mask is a
-        // permutation where the alternative is a hash colliding at the birthday
-        // rate. Measured 0.722 against 0.510.
+        // permutation and the alternative a hash. Measured 0.722 against 0.510.
         let (mask, hash) = residency(8, 6);
         assert!(
             mask > hash + 0.15,
@@ -822,10 +795,8 @@ mod tests {
     ///
     /// The fix for #196 is a fix only if the cache still caches. Widening the
     /// key so far that nothing ever matches — or dropping the cache — would
-    /// answer every one of `tests/plan_cache_identity.rs`'s cases correctly and
-    /// be worth nothing, and would also breach `docs/API.md` §1 R1, which
-    /// permits `lookup` to collapse the three tiers *on the condition* that it
-    /// goes through this cache rather than re-resolving topology per call.
+    /// answer every one of `tests/plan_cache_identity.rs`'s cases correctly, be
+    /// worth nothing, and breach `docs/API.md` §1 R1.
     #[test]
     fn two_trees_keep_separate_entries_and_still_hit() {
         let build = || {

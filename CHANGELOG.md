@@ -156,6 +156,40 @@ is a bug.
   the rule did not see it; it does now, and the flagged set over the 33 commits
   since `v0.0.5` grows by exactly that one commit.
 
+### Changed — comments in the six remaining workspace crates say why, not what
+
+- 33 files across `tf_tree`, `tf_tree_bench`, `tf_tree_bridge`, `tf_tree_c`,
+  `tf_tree_cli` and `tf_tree_ingest`: 32990 -> 31795 comment lines. Same rule as
+  the `no_std` pass — a sentence goes only when the fact it carries is still
+  stated somewhere else in the same file — and the same verification: every file
+  graded by a second reader against its parent, **zero must-restore**, and every
+  line with code on it byte-identical.
+- **3.6%, and the spread is the interesting part.** The concurrency and IPC files
+  yielded 2-3%; `tf_tree_cli/src/top.rs` yielded 6% and the `tf_tree_bench`
+  files similar. Benchmark and CLI code narrates; the arena protocols argue, and
+  an argument has nothing to cut.
+- Three files were reverted rather than kept. `tf_tree_c/src/bridge.rs` lost all
+  six of its section banners, which would have left it the only file in a crate
+  where three siblings still carry them; `tf_tree_c/src/layout.rs` lost the one
+  marking where its tests stop exercising `write` and start on `read` (restored
+  in place). Banners are navigation, not facts, so the survives-elsewhere test
+  never applied to them — the rule permitted deleting them and the rule was
+  wrong.
+- Restored before landing, each caught by a grader rather than a compiler:
+  `checks.rs`'s only statement of **why `TFT006` is a distance check and not a
+  range check** (a publisher writing nanoseconds into a seconds field is off by
+  10^9, which no plausible-range predicate distinguishes from a valid stamp) and
+  its note that `TFT010`'s skip belongs to the same compared-nothing family as
+  `TFT007` and `TFT008`; and `bridge/ingest.rs`'s `Recreate` rung, without which
+  `note_time_jump`'s pointer at "the argument for **both rungs**" led to a
+  section arguing only `Halt`.
+- Two comment defects fixed in passing. `impl Drop for Tree` carried a stray doc
+  describing a boot id "folded to a `u64`"; `boot_id()` returns `[u8; 16]` and
+  its own doc says **not** hashed to 64 bits (PHASE2 A7). And `sample_interval`'s
+  entire doc — the domain gate, the "`0` means never" contract, the clamp
+  argument — was glued to the end of `recorded_offset`'s, so one function had no
+  documentation and the other carried a contract that was not its own.
+
 ### Fixed — three broken intra-doc links, a stale complexity claim, and two spliced doc comments
 
 - **Three intra-doc links resolved to nothing, and no gate could see them.**
