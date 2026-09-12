@@ -1,10 +1,8 @@
 //! Edge records, the claim table, and the exclusive-writer `Publisher` handle.
 //!
 //! `unsafe`-free: raw arena access to these records lives in
-//! [`crate::arena_view`]. The claim protocol (`docs/PHASE1.md` §5.4;
-//! `docs/PROJECT.md` §5 D7) is a single
-//! `compare_exchange`; a second claim on a live edge is an error, never a silent
-//! success.
+//! [`crate::arena_view`]. The claim protocol is `docs/PHASE1.md` §5.4 /
+//! `docs/PROJECT.md` §5 D7.
 
 use core::marker::PhantomData;
 
@@ -80,10 +78,9 @@ pub struct EdgeRecord {
     pub pose_off: u32,
     /// Declared publication rate, in **milli-hertz** (`docs/PHASE5.md` §1.2).
     ///
-    /// `0` means "not declared" — **not** "declared as 0 Hz". The distinction is
-    /// load-bearing: `docs/PHASE5.md` §6's `TFT007` compares an observed rate
-    /// against this one, and reading the sentinel as a rate makes every
-    /// undeclared edge deviate from it by infinity.
+    /// `0` means "not declared" — **not** "declared as 0 Hz": `docs/PHASE5.md`
+    /// §6's `TFT007` compares an observed rate against this one, and reading the
+    /// sentinel as a rate makes every undeclared edge deviate from it by infinity.
     ///
     /// Written at declaration time from `tf_tree::EdgeCfg::nominal_rate_hz`,
     /// which a topology file's `rate_hz` reaches through
@@ -286,9 +283,8 @@ pub struct ClaimRecord {
     _pad: [u8; 32],
 }
 
-// The argument is the one above `EdgeRecord`'s pins — `size_of` is not a layout,
-// and this record travels the same two routes: a peer process maps it out of the
-// `memfd`, and `write_frozen` memcpys it into every `.tft`.
+// The argument is the one above `EdgeRecord`'s pins: `size_of` is not a layout,
+// and this record travels the same two routes.
 //
 // **This block used to cover two of the four fields.** `heartbeat` and
 // `clock_offset_nanos` are the same width class, so swapping them changes
@@ -319,15 +315,14 @@ const _: () = {
 /// touches. The `claim`/`release` algorithm is identical to the production one.
 #[cfg(loom)]
 pub struct ClaimRecord {
-    /// `0` = free, else `(epoch << 16) | (participant_slot + 1)`, exactly as in
-    /// the production record; `pack_owner` is shared between the two.
+    /// Exactly as in the production record; `pack_owner` is shared between the two.
     pub owner: AtomicU64,
     /// Claim epoch; bumped on claim and on reap.
     pub epoch: AtomicU64,
     /// Writer heartbeat.
     pub heartbeat: AtomicU64,
-    /// The publisher's clock offset at the last sampled push; `0` means none
-    /// yet. See the production record's field for the whole contract.
+    /// The publisher's clock offset at the last sampled push. See the production
+    /// record's field for the whole contract.
     pub clock_offset_nanos: AtomicI64,
 }
 
@@ -381,8 +376,8 @@ impl Default for ClaimRecord {
 /// # Errors
 ///
 /// [`ClaimError::EdgeAlreadyClaimed`] if the edge is already held. The reported
-/// The reported `owner_slot` is a participant slot, which the facade resolves to
-/// a PID through the participant table.
+/// `owner_slot` is a participant slot, which the facade resolves to a PID
+/// through the participant table.
 pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<(u64, u64), ClaimError> {
     // Win the record exclusively first. `CLAIMING` is distinguishable garbage,
     // not a plausible owner: a claimer killed before step 3 leaves a word no
@@ -401,16 +396,13 @@ pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<(u64, u64), Cla
     // slot indirection (A3)". The site is after the owner *word* is installed,
     // not after the `compare_exchange` two lines above, because the row names
     // the state and the state it names is a claim whose owner resolves to a
-    // participant slot — A3's model is one CAS publishing "the state and the
-    // full identity" together, and the store above is where this implementation
-    // finishes doing that. The earlier window leaves `CLAIMING`, which A3
-    // explicitly calls "distinguishable garbage, not a plausible owner" and
-    // which a reaper clears on sight; it is a different row's state, and there
-    // is no §11.3 row for it.
+    // participant slot, which is what the store above finishes publishing. The
+    // earlier window leaves `CLAIMING`: a different row's state, and there is no
+    // §11.3 row for it.
     //
     // The caller has not built its `Publisher` yet, so nothing here will ever
-    // run `Drop` — which is exactly the leak A3 exists to make repairable, and
-    // exactly why §11.3 forbids `panic!`.
+    // run `Drop` — the leak A3 exists to make repairable, and why §11.3 forbids
+    // `panic!`.
     crash_point!("claim.after_cas");
 
     Ok((epoch, word))
@@ -421,9 +413,8 @@ const CLAIMING: u64 = u64::MAX;
 
 /// `(epoch, slot + 1)` packed into the owner word.
 ///
-/// **The epoch is in the word, and that is the whole point.** A bare
-/// `slot + 1` is constant per participant, not per acquisition, so this
-/// sequence frees a live claim:
+/// **The epoch is in the word.** A bare `slot + 1` is constant per participant,
+/// not per acquisition, so this sequence frees a live claim:
 ///
 /// 1. P (slot 7) claims E; it is `SIGSTOP`ped and reaped.
 /// 2. P resumes, `push` returns `ClaimRevoked` — and P does exactly what that
@@ -552,16 +543,13 @@ pub struct Publisher<'a> {
     ///
     /// Retained so `Drop` can release with a compare-exchange instead of a
     /// store, and therefore cannot free a claim that has since passed to
-    /// somebody else. **The epoch is part of the word on purpose**: a bare
-    /// `slot + 1` is constant per participant, so the same participant
-    /// re-claiming after a `ClaimRevoked` would produce an identical word and a
-    /// stale release would free the new claim. See [`pack_owner`] and
-    /// [`release`].
+    /// somebody else. The epoch is part of the word on purpose: see
+    /// [`pack_owner`] and [`release`].
     owner: u64,
     /// Set by [`Publisher::abandon`]; makes `Drop` touch no arena memory.
     abandoned: bool,
-    // `Cell<()>` is `Send + !Sync`, which is exactly the auto-trait profile we
-    // want to project onto `Publisher` regardless of what its other fields allow.
+    // Projects `Send + !Sync` onto `Publisher` regardless of what its other
+    // fields allow.
     _not_sync: PhantomData<core::cell::Cell<()>>,
 }
 
@@ -644,9 +632,6 @@ impl<'a> Publisher<'a> {
         // each other's samples silently. That is precisely the failure the claim
         // model exists to prevent, so the model has to survive its own owner
         // being wrong about who is alive.
-        //
-        // `reap` bumps the epoch *before* freeing the claim, so the window is
-        // closed from both ends.
         if self.claim.epoch.load(Ordering::Relaxed) != self.epoch {
             return Err(PushError::ClaimRevoked {
                 edge: self.ring.edge,

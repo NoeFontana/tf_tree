@@ -71,10 +71,9 @@ pub enum AttachMode {
 
 /// An [`Arena`] backed by a sealed `memfd` mapped `MAP_SHARED`.
 ///
-/// The whole point of this type is that nothing above it knows it exists: the
-/// stack is written against [`Arena`], so the same reader code runs unmodified
-/// against a [`crate::heap::HeapArena`] and against a segment shared by another
-/// process.
+/// Nothing above it knows it exists: the stack is written against [`Arena`], so
+/// the same reader code runs unmodified against a [`crate::heap::HeapArena`] and
+/// against a segment shared by another process.
 pub struct MappedArena {
     base: NonNull<u8>,
     len: usize,
@@ -151,11 +150,8 @@ impl MappedArena {
         .map_err(ShmError::Create)?;
         ftruncate(&fd, len as u64).map_err(ShmError::Truncate)?;
 
-        // **No `MAP_POPULATE`** — see `unsafe_map`, which is where that decision
-        // and its measurement live. `docs/PHASE2.md` §7.1 is NORMATIVE that
-        // population happens at declaration granularity; mapping the whole arena
-        // eagerly charged 66.3 MiB of RSS against 66.1 MiB declared.
-        // `MappedArena::populate_hot` puts back exactly the pages that are read.
+        // **No `MAP_POPULATE`** — `unsafe_map` is where that decision and its
+        // measurement live.
         let base = unsafe_map(len, ProtFlags::READ | ProtFlags::WRITE, &fd)?;
 
         // **Take ownership of the mapping before the first fallible step.** Every
@@ -163,9 +159,8 @@ impl MappedArena {
         // to `munmap`: a failed `getrandom` or `F_ADD_SEALS` would strand the
         // segment's address space, and — because the mapping holds its own
         // reference to the memfd inode — its committed pages too, for the life of
-        // the process. Dropping `fd` does not release them. The whole reason
-        // `MappedArena` owns the mapping is that `Drop` unmaps it exactly once;
-        // the construction was simply on the wrong side of the fallible steps.
+        // the process. Dropping `fd` does not release them; the construction was
+        // simply on the wrong side of the fallible steps.
         let arena = MappedArena {
             owner_pid: rustix::process::getpid(),
             base,
@@ -212,9 +207,8 @@ impl MappedArena {
     /// [`ShmError::LayoutMismatch`] or [`ShmError::SizeMismatch`] if it is not a
     /// segment this build can read.
     pub fn attach(fd: OwnedFd, mode: AttachMode) -> Result<MappedArena, ShmError> {
-        // Refuse an unsealed segment *before* mapping it. Once mapped, a
-        // truncation by any fd holder turns every subsequent read into SIGBUS,
-        // and a library cannot recover from that.
+        // Refuse an unsealed segment *before* mapping it: once mapped, a
+        // truncation by any fd holder turns every read into SIGBUS.
         let seals = fcntl_get_seals(&fd).map_err(ShmError::SealQuery)?;
         if !seals.contains(REQUIRED_SEALS) {
             return Err(ShmError::Unsealed);
@@ -357,7 +351,7 @@ impl MappedArena {
     /// | participant counters | all (8 KiB) — same path, keyed by the reader's own slot |
     ///
     /// The headroom tails are what this leaves cold, and they are the whole
-    /// win: on the measured arena above, 66 MiB of it.
+    /// win: on the arena measured in `unsafe_map`, 66 MiB of it.
     ///
     /// # Why the two ring arenas are not populated here
     ///
@@ -407,8 +401,7 @@ impl MappedArena {
             h.max_participants as usize * 128,
         );
         self.populate(h.edge_table_off as usize, edges * 128);
-        // The stamp and pose arenas are deliberately absent — see the doc
-        // comment. Per-edge, at claim and at plan, driven from the facade.
+        // The stamp and pose arenas are deliberately absent — see the doc comment.
 
         // v3's counter regions (`docs/PHASE5.md` §5.2). These are not
         // diagnostics-only pages that a `top` invocation happens to touch:
@@ -490,8 +483,7 @@ fn instance_uuid() -> Result<[u8; 16], ShmError> {
             // buffer, so treat it as the I/O failure it is.
             Ok(0) => return Err(ShmError::Random(rustix::io::Errno::IO)),
             Ok(n) => filled += n,
-            // A blocking `getrandom` is interruptible; every other errno is a
-            // real failure and must not be retried.
+            // Every other errno is a real failure and must not be retried.
             Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(ShmError::Random(e)),
         }
@@ -604,15 +596,13 @@ impl CName {
     fn new(name: &str) -> CName {
         let mut buf = [0u8; Self::CAP];
         let src = name.as_bytes();
-        // Truncate at the first interior NUL. `from_bytes_with_nul_unchecked`
-        // requires exactly one NUL, at the end, and `name` is arbitrary caller
-        // input — `build_shared("a\0b")` would otherwise violate that contract.
-        // The kernel would stop at the first NUL anyway, so this only makes the
-        // Rust-side invariant match what actually happens.
+        // Truncate at the first interior NUL: `from_bytes_with_nul_unchecked`
+        // requires exactly one, at the end. The kernel would stop at the first
+        // NUL anyway, so this only makes the Rust-side invariant match what
+        // actually happens.
         let end = src.iter().position(|&b| b == 0).unwrap_or(src.len());
         // Leave room for the terminator. The kernel treats the name as opaque
-        // bytes, so a truncated multi-byte sequence is harmless — it is a debug
-        // label in /proc/<pid>/fd, nothing more.
+        // bytes, so a truncated multi-byte sequence is harmless.
         let n = core::cmp::min(end, Self::CAP - 1);
         buf[..n].copy_from_slice(&src[..n]);
         CName { buf, len: n }
@@ -643,19 +633,16 @@ mod tests {
         MappedArena::create("tf_tree.uuid_test", &fixture(), 1234, 5678, [7; 16]).unwrap()
     }
 
-    /// **The fallback must not write.** It runs on a segment other processes
-    /// are already using, so a store — even of the byte that is already there —
-    /// races every reader of a live claim record or sample slot. That would be a
-    /// correctness bug, not a slow path.
+    /// **The fallback must not write** — see [`MappedArena::populate_by_touch`]
+    /// for why a store there is a correctness bug, not a slow path.
     ///
     /// `MADV_POPULATE_*` landed in Linux 5.14, so on every machine this is
     /// developed and tested on, [`MappedArena::populate`] takes the `madvise`
     /// branch and this path is dead code that ships anyway; calling it directly
     /// is the only way it is exercised at all.
     ///
-    /// What this **cannot** show is that every page was touched: residency is
-    /// not observable from inside this crate. That is why the bound lives in
-    /// [`touch_offsets`] and is tested there.
+    /// What this **cannot** show is that every page was touched; that bound
+    /// lives in [`touch_offsets`] and is tested there.
     #[test]
     fn the_pre_5_14_fallback_writes_nothing() {
         let arena = create();
@@ -671,11 +658,8 @@ mod tests {
 
     /// The fallback's bound, tested where it is observable.
     ///
-    /// Residency is not visible from inside this crate, so the effect of
-    /// `populate_by_touch` cannot be distinguished from a loop that stops a page
-    /// early — which is why the bound lives in a pure function. Mutant:
-    /// `while at + PAGE < end` in the original loop shape, i.e. dropping the
-    /// final partial page ⇒ the last two cases below fail.
+    /// Mutant: `while at + PAGE < end` in the original loop shape, i.e. dropping
+    /// the final partial page ⇒ the last two cases below fail.
     #[test]
     fn touch_offsets_covers_every_page_and_never_passes_the_end() {
         let v = |o, l| touch_offsets(o, l).collect::<alloc::vec::Vec<_>>();
@@ -755,8 +739,7 @@ mod tests {
 
     /// **The seal check is the whole `memfd`-not-`shm_open` argument**, and it
     /// runs before the segment is mapped: once mapped, any fd holder could
-    /// `ftruncate` it and every subsequent read would fault with `SIGBUS` from
-    /// inside a lookup, which a library cannot recover from.
+    /// `ftruncate` it and every read would fault with `SIGBUS` inside a lookup.
     ///
     /// Mutant: delete the `seals.contains(REQUIRED_SEALS)` guard in `attach` ⇒
     /// the unsealed case below maps happily and this fails. Nothing else in the

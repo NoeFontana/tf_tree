@@ -160,19 +160,6 @@ pub enum ParticipantError {
 /// The single implementation of the publication protocol both
 /// [`ParticipantTable::register`] and [`ParticipantTable::register_at`] use.
 /// Returns the new incarnation on success, `None` if the slot was not [`FREE`].
-///
-/// # Crash consistency
-///
-/// The CAS is what makes this exclusive: the winner owns the slot from that
-/// instruction, and the identity stores that follow are invisible to anyone,
-/// because no reader trusts a non-[`LIVE`] slot. The final store is `Release`,
-/// so a peer that observes `LIVE` observes every field written above it.
-///
-/// A process killed between the CAS and the store leaves the slot [`RESERVED`],
-/// which is **distinguishable garbage** rather than a plausible-looking record:
-/// no live participant is `RESERVED` for more than a few instructions, so a
-/// reaper can reclaim one on sight without having to judge whether it is
-/// looking at a valid record.
 #[inline]
 fn fill_slot(rec: &ParticipantRecord, pid: u32, start_time: u64, now_nanos: i64) -> Option<u64> {
     rec.state
@@ -270,17 +257,16 @@ impl<'a> ParticipantTable<'a> {
     /// # Why the caller does not get to choose
     ///
     /// `docs/PHASE2.md` §3.7's `HelloResponse.participant_slot` "matches the
-    /// lock-file byte the client must take". That correspondence is the whole
-    /// point: the arena record and the `F_OFD_SETLK` byte have to be the *same
-    /// integer*, because §5.1's liveness predicate asks the kernel about the
-    /// byte and then reads the record it indexes. If the two were allocated
-    /// independently — which is what `register` here plus a scan for any free
-    /// byte over there would do — a process would hold byte 3 while occupying
-    /// record 7, and every liveness answer would be about somebody else. **No
-    /// path does that any more**: `0035` put the creator on
-    /// `try_take_participant(0)` and issue #201 deleted the takeover arm that
-    /// scanned (`docs/decisions/0037`), leaving `LockFile::take_any_participant`
-    /// with no production caller at all.
+    /// lock-file byte the client must take". The arena record and the
+    /// `F_OFD_SETLK` byte have to be the *same integer*, because §5.1's liveness
+    /// predicate asks the kernel about the byte and then reads the record it
+    /// indexes. If the two were allocated independently — which is what
+    /// `register` here plus a scan for any free byte over there would do — a
+    /// process would hold byte 3 while occupying record 7, and every liveness
+    /// answer would be about somebody else. **No path does that any more**:
+    /// `0035` put the creator on `try_take_participant(0)` and issue #201
+    /// deleted the takeover arm that scanned (`docs/decisions/0037`), leaving
+    /// `LockFile::take_any_participant` with no production caller at all.
     ///
     /// So a *joiner* uses this, with the slot the owner assigned. A creator or
     /// a process taking ownership has no owner to ask and uses `register`.
@@ -330,9 +316,6 @@ impl<'a> ParticipantTable<'a> {
         // would then share a slot index, and the `slot + 1` owner encoding that
         // both claims (A3) and the topology lock (A2) rest on stops being
         // unique.
-        //
-        // `state` therefore carries the incarnation in its high bits, so
-        // "still LIVE *and* still mine" is a single comparison.
         let _ = rec.state.compare_exchange(
             live_word(incarnation),
             FREE,
@@ -361,9 +344,8 @@ impl<'a> ParticipantTable<'a> {
     ///
     /// Returns whether the CAS succeeded — i.e. whether the word was still
     /// `observed` and is now [`FREE`]. An `observed` of [`FREE`] is vacuously
-    /// such a case and collects nothing; callers pass a non-`FREE` word because
-    /// a `FREE` slot has nothing to collect. `false` for a slot beyond the
-    /// table.
+    /// such a case and collects nothing, so callers pass a non-`FREE` word.
+    /// `false` for a slot beyond the table.
     ///
     /// # `RESERVED` is accepted, and *only* under two preconditions
     ///
@@ -418,23 +400,23 @@ impl<'a> ParticipantTable<'a> {
     /// reader to discover and quietly "simplify": weakening this
     /// `compare_exchange` to `Relaxed`/`Relaxed` passes the whole `tf_tree_core`
     /// suite and all of `cargo xtask loom`, controls included — measured on
-    /// 2026-08-21 (71 unit tests, 20 loom models, all green), not assumed. The loom model above is about the *caller's* read order and
-    /// never reaches this CAS on a contended slot; the unit tests that do reach
-    /// it are single-threaded, where every ordering is equivalent. `AcqRel` is
-    /// here on a protocol argument, and `docs/PHASE1.md` §10.2 is why that
-    /// argument has to be stated rather than implied:
+    /// 2026-08-21 (71 unit tests, 20 loom models, all green), not assumed. The
+    /// loom model above is about the *caller's* read order and never reaches
+    /// this CAS on a contended slot; the unit tests that do reach it are
+    /// single-threaded, where every ordering is equivalent. `AcqRel` is here on
+    /// a protocol argument, and `docs/PHASE1.md` §10.2 is why that argument has
+    /// to be stated rather than implied:
     ///
     /// - **The `Release` half orders this reclaimer's decision *inputs* before
     ///   the store that acts on them.** The verdict is formed from the state
-    ///   word and the OFD byte, and for `RESERVED` — which carries no
-    ///   incarnation, so the guard below degenerates to an ABA — the byte is the
-    ///   whole of it. A `Relaxed` store may be reordered before a preceding
-    ///   load: the slot could become `FREE` to other threads before the probe
-    ///   has read the byte, which is a reclaimer acting on a verdict it has not
-    ///   finished forming. Nothing in this workspace can measure that, because
-    ///   the probe is `F_OFD_GETLK` — a syscall, and a syscall is a barrier on
-    ///   every architecture this builds for. The ordering is stated for the
-    ///   model, and the model is where the byte-as-authority argument lives.
+    ///   word and the OFD byte, and for `RESERVED` the byte is the whole of it.
+    ///   A `Relaxed` store may be reordered before a preceding load: the slot
+    ///   could become `FREE` to other threads before the probe has read the
+    ///   byte, which is a reclaimer acting on a verdict it has not finished
+    ///   forming. Nothing in this workspace can measure that, because the probe
+    ///   is `F_OFD_GETLK` — a syscall, and a syscall is a barrier on every
+    ///   architecture this builds for. The ordering is stated for the model, and
+    ///   the model is where the byte-as-authority argument lives.
     /// - **The `Acquire` half publishes the collected occupancy to the
     ///   collector.** A successful CAS *reads* the word `fill_slot` released, so
     ///   `Acquire` makes it synchronise-with that publication and the `pid` and

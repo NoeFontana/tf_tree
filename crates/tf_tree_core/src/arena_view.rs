@@ -9,8 +9,9 @@
 //! because:
 //!
 //! * Every record type ([`FrameRecord`], [`EdgeRecord`], [`ClaimRecord`],
-//!   [`PoseSlot`](crate::buffer::PoseSlot)) and every atomic array element has an all-zero bit pattern as
-//!   a valid value, and the arena starts fully zeroed.
+//!   [`PoseSlot`](crate::buffer::PoseSlot)) and every atomic array element has
+//!   an all-zero bit pattern as a valid value, and the arena starts fully
+//!   zeroed.
 //! * Region offsets and strides come from the header, which
 //!   [`crate::layout`](tf_tree_arena::layout) laid out 64-byte aligned and in
 //!   header order, so every typed pointer formed here is in-bounds and correctly
@@ -119,9 +120,7 @@ impl<'a> ArenaView<'a> {
             header,
             me: CLAIM_UNRECORDED,
             is_alive: None,
-            // Conservative by default: a caller that has not said the mapping is
-            // writable gets a view that never writes. Opting *in* is safe to
-            // forget; opting out is not.
+            // Opting *in* is safe to forget; opting out is not.
             writable: false,
         }
     }
@@ -129,8 +128,7 @@ impl<'a> ArenaView<'a> {
     /// Declare that the mapping behind this view is writable.
     ///
     /// Only a caller that mapped it `PROT_WRITE` may say so. Saying it falsely
-    /// does not corrupt anything — the write simply faults, which is what this
-    /// flag exists to prevent.
+    /// does not corrupt anything — the write simply faults.
     #[must_use]
     pub fn writable(mut self, yes: bool) -> ArenaView<'a> {
         self.writable = yes;
@@ -176,11 +174,10 @@ impl<'a> ArenaView<'a> {
 
     /// The participant slot this view interns as, or `None` if it is anonymous.
     ///
-    /// A rescuer publishes *itself* into `claiming` when it takes over a stalled
-    /// entry, so an anonymous view can wait but never rescue (A8). Exposed
-    /// because "can this handle recover a wedged intern?" is a real diagnostic
-    /// question — `doctor` should be able to answer it — and because it is the
-    /// only way to assert from outside this crate that a `Tree` wired itself up.
+    /// An anonymous view can wait but never rescue (A8). Exposed because "can
+    /// this handle recover a wedged intern?" is a real diagnostic question —
+    /// `doctor` should be able to answer it — and because it is the only way to
+    /// assert from outside this crate that a `Tree` wired itself up.
     #[must_use]
     pub fn interning_identity(&self) -> Option<u32> {
         if self.me == CLAIM_UNRECORDED {
@@ -192,10 +189,8 @@ impl<'a> ArenaView<'a> {
 
     /// Whether this view can decide that a claimant died.
     ///
-    /// Without a liveness source every claimant is believed alive — the correct
-    /// fail-safe, and one that means A8's takeover never fires. A view with an
-    /// identity but no predicate is *silently* inert, which is exactly the
-    /// failure worth being able to test for.
+    /// A view with an identity but no predicate is *silently* inert, which is
+    /// the failure worth being able to test for.
     #[must_use]
     pub fn has_liveness_source(&self) -> bool {
         self.is_alive.is_some()
@@ -207,8 +202,6 @@ impl<'a> ArenaView<'a> {
     pub fn header(&self) -> &'a ArenaHeader {
         self.header
     }
-
-    // ---- frame interning -------------------------------------------------
 
     /// The interning hash array (`next_pow2(2 * max_frames)` slots).
     pub(crate) fn frame_hashes(&self) -> &'a [AtomicU64] {
@@ -236,7 +229,6 @@ impl<'a> ArenaView<'a> {
     /// slot + 1 of the in-flight interner, [`CLAIM_UNRECORDED`] if none).
     pub(crate) fn frame_claiming(&self) -> &'a [AtomicU32] {
         let slots = next_pow2(2 * self.header.max_frames as usize);
-        // Third array in the region: hashes (8 B) then ids (4 B) then claiming.
         let off = self.header.frame_hash_off as usize + slots * (8 + 4);
         // SAFETY: module invariant — `ArenaLayout` sizes the frame-hash region at
         // `slots * FRAME_HASH_STRIDE` (16) bytes, of which this is the last
@@ -397,15 +389,11 @@ impl<'a> ArenaView<'a> {
         Some(unsafe { &*ptr })
     }
 
-    // ---- topology --------------------------------------------------------
-
     fn topo_block(&self, index: usize) -> Block<'a> {
         let mf = self.header.max_frames as usize;
         let block_off =
             self.header.topo_block_off as usize + index * self.header.topo_block_stride as usize;
-        // Within a block: [parent: u32; mf], [edge_of_child: u32; mf], [depth:
-        // u16; mf]. The two u32 arrays come first so both stay 4-byte aligned for
-        // any `mf`; depth (u16) trails at `+ mf * 8`.
+        // The two u32 arrays come first so both stay 4-byte aligned for any `mf`.
         // SAFETY: module invariant — each block reserves `align64(mf * 10)` bytes
         // at `topo_block_off + index * stride`, block start is 64-aligned; parent
         // is `mf` u32 at offset 0, edge_of_child is `mf` u32 at `+ mf*4`, depth is
@@ -450,8 +438,6 @@ impl<'a> ArenaView<'a> {
         };
         ParticipantTable::new(slots)
     }
-
-    // ---- edges & claims --------------------------------------------------
 
     /// The claim record for edge `id`, or `None` if `id` is out of range.
     #[must_use]
@@ -641,8 +627,8 @@ impl<'a> ArenaView<'a> {
 /// leave that as a comment on a safe `pub fn` — where any caller, including a
 /// facade that writes no `unsafe` on this path, could violate it — the
 /// capability is gated behind an `&mut` borrow of the arena. Holding one
-/// *proves* no other
-/// [`ArenaView`] exists, because a shared view borrows the same arena.
+/// *proves* no other [`ArenaView`] exists, because a shared view borrows the
+/// same arena.
 ///
 /// Hand out shared views for the rest of construction with [`Self::view`].
 pub struct ArenaBuilder<'a> {

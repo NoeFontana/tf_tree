@@ -47,8 +47,7 @@
 //! bytes, and it is *reapable*: the spin is bounded, and an acquirer that runs
 //! out of patience asks whether the holder is still alive before stealing it.
 //!
-//! **Stealing needs no rollback**, and that is the entire payoff for A1. See
-//! [`TopoLockView::acquire`].
+//! **Stealing needs no rollback** — see [`TopoLockView::acquire`].
 //!
 //! This module is `#[cfg(not(loom))]`: `depth` is an `AtomicU16` which the loom
 //! build does not model. The topology loom test reimplements the identical
@@ -86,13 +85,12 @@ pub const TOPO_LOCK_SPIN_LIMIT: u32 = 1024;
 /// `Copy`, and it names the offending participant rather than allocating a
 /// message (`docs/PROJECT.md` §5).
 ///
-/// The one error enum here that is **not** `#[non_exhaustive]`, and the
-/// exception is deliberate. Its only consumer is `impl From<TopoLockError> for
-/// tf_tree::ReparentError`, which must produce a variant carrying the same
-/// payload; a catch-all arm there has no `owner_slot` to report and so no
-/// honest body. Nor does this type reach a user — the facade converts it at the
-/// boundary, and `ReparentError`, which *is* what a caller sees, is
-/// `#[non_exhaustive]`.
+/// The one error enum here that is deliberately **not** `#[non_exhaustive]`.
+/// Its only consumer is `impl From<TopoLockError> for tf_tree::ReparentError`,
+/// which must produce a variant carrying the same payload; a catch-all arm
+/// there has no `owner_slot` to report and so no honest body. Nor does this
+/// type reach a user — the facade converts it at the boundary, and
+/// `ReparentError`, which *is* what a caller sees, is `#[non_exhaustive]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopoLockError {
     /// The lock is held by a participant that the liveness predicate says is
@@ -139,8 +137,7 @@ pub struct TopoLockView<'a> {
 ///
 /// Released on drop, but only if this participant is *still* the holder: a
 /// stealer may have taken it in the meantime (which is legal — see
-/// [`TopoLockView::acquire`]), and clearing somebody else's lock would hand a
-/// third mutator a concurrent block copy.
+/// [`TopoLockView::acquire`]).
 #[derive(Debug)]
 pub struct TopoGuard<'a> {
     owner: &'a AtomicU64,
@@ -264,8 +261,7 @@ impl<'a> TopoLockView<'a> {
         // 1. The ordinary path: a bounded spin on the uncontended CAS.
         //    AcqRel on success pairs with the previous holder's Release in
         //    `TopoGuard::drop`, so this participant sees every block store and
-        //    the topology word it published. That pairing is what lets
-        //    `set_parent` read the topology word Relaxed.
+        //    the topology word it published.
         for _ in 0..TOPO_LOCK_SPIN_LIMIT {
             if self
                 .owner
@@ -302,9 +298,7 @@ impl<'a> TopoLockView<'a> {
             return Err(TopoLockError::Contended { owner_slot });
         }
 
-        // 3. Steal. See the section above: there is nothing to repair, because
-        //    the dead holder can only have dirtied an inactive block, and the
-        //    next `set_parent` re-copies the active block over it.
+        // 3. Steal. There is nothing to repair — see the doc section above.
         //
         //    CAS on the *observed* word rather than a blind store: two rescuers
         //    can reach this point together and only one may win, or the holder
@@ -419,8 +413,7 @@ impl<'a> TopologyView<'a> {
     ///
     /// It is written so that being *stolen from* mid-call is survivable: every
     /// step below either targets an inactive block or is the single publishing
-    /// store. A stealer re-enters here and re-copies the active block wholesale,
-    /// so it inherits no state from the holder it replaced.
+    /// store.
     ///
     /// Aborts without flipping if the mutation would create a cycle.
     ///
@@ -450,17 +443,16 @@ impl<'a> TopologyView<'a> {
         let dst = &self.blocks[next];
 
         // Copy the active block into the inactive one, then apply the mutation.
-        // parent and edge_of_child move together so the snapshot stays consistent.
         //
         // **This loop is the whole recovery story for a stolen lock.** It writes
         // every index unconditionally, so whatever a holder that died here left
         // in `dst` is overwritten rather than inherited — and `recompute_depths`
         // below does the same for `depth` over every frame a `FrameId` can name
         // (index 0 is the reserved root slot, which nothing ever writes and no
-        // reader can address: `FrameId` is non-zero). `next` is derived from the *current*
-        // active index, which the dead holder never advanced (that store is the
-        // last thing it would have done), so the stealer lands on the same
-        // scratch block and erases it. No rollback, no repair, no bookkeeping.
+        // reader can address: `FrameId` is non-zero). `next` is derived from the
+        // *current* active index, which the dead holder never advanced (that
+        // store is the last thing it would have done), so the stealer lands on
+        // the same scratch block and erases it.
         for f in 0..mf as usize {
             dst.parent[f].store(src.parent[f].load(Ordering::Relaxed), Ordering::Relaxed);
             dst.edge_of_child[f].store(
@@ -476,9 +468,7 @@ impl<'a> TopologyView<'a> {
             // the published topology is byte-identical to what it was on entry
             // and the topology word was never stored. The scratch block is left
             // dirty, which is harmless — the next mutation copies the active
-            // block over it wholesale before touching it. This is the same
-            // property that makes a *crashed* writer harmless, and it is why the
-            // A2 lock can be stolen with no rollback.
+            // block over it wholesale before touching it.
             return Err(TopologyError::WouldCreateCycle { child });
         }
 
@@ -509,8 +499,7 @@ impl<'a> TopologyView<'a> {
     ///
     /// Wait-free: it never spins on a writer, because there is no state a writer
     /// can leave that a reader must wait out. The loop re-reads only if the
-    /// *whole* topology word changed between the first and last field load,
-    /// which needs [`TOPO_BLOCKS`] mutations inside a three-load window.
+    /// *whole* topology word changed between the first and last field load.
     ///
     /// `None` means `child` is out of range for this arena (`FrameId` only
     /// guarantees non-zero, not in-bounds), or — after `TOPO_RETRY_LIMIT`

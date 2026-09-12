@@ -156,6 +156,58 @@ is a bug.
   the rule did not see it; it does now, and the flagged set over the 33 commits
   since `v0.0.5` grows by exactly that one commit.
 
+### Fixed — three broken intra-doc links, a stale complexity claim, and two spliced doc comments
+
+- **Three intra-doc links resolved to nothing, and no gate could see them.**
+  `sample.rs` linked `crate::edge::EdgeCfg`, which does not exist — the item is
+  `EdgeRecord`, whose `capacity: u32` the sentence is about. `plan.rs` linked
+  `[`Plan::new`]`, and `Plan` has no such constructor: `fold_into` derives those
+  fields. `plan.rs` also linked a bare `[`EdgeCounters`]`, unresolved from that
+  scope. All three are on **private** items, and `just doc` passes no
+  `--document-private-items`, so rustdoc never looked at them.
+- **`first_dynamic_edge` is O(1) and three comments still called it a scan.**
+  Its doc justified being passed as a parameter because it is "an O(plan length)
+  scan over the steps", and two hoist comments repeated that. It reads
+  `dyn_count`/`first_dyn`, which `d546462` stored at compile time. The hoist is
+  still right — the call is loop-invariant — but for a different reason, and the
+  comments now say which. (A review attributed the change to `#264`;
+  `git log -S dyn_count` does not support that.)
+- **A citation to a test that does not exist.** `Plan::span`'s doc named
+  `spans_agree_with_latest_common` in `tests.rs` as the pin for its agreement
+  with `latest_common`. Nothing by that name exists anywhere in the workspace.
+  The real one is `span_answers_exactly_at_the_ends_it_reports` in `tf_tree`'s
+  `tests/behavior.rs` — wrong name and wrong file — and that test's own comment
+  says it is "the agreement `Plan::span`'s doc comment claims".
+- **Two doc comments were spliced together in `tests.rs`.** An eighteen-line
+  block about `ExtrapPolicy`'s three variants sat on
+  `by_ns_zero_is_never_claimed_for_a_pose_the_fold_invented` with its last
+  sentence truncated at *"...under the narrower mutant of passing"*; the missing
+  tail was standing alone 150 lines later as
+  `extrapolation_is_selectable_and_reports_how_far_it_reached`'s entire doc.
+  Rejoined and moved onto the test it describes.
+- **A stray orphan doc on `impl Drop for Tree`** described a boot-id-folded-to-
+  `u64` that does not exist — `boot_id()` returns `[u8; 16]` and its own doc says
+  "**Not hashed to 64 bits**" (PHASE2 A7). Deleted. And `sample_interval`'s whole
+  doc block — the domain gate, the "`0` means never" contract, the clamp
+  argument — was glued to the end of `recorded_offset`'s, so one function had no
+  doc and the other was documented with a contract that is not its own.
+
+### Changed — comments in the four `no_std` crates say why, not what
+
+- 20 files, 9648 -> 9348 comment lines. No code changed: every line with code on
+  it is byte-identical to its parent. What went is restatement — a sentence whose
+  fact is still stated somewhere else in the same file — and nothing else.
+- **3.1% is the measured yield, and that is the finding.** An earlier attempt
+  with a "cut by half" target produced 24 must-restore and 193 should-restore
+  losses across the same 13 files against 82 justified deletions, and was
+  discarded. These comments are long because they carry rejected alternatives,
+  consequences and measured numbers. Every file here was graded by a second
+  reader against its parent; zero must-restore.
+- Two trailing comments had quietly lost a why and are restored:
+  `// -> odd (idempotent if already)`, and `// sin²(θ/2) — no sqrt taken`, which
+  is the whole reason `norm_squared` is called there. A whole-line comment count
+  does not see either.
+
 ### Added — `tft_bridge_close_startup_window`, and a reason code that does not say "authority"
 
 - **The C ABI minor version is `0.8`.** `docs/decisions/0011` implementation

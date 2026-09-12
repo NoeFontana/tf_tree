@@ -1,8 +1,7 @@
 //! Compiled lookup plans, typed time, and the evaluation `Guard`.
 //!
 //! A [`Plan`] is the compiled result of resolving a `lookup(target, source)`
-//! path through the topology *once*: a fixed array of [`Step`]s plus the topology
-//! generation it was compiled against. Evaluating it many times against a
+//! path through the topology *once*. Evaluating it many times against a
 //! [`Guard`] separates the (rare) topology walk from the (hot) temporal sampling
 //! — the single largest structural win over tf2's per-lookup topology walk
 //! (`docs/PHASE1.md` §7; `docs/PROJECT.md` §5 D3).
@@ -40,10 +39,6 @@ pub const MAX_KNOTS: usize = 4096;
 
 /// Maximum bisection recursion depth in [`Plan::at_adaptive`].
 pub const MAX_ADAPTIVE_DEPTH: u32 = 16;
-
-// ---------------------------------------------------------------------------
-// Time: typed domains and stamps
-// ---------------------------------------------------------------------------
 
 /// A time domain: a compile-time marker carrying a runtime [`Domain::TAG`] byte.
 ///
@@ -93,10 +88,9 @@ impl Domain for SensorDomain {
 ///
 /// # Why this exists, given that [`Domain`] is an open trait
 ///
-/// It is open so a driver with a PTP-disciplined clock can declare its own tag,
-/// and that is deliberate. But **two built-ins is close enough to a closed set
-/// that everything collapses onto tag 0**: a sim deployment and a steady-clock
-/// driver are both "not a sensor", so both take [`SystemDomain`] by default, and
+/// **Two built-ins is close enough to a closed set that everything collapses
+/// onto tag 0**: a sim deployment and a steady-clock driver are both "not a
+/// sensor", so both take [`SystemDomain`] by default, and
 /// [`LookupError::TimeDomainMismatch`] then never fires for the two populations
 /// most exposed to the bug it exists to catch (`docs/API.md` §2.5).
 ///
@@ -368,10 +362,6 @@ pub enum Query<D: Domain = SystemDomain> {
     LatestCommon,
 }
 
-// ---------------------------------------------------------------------------
-// Interpolation selection
-// ---------------------------------------------------------------------------
-
 /// Selects an interpolation policy at runtime from an edge's stored discriminant.
 ///
 /// The math crate models policies as zero-sized types implementing
@@ -423,10 +413,6 @@ impl InterpPolicy {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Sampled pose plus derivatives
-// ---------------------------------------------------------------------------
 
 /// A pose, and how far past the plan's newest common sample it was extrapolated.
 ///
@@ -482,10 +468,9 @@ pub struct Extrapolated {
 /// `#[non_exhaustive]` because this struct is *produced by the engine and only
 /// read by a caller*, so growing it cannot make an existing consumer silently
 /// wrong — it can only stop one from writing a literal nothing outside this
-/// crate writes. [`Sample::accel`]'s own note already schedules the growth:
-/// Phase 6's cumulative B-splines are the first interpolant with a real second
-/// derivative, and a third derivative after them would otherwise be a major
-/// bump for a field nobody had to read.
+/// crate writes. [`Sample::accel`]'s own note already schedules the growth, and
+/// a third derivative after Phase 6's splines would otherwise be a major bump
+/// for a field nobody had to read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Sample {
@@ -503,10 +488,6 @@ pub struct Sample {
     /// field exists now so that adding them is not a breaking change.
     pub accel: Option<Twist>,
 }
-
-// ---------------------------------------------------------------------------
-// Steps and the compiled plan
-// ---------------------------------------------------------------------------
 
 /// One step of a compiled plan.
 ///
@@ -1031,9 +1012,8 @@ impl Plan {
         // The two checks above fail on properties of the *query* — a plan
         // compiled against an old topology, or a domain mismatch — and neither
         // names an edge. Counting them would file a caller's mistake against a
-        // publisher that is working correctly, which is worse than not counting
-        // them at all (`docs/PHASE5.md` §5.2's attribution argument, applied in
-        // the other direction).
+        // publisher that is working correctly (`docs/PHASE5.md` §5.2's
+        // attribution argument, applied in the other direction).
         self.note(g, self.first_dynamic_edge(), self.fold_at(g, nanos))
     }
 
@@ -1049,11 +1029,12 @@ impl Plan {
     /// leaving them silent meant the two flagship consumers contributed nothing
     /// to the operator's view of who is failing.
     ///
-    /// `edge` is [`Self::first_dynamic_edge`]. It is a parameter rather than a
-    /// call inside this function because it is an O(plan length) scan over the
-    /// steps and it is loop-invariant: a batch caller resolves it once and
-    /// passes the same value for every element, which is the difference between
-    /// a per-element cost of a few nanoseconds and one proportional to depth.
+    /// `edge` is [`Self::first_dynamic_edge`], passed in rather than called here
+    /// because it is loop-invariant: a batch caller resolves it once and hands
+    /// the same value to every element. **It is no longer the O(plan length)
+    /// scan that first justified the hoist** — `d546462` gave the plan stored
+    /// `dyn_count`/`first_dyn`, so the call is O(1) and the parameter now buys
+    /// only the repeated call, not a repeated walk.
     #[inline]
     fn note<T>(
         &self,
@@ -1081,7 +1062,7 @@ impl Plan {
     /// number in `doctor`'s table that means something different from every
     /// other number in the same column.
     ///
-    /// Reads the fields [`Plan::new`] derived; it no longer scans. The `== 1`
+    /// Reads the fields [`fold_into`] derived; it no longer scans. The `== 1`
     /// test is what preserves the "several edges credit nobody" rule, which is
     /// why the count is stored and not just a `has_dynamic` flag.
     #[inline]
@@ -1165,10 +1146,8 @@ impl Plan {
     /// a monotone [`Layout::QuatTwist`] batch costs `O(1)` amortized per stamp
     /// instead of `O(log n)`.
     ///
-    /// A cursor is a *hint*: the galloping search still hands the binary search
-    /// an interval that brackets `t`, so a stale one costs probes and cannot
-    /// change an answer. That is what lets this share every assertion the
-    /// cursor-less form has.
+    /// A cursor is only a *hint* (see [`Guard::cursor`]), which is what lets
+    /// this share every assertion the cursor-less form has.
     #[inline]
     fn fold_at_with_derivatives_cursors(
         &self,
@@ -1226,18 +1205,10 @@ impl Plan {
         self.at_with_derivatives_tagged(g, t.nanos(), D::TAG)
     }
 
-    /// [`Self::at_with_derivatives`], with the query's domain as a runtime tag.
-    ///
-    /// The domain arrives as a runtime tag instead of a type parameter.
-    /// [`Domain`] is an **open trait** — a user declares their own tag from `4`
-    /// upwards — so a foreign binding cannot enumerate the domains it may be
-    /// asked about and cannot dispatch to the typed form. It carries the tag as
-    /// data instead ([`0038`]).
-    ///
-    /// The check is [`Self::at_with_derivatives`]'s, unchanged: same condition, same
-    /// [`LookupError::TimeDomainMismatch`]. Only where the tag comes from
-    /// differs. Rust callers should use [`Self::at_with_derivatives`], where a domain
-    /// mistake is a compile error.
+    /// [`Self::at_with_derivatives`], with the query's domain as a runtime tag —
+    /// the binding surface, for [`Self::at_tagged`]'s reason ([`0038`]). Rust
+    /// callers want [`Self::at_with_derivatives`], where a domain mistake is a
+    /// compile error.
     ///
     /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
     ///
@@ -1340,11 +1311,10 @@ impl Plan {
     /// the fold and only here. Nothing is threaded through `fold_at` or the
     /// seqlock read, so [`Self::at`]'s generated code is unmoved.
     ///
-    /// The order is a soundness guarantee, not an implementation detail: a
-    /// `push` landing between the fold and a *later* walk would lift the common
-    /// horizon past `nanos` and report `by_ns == 0` — "not extrapolated" — for a
-    /// pose the fold genuinely invented. Measuring first inverts that error into
-    /// the safe direction. The implementation carries the full argument.
+    /// The order is a soundness guarantee, not an implementation detail:
+    /// measuring after the fold made `by_ns == 0` — "not extrapolated" —
+    /// reachable for a pose the fold genuinely invented. The implementation
+    /// carries the full argument.
     ///
     /// # Errors
     ///
@@ -1511,7 +1481,8 @@ impl Plan {
     /// The two do *not* share a helper, on purpose: `latest_common` is a lookup
     /// path and folding it onto `Guard::window` would cost it a second atomic
     /// load and a second mask per edge to compute a lower end it never uses.
-    /// `spans_agree_with_latest_common` in `tests.rs` pins the agreement instead.
+    /// `span_answers_exactly_at_the_ends_it_reports` in `tf_tree`'s
+    /// `tests/behavior.rs` pins the agreement instead.
     ///
     /// It lives here, next to that method and to
     /// [`SampleRing::retained`](crate::buffer::SampleRing::retained), because the
@@ -1743,7 +1714,7 @@ impl Plan {
         self.check_generation(g)?;
         self.check_domain_tag(D::TAG)?;
 
-        // Hoisted: loop-invariant, and an O(plan length) scan (see [`Self::note`]).
+        // Hoisted: loop-invariant (see [`Self::note`]; it is O(1) since `d546462`).
         let edge = self.first_dynamic_edge();
         let monotone = stamps.windows(2).all(|w| w[0].nanos() <= w[1].nanos());
         if monotone {
@@ -1821,18 +1792,10 @@ impl Plan {
         self.at_many_into_tagged(g, stamps, D::TAG, layout, out)
     }
 
-    /// [`Self::at_many_into`], with the query's domain as a runtime tag.
-    ///
-    /// The domain arrives as a runtime tag instead of a type parameter.
-    /// [`Domain`] is an **open trait** — a user declares their own tag from `4`
-    /// upwards — so a foreign binding cannot enumerate the domains it may be
-    /// asked about and cannot dispatch to the typed form. It carries the tag as
-    /// data instead ([`0038`]).
-    ///
-    /// The check is [`Self::at_many_into`]'s, unchanged: same condition, same
-    /// [`LookupError::TimeDomainMismatch`]. Only where the tag comes from
-    /// differs. Rust callers should use [`Self::at_many_into`], where a domain
-    /// mistake is a compile error.
+    /// [`Self::at_many_into`], with the query's domain as a runtime tag — the
+    /// binding surface, for [`Self::at_tagged`]'s reason ([`0038`]). Rust
+    /// callers want [`Self::at_many_into`], where a domain mistake is a compile
+    /// error.
     ///
     /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
     ///
@@ -1897,18 +1860,10 @@ impl Plan {
         self.at_many_into_f32_tagged(g, stamps, D::TAG, layout, out)
     }
 
-    /// [`Self::at_many_into_f32`], with the query's domain as a runtime tag.
-    ///
-    /// The domain arrives as a runtime tag instead of a type parameter.
-    /// [`Domain`] is an **open trait** — a user declares their own tag from `4`
-    /// upwards — so a foreign binding cannot enumerate the domains it may be
-    /// asked about and cannot dispatch to the typed form. It carries the tag as
-    /// data instead ([`0038`]).
-    ///
-    /// The check is [`Self::at_many_into_f32`]'s, unchanged: same condition, same
-    /// [`LookupError::TimeDomainMismatch`]. Only where the tag comes from
-    /// differs. Rust callers should use [`Self::at_many_into_f32`], where a domain
-    /// mistake is a compile error.
+    /// [`Self::at_many_into_f32`], with the query's domain as a runtime tag —
+    /// the binding surface, for [`Self::at_tagged`]'s reason ([`0038`]). Rust
+    /// callers want [`Self::at_many_into_f32`], where a domain mistake is a
+    /// compile error.
     ///
     /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
     ///
@@ -1969,7 +1924,7 @@ impl Plan {
         // already elides the check and because ~245 us of interpolation dwarfs
         // it either way. It stays because it says what it means and drops the
         // manual index arithmetic, not because it is faster.
-        // Hoisted: loop-invariant, and an O(plan length) scan (see [`Self::note`]).
+        // Hoisted: loop-invariant (see [`Self::note`]; it is O(1) since `d546462`).
         let edge = self.first_dynamic_edge();
         let monotone = stamps.windows(2).all(|w| w[0] <= w[1]);
         if monotone {
@@ -2009,10 +1964,9 @@ impl Plan {
     /// leaving it as the one layout without a cursor made the flagship path the
     /// slowest one.
     ///
-    /// The cursor is only a *hint*: the galloping search still hands the binary
-    /// search an interval bracketing `t`, so the two branches below cannot
-    /// disagree about a number — which is why the monotone and non-monotone
-    /// paths are asserted bit-identical rather than merely close.
+    /// The cursor is only a *hint* (see [`Guard::cursor`]), so the two branches
+    /// below cannot disagree about a number — which is why the monotone and
+    /// non-monotone paths are asserted bit-identical rather than merely close.
     ///
     /// # Why it calls the same fold `at_with_derivatives` does
     ///
@@ -2029,8 +1983,7 @@ impl Plan {
         elems: usize,
         out: &mut [f64],
     ) -> Result<(), LookupError> {
-        // Hoisted for the same reason as in `fold_batch`: loop-invariant, and
-        // an O(plan length) scan (see [`Self::note`]).
+        // Hoisted for the same reason as in `fold_batch` (see [`Self::note`]).
         let edge = self.first_dynamic_edge();
         if stamps.windows(2).all(|w| w[0] <= w[1]) {
             let mut cursors = [0u64; MAX_DEPTH];
@@ -2077,10 +2030,8 @@ impl Plan {
 
     /// [`Self::at_adaptive`], with the query's domain carried as a runtime tag.
     ///
-    /// The tagged sibling of the adaptive shape, for the same reason as
-    /// [`Self::at_tagged`]: [`Domain`] is an open trait, so a foreign binding
-    /// cannot name the type it would have to instantiate
-    /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`).
+    /// The tagged sibling of the adaptive shape, for [`Self::at_tagged`]'s
+    /// reason (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`).
     ///
     /// # `D` here is storage, and `domain` is the query
     ///
@@ -2285,16 +2236,11 @@ pub struct EdgeMeta {
     pub static_pose: Iso3,
 }
 
-// ---------------------------------------------------------------------------
-// The evaluation guard
-// ---------------------------------------------------------------------------
-
 /// A batch-evaluation handle: it borrows the arena and pins the topology
 /// generation once, so a run of lookups validates against a single snapshot.
 ///
-/// [`Plan::at`] compares the plan's compiled generation against the guard's pinned
-/// generation; a mismatch is [`LookupError::TopologyChanged`]. Make one guard per
-/// batch of lookups.
+/// [`Plan::at`] validates its compiled generation against the guard's pinned
+/// one. Make one guard per batch of lookups.
 pub struct Guard<'a> {
     view: ArenaView<'a>,
     /// The pinned topology generation, or [`DETACHED`] for a guard built by
@@ -2423,7 +2369,7 @@ pub struct Guard<'a> {
 /// 32 bytes on a struct built once per `at()` call.
 const DETACHED: u64 = u64::MAX;
 
-/// Which [`EdgeCounters`] field a lookup error belongs in.
+/// Which [`crate::counters::EdgeCounters`] field a lookup error belongs in.
 ///
 /// A tiny enum rather than a closure so `counter_of` stays a pure classification
 /// with no borrow of the arena — the caller does the lookup, and the mapping is
@@ -2518,10 +2464,9 @@ pub(crate) const DETACHED_FOR_TEST: u64 = DETACHED;
 /// Flush the batch's success count into the arena — **one relaxed atomic per
 /// guard, not per lookup** (`docs/PHASE5.md` §5.4).
 ///
-/// A guard spanning 1000 lookups pays one `fetch_add` per 1000, per thread, so
-/// the contention a per-lookup atomic would create on a hot edge simply does not
-/// arise. That is the entire argument for buffering, and it is why the
-/// destructor exists at all.
+/// A guard spanning 1000 lookups pays one `fetch_add` per 1000, per thread. The
+/// `ok` field carries the argument for buffering, and it is why this destructor
+/// exists at all.
 #[cfg(feature = "counters")]
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
@@ -2531,9 +2476,8 @@ impl Drop for Guard<'_> {
         if n == 0 || !self.view.is_writable() {
             return;
         }
-        // And the fork guard. A shared mapping is `MADV_DONTFORK`, so in a child
-        // the arena is a hole in the address space and this write faults —
-        // exactly the failure `EdgeWriter::drop` already guards against. A
+        // And the fork guard: in a child the arena is a hole in the address
+        // space and this write faults (the `fork` field carries why). A
         // destructor is the worst place to discover it, because it runs whether
         // or not the child ever called anything.
         if let Some((born, read)) = self.fork {
@@ -2832,12 +2776,9 @@ impl<'a> Guard<'a> {
     /// The scalar fold's entry point. It differs from [`Self::sample`] only in
     /// *where the bracket search starts*: `sample` restarts at the window
     /// midpoint every call, this resumes beside the previous answer. See
-    /// [`Guard::cursor`] for the measurement and for why a wrong cursor
-    /// cannot produce a wrong result.
-    ///
-    /// The tag check is what keeps a mismatched hint cheap. `k` indexes the
-    /// plan's step, and one guard may evaluate several plans, so the cursor is
-    /// only trusted when it was last written by this same edge.
+    /// [`Guard::cursor`] for the measurement, for the edge tag that keeps a
+    /// mismatched hint cheap, and for why a wrong cursor cannot produce a wrong
+    /// result.
     #[inline]
     pub(crate) fn sample_hinted(
         &self,
@@ -2948,8 +2889,6 @@ impl<'a> Guard<'a> {
     /// between them can widen the pair past either real window. That is the same
     /// staleness [`Plan::latest`] has and is not fixable here without a seqlock
     /// over the whole ring; [`Plan::span`] documents what it means for a caller.
-    /// On a frozen arena — the case §4.2 is about — no push exists and the pair
-    /// is exact.
     pub(crate) fn window(&self, edge: EdgeId) -> Result<(i64, i64), LookupError> {
         let ring = self
             .view
@@ -2986,10 +2925,6 @@ impl<'a> Guard<'a> {
             .nominal_rate_mhz)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Compilation
-// ---------------------------------------------------------------------------
 
 /// Compile a `lookup(target, source)` path into a [`Plan`].
 ///
@@ -3269,14 +3204,11 @@ fn fold_into(
 ) -> Result<(), LookupError> {
     let out = &mut plan.steps;
     let mut n = 0usize;
-    // Derived here rather than by a second pass over `out`: the append arm below
-    // already holds the step and its discriminant, so both fall out for free,
-    // where a second pass would put an O(`len`) read back on the path #264
-    // exists to shorten, immediately after writing the thing it reads.
-    // Equivalent by construction — the
-    // collapse arm only ever rewrites a `Static` in place, so it can neither add
-    // nor remove a `Dyn`, and every append that is *written* is an append with
-    // `n < MAX_DEPTH`, which on any path that returns `Ok` is every append.
+    // Derived in the append arm, which already holds the step and its
+    // discriminant. Equivalent by construction — the collapse arm only ever
+    // rewrites a `Static` in place, so it can neither add nor remove a `Dyn`,
+    // and every append that is *written* is an append with `n < MAX_DEPTH`,
+    // which on any path that returns `Ok` is every append.
     // `plan_derived_fields_match_a_fresh_scan` is the pin.
     let mut dyn_count = 0u8;
     let mut first_dyn = EdgeId(0);

@@ -34,11 +34,11 @@
 //!
 //! [`crate::mapped`] refuses an unsealed segment because a peer could
 //! `ftruncate` it under a reader and turn every subsequent load into `SIGBUS`.
-//! A regular file has no seals, so that guarantee is **not available here** and
-//! pretending otherwise would be worse than saying so: anyone who truncates a
-//! `.tft` while it is mapped will fault its readers. The mitigation is the trust
-//! model, not a mechanism — §2.4 states a frozen arena has no writers, and a
-//! `.tft` is a cache you regenerate, not a live segment peers coordinate on.
+//! A regular file has no seals, so that guarantee is **not available here**:
+//! anyone who truncates a `.tft` while it is mapped will fault its readers. The
+//! mitigation is the trust model, not a mechanism — §2.4 states a frozen arena
+//! has no writers, and a `.tft` is a cache you regenerate, not a live segment
+//! peers coordinate on.
 //!
 //! # What is deliberately *not* here
 //!
@@ -230,13 +230,10 @@ const SNAPSHOT_CHUNK: usize = 64 * 1024;
 /// one (§3), when a clean index matters.
 ///
 /// The copy goes through a chunk buffer rather than forming a `&[u8]` over the
-/// arena. That avoids fabricating a shared reference over memory a peer is
+/// arena, which avoids fabricating a shared reference over memory a peer is
 /// concurrently storing into — but it does **not** make the read race-free:
 /// `copy_nonoverlapping` is a non-atomic bulk load of the same bytes and is a
-/// data race under the same model. The race is deliberate and unavoidable (there
-/// is no point-in-time snapshot of another process's memory to take); what the
-/// per-slot seqlock buys is that the *result* is interpretable — a slot caught
-/// mid-publish reads back as `SlotContended` rather than as a plausible pose.
+/// data race under the same model. The race is deliberate.
 ///
 /// # Errors
 ///
@@ -426,9 +423,8 @@ impl FrozenArena {
     ///
     /// # Errors
     ///
-    /// See [`FrozenError`]. In particular a `layout_hash` mismatch is refused
-    /// here and not worked around: §2.4 is NORMATIVE that the file must be
-    /// re-frozen.
+    /// See [`FrozenError`]; in particular a `layout_hash` mismatch is refused
+    /// here, not worked around.
     pub fn open(fd: OwnedFd) -> Result<FrozenArena, FrozenError> {
         let actual = rustix::fs::fstat(&fd).map_err(FrozenError::Io)?.st_size as u64;
         if actual < FROZEN_HEADER_SIZE as u64 {
@@ -708,8 +704,7 @@ mod tests {
         assert_eq!(core::mem::align_of::<FrozenHeader>(), 8);
     }
 
-    /// A `FrozenArena` is a variant of `tf_tree::Tree`'s backing enum, so its
-    /// size is charged to every tree in the workspace, including heap ones.
+    /// Pins the boxing argument on the `header` field.
     ///
     /// Four pointer-ish words is base + len + fd + boxed header. Mutant: store
     /// the `FrozenHeader` inline instead of boxing it ⇒ 152 bytes, and this
@@ -728,12 +723,8 @@ mod tests {
     /// A crash between the last arena byte and the container header must leave a
     /// file that will not open — not one that opens and serves zeros.
     ///
-    /// `ftruncate` sizes the file up front, so a crash never leaves a *short*
-    /// file: it leaves a full-length one with a zeroed tail. The only thing
-    /// standing between that and a silently-wrong offline dataset is that the
-    /// header is written last. This reproduces the exact bytes such a crash
-    /// leaves by calling the same `write_body` that `write_frozen` calls, and
-    /// then stopping.
+    /// This reproduces the exact bytes such a crash leaves by calling the same
+    /// `write_body` that `write_frozen` calls, and then stopping.
     ///
     /// The scratch fd deliberately already holds a **complete, valid `.tft` of
     /// identical geometry** — the re-freeze-over-yesterday's-file case — so its
@@ -854,19 +845,17 @@ mod tests {
         assert_eq!(a, b, "the frozen image is not the arena it came from");
     }
 
-    /// The arena image must be 2 MiB aligned in the file, or `MADV_HUGEPAGE` is
-    /// unsatisfiable no matter what address the kernel picks (§2.3).
+    /// The arena image must be [`ARENA_FILE_ALIGN`]-aligned in the file (§2.3).
     ///
     /// Mutant: round `arena_off` up to 4096 instead of `ARENA_FILE_ALIGN` ⇒
     /// fails, and the manifest here is far too short to reach 2 MiB by accident.
     /// ...and the 2 MiB it skips is a **hole**, not two megabytes of zeros.
     ///
     /// §2.3 pays for huge-page eligibility with padding, and the padding is only
-    /// free because nothing writes it: `ftruncate` sizes the file and every
-    /// subsequent write is a `pwrite` at an explicit offset. A 25 KB arena in a
-    /// 2.1 MB file must therefore occupy well under 100 KB of blocks — the bound
-    /// below is loose enough for any block size up to 64 KiB and still an order
-    /// of magnitude under a filled gap. Mutant: in `write_body`, `pwrite_all` a
+    /// free because nothing writes it. A 25 KB arena in a 2.1 MB file must
+    /// therefore occupy well under 100 KB of blocks — the bound below is loose
+    /// enough for any block size up to 64 KiB and still an order of magnitude
+    /// under a filled gap. Mutant: in `write_body`, `pwrite_all` a
     /// `vec![0u8; (arena_off - manifest_end) as usize]` into the gap ⇒ `st_blocks`
     /// jumps to the full file size and this fails.
     #[test]
@@ -925,9 +914,9 @@ mod tests {
     /// copy, a full disk — and it must be an error rather than a `SIGBUS` from
     /// inside a lookup.
     ///
-    /// A regular file has no seals (see the module docs), so `mmap` will happily
-    /// map past the end and fault on touch. The size check is the only thing
-    /// standing there. Mutant: delete the `file_size != actual` comparison in
+    /// A regular file has no seals (see the module docs), so `mmap` maps past
+    /// the end and faults on touch; the size check is the only thing standing
+    /// there. Mutant: delete the `file_size != actual` comparison in
     /// `open` ⇒ this fails (with `Truncated` from `check_extents`, which is a
     /// different error than the one asserted, so the assertion pins the check
     /// that actually ran).

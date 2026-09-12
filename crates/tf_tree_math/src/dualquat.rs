@@ -76,9 +76,6 @@ const SCREW_DEGENERATE_SQ: f64 = 1e-290;
 /// as `θ → 0`.
 ///
 /// Shared by [`screw_pow`] and [`screw_pow_with_twist`] so the two cannot drift.
-/// Every field is one of the quantities the module docs justify holding in
-/// product form rather than factored: `sh2 = sin²(θ/2)`, `ch = cos(θ/2)`,
-/// `k = q_d.w/sin²(θ/2)` and `m_sh = m·sin(θ/2)`.
 struct ScrewParts {
     q_v: Vec3,
     sh2: f64,
@@ -100,9 +97,9 @@ enum Screw {
 
 /// The prologue of the screw power, factored out of [`screw_pow`].
 ///
-/// `#[inline(always)]` is load-bearing, not decoration: [`screw_pow`] is the
-/// interpolation hot path and this must fold into it with no call and no
-/// materialized struct. `interp_cost` is the benchmark that proves it did.
+/// `#[inline(always)]` is load-bearing: [`screw_pow`] is the interpolation hot
+/// path and this must fold into it with no call and no materialized struct.
+/// `interp_cost` is the benchmark that proves it did.
 #[inline(always)]
 fn screw_parts(rel: &Iso3) -> Screw {
     // Canonicalize the real quaternion to the w ≥ 0 hemisphere so θ/2 ∈ [0, π/2]
@@ -117,9 +114,9 @@ fn screw_parts(rel: &Iso3) -> Screw {
     let ch = q.w; // cos(θ/2) ≥ 0
 
     if sh2 < SCREW_DEGENERATE_SQ {
-        // `q_d.w/sh2` would overflow. The rotation is the identity to far
-        // beyond f64 resolution, so the exact form costs nothing in accuracy,
-        // and this branch is unreachable for any physically meaningful input.
+        // The rotation is the identity to far beyond f64 resolution, so the
+        // exact form costs nothing in accuracy, and this branch is unreachable
+        // for any physically meaningful input.
         return Screw::Degenerate(Iso3::new(q, t));
     }
 
@@ -131,9 +128,7 @@ fn screw_parts(rel: &Iso3) -> Screw {
     // foldable without `nnan`/`nsz` (it is `-0.0` for negative `x` and `NaN` for
     // infinite `x`), nor is `±0.0 ± y`. So `Quat::from_pure(t) * q` emits the
     // four `a.w * b.*` multiplies and their whole add/sub chain — it costs
-    // exactly what a **fully general** `Quat * Quat` costs, which is the claim
-    // to check, and it is inside a function that is `#[inline(always)]` into
-    // `screw_pow`, `screw_twist` and `screw_pow_with_twist`, the kernel of the
+    // exactly what a **fully general** `Quat * Quat` costs, on the kernel of the
     // default `ScLerp` policy.
     //
     // The saving is the four dead multiplies and their chain: a Hamilton product
@@ -178,8 +173,7 @@ fn screw_parts(rel: &Iso3) -> Screw {
     // SCREW_DEGENERATE_SQ.
     let k = q_d.w / sh2;
 
-    // m·sin(θ/2) = q_d_v + q_v·k·cos(θ/2). The moment `m` itself diverges as
-    // θ → 0; this product does not, and it is the only form the result needs.
+    // m·sin(θ/2) = q_d_v + q_v·k·cos(θ/2).
     let m_sh = q_d.vector().add(q_v.scale(k * ch));
 
     Screw::Regular(ScrewParts {
@@ -244,10 +238,9 @@ impl ScrewParts {
     ///
     /// So the cost is `sh = sqrt(sh2)` plus `φ`. On the **large-arc** branch `φ`
     /// is the same `atan2` [`ScrewParts::pow`] already takes. On the
-    /// **small-angle** branch — the common one, adjacent samples on one edge —
-    /// `φ²` comes from the same transcendental-free `theta_sq_from_chord` the
-    /// power uses, so `φ` is a second `sqrt` and **no transcendental is added at
-    /// all**.
+    /// **small-angle** branch — the common one — `φ²` comes from the same
+    /// transcendental-free `theta_sq_from_chord` the power uses, so `φ` is a
+    /// second `sqrt` and **no transcendental is added at all**.
     ///
     /// The branch is a **speed** choice and nothing else. Measured against a
     /// 50-digit reference, `atan2(sh, ch)` is accurate to ~`1e-16` across the
@@ -468,10 +461,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // screw_pow_with_twist — `docs/PHASE4.md` §2.3
-    // -----------------------------------------------------------------------
-
     /// **The two public entry points must not drift apart.**
     ///
     /// [`screw_pow`] and [`screw_pow_with_twist`] share [`screw_parts`] and
@@ -541,9 +530,8 @@ mod tests {
         );
     }
 
-    /// **The twist does not depend on `s`.** This is the substance of §2.3: under
-    /// ScLerp the body twist is *constant across the whole segment*, which is
-    /// what makes it exact rather than a finite difference.
+    /// **The twist does not depend on `s`** — §2.3's substance, and what makes it
+    /// exact rather than a finite difference.
     ///
     /// Mutant: make [`ScrewParts::twist`] use `s` anywhere ⇒ fails.
     #[test]

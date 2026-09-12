@@ -155,20 +155,19 @@ impl LockFile {
     /// Try to take byte 1 — the right to mutate topology (`docs/PHASE2.md` §1,
     /// A2).
     ///
-    /// **This is an acquire, and the difference from a probe is the whole
-    /// point.** [`Self::probe_participant`] answers a question about somebody
-    /// else's byte and races every subsequent take, which is why §5.1 constrains
-    /// the order in which a probe may be composed with an arena word. Holding
-    /// this byte *excludes* every subsequent take for as long as it is held, so
-    /// what the holder reads afterwards cannot be invalidated by a taker: there
-    /// cannot be one.
+    /// **This is an acquire, not a probe.** [`Self::probe_participant`] answers
+    /// a question about somebody else's byte and races every subsequent take,
+    /// which is why §5.1 constrains the order in which a probe may be composed
+    /// with an arena word. Holding this byte *excludes* every subsequent take
+    /// for as long as it is held, so what the holder reads afterwards cannot be
+    /// invalidated by a taker: there cannot be one.
     ///
-    /// What that buys the caller is stated as an invariant in `0029` and is the
-    /// reason this exists: if a process holds this byte and then observes a
-    /// non-zero topology word, the word's holder is either **dead** or **a
-    /// writer with no lock file**. A live holder that `/proc` misreports —
-    /// another PID namespace, a non-dumpable process under `hidepid` — is
-    /// excluded by the kernel before any inference runs.
+    /// What that buys the caller is stated as an invariant in `0029`: if a
+    /// process holds this byte and then observes a non-zero topology word, the
+    /// word's holder is either **dead** or **a writer with no lock file**. A
+    /// live holder that `/proc` misreports — another PID namespace, a
+    /// non-dumpable process under `hidepid` — is excluded by the kernel before
+    /// any inference runs.
     ///
     /// Returns [`LockAttempt::Contended`] when another open file description
     /// holds it, which means a live peer is mid-mutation. Retry.
@@ -242,8 +241,7 @@ impl LockFile {
     /// its arena record are indexed by one integer (`docs/PHASE2.md` §5.1), so
     /// the byte is never free to choose. A creator's is `0`, a joiner's is the
     /// one the owner named in its `HelloResponse` (§3.7, and `Open::register_at`
-    /// takes exactly that byte), and a taker-over already has one. **Every
-    /// caller that reached for "any free byte" already knew its slot.**
+    /// takes exactly that byte), and a taker-over already has one.
     ///
     /// Kept because the primitive is correct and tested, and a lock-file byte is
     /// not always a participant record. **Do not reach for it to assign a
@@ -326,9 +324,8 @@ impl LockFile {
 
     /// Whether `edge`'s claim byte is held, and by whom.
     ///
-    /// Subject to the same self-blindness as every other `F_OFD_GETLK` here: a
-    /// description does not see its own locks, so a process asking about an
-    /// edge *it* holds is told the byte is free. Callers must skip their own
+    /// Subject to the module doc's self-blindness: a process asking about an
+    /// edge *it* holds is told the byte is free, so callers must skip their own
     /// edges — see `a_holder_does_not_see_its_own_lock`.
     ///
     /// # Errors
@@ -593,8 +590,7 @@ mod tests {
 
     #[test]
     fn a_holder_does_not_see_its_own_lock() {
-        // Documented trap: GETLK reports conflicts, and nothing conflicts with
-        // itself. Any future "read back my own state" code is wrong.
+        // The module doc's self-blindness trap, asserted rather than assumed.
         let path = scratch("self-blind");
         let a = LockFile::open(&path).unwrap();
         assert_eq!(a.try_take_participant(3).unwrap(), LockAttempt::Acquired);

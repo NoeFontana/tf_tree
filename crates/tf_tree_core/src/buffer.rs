@@ -70,9 +70,9 @@ pub struct PoseSlot {
 // ring and what `write_frozen` copies into a `.tft` — so `size_of` is not a
 // layout here either (`edge.rs`'s `EdgeRecord` block carries the argument).
 //
-// **This is a strictly weaker improvement than the sibling pins and it is worth
-// saying which**: unlike `ClaimRecord`'s two diagnostics-only fields, a swap of
-// `seq` and `data` here already HAS a guard — the committed fixture test
+// **This is a strictly weaker improvement than the sibling pins**: unlike
+// `ClaimRecord`'s two diagnostics-only fields, a swap of `seq` and `data` here
+// already HAS a guard — the committed fixture test
 // `tf_tree::frozen::the_committed_sensor_domain_fixture_reads_and_is_still_tag_one`
 // fails with `SlotContended`, measured. That test runs only under
 // `just shm-check` (its target carries `required-features = ["shm"]`), catches
@@ -195,16 +195,15 @@ impl SampleRing<'_> {
     /// Derived rather than stored — see the struct's `INVARIANT` for what the
     /// stored version cost.
     ///
-    /// **`wrapping_sub` and not `- 1`, and the reason is that the guarantee is
-    /// narrower than it looks.** For a ring this crate builds the capacity is a
-    /// power of two and therefore non-zero: `ArenaView::ring_bytes` is the one
-    /// place that is established, and it returns `None` when
-    /// `!cap.is_power_of_two()`, which also rejects `0`. That is a property of
-    /// the *constructor*, not of the type — every remaining field of
-    /// [`SampleRing`] is `pub`, `poses` included, so a caller outside this
-    /// crate can build one over an empty or non-power-of-two slice and no
-    /// guarantee here applies to it. `wrapping_sub` is what keeps such a ring
-    /// failing the way it always has, at the slice bounds check, instead of
+    /// **`wrapping_sub` and not `- 1`: the guarantee is narrower than it looks.**
+    /// For a ring this crate builds the capacity is a power of two and therefore
+    /// non-zero: `ArenaView::ring_bytes` is the one place that is established,
+    /// and it returns `None` when `!cap.is_power_of_two()`, which also rejects
+    /// `0`. That is a property of the *constructor*, not of the type — every
+    /// remaining field of [`SampleRing`] is `pub`, `poses` included, so a caller
+    /// outside this crate can build one over an empty or non-power-of-two slice
+    /// and no guarantee here applies to it. `wrapping_sub` is what keeps such a
+    /// ring failing the way it always has, at the slice bounds check, instead of
     /// adding a second debug-only panic site on the read path.
     #[inline]
     #[must_use]
@@ -256,9 +255,8 @@ impl SampleRing<'_> {
     /// The mirror of [`Self::newest_stamp`], and it lives here for the same
     /// reason [`Self::retained`] does: the readable window's lower end is
     /// `head - retained()` clamped at zero, and that arithmetic **changed once
-    /// already** (reading the lapped slot is what made an in-window query race a
-    /// `push`). A copy of it in another crate would not move when this one moves
-    /// next.
+    /// already**. A copy of it in another crate would not move when this one
+    /// moves next.
     ///
     /// Note the asymmetry with `newest_stamp`: this is the oldest sample still
     /// *in the ring*, not the oldest ever pushed. A lapped ring dropped those.
