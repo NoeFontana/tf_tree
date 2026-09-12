@@ -3,54 +3,31 @@
 //! ```text
 //! deadline = now + open_timeout (default 5 s)
 //! loop {
-//!     // 1. Someone is already serving. Join.
-//!     if connect(sock) succeeds { ...; return Joined }
-//!
-//!     // 2. Nobody is serving. Try to become the owner.
-//!     if F_OFD_SETLK(byte 0, exclusive) fails { backoff; continue }
-//!
-//!     // 3. Deleted. It short-circuited past step 4 for a process declaring it
-//!     //    already held the arena -- unverifiable from a new file
-//!     //    description (docs/decisions/0037). Do not re-add it.
-//!
-//!     // 4. SPLIT-BRAIN CHECK. Is any participant byte locked?
-//!     if any participant byte is held { release byte 0; backoff; continue }
-//!
-//!     // 5. Serve.
-//!     ...
-//!     return Created
+//!     1. if connect(sock) succeeds { ...; return Joined }
+//!     2. if F_OFD_SETLK(byte 0, exclusive) fails { backoff; continue }
+//!     3. deleted (docs/decisions/0037); do not re-add
+//!     4. SPLIT-BRAIN CHECK: any participant byte held ->
+//!            release byte 0; backoff; continue
+//!     5. serve; return Created
 //! }
 //! on timeout -> Err(ArenaHeldButUnreachable { holder_slots, identities })
 //! ```
 //!
-//! **Step 4 is the whole design.** Without it this sequence is possible: the
-//! owner dies; a fresh process starts, finds no socket, wins the ownership lock
-//! before any surviving participant has noticed the `HUP`, and creates a
-//! *second* arena. The survivors keep using the first. Two arenas, both live,
-//! silently diverging — worse than any failure to start, because nothing reports
-//! an error and the robot's transform tree is quietly inconsistent between
-//! nodes.
+//! **Step 4 is the whole design.** Without it, an owner dies, a fresh process
+//! finds no socket, wins the ownership lock before any survivor notices the
+//! `HUP`, and creates a *second* arena — two live arenas diverging, no error
+//! anywhere. It is **deterministic, not a grace period**: a locked participant
+//! byte means a live arena, full stop. The timeout is correct for the same
+//! reason — a `SIGSTOP`ped participant that never takes over blocks every new
+//! process, and that beats divergence.
 //!
-//! The check is **deterministic, not a grace period.** If any participant byte
-//! is locked, a live arena exists, and a fresh process must not create one, full
-//! stop. There is no timing assumption and no window to tune. The timeout case
-//! is likewise correct rather than a limitation: if a participant is
-//! `SIGSTOP`ped and never takes over, no new process can join, and that is the
-//! right answer, because the alternative is divergence.
-//!
-//! # What this module leaves to its caller
-//!
-//! Steps 1 and 5 are injected rather than performed here, and that is what keeps
-//! this module free of both the socket and the arena. The socket lives one
-//! module over, in [`crate::OwnerServer`] and [`crate::attach`]; the arena is
-//! not reachable from this crate at all — its `Cargo.toml` lists `rustix` and
-//! `libc` and nothing else, so `memfd` creation cannot happen here even in
-//! principle. "Is someone serving?" is therefore a [`ServerProbe`] the caller
-//! injects — [`crate::SocketProbe`] runs the real §3.7 handshake, [`NoServer`]
-//! is the test one — and "serve" means taking the locks and returning an
-//! [`OpenOutcome`] that tells the caller which of bind/create it now owes. That
-//! split is not a stub: the lock-file half is where every race in §3.4 lives,
-//! and it is testable to the last branch without a socket.
+//! Steps 1 and 5 are injected, which keeps this module free of the socket
+//! ([`crate::OwnerServer`], [`crate::attach`]) and of the arena (this crate
+//! depends only on `rustix` and `libc`, so `memfd` creation cannot happen here).
+//! Step 1 is a [`ServerProbe`] — [`crate::SocketProbe`] for the real §3.7
+//! handshake, [`NoServer`] for tests — and "serve" means taking the locks and
+//! returning an [`OpenOutcome`] naming what the caller owes. What is left is
+//! where every §3.4 race lives, testable without a socket.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -70,67 +47,46 @@ pub enum CreatePolicy {
     IfAbsent,
     /// Never create; fail with [`IpcError::ArenaAbsent`] instead.
     ///
-    /// Worth recommending for anything in a supervised deployment: a consumer
-    /// that creates an empty arena because the estimator has not started yet
-    /// looks healthy and publishes nothing.
+    /// Prefer it in a supervised deployment: a consumer that creates an empty
+    /// arena because the estimator has not started looks healthy while
+    /// publishing nothing.
     Never,
     /// Create over an arena that exists but cannot be reached, abandoning it.
     ///
     /// **`docs/PHASE2.md` §3.4 calls this `--force-new`, and the flag has never
-    /// existed** — the escape hatch is this policy and nothing else, on the
-    /// process that creates the arena (§0.0's row, #189). It **skips the
-    /// split-brain check**, which is to say it deliberately does the thing §3.4
-    /// exists to prevent, and it is here only because an operator staring at
-    /// [`IpcError::ArenaHeldButUnreachable`] on a wedged robot needs one. Never
-    /// take this path automatically.
+    /// existed** — this policy is the entire escape hatch (§0.0's row, #189). It
+    /// **skips the split-brain check**, so never take it automatically; it is for
+    /// an operator staring at [`IpcError::ArenaHeldButUnreachable`].
     ///
-    /// "Unreachable", not "unconditionally": step 1 of the loop still runs, so a
-    /// rendezvous with a server answering on its socket is *joined*. What this
-    /// abandons is an arena whose **owner is gone** and whose non-owner holders
-    /// are alive — §3.4's stranded-participant case, and the only shape it can
-    /// abandon.
-    ///
-    /// The sentence that stood here said "an arena whose holders are alive and
-    /// whose owner is not serving", which is precisely the state it *cannot*
-    /// abandon: this policy skips step 4's participant scan and nothing else, so
-    /// it still takes the ownership byte at step 2 and still takes participant
-    /// byte 0 at step 5 — and byte 0 is the owner's slot for the owner's whole
-    /// life (`CREATOR_SLOT`, `docs/decisions/0035`; joiners are
-    /// assigned slots `>= 1`). An owner that is alive holds one or both, so it
-    /// refuses exactly like [`CreatePolicy::IfAbsent`]; the two bytes being free
-    /// is when this creates, and an owner that is gone is the ordinary — not the
-    /// only — way they get that way. [`Session::release_ownership`] frees the
-    /// ownership byte and keeps byte 0, so a live non-owner can sit on the
-    /// creator's slot with no owner anywhere and this still refuses. Read the
-    /// bytes, not the role. Measured both ways by
+    /// It skips step 4's participant scan and nothing else: step 1 still joins a
+    /// server that answers, and steps 2 and 5 still take the ownership byte and
+    /// participant byte 0. Byte 0 is the owner's for the owner's whole life
+    /// (`CREATOR_SLOT`, `docs/decisions/0035`; joiners get `>= 1`), so either byte
+    /// held refuses exactly like [`CreatePolicy::IfAbsent`] — including a live
+    /// non-owner left on byte 0 by [`Session::release_ownership`]. Read the bytes,
+    /// not the role: all it can abandon is §3.4's stranded participant, an owner
+    /// gone with non-owner holders alive. Both ways measured by
     /// `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass` and
     /// `a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through`
-    /// (`crates/tf_tree/tests/rendezvous.rs`); the error's own `Display` now
-    /// names which of the three states a caller is in.
+    /// (`crates/tf_tree/tests/rendezvous.rs`).
     ///
     /// # What it leaves behind (§3.9, §11.3)
     ///
-    /// - **The abandoned arena.** Its survivors keep their mappings and keep
-    ///   publishing; §3.9 frees the segment only when the last one drops. Two
-    ///   arenas, two `instance_uuid`s, diverging — chosen, not suffered.
-    /// - **Their lock bytes**, in the same lock file. The new owner's slot
-    ///   assigner skips a byte the kernel reports held, so those slot indices
-    ///   are gone from the replacement's table until the survivors exit. The
-    ///   escape hatch spends participant slots; it never recovers one.
+    /// - **The abandoned arena**: §3.9 frees the segment only when the last
+    ///   survivor drops it, so two `instance_uuid`s diverge — chosen, not
+    ///   suffered.
+    /// - **Their lock bytes.** The new owner's assigner skips a byte the kernel
+    ///   reports held, so those slots are gone until the survivors exit.
     /// - **Their claim leases**, at [`crate::CLAIM_BASE`]` + edge_id` in that same
-    ///   file (§6.1). The replacement numbers its edges from zero again, so a
-    ///   writer claiming an id a survivor still holds wins the arena CAS on a
-    ///   record that is genuinely free and then loses the lease — the
-    ///   [`LockAttempt::Contended`] arm, which `tf_tree` surfaces as
-    ///   `ClaimApiError::LeaseContended`. Retrying cannot clear it while the
-    ///   survivor runs; this is the byte aliasing `docs/decisions/0005` §5 of
-    ///   *Consequences* names.
-    /// - **A crash mid-force is the original wedge again.** §11.3's
-    ///   `open.after_create_before_bind` row promises the next `open()` finds
-    ///   nothing alive and creates fresh, but that row assumes no participant
-    ///   byte is held — the one state this policy is reached from. The orphan
-    ///   memfd is still freed with its last mapping; the rendezvous is back
-    ///   where it started, and only another `Always` gets past it.
+    ///   file (§6.1). The replacement numbers edges from zero, so a writer can win
+    ///   the arena CAS on a genuinely free record and still lose the lease — the
+    ///   [`LockAttempt::Contended`] arm, surfaced as
+    ///   `ClaimApiError::LeaseContended` and unclearable while the survivor runs.
+    ///   `docs/decisions/0005` §5's byte aliasing.
+    /// - **A crash mid-force is the original wedge again**: §11.3's
+    ///   `open.after_create_before_bind` row assumes no participant byte is held,
+    ///   the one state this policy is reached from, so only another `Always` gets
+    ///   past it.
     Always,
 }
 
@@ -142,26 +98,22 @@ pub enum OpenOutcome {
     /// Nothing existed; this process won ownership and must now create the
     /// arena (§3.6), unlink any stale socket path, bind and listen.
     ///
-    /// A stale socket path is expected rather than exceptional: it is what an
-    /// owner that died leaves behind, it holds no state, and §3.9 makes it the
-    /// job of whoever wins ownership to remove it.
+    /// A stale socket path is expected, not exceptional: §3.9 makes removing what
+    /// a dead owner left the winner's job, and it holds no state.
     Created,
 }
 
 /// Whether a server is reachable at the socket path, and what it gave us.
 ///
-/// Generic over what a successful probe yields, because the real probe does not
-/// merely *observe* a server — it completes the §3.7 handshake and comes back
-/// holding the segment fd. Splitting "is anyone there?" from "attach to them"
-/// would mean connecting twice and re-running the race in between.
+/// Generic over what a probe yields: the real one completes the §3.7 handshake
+/// and returns the segment fd, since splitting "is anyone there?" from "attach"
+/// would connect twice and re-run the race.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach<T> {
     /// The handshake succeeded.
     ///
-    /// Carries whatever the probe obtained **and the slot the owner granted**.
-    /// The slot lives in the variant rather than behind a separate accessor so
-    /// that a probe cannot report success without saying which slot it was
-    /// given — the two are one fact, and splitting them lets them disagree.
+    /// The granted slot rides in the variant, not a separate accessor: reporting
+    /// success without naming a slot would let the two disagree.
     Serving {
         /// What the probe obtained; for the real one, the attachment.
         attached: T,
@@ -171,27 +123,23 @@ pub enum Reach<T> {
     },
     /// `ECONNREFUSED`, no socket at all, or a server that died mid-handshake.
     ///
-    /// **Not an error.** §3.9 makes a stale socket path an expected state and
-    /// the ownership byte is the real discriminator, so all three collapse to
-    /// the same verdict and the §3.4 loop carries on.
+    /// **Not an error.** §3.9 makes a stale socket path expected and the ownership
+    /// byte is the real discriminator, so all three collapse to one verdict.
     Absent,
     /// The owner answered, and refused.
     ///
-    /// Terminal, unlike [`Reach::Absent`]. §3.4's loop has no exit for a
-    /// rejection, so a `LayoutMismatch` would otherwise be retried until the
-    /// deadline and then reported as [`IpcError::ArenaHeldButUnreachable`] —
-    /// the exact multi-hour debugging session §3.7 says the message exists to
-    /// prevent.
+    /// Terminal, unlike [`Reach::Absent`]: §3.4's loop has no exit for a rejection,
+    /// so a `LayoutMismatch` would burn the deadline and surface as
+    /// [`IpcError::ArenaHeldButUnreachable`] — the debugging session §3.7's
+    /// message exists to prevent.
     Rejected(IpcError),
 }
 
 /// Step 1 of the algorithm, injected.
 ///
-/// The real implementation connects a `SOCK_SEQPACKET` and performs the §3.7
-/// handshake. Modelling it as a trait keeps every §3.4 branch reachable from a
-/// test — including the ones that only occur when a *live* arena is
-/// simultaneously unreachable, which is precisely the split-brain race and is
-/// otherwise a matter of winning a timing window on purpose.
+/// The real one connects a `SOCK_SEQPACKET` and performs the §3.7 handshake. A
+/// trait keeps every §3.4 branch testable, including the split-brain race — a
+/// *live* but unreachable arena — which otherwise needs a won timing window.
 pub trait ServerProbe {
     /// What a successful probe yields — for the real one, the attachment.
     type Attached;
@@ -200,15 +148,14 @@ pub trait ServerProbe {
     ///
     /// # Errors
     ///
-    /// Only for failures that are neither "nobody is listening" nor "the owner
-    /// refused" — those are [`Reach::Absent`] and [`Reach::Rejected`].
+    /// Only for what is neither "nobody is listening" nor "the owner refused":
+    /// those are [`Reach::Absent`] and [`Reach::Rejected`].
     fn probe(&mut self, sock: &Path) -> Result<Reach<Self::Attached>, IpcError>;
 }
 
 /// A probe that always reports nothing listening.
 ///
-/// The state of the world after an owner dies, and the state during the
-/// split-brain race. Also the honest stand-in until §3.7 exists.
+/// The state of the world after an owner dies, and during the split-brain race.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoServer;
 
@@ -235,27 +182,20 @@ pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// First backoff interval for *this* crate's handshake retry. Doubles up to
 /// [`MAX_BACKOFF`].
 ///
-/// **Private, and deliberately so.** A revision of `docs/decisions/0019` §2b's
-/// branch widened this pair to `pub` so the facade's `Open::await_open` could
-/// share it. That is permanent public API on this crate bought for two numbers,
-/// and it bought no guarantee: `await_open` retries whole rendezvous
-/// *attempts*, each of which runs this loop inside it, so the two are nested
-/// loops over different work and are free to disagree. The facade now keeps its
-/// own pair in `tf_tree::tree`, and this one went back to being an
-/// implementation detail.
+/// **Private, deliberately.** A `docs/decisions/0019` §2b branch made this pair
+/// `pub` for the facade to share: permanent public API for two numbers, and no
+/// guarantee — `Open::await_open` retries whole rendezvous *attempts*, each
+/// running this loop, so the two are free to disagree.
 const MIN_BACKOFF: Duration = Duration::from_micros(200);
 /// Backoff ceiling — small enough that a 5 s timeout still gives hundreds of
 /// attempts, so a takeover that completes in a millisecond is joined promptly.
 const MAX_BACKOFF: Duration = Duration::from_millis(4);
 
-/// The participant slot a creator takes, and the reason it is a named constant
-/// rather than a `0` in one expression.
+/// The participant slot a creator takes.
 ///
-/// It is the *same integer* as the arena record `TreeBuilder::build_shared`
-/// gives the creator, and the facade's liveness predicates index both with it —
-/// `LivenessProbe::is_held(slot)` probes the lock byte while
-/// `ParticipantTable` indexes the record. Two spellings of one number is how
-/// they drifted (#201).
+/// Named, not a bare `0`: it is the *same integer* as the arena record
+/// `TreeBuilder::build_shared` gives the creator, which the facade indexes with
+/// it. Two spellings is how they drifted (#201).
 const CREATOR_SLOT: u32 = 0;
 
 impl Open {
@@ -311,10 +251,10 @@ impl Open {
     ///
     /// # Errors
     ///
-    /// [`IpcError::ArenaHeldButUnreachable`] on timeout — a live arena exists
-    /// but nothing serves it; [`IpcError::ArenaAbsent`] under
-    /// [`CreatePolicy::Never`]; [`IpcError::NoParticipantSlots`] when the
-    /// participant table is full; and any lock or directory failure.
+    /// [`IpcError::ArenaHeldButUnreachable`] on timeout (a live arena nothing
+    /// serves); [`IpcError::ArenaAbsent`] under [`CreatePolicy::Never`];
+    /// [`IpcError::NoParticipantSlots`] when the table is full; lock or directory
+    /// failures.
     pub fn open<P: ServerProbe>(&self, probe: &mut P) -> Result<Session<P::Attached>, IpcError> {
         self.rendezvous.ensure_dir()?;
         let lock = LockFile::open(self.rendezvous.lock_path())?;
@@ -325,23 +265,13 @@ impl Open {
         loop {
             // 1. Someone is already serving. Join.
             match probe.probe(self.rendezvous.sock_path())? {
-                // Terminal. Retrying cannot change a version or layout
-                // disagreement, and burning the deadline on it would replace a
-                // precise message with a timeout.
+                // Terminal: retrying cannot change a version or layout
+                // disagreement, and would trade a precise message for a timeout.
                 Reach::Rejected(why) => return Err(why),
                 Reach::Serving { attached, slot } => {
-                    // The owner named the slot, so §3.3's specified order —
-                    // write the identity, *then* take the lock — is restorable
-                    // here. It was not in the fallback below, which used to
-                    // find a free slot itself and would race two writers onto
-                    // one record — that fallback was `register_any`, deleted
-                    // with issue #201's takeover arm.
-                    // `None` means the byte the owner named is held by somebody
-                    // the owner has not noticed leaving yet. Drop this
-                    // attachment and go round again: the owner re-probes its
-                    // table and will name a different slot. Nothing was written
-                    // to the arena, so nothing is left behind — which is the
-                    // point of taking the byte before touching it.
+                    // `None`: the named byte is held by somebody the owner has
+                    // not noticed leaving. Drop the attachment and loop — it
+                    // re-probes and names another, and nothing reached the arena.
                     if let Some(slot) = self.register_at(&lock, &identity, slot)? {
                         return Ok(Session {
                             outcome: OpenOutcome::Joined,
@@ -359,21 +289,17 @@ impl Open {
             if lock.try_take_ownership()? == LockAttempt::Acquired {
                 // **Step 3 is gone, and its absence is the decision.** It
                 // short-circuited past step 4 for a process declaring it already
-                // held the arena — a declaration no new file description can
-                // verify, since `F_OFD_GETLK` reports conflicts and cannot name
-                // a holder. Issue #201 and `docs/decisions/0037`: a takeover is
-                // not a second `open()`. **Do not re-add the short-circuit**;
-                // the five unsound states that argument cost are listed there.
+                // held the arena, which no new file description can verify:
+                // `F_OFD_GETLK` reports conflicts and cannot name a holder.
+                // **Do not re-add it** — #201 / `docs/decisions/0037` list the
+                // five unsound states it cost.
                 // 4. SPLIT-BRAIN CHECK. A held participant byte means a live
-                //    arena exists whose holder has not taken over yet, so yield
-                //    to it. Deterministic: no grace period, no timing
-                //    assumption, no window to tune.
+                //    arena whose holder has not taken over yet, so yield.
                 if self.create != CreatePolicy::Always && lock.any_participant_held()? {
                     lock.release_ownership()?;
                 } else if self.create == CreatePolicy::Never {
-                    // Nothing is serving and nothing is alive, so there is
-                    // genuinely no arena to join. Fail fast rather than wait out
-                    // a timeout that cannot change the answer.
+                    // Nothing serving and nothing alive, so there is no arena to
+                    // join. A timeout cannot change that answer.
                     lock.release_ownership()?;
                     return Err(IpcError::ArenaAbsent);
                 } else if let Some(slot) = self.register_creator(&lock, &identity)? {
@@ -387,11 +313,9 @@ impl Open {
                         attached: None,
                     });
                 } else {
-                    // Somebody took the creator's byte between step 4's scan and
-                    // step 5's acquire. That is step 4's own condition arriving
-                    // late, so it takes step 4's branch — release ownership and
-                    // go round again. Nothing was built, so there is nothing to
-                    // unwind.
+                    // The creator's byte was taken between step 4's scan and step
+                    // 5's acquire — step 4's condition arriving late, so take
+                    // step 4's branch. Nothing was built to unwind.
                     lock.release_ownership()?;
                 }
             }
@@ -404,87 +328,40 @@ impl Open {
         }
     }
 
-    /// Take a participant slot and write its identity record.
+    /// Take **the creator's slot** (byte 0), or report somebody else holds it.
     ///
-    /// **Deviation from §3.3's "written with `pwrite` before taking the slot
-    /// lock", and it is deliberate.** That ordering presumes the slot is already
-    /// known, which it is in the finished protocol: §3.7 has the *owner* assign
-    /// the slot in its accept loop and return it in the `HelloResponse`. Until
-    /// the socket exists, a joiner has to find a free slot itself, and
-    /// write-then-lock loses the race it is meant to win — two processes both
-    /// see slot 3 free, both write, one takes the lock, and the record now names
-    /// the process that *lost*. A lock byte held with somebody else's name
-    /// against it is worse than one held with no name yet: it makes
-    /// [`IpcError::ArenaHeldButUnreachable`] point an operator at the wrong pid.
+    /// **Lock, then write** — deliberately not §3.3's "identity written with
+    /// `pwrite` before taking the slot lock", which presumes a slot the owner
+    /// named. A joiner picking its own loses that race: two see slot 3 free, both
+    /// write, one locks, and the record names the *loser*, pointing
+    /// [`IpcError::ArenaHeldButUnreachable`] at the wrong pid. Reversed, a slot is
+    /// briefly held with a stale record, which is harmless: the record is advisory
+    /// (§5.1), the lock is the liveness. Creator-only — joiners use
+    /// [`Open::register_at`] and a taker-over registers nothing (`0028`
+    /// question 3, `docs/decisions/0037`).
     ///
-    /// So: lock, then write. The window where a slot is held with a stale record
-    /// is a few microseconds long, and the record is advisory (§5.1) — the lock
-    /// is the liveness.
+    /// **Not a scan for the first free byte.** A creator is the *first*
+    /// participant (step 4 refuses to create while any participant byte is held),
+    /// so its slot is `0`, matching the arena's first `FREE` record that the
+    /// facade indexes with the same integer. A scan (#201's deleted
+    /// `register_any`) is a *separate* pass from step 4's: `any_participant_held`
+    /// probes byte 0 then 63 more, leaving 63 `F_OFD_GETLK` calls in which byte 0
+    /// can be taken. Measured, a second description toggling byte 0 over 4000
+    /// iterations of exactly those two calls: **2242 took a non-zero byte** while
+    /// the arena would have registered record 0 — reachable from outside this
+    /// workspace anyway, `LockFile::try_take_participant` being published API. One
+    /// `F_OFD_SETLK` makes check and take kernel-atomic, so divergence is
+    /// unrepresentable rather than detected (the facade's
+    /// `ParticipantSlotDiverged` guard stays as an assertion this cannot trip).
     ///
-    /// **This path is now only for a creator.** A joiner uses
-    /// [`Open::register_at`], where §3.3's order *is* restored because the slot
-    /// is known before anything is written, and a taker-over registers nothing
-    /// at all — `0028` question 3, and `docs/decisions/0037`. Take
-    /// **the creator's slot**, or report that somebody else holds it.
-    ///
-    /// # Why this is not a scan for the first free byte
-    ///
-    /// A creator is the *first* participant — §3.4 step 4 refuses to create
-    /// while any participant byte is held — so its slot is `0`, and every
-    /// consumer of a created arena relies on that: the arena's first `FREE`
-    /// record is `0` too, and the facade's liveness predicates index the lock
-    /// byte and the arena record with **one** integer.
-    ///
-    /// A scan for the first free byte — which is what `register_any` did until
-    /// issue #201 deleted it — is a *separate* pass from step 4's. Between them the correspondence is only a hope:
-    /// `any_participant_held` probes byte 0 first and then 63 more before
-    /// returning, so the window in which byte 0 can be taken by somebody else is
-    /// the rest of that scan — 63 `F_OFD_GETLK` calls wide, not one instruction.
-    /// Measured with a second open file description toggling byte 0, 4000
-    /// iterations of exactly the two calls step 4 and step 5 make: **2242 took a
-    /// non-zero byte** while the arena would have registered record 0.
-    ///
-    /// That is reachable from outside this workspace whatever this workspace
-    /// does, because `LockFile::try_take_participant` is public API on a
-    /// published crate.
-    ///
-    /// So the check and the take are **one operation**: a single `F_OFD_SETLK`
-    /// on byte 0, whose atomicity is the kernel's. There is no window to close
-    /// because there is no gap. `Ok(None)` means somebody else holds it, which
-    /// is step 4's condition, so the caller takes step 4's branch.
-    ///
-    /// This is cheaper than what it replaces — one `SETLK` instead of a scan —
-    /// and the diverged state stops being *detected* and becomes
-    /// unrepresentable. The facade's `ParticipantSlotDiverged` guard stays where
-    /// it is, now as an assertion this path cannot trip.
-    ///
-    /// **`CreatePolicy::Always` gets the same treatment on purpose.** It skips
-    /// step 4, so `Ok(None)` there means a *live* participant holds the
-    /// creator's byte. Forcing a fresh arena past one is the split brain
-    /// `--force-new` is supposed to resolve, not cause; the caller loops and, if
-    /// the holder persists, times out into
-    /// [`IpcError::ArenaHeldButUnreachable`], which names it.
-    ///
-    /// **And byte 0 is free in exactly the case the escape hatch is for**, which
-    /// is not the reason this comment used to give. It said the wedged arena has
-    /// *dead* participants whose bytes the kernel already released — false, and
-    /// backwards: a wedge **requires** a live holder, because if every holder
-    /// were dead no participant byte would be held, step 4 would not fire, and
-    /// an ordinary [`CreatePolicy::IfAbsent`] create would already succeed with
-    /// no force involved. The real reason is the slot assignment `0035` makes
-    /// exact: byte 0 is the *owner's*, held for the owner's whole life, and
-    /// joiners get `>= 1`. So a free byte 0 with a held byte `>= 1` means the
-    /// owner is gone and a non-owner survived — §3.4's stranded participant, the
-    /// case the hatch resolves — and a held byte 0 is somebody on the creator's
-    /// slot, which no force can pass. Usually that is the owner; it need not be,
-    /// because [`Session::release_ownership`] keeps byte 0 while giving up the
-    /// role, and `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`
-    /// pins that state. The refusal is the same either way, which is the point
-    /// of predicating it on the byte rather than on who is meant to hold it.
-    /// Measured by
-    /// `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass`
-    /// (`crates/tf_tree/tests/rendezvous.rs`): with byte 0 held both policies
-    /// return the *same* error; move the held byte to 3 and `Always` creates.
+    /// `Ok(None)` is step 4's condition arriving here, so the caller takes step
+    /// 4's branch — under [`CreatePolicy::Always`] too, where it means a *live*
+    /// holder on byte 0, owner or not
+    /// (`defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`), and
+    /// forcing past that is the split brain `--force-new` must resolve, not cause.
+    /// Byte 0 is free in exactly the case the hatch is for (`0035`) — not, as once
+    /// claimed here, because a wedge's participants are dead: a wedge *requires* a
+    /// live holder, or step 4 would not fire and `IfAbsent` would already create.
     fn register_creator(
         &self,
         lock: &LockFile,
@@ -499,18 +376,13 @@ impl Open {
 
     /// Take the slot the owner named, in §3.3's specified order.
     ///
-    /// Write the identity record first, then the lock byte. That ordering is
-    /// safe here and was unsafe in the deleted `register_any`, and the
-    /// difference is who chose the slot: nobody else is racing us for *this* byte, because the
-    /// owner hands each client a different one. So the record can be in place
-    /// before the byte is held, and a reader that sees the byte held never sees
-    /// it nameless.
+    /// Identity first, then the byte — safe here and not in the deleted
+    /// `register_any`, because the owner hands each client a different byte, so
+    /// nobody races us and a reader never sees a held byte nameless.
     ///
-    /// Returns `None` if the byte is already held — the owner named a slot whose
-    /// previous holder it has not seen leave yet. The caller retries the
-    /// handshake rather than falling back to another slot: falling back would
-    /// re-open the split between the byte and the arena record that
-    /// `register_at` exists to close.
+    /// `None` if the byte is already held: the owner named a slot whose holder it
+    /// has not seen leave. The caller retries the handshake rather than falling
+    /// back to another slot, which would re-open the byte/record split.
     fn register_at(
         &self,
         lock: &LockFile,
@@ -526,20 +398,16 @@ impl Open {
 
     /// Build the timeout error, naming the slots an operator has to deal with.
     ///
-    /// **The ownership probe is what makes the message actionable.** Every
-    /// caller reaching this line has released the ownership byte again — step 2
-    /// either never acquired it, or one of step 4's / step 5's branches gave it
-    /// back — so `F_OFD_GETLK` here reports somebody *else*, which is precisely
-    /// the bit that decides whether [`CreatePolicy::Always`] could help: it has
-    /// to take that byte before it reaches the participant bytes it is allowed
-    /// to skip. Read at the deadline and advisory like the identity record, not
-    /// a claim about the whole timeout.
+    /// Every caller reaching here has released the ownership byte again, so the
+    /// probe reports somebody *else* — the bit that says whether
+    /// [`CreatePolicy::Always`] could help, since it must take that byte before
+    /// the participant bytes it may skip. A reading at the deadline, not a claim
+    /// about the whole timeout.
     fn held_but_unreachable(&self, lock: &LockFile) -> Result<IpcError, IpcError> {
         let holder_slots = lock.held_participants()?;
-        // `trailing_zeros()` is 64 on an empty mask, which is not a slot any
-        // arena has. `Display` happened to special-case the empty mask, but the
-        // field is public and a supervisor logging it would have recorded a
-        // fictional slot — so make "no holder" unrepresentable instead.
+        // `trailing_zeros()` is 64 on an empty mask, which is no arena's slot.
+        // `Display` special-cased that, but the field is public and a supervisor
+        // reading it would log a fictional slot.
         let first = (holder_slots != 0).then(|| holder_slots.trailing_zeros());
         let first_pid = match first {
             Some(slot) => lock.read_identity(slot)?.map_or(0, |id| id.pid),
@@ -557,9 +425,8 @@ impl Open {
 /// The result of a successful `open()`: the outcome, and the locks that make it
 /// true.
 ///
-/// Dropping a `Session` closes the lock file, which releases the ownership and
-/// participant bytes — the same thing the kernel does when the process dies, by
-/// the same mechanism. There is no separate teardown to forget.
+/// Dropping it closes the lock file, releasing both bytes by the mechanism the
+/// kernel uses on process death. No separate teardown to forget.
 #[derive(Debug)]
 pub struct Session<A = ()> {
     outcome: OpenOutcome,
@@ -577,8 +444,8 @@ impl<A> Session<A> {
         self.outcome
     }
 
-    /// This process's participant slot. Its lock byte is held for the lifetime
-    /// of the `Session`, on this session's own file description.
+    /// This process's participant slot. Its lock byte is held for the `Session`'s
+    /// lifetime, on this session's own file description.
     #[must_use]
     pub fn slot(&self) -> u32 {
         self.slot
@@ -599,9 +466,8 @@ impl<A> Session<A> {
     /// Give up the owner role while staying attached (§3.5).
     ///
     /// Ownership is a role, not a property of the arena: releasing byte 0 lets
-    /// another participant take over. **Lookups do not stop, slow down, or
-    /// observe anything during a takeover** — the data plane touches only the
-    /// mapping, and ownership lives entirely in the control plane.
+    /// another participant take over, and lookups are unaffected because
+    /// ownership is control plane only.
     ///
     /// # Errors
     ///
@@ -617,47 +483,25 @@ impl<A> Session<A> {
     /// Inherit the owner role, keeping this session's slot, byte and arena
     /// (§3.5). Returns whether this process is now the owner.
     ///
-    /// The other half of [`Self::release_ownership`], and the answer to
-    /// [`0037`]'s question 5: with no way for a survivor to *become* owner, that
-    /// method was one end of a pair whose other end did not exist, and the
-    /// rendezvous stayed ownerless until every participant left.
+    /// The other half of [`Self::release_ownership`] and the answer to [`0037`]'s
+    /// question 5: without it the rendezvous stayed ownerless until every
+    /// participant left.
     ///
-    /// # Why this is a method and not another `open()`
+    /// **A method, not another `open()`**, because a takeover rests on "I already
+    /// hold the arena at slot *n*" and no new file description can verify that:
+    /// from the fresh [`LockFile`] `Open::open` builds, `F_OFD_GETLK` answers
+    /// *does anyone **else** hold this byte*, so this caller and a live **peer**
+    /// holding byte *n* are indistinguishable, and believing the declaration hands
+    /// out a session naming the peer's slot. Two rounds of repair against that
+    /// shape executed five unsound states, four introduced while fixing the one
+    /// before ([`0037`]). Locking **the description this session already holds**
+    /// leaves nothing to verify — `0028` question 3's property, made structural.
     ///
-    /// **The declaration a takeover rests on is "I already hold the arena at
-    /// slot *n*", and no new file description can verify it.** `Open::open`
-    /// builds its own [`LockFile`], and from a fresh description `F_OFD_GETLK`
-    /// answers *does anyone **else** hold this byte* — so a caller holding byte
-    /// *n* on another description and a live **peer** holding byte *n* are
-    /// indistinguishable, and accepting the declaration hands the caller a
-    /// session naming the peer's slot. Two rounds of repair against that shape
-    /// produced five executed unsound states, four of them introduced while
-    /// fixing the one before ([`0037`] lists them).
-    ///
-    /// Here there is nothing to verify. The lock is taken on **the description
-    /// this session already holds**, so the slot, the participant byte and the
-    /// arena record do not move and cannot disagree — the invariant is
-    /// structural rather than checked. That is the property `0028` question 3
-    /// was reaching for.
-    ///
-    /// # What the caller still owes
-    ///
-    /// Acquiring byte 0 makes this process the owner; it does not make it a
-    /// *server*. The caller must then bind the rendezvous socket and serve its
-    /// existing segment — see `tf_tree::Tree::inherit_ownership`, which is the
-    /// facade seam that has the arena, the fd and the rendezvous in scope.
-    /// **Lookups are unaffected throughout**: `Plan::at` touches the mapping and
-    /// nothing else, and ownership lives entirely in the control plane (§3.5).
-    ///
-    /// # Racing survivors
-    ///
-    /// [`0037`]'s question 2. Both call this; one gets the byte and the other
-    /// receives `Ok(false)` and remains a plain participant **with its slot
-    /// intact** — which falls out of taking the lock on the existing
-    /// description, and is exactly what the deleted arm could not do.
-    /// `Ok(false)` is not an error: it means somebody else is mid-bind.
-    ///
-    /// Calling this while already the owner is a no-op returning `Ok(true)`.
+    /// Owner is not *server*: the caller must still bind the socket and serve its
+    /// existing segment (`tf_tree::Tree::inherit_ownership` has arena, fd and
+    /// rendezvous in scope). With racing survivors ([`0037`]'s question 2) one
+    /// gets the byte and the other `Ok(false)` **with its slot intact** — not an
+    /// error, just somebody else mid-bind. Already owning is a no-op `Ok(true)`.
     ///
     /// [`0037`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0037-a-takeover-is-not-a-second-open.md
     ///
@@ -679,27 +523,17 @@ impl<A> Session<A> {
 
     /// Does **anyone else** hold the ownership byte (§3.3 byte 0)?
     ///
-    /// The kernel's answer, from `F_OFD_GETLK` on the description this session
-    /// already holds. It is the second half of the question
-    /// `tf_tree::Tree::owner_lost` asks: a hung-up attach socket says *this
-    /// process's channel is dead*, and only this says whether the **role** is
-    /// vacant ([`0043`]).
+    /// The kernel's answer, from `F_OFD_GETLK` on this session's own description —
+    /// the second half of what `tf_tree::Tree::owner_lost` asks, a hung-up attach
+    /// socket saying only *this process's channel is dead* ([`0043`]).
     ///
-    /// # A survivor never sees its own byte
-    ///
-    /// [`crate::LockProbe::held`] reports *conflicting* locks, and nothing
-    /// conflicts with itself — so an owner asking this gets `false` about a byte
-    /// it is holding. That is why the caller in the facade reaches here only
-    /// from the `Joined` arm, where by construction this session is not the
-    /// owner. A caller that wants "am I the owner" wants
-    /// [`Self::take_over_ownership`]'s return, not this.
-    ///
-    /// # Why not read the participant table instead
-    ///
-    /// It carries pids and start times, and judging them needs the `/proc`
-    /// heuristic [`0033`] has already shown cannot name a namespace. The byte is
-    /// the authority for liveness everywhere else in this protocol (§5.1, §6.1,
-    /// [`0029`]); it is the authority here.
+    /// **A survivor never sees its own byte:** [`crate::LockProbe::held`] reports
+    /// *conflicting* locks, so an owner asking gets `false` about a byte it holds.
+    /// The facade therefore calls this only from the `Joined` arm; for "am I the
+    /// owner" use [`Self::take_over_ownership`]'s return. Not the participant
+    /// table, whose pids and start times need the `/proc` heuristic [`0033`] shows
+    /// cannot name a namespace — the byte is the liveness authority everywhere
+    /// else here (§5.1, §6.1, [`0029`]).
     ///
     /// [`0029`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0029-the-topology-lock-is-a-kernel-lock.md
     /// [`0033`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0033-the-identity-record-cannot-name-a-namespace.md
@@ -714,14 +548,10 @@ impl<A> Session<A> {
 
     /// Take what the §3.7 handshake yielded, if this session joined one.
     ///
-    /// `None` for [`OpenOutcome::Created`], which already has the arena and
-    /// never ran a handshake.
-    ///
-    /// Taking rather than borrowing, because the payload owns file descriptors —
-    /// the segment and the connection whose closure tells the owner this
-    /// participant is gone (D17). Leaving it inside the `Session` would make the
-    /// lifetime of the liveness signal the lifetime of a struct the caller has
-    /// no reason to keep.
+    /// `None` for [`OpenOutcome::Created`], which never ran a handshake. Taken,
+    /// not borrowed: the payload owns the segment fd and the connection whose
+    /// closure tells the owner this participant is gone (D17), and that liveness
+    /// signal must not be tied to a struct the caller has no reason to keep.
     pub fn take_attached(&mut self) -> Option<A> {
         self.attached.take()
     }
@@ -743,9 +573,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let rd = RuntimeDir::resolve_with(&EnvOverride(dir.clone()), current_uid()).unwrap();
         let rv = Rendezvous::new(rd, 0, ArenaName::new("default", EnvVar::Name).unwrap());
-        // Tests that pre-seed a lock (a surviving participant, a process
-        // mid-bind) open the lock file before `Open::open` would have created
-        // the directory.
+        // Tests that pre-seed a lock (a survivor, a process mid-bind) open the
+        // lock file before `Open::open` would have created the directory.
         rv.ensure_dir().unwrap();
         (rv, dir)
     }
@@ -758,9 +587,8 @@ mod tests {
         }
     }
 
-    /// A probe that reports "serving" only after `n` calls, so a test can make
-    /// the owner appear mid-loop. Grants slot `1`, since the creator in these
-    /// tests already holds slot `0`.
+    /// Reports "serving" only after `n` calls, so a test can make the owner
+    /// appear mid-loop. Grants slot `1`; the creator here holds slot `0`.
     struct ServingAfter(u32);
 
     impl ServerProbe for ServingAfter {
@@ -811,9 +639,8 @@ mod tests {
 
     #[test]
     fn the_split_brain_check_refuses_to_create() {
-        // §3.4 step 4, the whole design. A participant byte is held (a surviving
-        // participant of an arena whose owner died) and nothing is serving. A
-        // fresh `open()` must NOT create.
+        // §3.4 step 4: a survivor holds a participant byte and nothing serves,
+        // so `open()` must NOT create.
         let (rv, dir) = rendezvous("split-brain");
         let survivor = LockFile::open(rv.lock_path()).unwrap();
         assert_eq!(
@@ -837,8 +664,7 @@ mod tests {
             other => panic!("expected ArenaHeldButUnreachable, got {other}"),
         }
 
-        // And the yielded ownership byte was released, so the survivor can take
-        // over the instant it notices.
+        // Ownership was yielded back, so the survivor can take over at once.
         let taker = LockFile::open(rv.lock_path()).unwrap();
         assert_eq!(taker.try_take_ownership().unwrap(), LockAttempt::Acquired);
         std::fs::remove_dir_all(dir).unwrap();
@@ -859,16 +685,11 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// **The escape hatch is this policy, not a flag.** The name this test used
-    /// to carry — `force_new_is_the_documented_escape_hatch` — named
-    /// `RUNBOOK.md`'s `--force-new`, which no binary has ever had (#189), so the
-    /// one test covering the capability was named after the one thing about it
-    /// that was untrue. What it exercises is the branch: the loudness §3.4 asks
-    /// for belongs to whoever sets the policy, and nothing here can assert it.
-    ///
-    /// The survivor keeps byte 1 throughout — the created session must take a
-    /// different one, because the two arenas share the lock file and the byte is
-    /// the kernel's, not the arena's.
+    /// **The escape hatch is this policy, not a flag** — `--force-new`, which this
+    /// test was once named after, has never existed (#189). It covers the branch
+    /// only; the loudness §3.4 asks for belongs to whoever sets the policy. The
+    /// survivor keeps byte 1, so the created session must take another: one lock
+    /// file serves both arenas, and the byte is the kernel's.
     #[test]
     fn create_always_overrides_the_split_brain_check() {
         let (rv, dir) = rendezvous("force");
@@ -891,10 +712,9 @@ mod tests {
 
     /// **The escape hatch abandons an *unreachable* arena, never a served one.**
     ///
-    /// Step 1 runs before the create decision, so a rendezvous with a server
-    /// answering is joined whatever the policy says. That is what bounds the
-    /// damage — the doc on [`CreatePolicy::Always`] claims it, and a caller
-    /// reaching for the hatch is entitled to have it tested rather than argued.
+    /// Step 1 runs before the create decision, so a server that answers is joined
+    /// whatever the policy says — [`CreatePolicy::Always`]'s claimed bound on the
+    /// damage, tested rather than argued.
     #[test]
     fn create_always_still_joins_a_reachable_server() {
         let (rv, dir) = rendezvous("force-reachable");
@@ -909,8 +729,8 @@ mod tests {
 
     #[test]
     fn a_contended_ownership_byte_is_retried_not_failed() {
-        // Another process is mid-bind: it holds byte 0 but is not yet serving.
-        // The opener must back off and retry, and join once the socket appears.
+        // Mid-bind: byte 0 held, nothing serving yet. The opener must back off
+        // and join once the socket appears.
         let (rv, dir) = rendezvous("mid-bind");
         let binder = LockFile::open(rv.lock_path()).unwrap();
         binder.try_take_ownership().unwrap();
@@ -933,8 +753,7 @@ mod tests {
 
         let heir = LockFile::open(rv.lock_path()).unwrap();
         assert_eq!(heir.try_take_ownership().unwrap(), LockAttempt::Acquired);
-        // The participant byte is still held: releasing the role is not
-        // detaching.
+        // The participant byte is still held: the role is not the attachment.
         assert!(heir.probe_participant(s.slot()).unwrap().held);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -942,20 +761,12 @@ mod tests {
     /// `Session::ownership_held` reports the *kernel's* answer, live
     /// ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
     ///
-    /// **Mutant, run:** replace the body with `Ok(!self.owner)` — the
-    /// session-state answer instead of the kernel's. This fails, on the **first**
-    /// assertion (`nobody holds byte 0 once the creator released it`), because a
-    /// session that released the role is not the owner and `!self.owner` is
-    /// already `true` there. That is one assertion earlier than the note here
-    /// first claimed, which is why it was run.
-    ///
-    /// **The third assertion has no one-line mutant, and is here anyway.** It
-    /// guards against a *caching* implementation — a `Cell<bool>` latched on the
-    /// first `true`, which is the change somebody makes to save the `fcntl` — and
-    /// a cache is not a substitution a single edit expresses. Without it the
-    /// property `Tree::owner_lost` depends on is untested: a loser must stop
-    /// answering `true` after a takeover **and start again** if the new owner
-    /// dies, and only a live probe does both.
+    /// **Mutant, run:** body → `Ok(!self.owner)` fails on the **first** assertion,
+    /// not the later one the note first claimed — a session that released the role
+    /// is already `!self.owner`. The third assertion matches no one-line mutant
+    /// but guards a `Cell<bool>` latched on the first `true` (the change made to
+    /// save the `fcntl`): `Tree::owner_lost` needs a loser to stop answering
+    /// `true` after a takeover **and start again** if the new owner dies.
     #[test]
     fn ownership_held_tracks_the_byte_and_not_a_latch() {
         let (rv, dir) = rendezvous("ownprobe");
@@ -982,14 +793,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// An owner asking about its own byte is told `false`, and that is the
-    /// kernel's rule rather than this method's.
-    ///
-    /// `F_OFD_GETLK` reports *conflicting* locks and nothing conflicts with
-    /// itself, so this cannot be used as "am I the owner". `Tree::owner_lost`
-    /// reaches it only from the `Joined` arm, where by construction this session
-    /// is not the owner — and this test is what stops a later reader deleting
-    /// that scoping as unnecessary.
+    /// An owner asking about its own byte is told `false` — the kernel's rule, not
+    /// this method's, since `F_OFD_GETLK` reports only *conflicting* locks. This
+    /// test stops a later reader deleting `Tree::owner_lost`'s scoping to the
+    /// `Joined` arm as unnecessary.
     #[test]
     fn an_owner_does_not_see_its_own_ownership_byte() {
         let (rv, dir) = rendezvous("ownself");

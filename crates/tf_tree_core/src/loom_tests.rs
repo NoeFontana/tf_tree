@@ -1,14 +1,11 @@
 //! `loom` model-checked concurrency tests (run under `--cfg loom`).
 //!
-//! These are the hard gate for step 5 of `docs/PHASE1.md`'s implementation
-//! order, and for its §10.2 *Concurrency (loom)*: the publish/read/claim/
-//! intern protocols must be sound under every interleaving loom explores, not
-//! merely on x86. Buffers are capacity 4 and push counts <= 5 to keep the state
-//! space tractable — small, but never so small that the code under test becomes
-//! unreachable, which is a failure mode these models have already had once (see
-//! [`writer_wraps_reader_gets_valid_or_recycled`]). Each test drives the
-//! *shared* algorithm code (the same functions the production arena view calls)
-//! over heap-allocated instances built from `crate::sync` (loom) atomics.
+//! The hard gate for step 5 of `docs/PHASE1.md` and its §10.2 *Concurrency
+//! (loom)*. Capacity-4 buffers and <= 5 pushes keep the state space tractable,
+//! but never so small that the code under test becomes unreachable — a failure
+//! mode these models have already had (see
+//! [`writer_wraps_reader_gets_valid_or_recycled`]). Each test drives the shared
+//! algorithm code over heap instances built from `crate::sync` (loom) atomics.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use loom::sync::Arc;
@@ -67,37 +64,13 @@ impl HeapRing {
 /// Run a `loom` model under a preemption bound that the environment can raise
 /// but **cannot lower**.
 ///
-/// # Why this is not `loom::model` directly
-///
-/// `loom::model` reads `LOOM_MAX_PREEMPTIONS` and uses `None` — unbounded — when
-/// it is unset. Unbounded sounds strictly stronger and is not. Measured on
+/// `loom::model` treats an unset `LOOM_MAX_PREEMPTIONS` as unbounded, which is
+/// weaker, not stronger: on
 /// `two_mutators_race_the_lock_and_a_reader_sees_no_mix` with its liveness
-/// predicate deliberately broken, so a real violation is present to find:
-///
-/// | `LOOM_MAX_PREEMPTIONS` | result | wall clock |
-/// |---|---|---|
-/// | unset (loom's `None`) | **ok — the violation is missed** | 8143 ms |
-/// | 0, 1, 2 | ok — missed | fast |
-/// | 3 | **FAILED, correctly** | 373 ms |
-///
-/// So the unbounded search runs **22x longer and still finds nothing**, which is
-/// preemption-bounded search behaving as designed: it enumerates every schedule
-/// with at most *k* preemptions before going deeper, and almost every real
-/// concurrency bug needs few. An unbounded depth-first walk can descend one
-/// branch of an enormous space and never come back to the shallow interleaving
-/// that exhibits the fault.
-///
-/// **The consequence is that the bound was load-bearing and lived outside the
-/// code.** `xtask loom` sets 3; a developer running
-/// `RUSTFLAGS='--cfg loom' cargo test -p tf_tree_core` by hand — which is what
-/// debugging one model looks like — got a materially weaker check *and* a much
-/// slower one, with nothing to say so. A test whose power depends on an
-/// environment variable set by one caller is the shape
-/// `docs/benchmarks/EVIDENCE.md` exists to catch, one layer down.
-///
-/// The floor is a floor, not a value: `LOOM_MAX_PREEMPTIONS=5` still explores
-/// more, because a deliberate deeper run is a thing somebody should be able to
-/// ask for.
+/// predicate deliberately broken, unbounded search missed the violation after
+/// 8143 ms (as did bounds 0-2) while a bound of 3 caught it in 373 ms. The
+/// bound was load-bearing and lived outside the code — `xtask loom` set 3, a
+/// hand-run `cargo test` silently got the weaker, slower check.
 fn model(f: impl Fn() + Sync + Send + 'static) {
     /// Enough to reach the topology lock's steal path, which needs the spin
     /// budget (`MODEL_SPIN_LIMIT`) exhausted while another thread holds the
@@ -131,9 +104,8 @@ fn writer_three_pushes_reader_never_torn() {
 
         let r = Arc::clone(&hr);
         let reader = thread::spawn(move || {
-            // Physical slot 1 is written exactly once (the second push, pose(2)),
-            // so a consistent read is either the initial zero pose or pose(2) —
-            // never a mix of the two.
+            // Slot 1 is written exactly once (the second push, pose(2)), so a
+            // consistent read is the initial zero pose or pose(2), never a mix.
             let ring = r.ring();
             match ring.read_slot(1) {
                 Ok(iso) => {
@@ -155,24 +127,14 @@ fn writer_three_pushes_reader_never_torn() {
 /// published history permits, or a documented error — never a pose assembled
 /// from two eras.
 ///
-/// # Why capacity 4 and five pushes, and not capacity 2 and three
-///
-/// [`SampleRing::retained`] is `capacity - 1`, so a capacity-2 ring has a
-/// readable window of exactly *one* sample. `sample()` then finds `t_old ==
-/// t_new` and can only ever answer `NoData` or `Extrapolation`: the bracket
-/// search, the interpolation and the trailing `head - i > retained`
-/// revalidation — the entire subject of this test — are unreachable. That was
-/// this test's shape until it was measured: a `panic!` planted in the `Ok` arm
-/// never fired, across every interleaving loom explores. Five pushes into four
-/// slots is the smallest configuration in which the ring genuinely laps a
-/// reader *and* the reader has something to interpolate.
-///
-/// The assertion is bit equality against the single legal answer, not
-/// finiteness. Finiteness was the old check and it proves nothing here: a pose
-/// interpolated between two samples from different eras is perfectly finite.
-/// Whether the writer has landed three, four or five pushes when the reader
-/// looks, the only bracket containing `t = 25` is `(20, 30)` at `s = 0.5`, so
-/// any other value the reader could return is a splice.
+/// Capacity 4 and five pushes, not 2 and three: [`SampleRing::retained`] is
+/// `capacity - 1`, so a capacity-2 ring has `t_old == t_new` and the bracket
+/// search, interpolation and `head - i > retained` revalidation — this test's
+/// whole subject — are unreachable; that was its shape until a `panic!` planted
+/// in the `Ok` arm never fired. Five into four is the smallest ring that laps a
+/// reader with something left to interpolate. The assertion is bit equality,
+/// not finiteness: a spliced pose is finite, and whatever has landed the only
+/// bracket around `t = 25` is `(20, 30)`.
 #[test]
 fn writer_wraps_reader_gets_valid_or_recycled() {
     model(|| {
@@ -217,44 +179,20 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
 /// `head`'s `Release` store carries — that observing `head == h` makes the
 /// stamps of all `h` published samples visible.
 ///
-/// # Why this model exists
-///
-/// §10.2 asks that weakening each §6.2/§6.3 ordering to `Relaxed`, one at a
-/// time, break a model, and that a **survivor be investigated rather than
-/// assumed benign**. Run over the five orderings, four die against the two
-/// models above. The fifth — [`SampleRing::push`]'s
-/// `self.head.store(h + 1, Release)` — survived the entire suite, because
-/// neither model above ever reads a *stamp*: `writer_three_pushes_...` calls
-/// `read_slot` directly, and `writer_wraps_...` does call `sample`, but cannot
-/// observe the difference for a reason worth writing down, because it is the
-/// reason this model is not simply a third `sample` fixture.
-///
-/// ## Why no `sample`-shaped fixture can catch it
-///
-/// In `push`, the `fence(Release)` sits *before* that push's stamp store. So a
-/// reader that observes `head == h` synchronises with push `h`'s release fence
-/// and is guaranteed stamps `0 ..= h-2` — every stamp except the newest.
-/// `stamps[h-1]` is the single unprotected one, and `sample` reads it as
-/// `t_new`. An unpublished stamp reads as the arena's zero-initialised `0`, and
-/// a lapped one reads as its previous era's value; stamps only increase, so a
-/// stale `t_new` is always *below* the fresh one. Every `t` above it therefore
-/// leaves through the tolerated `Extrapolation` arm instead of reaching a
-/// bit-equality assertion. Reaching it needs `t < 0` so the zero sentinel sits
-/// above `t` — a fixture that exists only to dodge the sentinel, and would pin
-/// the sentinel rather than the ordering.
-///
-/// So this model asserts the invariant directly, in the shape the reader
-/// actually uses it: [`SampleRing::sample`] loads `head` `Acquire`
-/// (`sample.rs`) and then loads stamps `Relaxed`, and `stamp_at`'s own doc
-/// rests that `Relaxed` on this edge — *"the `head` Acquire load in `sample`
-/// already ordered every stamp of a published sample into view"*. That sentence
-/// is the property below. The writer is the real [`SampleRing::push`]; only the
-/// reader is transcribed, which is the same division the reclaim model uses.
-///
-/// **Mutation-verified**: with `head.store(h + 1, Relaxed)` this fails on the
-/// assertion below; at `Release` it passes. That is what makes `buffer.rs`'s
-/// "every ordering below is load-bearing and is exercised by the loom tests"
-/// true of all five orderings rather than four.
+/// §10.2 requires each §6.2/§6.3 ordering weakened to `Relaxed` to break a
+/// model, and a survivor to be investigated. Four of five die against the
+/// models above; [`SampleRing::push`]'s `head.store(h + 1, Release)` survived,
+/// because neither reads a *stamp* — and no `sample`-shaped fixture could:
+/// `push`'s `fence(Release)` sits before that push's stamp store, so `head ==
+/// h` guarantees only stamps `0 ..= h-2`, leaving `sample`'s `t_new`
+/// (`stamps[h-1]`) unprotected, and a stale `t_new` — zero sentinel or lapped
+/// older stamp — is always *below* the fresh one, so every `t` above it exits
+/// through the tolerated `Extrapolation` arm, and reaching a bit-equality
+/// assertion would need `t < 0`, pinning the sentinel rather than the ordering.
+/// Hence the direct assertion in the reader's own shape: [`SampleRing::sample`]
+/// loads `head` `Acquire` then the stamps `Relaxed`, and `stamp_at`'s doc rests
+/// that `Relaxed` on this edge. **Mutation-verified**: `Relaxed` here fails it,
+/// `Release` passes.
 #[test]
 fn head_publishes_every_stamp_below_it() {
     model(|| {
@@ -263,9 +201,8 @@ fn head_publishes_every_stamp_below_it() {
         let w = Arc::clone(&hr);
         let writer = thread::spawn(move || {
             let ring = w.ring();
-            // Four pushes into four slots: nothing laps, so every stamp
-            // location is written exactly once and a stale read can only be the
-            // zero-initialised value. That keeps the assertion unambiguous.
+            // Four pushes into four slots: nothing laps, so a stale read can
+            // only be the zero-initialised value and the assertion is exact.
             for i in 1..=4u64 {
                 ring.push(i as i64 * 10, &pose(i)).unwrap();
             }
@@ -273,8 +210,7 @@ fn head_publishes_every_stamp_below_it() {
 
         let r = Arc::clone(&hr);
         let reader = thread::spawn(move || {
-            // Exactly `sample`'s first two steps: `head` Acquire, then the
-            // stamps of the samples it claims are published, Relaxed.
+            // Exactly `sample`'s first two steps: head Acquire, stamps Relaxed.
             let h = r.head.load(Ordering::Acquire);
             for i in 0..h {
                 let got = r.stamps[(i & 3) as usize].load(Ordering::Relaxed);
@@ -291,13 +227,12 @@ fn head_publishes_every_stamp_below_it() {
     });
 }
 
-/// The interning table's three parallel arrays plus its id allocator, on the heap
-/// and built from loom atomics — the same shape `ArenaView` hands `intern_core`.
+/// The interning table's three parallel arrays plus its id allocator, on the
+/// heap from loom atomics — the shape `ArenaView` hands `intern_core`.
 ///
-/// Every array is **zero-initialized, exactly like the production arena**
-/// (`alloc_zeroed`). Seeding `ids` with a different "unpublished" sentinel is what
-/// once let this model check pass while the real publish-then-spin handshake was
-/// inert: nothing in the arena ever writes a non-zero unpublished marker.
+/// Zero-initialized exactly like the production arena (`alloc_zeroed`): seeding
+/// `ids` with a different "unpublished" sentinel once let this model pass while
+/// the real publish-then-spin handshake was inert.
 struct HeapInternTable {
     hashes: alloc::vec::Vec<AtomicU64>,
     ids: alloc::vec::Vec<AtomicU32>,
@@ -344,9 +279,8 @@ fn intern_race_same_id() {
         let t = Arc::new(HeapInternTable::new(4));
         let hash: u64 = 0xdead_beef_0000_0001;
 
-        // Two *live* registered participants (slots 0 and 1, so `me` is 1 and 2).
-        // Neither may be taken over: `claimant_alive` always agrees they are
-        // running, which is what the fail-safe default does in production.
+        // Two *live* participants (slots 0 and 1, so `me` is 1 and 2), neither
+        // stealable: `claimant_alive` always agrees, like production's default.
         let spawn_one = |t: Arc<HeapInternTable>, me: u32| {
             thread::spawn(move || {
                 intern_core(&t.table(3), hash, me, |_| true, |_| true, |_| {}).unwrap()
@@ -371,15 +305,11 @@ fn intern_race_same_id() {
 /// Loom test 6 — **amendment A8** (`docs/PHASE2.md` §1 A8, §11.3 crash point
 /// `intern.after_hash_cas_before_id_store`).
 ///
-/// One thread plays the process that wins the hash slot and is `SIGKILL`ed before
-/// publishing the id: it performs exactly the stores a killed interner would have
-/// completed and then vanishes. The other thread must still terminate with the
-/// name interned. Before A8 it spun forever, in every interleaving where the
-/// "dead" thread got there first.
-///
-/// The dying thread's writes are open-coded rather than done through
-/// `intern_core` because there is no way to abandon that function part-way; the
-/// two CASes below are precisely its prefix up to the crash point.
+/// One thread wins the hash slot and is `SIGKILL`ed before publishing the id;
+/// the other must still terminate with the name interned. Before A8 it spun
+/// forever whenever the dead thread got there first. The dying thread is
+/// open-coded because `intern_core` cannot be abandoned part-way; the two CASes
+/// below are exactly its prefix up to the crash point.
 #[test]
 fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
     /// Participant slot of the doomed interner, as stored in `claiming` (slot + 1).
@@ -398,8 +328,7 @@ fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
                 .compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                // Record the claim, then die: no id is allocated, no record is
-                // written, nothing is ever published into `ids[slot]`.
+                // Record the claim, then die: nothing reaches `ids[slot]`.
                 let _ = d.claiming[slot].compare_exchange(
                     CLAIM_UNRECORDED,
                     DEAD,
@@ -411,9 +340,8 @@ fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
 
         let s = Arc::clone(&t);
         let survivor = thread::spawn(move || {
-            // Liveness predicate: participant `DEAD` is gone, everyone else runs.
-            // In production this is the injected OFD-lock/`/proc` predicate
-            // (`docs/PHASE2.md` §5.1, §6.2).
+            // Liveness predicate: `DEAD` is gone, the rest run; production
+            // injects the OFD-lock/`/proc` one (`docs/PHASE2.md` §5.1, §6.2).
             intern_core(
                 &s.table(3),
                 hash,
@@ -441,9 +369,8 @@ fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
             ME,
             "the rescuer must record itself as the entry's claimant"
         );
-        // Whoever wins, exactly one id is allocated: the dead claimant never got
-        // as far as `frame_count`, and the takeover happens before the rescuer
-        // touches it.
+        // Exactly one id however the race went: the dead claimant never reached
+        // `frame_count`, and the takeover precedes the rescuer touching it.
         assert_eq!(t.count.load(Ordering::Relaxed), 1, "no id was leaked");
     });
 }
@@ -471,64 +398,29 @@ fn claim_race_exactly_one_wins() {
 /// packed word and A2's in-arena mutation lock — mirroring
 /// `topology::{TopologyView, TopoLockView}` step for step.
 ///
-/// It is a reimplementation rather than a call into the real code because the
-/// lock word and the topology blocks live in a `#[repr(C)]` arena header, and
-/// loom's atomics cannot inhabit one: they carry instrumentation state and are
-/// not constructible from the zeroed bytes an arena hands out. That is the same
-/// constraint `buffer::PoseSlot` meets, and it is why `crate::topology` is
-/// `#[cfg(not(loom))]` in the first place. Everything that matters is preserved
-/// — the same orderings, the same single publishing store, the same bounded spin
-/// and liveness-gated steal. Keep the two in step; the real code is the one that
-/// ships.
+/// A reimplementation because the lock word and topology blocks live in a
+/// `#[repr(C)]` arena header that loom's atomics cannot inhabit (they carry
+/// instrumentation state and are not constructible from zeroed bytes — the
+/// constraint `buffer::PoseSlot` meets, and why `crate::topology` is
+/// `#[cfg(not(loom))]`). Keep the two in step. Refuted: *"`depth` is an
+/// `AtomicU16`, which loom does not provide"* — loom 0.7 exports it; the
+/// `#[repr(C)]` reason is the one to answer before deleting this model.
 ///
-/// **This paragraph gave a second reason until 2026-08-28 and that reason was
-/// false**: *"its `depth` array is an `AtomicU16`, which loom does not provide"*.
-/// loom 0.7 exports `AtomicU16` beside `AtomicU8`/`U32`/`U64`/`Usize`
-/// (`loom::sync::atomic`), so the width was never the obstacle. Recorded rather
-/// than deleted, because the false reason is the one that makes the twin look
-/// unavoidable — the real one is about `#[repr(C)]`, and anybody trying to
-/// delete this model has to answer *that*.
+/// The control that stops this being a theorem about itself: with `is_alive`
+/// disabled, so every holder reads dead,
+/// `two_mutators_race_the_lock_and_a_reader_sees_no_mix` fails with *"two
+/// mutators inside the critical section"* while
+/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`] still passes — one
+/// of the pair fails whichever way the predicate is broken. `MODEL_SPIN_LIMIT`
+/// must stay small enough to reach the steal path, and the control fires only
+/// under a preemption bound (8 s unbounded and missed; 0.37 s at 3): [`model`].
 ///
-/// # The control run, which is what stops this being a theorem about itself
-///
-/// A model that idealises the exclusion it is checking proves the safety
-/// property by construction. So the predicate was **disabled and the model
-/// re-run**: with `is_alive`'s refusal removed — every holder read as dead, so
-/// every contended acquire steals — `two_mutators_race_the_lock_and_a_reader_sees_no_mix`
-/// fails with *"two mutators inside the critical section"*, while
-/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`] still passes,
-/// because it wants the steal.
-///
-/// That is the pair that matters. The first test passes `|_| true`, so its
-/// holder is **live and unstealable**, and the liveness gate is the only thing
-/// keeping the second mutator out; the second test's holder is a corpse, so the
-/// gate is the only thing letting the rescuer in. One of them fails whichever
-/// way the predicate is broken, which is what makes the green run mean
-/// something. `MODEL_SPIN_LIMIT` being small enough to reach the steal path is
-/// load-bearing for the first half of that, exactly as its own comment says.
-///
-/// **The control only fires under a preemption bound, and finding that out is
-/// why [`model`] exists.** Run with `LOOM_MAX_PREEMPTIONS` unset — which is what
-/// invoking `cargo test` by hand used to do — the broken predicate went
-/// undetected after 8 seconds of unbounded search, against 0.37 s to catch it at
-/// a bound of 3. [`model`] now pins that as a floor the environment can raise
-/// and cannot lower, so this control holds however the suite is invoked.
-///
-/// `MODEL_BLOCKS` matches production's [`tf_tree_arena::TOPO_BLOCKS`] and that is
-/// **load-bearing, not decoration**. A first draft of this model used two blocks
-/// on the theory that the count is a tuning knob, and loom immediately produced
-/// a reader that observed `(P_OLD, D_A)` — a genuine mix of two generations. The
-/// mechanism is worth writing down, because it is the whole reason A1 says four:
-///
-/// The reader's re-check (`word.load(Relaxed) == w1`) detects a mutation only if
-/// the word *changed*. Cache coherence guarantees the second load sees `w1` or
-/// something newer, but a `Relaxed` load is free to keep returning `w1` after
-/// other threads have moved on. So the re-check is not a proof that nothing
-/// happened — it is a proof that nothing has become *visible here* yet. What
-/// actually protects the reader is that a mutator never writes the block the
-/// reader is walking, and with `N` blocks that needs `N` publications inside one
-/// read. With two blocks and two mutators, `N` is reachable and the reader tore.
-/// With four it is not, which is precisely A1's "four flips" argument.
+/// `MODEL_BLOCKS` matching [`tf_tree_arena::TOPO_BLOCKS`] is load-bearing: a
+/// two-block draft let loom produce a reader observing `(P_OLD, D_A)`, a real
+/// mix of generations. The `Relaxed` re-check proves only that nothing became
+/// *visible here*, so what protects the reader is that a mutator never writes
+/// the block being walked — `N` publications inside one read, reachable with
+/// two blocks and not with four. A1's "four flips".
 struct TopoModel {
     /// A2: `0` = free, else `participant_slot + 1`.
     lock: AtomicU64,
@@ -590,9 +482,8 @@ impl TopoModel {
         }
     }
 
-    /// A2's acquire: bounded spin, then resolve the holder and steal if it is
-    /// dead. `is_alive` is injected exactly as in the real code — the lock never
-    /// decides liveness itself.
+    /// A2's acquire: bounded spin, then steal if the holder is dead. `is_alive`
+    /// is injected as in the real code — the lock never decides liveness.
     fn acquire(&self, slot: u32, is_alive: impl Fn(u32) -> bool) -> Option<ModelGuard<'_>> {
         let want = u64::from(slot) + 1;
         for _ in 0..MODEL_SPIN_LIMIT {
@@ -619,9 +510,8 @@ impl TopoModel {
             .map(|_| ModelGuard { model: self, want })
     }
 
-    /// A1's writer, held under A2's lock: mutate the *inactive* block, then
-    /// publish with a **single store**. No odd state, so nothing a crash can
-    /// leave half-done is observable.
+    /// A1's writer, under A2's lock: mutate the *inactive* block, then publish
+    /// with a **single store**: no odd state, so a crash leaves nothing seen.
     fn mutate(&self, guard: &ModelGuard<'_>, parent: u32, depth: u32) {
         let _ = guard; // the type is the proof; this silences "unused".
 
@@ -650,9 +540,8 @@ impl TopoModel {
         self.in_section.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// A1's reader — what plan compilation does. Wait-free: it never spins on a
-    /// writer, because there is no state a writer can leave that a reader must
-    /// wait out.
+    /// A1's reader — what plan compilation does. Wait-free: a writer leaves no
+    /// state a reader must wait out.
     fn read(&self) -> (u32, u32, u64) {
         loop {
             let w1 = self.word.load(Ordering::Acquire);
@@ -697,19 +586,11 @@ fn topology_read_sees_old_or_new_never_mixed() {
 }
 
 /// Loom test 6 (`docs/PHASE2.md` §1, A2): two participants racing the mutation
-/// lock, with a third thread compiling a plan against the topology throughout.
-///
-/// Three properties, all of which fail without A2:
-///
-/// * **Exactly one mutator at a time** — asserted from inside the critical
-///   section by `in_section`, so a broken lock is caught where it happens rather
-///   than inferred from the wreckage.
-/// * **Every published generation is accounted for.** A mutation that succeeded
-///   published exactly once; one that lost the lock published nothing. Two
-///   mutators sharing a scratch block would lose one.
-/// * **The reader sees one generation or the other, never a mix.** The
-///   `(parent, depth)` pair is written as a unit under the lock, so any pairing
-///   the reader observes must be one that some single mutator wrote.
+/// lock while a third compiles a plan. Three properties, all failing without
+/// A2: exactly one mutator at a time, asserted from inside the critical section
+/// by `in_section`; every published generation accounted for, since two
+/// mutators sharing a scratch block would lose one; and a reader that never
+/// sees a mix, because `(parent, depth)` is written as a unit under the lock.
 #[test]
 fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
     const P_A: u32 = 11;
@@ -726,8 +607,7 @@ fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
                     topo.mutate(&g, parent, depth);
                     true
                 }
-                // Contended. Every participant is alive here, so nothing may be
-                // stolen and the loser simply does not publish.
+                // Contended. All alive here, so nothing is stealable.
                 None => false,
             })
         };
@@ -754,36 +634,23 @@ fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
                 || (parent, depth) == (P_B, D_B),
             "reader saw a topology nobody published: ({parent}, {depth})"
         );
-        // The lock is free again however the race went: every winner released,
-        // and no loser ever held it.
+        // Free however the race went: winners released, losers never held it.
         assert_eq!(topo.lock.load(Ordering::Relaxed), 0, "the lock leaked");
     });
 }
 
 /// Loom test 7 — the `topo.holding_lock` crash point (`docs/PHASE2.md` §11.3).
 ///
-/// One participant takes the lock, scribbles on the inactive block the way a
+/// One participant takes the lock, scribbles on the inactive block as a
 /// half-finished copy would, and dies without releasing or publishing. A second
-/// participant must steal the lock and complete, and the result must carry **no
-/// trace** of the first — which is A2's claim that recovery is a no-op, because
-/// A1 left the dead holder nothing observable to undo.
-///
-/// A reader runs throughout, and must never see the scribble: it was written to
-/// a block the topology word never pointed at.
-///
-/// # Why the death is not a thread
-///
-/// The first draft ran the dying participant as a loom thread, and loom
-/// immediately scheduled its scribble *after* the rescuer had published —
-/// leaving `0xDEAD` in the block that was by then active. That is a real hazard,
-/// but it is **not this one**: it is the false-negative case, where liveness
-/// wrongly declares a live-but-stalled participant dead and it later resumes.
-/// `docs/PHASE2.md` §6.2 addresses that by making the predicate fail safe, and
-/// §6.1 removes it entirely once claims are kernel locks.
-///
-/// A participant that actually died executes no further instruction, ever. So
-/// the death is modelled inline, before the rescuer exists: every store the
-/// corpse will ever make has already happened.
+/// must steal it and complete, leaving **no trace** — A2's claim that recovery
+/// is a no-op, because A1 left the corpse nothing observable to undo. A reader
+/// runs throughout and never sees the scribble: it went to a block the topology
+/// word never pointed at. The death is staged inline, not as a thread, because
+/// a corpse executes no further instruction; as a thread loom scheduled the
+/// scribble *after* the rescuer published — a real hazard, but a different one
+/// (liveness wrongly calling a stalled participant dead), which §6.2 fails safe
+/// against and §6.1 removes once claims are kernel locks.
 #[test]
 fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
     const P_GARBAGE: u32 = 0xDEAD;
@@ -797,8 +664,7 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
     model(|| {
         let topo = Arc::new(TopoModel::new());
 
-        // Participant 0 dies holding the lock, mid-copy: it took the lock and
-        // dirtied the scratch block, and it will never release or publish.
+        // Participant 0 dies mid-copy: lock taken, scratch dirtied, no release.
         {
             let g = topo.acquire(DEAD_SLOT, |_| true).unwrap();
             let (_, active) = unpack(topo.word.load(Ordering::Relaxed));
@@ -834,8 +700,7 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
             (parent, depth) == (P_OLD, D_OLD) || (parent, depth) == (P_NEW, D_NEW),
             "a reader observed an abandoned mutation: ({parent}, {depth})"
         );
-        // The stealer's mutation is the only one that landed, and it landed
-        // whole — no rollback, no repair, nothing inherited.
+        // The stealer's is the only mutation, and it landed whole: no rollback.
         let (generation, active) = unpack(topo.word.load(Ordering::Relaxed));
         assert_eq!(generation, 1, "exactly one mutation should have published");
         assert_eq!(topo.parent[active].load(Ordering::Relaxed), P_NEW);
@@ -843,23 +708,18 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
     });
 }
 
-/// A late `release` racing a reap + re-`register` must not free the new occupant.
+/// A late `release` racing a reap + re-`register` must not free the new tenant.
 ///
-/// The single-threaded version of this (`tests.rs`) cannot fail on the code this
-/// guards against, and saying so matters: the old guard *did* reject a stale
-/// incarnation — but as a load of `incarnation` followed by a CAS on `state`,
-/// two words apart. The bug lives entirely in the window between them, so only
-/// an interleaving exhibits it. Here, thread A is the departing participant's
-/// late `release(slot, 1)`; thread B reaps the same slot and hands it to a new
-/// process. Loom explores the schedule where A reads "still incarnation 1",
-/// B completes the whole handover, and A's CAS then lands on the new occupant.
-///
-/// Packing the incarnation into `state` makes that schedule harmless: there is
-/// one word, so "still LIVE and still mine" is decided by the CAS itself.
-///
-/// The consequence of getting it wrong is not a lost slot — it is two live
-/// processes sharing a slot index, after which the `slot + 1` owner encoding
-/// used by claims (A3) and by the topology lock (A2) no longer names one process.
+/// The sequential version in `tests.rs` cannot fail on the code this guards
+/// against: the old guard loaded `incarnation` then CASed `state`, two words
+/// apart, and the bug lives in the window between them. A is the departing
+/// participant's late `release(slot, 1)`, B reaps the slot and hands it on, and
+/// loom explores A reading "still incarnation 1", B completing the handover,
+/// and A's CAS landing on the new occupant. Packing the incarnation into
+/// `state` makes that harmless — one word, so the CAS decides "still LIVE and
+/// still mine". The cost of getting it wrong is two live processes on one slot
+/// index, after which the `slot + 1` owner encoding used by claims (A3) and the
+/// topology lock (A2) no longer names one process.
 #[test]
 fn a_late_release_racing_a_slot_handover_frees_nobody() {
     const P_LATE: u32 = 111;
@@ -876,9 +736,8 @@ fn a_late_release_racing_a_slot_handover_frees_nobody() {
         let a = Arc::clone(&table);
         let late = thread::spawn(move || ParticipantTable::new(&a).release(0, 1));
 
-        // B: a reaper decides that participant is gone, and a new process takes
-        // the freed slot. Modelled as the same release (a reap *is* a release
-        // performed by somebody else) followed by a registration.
+        // B: a reaper decides it is gone and a new process takes the slot — the
+        // same release (a reap *is* a release by somebody else), then register.
         let b = Arc::clone(&table);
         let handover = thread::spawn(move || {
             let t = ParticipantTable::new(&b);
@@ -903,28 +762,23 @@ fn a_late_release_racing_a_slot_handover_frees_nobody() {
 
 /// Two joiners told to take the *same* slot: exactly one may get it.
 ///
-/// `docs/PHASE2.md` §3.7 has the owner hand each client a `participant_slot`,
+/// `docs/PHASE2.md` §3.7 has the owner hand each client a `participant_slot`
 /// and `docs/decisions/0005` makes that integer double as the lock-file byte.
-/// Two clients can be handed the same slot — by an owner bug, by a takeover
-/// mid-handshake, or by a stale `HelloResponse` replayed after a reap — and the
-/// arena must be the thing that says no.
-///
-/// This has to be a loom test rather than a sequential one. The window is
-/// between `register_at`'s CAS and its release-store: a sequential test calls
-/// them in order and can never place a second thread inside. Restore the
+/// Two clients can be handed the same slot — owner bug, takeover mid-handshake,
+/// a stale `HelloResponse` replayed after a reap — and the arena must say no.
+/// Loom, not a sequential test: the window is between `register_at`'s CAS and
+/// its release-store, which a sequential caller cannot enter. Restore the
 /// pre-CAS shape (load `state`, compare to `FREE`, store `RESERVED`) and loom
-/// finds the interleaving where both threads observe `FREE` and both proceed to
-/// publish — two live processes sharing one slot index, which is exactly what
-/// the `slot + 1` owner encoding behind A3 claims cannot happen.
+/// finds both threads observing `FREE` and both publishing — two live processes
+/// on one slot, which the `slot + 1` encoding behind A3 forbids.
 #[test]
 fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
     const P_A: u32 = 101;
     const P_B: u32 = 202;
 
     model(|| {
-        // Four slots, so a losing thread has somewhere it *could* have gone —
-        // the assertion is that it does not go there, because `register_at`
-        // takes the named slot or nothing.
+        // Four slots, so a loser has somewhere it *could* have gone; it must
+        // not, because `register_at` takes the named slot or nothing.
         let table = Arc::new(alloc::vec![
             ParticipantRecord::default(),
             ParticipantRecord::default(),
@@ -947,8 +801,7 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
 
         let t = ParticipantTable::new(&table);
         let (pid, _, inc) = t.identity(2).expect("the winner published a LIVE record");
-        // The record must belong to the winner *entire* — not a mix of A's pid
-        // and B's incarnation, which is what a torn publication would leave.
+        // The winner *entire* — a torn publication would mix A's pid with B's.
         let (winner_pid, winner_inc) = if let Ok(i) = ra {
             (P_A, i)
         } else {
@@ -964,92 +817,47 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
 }
 
 /// A reclaimer sweeping the table while a joiner registers: **the caller's**
-/// read order. The state word is observed before the lock byte is probed, and no
-/// record a joiner published is erased.
+/// read order. The state word is observed before the lock byte is probed, and
+/// no record a joiner published is erased.
 ///
-/// # What this model pins — and what it does not
+/// Both asserted properties belong to the **caller** of
+/// [`ParticipantTable::reclaim`], not to `reclaim`. *Ordering*: an `Acquire`
+/// load returning a `live_word` synchronises-with `fill_slot`'s publishing
+/// `Release` store, so the byte its holder took before that store must read
+/// held to any probe after the load — a byte-first sweep, or one up-front
+/// holder mask (the shape `LockFile::held_participants()` invites), has no such
+/// edge. At bound 3 the sweeper sees slot 1 with a published `live_word` in 38
+/// of 294 executions, byte held in every one. *No erasure*: a joiner that
+/// returned `Ok` is never left `FREE`.
 ///
-/// Both properties it asserts are properties of the **caller** of
-/// [`ParticipantTable::reclaim`], not of `reclaim`:
+/// It does **not** pin `reclaim`'s own CAS guard — a claim made here until it
+/// was measured: the sweeper reaches that CAS in zero of 294 executions at
+/// bound 3 and zero of 781 at bound 5, so **a `reclaim` that ignored `observed`
+/// entirely passes this model.** The guard is pinned by
+/// [`crate::tests::reclaim_fails_when_the_observed_word_has_changed`], the
+/// *strength* of its orderings by nothing in this workspace (a gap argued on
+/// `reclaim` itself). "No two occupants" is not asserted either: two
+/// independent models were vacuous for it (0028 question 6 — a byte-blind
+/// reclaimer passed 1 140 088 executions while erasing 151 590 `LIVE` records),
+/// because an exclusive byte entails it — the same non-C11 fact that makes
+/// widening `reclaim` to `RESERVED` safe, a writer holding its byte across all
+/// of `fill_slot` (0028 step 0b) with byte index and record index one integer
+/// (step 0c).
 ///
-/// - **Ordering.** An `Acquire` load returning a `live_word` synchronises-with
-///   `fill_slot`'s publishing `Release` store, so the byte its holder took
-///   *before* that store must read held to any probe sequenced after the load.
-///   A sweep that reads the byte first — or takes one up-front holder mask,
-///   which is the shape `LockFile::held_participants()` invites — has no such
-///   edge. This is the assertion with teeth: at `LOOM_MAX_PREEMPTIONS=3` the
-///   sweeper observes slot 1 carrying a published `live_word` in 38 of 294
-///   executions, and in every one of those the byte reads held.
-/// - **No erasure.** A joiner that returned `Ok` is never left with a `FREE`
-///   record.
+/// 0028's plan requires the failing control to ship, so both are runnable
+/// `#[test]`s ([`control_reclaim_races_register_probes_the_byte_first`],
+/// [`control_reclaim_races_register_observes_relaxed`]): a model that quietly
+/// stops being falsifiable fails the suite. Both witnesses are legal C11 —
+/// nothing orders the byte's *initial* store after the joiner's acquisition.
 ///
-/// It does **not** pin `reclaim`'s own CAS guard, and this comment claimed
-/// otherwise until a verifier measured it. Measured, at
-/// `LOOM_MAX_PREEMPTIONS=3` (294 executions) and `=5` (781): the sweeper reaches
-/// the CAS on the joiner's slot in **zero** of them — every execution either
-/// observes slot 1 `FREE` or finds its byte held, which is the ordering property
-/// above doing its job. The only CAS that ever fires here is the corpse's, on a
-/// word no other thread writes, so its success in all 294 and all 781 is a fact
-/// about the harness and not about the guard: **a `reclaim` that ignored
-/// `observed` entirely passes this model.** What pins the guard is the unit test
-/// [`crate::tests::reclaim_fails_when_the_observed_word_has_changed`]; what pins
-/// the *strength* of `reclaim`'s own orderings is nothing in this workspace, a
-/// gap stated with its argument on `reclaim` itself rather than left for the
-/// next reader to rediscover here.
-///
-/// The corpse is still staged and its CAS still asserted, because a model that
-/// never enters the code under test would be vacuous in a second and worse way.
-/// That assertion is labelled below for what it is: harness liveness.
-///
-/// "No two occupants" is **not** asserted either. Two independently-built models
-/// were vacuous for it in the same structural way — 0028 open question 6 records
-/// a byte-blind hostile reclaimer passing it over 1 140 088 executions while
-/// erasing 151 590 `LIVE` records — because it is entailed by the byte being an
-/// exclusive lock and needs no schedule exploration at all. What makes
-/// `reclaim`'s widening to `RESERVED` safe is the same non-C11 fact: every
-/// writer holds its byte across the whole of `fill_slot` (0028 step 0b) and the
-/// byte index and the record index are the same integer (step 0c).
-///
-/// # The controls, which ship runnable
-///
-/// 0028's plan requires this model to ship with the control that fails, because
-/// a model with no failing control proves nothing — question 6's own finding.
-/// Both controls are `#[test]`s in this file rather than a paragraph, so
-/// `cargo xtask loom` re-runs them and a model that has quietly stopped being
-/// falsifiable fails the suite instead of waiting to be believed:
-///
-/// - [`control_reclaim_races_register_probes_the_byte_first`] — the two reads
-///   swapped. Loom finds the execution where the sweeper reads byte 1 free
-///   before the joiner takes it, observes the `live_word` the joiner has since
-///   published, and CASes a live participant's record to `FREE`.
-/// - [`control_reclaim_races_register_observes_relaxed`] — the right order, but
-///   the word observed `Relaxed`. It erases too, which is what says the property
-///   is carried by the synchronises-with edge and not by the order two lines
-///   happen to be written in.
-///
-/// Both witnesses are legal C11 executions: the sweeper reads the byte's
-/// *initial* store because nothing orders it after the joiner's acquisition.
-/// Each is `#[should_panic]` on the erasure assertion, which is the one that
-/// speaks first — the ordering flag trips in the same execution and is reported
-/// rather than acted on.
-///
-/// # Modelling notes
-///
-/// Slot 0's corpse is reclaimed uncontended, which is also what keeps this model
-/// clear of loom 0.7.2's `match_rmw_to_stores` over-approximation: an RMW is
-/// offered every store back to the first in its own causality, so a second
-/// writer to a slot a stale verdict names lets a `RESERVED -> FREE` CAS match a
-/// modification-order-superseded store and report a C11-illegal erasure. A pass
-/// here is sound; a failure needs its witness hand-checked before it is
-/// believed. That is also why the same-slot race is not modelled here.
-///
-/// The byte is modelled as an exclusive per-slot lock word, taken and never
-/// released: `Session` outlives the `Tree`'s registration, and `Tree::drop`
-/// releases the record before the byte, never the reverse. The probe is a
-/// `Relaxed` load deliberately — `F_OFD_GETLK` is a syscall and is at least that
-/// strong, so a property that holds against the weakest read holds against the
-/// real one. The corpse is staged inline because a process killed inside
-/// `fill_slot` executes no further instruction, ever: the idiom of
+/// Slot 0's corpse is reclaimed uncontended, keeping clear of loom 0.7.2's
+/// `match_rmw_to_stores` over-approximation, under which a second writer to a
+/// slot lets a `RESERVED -> FREE` CAS match a superseded store and report a
+/// C11-illegal erasure: a pass here is sound, a failure needs its witness
+/// hand-checked, and the same-slot race is not modelled at all. The byte is an
+/// exclusive per-slot lock word, taken and never released (`Session` outlives
+/// the `Tree`'s registration), probed `Relaxed` because `F_OFD_GETLK` is a
+/// syscall and at least that strong. The corpse is staged inline, the idiom of
 /// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`].
 #[test]
 fn reclaim_races_register() {
@@ -1058,9 +866,8 @@ fn reclaim_races_register() {
 
 /// The failing control: the byte is probed **before** the word is observed.
 ///
-/// See [`reclaim_races_register`]. Erases a published record, which is the
-/// point; `#[should_panic]` so the erasure is an assertion this suite makes
-/// rather than a claim it prints.
+/// Loom reads byte 1 free before the joiner takes it, then CASes a live record
+/// to `FREE`. `#[should_panic]` makes that erasure an assertion, not a claim.
 #[test]
 #[should_panic(expected = "no erasure")]
 fn control_reclaim_races_register_probes_the_byte_first() {
@@ -1068,10 +875,8 @@ fn control_reclaim_races_register_probes_the_byte_first() {
 }
 
 /// The second failing control: the right read order, the word observed
-/// `Relaxed`.
-///
-/// See [`reclaim_races_register`]. What carries the property is the
-/// synchronises-with edge, not the source order, and this is how that is known.
+/// `Relaxed`. It erases too — the property is carried by the synchronises-with
+/// edge, not by source order, and this is how that is known.
 #[test]
 #[should_panic(expected = "no erasure")]
 fn control_reclaim_races_register_observes_relaxed() {
@@ -1081,8 +886,7 @@ fn control_reclaim_races_register_observes_relaxed() {
 /// How one sweep reads a slot: the protocol, and the two controls that break it.
 #[derive(Clone, Copy)]
 enum Sweep {
-    /// The word (`Acquire`) first, then the byte. What `reclaim`'s doc requires
-    /// of a caller.
+    /// The word (`Acquire`) first, then the byte — `reclaim`'s requirement.
     WordThenByte,
     /// The byte first. Control.
     ByteThenWord,
@@ -1103,12 +907,9 @@ fn reclaim_races_register_model(shape: Sweep) {
     const BYTE_FREE: u32 = 0;
     const BYTE_HELD: u32 = 1;
 
-    /// One reclamation decision, for one slot.
-    ///
-    /// Returns whether the CAS fired, and whether this sweeper ever read a byte
-    /// free under a published `live_word` — the ordering violation itself,
-    /// reported rather than acted on so that the erasure assertion is the one
-    /// that speaks first.
+    /// One reclamation decision, for one slot: whether the CAS fired, and
+    /// whether a byte read free under a published `live_word` — the ordering
+    /// violation, reported not acted on so the erasure assertion speaks first.
     fn sweep(
         table: &[ParticipantRecord],
         bytes: &[AtomicU32],
@@ -1146,9 +947,8 @@ fn reclaim_races_register_model(shape: Sweep) {
             AtomicU32::new(BYTE_FREE)
         ]);
 
-        // The corpse in slot 0. `register` can never collect it — it only ever
-        // CASes from FREE — which is why such a slot was lost to everybody for
-        // ever before `reclaim` existed.
+        // The corpse in slot 0. `register` only CASes from FREE, so before
+        // `reclaim` existed such a slot was lost to everybody for ever.
         table[0].pid.store(P_CORPSE, Ordering::Relaxed);
         table[0].state.store(RESERVED, Ordering::Release);
 
@@ -1166,9 +966,8 @@ fn reclaim_races_register_model(shape: Sweep) {
             ParticipantTable::new(&ta).register_at(1, P_JOINER, T_JOINER, 0)
         });
 
-        // B: a peer running `reap_participants` (0028 piece 4) over the whole
-        // table, holding no byte of its own. Slot 0 is the corpse it collects;
-        // slot 1 is the live joiner it must not touch.
+        // B: a peer running `reap_participants` (0028 piece 4) over the table,
+        // holding no byte. Slot 0 is a corpse; slot 1 must not be touched.
         let tb = Arc::clone(&table);
         let bb = Arc::clone(&bytes);
         let sweeper = thread::spawn(move || (sweep(&tb, &bb, 0, shape), sweep(&tb, &bb, 1, shape)));
@@ -1189,10 +988,8 @@ fn reclaim_races_register_model(shape: Sweep) {
              was not observed first"
         );
         // Harness liveness, not evidence about the guard: the corpse's CAS is
-        // uncontended, on a word no other thread writes, so it fires in every
-        // execution and would fire for a `reclaim` that never looked at
-        // `observed`. It is here so that a model in which nothing under test
-        // ever runs fails instead of passing.
+        // uncontended and fires even for a `reclaim` that ignored `observed`.
+        // It is here so a model that runs nothing under test fails.
         assert!(
             corpse_fired,
             "the widened CAS never fired: nothing was tested"

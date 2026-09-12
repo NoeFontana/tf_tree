@@ -2,33 +2,21 @@
 //!
 //! # SAFETY (module invariant)
 //!
-//! This module is the crate's second `unsafe` island (the other is
-//! [`crate::buffer`]). It reinterprets the flat, zero-initialized, 64-byte
-//! aligned arena bytes as the typed records that live in each region, using the
-//! byte offsets the [`ArenaHeader`] records. The reinterpretation is sound
-//! because:
-//!
-//! * Every record type ([`FrameRecord`], [`EdgeRecord`], [`ClaimRecord`],
-//!   [`PoseSlot`](crate::buffer::PoseSlot)) and every atomic array element has an all-zero bit pattern as
-//!   a valid value, and the arena starts fully zeroed.
-//! * Region offsets and strides come from the header, which
-//!   [`crate::layout`](tf_tree_arena::layout) laid out 64-byte aligned and in
-//!   header order, so every typed pointer formed here is in-bounds and correctly
-//!   aligned for its element type.
-//! * All interior mutation goes through atomics (or, for [`FrameRecord`] /
-//!   [`EdgeRecord`] scalar fields, through writes that are ordered *before* the
-//!   atomic publish that exposes them), so aliasing a region as a shared
-//!   reference from multiple threads is sound.
-//! * **Every record index is bounds-checked against the header's `max_frames` /
-//!   `max_edges` before a pointer is formed.** [`EdgeId`] is a plain public
-//!   `u32` newtype and [`FrameId::new`] accepts any non-zero `u32`, so an
-//!   out-of-range id is reachable from perfectly safe caller code — including
-//!   from every path in `tf_tree`, whose one `unsafe` is a lifetime extension
-//!   in `OwnedWriter` (`docs/decisions/0017`) and touches nothing here. The
-//!   checked accessors return `None` rather than forming an out-of-bounds
-//!   pointer.
-//!
-//! Every `unsafe` block below names which of these invariants it relies on.
+//! The crate's second `unsafe` island (with [`crate::buffer`]): it reads the
+//! zeroed, 64-byte aligned arena bytes as typed records at the offsets
+//! [`ArenaHeader`] gives. Sound because [`FrameRecord`], [`EdgeRecord`],
+//! [`ClaimRecord`], [`PoseSlot`](crate::buffer::PoseSlot) and every atomic
+//! element are valid all-zero; because [`crate::layout`](tf_tree_arena::layout)
+//! laid every region out 64-byte aligned in header order, so each typed
+//! pointer is in-bounds and aligned; because mutation is atomic, or (for
+//! [`FrameRecord`] / [`EdgeRecord`] scalars) ordered before the atomic publish
+//! that exposes it; and because **every index is bounds-checked against
+//! `max_frames` / `max_edges` before a pointer is formed** — [`EdgeId`] and
+//! [`FrameId::new`] accept out-of-range ids from safe code, so the checked
+//! accessors return `None`. `tf_tree` reaches these paths without writing
+//! `unsafe` at all: its one block is `OwnedWriter`'s lifetime extension
+//! (`docs/decisions/0017`), which touches nothing here. Each `unsafe` block
+//! below names what it relies on.
 #![allow(unsafe_code)]
 
 use tf_tree_arena::{Arena, ArenaHeader};
@@ -42,24 +30,15 @@ use crate::participant::{state_of, ParticipantRecord, ParticipantTable, LIVE};
 use crate::sync::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use crate::topology::{Block, TopologyView};
 
-/// A caller-supplied liveness predicate for A8's interning takeover, and for the
-/// claim/topology-lock reaping that will use the same source
-/// (`docs/PHASE2.md` §6.2).
+/// A caller-supplied liveness predicate for A8's interning takeover and the
+/// claim/topology-lock reaping that will share it (`docs/PHASE2.md` §6.2).
 ///
-/// It is injected rather than implemented here for two reasons. This crate is
-/// `no_std` and cannot read `/proc`. And `docs/PHASE2.md` §5.1 makes the **OFD
-/// lock file** — not `/proc`, not the participant `state` field — the
-/// authoritative answer to "is that participant still running"; that machinery
-/// lives outside `tf_tree_core` and is built independently. Handing the answer in
-/// as a closure keeps the arena algorithms unchanged when it arrives.
-///
-/// **It must fail safe** (§6.2): return `true` whenever it cannot tell. A false
-/// "dead" verdict steals an in-flight entry from a working process; a false
-/// "alive" verdict only postpones recovery.
-/// The first argument is the **participant slot**, which the `docs/PHASE2.md`
-/// §5.1 implementation needs: it asks the kernel about that slot's lock byte
-/// rather than parsing `/proc`. The record is passed too, because the `/proc`
-/// fallback and `doctor` still read the identity out of it.
+/// Injected because this crate is `no_std` (no `/proc`) and because §5.1 makes
+/// the OFD lock file authoritative over `/proc` and the participant `state`
+/// field. **It must fail safe** (§6.2): `true` whenever it cannot tell, since a
+/// false "dead" steals an in-flight entry from a working process. It is passed
+/// the participant **slot** (§5.1 asks the kernel about that slot's lock byte)
+/// and its record (the `/proc` fallback and `doctor` need the identity).
 pub type LivenessFn = dyn Fn(u32, &ParticipantRecord) -> bool;
 
 /// Smallest power of two `>= n` (matching the arena layout's `next_pow2`).
@@ -71,66 +50,48 @@ const fn next_pow2(n: usize) -> usize {
     p
 }
 
-/// A borrowed, typed view over an [`Arena`]'s regions.
-///
-/// Cheap to construct (it just reads the header offsets) and freely copyable in
-/// spirit; it borrows the arena for `'a`.
+/// A borrowed, typed view over an [`Arena`]'s regions. Cheap to construct (it
+/// just reads the header offsets) and borrows the arena for `'a`.
 pub struct ArenaView<'a> {
     base: *mut u8,
     header: &'a ArenaHeader,
-    /// A8: this caller's participant slot **+ 1**, or [`CLAIM_UNRECORDED`] if it
-    /// is not a registered participant. Recorded in `claiming` when this view
-    /// wins an interning hash slot, and required to *rescue* one.
+    /// A8: this caller's participant slot **+ 1**, or [`CLAIM_UNRECORDED`] if
+    /// anonymous. Recorded in `claiming` on winning an interning hash slot, and
+    /// required to *rescue* one.
     me: u32,
-    /// A8's injected liveness predicate; `None` means "assume alive", which
-    /// disables takeover of a claimant whose participant slot still reads `LIVE`.
+    /// A8's injected liveness predicate; `None` means "assume alive", disabling
+    /// takeover of a claimant whose participant slot still reads `LIVE`.
     is_alive: Option<&'a LivenessFn>,
-    /// Whether the mapping behind `base` is writable.
-    ///
-    /// **Default `false`, and that default is load-bearing.** A consumer
-    /// attaches read-only (D18) — the MMU is what stops it corrupting a robot's
-    /// transform tree — so *any* write through this view faults with `SIGSEGV`.
-    /// The diagnostic counters (`docs/PHASE5.md` §5) are the first thing that
-    /// wants to write from a *read* path, and they found this the hard way: the
-    /// `Guard` flush killed a read-only child process with signal 11.
-    ///
-    /// §5 does not discuss it. The resolution is that a read-only participant
-    /// silently keeps no counters — it cannot, and refusing to run would be far
-    /// worse than losing a diagnostic — and `doctor` reports what the writable
-    /// participants recorded.
+    /// Whether the mapping behind `base` is writable. **Default `false`, and
+    /// load-bearing**: a consumer attaches read-only (D18), so any write faults
+    /// with `SIGSEGV` — the counters' `Guard` flush (`docs/PHASE5.md` §5) killed
+    /// a read-only child with signal 11. §5 does not discuss it; a read-only
+    /// participant silently keeps no counters.
     writable: bool,
 }
 
 impl<'a> ArenaView<'a> {
-    /// Build a view over `arena`, reading its header.
-    ///
-    /// The view is anonymous and has no liveness source: it can wait on another
-    /// interner but never takes an entry over. Add both with
-    /// [`Self::as_participant`] and [`Self::with_liveness`].
+    /// Build a view over `arena`, reading its header. Anonymous and with no
+    /// liveness source: it can wait on another interner but never take an entry
+    /// over — [`Self::as_participant`] and [`Self::with_liveness`] add both.
     #[must_use]
     pub fn new(arena: &'a dyn Arena) -> ArenaView<'a> {
         let base = arena.base();
-        // SAFETY: module invariant — the arena base is a validly-initialized
-        // `ArenaHeader` (written by `HeapArena::new`), 64-byte aligned, and lives
-        // as long as the borrowed `arena`, hence as long as `'a`.
+        // SAFETY: module invariant — the base is a validly-initialized,
+        // 64-byte-aligned `ArenaHeader` (`HeapArena::new`) that lives for `'a`.
         let header = unsafe { &*base.cast::<ArenaHeader>() };
         ArenaView {
             base,
             header,
             me: CLAIM_UNRECORDED,
             is_alive: None,
-            // Conservative by default: a caller that has not said the mapping is
-            // writable gets a view that never writes. Opting *in* is safe to
-            // forget; opting out is not.
+            // Opting *in* to writes is safe to forget; opting out is not.
             writable: false,
         }
     }
 
-    /// Declare that the mapping behind this view is writable.
-    ///
-    /// Only a caller that mapped it `PROT_WRITE` may say so. Saying it falsely
-    /// does not corrupt anything — the write simply faults, which is what this
-    /// flag exists to prevent.
+    /// Declare that the mapping behind this view is writable. Only a caller that
+    /// mapped it `PROT_WRITE` may say so; a false claim only faults.
     #[must_use]
     pub fn writable(mut self, yes: bool) -> ArenaView<'a> {
         self.writable = yes;
@@ -143,15 +104,11 @@ impl<'a> ArenaView<'a> {
         self.writable
     }
 
-    /// Identify this view as participant `slot` (`docs/PHASE2.md` §1 A6/A8).
-    ///
-    /// `slot` is what [`ParticipantTable::register`] returned. An out-of-range
-    /// slot — including the `u32::MAX` a read-only attachment carries — leaves the
-    /// view anonymous rather than recording a claim nobody can resolve.
-    ///
-    /// A view must be identified before it can rescue an interning slot whose
-    /// claimant died: the rescuer publishes *itself* into `claiming`, so an
-    /// anonymous one would erase the entry's owner.
+    /// Identify this view as participant `slot` (`docs/PHASE2.md` §1 A6/A8). An
+    /// out-of-range slot — including the `u32::MAX` a read-only attachment
+    /// carries — leaves the view anonymous rather than recording a claim nobody
+    /// can resolve. Only an identified view can rescue a stalled intern: the
+    /// rescuer publishes *itself* into `claiming`.
     #[must_use]
     pub fn as_participant(mut self, slot: u32) -> ArenaView<'a> {
         self.me = if slot < self.header.max_participants {
@@ -162,25 +119,18 @@ impl<'a> ArenaView<'a> {
         self
     }
 
-    /// Attach the liveness predicate used to decide whether a claimant that has
-    /// not published is dead (see [`LivenessFn`], `docs/PHASE2.md` §6.2).
-    ///
-    /// Without one, a participant whose slot still reads `LIVE` is always
-    /// believed — the fail-safe default, and the reason a crashed process is only
-    /// *detected* once the real (OFD-lock) predicate is wired in.
+    /// Attach the predicate for whether a claimant that has not published is
+    /// dead ([`LivenessFn`], `docs/PHASE2.md` §6.2). Without one a slot reading
+    /// `LIVE` is always believed — fail-safe, and why a crashed process is
+    /// detected only once the real OFD-lock predicate is wired in.
     #[must_use]
     pub fn with_liveness(mut self, is_alive: &'a LivenessFn) -> ArenaView<'a> {
         self.is_alive = Some(is_alive);
         self
     }
 
-    /// The participant slot this view interns as, or `None` if it is anonymous.
-    ///
-    /// A rescuer publishes *itself* into `claiming` when it takes over a stalled
-    /// entry, so an anonymous view can wait but never rescue (A8). Exposed
-    /// because "can this handle recover a wedged intern?" is a real diagnostic
-    /// question — `doctor` should be able to answer it — and because it is the
-    /// only way to assert from outside this crate that a `Tree` wired itself up.
+    /// The participant slot this view interns as, or `None` if anonymous — an
+    /// anonymous view can wait on an intern but never rescue one (A8).
     #[must_use]
     pub fn interning_identity(&self) -> Option<u32> {
         if self.me == CLAIM_UNRECORDED {
@@ -190,12 +140,9 @@ impl<'a> ArenaView<'a> {
         }
     }
 
-    /// Whether this view can decide that a claimant died.
-    ///
-    /// Without a liveness source every claimant is believed alive — the correct
-    /// fail-safe, and one that means A8's takeover never fires. A view with an
-    /// identity but no predicate is *silently* inert, which is exactly the
-    /// failure worth being able to test for.
+    /// Whether this view can decide that a claimant died. Without a liveness
+    /// source every claimant is believed alive, so A8's takeover never fires and
+    /// an identified view is *silently* inert.
     #[must_use]
     pub fn has_liveness_source(&self) -> bool {
         self.is_alive.is_some()
@@ -208,16 +155,12 @@ impl<'a> ArenaView<'a> {
         self.header
     }
 
-    // ---- frame interning -------------------------------------------------
-
     /// The interning hash array (`next_pow2(2 * max_frames)` slots).
     pub(crate) fn frame_hashes(&self) -> &'a [AtomicU64] {
         let slots = next_pow2(2 * self.header.max_frames as usize);
         let off = self.header.frame_hash_off as usize;
-        // SAFETY: module invariant — the frame-hash region begins at
-        // `frame_hash_off`, is 64-byte aligned, and reserves
-        // `slots * FRAME_HASH_STRIDE` bytes; the first `slots * 8` are the
-        // `AtomicU64` hash array.
+        // SAFETY: module invariant — the 64-aligned region at `frame_hash_off`
+        // spans `slots * FRAME_HASH_STRIDE`; this is its first `slots * 8`.
         unsafe { core::slice::from_raw_parts(self.base.add(off).cast::<AtomicU64>(), slots) }
     }
 
@@ -226,9 +169,8 @@ impl<'a> ArenaView<'a> {
     pub(crate) fn frame_ids(&self) -> &'a [AtomicU32] {
         let slots = next_pow2(2 * self.header.max_frames as usize);
         let off = self.header.frame_hash_off as usize + slots * 8;
-        // SAFETY: module invariant — the id array follows the hash array within
-        // the same region; `off` is 8-byte aligned (hashes are `slots * 8` bytes)
-        // and names `slots` `AtomicU32`.
+        // SAFETY: module invariant — the id array follows the hashes in the same
+        // region; `off` is 8-byte aligned and names `slots` `AtomicU32`.
         unsafe { core::slice::from_raw_parts(self.base.add(off).cast::<AtomicU32>(), slots) }
     }
 
@@ -236,40 +178,31 @@ impl<'a> ArenaView<'a> {
     /// slot + 1 of the in-flight interner, [`CLAIM_UNRECORDED`] if none).
     pub(crate) fn frame_claiming(&self) -> &'a [AtomicU32] {
         let slots = next_pow2(2 * self.header.max_frames as usize);
-        // Third array in the region: hashes (8 B) then ids (4 B) then claiming.
         let off = self.header.frame_hash_off as usize + slots * (8 + 4);
-        // SAFETY: module invariant — `ArenaLayout` sizes the frame-hash region at
-        // `slots * FRAME_HASH_STRIDE` (16) bytes, of which this is the last
-        // `slots * 4`; `off` is 4-byte aligned because `slots * 12` is.
+        // SAFETY: module invariant — hashes (8 B), then ids (4 B), then this:
+        // the last `slots * 4` of the region `ArenaLayout` sized at
+        // `slots * FRAME_HASH_STRIDE` (16); `slots * 12` is 4-byte aligned.
         unsafe { core::slice::from_raw_parts(self.base.add(off).cast::<AtomicU32>(), slots) }
     }
 
-    /// The three interning arrays plus the id allocator, as `frame`'s algorithms
-    /// want them.
+    /// The three interning arrays plus the id allocator, for [`crate::frame`].
     fn intern_table(&self) -> InternTable<'a> {
         InternTable {
             hashes: self.frame_hashes(),
             ids: self.frame_ids(),
             claiming: self.frame_claiming(),
             frame_count: &self.header.frame_count,
-            // Usable ids are 1..max_frames (slot 0 is the root sentinel), so the
-            // interned-frame capacity is one less than the table slot count.
+            // Ids run 1..max_frames — slot 0 is the root sentinel.
             capacity: self.header.max_frames.saturating_sub(1),
         }
     }
 
-    /// A8's claimant-liveness test, as [`crate::frame`] wants it: given a
-    /// `claiming` entry (participant slot + 1), may that interner still publish?
-    ///
-    /// Two conditions, both required, and **both fail safe** — anything this
-    /// cannot resolve counts as alive (`docs/PHASE2.md` §6.2):
-    ///
-    /// 1. the participant slot still reads `LIVE` (a `FREE` slot detached, a
-    ///    `RESERVED` one died mid-attach — neither is going to finish an intern);
-    /// 2. the injected [`LivenessFn`] agrees, when one was supplied.
-    ///
-    /// Condition 1 alone cannot see a *crash*: a `SIGKILL`ed process leaves its
-    /// slot `LIVE` forever, which is exactly what condition 2 exists to catch.
+    /// A8's claimant-liveness test: given a `claiming` entry (participant slot +
+    /// 1), may that interner still publish? Both conditions **fail safe** —
+    /// anything unresolvable counts as alive (`docs/PHASE2.md` §6.2). The slot
+    /// must read `LIVE` (a `FREE` one detached, a `RESERVED` one died
+    /// mid-attach), which alone cannot see a crash — `SIGKILL` leaves it `LIVE`
+    /// forever — so the injected [`LivenessFn`] must agree as well.
     fn claimant_alive(&self) -> impl Fn(u32) -> bool + '_ {
         move |owner: u32| {
             if owner == CLAIM_UNRECORDED {
@@ -285,21 +218,19 @@ impl<'a> ArenaView<'a> {
         }
     }
 
-    /// Pointer to frame record slot `id` (1-based; slot 0 is the root sentinel),
-    /// or `None` if `id` is out of range for this arena.
+    /// Pointer to frame slot `id` (slot 0 is the root sentinel); `None` if out
+    /// of range for this arena.
     fn frame_record_ptr(&self, id: u32) -> Option<*mut FrameRecord> {
         if id >= self.header.max_frames {
             return None;
         }
         let off = self.header.frame_table_off as usize + id as usize * 64;
-        // SAFETY: module invariant — the frame table reserves `max_frames` 64-byte
-        // records at `frame_table_off`, and `id < max_frames` was just checked, so
-        // this pointer is in-bounds and 64-aligned.
+        // SAFETY: module invariant — `max_frames` 64-byte records at
+        // `frame_table_off`, and `id < max_frames` was just checked.
         Some(unsafe { self.base.add(off).cast::<FrameRecord>() })
     }
 
-    /// Byte offset of record `id` in a table of `stride`-byte records starting at
-    /// `table_off`, or `None` if `id` is out of range for this arena's edge table.
+    /// Byte offset of record `id` in a `stride`-byte table at `table_off`.
     #[inline]
     fn edge_slot_off(&self, id: EdgeId, table_off: u32, stride: usize) -> Option<usize> {
         if id.get() >= self.header.max_edges {
@@ -308,14 +239,11 @@ impl<'a> ArenaView<'a> {
         Some(table_off as usize + id.get() as usize * stride)
     }
 
-    /// Intern `name`, returning its stable [`FrameId`]. Idempotent: the same name
-    /// always maps to the same id, even across concurrent interners (loom-tested).
-    ///
-    /// If another interner won this name's hash slot and died before publishing
-    /// the id, this call takes the entry over rather than spinning forever
-    /// (`docs/PHASE2.md` §1 A8) — but only if the view was given an identity with
-    /// [`Self::as_participant`] and enough information to declare the claimant
-    /// dead (see [`Self::with_liveness`]).
+    /// Intern `name`, returning its stable [`FrameId`]. Idempotent even across
+    /// concurrent interners (loom-tested), and takes over a hash slot whose
+    /// claimant won it and died before publishing rather than spinning forever
+    /// (`docs/PHASE2.md` §1 A8) — but only given both [`Self::as_participant`]
+    /// and [`Self::with_liveness`].
     ///
     /// # Errors
     ///
@@ -327,11 +255,9 @@ impl<'a> ArenaView<'a> {
 
         let name_matches = |id: u32| -> bool {
             match self.frame_record_ptr(id) {
-                // SAFETY: `id` is in bounds (checked by `frame_record_ptr`) and was
-                // published (its record was fully written before the `ids` Release
-                // store this reader synchronized with via Acquire); records are
-                // append-only, so no writer aliases it. Reading a shared
-                // `&FrameRecord` is sound.
+                // SAFETY: `id` is in bounds (`frame_record_ptr`) and published:
+                // written before the `ids` Release store this reader acquired,
+                // and append-only, so no writer aliases it.
                 Some(ptr) => unsafe { &*ptr }.name_matches(name),
                 None => false,
             }
@@ -339,10 +265,9 @@ impl<'a> ArenaView<'a> {
         let write_record = |id: u32| {
             if let Some(ptr) = self.frame_record_ptr(id) {
                 let rec = FrameRecord::for_name(name, hash);
-                // SAFETY: `id < max_frames` (checked), and this runs only for the
-                // unique CAS winner, before the `ids` Release store publishes `id`;
-                // no other thread holds a reference to this (append-only) slot yet,
-                // so the raw write does not race.
+                // SAFETY: `id < max_frames` (checked); this runs only for the
+                // unique CAS winner, before the `ids` Release store publishes
+                // `id`, so nothing else references the append-only slot yet.
                 unsafe { core::ptr::write(ptr, rec) };
             }
         };
@@ -358,17 +283,12 @@ impl<'a> ArenaView<'a> {
         FrameId::new(id).ok_or(FrameError::CapacityExceeded)
     }
 
-    /// Look up an already-interned frame by name **without** creating one.
-    ///
-    /// Returns `Ok(Some(id))` if `name` was previously interned, `Ok(None)` if it
-    /// was never interned. Unlike [`Self::intern`] this never inserts, so the
-    /// read-only lookup path (`tree.lookup`) can distinguish "unknown frame" from
-    /// "known but disconnected".
-    ///
-    /// A lookup never writes, so it cannot rescue a slot whose interner died; it
-    /// reports `Ok(None)` instead (`docs/PHASE2.md` §1 A8). That is truthful — no
-    /// id exists for the name — and self-correcting, since the next *interner* of
-    /// the name takes the entry over.
+    /// Look up an already-interned frame by name **without** creating one:
+    /// `Ok(None)` means never interned, which is how the read-only lookup path
+    /// tells "unknown frame" from "known but disconnected". A lookup never
+    /// writes, so it cannot rescue a slot whose interner died and reports
+    /// `Ok(None)` there too (`docs/PHASE2.md` §1 A8) — truthful, and
+    /// self-correcting, since the next *interner* takes the entry over.
     ///
     /// # Errors
     ///
@@ -386,30 +306,25 @@ impl<'a> ArenaView<'a> {
         Ok(id.and_then(FrameId::new))
     }
 
-    /// Read an interned frame record (for name display / diagnostics), or `None`
-    /// if `id` is out of range for this arena.
+    /// Read an interned frame record (name display / diagnostics), or `None` if
+    /// `id` is out of range for this arena.
     #[must_use]
     pub fn frame_record(&self, id: FrameId) -> Option<&'a FrameRecord> {
         let ptr = self.frame_record_ptr(id.get())?;
-        // SAFETY: `id.get() < max_frames` (checked by `frame_record_ptr`); a live
-        // `FrameId` names a published, append-only record slot, and a shared read
-        // does not race any writer.
+        // SAFETY: `id.get() < max_frames` (checked by `frame_record_ptr`); a
+        // live `FrameId` names a published, append-only record slot.
         Some(unsafe { &*ptr })
     }
-
-    // ---- topology --------------------------------------------------------
 
     fn topo_block(&self, index: usize) -> Block<'a> {
         let mf = self.header.max_frames as usize;
         let block_off =
             self.header.topo_block_off as usize + index * self.header.topo_block_stride as usize;
-        // Within a block: [parent: u32; mf], [edge_of_child: u32; mf], [depth:
-        // u16; mf]. The two u32 arrays come first so both stay 4-byte aligned for
-        // any `mf`; depth (u16) trails at `+ mf * 8`.
-        // SAFETY: module invariant — each block reserves `align64(mf * 10)` bytes
-        // at `topo_block_off + index * stride`, block start is 64-aligned; parent
-        // is `mf` u32 at offset 0, edge_of_child is `mf` u32 at `+ mf*4`, depth is
-        // `mf` u16 at `+ mf*8` — all in-bounds and correctly aligned.
+        // Blocks hold [parent u32; mf][edge_of_child u32; mf][depth u16; mf] —
+        // u32s first so both stay 4-aligned for any `mf`.
+        // SAFETY: module invariant — each block reserves `align64(mf * 10)` at a
+        // 64-aligned `topo_block_off + index * stride`, so the sub-arrays at 0,
+        // `+ mf*4` and `+ mf*8` are all in-bounds and aligned.
         let parent = unsafe {
             core::slice::from_raw_parts(self.base.add(block_off).cast::<AtomicU32>(), mf)
         };
@@ -441,52 +356,38 @@ impl<'a> ArenaView<'a> {
     pub fn participants(&self) -> ParticipantTable<'a> {
         let n = self.header.max_participants as usize;
         let off = self.header.participant_table_off as usize;
-        // SAFETY: module invariant — the participant region reserves
-        // `max_participants` 128-byte records at `participant_table_off`, sized
-        // by `ArenaLayout` and validated on attach, and every field is atomic so
-        // sharing the slice across processes is sound.
+        // SAFETY: module invariant — `max_participants` 128-byte, all-atomic
+        // records at `participant_table_off`, sized by `ArenaLayout`.
         let slots = unsafe {
             core::slice::from_raw_parts(self.base.add(off).cast::<ParticipantRecord>(), n)
         };
         ParticipantTable::new(slots)
     }
 
-    // ---- edges & claims --------------------------------------------------
-
     /// The claim record for edge `id`, or `None` if `id` is out of range.
     #[must_use]
     pub fn claim(&self, id: EdgeId) -> Option<&'a ClaimRecord> {
         let off = self.edge_slot_off(id, self.header.claim_table_off, 64)?;
-        // SAFETY: module invariant — the claim table reserves `max_edges` 64-byte
-        // records at `claim_table_off`, and `id < max_edges` was just checked, so
-        // the record is in bounds and 64-aligned. All its mutation is atomic, so
-        // sharing it across threads is sound.
+        // SAFETY: module invariant — `max_edges` 64-byte records at
+        // `claim_table_off`, `id < max_edges` checked; all mutation is atomic.
         Some(unsafe { &*self.base.add(off).cast::<ClaimRecord>() })
     }
 
-    /// The per-edge diagnostic counters for edge `id` (`docs/PHASE5.md` §5.2),
-    /// or `None` if `id` is out of range.
-    ///
-    /// The region exists in every `FORMAT_VERSION` 3 arena whether or not the
-    /// `counters` feature is compiled in — D34, so that disabling the feature
-    /// does not fork the layout hash. What the feature removes is the *writes*,
-    /// not the space.
+    /// The per-edge diagnostic counters for edge `id`, or `None` if out of range
+    /// (`docs/PHASE5.md` §5.2). The region exists in every `FORMAT_VERSION` 3
+    /// arena whether or not the `counters` feature is compiled in — D34, so
+    /// disabling it cannot fork the layout hash: it removes writes, not space.
     #[must_use]
     pub fn edge_counters(&self, id: EdgeId) -> Option<&'a EdgeCounters> {
         let off = self.edge_slot_off(id, self.header.edge_counters_off, 128)?;
-        // SAFETY: module invariant — the counter region reserves `max_edges`
-        // 128-byte records at `edge_counters_off` (sized by `ArenaLayout`,
-        // validated on attach by `MappedArena::attach`), and `id < max_edges`
-        // was just checked. Every field is atomic, so sharing the reference
-        // across processes is sound.
+        // SAFETY: module invariant — `max_edges` 128-byte all-atomic records at
+        // `edge_counters_off`, validated on attach by `MappedArena::attach`;
+        // `id < max_edges` was just checked.
         Some(unsafe { &*self.base.add(off).cast::<EdgeCounters>() })
     }
 
-    /// The per-participant diagnostic counters for `slot`, or `None` if the
-    /// slot is out of range.
-    ///
-    /// This is what makes a diagnostic actionable: the edge counters say
-    /// failures exist, and these say *which consumer* is failing.
+    /// The per-participant diagnostic counters for `slot`, `None` if out of
+    /// range. Edge counters say failures exist; these say *which consumer*.
     #[must_use]
     pub fn participant_counters(&self, slot: u32) -> Option<&'a ParticipantCounters> {
         if slot >= self.header.max_participants {
@@ -502,18 +403,14 @@ impl<'a> ArenaView<'a> {
     #[must_use]
     pub fn edge(&self, id: EdgeId) -> Option<&'a EdgeRecord> {
         let off = self.edge_slot_off(id, self.header.edge_table_off, 128)?;
-        // SAFETY: module invariant — the edge table reserves `max_edges` 128-byte
-        // records at `edge_table_off`, and `id < max_edges` was just checked, so
-        // the record is in bounds and 64-aligned.
+        // SAFETY: module invariant — `max_edges` 128-byte records at
+        // `edge_table_off`, and `id < max_edges` was just checked.
         Some(unsafe { &*self.base.add(off).cast::<EdgeRecord>() })
     }
 
-    /// The [`SampleRing`] for a dynamic edge, assembled from its edge record
-    /// (head, capacity, region offsets) and claim record (heartbeat).
-    ///
-    /// Returns `None` if `id` is out of range, or if the edge is not a ring —
-    /// a static or tombstoned edge has `capacity == 0`, which is not a power of
-    /// two, so there is no ring to build.
+    /// The [`SampleRing`] for a dynamic edge, from its edge record (head,
+    /// capacity, offsets) and claim record (heartbeat). `None` if `id` is out of
+    /// range, or if `capacity == 0` — a static or tombstoned edge, not a ring.
     #[must_use]
     pub fn ring(&self, id: EdgeId) -> Option<SampleRing<'a>> {
         let edge = self.edge(id)?;
@@ -521,10 +418,9 @@ impl<'a> ArenaView<'a> {
         self.ring_of(id, edge, claim)
     }
 
-    /// Everything the sampling hot path needs for one edge — its interpolation
-    /// discriminant and its ring — resolved behind a single bounds check.
-    ///
-    /// Returns `None` under exactly the conditions [`Self::ring`] does.
+    /// Everything the sampling hot path needs for one edge — interpolation
+    /// discriminant and ring — behind one bounds check. `None` under exactly
+    /// [`Self::ring`]'s conditions.
     #[must_use]
     pub fn sampler(&self, id: EdgeId) -> Option<(u8, SampleRing<'a>)> {
         let edge = self.edge(id)?;
@@ -533,27 +429,14 @@ impl<'a> ArenaView<'a> {
     }
 
     /// The byte extents of one dynamic edge's two rings, as `(offset, len)`
-    /// pairs from the arena base — stamps first, then poses.
+    /// pairs from the arena base — stamps first, then poses. `None` under
+    /// exactly [`Self::ring`]'s conditions, sharing its `ring_bytes` check.
     ///
-    /// Returns `None` under exactly the conditions [`Self::ring`] does, and for
-    /// the same reason: an extent is only meaningful once the record's
-    /// `stamp_off`/`pose_off`/`capacity` triple has been proved to lie inside
-    /// the two regions, so this shares that bounds check with the hot path
-    /// (`ring_bytes`, private) rather than recomputing it alongside.
-    ///
-    /// # What this is for
-    ///
-    /// Page population (`docs/PHASE2.md` §7.1). `MappedArena::populate_hot`
-    /// warms every region that is read on the lookup path *except* the two ring
-    /// arenas, because §7.1's granularity is per-edge and the arena crate cannot
-    /// compute a per-edge extent — [`EdgeRecord`] is defined here, in a crate
-    /// that depends on it. The facade closes that loop: it holds both crates,
-    /// asks this for the extents of an edge it is about to claim or to compile
-    /// into a plan, and hands them to `MappedArena::populate`.
-    ///
-    /// It is deliberately expressed in bytes rather than as a `&[T]`: the caller
-    /// is a `madvise`, and handing out a typed slice of a region another process
-    /// is writing would be a data race dressed as an accessor.
+    /// For page population (`docs/PHASE2.md` §7.1): `MappedArena::populate_hot`
+    /// skips the ring arenas, because §7.1's granularity is per-edge and the
+    /// arena crate cannot name [`EdgeRecord`], which is defined here.
+    /// Bytes, not `&[T]`: the caller is a `madvise`, and a typed slice of a
+    /// region another process writes would be a data race in disguise.
     #[must_use]
     pub fn ring_extents(&self, id: EdgeId) -> Option<[(usize, usize); 2]> {
         let edge = self.edge(id)?;
@@ -561,8 +444,7 @@ impl<'a> ArenaView<'a> {
         Some([(stamp_byte_off, cap * 8), (pose_byte_off, cap * 64)])
     }
 
-    /// Assemble a ring from already-resolved records. `None` if `edge` is not a
-    /// dynamic ring.
+    /// Assemble a ring from resolved records; `None` if `edge` is not a ring.
     #[inline]
     fn ring_of(
         &self,
@@ -573,11 +455,9 @@ impl<'a> ArenaView<'a> {
         let (stamp_byte_off, pose_byte_off, cap) = self.ring_bytes(edge)?;
 
         // SAFETY: `ring_bytes` proved `stamp_off + cap <= stamp_slots` and
-        // `pose_off + cap <= pose_slots`, so both sub-ranges lie wholly
-        // inside the stamp/pose arenas whose extents `validate_arena_header`
-        // confirmed against the mapping. This is enforced there rather than
-        // assumed of `ArenaBuilder::declare_edge`, which only asserts the
-        // invariant — it writes the caller's record unvalidated.
+        // `pose_off + cap <= pose_slots`, so both sub-ranges lie inside the
+        // arenas whose extents `validate_arena_header` confirmed — not assumed
+        // of `ArenaBuilder::declare_edge`, which writes the record unvalidated.
         let stamps = unsafe { stamp_slots(self.base, stamp_byte_off, cap) };
         let poses = unsafe { pose_slots(self.base, pose_byte_off, cap) };
 
@@ -592,10 +472,8 @@ impl<'a> ArenaView<'a> {
 
     /// The `(stamp_byte_off, pose_byte_off, capacity)` triple for a dynamic
     /// edge, with the record's offsets proved to lie inside the two ring
-    /// regions. `None` if `edge` is not a dynamic ring.
-    ///
-    /// This is the single place that bound is established, so that
-    /// [`Self::ring_of`]'s `unsafe` slice construction and
+    /// regions; `None` if `edge` is not a dynamic ring. The single place that
+    /// bound is established, so [`Self::ring_of`]'s `unsafe` slice and
     /// [`Self::ring_extents`]'s `madvise` range cannot drift apart.
     #[inline]
     fn ring_bytes(&self, edge: &EdgeRecord) -> Option<(usize, usize, usize)> {
@@ -604,23 +482,12 @@ impl<'a> ArenaView<'a> {
             return None;
         }
 
-        // The record's own `stamp_off`/`pose_off`/`capacity` triple is foreign
-        // input on every path that maps bytes this process did not write — a
-        // peer's `memfd`, and since Phase 5 a `.tft` file `FrozenArena::open`
-        // took from disk. `validate_arena_header` bounds the *regions* and says
-        // so itself (`check.rs`, "would produce out-of-bounds reads rather than
-        // an error"); nothing bounded a sub-range *inside* them, so a corrupt or
-        // crafted triple formed a typed slice running past the end of the
-        // mapping. It is reachable from safe code too: `declare_edge` and
-        // `EdgeRecord::dynamic` are safe `pub fn`s that write a caller-supplied
-        // record, so `tf_tree` could cause UB without writing a single `unsafe`
-        // block — its one `unsafe` is `OwnedWriter`'s lifetime extension
-        // (`docs/decisions/0017`) and is nowhere near this path.
-        //
-        // `stamp_slots`/`pose_slots` are the counts the two regions were sized
-        // from, and the header check already proved they agree with the
-        // segment's geometry. No legitimate edge can trip this: the facade
-        // assigns `stamp_off` cumulatively from a running offset.
+        // The record's triple is foreign input wherever this process did not
+        // write the bytes — a peer's `memfd`, a `.tft` from disk — and
+        // `validate_arena_header` bounds the *regions* only. Without this check
+        // a corrupt triple formed a typed slice past the mapping, reachable from
+        // safe code through `declare_edge` / `EdgeRecord::dynamic`. No
+        // legitimate edge trips it: the facade assigns `stamp_off` cumulatively.
         if (edge.stamp_off as usize).saturating_add(cap) > self.header.stamp_slots as usize
             || (edge.pose_off as usize).saturating_add(cap) > self.header.pose_slots as usize
         {
@@ -637,14 +504,8 @@ impl<'a> ArenaView<'a> {
 /// Exclusive, construction-time access to an arena.
 ///
 /// Writing an [`EdgeRecord`] is a raw, non-atomic write of a whole 128-byte
-/// record: it is sound only when nothing else can observe the slot. Rather than
-/// leave that as a comment on a safe `pub fn` — where any caller, including a
-/// facade that writes no `unsafe` on this path, could violate it — the
-/// capability is gated behind an `&mut` borrow of the arena. Holding one
-/// *proves* no other
-/// [`ArenaView`] exists, because a shared view borrows the same arena.
-///
-/// Hand out shared views for the rest of construction with [`Self::view`].
+/// record, sound only when nothing else can observe the slot; an `&mut` borrow
+/// *proves* that, since a shared [`ArenaView`] borrows the same arena.
 pub struct ArenaBuilder<'a> {
     arena: &'a mut dyn Arena,
 }
@@ -667,8 +528,7 @@ impl<'a> ArenaBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// [`TopologyError::CapacityExceeded`] if `id` is out of range for this
-    /// arena's edge table.
+    /// [`TopologyError::CapacityExceeded`] if `id` is out of range.
     pub fn declare_edge(&mut self, id: EdgeId, record: EdgeRecord) -> Result<(), TopologyError> {
         let view = ArenaView::new(self.arena);
         let off = view
@@ -676,9 +536,8 @@ impl<'a> ArenaBuilder<'a> {
             .ok_or(TopologyError::CapacityExceeded)?;
         let base = view.base;
         // SAFETY: `id < max_edges` (checked above), so the slot is in bounds and
-        // 64-aligned. `&mut self` proves this builder holds the arena exclusively,
-        // so no `ArenaView` — and therefore no `&EdgeRecord` — aliases the slot
-        // while the raw write happens.
+        // 64-aligned, and `&mut self` proves no `ArenaView` — hence no
+        // `&EdgeRecord` — aliases it while the raw write happens.
         unsafe {
             core::ptr::write(base.add(off).cast::<EdgeRecord>(), record);
         }
@@ -693,42 +552,27 @@ mod padding_tests {
 
     /// **Every byte an `EdgeRecord` puts on disk is initialised.**
     ///
-    /// `EdgeRecord` is `#[repr(C, align(64))]`; `nominal_rate_mhz` ends at
-    /// offset 28 and `head: AtomicU64` must start 8-aligned, so the compiler
-    /// reserves `[28..32)`. A struct literal initialises *fields*, not padding
-    /// — `_pad0` and `_pad2` are named and zeroed and this one was not.
-    /// [`TopologyBuilder::declare_edge`] publishes the record with the **typed**
-    /// `core::ptr::write` a few hundred lines above, which copies the hole, and
-    /// `write_frozen` memcpys the whole arena to the file. So four bytes of
-    /// producer memory reached disk in every `.tft`, once per declared edge.
+    /// `nominal_rate_mhz` ends at 28 and `head: AtomicU64` must start 8-aligned,
+    /// so `[28..32)` is padding, which a struct literal does not initialise.
+    /// [`TopologyBuilder::declare_edge`]'s typed `core::ptr::write` copies the
+    /// hole and `write_frozen` memcpys the arena to the file, so four bytes of
+    /// producer memory reached every `.tft` once per declared edge: UB, a leak,
+    /// and why a `.tft` could not be content-addressed. Naming the bytes moves
+    /// no offset and leaves `layout_hash` (stride constants) untouched.
     ///
-    /// It was **UB** (reading uninitialised memory as `u8`), an **information
-    /// leak** into a shipped artifact, and the reason a `.tft` could not be
-    /// content-addressed. Naming the bytes moves nothing: `size_of` is still
-    /// 128, both offsets are unchanged, and `layout_hash` is untouched because
-    /// it folds literal stride constants rather than field offsets.
+    /// Keep it here: `src/tests.rs` cannot take the `&[u8]` view under
+    /// `#![deny(unsafe_code)]`, `tf_tree_arena` cannot name `EdgeRecord`, and a
+    /// `tf_tree_core/tests/` build gets no `cfg(loom)` dev-dependency under
+    /// `cargo xtask loom`.
     ///
-    /// **It lives here, and the two rejected homes are worth recording.**
-    /// `tf_tree_core` is `#![deny(unsafe_code)]` outside `buffer` and this
-    /// module, so `src/tests.rs` cannot take the `&[u8]` view — and this is the
-    /// module holding the write that caused it. `tf_tree_arena` cannot host it
-    /// either: it sits *below* `tf_tree_core` and cannot name `EdgeRecord`. A
-    /// `tf_tree_core/tests/` directory is the third non-option — it breaks
-    /// `cargo xtask loom`, which runs `cargo test -p tf_tree_core --tests` under
-    /// `--cfg loom`, because `loom` is a `cfg(loom)` **dev**-dependency that an
-    /// integration test's plain-library build of the crate does not get.
-    ///
-    /// **Mutant, run rather than asserted.** With `_pad1` removed,
-    /// `cargo +nightly miri test -p tf_tree_core` reports *"Undefined Behavior:
-    /// reading memory at `alloc[0x0..0x80]`, but memory is uninitialized at
-    /// `[0x1c..0x20]`"* — `0x1c..0x20` is 28..32 — and this test fails.
+    /// **Mutant, run.** With `_pad1` removed, `cargo +nightly miri test -p
+    /// tf_tree_core` reports UB at `[0x1c..0x20]` (= 28..32) and this fails.
     #[test]
     fn an_edge_record_leaves_no_uninitialised_bytes() {
         /// The same `&[u8]` view `write_frozen` takes of the arena.
         fn wire_bytes(rec: &EdgeRecord) -> &[u8] {
-            // SAFETY: `EdgeRecord` is `#[repr(C)]` with every hole named, so it
-            // has no uninitialised bytes — the property under test — and the
-            // reference is live for `size_of` bytes.
+            // SAFETY: `EdgeRecord` is `#[repr(C)]` with every hole named — the
+            // property under test — and the reference is live for `size_of`.
             unsafe {
                 core::slice::from_raw_parts(
                     core::ptr::from_ref(rec).cast::<u8>(),
@@ -737,8 +581,6 @@ mod padding_tests {
             }
         }
 
-        // Geometry first: if `head` moves, the hole this guards is elsewhere
-        // and the test must say so rather than quietly pass.
         assert_eq!(size_of::<EdgeRecord>(), 128);
         assert_eq!(align_of::<EdgeRecord>(), 64);
         assert_eq!(offset_of!(EdgeRecord, nominal_rate_mhz), 24);

@@ -1,11 +1,16 @@
 //! `memfd`-backed shared-memory arena — the Phase 2 backend.
 //!
-//! `docs/PHASE2.md` §4 makes one thing NORMATIVE: the diff against Phase 1 in
-//! the read path must be **zero lines**. `Plan::at`, the bracket search, slot
-//! reads and interning are byte-identical code operating on a different base
-//! pointer. That is achievable because the arena is pointer-free, which
-//! `crates/tf_tree_bench/tests/relocation.rs` proves independently of this
-//! module. Everything here is about *obtaining* that base pointer safely.
+//! `docs/PHASE2.md` §4 is NORMATIVE: the read path's diff against Phase 1 is
+//! **zero lines** — the arena is pointer-free, so identical code runs on a
+//! different base pointer (`crates/tf_tree_bench/tests/relocation.rs` proves it
+//! independently). Everything here is about *obtaining* that pointer safely.
+//!
+//! `memfd`, not `shm_open`, for sealing (§3.2 forbids the "simplification"):
+//! sealed in [`MappedArena::create`] and verified — never trusted — in
+//! [`MappedArena::attach`], the size is immutable, so no fd holder can
+//! `ftruncate` a reader into a `SIGBUS` inside a lookup. Participants are
+//! otherwise mutually trusting same-user processes (§0), so the MMU-enforced
+//! **read-only** attach is the one real boundary and the consumer default.
 //!
 //! # SAFETY (module invariant)
 //!
@@ -16,32 +21,8 @@
 //!   `len` readable bytes — writable as well when `writable` is true.
 //! * `len` equals the segment size, which the seals make **immutable**, so the
 //!   mapping can never be truncated out from under a reader.
-//! * All typed access to the bytes goes through `tf_tree_core`'s atomic
-//!   protocols, which is what makes `Send + Sync` sound — the identical argument
-//!   [`crate::heap::HeapArena`] makes.
-//!
-//! # Why `memfd` and not `shm_open`
-//!
-//! Sealing. After [`MappedArena::create`] applies `F_SEAL_SHRINK | F_SEAL_GROW |
-//! F_SEAL_SEAL`, the segment's size is immutable for the life of the fd, and
-//! **`SIGBUS` becomes structurally impossible**. Without a seal, any process
-//! holding the fd could `ftruncate` the segment, and every reader touching a
-//! truncated page would take `SIGBUS` from inside a lookup — an unrecoverable
-//! fault in the middle of a control loop that a library cannot handle sanely.
-//! `shm_open` segments cannot be sealed, which is why `docs/PHASE2.md` §3.2
-//! forbids that "simplification".
-//!
-//! [`MappedArena::attach`] *verifies* the seals rather than trusting them, and
-//! refuses an unsealed segment. A peer that hands you an unsealed fd is either
-//! buggy or hostile, and the two are indistinguishable from here.
-//!
-//! # Trust model
-//!
-//! Per `docs/PHASE2.md` §0: participants are mutually trusting, same-user,
-//! cooperating processes. A read-write peer can corrupt any part of the arena
-//! and no checksum changes that. The **read-only** attach mode is the one real
-//! boundary, and it is enforced by the MMU, not by convention — which is why it
-//! is the right default for consumers.
+//! * All typed access goes through `tf_tree_core`'s atomic protocols, which is
+//!   what makes `Send + Sync` sound — [`crate::heap::HeapArena`]'s argument.
 
 use core::ptr::NonNull;
 
@@ -62,8 +43,7 @@ const REQUIRED_SEALS: SealFlags = SealFlags::SHRINK.union(SealFlags::GROW);
 /// How a process attaches to an existing segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachMode {
-    /// `PROT_READ` only. The consumer default: the MMU makes corruption
-    /// impossible rather than merely impolite.
+    /// `PROT_READ` only; the consumer default, enforced by the MMU.
     ReadOnly,
     /// `PROT_READ | PROT_WRITE`. Required to publish samples or claim edges.
     ReadWrite,
@@ -71,10 +51,8 @@ pub enum AttachMode {
 
 /// An [`Arena`] backed by a sealed `memfd` mapped `MAP_SHARED`.
 ///
-/// The whole point of this type is that nothing above it knows it exists: the
-/// stack is written against [`Arena`], so the same reader code runs unmodified
-/// against a [`crate::heap::HeapArena`] and against a segment shared by another
-/// process.
+/// Nothing above it knows it exists: the stack is written against [`Arena`], so
+/// the same reader code runs unmodified against a [`crate::heap::HeapArena`].
 pub struct MappedArena {
     base: NonNull<u8>,
     len: usize,
@@ -82,40 +60,24 @@ pub struct MappedArena {
     writable: bool,
     /// The process that established this mapping.
     ///
-    /// The mapping is `MADV_DONTFORK` (§7.3), so a `fork` child does not have
-    /// it — the address range is a *hole* in the child's address space. An
-    /// unguarded `munmap` there is usually a harmless no-op, but "usually" is
-    /// doing real work in that sentence: nothing stops the kernel from placing a
-    /// later mapping of the child's own into that hole, and the destructor would
-    /// then unmap memory belonging to something else entirely, at a distance,
-    /// with no diagnostic.
-    ///
-    /// `getpid` is a syscall, and that is affordable *here* and nowhere else:
-    /// this runs once per arena teardown. The equivalent check on the hot path
-    /// is a `pthread_atfork` counter (`tf_tree_ipc::fork`), which this crate
-    /// deliberately does not depend on — the dependency would point the wrong
-    /// way, and a destructor can pay 50 ns.
-    ///
-    /// **Coverage, stated plainly: no test fails when this check is removed.**
-    /// `crates/tf_tree_bench/tests/fork.rs` was run against that mutant and
-    /// stayed green, because `munmap` on a hole succeeds and does nothing — the
-    /// damage needs the child to have placed a mapping of its own in that hole
-    /// first, which the harness does not arrange and cannot arrange without a
-    /// public accessor for the arena's base address that exists for no other
-    /// reason. Kept anyway: the state is reachable by any child that allocates
-    /// enough, the failure is silent and at a distance, and nothing else guards
-    /// it.
+    /// The mapping is `MADV_DONTFORK` (§7.3), so in a `fork` child the range is
+    /// a *hole*; `munmap` there is a no-op unless the child has put a mapping of
+    /// its own in the hole, and then the destructor unmaps it, silently and at a
+    /// distance. `getpid` is a syscall, affordable once per teardown — the
+    /// hot-path equivalent, `tf_tree_ipc::fork`'s atfork counter, is a
+    /// dependency pointing the wrong way. **No test fails when this check is
+    /// removed** (`crates/tf_tree_bench/tests/fork.rs` stayed green: `munmap` on
+    /// a hole succeeds, and the harness cannot fill the hole without a public
+    /// base-address accessor); kept because nothing else guards it.
     owner_pid: rustix::process::Pid,
 }
 
 impl MappedArena {
     /// Create a new sealed segment sized for `layout` and write its header.
     ///
-    /// Follows `docs/PHASE2.md` §3.2. Sealing happens **after** the mapping is
-    /// established, which is what lets the creator keep write access:
-    /// `F_ADD_SEALS SHRINK|GROW` succeeds while a writable mapping is held,
-    /// whereas `F_SEAL_WRITE` would return `EBUSY` — so the size is frozen
-    /// without freezing the contents.
+    /// `docs/PHASE2.md` §3.2. Sealing happens **after** the mapping so the
+    /// creator keeps write access: `F_ADD_SEALS SHRINK|GROW` succeeds under a
+    /// writable mapping where `F_SEAL_WRITE` would return `EBUSY`.
     ///
     /// # Errors
     ///
@@ -139,10 +101,8 @@ impl MappedArena {
         }
         let len = layout.total_size();
 
-        // `MFD_ALLOW_SEALING` is required for step 5 below; without it
-        // `F_ADD_SEALS` returns EPERM and the segment can never be made
-        // SIGBUS-safe. `MFD_CLOEXEC` so a segment is never leaked into an
-        // unrelated child by accident — sharing is always deliberate.
+        // Without `MFD_ALLOW_SEALING` the `F_ADD_SEALS` below is EPERM and the
+        // segment can never be made SIGBUS-safe. `CLOEXEC`: sharing is explicit.
         let cname = CName::new(name);
         let fd = memfd_create(
             cname.as_cstr(),
@@ -151,21 +111,13 @@ impl MappedArena {
         .map_err(ShmError::Create)?;
         ftruncate(&fd, len as u64).map_err(ShmError::Truncate)?;
 
-        // **No `MAP_POPULATE`** — see `unsafe_map`, which is where that decision
-        // and its measurement live. `docs/PHASE2.md` §7.1 is NORMATIVE that
-        // population happens at declaration granularity; mapping the whole arena
-        // eagerly charged 66.3 MiB of RSS against 66.1 MiB declared.
-        // `MappedArena::populate_hot` puts back exactly the pages that are read.
+        // **No `MAP_POPULATE`** — see `unsafe_map` for the measurement.
         let base = unsafe_map(len, ProtFlags::READ | ProtFlags::WRITE, &fd)?;
 
-        // **Take ownership of the mapping before the first fallible step.** Every
-        // `?` below returns early, and until this value exists there is no `Drop`
-        // to `munmap`: a failed `getrandom` or `F_ADD_SEALS` would strand the
-        // segment's address space, and — because the mapping holds its own
-        // reference to the memfd inode — its committed pages too, for the life of
-        // the process. Dropping `fd` does not release them. The whole reason
-        // `MappedArena` owns the mapping is that `Drop` unmaps it exactly once;
-        // the construction was simply on the wrong side of the fallible steps.
+        // **Own the mapping before the first fallible step.** Until this value
+        // exists there is no `Drop` to `munmap`, so a failing `?` below strands
+        // the address space and — the mapping holding its own reference to the
+        // memfd inode — its committed pages, for the life of the process.
         let arena = MappedArena {
             owner_pid: rustix::process::getpid(),
             base,
@@ -175,10 +127,9 @@ impl MappedArena {
         };
 
         let uuid = instance_uuid()?;
-        // SAFETY: `arena.base` addresses `len` freshly zeroed bytes (a memfd is
-        // zero-filled and was just sized), page-aligned hence 64-byte aligned,
-        // and no other mapping of this fd exists yet, so this call uniquely owns
-        // the region.
+        // SAFETY: `arena.base` addresses `len` freshly zeroed bytes (a memfd,
+        // just sized), page-aligned hence 64-byte aligned, and no other mapping
+        // of this fd exists yet, so this call uniquely owns the region.
         unsafe {
             write_header_at(
                 arena.base.as_ptr(),
@@ -191,9 +142,8 @@ impl MappedArena {
             )
         };
 
-        // Step 5, the load-bearing one. SEAL itself prevents any future seal
-        // being added, so a peer cannot later add F_SEAL_WRITE and freeze the
-        // writer out.
+        // SEAL itself prevents any future seal, so a peer cannot later add
+        // F_SEAL_WRITE and freeze the writer out.
         fcntl_add_seals(&arena.fd, REQUIRED_SEALS | SealFlags::SEAL).map_err(ShmError::Seal)?;
 
         arena.advise();
@@ -202,19 +152,18 @@ impl MappedArena {
 
     /// Map an existing segment from a received fd, validating it first.
     ///
-    /// Follows `docs/PHASE2.md` §3.3 steps 4-6. Every check here is a refusal to
-    /// trust a peer about something this process can verify itself.
+    /// `docs/PHASE2.md` §3.3 steps 4-6: every check is a refusal to trust a peer
+    /// about something this process can verify itself.
     ///
     /// # Errors
     ///
     /// [`ShmError::Unsealed`] if the segment could be truncated under us;
     /// [`ShmError::BadMagic`], [`ShmError::VersionMismatch`],
-    /// [`ShmError::LayoutMismatch`] or [`ShmError::SizeMismatch`] if it is not a
-    /// segment this build can read.
+    /// [`ShmError::LayoutMismatch`] or [`ShmError::SizeMismatch`] if this build
+    /// cannot read it.
     pub fn attach(fd: OwnedFd, mode: AttachMode) -> Result<MappedArena, ShmError> {
-        // Refuse an unsealed segment *before* mapping it. Once mapped, a
-        // truncation by any fd holder turns every subsequent read into SIGBUS,
-        // and a library cannot recover from that.
+        // Refuse *before* mapping: afterwards a truncation by any fd holder
+        // turns every subsequent read into an unrecoverable SIGBUS.
         let seals = fcntl_get_seals(&fd).map_err(ShmError::SealQuery)?;
         if !seals.contains(REQUIRED_SEALS) {
             return Err(ShmError::Unsealed);
@@ -241,43 +190,25 @@ impl MappedArena {
         };
         arena.advise();
 
-        // Validate the header only now that it is mapped. On any failure the
-        // `MappedArena` is dropped, unmapping cleanly.
-        //
-        // The checks themselves live in `crate::check` because the frozen-file
-        // backend must make exactly the same ones, and a check that exists on
-        // one path and not the other is a hole with a filename on it.
+        // Validated only once mapped; on failure the `MappedArena` drops and
+        // unmaps. In `crate::check` because the frozen-file backend shares them.
         validate_arena_header(arena.header(), size)?;
         Ok(arena)
     }
 
     /// Fault in `[offset, offset + len)` of this arena, up front.
     ///
-    /// # Why this is not `MADV_WILLNEED`
+    /// **Not `MADV_WILLNEED`** — `docs/PHASE2.md` §7.1: *"does not work here
+    /// (measured: zero change in charged pages on a memfd). Do not substitute
+    /// it."* A memfd's pages are already in the page cache; the page *tables*
+    /// are what need populating. The advice follows the mapping's protection
+    /// (`POPULATE_WRITE` on `PROT_READ` is `EINVAL`), and `WRITE` is right for a
+    /// writable mapping even before any store, which `POPULATE_READ` would leave
+    /// to take a copy-on-write fault.
     ///
-    /// `docs/PHASE2.md` §7.1: *"`MADV_WILLNEED` does not work here (measured:
-    /// zero change in charged pages on a memfd). Do not substitute it."*
-    /// `WILLNEED` is a readahead hint for page-cache-backed mappings; a memfd's
-    /// pages are already in the page cache, so it has nothing to do. What is
-    /// needed is population of the *page tables*, which is `MADV_POPULATE_*`.
-    ///
-    /// # Read versus write
-    ///
-    /// `MADV_POPULATE_WRITE` on a `PROT_READ` mapping is `EINVAL`, so the advice
-    /// follows the mapping's protection. For a writable mapping `WRITE` is the
-    /// right one even though nothing is written yet: `POPULATE_READ` on a
-    /// private-writable page would fault in the shared zero page and leave the
-    /// first *store* to take a copy-on-write fault, which is the fault this
-    /// exists to remove. (`MAP_SHARED` makes that moot here, but the rule is
-    /// worth not having to re-derive.)
-    ///
-    /// # Errors
-    ///
-    /// Never. `MADV_POPULATE_*` landed in Linux 5.14 and returns `EINVAL` on
-    /// anything older; that case falls back to touching the pages by hand, which
-    /// is what the kernel would have done anyway. Any other errno means the
-    /// pages stay cold and the first access faults — slower, never incorrect —
-    /// so this returns `()` rather than an error nobody could act on.
+    /// Infallible: `MADV_POPULATE_*` needs Linux 5.14 and is `EINVAL` below it,
+    /// which falls back to touching pages by hand; any other errno leaves pages
+    /// cold — slower, never incorrect.
     pub fn populate(&self, offset: usize, len: usize) {
         if len == 0 || offset >= self.len {
             return;
@@ -289,8 +220,7 @@ impl MappedArena {
             Advice::LinuxPopulateRead
         };
         // SAFETY: module invariant — `base` addresses `self.len` bytes of this
-        // arena's own live mapping, and `offset + len` is clamped to it above,
-        // so the range passed is inside that mapping.
+        // arena's own live mapping, and `offset + len` is clamped to it above.
         let r = unsafe { madvise(self.base.as_ptr().add(offset).cast(), len, advice) };
         if r == Err(rustix::io::Errno::INVAL) {
             self.populate_by_touch(offset, len);
@@ -299,92 +229,50 @@ impl MappedArena {
 
     /// Kernels before 5.14: fault the pages in by touching one byte per page.
     ///
-    /// A **read** of each page, never a write, on both mapping modes. A write
-    /// would be a correctness bug rather than a slow path: this runs on a
-    /// segment other processes are already using, and storing anything — even
-    /// the byte that is already there — into a live claim record or sample slot
-    /// races every reader of it. A read fault populates the page table entry,
-    /// which is the entire objective.
+    /// A **read** on both mapping modes, never a write: this runs on a live
+    /// segment, so a store races every reader of a claim record or sample slot.
     fn populate_by_touch(&self, offset: usize, len: usize) {
         for at in touch_offsets(offset, len) {
-            // SAFETY: `at` is within `[offset, offset + len)` — see
-            // `touch_offsets`, which is where that is established and tested —
-            // and the caller has already clamped that range to this arena's
-            // mapping. `read_volatile` is used so the load cannot be optimised
-            // away: the fault it takes is the only reason the load exists.
+            // SAFETY: `at` is within `[offset, offset + len)` (established and
+            // tested in `touch_offsets`) and the caller clamped that range to
+            // this mapping. `read_volatile`: the fault is the load's only point.
             unsafe {
                 core::ptr::read_volatile(self.base.as_ptr().add(at));
             }
         }
     }
 
-    /// The first 256 bytes of the arena, for tests that assert nothing wrote to
-    /// it.
+    /// The first 256 bytes, for tests asserting nothing wrote to the arena.
     #[cfg(test)]
     fn header_snapshot(&self) -> [u8; 256] {
         let mut out = [0u8; 256];
-        // SAFETY: module invariant — the mapping is at least 256 bytes (it is at
-        // least `size_of::<ArenaHeader>()`, which is 320 since FORMAT_VERSION 3
-        // and was 256 before it), and this only reads. The snapshot deliberately
-        // stays 256: it exists to compare the *pinned* header prefix across a
-        // remap, and every field it is used to check lives below 256.
+        // SAFETY: module invariant — the mapping is at least
+        // `size_of::<ArenaHeader>()` (320 since FORMAT_VERSION 3) and this only
+        // reads. Still 256: every field it pins lives below that.
         unsafe { core::ptr::copy_nonoverlapping(self.base.as_ptr(), out.as_mut_ptr(), 256) };
         out
     }
 
-    /// Populate every region that is actually read, and nothing else (§7.1).
+    /// Populate every region that is actually read, and nothing else (§7.1) —
+    /// the cold headroom tails are the whole win: 66 MiB on the arena measured
+    /// in `unsafe_map`. §7.1's *declaration* granularity survives `0004` moving
+    /// declaration to build time because `frame_count`/`edge_count` are live
+    /// header counters: an attaching process derives the extents itself, with
+    /// nothing passed in and nothing to keep in sync with the builder.
     ///
-    /// # What "actually read" means, and why the header can answer it
-    ///
-    /// §7.1 says to populate at *declaration* granularity. Decision `0004` moved
-    /// declaration to build time, so there is no `declare_dynamic` to hook — but
-    /// the arena records what was declared: `frame_count` and `edge_count` are
-    /// live counters in the header. So an **attaching** process derives the used
-    /// extents itself, with nothing passed in and no agreement to keep in sync
-    /// with the builder.
-    ///
-    /// | region | populated |
-    /// |---|---|
-    /// | header | all (320 B) |
-    /// | frame table | `frame_count` records |
-    /// | frame hash | **none** — probed by hash, so it is scattered; interning is not the hot path |
-    /// | topology blocks | `frame_count` entries of each of the four |
-    /// | claim table | `edge_count` records |
-    /// | participant table | all (8 KiB, and every liveness check walks it) |
-    /// | edge table | `edge_count` records |
-    /// | stamp + pose arenas | **none — see below** |
-    /// | edge counters | `edge_count` records — written by `Guard::drop` on every read batch |
-    /// | participant counters | all (8 KiB) — same path, keyed by the reader's own slot |
-    ///
-    /// The headroom tails are what this leaves cold, and they are the whole
-    /// win: on the measured arena above, 66 MiB of it.
-    ///
-    /// # Why the two ring arenas are not populated here
-    ///
-    /// They used to be, in full — `stamp_slots * 8` and `pose_slots * 64`, on
-    /// the stated grounds that `0004` sizes them to the declared rings exactly.
-    /// That is true and it is the wrong granularity: §7.1 is NORMATIVE that
-    /// population is **per-edge**, and "every declared ring" is per-*arena*. The
-    /// rings are 99.8% of a large arena, so the over-approximation is very
-    /// nearly the whole cost — a process that attaches to a 200-edge arena and
-    /// reads five of those edges was charged for all 200 forever.
-    ///
-    /// So the rings moved to the two moments an edge is actually taken up:
-    /// `Tree::claim` for the writer's, and plan compilation for a reader's. Both
-    /// are off the query path by D3, so §7.1's guarantee — no page fault inside
-    /// a lookup — is preserved for the *reason* it is stated rather than by
-    /// populating everything and hoping. The extents cannot be computed here:
-    /// they come from `EdgeRecord`'s `stamp_off`/`pose_off`/`capacity`, and
-    /// `EdgeRecord` lives in `tf_tree_core`, which depends on this crate.
-    /// `ArenaView::ring_extents` is the other half of this and names it back.
-    ///
-    /// Frames interned *after* this runs fault once, which is correct — that is
-    /// a rare path, and pre-faulting a 200 000-frame table on the chance that
-    /// one more name shows up is exactly what §7.1 forbids.
+    /// Deliberately left cold: the frame hash (probed by hash, so scattered, and
+    /// interning is not the hot path), and the stamp and pose rings. The rings
+    /// were populated in full, which is per-*arena* where §7.1 is NORMATIVE that
+    /// population is **per-edge**; at 99.8% of a large arena, a process reading
+    /// 5 edges of 200 paid for all 200. They moved to `Tree::claim` and to plan
+    /// compilation, both off the query path by D3. Their extents cannot be
+    /// computed here — they come from `EdgeRecord` in `tf_tree_core`, which
+    /// depends on this crate (`ArenaView::ring_extents` is the other half).
+    /// Frames interned after this fault once, which §7.1 requires.
     pub fn populate_hot(&self) {
         // SAFETY: module invariant — the mapping is at least `size_of::<ArenaHeader>()`
-        // bytes (checked by `attach`, and by construction in `create`), aligned,
-        // and the header is only ever read through this shared reference.
+        // bytes (checked by `attach`, by construction in `create`), aligned, and
+        // the header is only ever read through this shared reference.
         let h = unsafe { &*self.base.as_ptr().cast::<ArenaHeader>() };
         let frames = h.frame_count.load(core::sync::atomic::Ordering::Acquire) as usize;
         let edges = h.edge_count.load(core::sync::atomic::Ordering::Acquire) as usize;
@@ -392,9 +280,8 @@ impl MappedArena {
         self.populate(0, core::mem::size_of::<ArenaHeader>());
         self.populate(h.frame_table_off as usize, frames * 64);
 
-        // The four topology blocks are strided, not contiguous, so each one's
-        // used prefix is populated separately. Populating `blocks * stride` from
-        // the first would pull in three blocks' worth of headroom.
+        // Strided, not contiguous: `blocks * stride` from the first would pull
+        // in three blocks' worth of headroom.
         let topo_used = frames * 12;
         for b in 0..TOPO_BLOCKS {
             let off = h.topo_block_off as usize + b * h.topo_block_stride as usize;
@@ -407,17 +294,12 @@ impl MappedArena {
             h.max_participants as usize * 128,
         );
         self.populate(h.edge_table_off as usize, edges * 128);
-        // The stamp and pose arenas are deliberately absent — see the doc
-        // comment. Per-edge, at claim and at plan, driven from the facade.
+        // Stamp and pose arenas are deliberately absent — see the doc comment.
 
-        // v3's counter regions (`docs/PHASE5.md` §5.2). These are not
-        // diagnostics-only pages that a `top` invocation happens to touch:
-        // `Guard::drop` does a `fetch_add` into `edge_counters` at the end of
-        // every read batch and `note_err` writes there on every failure, so they
-        // are on the *lookup* path of any read-write participant — exactly the
-        // pages §7.1 exists to warm. Left out, an attaching process takes ~34
-        // minor faults at 1-3 µs each inside a control loop's first iterations,
-        // against a 150 ns p50 budget.
+        // v3's counter regions (`docs/PHASE5.md` §5.2) are on the *lookup* path
+        // of a read-write participant, not diagnostics: `Guard::drop`
+        // `fetch_add`s here every read batch. Left cold, an attaching process
+        // takes ~34 minor faults at 1-3 µs each against a 150 ns p50 budget.
         self.populate(h.edge_counters_off as usize, edges * 128);
         self.populate(
             h.participant_counters_off as usize,
@@ -425,21 +307,17 @@ impl MappedArena {
         );
     }
 
-    /// Apply the mapping policy from `docs/PHASE2.md` §7. Both calls are
-    /// best-effort: a kernel without transparent huge pages, or a mapping the
-    /// kernel declines to mark, is not a reason to fail an attach.
+    /// Apply `docs/PHASE2.md` §7's mapping policy. Both calls are best-effort: a
+    /// kernel without transparent huge pages must not fail an attach.
     fn advise(&self) {
-        // MADV_DONTFORK is the easy one to forget (§7.3) and the consequences
-        // are subtle: a forked child would otherwise inherit the mapping and
-        // become an invisible participant that no registry knows about, holding
-        // the segment alive and potentially writing to it.
+        // MADV_DONTFORK (§7.3) is easy to forget: a forked child would inherit
+        // the mapping as an invisible participant no registry knows about.
         let _ = self.madvise(Advice::LinuxDontFork);
         let _ = self.madvise(Advice::LinuxHugepage);
     }
 
     fn madvise(&self, advice: Advice) -> rustix::io::Result<()> {
-        // SAFETY: module invariant — `base`/`len` describe this arena's own live
-        // mapping, which is what `madvise` requires.
+        // SAFETY: module invariant — `base`/`len` are this arena's live mapping.
         unsafe { madvise(self.base.as_ptr().cast(), self.len, advice) }
     }
 
@@ -458,26 +336,16 @@ impl MappedArena {
     #[must_use]
     pub fn header(&self) -> &ArenaHeader {
         // SAFETY: module invariant — the base addresses at least
-        // size_of::<ArenaHeader>() readable bytes (checked in `attach`, sized in
-        // `create`) and is page-aligned, hence aligned for ArenaHeader.
+        // size_of::<ArenaHeader>() readable bytes and is page-aligned.
         unsafe { &*self.base.as_ptr().cast::<ArenaHeader>() }
     }
 }
 
 /// Draw 16 random bytes for a new arena's `instance_uuid`.
 ///
-/// `getrandom` is documented not to return a short read for buffers this small
-/// **except when interrupted by a signal**, and "except when interrupted" is the
-/// entire hazard here: a partially-filled uuid is still 16 bytes that look
-/// random, so a short read would not announce itself anywhere downstream. The
-/// loop therefore refills from where it stopped rather than assuming one call
-/// suffices.
-///
-/// The call **blocks** (no `GRND_NONBLOCK`), deliberately. Arena creation is a
-/// startup operation, so waiting for the entropy pool on a freshly-booted
-/// embedded target is correct where spinning on `EAGAIN` would not be — and
-/// with blocking flags `EAGAIN` cannot be returned at all, so there is no arm
-/// for it to hide in.
+/// The refill loop exists because a signal can short-read even 16 bytes, and a
+/// partly filled uuid still looks random downstream. It **blocks** deliberately:
+/// creation is startup work, and blocking flags cannot return `EAGAIN` at all.
 fn instance_uuid() -> Result<[u8; 16], ShmError> {
     use rustix::rand::{getrandom, GetRandomFlags};
 
@@ -485,13 +353,10 @@ fn instance_uuid() -> Result<[u8; 16], ShmError> {
     let mut filled = 0;
     while filled < uuid.len() {
         match getrandom(&mut uuid[filled..], GetRandomFlags::empty()) {
-            // A zero-length read with no error would spin forever; there is no
-            // legitimate way for `getrandom` to make no progress on a non-empty
-            // buffer, so treat it as the I/O failure it is.
+            // No progress on a non-empty buffer is not legitimate; do not spin.
             Ok(0) => return Err(ShmError::Random(rustix::io::Errno::IO)),
             Ok(n) => filled += n,
-            // A blocking `getrandom` is interruptible; every other errno is a
-            // real failure and must not be retried.
+            // A blocking `getrandom` is interruptible; other errnos are real.
             Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(ShmError::Random(e)),
         }
@@ -502,45 +367,32 @@ fn instance_uuid() -> Result<[u8; 16], ShmError> {
 /// Byte offsets to touch so that every page overlapping `[offset, offset + len)`
 /// is faulted in — one per page, plus the first, and **never past the end**.
 ///
-/// Pulled out of [`MappedArena::populate_by_touch`] as a pure function precisely
-/// so its bound can be tested. The kernel side of that function is not
-/// observable from inside this crate — residency needs `mincore`, which
-/// `rustix` does not have and which is not worth a `libc` dependency here — so a
-/// test of the *effect* cannot distinguish "touched every page" from "stopped
-/// one page short". A test of the arithmetic can, and the arithmetic is the part
-/// that can be wrong.
-///
-/// Every yielded offset is `< offset + len`, which is what makes the `unsafe`
-/// read in the caller in-bounds.
+/// Pure so the bound can be tested: residency needs `mincore`, which `rustix`
+/// lacks and which is not worth a `libc` dependency here, so a test of the
+/// *effect* cannot tell "touched every page" from "stopped one short". Every
+/// offset is `< offset + len`, which makes the caller's `unsafe` read in-bounds.
 fn touch_offsets(offset: usize, len: usize) -> impl Iterator<Item = usize> {
     const PAGE: usize = 4096;
-    // The first page of the range starts at `offset`, which is not necessarily
-    // page-aligned; stepping from the *aligned* base instead would touch a page
-    // before the range.
+    // The range's first page starts at `offset`, not necessarily page-aligned;
+    // stepping from the aligned base would touch a page before the range.
     (0..len).step_by(PAGE).map(move |d| offset + d)
 }
 
 /// `mmap` `len` bytes of `fd` shared, **without** prefaulting.
 fn unsafe_map(len: usize, prot: ProtFlags, fd: &OwnedFd) -> Result<NonNull<u8>, ShmError> {
-    // SAFETY: `mmap` with a null hint lets the kernel choose an address, so no
-    // existing mapping can be replaced. `len` is the segment's size and `fd`
-    // refers to a memfd of at least that size (just `ftruncate`d, or `fstat`ed).
-    // The returned pointer is checked for null by `NonNull::new`.
+    // SAFETY: a null hint lets the kernel choose the address, so no existing
+    // mapping can be replaced; `len` is the segment's size and `fd` a memfd of
+    // at least that size. `NonNull::new` checks the result for null.
     let raw = unsafe {
         mmap(
             core::ptr::null_mut(),
             len,
             prot,
             // No `MAP_POPULATE`: `docs/PHASE2.md` §7.1 is NORMATIVE that
-            // population happens at declaration granularity, not over the whole
-            // address space. Measured, on an arena declaring one 1024-slot edge
-            // with 200k slots of frame/edge headroom: `MAP_POPULATE` charged
-            // **66.3 MiB of RSS against 66.1 MiB declared** — essentially all of
-            // it headroom nobody asked for and nothing ever reads.
-            //
-            // `MappedArena::populate_hot` puts back exactly the pages that are
-            // actually touched, and reports failure, which `MAP_POPULATE`
-            // cannot: it is best-effort and silent.
+            // population happens at declaration granularity. Measured on an
+            // arena declaring one 1024-slot edge with 200k slots of headroom, it
+            // charged **66.3 MiB of RSS against 66.1 MiB declared**.
+            // `populate_hot` puts back the pages touched, and reports failure.
             MapFlags::SHARED,
             fd,
             0,
@@ -557,25 +409,22 @@ impl Drop for MappedArena {
             return;
         }
         // SAFETY: module invariant — `base`/`len` are exactly what `mmap`
-        // returned for this arena, unmapped here exactly once. The `getpid`
-        // guard above additionally establishes that this is the process the
-        // mapping was made in, so the range is still ours.
+        // returned, unmapped here exactly once, and the `getpid` guard
+        // establishes that this is still the process it was made in.
         let _ = unsafe { munmap(self.base.as_ptr().cast(), self.len) };
     }
 }
 
-// SAFETY: `MappedArena` owns its mapping and exposes only the base pointer and
-// length. It hands out no interior references that alias the bytes, and all
-// concurrent access — within this process or from another — is mediated by the
-// atomic protocols in `tf_tree_core`.
+// SAFETY: `MappedArena` owns its mapping and exposes only base and length; it
+// hands out no interior references that alias the bytes, and all concurrent
+// access is mediated by `tf_tree_core`'s atomic protocols.
 unsafe impl Send for MappedArena {}
 // SAFETY: see the `Send` impl above.
 unsafe impl Sync for MappedArena {}
 
 // SAFETY: `base()`/`len()` describe one live mapping at a fixed page-aligned
-// address, valid for `len` bytes until `Drop`. The seals verified in `attach`
-// (and applied in `create`) are what make `len` immutable for the fd's lifetime,
-// so the region cannot be truncated out from under a reader.
+// address, valid for `len` bytes until `Drop`. The seals (applied in `create`,
+// verified in `attach`) make `len` immutable for the fd's lifetime.
 unsafe impl Arena for MappedArena {
     fn base(&self) -> *mut u8 {
         self.base.as_ptr()
@@ -588,11 +437,8 @@ unsafe impl Arena for MappedArena {
 
 /// A NUL-terminated copy of a short segment name, on the stack.
 ///
-/// `memfd_create` wants a `&CStr` and this crate is `no_std + alloc` with a
-/// deliberately tiny dependency budget, so building one without pulling in
-/// anything is worth 20 lines. The name is debug-only — it shows up in
-/// `/proc/<pid>/fd` — so silently truncating an over-long one is the right
-/// failure mode.
+/// `memfd_create` wants a `&CStr` and this crate's dependency budget is tiny.
+/// The name is debug-only (`/proc/<pid>/fd`), so truncating is right.
 struct CName {
     buf: [u8; Self::CAP],
     len: usize,
@@ -604,24 +450,20 @@ impl CName {
     fn new(name: &str) -> CName {
         let mut buf = [0u8; Self::CAP];
         let src = name.as_bytes();
-        // Truncate at the first interior NUL. `from_bytes_with_nul_unchecked`
-        // requires exactly one NUL, at the end, and `name` is arbitrary caller
-        // input — `build_shared("a\0b")` would otherwise violate that contract.
-        // The kernel would stop at the first NUL anyway, so this only makes the
-        // Rust-side invariant match what actually happens.
+        // Truncate at the first interior NUL: `from_bytes_with_nul_unchecked`
+        // requires exactly one, at the end, and `name` is arbitrary caller input
+        // (`build_shared("a\0b")`). The kernel stops there anyway.
         let end = src.iter().position(|&b| b == 0).unwrap_or(src.len());
         // Leave room for the terminator. The kernel treats the name as opaque
-        // bytes, so a truncated multi-byte sequence is harmless — it is a debug
-        // label in /proc/<pid>/fd, nothing more.
+        // bytes, so a truncated multi-byte sequence is harmless.
         let n = core::cmp::min(end, Self::CAP - 1);
         buf[..n].copy_from_slice(&src[..n]);
         CName { buf, len: n }
     }
 
     fn as_cstr(&self) -> &core::ffi::CStr {
-        // SAFETY: `buf` was zero-initialized and only `buf[..len]` was written
-        // with `len <= CAP - 1`, so `buf[len]` is a NUL and the slice up to and
-        // including it contains exactly one NUL, at the end.
+        // SAFETY: `buf` was zero-initialized and only `buf[..len]` written, with
+        // `len <= CAP - 1`, so `buf[len]` is a NUL and is the only one.
         unsafe { core::ffi::CStr::from_bytes_with_nul_unchecked(&self.buf[..=self.len]) }
     }
 }
@@ -643,19 +485,10 @@ mod tests {
         MappedArena::create("tf_tree.uuid_test", &fixture(), 1234, 5678, [7; 16]).unwrap()
     }
 
-    /// **The fallback must not write.** It runs on a segment other processes
-    /// are already using, so a store — even of the byte that is already there —
-    /// races every reader of a live claim record or sample slot. That would be a
-    /// correctness bug, not a slow path.
-    ///
-    /// `MADV_POPULATE_*` landed in Linux 5.14, so on every machine this is
-    /// developed and tested on, [`MappedArena::populate`] takes the `madvise`
-    /// branch and this path is dead code that ships anyway; calling it directly
-    /// is the only way it is exercised at all.
-    ///
-    /// What this **cannot** show is that every page was touched: residency is
-    /// not observable from inside this crate. That is why the bound lives in
-    /// [`touch_offsets`] and is tested there.
+    /// **The fallback must not write**: it runs on a live segment, so a store
+    /// races every reader of a claim record or sample slot. `MADV_POPULATE_*`
+    /// (Linux 5.14+) means [`MappedArena::populate`] never reaches it here, so
+    /// only a direct call covers it; its page bound is in [`touch_offsets`].
     #[test]
     fn the_pre_5_14_fallback_writes_nothing() {
         let arena = create();
@@ -669,13 +502,9 @@ mod tests {
         );
     }
 
-    /// The fallback's bound, tested where it is observable.
-    ///
-    /// Residency is not visible from inside this crate, so the effect of
-    /// `populate_by_touch` cannot be distinguished from a loop that stops a page
-    /// early — which is why the bound lives in a pure function. Mutant:
-    /// `while at + PAGE < end` in the original loop shape, i.e. dropping the
-    /// final partial page ⇒ the last two cases below fail.
+    /// The fallback's bound, tested where it is observable (residency is not).
+    /// Mutant: `while at + PAGE < end`, dropping the final partial page ⇒ the
+    /// last two cases below fail.
     #[test]
     fn touch_offsets_covers_every_page_and_never_passes_the_end() {
         let v = |o, l| touch_offsets(o, l).collect::<alloc::vec::Vec<_>>();
@@ -684,12 +513,10 @@ mod tests {
         assert_eq!(v(0, 4096), alloc::vec![0]);
         assert_eq!(v(0, 4097), alloc::vec![0, 4096]);
         assert_eq!(v(0, 8192), alloc::vec![0, 4096]);
-        // A range that starts mid-page must touch *that* page, not the aligned
-        // one before it.
+        // A range starting mid-page must touch *that* page, not the one before.
         assert_eq!(v(100, 1), alloc::vec![100]);
         assert_eq!(v(4095, 2), alloc::vec![4095]);
-        // The last partial page is still a page, and skipping it leaves exactly
-        // the fault this code exists to remove.
+        // Skipping the last partial page leaves the fault this exists to remove.
         assert_eq!(v(0, 4096 * 3 + 1), alloc::vec![0, 4096, 8192, 12288]);
         for (o, l) in [(0usize, 12345usize), (7, 99999), (4095, 4097)] {
             for at in touch_offsets(o, l) {
@@ -698,10 +525,8 @@ mod tests {
         }
     }
 
-    /// `populate` must never walk off the end, whatever it is asked for.
-    ///
-    /// The clamp is the only thing between a caller's arithmetic slip and an
-    /// `madvise` over memory this arena does not own.
+    /// `populate` must never walk off the end — the clamp is all that stands
+    /// between a caller's slip and an `madvise` over memory we do not own.
     #[test]
     fn populate_clamps_to_the_mapping() {
         let arena = create();
@@ -710,41 +535,31 @@ mod tests {
         arena.populate(arena.len, 4096);
         arena.populate(arena.len + 1_000_000, 4096);
         arena.populate(0, 0);
-        // Still intact and still readable.
         assert_eq!(arena.header().magic, u64::from_le_bytes(TF_TREE_MAGIC));
     }
 
-    /// The point of an instance id is to tell two *different* segments apart.
-    ///
-    /// A constant would satisfy every other assertion in this file — the field
-    /// would round-trip through `attach`, land at the right offset, and survive
-    /// sealing — while making the split-brain check (`docs/PHASE2.md` §11.2
-    /// scenario 9) compare equal for two unrelated arenas, which is exactly the
-    /// answer it must never give.
+    /// The point of an instance id is to tell two *different* segments apart: a
+    /// constant would satisfy every other assertion here while making the
+    /// split-brain check (`docs/PHASE2.md` §11.2 scenario 9) compare equal.
     #[test]
     fn two_arenas_never_share_an_instance_uuid() {
         let a = create();
         let b = create();
         assert_ne!(a.header().instance_uuid, b.header().instance_uuid);
-        // ...and neither is the all-zero "not a shared instance" sentinel that
-        // a heap arena writes.
+        // ...nor the all-zero "not a shared instance" sentinel a heap arena writes.
         assert_ne!(a.header().instance_uuid, [0; 16]);
         assert_ne!(b.header().instance_uuid, [0; 16]);
     }
 
-    /// A joiner must read the *creator's* id, not one of its own.
-    ///
-    /// This is the direction the wire depends on: `HelloResponse` carries the
-    /// owner's `instance_uuid` and the client compares it against the header it
-    /// just mapped. If `attach` minted a fresh id the comparison would fail for
-    /// every legitimate join.
+    /// A joiner must read the *creator's* id, not one of its own: `HelloResponse`
+    /// carries the owner's `instance_uuid` and the client compares it against
+    /// the header it just mapped, so a fresh id would fail every legitimate join.
     #[test]
     fn attach_preserves_the_creators_instance_uuid() {
         let created = create();
         let uuid = created.header().instance_uuid;
-        // Assert non-zero *before* comparing: if `write_header_at` never wrote
-        // the field, both sides would read all-zero and the equality below would
-        // hold while proving nothing.
+        // Assert non-zero *before* comparing: an unwritten field would read
+        // all-zero on both sides and the equality below would prove nothing.
         assert_ne!(uuid, [0; 16], "instance_uuid was never written");
 
         let fd = rustix::io::fcntl_dupfd_cloexec(created.as_raw_fd(), 0).unwrap();
@@ -753,28 +568,22 @@ mod tests {
         assert_eq!(attached.header().instance_uuid, uuid);
     }
 
-    /// **The seal check is the whole `memfd`-not-`shm_open` argument**, and it
-    /// runs before the segment is mapped: once mapped, any fd holder could
-    /// `ftruncate` it and every subsequent read would fault with `SIGBUS` from
-    /// inside a lookup, which a library cannot recover from.
-    ///
-    /// Mutant: delete the `seals.contains(REQUIRED_SEALS)` guard in `attach` ⇒
-    /// the unsealed case below maps happily and this fails. Nothing else in the
-    /// workspace exercises it — every other test attaches to a segment `create`
-    /// has just sealed for it.
+    /// **The seal check is the whole `memfd`-not-`shm_open` argument** and runs
+    /// before the segment is mapped: after that, any fd holder could `ftruncate`
+    /// it into a `SIGBUS` no library can recover from. Mutant: delete the
+    /// `seals.contains(REQUIRED_SEALS)` guard in `attach` ⇒ the unsealed case
+    /// below maps happily and fails. Nothing else in the workspace covers it.
     #[test]
     fn an_unsealed_or_undersized_segment_is_refused_before_it_is_mapped() {
         let len = fixture().total_size() as u64;
 
-        // No `ALLOW_SEALING`, so the segment can never be sealed and a peer
-        // could shrink it under us.
+        // No `ALLOW_SEALING`, so a peer could shrink it under us.
         let raw = memfd_create(c"tf_tree.unsealed", MemfdFlags::CLOEXEC).unwrap();
         ftruncate(&raw, len).unwrap();
         let refused = MappedArena::attach(raw, AttachMode::ReadOnly).err();
         assert_eq!(refused, Some(ShmError::Unsealed));
 
-        // Sealed, but too small to hold a header — so the header cannot even be
-        // read to find out what the segment claims to be.
+        // Sealed, but too small to hold the header that says what it is.
         let tiny = memfd_create(
             c"tf_tree.tiny",
             MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
@@ -787,12 +596,9 @@ mod tests {
     }
 
     /// **`docs/PHASE2.md` §11.2 scenario 4**: a segment from a different build
-    /// is rejected by value, naming both sides.
-    ///
-    /// Each case is a single-field edit to an otherwise perfectly good segment,
-    /// which is the shape of the real failure: the same binary, rebuilt. Mutant:
-    /// drop any one of the three comparisons in `validate_arena_header` ⇒ the
-    /// corresponding case here reports `None` or the next error down, and fails.
+    /// is rejected by value, naming both sides. Each case is a single-field edit
+    /// — the real failure's shape, the same binary rebuilt. Mutant: drop any of
+    /// `validate_arena_header`'s three comparisons ⇒ that case fails.
     #[test]
     fn attach_refuses_a_segment_this_build_cannot_read() {
         type Poke = fn(&mut ArenaHeader);
@@ -817,8 +623,8 @@ mod tests {
         for (poke, want) in cases {
             let owner = create();
             // SAFETY: `owner` is this test's own read-write mapping of a segment
-            // no other process holds, and its base is a live, page-aligned
-            // (hence 64-byte aligned), initialized `ArenaHeader`. No other
+            // no other process holds, its base is a live, page-aligned (hence
+            // 64-byte aligned), initialized `ArenaHeader`, and no other
             // reference to it is live across this call.
             unsafe { poke(&mut *owner.base().cast::<ArenaHeader>()) };
             let fd = rustix::io::fcntl_dupfd_cloexec(owner.as_raw_fd(), 0).unwrap();
@@ -828,15 +634,11 @@ mod tests {
     }
 
     /// `CName::as_cstr`'s `from_bytes_with_nul_unchecked` requires **exactly
-    /// one** NUL, at the end — and `MappedArena::create` takes the name from an
-    /// arbitrary caller (`tf_tree::TreeBuilder::build_shared` passes it
-    /// straight through), so `create("a\0b")` is reachable public API and this
-    /// truncation is the sole guarantor of that precondition.
-    ///
-    /// Mutant: drop the interior-NUL truncation in `CName::new` ⇒ the buffer
-    /// holds two NULs, the `unsafe` becomes unsound, and the `"a\0b"` case
-    /// fails. Mutant: use `CAP` instead of `CAP - 1` for the length bound ⇒ the
-    /// terminator is overwritten and the long case fails.
+    /// one** NUL, at the end, and `MappedArena::create`'s name is arbitrary
+    /// caller input (`tf_tree::TreeBuilder::build_shared`), so the truncation is
+    /// its sole guarantor. Mutants: drop the interior-NUL truncation ⇒ `"a\0b"`
+    /// holds two NULs, the `unsafe` is unsound and it fails; `CAP` for
+    /// `CAP - 1` ⇒ the terminator is overwritten and the long case fails.
     #[test]
     fn a_segment_name_is_always_exactly_one_nul_terminated_string() {
         for (input, want) in [
@@ -852,8 +654,7 @@ mod tests {
         let long = "x".repeat(4 * CName::CAP);
         let n = CName::new(&long);
         assert_eq!(n.as_cstr().to_bytes().len(), CName::CAP - 1);
-        // And the truncated name still reaches the kernel, rather than being
-        // refused: the whole point of truncating instead of erroring.
+        // The truncated name still reaches the kernel rather than being refused.
         MappedArena::create(&long, &fixture(), 0, 0, [0; 16]).unwrap();
     }
 
