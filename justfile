@@ -49,13 +49,11 @@ test-rust:
     # run.** No count here either: this comment said "eight" and
     # `cargo nextest list -p tf_tree_core --features crash-points | grep -c
     # 'crash_tests::'` disagrees. Same shape as the `bridge` row above and
-    # `just shm-check`: a
-    # default-off feature is invisible to `--workspace`, and a test nobody runs
-    # is not a test. These re-execute the test binary as a child, arm one named
-    # site through `TF_TREE_CRASH_AT`, and assert the child died of `SIGABRT` at
-    # that site and that the state it left is repairable — so they are the only
-    # thing standing between a mis-placed `crash_point!` and a fault-injection
-    # harness that proves nothing.
+    # `just shm-check`: a test nobody runs is not a test. These re-execute the
+    # test binary as a child, arm one named site through `TF_TREE_CRASH_AT`, and
+    # assert the child died of `SIGABRT` at that site and that the state it left
+    # is repairable — so they are the only thing standing between a mis-placed
+    # `crash_point!` and a fault-injection harness that proves nothing.
     cargo nextest run -p tf_tree_core --features crash-points
 
 test-doc:
@@ -119,10 +117,9 @@ test-doc-error-codes:
 #
 # What is genuinely unique to this recipe is narrower and worth keeping for its
 # own sake: the **whole set of stable-tier checks in one place** — clippy on
-# three configurations, the tier's own rustdoc (`just doc` renders the facade at
-# `--all-features`, where a link into `tf_tree::unstable` resolves and here it
-# does not), the consumer-list scan, and the test-count floor. `docs/API.md`
-# §2.6 states the corrected version; do not re-derive it here.
+# three configurations, the tier's own rustdoc, the consumer-list scan, and the
+# test-count floor. `docs/API.md` §2.6 states the corrected version; do not
+# re-derive it here.
 #
 # **Verified to be a real gate, by breaking it.** Reverting the branch's own
 # `frozen.rs` fix — `self.view()` back to `self.arena_view()`, a crate-internal
@@ -142,8 +139,7 @@ test-doc-error-codes:
 # 0.0.1 deleted that line (the manifest's `[dev-dependencies]` comment records
 # why: it does not survive `cargo package`), so the constraint is gone —
 # `cargo nextest list -p tf_tree --lib --tests` reports **70** tests where
-# `--features unstable` reports **77**. The seven are `tests/counters.rs` whole
-# plus one test each in `construction.rs` and `behavior.rs`: they carry
+# `--features unstable` reports **77**. The seven carry
 # `#[cfg(feature = "unstable")]` at the call site now, so on the stable tier they
 # do not exist rather than failing to compile.
 #
@@ -243,9 +239,9 @@ stable-tier-check:
     # **A runtime pass over the tier, from the only place one is available —
     # and the two crates below are here for two different reasons.**
     #
-    # `tf_tree_ingest` links the facade with **no features at all**:
-    # `[workspace.dependencies]` declares `tf_tree = { default-features = false }`,
-    # so `-p tf_tree_ingest` executes a suite through a facade built without
+    # `tf_tree_ingest` links the facade with **no features at all**, the
+    # `default-features = false` configuration named twice above, so
+    # `-p tf_tree_ingest` executes a suite through a facade built without
     # `unstable`. That is the nearest thing in this repository to *running* the
     # stable tier. It is **not** the same feature set as the first line above —
     # `counters` is on there and off here — and `just ingest-check` already
@@ -289,8 +285,6 @@ stable-tier-check:
 loom:
     cargo xtask loom
 
-# Undefined-behavior checking under Miri (arena + core + the facade).
-#
 # `miri-soft-float` is opt-in here and nowhere else: Miri cannot execute the x86
 # inline `sqrt` asm libm's default `arch` feature emits. Enabling it globally
 # would compile the shipped binaries and the benchmarks with soft floats too.
@@ -396,8 +390,6 @@ miri:
 # and the word-boundary form drops those (no boundary before `_`) while still
 # over-counting the census by more than a hundred lines of `// SAFETY:` prose.
 #
-# **Where it runs:** `just lint` depends on it, so it is on every pull request
-# through `ci.yml`'s `lint` job and on every tag through `release.yml`'s.
 # **What it costs, both numbers, because they differ by six times.** On a
 # 4-core host: **9 s** with the `--force-warn` artifacts already in the target
 # directory, and **55 s** on the first run after they are not. `RUSTFLAGS`
@@ -517,21 +509,6 @@ no-conflict-markers:
 #     `Guard::drop` early-returns on `!is_writable()`.
 #
 # Both arenas here are writable, so this is the dear configuration on purpose.
-# **The runtime path, as a node writes it — and the tail a deadline is set
-# against.**
-#
-# `crates/tf_tree/examples/control_loop.rs` is the example that did not exist:
-# the README's worked example is an offline dataloader, so a consumer evaluating
-# this for a control loop had nothing showing plan-once, hoist-the-guard,
-# extrapolate-on-purpose, or `SlotContended` as data rather than as an error.
-#
-# It reports and does **not** gate. `docs/PHASE1.md` §11.3's latency criteria
-# need core-pinned hardware; this runs on whatever host you have, brackets a
-# sub-microsecond operation with two clock reads, and is preempted by whatever
-# else is running — all three of which inflate the numbers, and all three of
-# which it says in its own output. What it is good for is the *shape*: two
-# queries under one guard, and the staleness of a composed route being set by its
-# slowest edge.
 guard-cost:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -554,6 +531,21 @@ guard-cost:
 interp-accuracy:
     cargo run --release -q -p tf_tree_bench --example interp_accuracy
 
+# **The runtime path, as a node writes it — and the tail a deadline is set
+# against.**
+#
+# `crates/tf_tree/examples/control_loop.rs` is the example that did not exist:
+# the README's worked example is an offline dataloader, so a consumer evaluating
+# this for a control loop had nothing showing plan-once, hoist-the-guard,
+# extrapolate-on-purpose, or `SlotContended` as data rather than as an error.
+#
+# It reports and does **not** gate. `docs/PHASE1.md` §11.3's latency criteria
+# need core-pinned hardware; this runs on whatever host you have, brackets a
+# sub-microsecond operation with two clock reads, and is preempted by whatever
+# else is running — all three of which inflate the numbers, and all three of
+# which it says in its own output. What it is good for is the *shape*: two
+# queries under one guard, and the staleness of a composed route being set by its
+# slowest edge.
 control-loop:
     cargo run --release -q -p tf_tree --features shm --example control_loop
 
@@ -883,8 +875,7 @@ gate4-python: py-setup
 # the finding, and because deleting it would leave nobody able to check the
 # claim.
 #
-# **Pinned**, for `cpp-bench`'s reason: an unpinned run migrates cores and swings
-# by more than the gate allows.
+# **Pinned**, for `cpp-bench`'s reason.
 #
 # **Exit status is now the gate** — at the `embedder` profile only. It was not,
 # and the recipe said "wire it in the commit that fixes the regression": this is
@@ -955,11 +946,11 @@ abi-cost:
     fi
     exit "$gate"
 
-# The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
-#
 # Rows append to `$MIRIFLAGS` rather than assigning it, so a caller can add
 # `-Zmiri-strict-provenance` without losing `-Zmiri-disable-isolation` — the fix
 # `just miri` already had. No job sets it here yet.
+#
+# The C ABI under Miri and ASan (PHASE4 §6.1, §7 gate 4).
 c-abi-check:
     MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
@@ -1181,10 +1172,9 @@ ingest-check:
     # recipe in this file compiles exactly one configuration and
     # `#[cfg(not(feature = "compression"))]` code — `tests/codec_free.rs`, the
     # `is_built_in` arm that refuses a codec, `fixture`'s refusal to write one —
-    # is compiled by nothing. That is the same shape as the four defects
-    # `test-rust` and `shm-check` exist for, one crate over: a configuration
-    # nobody builds is not a checked configuration, and here the unchecked one is
-    # what a `--no-default-features` consumer gets.
+    # is compiled by nothing: a configuration nobody builds is not a checked
+    # configuration, and here the unchecked one is what a `--no-default-features`
+    # consumer gets.
     #
     # Verified to be a real gate rather than a no-op: this line runs 87 tests,
     # five of which exist only in this configuration.
@@ -1294,9 +1284,7 @@ ingest-check:
 #
 # * `tf_tree_py` — the crate whose documentation a PyPI user reads, and the one
 #   this recipe would most like to cover. It is gated by `just py-lint`, whose
-#   rustdoc line carries the argument for living there: the `--manifest-path`
-#   form works fine from here, but PyO3's build script needs an interpreter and
-#   `py-*` is what owns one.
+#   rustdoc line carries the argument for living there.
 # * `tf_tree_tf2_sys` — rustdoc for it runs in **no** recipe. It needs ROS 2
 #   headers, so the only recipe that could carry it is `just tf2-check`'s
 #   container invocation, and it is `publish = false` behind
@@ -1338,9 +1326,9 @@ doc:
 # version, so this line needs no number in it.
 #
 # `no-build-output` goes first because it is both the cheapest (6 ms measured,
-# 5 ms in CI) and the
-# one whose failure invalidates the rest: if the tree has build output committed
-# in it, what clippy thinks of the source is not the interesting news.
+# 5 ms in CI) and the one whose failure invalidates the rest: if the tree has
+# build output committed in it, what clippy thinks of the source is not the
+# interesting news.
 # `unsafe-budget` goes **last** among the dependencies for the opposite reason:
 # it costs 9 s warm and 55 s cold, plus ~1 GiB of extra `target/` because
 # `RUSTFLAGS` is part of cargo's fingerprint — and a contributor whose tree
@@ -1391,8 +1379,7 @@ lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-ver
     cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
     # **`pure-hash`, because every pass above compiles it out.** The feature is
     # off by default and swaps `blake3`'s backend, so nothing else here builds a
-    # line of it — the same shape as the five rows above, and the reason this
-    # recipe has more than one pass at all.
+    # line of it.
     #
     # This is a *lint* row and not the row that proves the feature does its job:
     # what it buys is a cross-check to `*-apple-darwin` / `*-windows-msvc`, and
@@ -1466,8 +1453,7 @@ py-compile:
 # Format and auto-fix safe lint issues.
 fmt:
     cargo fmt --all
-    # `--all` is every workspace *member*, and `tf_tree_py` is excluded — so
-    # without this line `just lint` fails, through `py-compile`, on a file the
+    # Without this line `just lint` fails, through `py-compile`, on a file the
     # recipe that exists to fix formatting leaves untouched. Only fmt: the
     # clippy half needs an interpreter, and `py-compile` is where that branch
     # lives.
@@ -1565,9 +1551,6 @@ msrv:
     done
     exit $rc
 
-# **The repository checked against itself: one version everywhere, and no
-# document that names a recipe which does not exist.**
-#
 # Third of the family that starts with `just msrv` and `just evidence-audit`,
 # and it exists because three independent readings of this release found the
 # same defect in three different places — shipped text contradicting a document
@@ -1733,12 +1716,8 @@ bench-report-shm *ARGS:
 # same pair by hand.
 #
 # **`EMBED_COST_KNOWN_COLLAPSED=1` is a disclosed escape, currently set by CI's
-# `bench-gate` job.** The structural self-check below has been red since it was
-# written, on a defect in the code under test that predates it, and whose repair
-# is a trade nobody has priced. The escape keeps the recipe running and prints
-# the whole diagnosis plus a statement that the run's quotient is 1.0 by
-# construction; it is not a suppression and there is no quiet mode. It is
-# deleted by the commit that restores the row's independent variable — which is
+# `bench-gate` job.** The structural self-check below carries what it discloses
+# and when to delete it; deleting it is
 # also what makes `docs/API.md` §2.3's 2026-09-06 amendment stop applying.
 embed-cost:
     #!/usr/bin/env bash
@@ -1756,10 +1735,9 @@ embed-cost:
     cargo build -q --release -p tf_tree_bench --features embed-probe --bin embed_cost
     # **STRUCTURAL SELF-CHECK: is the crate boundary still this row's variable?**
     #
-    # The row's entire design is that one identical three-line body is compiled
-    # twice, once in `tf_tree_bench` (numerator) and once in `tf_tree_core`
-    # (denominator), so the quotient is the boundary and nothing else. If the
-    # thing the boundary is supposed to interpose on stops being inlinable, both
+    # The row's design is one identical body compiled twice — `tf_tree_bench`
+    # (numerator) against `tf_tree_core` (denominator). If the thing the
+    # boundary is supposed to interpose on stops being inlinable, both
     # columns collapse to the same call stub around the same out-of-line symbol,
     # the quotient is 1.0 **by construction**, and `Verdict::Over` becomes
     # unreachable — the row keeps printing and can no longer fail. That is not
@@ -1945,8 +1923,6 @@ bench-baseline-update: embed-cost
 workloads:
     cargo run --release -p tf_tree_bench --features shm --bin contended_scaling -- --list
 
-# **`docs/PHASE1.md` §11.2's read-scaling row, with the writers and the pinning.**
-#
 # Every other reader benchmark in this repository runs against a QUIESCENT tree —
 # `benches/read_scaling.rs` says so in its own header and `docs/benchmarks/tf2.md`
 # lists both gaps under "What is still not measured". This runs N reader processes
@@ -1973,12 +1949,11 @@ contended-scaling *ARGS:
 scale-sweep *ARGS:
     cargo run --release -p tf_tree_bench --bin scale_sweep -- {{ARGS}}
 
-# Steady state over minutes: does the tail drift, does RSS grow, do the rings
-# actually lap? EXITS NON-ZERO if the last interval's p99.9 exceeds the first's
-# by more than 3x, if RSS grows past 8 MiB, or if the rings never lapped — the
-# last of which is a failure of the experiment rather than of the engine, and is
-# the vacuous-green case `docs/PHASE2.md` §11.4's torture harness was rewritten
-# to avoid.
+# EXITS NON-ZERO if the last interval's p99.9 exceeds the first's by more than
+# 3x, if RSS grows past 8 MiB, or if the rings never lapped — the last of which
+# is a failure of the experiment rather than of the engine, and is the
+# vacuous-green case `docs/PHASE2.md` §11.4's torture harness was rewritten to
+# avoid.
 #
 # Long-duration steady state: does the tail drift, does RSS grow, do rings lap?
 soak *ARGS:
@@ -2021,17 +1996,12 @@ bench-run workload="robot":
     echo
     echo "wrote $out/{contended_scaling,scale_sweep}.json"
 
-# Compare two run files. Non-zero exit means something regressed past its own
-# tolerance.
-#
 # Compare two run files; non-zero exit means a metric regressed past its tolerance.
 bench-ab a b:
     cargo run --release -p tf_tree_bench --bin bench_ab -- {{a}} {{b}}
 
 # --- Profiling: where does the time actually go? ----------------------------
 
-# Sampling profile of a workload, folded to a flamegraph.
-#
 # Uses the `profiling` profile — release codegen with debuginfo kept — because
 # `[profile.release]` strips it and every tool then falls back to function-level
 # attribution, at which point the answer is "it is all in fold_at", which is true
@@ -2062,9 +2032,6 @@ profile workload="fleet_16" seconds="20":
     perf script -i target/profile/perf.data > target/profile/out.perf
     echo "wrote target/profile/out.perf — fold it with inferno-collapse-perf or stackcollapse-perf"
 
-# Exact, simulated, and needs no privileges: instruction counts and cache misses
-# per source line over any workload.
-#
 # The generalisation of `profile-lookup`, which is pinned to `footprint`'s one
 # hardcoded query. Simulated, so no idle machine is needed and the counts are
 # exact — but it is roughly 50x slower than native, so keep the workload small.
@@ -2236,8 +2203,6 @@ tf2-check:
         cargo nextest run -p tf_tree_bench --features tf2 --release --lib --no-tests=pass; \
         cargo clippy -p tf_tree_c --features bridge,shm --all-targets -- -D warnings'
 
-# **The ROS 2 ingest bridge (`docs/PHASE4.md` §5), built in the container.**
-#
 # `ros/tf_tree_ros` is an `ament_cmake` package, not a cargo crate: it needs
 # `rclcpp`, which exists only in `docker/tf2`. It therefore inherits
 # `tf_tree_tf2_sys`' problem — no `cargo fmt`, no `clippy`, no `nextest` — and
@@ -2392,10 +2357,8 @@ footprint:
 
 # Line-level profile of the lookup hot path (docs/benchmarks/tf2.md).
 #
-# Uses the `profiling` profile — release codegen with debuginfo kept — because
-# `[profile.release]` strips it and every tool then falls back to function-level
-# attribution. `fold_at` inlines the whole sampling chain, so a function-level
-# answer is "it is all in fold_at", which is true and tells you nothing.
+# Uses the `profiling` profile for `just profile`'s reason: `fold_at` inlines
+# the whole sampling chain, so a function-level answer says nothing here.
 #
 # Simulated, so no idle machine is needed and the counts are exact.
 profile-lookup n="200000":
@@ -2644,8 +2607,7 @@ shm-check:
     # nowhere. `lib.rs`'s `recorded_given` is one: it is the `/proc`
     # classification `TFT014`'s fork arm rests on, and its arms are only
     # assertable by passing the two host facts in, which is a unit test's job
-    # (`docs/decisions/0028` plan step 6). `--lib` and not the whole package:
-    # the integration targets are named individually, on purpose.
+    # (`docs/decisions/0028` plan step 6).
     cargo nextest run -p tf_tree_cli --features shm --lib
     # The CLI against a live arena, and `participants` against no arena at all.
     # This is the milestone's acceptance test: the shipped binary, through clap,
@@ -2869,15 +2831,6 @@ shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
     cargo build --release --features shm,crash-points -p tf_tree_bench --bin shm_torture
     ./target/release/shm_torture --crash-points {{ARGS}}
 
-# **The torture harness's own gate**, seconds rather than minutes, so it belongs
-# on a branch rather than in a nightly.
-#
-# It runs the binary twice and asserts the two runs disagree: once with a child
-# publishing a deliberately corrupt transform (which some *other* process must
-# catch) and once clean (which must pass having validated thousands of reads).
-# Without it, a harness that quietly stopped reading would print the same
-# "0 violations" forever — which is exactly what the first revision of this
-# harness did, and how the writer pacing in `work` came to exist.
 # **`docs/PHASE2.md` §12.2's two ownership-migration rows, and §12.3 gate 4b** —
 # the normative criterion that had no artifact until 2026-08-29. §3.5's migration
 # shipped on 2026-08-28 with correctness tests; nothing measured its *latency*,
@@ -2904,6 +2857,15 @@ owner-migration *ARGS:
     cargo build --release -q --features shm -p tf_tree_bench --bin owner_migration
     "${CARGO_TARGET_DIR:-target}/release/owner_migration" {{ARGS}}
 
+# **The torture harness's own gate**, seconds rather than minutes, so it belongs
+# on a branch rather than in a nightly.
+#
+# It runs the binary twice and asserts the two runs disagree: once with a child
+# publishing a deliberately corrupt transform (which some *other* process must
+# catch) and once clean (which must pass having validated thousands of reads).
+# Without it, a harness that quietly stopped reading would print the same
+# "0 violations" forever — which is exactly what the first revision of this
+# harness did, and how the writer pacing in `work` came to exist.
 shm-torture-self-test:
     cargo nextest run -p tf_tree_bench --features shm --release --test torture
 
@@ -3093,11 +3055,8 @@ shm-rendezvous:
     # (49−37, 55−43). An earlier revision of this paragraph recorded the
     # discrepancy and left the twelfth unnamed, which is the same failure the
     # paragraph above it records — a number corrected while the list beside it
-    # was not. It is
-    # `a_live_holder_that_proc_calls_dead_keeps_the_topology_lock`
-    # (`crates/tf_tree/tests/rendezvous.rs`, `#[cfg(feature = "unstable")]`),
-    # found by `comm` over the two `nextest list` runs, and it is now in the
-    # list at the top of this comment. The arithmetic and the list agree.
+    # was not. The twelfth is now in the list at the top of this comment, so the
+    # arithmetic and the list agree.
     cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.
@@ -3119,22 +3078,6 @@ versions:
 tf2-native-control:
     ./docker/tf2/run.sh 'bash docker/tf2/native_scaling.sh'
 
-# **The depth-3 ratio with no Rust binding on either arm.**
-#
-# `just tf2-bench-check`'s `lookup_ratio_vs_tf2` row puts tf2 behind
-# `tf_tree_tf2_sys`, which charges it the residual FFI boundary and therefore
-# flatters `tf_tree`. This runs the other direction: tf2 native C++, `tf_tree`
-# through its C ABI as a shared library, both interleaved in one process so the
-# quotient still resolves on a host that cannot time either arm absolutely.
-#
-# Three processes, because `tft_tree_open` attaches and cannot create (D18):
-# `native_arena` serves the fixture over the rendezvous and dumps the identical
-# `.tfstream` the C++ side feeds to tf2. The script wires them together.
-#
-# **Neither this nor the Rust row is "the" answer — they bracket it.**
-# `docs/benchmarks/tf2.md` states the bracket, the unpaired point estimate, and
-# what is still owed to close it. Not gated: it is not wired into
-# `bench_report`, so no baseline carries it yet.
 # **The memory comparison with no binding on either side.**
 #
 # Every other memory row in this repository puts tf2 behind the Rust binding
@@ -3159,6 +3102,22 @@ tf2-native-control:
 tf2-native-footprint:
     ./docker/tf2/run.sh 'bash docker/tf2/native_footprint.sh'
 
+# **The depth-3 ratio with no Rust binding on either arm.**
+#
+# `just tf2-bench-check`'s `lookup_ratio_vs_tf2` row puts tf2 behind
+# `tf_tree_tf2_sys`, which charges it the residual FFI boundary and therefore
+# flatters `tf_tree`. This runs the other direction: tf2 native C++, `tf_tree`
+# through its C ABI as a shared library, both interleaved in one process so the
+# quotient still resolves on a host that cannot time either arm absolutely.
+#
+# Three processes, because `tft_tree_open` attaches and cannot create (D18):
+# `native_arena` serves the fixture over the rendezvous and dumps the identical
+# `.tfstream` the C++ side feeds to tf2. The script wires them together.
+#
+# **Neither this nor the Rust row is "the" answer — they bracket it.**
+# `docs/benchmarks/tf2.md` states the bracket, the unpaired point estimate, and
+# what is still owed to close it. Not gated: it is not wired into
+# `bench_report`, so no baseline carries it yet.
 tf2-native-ratio *ARGS:
     ./docker/tf2/run.sh 'bash docker/tf2/native_ratio.sh {{ARGS}}'
 
@@ -3289,8 +3248,7 @@ py-test-freethreaded:
 # build but a different program: it reads about six times worse *and moves the
 # scaling curve*, so the first revision of this recipe published a debug curve as
 # the finding and blamed the host for it. The harness prints ns/sample against
-# `tree.rs`'s documented release figure so a wrong profile is unmissable. It is
-# also the profile a `pip install` gets.
+# `tree.rs`'s documented release figure so a wrong profile is unmissable.
 #
 # **`.venv-t`, so this is the free-threaded half; `py-thread-scaling-gil` below is
 # the other one.** This comment used to say "run the same script under
@@ -3339,15 +3297,12 @@ py-thread-scaling-gil *ARGS:
 
 # fmt + lint for both languages of the binding, plus the Rust half's rustdoc.
 py-lint: py-compile
-    # **Rustdoc for the one crate no other recipe compiles the documentation of.**
-    # `just doc` names its packages with `-p`, and this crate is in the root
-    # manifest's `exclude`, so from the root `cargo doc --no-deps -p tf_tree_py`
-    # answers *"package ID specification `tf_tree_py` did not match any
-    # packages"*. Until this line, fmt, clippy, ruff, ruff format and pyright
-    # were the whole of the crate's gate and none of them is rustdoc — for the
-    # crate whose rendered documentation is the one a PyPI user reads. The 0.0.1
-    # release prep found **three** broken intra-doc links here, by running this
-    # command by hand.
+    # **Rustdoc for the one crate no other recipe compiles the documentation
+    # of**, `just doc` being unable to name an excluded package with `-p`. Until
+    # this line, fmt, clippy, ruff, ruff format and pyright were the whole of the
+    # crate's gate and none of them is rustdoc — for the crate whose rendered
+    # documentation is the one a PyPI user reads. The 0.0.1 release prep found
+    # **three** broken intra-doc links here, by running this command by hand.
     #
     # **The reason it is here and not in `just doc` is the interpreter, not
     # reachability** — the "an excluded crate is structurally out of `just doc`'s
@@ -3583,10 +3538,10 @@ release-archive TARGET:
     rm -rf "${staging}"
     mkdir -p "${stage}"
     cp "${bin}" "${stage}/tf_tree"
-    # `tft` is a symlink, not a second binary. `src/bin/tft.rs` is four lines
-    # calling the same `tf_tree_cli::run()` and inspects no `argv[0]`, so the two
-    # are behaviourally identical — measured, the pair costs 2.27 MB compressed
-    # against 1.14 MB for one.
+    # `tft` is a symlink, not a second binary: `src/bin/tft.rs` is four lines
+    # calling the same `tf_tree_cli::run()` and inspects no `argv[0]`, so the
+    # two are behaviourally identical — measured, the pair
+    # costs 2.27 MB compressed against 1.14 MB for one.
     ln -s tf_tree "${stage}/tft"
     # Apache-2.0 §4(a) and the MIT licence both require the licence text to
     # travel with a binary distribution, exactly as `release.yml` already asserts
