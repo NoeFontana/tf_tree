@@ -177,13 +177,11 @@ fn writer_three_pushes_reader_never_torn() {
 fn writer_wraps_reader_gets_valid_or_recycled() {
     model(|| {
         let hr = Arc::new(HeapRing::new(4));
-        // The only legal `Ok`: stamps 20 and 30 bracket t = 25 at s = 0.5.
         let expect = <LerpSlerp as tf_tree_math::Interp>::eval(&pose(2), &pose(3), 0.5).to_bits();
 
         let w = Arc::clone(&hr);
         let writer = thread::spawn(move || {
             let ring = w.ring();
-            // Stamps 10..50 into four slots: the fifth push laps slot 0.
             for i in 1..=5u64 {
                 ring.push(i as i64 * 10, &pose(i)).unwrap();
             }
@@ -226,8 +224,7 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
 /// `self.head.store(h + 1, Release)` — survived the entire suite, because
 /// neither model above ever reads a *stamp*: `writer_three_pushes_...` calls
 /// `read_slot` directly, and `writer_wraps_...` does call `sample`, but cannot
-/// observe the difference for a reason worth writing down, because it is the
-/// reason this model is not simply a third `sample` fixture.
+/// observe the difference, for the reason below.
 ///
 /// ## Why no `sample`-shaped fixture can catch it
 ///
@@ -273,8 +270,6 @@ fn head_publishes_every_stamp_below_it() {
 
         let r = Arc::clone(&hr);
         let reader = thread::spawn(move || {
-            // Exactly `sample`'s first two steps: `head` Acquire, then the
-            // stamps of the samples it claims are published, Relaxed.
             let h = r.head.load(Ordering::Acquire);
             for i in 0..h {
                 let got = r.stamps[(i & 3) as usize].load(Ordering::Relaxed);
@@ -504,15 +499,11 @@ fn claim_race_exactly_one_wins() {
 /// keeping the second mutator out; the second test's holder is a corpse, so the
 /// gate is the only thing letting the rescuer in. One of them fails whichever
 /// way the predicate is broken, which is what makes the green run mean
-/// something. `MODEL_SPIN_LIMIT` being small enough to reach the steal path is
-/// load-bearing for the first half of that, exactly as its own comment says.
+/// something.
 ///
 /// **The control only fires under a preemption bound, and finding that out is
-/// why [`model`] exists.** Run with `LOOM_MAX_PREEMPTIONS` unset — which is what
-/// invoking `cargo test` by hand used to do — the broken predicate went
-/// undetected after 8 seconds of unbounded search, against 0.37 s to catch it at
-/// a bound of 3. [`model`] now pins that as a floor the environment can raise
-/// and cannot lower, so this control holds however the suite is invoked.
+/// why [`model`] exists** — the floor it pins is what makes this control hold
+/// however the suite is invoked.
 ///
 /// `MODEL_BLOCKS` matches production's [`tf_tree_arena::TOPO_BLOCKS`] and that is
 /// **load-bearing, not decoration**. A first draft of this model used two blocks
@@ -625,7 +616,6 @@ impl TopoModel {
     fn mutate(&self, guard: &ModelGuard<'_>, parent: u32, depth: u32) {
         let _ = guard; // the type is the proof; this silences "unused".
 
-        // Exactly one mutator may be here. If A2's lock is broken this fires.
         let concurrent = self.in_section.fetch_add(1, Ordering::AcqRel);
         assert_eq!(concurrent, 0, "two mutators inside the critical section");
 
@@ -797,8 +787,6 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
     model(|| {
         let topo = Arc::new(TopoModel::new());
 
-        // Participant 0 dies holding the lock, mid-copy: it took the lock and
-        // dirtied the scratch block, and it will never release or publish.
         {
             let g = topo.acquire(DEAD_SLOT, |_| true).unwrap();
             let (_, active) = unpack(topo.word.load(Ordering::Relaxed));
@@ -813,7 +801,6 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
             "the corpse should still hold the lock"
         );
 
-        // Participant 1 finds the lock held by a corpse and takes it over.
         let thief = Arc::clone(&topo);
         let rescuer = thread::spawn(move || loop {
             if let Some(g) = thief.acquire(1, |slot| slot != DEAD_SLOT) {
@@ -829,13 +816,10 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
         rescuer.join().unwrap();
         let (parent, depth, _g) = reader.join().unwrap();
 
-        // The scribble was never published, whenever the reader looked.
         assert!(
             (parent, depth) == (P_OLD, D_OLD) || (parent, depth) == (P_NEW, D_NEW),
             "a reader observed an abandoned mutation: ({parent}, {depth})"
         );
-        // The stealer's mutation is the only one that landed, and it landed
-        // whole — no rollback, no repair, nothing inherited.
         let (generation, active) = unpack(topo.word.load(Ordering::Relaxed));
         assert_eq!(generation, 1, "exactly one mutation should have published");
         assert_eq!(topo.parent[active].load(Ordering::Relaxed), P_NEW);
@@ -872,13 +856,11 @@ fn a_late_release_racing_a_slot_handover_frees_nobody() {
             .unwrap();
         assert_eq!((slot, inc), (0, 1));
 
-        // A: the departing process finally gets around to detaching.
         let a = Arc::clone(&table);
         let late = thread::spawn(move || ParticipantTable::new(&a).release(0, 1));
 
-        // B: a reaper decides that participant is gone, and a new process takes
-        // the freed slot. Modelled as the same release (a reap *is* a release
-        // performed by somebody else) followed by a registration.
+        // B: modelled as the same release (a reap *is* a release performed by
+        // somebody else) followed by the new process's registration.
         let b = Arc::clone(&table);
         let handover = thread::spawn(move || {
             let t = ParticipantTable::new(&b);
@@ -956,7 +938,6 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
         };
         assert_eq!((pid, inc), (winner_pid, winner_inc));
 
-        // And the loser did not silently land somewhere else.
         for other in [0, 1, 3] {
             assert_eq!(t.identity(other), None, "slot {other} should be untouched");
         }
@@ -1029,9 +1010,8 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
 ///
 /// Both witnesses are legal C11 executions: the sweeper reads the byte's
 /// *initial* store because nothing orders it after the joiner's acquisition.
-/// Each is `#[should_panic]` on the erasure assertion, which is the one that
-/// speaks first — the ordering flag trips in the same execution and is reported
-/// rather than acted on.
+/// Each is `#[should_panic]` on the erasure assertion; the ordering flag trips
+/// in the same execution.
 ///
 /// # Modelling notes
 ///
@@ -1048,8 +1028,7 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
 /// releases the record before the byte, never the reverse. The probe is a
 /// `Relaxed` load deliberately — `F_OFD_GETLK` is a syscall and is at least that
 /// strong, so a property that holds against the weakest read holds against the
-/// real one. The corpse is staged inline because a process killed inside
-/// `fill_slot` executes no further instruction, ever: the idiom of
+/// real one. The corpse is staged inline: the idiom of
 /// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`].
 #[test]
 fn reclaim_races_register() {
@@ -1058,9 +1037,7 @@ fn reclaim_races_register() {
 
 /// The failing control: the byte is probed **before** the word is observed.
 ///
-/// See [`reclaim_races_register`]. Erases a published record, which is the
-/// point; `#[should_panic]` so the erasure is an assertion this suite makes
-/// rather than a claim it prints.
+/// See [`reclaim_races_register`].
 #[test]
 #[should_panic(expected = "no erasure")]
 fn control_reclaim_races_register_probes_the_byte_first() {
@@ -1070,8 +1047,7 @@ fn control_reclaim_races_register_probes_the_byte_first() {
 /// The second failing control: the right read order, the word observed
 /// `Relaxed`.
 ///
-/// See [`reclaim_races_register`]. What carries the property is the
-/// synchronises-with edge, not the source order, and this is how that is known.
+/// See [`reclaim_races_register`].
 #[test]
 #[should_panic(expected = "no erasure")]
 fn control_reclaim_races_register_observes_relaxed() {
@@ -1188,11 +1164,8 @@ fn reclaim_races_register_model(shape: Sweep) {
             "ordering: a byte read free under a published live_word, so the word \
              was not observed first"
         );
-        // Harness liveness, not evidence about the guard: the corpse's CAS is
-        // uncontended, on a word no other thread writes, so it fires in every
-        // execution and would fire for a `reclaim` that never looked at
-        // `observed`. It is here so that a model in which nothing under test
-        // ever runs fails instead of passing.
+        // Harness liveness, not evidence about the guard: it is here so that a
+        // model in which nothing under test ever runs fails instead of passing.
         assert!(
             corpse_fired,
             "the widened CAS never fired: nothing was tested"

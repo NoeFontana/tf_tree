@@ -1,11 +1,10 @@
 //! `Copy`, `String`-free errors that name what failed.
 //!
-//! Same rule as the rest of the workspace (`docs/PROJECT.md` §5): an error
-//! carries integers and enums, never an allocation. That is not asceticism here
-//! — the rendezvous runs at process start, when the arena may be unmappable and
-//! the failure has to be reportable by a binary that has no allocator state left
-//! to trust. It also means an error can be returned from a signal-adjacent path
-//! later without revisiting the type.
+//! Same rule as the rest of the workspace (`docs/PROJECT.md` §5): integers and
+//! enums, never an allocation. The rendezvous runs at process start, when the
+//! arena may be unmappable and the failure has to be reportable by a binary
+//! with no allocator state left to trust. It also means an error can be
+//! returned from a signal-adjacent path later without revisiting the type.
 //!
 //! Every variant names *both* sides of whatever disagreed, or the exact
 //! environment variable / slot / errno responsible. `docs/PHASE2.md` §3.7 makes
@@ -356,8 +355,7 @@ pub enum IpcError {
     /// limitation**: the alternative to refusing is creating a second arena
     /// while the first is still in use, which diverges silently. The stuck slots
     /// are named so an operator can see exactly what to `kill`; full identity
-    /// records for them are readable with
-    /// [`crate::LockFile::read_identity`].
+    /// records for them are readable with [`crate::LockFile::read_identity`].
     ArenaHeldButUnreachable {
         /// Bitmask of participant slots whose lock byte is still held. Zero
         /// means nobody is attached and the *ownership* byte was what stayed
@@ -529,10 +527,9 @@ impl fmt::Display for IpcError {
             IpcError::ArenaAbsent => f.write_str(
                 "no arena is serving and CreatePolicy::Never forbids creating one",
             ),
-            // The mask is empty in one distinct situation — nobody is attached,
-            // but some process held the ownership byte for the whole deadline
-            // without ever serving. Saying "slot 64, pid 0" there would point an
-            // operator at a slot that does not exist.
+            // Empty mask: nobody is attached and the ownership byte was held
+            // for the whole deadline. Saying "slot 64, pid 0" here would point
+            // an operator at a slot that does not exist.
             IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0,
                 ownership_held: true,
@@ -559,9 +556,8 @@ impl fmt::Display for IpcError {
                 first_pid,
                 ownership_held,
             } => match (first_slot, ownership_held) {
-                // Slot 0 is the creator's slot (`0035`, `CREATOR_SLOT`), and a
-                // forced create takes slot 0 or nothing — so this is the one
-                // state the escape hatch provably cannot pass, and pointing an
+                // Slot 0 is the creator's slot (`0035`, `CREATOR_SLOT`), so the
+                // escape hatch provably cannot pass this state; pointing an
                 // operator at it would send them down a path that fails.
                 (Some(0), _) => write!(
                     f,
@@ -577,8 +573,7 @@ impl fmt::Display for IpcError {
                          becomes the escape hatch, provided nothing still holds the ownership byte"
                     }
                 ),
-                // Every held byte is a non-owner's and nothing holds ownership:
-                // §3.4's stranded-participant case, and the only one where
+                // §3.4's stranded-participant case: the only one where
                 // `CreatePolicy::Always` is the answer.
                 (Some(slot), false) => write!(
                     f,
@@ -593,8 +588,6 @@ impl fmt::Display for IpcError {
                      AttachMode::ReadWrite; without them the retry fails with a second, different \
                      error rather than creating"
                 ),
-                // A live holder of the ownership byte blocks the forced create
-                // before it ever reaches the participant bytes it may skip.
                 (Some(slot), true) => write!(
                     f,
                     "an arena is alive but unreachable: participant slots {holder_slots:#x} still \

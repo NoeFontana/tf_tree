@@ -20,8 +20,7 @@
 //! # Policy is the caller's
 //!
 //! Slot assignment and reaping live in `tf_tree`, which has the arena. This
-//! module does the protocol and calls out: `assign` turns a validated request
-//! into a slot or a rejection, and `on_hangup` is told which slot went away. So
+//! module does the protocol and calls out to `assign`/`on_hangup`, so
 //! `tf_tree_ipc` still knows nothing about arenas (§2).
 
 use std::path::{Path, PathBuf};
@@ -65,8 +64,8 @@ pub struct OwnerServer {
     owner_pid: u32,
     /// The fork generation this server bound its socket in — see `Drop`.
     fork_gen: u64,
-    /// `(st_dev, st_ino)` of the socket file this server published, captured
-    /// from the *path* right after the `rename` — see `unlink_if_still_ours`.
+    /// `(st_dev, st_ino)` of the socket file this server published — see
+    /// `unlink_if_still_ours`.
     bound: (u64, u64),
 }
 
@@ -105,8 +104,8 @@ impl OwnerServer {
     /// that died — then collide on `EADDRINUSE`, and a Unix socket path is not
     /// removed when its process exits. So: unlink any stale path, bind a
     /// **pid-suffixed** temporary, restrict it to the owner, and `rename` it
-    /// into place. `rename` is atomic, so a client either sees no socket or a
-    /// fully-listening one, never a bound-but-not-listening one.
+    /// into place. `rename` is atomic, so a client sees the old socket or a
+    /// fully-listening new one, never a bound-but-not-listening one.
     ///
     /// # Errors
     ///
@@ -167,8 +166,6 @@ impl OwnerServer {
             .map(|s| (s.st_dev as u64, s.st_ino as u64))
             .map_err(io)?;
 
-        // Publish atomically: a client sees the old socket, or this one
-        // listening, never a half-built one.
         std::fs::rename(&tmp, sock_path).map_err(|e| IpcError::HandshakeIo {
             raw_os_error: e.raw_os_error().unwrap_or(0),
         })?;
@@ -393,10 +390,8 @@ impl OwnerServer {
     /// Returns the connection and the slot granted, or an error if the client
     /// was rejected or misbehaved — in which case its socket is dropped here.
     ///
-    /// `on_hangup` is the caller's slot-release callback, the same one [`Self::serve`]
-    /// runs when a watched participant dies. It is needed here because `assign`
-    /// reserves the slot *before* the response is sent: a failure after that
-    /// point produces a slot nobody holds and nobody will ever hang up on.
+    /// `on_hangup` is the caller's slot-release callback, the same one
+    /// [`Self::serve`] runs when a watched participant dies.
     fn accept_one<A, H>(
         &self,
         segment: BorrowedFd<'_>,
@@ -553,10 +548,10 @@ impl OwnerServer {
     /// silently make the new owner unreachable while it happily keeps serving a
     /// socket no client can find.
     ///
-    /// Comparing the identity this server *published* (`bound`, captured from
-    /// the path at bind time) against what the path names today closes it:
-    /// after a successor's `rename` the inodes differ, so this leaves the path
-    /// alone. Not perfectly atomic — the successor could rename between the
+    /// Comparing the identity this server *published* (`bound`, captured at
+    /// bind time) against what the path names today closes it: after a
+    /// successor's `rename` the inodes differ, so this leaves the path alone.
+    /// Not perfectly atomic — the successor could rename between the
     /// `stat` and the `unlink` — but that window is a single syscall wide,
     /// against a window that is otherwise the entire lifetime of the process,
     /// and §3.9 already makes a stale socket path a state every client
@@ -615,13 +610,6 @@ mod tests {
     }
 
     /// **An outgoing owner must not unlink its successor's socket.**
-    ///
-    /// §3.5 lets a survivor inherit the owner role, and it publishes by
-    /// `rename`ing its own socket over the shared path. By the time the previous
-    /// owner winds down, that path names *somebody else's live listener* — and a
-    /// plain `remove_file` there makes the new owner unreachable while it keeps
-    /// serving a socket no client can find, with nothing reporting an error
-    /// anywhere.
     ///
     /// Mutants this kills: replacing `unlink_if_still_ours` with an
     /// unconditional `remove_file` fails the second assertion; comparing

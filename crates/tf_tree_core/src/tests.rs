@@ -3134,24 +3134,6 @@ fn a_tagged_query_is_the_typed_query_with_the_domain_as_data() {
     );
 }
 
-/// `ExtrapPolicy`'s three variants were all implemented, all tested at the
-/// sampler, and reachable from no shipped surface: every fold site passed the
-/// `Error` literal and the facade did not re-export the type
-/// (`docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md`).
-/// `Plan::at_extrapolating` is what reaches them.
-///
-/// **The third assertion is the one that earns the test.** Asserting that `Hold`
-/// and `ConstantTwist` each return *something* would pass against a
-/// `fold_at_policy` that ignored its argument and served `Hold` for both. What
-/// distinguishes them is that a moving body's held pose and its
-/// constant-twist extension are different poses at the same stamp, and only the
-/// second keeps moving.
-///
-/// **Mutant:** `fold_at_policy` passes `ExtrapPolicy::Hold` instead of its
-/// `policy` argument. Applied: the run stops at the *first* `at_extrapolating`
-/// assertion — `ExtrapPolicy::Error` returns the held pose instead of refusing —
-/// so the `ConstantTwist` assertion at the end is never reached under this
-/// mutant. It is reached, and needed, under the narrower mutant of passing
 /// **`by_ns == 0` must mean the fold bracketed, and the *order* of two walks is
 /// the whole of that guarantee.**
 ///
@@ -3307,6 +3289,24 @@ fn by_ns_zero_is_never_claimed_for_a_pose_the_fold_invented() {
     );
 }
 
+/// `ExtrapPolicy`'s three variants were all implemented, all tested at the
+/// sampler, and reachable from no shipped surface: every fold site passed the
+/// `Error` literal and the facade did not re-export the type
+/// (`docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md`).
+/// `Plan::at_extrapolating` is what reaches them.
+///
+/// **The third assertion is the one that earns the test.** Asserting that `Hold`
+/// and `ConstantTwist` each return *something* would pass against a
+/// `fold_at_policy` that ignored its argument and served `Hold` for both. What
+/// distinguishes them is that a moving body's held pose and its
+/// constant-twist extension are different poses at the same stamp, and only the
+/// second keeps moving.
+///
+/// **Mutant:** `fold_at_policy` passes `ExtrapPolicy::Hold` instead of its
+/// `policy` argument. Applied: the run stops at the *first* `at_extrapolating`
+/// assertion — `ExtrapPolicy::Error` returns the held pose instead of refusing —
+/// so the `ConstantTwist` assertion at the end is never reached under this
+/// mutant. It is reached, and needed, under the narrower mutant of passing
 /// `Hold` only where `ConstantTwist` was asked for.
 #[test]
 fn extrapolation_is_selectable_and_reports_how_far_it_reached() {

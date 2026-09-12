@@ -12,12 +12,10 @@
 //! it. It costs nothing in Phase 1 and cannot be retrofitted.
 //!
 //! The protocol only works if the "unpublished" state is the state a **zeroed
-//! arena** is already in — see [`ID_UNPUBLISHED`]. Nothing pre-fills the id
-//! array, so a non-zero sentinel makes the wait loop inert: it exits on the first
-//! read and hands back a bogus id. Every interner that claims a slot must also
-//! leave it in a terminal state, either the real id or [`ID_FAILED`]; returning
-//! `Err` with the slot claimed and the id unpublished hangs every later interner
-//! of that name.
+//! arena** is already in — see [`ID_UNPUBLISHED`]. Every interner that claims a
+//! slot must also leave it in a terminal state, either the real id or
+//! [`ID_FAILED`]; returning `Err` with the slot claimed and the id unpublished
+//! hangs every later interner of that name.
 //!
 //! # A8 — a dead claimant must not wedge the table
 //!
@@ -241,8 +239,8 @@ pub const INTERN_SPIN_LIMIT: u32 = 10_000;
 ///
 /// A reader cannot tell "healthy winner mid-CAS" from "dead before it recorded
 /// itself" — both read `CLAIM_UNRECORDED`. Giving up after one round made
-/// `find_frame` report a live, in-flight name as absent, so it waits several.
-/// Still bounded, which is the whole point of A8.
+/// `find_frame` report a live, in-flight name as absent, so it waits several —
+/// still bounded, as A8 requires.
 pub const READER_UNRECORDED_ROUNDS: u32 = 4;
 /// See the `not(loom)` variant.
 #[cfg(loom)]
@@ -344,10 +342,9 @@ impl InternTable<'_> {
         }
         // Somebody that judged us dead rescued this slot and published first. Its
         // id is the one the name resolves to; ours is abandoned — the record stays
-        // written
-        // but unreferenced, and `frame_count` over-counts by one. That is the
-        // deliberate trade: `fetch_sub`bing it here could hand a *live* id back to
-        // the allocator and alias two frames onto one record.
+        // written but unreferenced, and `frame_count` over-counts by one. That is
+        // the deliberate trade: `fetch_sub`bing it here could hand a *live* id
+        // back to the allocator and alias two frames onto one record.
         resolve(winner, hash, name_matches)
     }
 
@@ -378,11 +375,10 @@ impl InternTable<'_> {
                 match role {
                     Role::Reader => {
                         if owner == CLAIM_ANONYMOUS {
-                            // Somebody is working and nobody can judge them, so
-                            // this is not evidence of absence. Wait — but
-                            // *bounded*, because an unbounded wait here is the
-                            // hang A8 exists to prevent, and an anonymous
-                            // claimant that dies can never be proven dead.
+                            // Not evidence of absence. Wait — but *bounded*:
+                            // an unbounded wait here is the hang A8 exists to
+                            // prevent, and an anonymous claimant that dies can
+                            // never be proven dead.
                             unrecorded_rounds += 1;
                             if unrecorded_rounds >= READER_UNRECORDED_ROUNDS {
                                 return Wait::Contended;
@@ -395,17 +391,14 @@ impl InternTable<'_> {
                         }
                         if owner == CLAIM_UNRECORDED {
                             // **Not proof of anything.** `CLAIM_UNRECORDED` is
-                            // also (a) the two-instruction window between a
-                            // healthy winner's hash CAS and its claiming CAS,
-                            // and (b) the permanent state of an anonymous
-                            // interner. Abandoning on sight made `find_frame`
-                            // answer `Ok(None)` — "no such frame" — for a name a
-                            // live process was in the middle of publishing.
-                            //
-                            // A reader cannot resolve the ambiguity, so it buys
-                            // patience instead: several full spin rounds before
-                            // giving up. That keeps the bound A8 requires while
-                            // making the false negative require a claimant
+                            // also the two-instruction window between a healthy
+                            // winner's hash CAS and its claiming CAS; abandoning
+                            // on sight made `find_frame` answer `Ok(None)` — "no
+                            // such frame" — for a name a live process was in the
+                            // middle of publishing. A reader cannot resolve the
+                            // ambiguity, so it buys patience instead: several
+                            // full spin rounds, which keeps the bound A8 requires
+                            // while making the false negative require a claimant
                             // descheduled across ~40 000 spins rather than one.
                             unrecorded_rounds += 1;
                             if unrecorded_rounds >= READER_UNRECORDED_ROUNDS {
@@ -530,7 +523,6 @@ pub fn intern_core(
                 Wait::TakenOver => table.finish(i, hash, &name_matches, &write_record),
                 // `Role::Interner` never abandons: it either publishes or waits.
                 Wait::Abandoned => Err(FrameError::CapacityExceeded),
-                // An anonymous claimant holds the entry and cannot be judged.
                 // Reporting beats stealing (a second id for one name) and beats
                 // waiting forever (the hang A8 exists to prevent).
                 Wait::Contended => Err(FrameError::InternContended),
@@ -636,8 +628,6 @@ pub fn find_core(
         if cur == hash {
             let id = match table.wait_for_publish(i, Role::Reader, &claimant_alive) {
                 Wait::Published(id) => id,
-                // Nothing was ever published for this name, and nobody live is
-                // going to publish it.
                 Wait::Abandoned => return Ok(None),
                 // `Role::Reader` never takes over.
                 Wait::TakenOver => return Ok(None),
@@ -646,8 +636,6 @@ pub fn find_core(
                 Wait::Contended => return Err(FrameError::InternContended),
             };
             if id == ID_FAILED {
-                // An interner claimed this slot and then lost the capacity race:
-                // the name was never actually interned.
                 return Ok(None);
             }
             return resolve(id, hash, &name_matches).map(Some);

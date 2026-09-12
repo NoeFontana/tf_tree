@@ -1,10 +1,10 @@
 //! Identity types and the `Copy`, allocation-free error enums.
 //!
-//! Every error is `Copy` and `no_std`: it carries integer IDs, never a
-//! `String`. Names are resolved for humans by a `Display` wrapper (Phase 1
-//! step 7) that consults the arena; the error itself stays allocation-free so
-//! it can be returned from the wait-free read path. **Every variant that can
-//! name an edge does name one** (decision D11).
+//! Every error is `no_std` and carries integer IDs, never a `String`. Names are
+//! resolved for humans by a `Display` wrapper (Phase 1 step 7) that consults the
+//! arena; the error itself stays allocation-free so it can be returned from the
+//! wait-free read path. **Every variant that can name an edge does name one**
+//! (decision D11).
 
 use core::fmt;
 use core::num::NonZeroU32;
@@ -67,8 +67,8 @@ impl EdgeId {
 
 /// A lookup or sample failure.
 ///
-/// `Copy`, allocation-free, `no_std`. Returned by the sample/read path and by
-/// plan compilation and evaluation ([`crate::plan`]).
+/// Returned by the sample/read path and by plan compilation and evaluation
+/// ([`crate::plan`]).
 ///
 /// # It composes like any other Rust error
 ///
@@ -393,30 +393,25 @@ pub enum TopologyError {
     },
 }
 
-// ---------------------------------------------------------------------------
 // `Display` and `core::error::Error` — decision 0040
-// ---------------------------------------------------------------------------
 //
-// **These print identifiers, never names.** Name resolution against the arena is
-// `tf_tree::Tree::describe`, which holds a `&Tree` and can say
-// `odom -> base_link` where this can only say `edge 3` (`docs/API.md` R5, D11).
-// Nothing here allocates, holds a `String`, or changes a layout: `Display` writes
-// into the caller's formatter, so every error stays `Copy` and every one of them
-// is still returnable from the wait-free read path.
+// These print identifiers, never names (`docs/API.md` R5, D11). Nothing here
+// allocates, holds a `String`, or changes a layout: `Display` writes into the
+// caller's formatter, so every error stays `Copy` and every one of them is still
+// returnable from the wait-free read path.
 //
-// **Why they exist at all.** Without `core::error::Error` an error cannot be
-// `?`-chained into `anyhow::Error` or even `Box<dyn Error>`, and this crate's own
-// documentation cited that as the reason `docs/decisions/0019` §2b's startup
-// sequence — attach, wait for frames, plan — is published as a `text` block
-// rather than as compiling Rust. That is the first code a consumer writes.
+// **Why they exist at all.** Before `0040`, the missing `?`-chaining was cited by
+// this crate's own documentation as the reason `docs/decisions/0019` §2b's
+// startup sequence — attach, wait for frames, plan — is published as a `text`
+// block rather than as compiling Rust. That is the first code a consumer writes.
 //
 // **`core::error::Error`, not `std::error::Error`**, so the crate stays `no_std`.
 // It has been in `core` since Rust 1.81 and the MSRV is 1.87; a floor below that
 // would break the crate rather than merely this convenience.
 //
-// **The message text is not a compatibility promise** (`docs/API.md` R5,
-// NORMATIVE). The *type* is the contract and the discriminant is what an FFI
-// caller matches on; these strings are diagnostics and may change in any release.
+// The message text is not a compatibility promise (`docs/API.md` R5, NORMATIVE);
+// these strings are diagnostics and may change in any release, and the
+// discriminant is what an FFI caller matches on.
 //
 // Every match below is exhaustive on purpose. These enums are `#[non_exhaustive]`
 // to the outside world, but inside the defining crate that grants no catch-all —

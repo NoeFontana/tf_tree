@@ -2,10 +2,9 @@
 //!
 //! Two policies share the [`Interp`] trait:
 //!
-//! * [`ScLerp`] — the SE(3) screw geodesic, **the default**. Left- and
-//!   right-invariant. Computed with the fast dual-quaternion power
-//!   ([`crate::dualquat::screw_pow`]), proptested against
-//!   [`crate::reference::sclerp`].
+//! * [`ScLerp`] — the SE(3) screw geodesic. Left- and right-invariant. Computed
+//!   with the fast dual-quaternion power ([`crate::dualquat::screw_pow`]),
+//!   proptested against [`crate::reference::sclerp`].
 //! * [`LerpSlerp`] — tf2-compatible: translation LERP, rotation shortest-arc
 //!   SLERP. Left-invariant but **not** right-invariant; that asymmetry is why
 //!   `ScLerp` is the default (`docs/PHASE1.md` §3.4; `docs/PROJECT.md` §5 D5).
@@ -138,13 +137,12 @@ impl ScLerp {
     #[must_use]
     pub fn eval_with_twist(a: &Iso3, b: &Iso3, s: f64) -> (Iso3, Twist) {
         let rel = a.inv_mul(b);
-        // The endpoints are exact by construction, exactly as in `eval` — and the
-        // test is made *before* the power, not after. `ScrewParts::pow` is the
-        // half of the decomposition that carries the transcendental on the
-        // large-arc branch, and at `s ∈ {0, 1}` its result is discarded. LLVM
-        // does not sink the call out of the untaken branch, so computing it first
-        // and then throwing it away is a real cost on the two stamps most likely
-        // to be queried: an exact hit on a published sample, and `t == t_new`.
+        // The endpoint test is made *before* the power, not after. `ScrewParts::pow`
+        // is the half of the decomposition that carries the transcendental on the
+        // large-arc branch, and at `s ∈ {0, 1}` its result is discarded. LLVM does
+        // not sink the call out of the untaken branch, so computing it first and
+        // then throwing it away is a real cost on the two stamps most likely to be
+        // queried: an exact hit on a published sample, and `t == t_new`.
         //
         // The twist is still needed at the endpoints — it is a property of the
         // segment, not of `s` — so only the power is skipped, never the screw
@@ -299,9 +297,8 @@ impl Iso3 {
 ///   bound goes: at `|s| = 2.3` the series' weights still match
 ///   `sin(aθ)/sin θ` to within their own ulp while the floor is `7.9e-16`, and
 ///   by `|s| = 3` the weights are `2.4e-15` off against a floor of `1.1e-15`.
-///   **So the range's two ends have different causes**, and an edit adding a
-///   seventh term would move the `0.1499` end and leave the `0.02` end exactly
-///   where it is.
+///   An edit adding a seventh term would therefore move the `0.1499` end and
+///   leave the `0.02` end exactly where it is.
 /// * **LERP fallback** (below `1e-6` rad) — a chord, extrapolated and
 ///   renormalized. Mechanically the crudest of the three and numerically the
 ///   most forgiving, because the arc it cuts is tiny: `1.2e-14` at `|s| = 100`,
@@ -435,8 +432,6 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
     let dot = qa.dot(qb);
     let qb = if dot < 0.0 { qb.neg() } else { qb };
 
-    // θ² from the *chord*, not from `acos(dot)`.
-    //
     // `1 - dot` is catastrophic cancellation exactly where this code spends its
     // life (adjacent samples, dot → 1), and `acos` loses half its significant
     // digits there too. For unit quaternions `|qb - qa|² = 2 - 2·dot`, and
@@ -455,7 +450,6 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
             // below are exact here but the inputs carry no usable direction.
             return lerp_norm(qa, qb, s);
         }
-        // Transcendental-free: two Horner evaluations, no acos, no sin, no div.
         let wa = slerp_weight(1.0 - s, theta_sq);
         let wb = slerp_weight(s, theta_sq);
         return qa.scale(wa).add(qb.scale(wb));
@@ -474,9 +468,9 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
 ///
 /// `θ = 2·asin(d)` where `d` is the half-chord and `d² = h/2`, so
 /// `θ² = 2h·Σ Cₖ hᵏ` with the `Cₖ` below coming from squaring the `asin` series.
-/// `asin` near zero is well conditioned, which is the whole point: the caller
-/// obtains `h` from component differences, so nothing in this path ever forms
-/// `1 − dot` or feeds `acos` an argument near 1.
+/// `asin` near zero is well conditioned: the caller obtains `h` from component
+/// differences, so nothing in this path ever forms `1 − dot` or feeds `acos` an
+/// argument near 1.
 ///
 /// ```text
 /// C₀..C₇ = 1, 1/6, 2/45, 1/70, 8/1575, 4/2079, 16/21021, 2/6435
@@ -596,12 +590,11 @@ mod tests {
     /// The conversion `h -> theta^2` must itself be exact across the whole fast
     /// path, and it must be tested **separately** from `slerp_weight`.
     ///
-    /// This test did not exist on the first draft, and its absence is precisely
-    /// how a wrong `C2` (3/40 instead of 2/45) reached the recorded-stream
-    /// differential: `slerp_series_matches_exact_below_threshold` feeds
-    /// `slerp_weight` a `u` computed by the *test*, so it validated the weights
-    /// while the input conversion was broken. The synthetic fixture missed it too
-    /// — its inter-sample arcs are far too small for the h^2 term to matter.
+    /// This test did not exist on the first draft, and its absence is how the
+    /// wrong `C2` reached the recorded-stream differential:
+    /// `slerp_series_matches_exact_below_threshold` feeds `slerp_weight` a `u`
+    /// computed by the *test*, so it validated the weights while the input
+    /// conversion was broken.
     #[test]
     fn theta_sq_matches_acos_across_the_fast_path() {
         let mut worst = 0.0f64;
@@ -768,7 +761,6 @@ mod tests {
                 "s=0 @ {theta}"
             );
             let one = slerp(qa, qb, 1.0);
-            // At s = 1 the weights are (0, 1) exactly on both branches.
             for (g, e) in [(one.w, qb.w), (one.x, qb.x), (one.y, qb.y), (one.z, qb.z)] {
                 assert!((g - e).abs() < 1e-15, "s=1 @ {theta}: {g} vs {e}");
             }

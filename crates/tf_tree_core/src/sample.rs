@@ -126,8 +126,7 @@ impl SampleRing<'_> {
     /// * [`LookupError::SlotContended`] — a slot stayed mid-write too long.
     /// * [`LookupError::SlotRecycled`] — the ring lapped the reader mid-read.
     pub fn sample<I: Interp>(&self, t: i64, policy: ExtrapPolicy) -> Result<Iso3, LookupError> {
-        // Publishes the sample set; every stamp below was written before the
-        // matching head store, so this Acquire load orders them into view.
+        // Acquire: pairs with `push`'s head store to publish every stamp below it.
         let h = self.head.load(Ordering::Acquire);
         if h == 0 {
             return Err(LookupError::NoData { edge: self.edge });
@@ -186,9 +185,7 @@ impl SampleRing<'_> {
 
         // Revalidate: if the ring lapped past `i` while we read, the endpoints we
         // used may be stale. Return the error rather than looping; the caller
-        // knows whether a retry makes sense. The bound is `retained`, not
-        // `capacity`: `head - i == capacity` already means slot `i` is the one
-        // `push` is overwriting.
+        // knows whether a retry makes sense.
         if self.head.load(Ordering::Acquire) - i > retained {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
@@ -213,8 +210,6 @@ impl SampleRing<'_> {
     /// is refused. A 64-slot ring — `Capacity::slots(64)`, which the ABI cost
     /// fixture uses — laps in 64 ms at 1 kHz, which is one ordinary preemption.
     ///
-    /// The bound is `retained`, not `capacity`: `head - i == capacity` already
-    /// means slot `i` is the one `push` is overwriting.
     /// [`Self::revalidated`] with no payload, for the test that pins its bound.
     #[cfg(test)]
     pub(crate) fn revalidated_for_test(&self, i: u64, retained: u64) -> Result<(), LookupError> {
@@ -335,8 +330,7 @@ impl SampleRing<'_> {
 
     /// Last logical index in `[lo, hi]` whose stamp is `<= t`.
     ///
-    /// This line used to end **"branchlessly"**. It is not — see the section
-    /// below, which carries the disassembly command that settles it.
+    /// This line used to end **"branchlessly"**. It is not — see below.
     ///
     /// Caller guarantees `stamp[lo] <= t < stamp[hi]`, which `sample` and
     /// `sample_from` establish before calling. Under that precondition the
@@ -418,10 +412,9 @@ impl SampleRing<'_> {
         let mut len = hi - lo + 1;
         while len > 1 {
             let half = len / 2;
-            // Mask, not multiply — and the backend turns this one back into
-            // control flow as well, so both spellings branch here. The section
-            // above says how to see that in the disassembly; do not restore a
-            // branchlessness claim to this comment without re-running it.
+            // Mask, not multiply — but the backend turns it back into control
+            // flow too. Do not restore a branchlessness claim here without
+            // re-running the disassembly above.
             let cmp = u64::from(self.stamp_at(base + half) <= t);
             base = base.wrapping_add(half & 0u64.wrapping_sub(cmp));
             len -= half;
@@ -482,8 +475,7 @@ impl SampleRing<'_> {
             }
             (hint.saturating_sub(step).max(lo_logical), hint - step / 2)
         };
-        // Binary search within the galloped bracket — see [`Self::bracket`],
-        // which is where the (retracted) branchlessness claim lived.
+        // Binary search within the galloped bracket.
         // Invariant: stamp[lo] <= t < stamp[hi].
         self.bracket(lo, hi, t)
     }
@@ -543,10 +535,8 @@ impl SampleRing<'_> {
     /// that layout is the only one paying an `O(log n)` binary search per stamp
     /// per plan step while every pose layout pays `O(1)` amortized.
     ///
-    /// Only the *start* of the search differs; `Self::bracket_from` is shared
-    /// with `sample_from` and cannot return a different index than
-    /// `Self::bracket` would. `cursor` is updated to the lower bracket index
-    /// found, so the next call resumes there; seed it to `0` for the first.
+    /// `cursor` is updated to the lower bracket index found, so the next call
+    /// resumes there; seed it to `0` for the first.
     ///
     /// # Errors
     ///
@@ -574,9 +564,8 @@ impl SampleRing<'_> {
     /// `at_with_derivatives` path.
     ///
     /// It is called only from the interpolating arm. The extrapolation arms and
-    /// the `t == t_new` left-limit arm reach their index without a search at
-    /// all, so a cursor passed through them is simply left where it was — still
-    /// a valid hint, since a wrong one cannot produce a wrong result.
+    /// the `t == t_new` left-limit arm reach their index without a search at all,
+    /// so a cursor passed through them is left where it was — still a valid hint.
     #[inline]
     fn sample_with_twist_seeking<F>(
         &self,
@@ -618,15 +607,13 @@ impl SampleRing<'_> {
                     })
                 }
                 ExtrapPolicy::Hold => {
-                    // The pose is pinned, so the velocity really is zero. This is
-                    // not a fallback — it is the derivative of what Hold does.
+                    // Held is stationary: zero is the derivative, not a fallback.
                     let p = self.read_slot((newest & self.mask()) as usize)?;
                     return self.revalidated(newest, retained, (p, Twist::ZERO));
                 }
                 ExtrapPolicy::ConstantTwist => {
-                    // Degraded to Hold: there is a pose to extend from but no
-                    // segment to extend *along*, so the derivative is missing
-                    // while the pose is fine — which is exactly `NoSegment`.
+                    // Degraded to Hold: a pose to extend from but no segment to
+                    // extend *along*, which is exactly `NoSegment`.
                     if newest == lo_logical {
                         return Err(LookupError::NoSegment { edge: self.edge });
                     }
@@ -642,9 +629,8 @@ impl SampleRing<'_> {
         }
         // At the newest stamp there is no forward segment; the body twist is
         // piecewise-constant per segment, so the value there is the left limit —
-        // the segment that *ends* at that knot. Everywhere else `bracket`'s
-        // precondition (`stamp[lo] <= t < stamp[hi]`) holds and it returns
-        // `i < newest`, so `i + 1` is in range.
+        // the segment that *ends* at that knot. Everywhere else `bracket`
+        // returns `i < newest`, so `i + 1` is in range.
         let i = if t == t_new {
             newest - 1
         } else {
@@ -663,8 +649,7 @@ impl SampleRing<'_> {
         let s = span_ns(t_i, t) / dt;
         let (pose, xi) = ScLerp::eval_with_twist(&a, &b, s);
 
-        // Same revalidation and the same bound as `sample`: if the ring lapped
-        // past `i` while we read, both the pose and the twist are stale.
+        // As in `sample`: a lap past `i` makes both the pose and the twist stale.
         if self.head.load(Ordering::Acquire) - i > retained {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
@@ -706,7 +691,6 @@ impl SampleRing<'_> {
         t_new: i64,
     ) -> Result<(Iso3, Twist), LookupError> {
         if newest == lo_logical {
-            // Only one sample retained: no twist to extend.
             let p = self.read_slot((newest & self.mask()) as usize)?;
             return self.revalidated(newest, self.retained(), (p, Twist::ZERO));
         }
@@ -716,8 +700,7 @@ impl SampleRing<'_> {
         let b = self.read_slot((newest & self.mask()) as usize)?;
         let dt = span_ns(t_prev, t_new);
         let result = if dt == 0.0 {
-            // Equal stamps span no time: nothing to extend along, and the
-            // velocity would be infinite rather than unknown.
+            // Equal stamps span no time: nothing to extend along.
             (b, Twist::ZERO)
         } else {
             // Constant screw twist of a->b, extended to `t`. `param > 1` walks
@@ -754,7 +737,7 @@ impl SampleRing<'_> {
 /// # Why the lift is exact rather than a heuristic
 ///
 /// The readable window is `retained` wide and `retained = capacity - 1` with
-/// `capacity: u32` ([`Capacity`](crate::edge::EdgeCfg)), so the window is
+/// `capacity: u32` ([`EdgeRecord::capacity`](crate::edge::EdgeRecord)), so the window is
 /// *strictly* narrower than 2^32 and can straddle at most one multiple of it.
 /// A truncated index therefore has exactly one preimage in the window: the one
 /// in `newest`'s 2^32 block, or — when the window straddles the boundary and the
@@ -782,10 +765,9 @@ pub(crate) fn rebase_hint(hint: u64, lo_logical: u64, newest: u64) -> u64 {
     }
     let lifted = (newest & !(BLOCK - 1)) | (hint & (BLOCK - 1));
     if lifted > newest {
-        // The window straddles a 2^32 boundary and this hint belongs to the
-        // block below it. `newest >= lifted - BLOCK` cannot underflow: `lifted`
-        // and `newest` share a block base, so `lifted > newest` implies
-        // `newest >= BLOCK`.
+        // This hint belongs to the block below the straddled 2^32 boundary.
+        // `newest >= lifted - BLOCK` cannot underflow: `lifted` and `newest`
+        // share a block base, so `lifted > newest` implies `newest >= BLOCK`.
         lifted - BLOCK
     } else {
         lifted

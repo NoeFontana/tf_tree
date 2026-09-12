@@ -9,9 +9,7 @@
 //!     // 2. Nobody is serving. Try to become the owner.
 //!     if F_OFD_SETLK(byte 0, exclusive) fails { backoff; continue }
 //!
-//!     // 3. Deleted. It short-circuited past step 4 for a process declaring it
-//!     //    already held the arena -- unverifiable from a new file
-//!     //    description (docs/decisions/0037). Do not re-add it.
+//!     // 3. Deleted (docs/decisions/0037). Do not re-add it.
 //!
 //!     // 4. SPLIT-BRAIN CHECK. Is any participant byte locked?
 //!     if any participant byte is held { release byte 0; backoff; continue }
@@ -158,7 +156,6 @@ pub enum OpenOutcome {
 pub enum Reach<T> {
     /// The handshake succeeded.
     ///
-    /// Carries whatever the probe obtained **and the slot the owner granted**.
     /// The slot lives in the variant rather than behind a separate accessor so
     /// that a probe cannot report success without saying which slot it was
     /// given — the two are one fact, and splitting them lets them disagree.
@@ -325,23 +322,13 @@ impl Open {
         loop {
             // 1. Someone is already serving. Join.
             match probe.probe(self.rendezvous.sock_path())? {
-                // Terminal. Retrying cannot change a version or layout
-                // disagreement, and burning the deadline on it would replace a
-                // precise message with a timeout.
                 Reach::Rejected(why) => return Err(why),
                 Reach::Serving { attached, slot } => {
-                    // The owner named the slot, so §3.3's specified order —
-                    // write the identity, *then* take the lock — is restorable
-                    // here. It was not in the fallback below, which used to
-                    // find a free slot itself and would race two writers onto
-                    // one record — that fallback was `register_any`, deleted
-                    // with issue #201's takeover arm.
                     // `None` means the byte the owner named is held by somebody
                     // the owner has not noticed leaving yet. Drop this
                     // attachment and go round again: the owner re-probes its
                     // table and will name a different slot. Nothing was written
-                    // to the arena, so nothing is left behind — which is the
-                    // point of taking the byte before touching it.
+                    // to the arena, so nothing is left behind.
                     if let Some(slot) = self.register_at(&lock, &identity, slot)? {
                         return Ok(Session {
                             outcome: OpenOutcome::Joined,
@@ -366,8 +353,7 @@ impl Open {
                 // the five unsound states that argument cost are listed there.
                 // 4. SPLIT-BRAIN CHECK. A held participant byte means a live
                 //    arena exists whose holder has not taken over yet, so yield
-                //    to it. Deterministic: no grace period, no timing
-                //    assumption, no window to tune.
+                //    to it.
                 if self.create != CreatePolicy::Always && lock.any_participant_held()? {
                     lock.release_ownership()?;
                 } else if self.create == CreatePolicy::Never {
@@ -377,8 +363,7 @@ impl Open {
                     lock.release_ownership()?;
                     return Err(IpcError::ArenaAbsent);
                 } else if let Some(slot) = self.register_creator(&lock, &identity)? {
-                    // 5. Serve. The caller owes: memfd create + seal (§3.6),
-                    //    unlink stale sock, bind, listen.
+                    // 5. Serve. The caller owes memfd create + seal (§3.6).
                     return Ok(Session {
                         outcome: OpenOutcome::Created,
                         lock,
@@ -387,11 +372,10 @@ impl Open {
                         attached: None,
                     });
                 } else {
-                    // Somebody took the creator's byte between step 4's scan and
-                    // step 5's acquire. That is step 4's own condition arriving
-                    // late, so it takes step 4's branch — release ownership and
-                    // go round again. Nothing was built, so there is nothing to
-                    // unwind.
+                    // Somebody took the creator's byte between step 4's scan
+                    // and step 5's acquire: step 4's condition arriving late,
+                    // so it takes step 4's branch. Nothing was built, so there
+                    // is nothing to unwind.
                     lock.release_ownership()?;
                 }
             }
@@ -599,9 +583,7 @@ impl<A> Session<A> {
     /// Give up the owner role while staying attached (§3.5).
     ///
     /// Ownership is a role, not a property of the arena: releasing byte 0 lets
-    /// another participant take over. **Lookups do not stop, slow down, or
-    /// observe anything during a takeover** — the data plane touches only the
-    /// mapping, and ownership lives entirely in the control plane.
+    /// another participant take over.
     ///
     /// # Errors
     ///
@@ -891,10 +873,9 @@ mod tests {
 
     /// **The escape hatch abandons an *unreachable* arena, never a served one.**
     ///
-    /// Step 1 runs before the create decision, so a rendezvous with a server
-    /// answering is joined whatever the policy says. That is what bounds the
-    /// damage — the doc on [`CreatePolicy::Always`] claims it, and a caller
-    /// reaching for the hatch is entitled to have it tested rather than argued.
+    /// That is what bounds the damage — the doc on [`CreatePolicy::Always`]
+    /// claims it, and a caller reaching for the hatch is entitled to have it
+    /// tested rather than argued.
     #[test]
     fn create_always_still_joins_a_reachable_server() {
         let (rv, dir) = rendezvous("force-reachable");
@@ -985,11 +966,9 @@ mod tests {
     /// An owner asking about its own byte is told `false`, and that is the
     /// kernel's rule rather than this method's.
     ///
-    /// `F_OFD_GETLK` reports *conflicting* locks and nothing conflicts with
-    /// itself, so this cannot be used as "am I the owner". `Tree::owner_lost`
-    /// reaches it only from the `Joined` arm, where by construction this session
-    /// is not the owner — and this test is what stops a later reader deleting
-    /// that scoping as unnecessary.
+    /// `Tree::owner_lost` reaches it only from the `Joined` arm, where by
+    /// construction this session is not the owner — and this test is what stops
+    /// a later reader deleting that scoping as unnecessary.
     #[test]
     fn an_owner_does_not_see_its_own_ownership_byte() {
         let (rv, dir) = rendezvous("ownself");
