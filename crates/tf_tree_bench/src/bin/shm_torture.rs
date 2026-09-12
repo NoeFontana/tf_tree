@@ -507,6 +507,42 @@ mod imp {
         /// all*, which the header's reachability table states as a measurement
         /// and which nobody could re-run before this existed.
         crash_site: Option<String>,
+        /// Megabytes of dirty anonymous memory each child holds — **the positive
+        /// control for the kill-window class**, and zero by default.
+        ///
+        /// The driver's `kill()`-to-`wait()` interval is exactly the interval in
+        /// which the owner is dead and no survivor can see it yet, because a
+        /// `SIGKILL`ed process releases its lock byte and its rendezvous socket
+        /// in `exit_files()`, which `do_exit` runs *after* `exit_mm()`. That
+        /// interval scales with the victim's **dirty pages** — about 0.09 ms per
+        /// resident MB on the development host — and not with its mappings.
+        ///
+        /// So this reproduces on a plain release build what ASan reproduces by
+        /// accident: an ASan torture child is 43-49 MB resident against a plain
+        /// one's 2.8, which is a 6.7 ms reap window against 0.3 ms. Without a
+        /// control, a defect that fires on ~1 % of kills is unfalsifiable in any
+        /// run a person will wait for, and a fix for it can only be shown *not
+        /// to have stopped it yet*.
+        victim_ballast_mb: usize,
+        /// Milliseconds to hold the owner **stopped** before killing it — the
+        /// portable positive control for the same window, and zero by default.
+        ///
+        /// `--victim-ballast-mb` widens the blind window by making the victim's
+        /// teardown slow, which works and is not portable: it depends on the
+        /// victim's pages being 4 KiB. On a host with
+        /// `transparent_hugepage=always` — which is what GitHub's runners use —
+        /// 256 MiB becomes 128 huge pages instead of 65 536 small ones, the reap
+        /// drops from ~25 ms to **1.2–1.8 ms** (measured 2026-09-12, both sides),
+        /// and the control silently does nothing. A test built on it is then
+        /// vacuous exactly where it most needs not to be.
+        ///
+        /// `SIGSTOP` reaches the same state with no memory physics in it at all.
+        /// A stopped owner holds its rendezvous socket open, so no survivor's
+        /// `owner_lost` answers `true` and nothing can inherit; it has stopped
+        /// serving, so no fresh process can join; and every survivor keeps
+        /// drawing its detach arm. That is the blind window, for exactly as long
+        /// as this says, on any host.
+        stop_owner_ms: u64,
     }
 
     /// `30m`, `120s`, `500ms`, `1h`, or a bare number of seconds.
@@ -551,6 +587,8 @@ mod imp {
             owner_kill_every: Some(Duration::from_secs(8)),
             no_inherit: false,
             crash_site: None,
+            victim_ballast_mb: 0,
+            stop_owner_ms: 0,
         };
         let mut help = false;
         let mut it = argv.into_iter();
@@ -598,6 +636,27 @@ mod imp {
                 // and asserts on the message, because "the run failed" is also
                 // what a harness that fails unconditionally produces.
                 "--no-inherit" => a.no_inherit = true,
+                // **The positive control for the kill-window class**, and the
+                // third of this harness's deliberate-failure flags beside
+                // `--inject-violation` and `--no-inherit`. Those two make the
+                // harness prove it can see a violation and a missing migration;
+                // this one makes it prove it can see — and then stop — a pool
+                // that drains inside the interval where nobody can inherit.
+                // See [`Args::victim_ballast_mb`]. 512 buys roughly a 46 ms
+                // window on the development host, which wedges an unfixed
+                // `--children 4` run within a handful of kills rather than
+                // within a nightly.
+                "--victim-ballast-mb" => {
+                    a.victim_ballast_mb = value("--victim-ballast-mb")?.parse()?;
+                }
+                // **The portable sibling of `--victim-ballast-mb`.** See
+                // [`Args::stop_owner_ms`]: the ballast's window depends on the
+                // host's transparent-huge-page setting and this one does not,
+                // which is why the regression test uses this and a human
+                // reproducing the original failure can use either.
+                "--stop-owner-ms" => {
+                    a.stop_owner_ms = value("--stop-owner-ms")?.parse()?;
+                }
                 // **This used to refuse unconditionally**, on the grounds that
                 // "the `crash-points` feature and `TF_TREE_CRASH_AT` are
                 // recorded as not implemented in §0.0, so there is nothing to
@@ -719,6 +778,7 @@ mod imp {
                 "usage: shm_torture [--duration 30s] [--children 6] [--seed N] \
                  [--kill-hz 4] [--owner-kill-every 8s] [--no-kill-owner] \
                  [--inject-violation] [--readers-only] [--no-inherit] \
+                 [--victim-ballast-mb N] [--stop-owner-ms N] \
                  [--crash-points] [--crash-site NAME[:nth]]"
             );
             println!(
@@ -727,6 +787,25 @@ mod imp {
                  process joining the arena again and by a survivor recording an inheritance, \
                  or the run fails. --no-inherit is the negative control and is expected \
                  to fail."
+            );
+            println!(
+                "  --victim-ballast-mb is the POSITIVE control for the kill window: each \
+                 child holds N MB of dirty memory, which widens the interval between the \
+                 SIGKILL and the victim's `exit_files` — the interval in which the owner \
+                 is dead, nothing can inherit yet, and a survivor that detaches cannot \
+                 rejoin. 512 wedges an unfixed --children 4 run within a few kills on a \
+                 plain build; ASan reaches the same width by accident at 43-49 MB/child. \
+                 It is NOT portable: on a host with transparent_hugepage=always the pages \
+                 are 2 MiB and the window collapses, which is why the regression test uses \
+                 the flag below instead."
+            );
+            println!(
+                "  --stop-owner-ms is the PORTABLE positive control for the same window: \
+                 SIGSTOP the owner for N ms before killing it. A stopped owner holds its \
+                 rendezvous socket open, so nothing can inherit, and it has stopped serving, \
+                 so nothing can join — the blind window, for as long as you ask, with no \
+                 dependence on the victim's page size. 300 wedges an unfixed --children 4 \
+                 run on its FIRST owner kill."
             );
             println!(
                 "  --crash-points arms PHASE2 §11.3's fault injection in ~10% of children \
@@ -922,6 +1001,57 @@ mod imp {
         dir.join("owner.pid")
     }
 
+    /// Present exactly while the driver is inside an owner kill — **the window
+    /// in which leaving the arena is irreversible.**
+    ///
+    /// A `SIGKILL`ed process releases its participant lock byte and its
+    /// rendezvous socket in `exit_files()`, which `do_exit` runs *after*
+    /// `exit_mm()`. So for the whole of the driver's `kill()`-to-`wait()`
+    /// interval the owner is dead and **undetectably** dead:
+    /// [`tf_tree::Tree::owner_lost`] is a socket hangup, the socket is still
+    /// open, and every survivor's `owner_lost()` answers `false`. Nothing can
+    /// inherit yet. Meanwhile every survivor keeps drawing its 2 %-per-operation
+    /// detach arm, and a survivor that detaches **cannot come back**: an arena
+    /// whose ownership byte is free but whose participant bytes are held refuses
+    /// `CreatePolicy::Never` with `ArenaHeldButUnreachable`. If every survivor
+    /// leaves inside that window, the census after the reap reads zero and the
+    /// arena is absorbing.
+    ///
+    /// The interval scales with the victim's **dirty pages** — about 0.09 ms per
+    /// resident MB here — which is why ASan reaches it by accident (43-49 MB
+    /// resident against a plain child's 2.8, a 6.7 ms window against 0.3 ms) and
+    /// why `--victim-ballast-mb` reaches it on purpose.
+    ///
+    /// **This marker is the fix, and it is a suppression of the harness's own
+    /// churn rather than of anything the engine does.** A child about to detach
+    /// checks it immediately before leaving and stays instead. The cost is that
+    /// §11.4's attach/detach churn pauses for the width of one reap — tens of
+    /// microseconds normally, tens of milliseconds under ballast — against a
+    /// detach arm that fires about every fifty operations. It does not suppress
+    /// a *kill*, a violation, or an inheritance; the population it holds still
+    /// has to answer §3.5, and an engine that refuses it still fails the run.
+    fn kill_window_path(dir: &Path) -> PathBuf {
+        dir.join("kill.in_progress")
+    }
+
+    /// Open the window. Written **before** `kill()`, so no child can observe the
+    /// corpse without also observing this.
+    fn open_kill_window(dir: &Path, victim: u32) {
+        let _ = std::fs::write(kill_window_path(dir), victim.to_string());
+    }
+
+    /// Close it. Called after the post-reap census, not after `wait()`: the
+    /// census is what the verdict reads, so the window has to span both.
+    fn close_kill_window(dir: &Path) {
+        let _ = std::fs::remove_file(kill_window_path(dir));
+    }
+
+    /// Cheapest possible probe — an `access(2)`-shaped existence check, read on
+    /// the detach arm only, which already reads one marker.
+    fn kill_window_open(dir: &Path) -> bool {
+        kill_window_path(dir).exists()
+    }
+
     /// One line per successful inheritance, appended by the heir.
     ///
     /// Append-only rather than a counter file: two survivors can inherit in
@@ -1047,6 +1177,36 @@ mod imp {
     /// alternative and is rejected: it keeps two spellings of the ledger's shape
     /// and leaves a torn record silently uncounted, which is the permissive
     /// direction [`inherited_pids`] argues against.
+    /// Where a child records **a detach it skipped because a kill window was
+    /// open** — one line per skip, `<pid>`.
+    ///
+    /// Append-only for [`inherited_path`]'s reason: the writers are processes
+    /// this harness `SIGKILL`s, and a counter read-modify-written by one of them
+    /// would lose exactly the events being counted. The driver counts the lines
+    /// at teardown, so **a run that leaned on the exemption says how hard**.
+    /// Without it the fix is invisible in the output and a reader cannot tell a
+    /// run that never needed it from one that needed it on every kill.
+    fn detach_skips_path(dir: &Path) -> PathBuf {
+        dir.join("detach_skips.log")
+    }
+
+    fn record_detach_skip(dir: &Path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(detach_skips_path(dir))
+        {
+            let _ = f.write_all(format!("{}\n", std::process::id()).as_bytes());
+        }
+    }
+
+    /// How many detaches the kill-window exemption suppressed over the whole run.
+    fn detach_skip_count(dir: &Path) -> usize {
+        std::fs::read_to_string(detach_skips_path(dir))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
     fn record_inheritance(dir: &Path) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -1316,13 +1476,33 @@ mod imp {
         )
     }
 
+    /// The behaviour a child is started with, as one value.
+    ///
+    /// **Grouped because `--victim-ballast-mb` took `spawn` to eight parameters
+    /// and `clippy::too_many_arguments` was right to object.** Four of them are
+    /// independent flags whose *order* at a call site nothing checks, and the two
+    /// call sites differ in exactly one field — which is the shape where a
+    /// positional list eventually gets transposed. `crash_at` stays a separate
+    /// argument: it is per-child rather than per-run (`crash_spec` draws it), so
+    /// it is not part of a `Copy` description of the fleet.
+    #[derive(Clone, Copy)]
+    struct ChildSpec {
+        /// This child publishes the deliberate corruption (`--inject-violation`).
+        inject: bool,
+        /// Attach and read but never claim or publish (`--readers-only`).
+        readers_only: bool,
+        /// Skip §3.5's trigger entirely (`--no-inherit`).
+        no_inherit: bool,
+        /// Megabytes of dirty memory to hold, widening the reap window
+        /// (`--victim-ballast-mb`). See [`kill_window_path`].
+        ballast_mb: usize,
+    }
+
     fn spawn(
         exe: &std::path::Path,
         dir: &PathBuf,
         seed: u64,
-        inject: bool,
-        readers_only: bool,
-        no_inherit: bool,
+        spec: ChildSpec,
         crash_at: Option<String>,
     ) -> Result<Kid> {
         let mut cmd = Command::new(exe);
@@ -1335,26 +1515,32 @@ mod imp {
             // Inherited: a `VIOLATION` line must reach the operator's terminal
             // and the CI log even if the driver is killed before it reports.
             .stderr(Stdio::inherit());
-        if inject {
+        if spec.inject {
             cmd.arg("--inject-violation");
         }
-        if readers_only {
+        if spec.readers_only {
             cmd.arg("--readers-only");
         }
-        if no_inherit {
+        if spec.no_inherit {
             cmd.arg("--no-inherit");
+        }
+        if spec.ballast_mb > 0 {
+            cmd.arg("--ballast-mb").arg(spec.ballast_mb.to_string());
         }
         // **Per child, not per run.** §11.4 asks for a random site in 10% of
         // children, and `crash::spec` parses the variable once per process, so
         // the environment is the only place this can go.
-        if let Some(spec) = crash_at.as_deref() {
-            cmd.env("TF_TREE_CRASH_AT", spec);
+        // `site`, not `spec`: `spec` is this function's `ChildSpec` parameter now,
+        // and shadowing it here would put two unrelated meanings on one name in a
+        // function whose whole subject is which flags a child gets.
+        if let Some(site) = crash_at.as_deref() {
+            cmd.env("TF_TREE_CRASH_AT", site);
         }
         let proc = cmd.spawn().context("spawning a torture child")?;
         Ok(Kid {
             proc,
             seed,
-            inject,
+            inject: spec.inject,
             crash_at,
         })
     }
@@ -1439,9 +1625,12 @@ mod imp {
                 &exe,
                 &dir,
                 rng.next_u64(),
-                a.inject && i == 0,
-                a.readers_only,
-                a.no_inherit,
+                ChildSpec {
+                    inject: a.inject && i == 0,
+                    readers_only: a.readers_only,
+                    no_inherit: a.no_inherit,
+                    ballast_mb: a.victim_ballast_mb,
+                },
                 crash_spec(
                     a.crash_points,
                     a.crash_site.as_deref(),
@@ -1529,9 +1718,12 @@ mod imp {
                         &exe,
                         &dir,
                         seed,
-                        a.inject && slot == 0,
-                        a.readers_only,
-                        a.no_inherit,
+                        ChildSpec {
+                            inject: a.inject && slot == 0,
+                            readers_only: a.readers_only,
+                            no_inherit: a.no_inherit,
+                            ballast_mb: a.victim_ballast_mb,
+                        },
                         crash_spec(
                             a.crash_points,
                             a.crash_site.as_deref(),
@@ -1561,6 +1753,7 @@ mod imp {
                         &mut health,
                         migrations.len() + 1,
                         last_round_reads > 0,
+                        a.stop_owner_ms,
                     );
                     reads.add(m.reads);
                     rounds += m.rounds;
@@ -1985,6 +2178,13 @@ mod imp {
         // gives. Holding the finished `String` is what makes the print site
         // independent of the directory's lifetime.
         let trigger_outcomes = trigger_tally_line(&dir);
+        // **Same trap, same line, and I walked into it anyway.** This counter is
+        // a ledger in the scratch directory, the print site is ~130 lines below,
+        // and `Scratch::drop` on the next line deletes the directory — so
+        // reading it there returns 0 on every run, which is exactly the value
+        // that means "the exemption was never needed". Measured: a ballast run
+        // whose `detach_skips.log` held three lines mid-run printed 0.
+        let detach_skips = detach_skip_count(&dir);
         drop(scratch);
 
         println!(
@@ -2092,6 +2292,16 @@ mod imp {
                 role_holder_draws_skipped,
                 thin_pool_draws_skipped,
                 MIN_ATTACHED_FOR_ORDINARY_KILL
+            );
+            // **The third reduction, and it is the newest, so it is the one most
+            // worth printing.** The kill-window exemption suppresses a detach —
+            // see [`kill_window_path`] — and a fix that quietly holds the
+            // population on every kill is a different harness from one that
+            // never needs to. Printed unconditionally, zeroes included, for the
+            // reason the line above gives: a reduction nobody can see is a gate
+            // doing less than it claims.
+            println!(
+                "shm_torture: detaches suppressed inside an owner-kill window: {detach_skips}"
             );
             for m in &migrations {
                 if let Some(why) = m.failure() {
@@ -2441,6 +2651,26 @@ mod imp {
         /// against an arena no owner is serving — so a run that recovers late
         /// has two different populations, and only the pair says which.
         heirs_first_round: Option<u64>,
+        /// Wall time from `kill()` to `wait()` returning — **the blind window**
+        /// in which the pool can drain without the census being able to see it.
+        ///
+        /// This is the number the 2026-09-11 investigation turned on and the
+        /// one the log could not report. `heirs_before` is censused, then the
+        /// victim is killed and reaped, then `heirs_at_kill` is censused; a
+        /// survivor running its 2 %-per-operation detach arm during that
+        /// interval leaves, and the `owner.pid` guard does not protect it
+        /// because the marker still names the corpse. So the hazard is
+        /// proportional to this duration, and it is **not** a constant of the
+        /// harness: it is dominated by the victim's teardown, which scales with
+        /// its RSS. Measured on this host, three reps each, `--children 4
+        /// --kill-hz 4`: a plain release child is 2.8 MB and reaps in
+        /// **0.224–0.263 ms**; the same child under ASan is **43–49 MB** and
+        /// reaps in **4.720–5.868 ms**, about 21× the window. ASan RSS also
+        /// grows 5–9 MB/s from ~11 MB at spawn, and the victim is always the
+        /// *oldest* child, because the ordinary draw spares the role holder and
+        /// the role holder extends its operation cap — so the window grows with
+        /// the owner's tenure, which `owner_kill_every` sets.
+        kill_to_reaped: Option<Duration>,
     }
 
     impl Migration {
@@ -2453,26 +2683,49 @@ mod imp {
                 victim,
                 recovered,
                 inherits,
+                heirs_before,
                 heirs_at_kill,
                 heirs_first_round,
+                kill_to_reaped,
                 ..
             } = self;
             let unknown = || "?".to_string();
             if self.deferred {
+                // The census that decided this is the whole content of the
+                // line, so it is in it. Without the number a reader cannot tell
+                // a fleet holding only the role holder from one holding nobody
+                // at all — a thin population and the absorbing state
+                // respectively, which the caller's `starved` test already
+                // separates and this line did not.
                 return format!(
-                    "shm_torture: §3.5 owner kill {n} DEFERRED: no read-write survivor besides \
-                     the role holder was attached, and §11.3's row for this migration presumes \
-                     one (\"another participant takes over\"). Killing the last eligible heir \
-                     would produce an arena that is ownerless, uninheritable and unjoinable — \
-                     absorbing, not slow — which tests nothing §3.5 claims. Retrying at the \
-                     next interval."
+                    "shm_torture: §3.5 owner kill {n} DEFERRED: {} read-write participant(s) \
+                     attached including the role holder, below the floor this arm needs, and \
+                     §11.3's row for this migration presumes a survivor (\"another participant \
+                     takes over\"). Killing the last eligible heir would produce an arena that \
+                     is ownerless, uninheritable and unjoinable — absorbing, not slow — which \
+                     tests nothing §3.5 claims. Retrying at the next interval.",
+                    heirs_before.map_or_else(unknown, |c| c.to_string()),
                 );
             }
+            // **`heirs_before` and the reap window are printed because their
+            // absence is what made the 2026-09-11 nightly undiagnosable from
+            // its own log.** `heirs_before` was recorded and read by exactly
+            // one consumer — the `starved` test at the call site — and never
+            // printed, so a failing kill could not say how many heirs it had to
+            // lose: `heirs_at_kill = heirs_before - 1 - departures`, and with
+            // only the left-hand side in the log the departure count is not
+            // recoverable. With both, plus the window they departed in, the
+            // whole hypothesis is decidable from one nightly instead of from a
+            // local reproduction.
             format!(
-                "shm_torture: §3.5 owner kill {n}: killed pid {}; {}; {inherits} survivor(s) \
-                 inherited; {} heir(s) attached at the kill, {} on the first round after; the \
-                 observer validated {} transform(s) while the role was vacant",
+                "shm_torture: §3.5 owner kill {n}: killed pid {}{}; {}; {inherits} survivor(s) \
+                 inherited; {} heir(s) attached before the kill, {} after it, {} on the first \
+                 round after; the observer validated {} transform(s) while the role was vacant",
                 victim.map_or_else(unknown, |p| p.to_string()),
+                kill_to_reaped.map_or_else(String::new, |d| format!(
+                    " (reaped in {:.1} ms)",
+                    d.as_secs_f64() * 1e3
+                )),
                 recovered.map_or_else(
                     || format!("NO fresh process joined within {OWNER_RECOVERY_DEADLINE:?}"),
                     |d| format!(
@@ -2480,6 +2733,7 @@ mod imp {
                         d.as_secs_f64() * 1e3
                     )
                 ),
+                heirs_before.map_or_else(unknown, |c| c.to_string()),
                 heirs_at_kill.map_or_else(unknown, |c| c.to_string()),
                 heirs_first_round.map_or_else(unknown, |c| c.to_string()),
                 self.reads.total(),
@@ -2577,6 +2831,7 @@ mod imp {
         health: &mut Health,
         n: usize,
         read_before: bool,
+        stop_owner_ms: u64,
     ) -> Migration {
         let mut m = Migration {
             n,
@@ -2590,6 +2845,7 @@ mod imp {
             heirs_first_round: None,
             deferred: false,
             heirs_before: None,
+            kill_to_reaped: None,
         };
         let before = inheritance_count(dir);
         let Some(pid) = read_owner_pid(dir) else {
@@ -2630,6 +2886,49 @@ mod imp {
         }
 
         let mut killed = false;
+        // **Opened before the signal, and that order is the whole point.** A
+        // child must not be able to observe a dead owner without also observing
+        // this — see [`kill_window_path`]. Opening it after `kill()` would leave
+        // exactly the interval the marker exists to close.
+        open_kill_window(dir, pid);
+        // Bracketing both arms rather than each, so the number printed is the
+        // whole interval between the two censuses and not a part of it — and
+        // that includes the deliberate hold below, because the hold *is* part of
+        // the blind window and the printed figure is what a reader compares
+        // against the ballast's.
+        let kill_started = Instant::now();
+
+        // **`SIGSTOP` before `SIGKILL`, when asked: the portable positive
+        // control.** See [`Args::stop_owner_ms`]. A stopped owner holds its
+        // rendezvous socket open, so every survivor's `owner_lost` answers
+        // `false` and nothing can inherit; it has stopped serving, so no fresh
+        // process can join; and every survivor keeps drawing its detach arm.
+        // That is the blind window this whole class is about, for exactly as
+        // long as the flag says, with no dependence on the victim's page size.
+        //
+        // **Sent through `/bin/kill` rather than `libc::kill`**, which would put
+        // the first `unsafe` into this file and change a posture
+        // `scripts/unsafe-budget.txt` governs — for a test control. `Child::kill`
+        // sends `SIGKILL` only. A failure to signal is reported rather than
+        // swallowed: a control that silently does not fire is the defect this
+        // flag exists to avoid, one level up.
+        if stop_owner_ms > 0 {
+            match Command::new("kill")
+                .args(["-STOP", &pid.to_string()])
+                .status()
+            {
+                Ok(st) if st.success() => {
+                    std::thread::sleep(Duration::from_millis(stop_owner_ms));
+                }
+                other => {
+                    println!(
+                        "shm_torture: --stop-owner-ms could not stop pid {pid} ({other:?}); this \
+                         run's positive control did NOT fire and its result says nothing about \
+                         the kill window"
+                    );
+                }
+            }
+        }
         if owner_kid.as_ref().is_some_and(|k| k.proc.id() == pid) {
             if let Some(kid) = owner_kid.as_mut() {
                 let _ = kid.proc.kill();
@@ -2652,10 +2951,15 @@ mod imp {
         }
         if !killed {
             // A pid we did not spawn, or one that has already exited — the
-            // marker is stale. Not signalled; recorded.
+            // marker is stale. Not signalled; recorded. The window closes on
+            // this path too, or a stale marker would pin the churn off for the
+            // rest of the run and quietly turn §11.4's attach/detach clause into
+            // nothing.
+            close_kill_window(dir);
             return m;
         }
         m.victim = Some(pid);
+        m.kill_to_reaped = Some(kill_started.elapsed());
 
         // **Censused here and nowhere else, because this is the only instant
         // the number means what the verdict needs.** `drive` observes at the
@@ -2676,6 +2980,10 @@ mod imp {
         let mut at_kill = RoundHealth::default();
         census(observer, &mut at_kill);
         m.heirs_at_kill = Some(at_kill.slots_alive);
+        // Closed here rather than after `wait()`: the census is the number the
+        // verdict reads, so the window has to span it. From this instant the
+        // survivors churn again, and one of them is about to inherit.
+        close_kill_window(dir);
 
         // **Read and probe in one loop.** The observer keeps validating while
         // the role is vacant (§3.5's data-plane claim) and the fresh join is
@@ -3794,6 +4102,7 @@ mod imp {
         let mut inject = false;
         let mut readers_only = false;
         let mut no_inherit = false;
+        let mut ballast_mb = 0usize;
         let mut it = argv.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -3812,9 +4121,78 @@ mod imp {
                 "--inject-violation" => inject = true,
                 "--readers-only" => readers_only = true,
                 "--no-inherit" => no_inherit = true,
+                "--ballast-mb" => {
+                    ballast_mb = it
+                        .next()
+                        .context("--ballast-mb needs a value")?
+                        .parse()
+                        .context("--ballast-mb")?;
+                }
                 other => bail!("child: unknown argument `{other}`"),
             }
         }
+        // **The positive control for the kill-window class, and it is the whole
+        // reason this class is testable in seconds rather than in nights.**
+        //
+        // A `SIGKILL`ed process releases its participant lock byte and its
+        // rendezvous socket in `exit_files()`, which `do_exit` runs *after*
+        // `exit_mm()` — so the driver's `kill()`-to-`wait()` interval is exactly
+        // the interval in which the owner is dead and no survivor can yet see
+        // it (`Tree::owner_lost` is a socket hangup). Every survivor keeps
+        // running its 2 %-per-operation detach arm through it, blind, and a
+        // survivor that leaves cannot return: an ownerless arena with a held
+        // participant byte refuses `CreatePolicy::Never`.
+        //
+        // That interval scales with the victim's **dirty pages** — measured on
+        // this host at roughly 0.09 ms per resident MB, and *not* with its
+        // mappings. Which is why ASan turns a 0.3 ms window into a 6.7 ms one:
+        // an ASan torture child is 43-49 MB resident against a plain one's 2.8,
+        // and it is always the oldest child that dies, because the ordinary draw
+        // spares the role holder and the role holder extends its operation cap.
+        //
+        // `--ballast-mb` buys the same window on a **plain release build**, in
+        // one flag, with no sanitizer and no nightly. It is `--inject-violation`
+        // and `--no-inherit`'s sibling: a control that makes a failure happen on
+        // purpose, so that a fix can be shown to stop it rather than shown not
+        // to have stopped it yet. Without one, a fix for a defect that fires on
+        // ~1 % of kills is unfalsifiable in any run anybody will wait for.
+        //
+        // Dirtied a page at a time on purpose: a zeroed allocation can be backed
+        // by the shared zero page until written, and an untouched page costs
+        // nothing to tear down — which is the quantity being inflated.
+        //
+        // **And allocated in 1 MiB chunks rather than one block, because
+        // transparent huge pages defeat the whole control otherwise.** Measured
+        // 2026-09-12: one 256 MiB `Vec` gives a ~25 ms reap on a host with
+        // `transparent_hugepage=madvise` (4 KiB pages, 65 536 of them) and a
+        // **1.2–1.8 ms** reap on a GitHub runner, where it is `always` — 2 MiB
+        // huge pages, ~500x fewer to tear down, and the control silently does
+        // nothing. The regression test failed on CI for exactly that reason and
+        // passed here.
+        //
+        // A chunk of 1 MiB is above glibc's 128 KiB `MMAP_THRESHOLD`, so each one
+        // is its own `mmap` VMA, and **a 1 MiB VMA cannot contain a 2 MiB-aligned
+        // 2 MiB range** — so THP cannot back it whatever the host's setting is.
+        // The dynamic mmap threshold only grows when an mmapped block is *freed*,
+        // and these are held for the life of the process, so it stays at the
+        // default. `MADV_NOHUGEPAGE` would be the direct spelling and would put
+        // the first `unsafe` into this file, changing a posture
+        // `scripts/unsafe-budget.txt` governs, for a test control.
+        const CHUNK_MIB: usize = 1;
+        let ballast: Vec<Vec<u8>> = (0..ballast_mb / CHUNK_MIB)
+            .map(|_| {
+                let mut v = vec![0u8; CHUNK_MIB * 1024 * 1024];
+                for i in (0..v.len()).step_by(4096) {
+                    v[i] = 0xA5;
+                }
+                v
+            })
+            .collect();
+        // Kept live for the life of the process, and kept from being elided: an
+        // allocation nothing reads is one LLVM may delete, and a deleted ballast
+        // is a control that silently does nothing.
+        let _ballast = std::hint::black_box(&ballast);
+
         let mut rng = Rng::new(seed);
         let dir = runtime_dir();
         // One `could not join` line per process; see the arm below.
@@ -3916,14 +4294,48 @@ mod imp {
         // whole run.
         let mut extensions = 0u32;
         let mut ops_left: u32 = OPS_PER_ATTACHMENT;
+        // Whether this attachment is already parked at its cap waiting for a
+        // kill window to close, so the stall is recorded once rather than once
+        // per re-check.
+        let mut capped_in_window = false;
         while ops_left > 0 {
             ops_left -= 1;
+            // **The cap is the detach arm's quieter twin, and it leaves the
+            // arena the same way.** Returning here drops the attachment exactly
+            // as the `18..=19` arm does, so it has to answer the same two
+            // questions: am I the role holder, and is an owner kill in flight?
+            // The second was missed in the first revision of the kill-window
+            // fix. It is rarer — an attachment is ~2000 operations at ~1.2 ms,
+            // so a 49 ms window catches a cap about 2 % of the time per heir per
+            // kill against the detach arm's ~56 % — but "rarer" is how a defect
+            // that fires on 1 % of kills got here in the first place, and one
+            // departure short of the pool is still one departure.
+            //
+            // A cap reached inside the window is *extended* rather than skipped,
+            // and not charged against `MAX_OWNER_CAP_EXTENSIONS`: that bound
+            // exists so a marker naming a corpse cannot pin one child in this
+            // loop for the whole run, and a kill window is bounded by the
+            // driver's own `wait()` rather than by a marker that might never
+            // clear.
             if ops_left == 0
                 && extensions < MAX_OWNER_CAP_EXTENSIONS
                 && read_owner_pid(dir) == Some(std::process::id())
             {
                 extensions += 1;
                 ops_left = OPS_PER_ATTACHMENT;
+            } else if ops_left == 0 && kill_window_open(dir) {
+                // One record per stall, not one per re-check. `ops_left = 1`
+                // re-enters this branch every operation until the window
+                // closes — about forty times across a 49 ms one — and counting
+                // each would report the tally in units of polls rather than of
+                // suppressed departures, which is not what the line says.
+                if !capped_in_window {
+                    capped_in_window = true;
+                    record_detach_skip(dir);
+                }
+                ops_left = 1;
+            } else if ops_left > 0 {
+                capped_in_window = false;
             }
             // **Pacing, and it is not politeness.** A 64-slot ring filled by an
             // unthrottled loop covers about nine *microseconds* of history, and
@@ -4061,6 +4473,22 @@ mod imp {
                 // require what §3.5 owes for each death.
                 18..=19 => {
                     if read_owner_pid(dir) != Some(std::process::id()) {
+                        // **Checked last, immediately before leaving.** The
+                        // driver opens the window before it signals, so a child
+                        // that reads `false` here is reading it at an instant
+                        // when the owner is still alive — and a detach then is
+                        // recoverable, because its re-`open()` still finds a
+                        // serving owner. Reading earlier in the arm, or once per
+                        // round, would leave a window whose width is the harness's
+                        // own scheduling rather than a syscall's.
+                        //
+                        // See [`kill_window_path`] for what this is and what it
+                        // costs. It suppresses a detach, never a kill, never an
+                        // inheritance and never a violation.
+                        if kill_window_open(dir) {
+                            record_detach_skip(dir);
+                            continue;
+                        }
                         return Ok(());
                     }
                 }

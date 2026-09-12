@@ -161,8 +161,25 @@ jobs:
           # for somebody checking a change. Four children rather than
           # `shm-torture`'s six: ASan's shadow memory and interceptors cost
           # enough that six under it is a different amount of work than six
-          # without, and the 90-minute job budget has to cover a `-Zbuild-std`
-          # rebuild as well as the run.
+          # without, and this job's budget has to cover a `-Zbuild-std` rebuild
+          # as well as the run.
+          #
+          # **Four is the thinnest fleet the owner-kill arm accepts, and until
+          # 2026-09-11 that was load-bearing in a way nobody had measured.** This
+          # job was red on four of five nightlies; the cause was the reap window
+          # in which nobody can inherit and every survivor keeps detaching, which
+          # scales with the victim's dirty pages — 43-49 MB under ASan against a
+          # plain child's 2.8, so 6.7 ms against 0.3 ms. **The plain build wedges
+          # at these arguments too** (900 s, no sanitizer), so the green
+          # `shm-torture` job above is green for its `--children 6` and not for
+          # its lack of ASan: the two rows move two variables at once and were
+          # never a controlled comparison.
+          #
+          # `--children 4` is **kept** here deliberately. The harness fix is the
+          # `kill.in_progress` marker, and leaving this row at its thinnest fleet
+          # is what makes this job the standing check that the marker works in
+          # production rather than only in the ballast control. Raising it in the
+          # same change would have moved two variables again.
           - { recipe: shm-torture-asan, args: "--duration 30m --children 4 --kill-hz 4" }
     steps:
       - uses: actions/checkout@v7

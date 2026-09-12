@@ -2975,6 +2975,22 @@ no-network:
 # aarch64 job it would build a cross target that is not installed and fail for a
 # reason that says nothing about the arena. `baseline.rs`'s `PORTABLE_FACTS`
 # reasons explicitly about aarch64 running these gates.
+#
+# **What this recipe reddened four nightlies out of five was not a memory error,
+# and it was not really about ASan.** An ASan child is 43-49 MB resident against
+# a plain one's 2.8, and the driver's `kill()`-to-`wait()` interval scales with
+# the victim's *dirty pages* — so ASan turns a 0.3 ms reap into a 6.7 ms one,
+# and that interval is exactly the one in which the owner is dead, nothing can
+# inherit yet, and a survivor that detaches cannot rejoin. The plain build wedges
+# at the same `--children 4` (measured: 900 s). If you want that failure on
+# purpose there are two flags. `--victim-ballast-mb 512` buys the same window with
+# no sanitizer and wedges an unfixed run in about 25 seconds, but it needs the
+# host's `transparent_hugepage` to be anything but `always` — on a GitHub runner
+# the pages are 2 MiB and the window collapses to ~1.5 ms. `--stop-owner-ms 300`
+# has no such dependence (it `SIGSTOP`s the owner) and wedges an unfixed run on
+# the FIRST owner kill, which is what
+# `tests/torture.rs::a_kill_window_wide_enough_to_drain_the_pool_does_not_wedge_the_arena`
+# uses.
 shm-torture-asan *ARGS="--duration 120s --children 4 --kill-hz 4":
     RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS=detect_leaks=0 \
     cargo +nightly run -Zbuild-std --target "$(rustc -vV | sed -n 's/^host: //p')" \
