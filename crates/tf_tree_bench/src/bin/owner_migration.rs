@@ -21,19 +21,19 @@
 //! produce its number. This is that artifact.
 //!
 //! It does not decide whether the gate passes on any given host — it prints the
-//! quotient and the verdict, and `just owner-migration` is what runs it.
+//! quotient and the verdict.
 //!
 //! # The shape, and why each role is a separate process
 //!
 //! Five roles, because collapsing any two of them measures something else:
 //!
 //! * **`owner`** — creates the arena and serves the rendezvous. It is the
-//!   process this benchmark kills, and it does **nothing else**, which is the
-//!   whole point of splitting it out. The obvious shortcut — let the owner also
-//!   publish, as `shm_torture`'s driver does — makes the kill stop the data
-//!   stream, so every reader would start reporting `Extrapolation` a few
-//!   hundred milliseconds later and the "zero failed lookups" half of 4b would
-//!   be measuring the *writer's* death rather than the owner's.
+//!   process this benchmark kills, and it does **nothing else**. The obvious
+//!   shortcut — let the owner also publish, as `shm_torture`'s driver does —
+//!   makes the kill stop the data stream, so every reader would start reporting
+//!   `Extrapolation` a few hundred milliseconds later and the "zero failed
+//!   lookups" half of 4b would be measuring the *writer's* death rather than
+//!   the owner's.
 //! * **`writer`** — joins read-write, claims the chain and publishes at a fixed
 //!   rate for the whole run. Never killed, so the rings stay fed across the
 //!   migration and a failed lookup means what 4b says it means.
@@ -68,11 +68,8 @@
 //! window boundary by microseconds against a window of 50 ms.
 //!
 //! Percentiles are merged across windows from **bucket counts, not from
-//! per-window percentiles** — averaging a p99.9 is not a p99.9. The buckets are
-//! `BUCKET_NS` = 2 ns linear across `HIST_BUCKETS` = 65 536 (so 131 us) plus one
-//! overflow, with the maximum tracked exactly outside them. 2 ns rather than 10
-//! because the tail lands in the high hundreds of nanoseconds, where 10 ns
-//! buckets quantize at ~2.3% — half the budget of a gate stated at 5%.
+//! per-window percentiles** — averaging a p99.9 is not a p99.9. `BUCKET_NS`
+//! carries the bucket width and why it is not 10 ns.
 //!
 //! # What the ratio can and cannot detect
 //!
@@ -93,9 +90,8 @@
 //!
 //! * the window is `MIGRATION_WINDOW`, not 750 ms; and
 //! * **the stall count** — lookups at or above 10x the steady p99.9, per
-//!   million, per phase. That is the statistic sensitive to exactly the failure
-//!   the percentile cannot see, and it is reported for both phases so the
-//!   comparison is like-with-like rather than against a constant.
+//!   million, reported for **both** phases so the comparison is like-with-like
+//!   rather than against a constant.
 //!
 //! `gate_arithmetic_is_not_vacuous` in this file's tests injects a tail into a
 //! synthetic during-histogram and asserts the verdict flips to FAIL, so the
@@ -194,10 +190,9 @@ mod imp {
     ///
     /// Wide enough to cover the vacancy, the heir's `F_OFD_SETLK` and its bind —
     /// measured at 0.4-2.2 ms on this host — with room for the settling after
-    /// it, and **no wider**. The first revision of this file used 750 ms, which
-    /// made the during-histogram 99.7% ordinary steady-state samples and drove
-    /// the ratio to exactly 1.000 on three consecutive runs: a gate that cannot
-    /// fail. See *What the ratio can and cannot detect* in the module header.
+    /// it, and **no wider**: the first revision's 750 ms made the
+    /// during-histogram 99.7% ordinary steady-state samples. See *What the ratio
+    /// can and cannot detect* in the module header.
     const MIGRATION_WINDOW: Duration = Duration::from_millis(250);
 
     struct Args {
@@ -298,7 +293,7 @@ mod imp {
 
     // ---------------------------------------------------------------- histogram
 
-    /// Sparse latency histogram: 10 ns linear buckets plus one overflow.
+    /// Sparse latency histogram: [`BUCKET_NS`] buckets plus one overflow.
     #[derive(Clone)]
     struct Hist {
         buckets: Vec<u32>,
@@ -420,7 +415,7 @@ mod imp {
         say("ready");
         // **Hold the tree.** Dropping it would stop serving the rendezvous, so
         // the binding below is what keeps this process an owner; the loop only
-        // keeps the scope alive. This process exists to be killed.
+        // keeps the scope alive.
         let _owner = tree;
         loop {
             std::thread::sleep(Duration::from_secs(3600));
@@ -510,8 +505,8 @@ mod imp {
 
     /// Read-only, tight `Plan::at` loop, one histogram line per [`WINDOW`].
     ///
-    /// **No control-plane call appears in this function.** That is what makes
-    /// its numbers an answer to 4b rather than a measurement of the poll.
+    /// **No control-plane call appears in this function** — that is what makes its
+    /// numbers an answer to 4b rather than a measurement of the poll.
     fn run_reader() -> Result<()> {
         let tree = tf_tree::Open::new()
             .mode(AttachMode::ReadOnly)
@@ -689,9 +684,8 @@ mod imp {
 
     /// One reader's stream, drained on its own thread into timestamped windows.
     ///
-    /// A window is `(arrival, fails, hist)`; the arrival stamp is taken **in the
-    /// driver's clock**, which is what lets the driver classify windows against
-    /// its own `SIGKILL` instant with no cross-process clock comparison.
+    /// The arrival stamp is taken **in the driver's clock**, which is what lets
+    /// the driver classify windows against its own `SIGKILL` instant.
     type Window = (Instant, u64, u64, u64, Hist);
 
     /// `sink` is taken **by value on purpose**, against
@@ -900,10 +894,7 @@ mod imp {
 
             // ---- drain the migration window, then settle ------------------
             //
-            // One loop for both: `take!` decides each window's phase from its
-            // arrival stamp, so a recovery that overran `MIGRATION_WINDOW`
-            // leaves nothing misfiled — the windows inside it are still charged
-            // to `during`, and the rest to `steady`.
+            // One loop for both: `take!` files each window by its arrival stamp.
             let window_end = killed_at.unwrap_or_else(Instant::now) + MIGRATION_WINDOW;
             let until = window_end.max(Instant::now()) + a.settle;
             while Instant::now() < until {
@@ -938,8 +929,7 @@ mod imp {
         )
     }
 
-    /// §12.3 gate 4b, as stated: p99.9 within 5% of steady state, zero failed
-    /// lookups. Separated from [`report`] so a test can drive it.
+    /// §12.3 gate 4b, as stated. Separated from [`report`] so a test can drive it.
     fn gate_4b_holds(ratio: f64, fails: u64) -> bool {
         ratio <= 1.05 && fails == 0
     }
@@ -1005,19 +995,13 @@ mod imp {
         let ratio = if s999 > 0.0 { d999 / s999 } else { f64::NAN };
         let fails = steady_fails + during_fails;
 
-        // **The statistic a percentile cannot give.** A single lookup that
-        // paused for a millisecond is p99.9999 in a window of a million and
-        // moves no percentile this gate quotes; it moves this by one. The
-        // threshold is 10x the *steady* p99.9, so it is defined by the arena's
-        // own behaviour on this host rather than by a constant that would mean
-        // something different on every machine.
         // **Exactly 10x the steady p99.9, with no floor.** This carried a
         // `.max(10_000)` floor, and on this fixture the floor always won:
         // `s999` lands in the high hundreds of nanoseconds, so 10x is ~4 300 ns
         // and every run printed `10000 ns` while labelling it "10x steady
         // p99.9" — roughly 23x, less sensitive than documented and mislabelled
         // in the output, in `docs/benchmarks/EVIDENCE.md` and in
-        // `docs/PHASE2.md`. A constant would also mean something different on
+        // `docs/PHASE2.md`. A constant would mean something different on
         // every machine, which is the thing the multiplier exists to avoid.
         // `report` has already refused an empty phase, so `s999` is non-zero.
         let stall_ns = (s999 as u64).saturating_mul(10);
@@ -1080,11 +1064,9 @@ mod imp {
         }
 
         // **The torn bounds pair, stated rather than absorbed.** `disjoint`
-        // counts refusals whose reported window was inverted (`oldest >
-        // newest`) — one ring's two bounds read by two independent `Relaxed`
-        // loads with a writer lapping between them, not, as this comment first
-        // claimed, an empty intersection across the composed path. It occurs at
-        // the same rate in both phases. Subtracting it from the 4b count is a
+        // counts the inverted-window refusals `run_reader` analyses: one ring's
+        // two bounds, not an empty intersection across the composed path, and
+        // equally common in both phases. Subtracting it from the 4b count is a
         // judgement, so the arithmetic is printed and the unsubtracted totals
         // appear above it.
         if disjoint > 0 {

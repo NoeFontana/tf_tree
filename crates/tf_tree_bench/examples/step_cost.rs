@@ -109,9 +109,8 @@ fn median_ns(iters: usize, mut f: impl FnMut() -> f64) -> f64 {
 }
 
 /// A chain `f0 -> f1 -> ... -> f{depth}` of dynamic edges at ring capacity
-/// `cap`, filled to `cap - 1` samples at 1 kHz (the most it retains without
-/// lapping). Identical construction to `cost_model::chain`, so the two
-/// harnesses measure the same tree.
+/// `cap`, filled to `cap - 1` samples at 1 kHz. Identical construction to
+/// `cost_model::chain`, so the two harnesses measure the same tree.
 fn chain_cap(depth: usize, cap: u32) -> (Tree, Vec<String>) {
     let names: Vec<String> = (0..=depth).map(|i| format!("f{i}")).collect();
     let mut b = TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
@@ -475,9 +474,8 @@ fn t_sample_cursor(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
 /// filled the same way. `0042` checked that before moving, and found nothing
 /// outside `tf_tree_math`'s own tests depending on the type's size at all.
 ///
-/// The *remaining* change — one `u32` per step with a side array of statics — is
-/// still harness-only, and now for its own reason: it changes what `Plan` is
-/// rather than how wide it is, and `Plan` is `pub`.
+/// The *remaining* change is still harness-only, and now for its own reason: it
+/// changes what `Plan` is rather than how wide it is, and `Plan` is `pub`.
 fn t_fold_compact(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps: &[i64]) -> f64 {
     const DYN: u32 = 1 << 31;
     const INV: u32 = 1 << 30;
@@ -591,7 +589,6 @@ fn main() {
     let sample_exact = t_sample(&ring1, &exact);
     let sample_between = t_sample(&ring1, &between);
     let guard_sample = t_guard_sample(view1, &edges1, &between);
-    // Past the newest sample, so `Hold` short-circuits before the search.
     let past_end = vec![FILL as i64 * 1_000_000; N];
     let sample_hold = t_sample_hold(&ring1, &past_end);
 
@@ -602,11 +599,9 @@ fn main() {
         .collect();
     let compose = t_compose(&poses);
 
-    // The per-call floor: an identity plan (`lookup(x, x)`, zero steps) runs
-    // `check_generation`, `check_domain`, `first_dynamic_edge` and `note` and
-    // folds nothing. It therefore measures the *constant* part of the per-call
-    // overhead and **not** the part that scales with plan length, which is the
-    // whole point of the reconciliation below.
+    // The per-call floor: an identity plan (`lookup(x, x)`, zero steps) folds
+    // nothing, so it measures the *constant* part of the per-call overhead and
+    // **not** the part that scales with plan length.
     let fixed = t_plan_at(&tree1, &names1[0], &names1[0], &between);
 
     println!("## primitives, measured directly");
@@ -650,10 +645,9 @@ fn main() {
     // between them, nothing but `d` separate dependent-load chains issued back
     // to back. That is precisely the shape Lever 2's "locate" phase would create.
     //
-    // So if the per-sample cost falls as `d` rises, the chains overlap when
-    // nothing forces them not to, and the serial fold is leaving that on the
-    // table. If it is flat, the out-of-order engine was already overlapping them
-    // through the fold's accumulator and `?`, and Lever 2 has nothing to win.
+    // A cost that falls as `d` rises means the chains overlap when nothing forces
+    // them not to; flat means the out-of-order engine was already overlapping
+    // them through the fold's accumulator and `?`.
     println!("\n## available ILP: d independent samples per stamp (capacity {CAP})");
     println!("{:>10} {:>16} {:>14}", "d (edges)", "ns/sample", "vs d=1");
     let mut ilp_base = f64::NAN;
@@ -678,9 +672,8 @@ fn main() {
     // — six rings at capacity 4096 is 1.7 MiB against one ring's 288 KiB, past
     // this host's 512 KiB L2. A real ILP win could be hidden by that.
     //
-    // So repeat the sweep against **one** ring sampled `d` times. The chains are
-    // just as independent and the footprint does not move. If this is flat too,
-    // the absence of overlap is a property of the work and not of the cache.
+    // So repeat the sweep against **one** ring sampled `d` times. If this is flat
+    // too, the absence of overlap is a property of the work and not of the cache.
     println!("\n## the control: d independent samples of ONE ring (footprint fixed)");
     println!("{:>10} {:>16} {:>14}", "d (repeats)", "ns/sample", "vs d=1");
     let mut ctl_base = f64::NAN;
@@ -741,10 +734,9 @@ fn main() {
     // steps hard. The break is where the ring stops fitting the cache, not where
     // the probe count changes — one more probe is ~2 ns and the step is ~20.
     //
-    // Reported as measured, with no line fitted through it. An earlier revision
-    // did fit one and read its intercept as the preamble; on data with a step in
-    // it that produced a preamble of **−22 ns**, which is how the fit was caught.
-    // The preamble now comes from `sample(Hold)` instead, which measures it.
+    // Reported as measured, with no line fitted through it: an earlier revision
+    // fitted one and read a **−22 ns** preamble off its intercept. See
+    // `t_sample_hold`, which measures the preamble instead.
     println!("\n## search cost vs ring capacity (depth 1, exact hits, whole window swept)");
     // The `Hold` column is the control that says **where** the cliff is. `Hold`
     // reads one pose slot and runs no search; `exact` runs the search and reads

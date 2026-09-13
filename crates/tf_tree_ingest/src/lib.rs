@@ -215,8 +215,8 @@ pub struct FrameId(pub u32);
 
 /// Why an ingest failed.
 ///
-/// `Copy` and `String`-free (`docs/PROJECT.md` §5), and the two variants that
-/// are about a specific edge name it — by [`FrameId`], which indexes the
+/// `Copy` and `String`-free (`docs/PROJECT.md` §5, D11), and the two variants
+/// that are about a specific edge name it — by [`FrameId`], which indexes the
 /// [`Frames`] table the caller passed in. That is why [`survey`] takes the
 /// table as an `&mut` parameter instead of returning it: a failed pass still has
 /// to be able to say *which* edge, and an index without its table cannot.
@@ -254,9 +254,6 @@ pub enum IngestError {
     /// bigger than a *policy* number the caller chose. Carrying `declared` is
     /// what makes the remedy computable rather than guessable: the number to
     /// pass to `--max-record-size` is in the error.
-    ///
-    /// `Copy` and `String`-free like every error in this workspace
-    /// (`docs/PROJECT.md` §5, D11).
     #[error(
         "a record declared {declared} bytes, over the {ceiling}-byte ceiling; \
          raise --max-record-size"
@@ -281,12 +278,10 @@ pub enum IngestError {
     /// A chunk names a codec this build has no decoder for.
     ///
     /// **Not the ordinary compressed recording.** zstd and lz4 are decoded
-    /// transparently by the default-on `compression` feature, so reaching this
-    /// means either a codec name outside the MCAP specification
-    /// ([`ChunkCodec::Other`]) or a `--no-default-features` build. See the crate
-    /// docs, and note that a chunk which *claims* zstd and carries something else
-    /// is [`IngestError::BadChunk`] instead — that is damage, not a missing
-    /// decoder.
+    /// transparently by the default-on `compression` feature; the crate docs list
+    /// the two cases that reach here. A chunk which *claims* zstd and carries
+    /// something else is [`IngestError::BadChunk`] instead — that is damage, not a
+    /// missing decoder.
     ///
     /// **Never skippable, unlike [`IngestError::BadChunk`].** Every chunk in a
     /// recording uses the same codec, so skipping them all would yield
@@ -498,14 +493,14 @@ pub struct Ingested {
     pub frames: Frames,
     /// What pass one found.
     pub survey: Survey,
-    /// The report §3.2 calls a first-class output.
+    /// The ingest report.
     pub report: IngestReport,
 }
 
 /// Run both passes over `path`.
 ///
 /// The `frames` table is an `&mut` parameter for the reason [`IngestError`]
-/// documents: a failure has to be able to name an edge.
+/// documents.
 ///
 /// # Errors
 ///

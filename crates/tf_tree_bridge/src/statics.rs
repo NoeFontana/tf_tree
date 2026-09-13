@@ -103,10 +103,8 @@ pub struct StaticStore {
     /// contradicted; `values[slot]` already holds the owner.
     ///
     /// **One clone per edge, ever**, not one per observation: it is written only
-    /// where `reported[slot]` goes from 0 to 1. The reason `reported` is a `Vec`
-    /// rather than a keyed map is that the conflict path must not allocate two
-    /// `String`s per sample, and this keeps that property — a latched static
-    /// redelivered to a hundred late joiners clones nothing.
+    /// where `reported[slot]` goes from 0 to 1, so a latched static redelivered
+    /// to a hundred late joiners clones nothing.
     ///
     /// **Why the intruder and not the whole verdict.** The owner and the declared
     /// pose are already in `values`; the offered pose is *not* kept, because
@@ -134,8 +132,7 @@ impl StaticStore {
     /// [`Publisher::Declared`], so an arriving `/tf_static` runs the same
     /// [`Self::observe_static`] it always did and lands in the same three
     /// buckets — with the config as the incumbent. `/tf_static` handling
-    /// becomes §5.7's conflict machinery and nothing else, which is what that
-    /// machinery was for.
+    /// becomes §5.7's conflict machinery and nothing else.
     #[must_use]
     pub fn seeded(config: &TopologyConfig) -> StaticStore {
         let mut s = StaticStore {
@@ -180,7 +177,6 @@ impl StaticStore {
         match self.index.get(parent, child) {
             Some(slot) if self.kinds[slot.get()] == StaticKind::Static => Err(StaticKind::Static),
             Some(_) => Ok(()),
-            // The only allocating arm, and it runs once per edge ever.
             None => {
                 self.slot_or_insert(parent, child, StaticKind::Dynamic);
                 Ok(())
@@ -204,8 +200,7 @@ impl StaticStore {
     ///
     /// The whole of §5.7's machinery, with the two name probes removed. A slot
     /// exists only for an edge the store knows, which is what makes the
-    /// `Declare` arm below reachable *only* from an unseeded store — a seeded
-    /// one has a value on file for every static edge before any message arrives.
+    /// `Declare` arm below reachable *only* from an unseeded store.
     pub(crate) fn observe_static_at(
         &mut self,
         slot: EdgeSlot,
@@ -232,8 +227,7 @@ impl StaticStore {
         let first_time = *seen == 0;
         *seen += 1;
         if first_time {
-            // The one clone this path ever makes for a given edge. See
-            // `first_intruder`.
+            // See `first_intruder`: one clone per edge, ever.
             self.first_intruder[slot.get()] = Some(publisher.clone());
         }
         self.conflicts += 1;
@@ -333,13 +327,11 @@ impl StaticStore {
         &self,
     ) -> impl Iterator<Item = (&str, &str, &Publisher, &Publisher, u64)> {
         // **Membership is `first_intruder`, and the count is `reported`.** An
-        // earlier revision filtered on `reported[slot] > 0` *and* then reached
-        // for the publishers with `?`, and the `reported` filter turned out to be
-        // dead: the two are written in the same breath, so `filter_map` already
-        // dropped every slot the filter would have. A predicate no mutation can
-        // distinguish is the vacuity smell `docs/PROJECT.md` §6 names, so there is
-        // one predicate now — "an intruder was recorded for this edge" — and it
-        // is the one that also makes the publishers available.
+        // earlier revision also filtered on `reported[slot] > 0`; that filter was
+        // dead, and a predicate no mutation can distinguish is the vacuity smell
+        // `docs/PROJECT.md` §6 names. One predicate now — "an intruder was
+        // recorded for this edge" — and it is the one that also makes the
+        // publishers available.
         //
         // `?` on the owner rather than an `expect`: the conflict arm reaches
         // `values[slot]` to find the owner it compares against, so it is `Some`
@@ -395,8 +387,7 @@ mod tests {
     }
     const ID: [f64; 7] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-    /// **A latched re-delivery is silent.** This is the normal case; logging it
-    /// would bury the two that matter.
+    /// **A latched re-delivery is silent.**
     #[test]
     fn an_identical_repeat_is_idempotent() {
         let mut s = StaticStore::new();
@@ -422,10 +413,6 @@ mod tests {
     }
 
     /// **A different value names both publishers and both values.**
-    ///
-    /// Two `robot_state_publisher`s with different URDFs. In `tf2` whichever
-    /// arrived last wins, silently, and the winner changes when the launch
-    /// order does.
     ///
     /// Mutant: drop `existing`/`offered` from the verdict ⇒ an operator learns
     /// there is a conflict but not which URDF is installed, which is the only
@@ -462,11 +449,7 @@ mod tests {
         assert_eq!(s.conflicts(), 11);
     }
 
-    /// **`q` and `−q` are the same rotation**, and a publisher that re-derives
-    /// its quaternion from a matrix hands back whichever sign the conversion
-    /// produced. Reporting that as a URDF disagreement is a false alarm on a
-    /// correct system, which is the one failure a conflict detector cannot
-    /// afford.
+    /// **`q` and `−q` are the same rotation**; see `same_pose`.
     ///
     /// Mutant: compare componentwise without the sign fold ⇒ every such
     /// re-delivery becomes a conflict.
@@ -489,9 +472,7 @@ mod tests {
         ));
     }
 
-    /// **One ulp is not a disagreement.** A URDF re-parsed by a different
-    /// version of the same parser, or round-tripped through YAML, differs in
-    /// the last bit and no consumer can observe it.
+    /// **One ulp is not a disagreement.**
     #[test]
     fn a_one_ulp_difference_is_within_tolerance() {
         let mut s = StaticStore::new();
@@ -514,10 +495,6 @@ mod tests {
     }
 
     /// **NaN never matches, including itself.**
-    ///
-    /// Without the finiteness guard, `NaN != NaN` makes an edge conflict with
-    /// its own stored value on every re-delivery — an infinite stream of
-    /// diagnostics about a single bad message.
     #[test]
     fn a_non_finite_pose_is_a_conflict_not_a_match() {
         let mut s = StaticStore::new();
@@ -531,9 +508,6 @@ mod tests {
     }
 
     /// **The edge kind cannot change**, in either direction.
-    ///
-    /// An arena where it did would have a ring behind an edge that consumers
-    /// treat as constant.
     #[test]
     fn an_edge_cannot_change_kind_in_either_direction() {
         let mut s = StaticStore::new();
@@ -553,14 +527,11 @@ mod tests {
     }
 
     /// **`conflicts_by_edge` names the edges; `conflicts` only counts
-    /// observations — and the gap between the two is the whole reason the
-    /// accessor exists.**
+    /// observations.**
     ///
     /// `docs/PHASE4.md` §5.4's amendment is normative that a `Strict` startup
     /// halt's `detail` "enumerates **every** recorded edge with both of its
-    /// publishers, not the first". Until this accessor landed the static half of
-    /// that had no way to be enumerated at all: `Ingest` kept a private `u32` of
-    /// distinct edges, which could say *how many* and never *which*.
+    /// publishers, not the first".
     ///
     /// The fixture keeps the two numbers apart on purpose — 2 contradicted edges
     /// against 7 conflicting observations — so a substitution of one for the
@@ -611,8 +582,7 @@ mod tests {
             );
         }
 
-        // Two that are, at different loudnesses: a latched static redelivered to
-        // five late joiners is five observations of one misconfiguration.
+        // Two that are, at different loudnesses.
         assert_eq!(
             s.observe_static("base", "cam", ID, &node("/rsp")),
             StaticVerdict::Declare
@@ -628,8 +598,7 @@ mod tests {
             ));
         }
         // A *second* intruder on the same edge. The recorded one must stay the
-        // publisher that opened the fault — that is the one whose launch file
-        // changed — and `first_intruder` is written once for that reason.
+        // publisher that opened the fault — the one whose launch file changed.
         assert!(matches!(
             s.observe_static("base", "cam", THIRD, &node("/latecomer")),
             StaticVerdict::Conflict { .. }

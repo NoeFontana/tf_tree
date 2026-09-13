@@ -144,8 +144,7 @@ fn main() -> Result<()> {
     //
     // The flag is still accepted, and is now a *claim that is checked*: a
     // mismatch against the measured profile is an error rather than a wrong
-    // label on a right-looking table. That is what makes the recipe's two lines
-    // unswappable.
+    // label on a right-looking table.
     let mut name = "abi_attached".to_owned();
     let mut claimed_real = false;
     for a in std::env::args().skip(1) {
@@ -202,10 +201,9 @@ fn main() -> Result<()> {
 
     // --- the ABI arm: attach again, through the C entry points --------------
     //
-    // A second, independent attach of the same segment. `tft_tree_open` reads
+    // A second, independent attach of the same segment: `tft_tree_open` reads
     // the same `TF_TREE_NAME`/`TF_TREE_RUNTIME_DIR` the facade used, so both
-    // arms are on the same arena without either handle being converted into the
-    // other — which there is no API to do, and which would defeat the point.
+    // arms are on the same arena.
     let mut ctree = core::ptr::null_mut();
     // SAFETY: `out` is a writable pointer to a null-initialised handle slot.
     let rc = unsafe { tft_tree_open(&mut ctree) };
@@ -368,17 +366,13 @@ fn main() -> Result<()> {
     // step is one named thing:
     //
     //   `empty`    the loop itself, so nothing below is loop overhead;
-    //   `forkgen`  `tf_tree_ipc::fork::generation` — the leading hypothesis:
-    //              a cross-crate call that thin LTO inlines and `embedder` does
-    //              not. It is `#[inline]`, so its MIR crosses the crate anyway;
-    //              this is what says whether that is true in the build;
+    //   `forkgen`  `tf_tree_ipc::fork::generation` — the leading hypothesis;
     //   `view`     `Tree::view` (through the `unstable` public spelling) — the
     //              `ArenaView` a guard is built from: an `as_dyn` vtable hop,
     //              the header deref, and three builder fields;
     //   `gnew`     `Guard::new(view)` — adds the seqlock generation read and
     //              zeroing the 16-entry cursor array;
-    //   `gfull`    `Tree::guard()` — adds `detached()`, `is_shared()` and
-    //              `with_fork_check`, i.e. the whole fork-safety half.
+    //   `gfull`    `Tree::guard()` — adds the whole fork-safety half.
     //
     // `gfull - gnew` is therefore the fork check *as the facade pays for it*,
     // and `forkgen - empty` is the counter load alone. If those two disagree by
@@ -600,8 +594,7 @@ fn main() -> Result<()> {
         let t = std::time::Instant::now();
         let _ = sweep_unguarded();
         u_ns.push(t.elapsed().as_nanos() as f64 / per_round);
-        // The five decomposition arms, same fixed-order argument as above: each
-        // is only ever read as a difference against its neighbour.
+        // The five decomposition arms, same fixed-order argument as above.
         let t = std::time::Instant::now();
         let _ = sweep_empty();
         e_ns.push(t.elapsed().as_nanos() as f64 / per_round);
@@ -757,15 +750,9 @@ fn main() -> Result<()> {
         cell[2] - build_only
     );
     println!();
-    // **Which profile this binary was built with decides what it measured.**
-    // The workspace release profile is `lto = "thin"`, which erases the crate
-    // boundary — `report.rs`'s §9.2 embedding row says so in those words — so a
-    // Rust caller gets `tft_plan_at` *inlined*, which no foreign caller ever
-    // does. `[profile.embedder]` is `lto = false` and is the one that measures a
-    // real boundary.
-    // The profile travels with the numbers, on the same page as the numbers.
-    // Every table above is a boundary measurement and a boundary measurement
-    // read without its profile is the error `docs/PHASE4.md` §0.0 records twice.
+    // The profile travels with the numbers, on the same page as the numbers:
+    // every table above is a boundary measurement, and one read without its
+    // profile is the error `docs/PHASE4.md` §0.0 records twice.
     println!(
         "  build: target/{}/  (the workspace manifest declares lto = {lto} for it)",
         tf_tree_bench::embed::PROFILE_DIR

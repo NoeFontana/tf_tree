@@ -148,10 +148,9 @@ fn another_process_reads_the_same_arena_bit_identically() {
 /// A read-only attachment must be exactly that: the MMU, not politeness, is what
 /// stops a consumer corrupting the arena.
 ///
-/// Verified in-process because the observable effect of writing through a
-/// `PROT_READ` mapping is `SIGSEGV`, which is awkward to assert on. What *can*
-/// be asserted cheaply is that the mode is carried through and reported, and
-/// that a read-only tree still answers queries.
+/// Verified in-process because the fault a `PROT_READ` write takes is awkward
+/// to assert on; what is cheap to assert is that the mode is carried through
+/// and that a read-only tree still answers queries.
 #[test]
 fn read_only_attachment_still_answers() {
     let tree = shared_fixture();
@@ -179,7 +178,7 @@ fn read_only_attachment_still_answers() {
 ///
 /// The bit-identity test above could pass against a snapshot. This one cannot:
 /// the reader attaches first, then the writer publishes, and the reader has to
-/// see it. That is the difference between sharing memory and copying it.
+/// see it.
 #[test]
 fn writes_are_visible_to_an_already_attached_peer() {
     let tree = shared_fixture();
@@ -306,7 +305,7 @@ fn read_only_refuses_mutation_instead_of_faulting() {
 /// which serializes nothing against a peer that mapped the same segment, so the
 /// operation was refused rather than raced. A1 removed the wedge a crashed
 /// mutator caused; A2 put the mutation lock in the arena header where every
-/// participant contends on it. The refusal is gone and this is what replaces it.
+/// participant contends on it.
 ///
 /// The reparent is non-trivial on purpose: moving `imu_link` from `base_link` to
 /// `odom` drops the `odom → base_link` leg out of every `map → imu_link` path,
@@ -402,8 +401,7 @@ fn reparent_on_a_shared_arena_is_visible_to_another_process() {
 ///
 /// Every other test in this file goes through `build_shared`, which reaches no
 /// lock file and no socket and needs none of this. Three use it now, under two
-/// different arena names — which is why [`Scratch::lock_path`] takes the name
-/// rather than assuming [`RACE_ARENA`].
+/// different arena names.
 struct Scratch(std::path::PathBuf);
 
 impl Scratch {
@@ -612,10 +610,9 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
     // is not about the error value. The owner holds byte 0, so a refused attach
     // that kept its session would show as a held byte 1.
     //
-    // Deterministic, and worth saying why: `Open::open` drops the session — and
-    // with it the OFD lock — *before* it returns `ArenaAlreadyLive`, and that
-    // happens in this process, on this thread, inside the call above. There is
-    // nothing to wait for.
+    // Deterministic: `Open::open` drops the session — and with it the OFD
+    // lock — *before* it returns `ArenaAlreadyLive`, in this process, on this
+    // thread, inside the call above. There is nothing to wait for.
     {
         let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path(RACE_ARENA))
             .expect("the rendezvous created a lock file");
@@ -670,15 +667,14 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
 /// tested is a *data race on the shared bytes*, which needs both mutators alive
 /// and interleaved; the process-boundary half is covered by the test above.
 ///
-/// # Why this one test needs a rendezvous when nothing else in the file does
+/// # Why this test needs a rendezvous
 ///
 /// It used to take its two attachments from `Tree::attach_shared(fd,
 /// ReadWrite)` on a duplicated descriptor. `docs/decisions/0028` plan step 0b
-/// removed that: a read-write attach registers a participant record, and over a
-/// bare descriptor there is no lock file to take the byte that decides whether
-/// the record may be reclaimed. So the arena is created through
-/// [`served_fixture`] and the peers join through [`join_read_write`], which is
-/// now the only read-write path there is.
+/// removed that: a read-write attach registers a participant record, and over
+/// a bare descriptor there is no lock file to take the byte that decides
+/// whether the record may be reclaimed. So the arena is created through
+/// [`served_fixture`] and the peers join through [`join_read_write`].
 ///
 /// **The port preserves each property the test was written for, and the
 /// assertions below say which line preserves which:**
@@ -703,11 +699,10 @@ fn concurrent_reparents_from_separate_attachments_are_serialized() {
     let a = join_read_write();
     let b = join_read_write();
 
-    // **Three participants, three bytes, and that is what the port bought.**
-    // The owner took byte 0 when it created the arena and each joiner took its
-    // own during the handshake, before its arena record was written. Byte 3 is
-    // asserted free so this cannot pass against a build that reports every byte
-    // held.
+    // **Three participants, three bytes.** The owner took byte 0 when it
+    // created the arena and each joiner took its own during the handshake,
+    // before its arena record was written. Byte 3 is asserted free so this
+    // cannot pass against a build that reports every byte held.
     {
         let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path(RACE_ARENA))
             .expect("the rendezvous created a lock file");

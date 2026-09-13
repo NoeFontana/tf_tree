@@ -32,9 +32,8 @@
 //! deleting it was `0017` step 7.
 //!
 //! The `Arc<TreeShare>` this handle used to carry for that purpose is gone with
-//! it: the `OwnedWriter`'s own reference is what keeps the arena alive, and a
-//! second one beside it would be a refcount whose contribution nothing could
-//! state.
+//! it: a second refcount beside the `OwnedWriter`'s own would be one whose
+//! contribution nothing could state.
 
 use core::ffi::{c_char, c_void};
 use std::cell::Cell;
@@ -112,10 +111,8 @@ pub struct tft_publisher {
     /// leaks the handle leaks the *claim*, and no other process can take the
     /// edge until this one exits.
     ///
-    /// The [`OwnedWriter`] carries the arena reference that keeps this sound —
-    /// see the module docs. Setting this to `None` therefore drops both the
-    /// claim and this handle's share of the arena, which is what
-    /// [`tft_publisher_release`] promises.
+    /// Setting this to `None` drops both the claim and this handle's share of
+    /// the arena, which is what [`tft_publisher_release`] promises.
     writer: Option<OwnedWriter>,
 }
 
@@ -135,13 +132,11 @@ unsafe fn check_publisher(p: *const tft_publisher) -> bool {
 
 /// Check thread affinity, per §3.2.
 ///
-/// Returns `TFT_OK` when the calling thread owns `h`. Otherwise:
-///
-/// * **debug builds abort**, loudly and by name, because §3.2 says so and
-///   because a C programmer who has done this wants to find out at the moment it
-///   happens rather than three frames of transform history later;
-/// * **release builds return [`TFT_ERR_WRONG_THREAD`]**, which is strictly more
-///   useful than proceeding and is why that code is not dead.
+/// Returns `TFT_OK` when the calling thread owns `h`. Otherwise debug builds
+/// abort, because a C programmer who has done this wants to find out at the
+/// moment it happens rather than three frames of transform history later, and
+/// release builds return [`TFT_ERR_WRONG_THREAD`] — which is why that code is
+/// not dead.
 #[inline]
 fn check_thread(h: &tft_publisher) -> tft_status {
     check_thread_token(h.owner, "tft_publisher")
@@ -152,8 +147,7 @@ fn check_thread(h: &tft_publisher) -> tft_status {
 /// Split out so the bridge handle — which owns one [`OwnedWriter`] per declared
 /// edge and is `!Sync` for exactly the same reason — enforces the rule through
 /// *this* code rather than a second copy of it. `what` names the handle type in
-/// the abort message, because "which handle did I move between threads" is the
-/// first question the message has to answer.
+/// the message.
 #[inline]
 pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
     if owner == thread_token() {
@@ -166,8 +160,7 @@ pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
         // `eprintln!` rather than a log facade: this runs microseconds before
         // `abort()`, in a library with no logging dependency, and the message
         // has to survive a caller who has redirected nothing. The workspace
-        // lint denies it everywhere else for good reason and this is the
-        // exception §3.2 asks for.
+        // lint denies it everywhere else; this is the exception.
         #[allow(clippy::print_stderr)]
         {
             eprintln!(
@@ -191,15 +184,13 @@ pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
 
 /// The sentence both profiles print, built in one place.
 ///
-/// **`what` is in it, and that is the whole reason this is a function.** The two
-/// profiles report the same mistake by different means — a debug build aborts
-/// with a message on stderr, a release build returns `TFT_ERR_WRONG_THREAD` and
-/// a `tft_error` — and only one of them is compiled at a time, so a name dropped
-/// from the arm you are not building is a regression nothing observes. It had
-/// been: the release arm discarded `what` and told a `tft_bridge` caller only
-/// that *"this handle"* had moved. An operator reading `TFT_ERR_WRONG_THREAD` in
-/// production has several handle types in hand and no other clue which one it
-/// was.
+/// **`what` is in it, and that is why this is a function.** Only one profile is
+/// compiled at a time — debug aborts with a message on stderr, release returns
+/// `TFT_ERR_WRONG_THREAD` and a `tft_error` — so a name dropped from the arm you
+/// are not building is a regression nothing observes. It had been: the release
+/// arm discarded `what` and told a `tft_bridge` caller only that *"this handle"*
+/// had moved, and an operator reading `TFT_ERR_WRONG_THREAD` in production has
+/// several handle types in hand and no other clue which one it was.
 ///
 /// `format!` on a path that is either about to `abort()` or has already lost the
 /// call is not a hot-path allocation.
@@ -504,7 +495,6 @@ pub unsafe extern "C" fn tft_publisher_release(pubh: *mut tft_publisher) -> tft_
         if rc != TFT_OK {
             return rc;
         }
-        // Dropping the writer is what releases the arena record and the lease.
         h.writer = None;
         TFT_OK
     })
@@ -786,12 +776,9 @@ mod tests {
 
     /// **The cross-thread diagnostic names the handle type**, in both profiles.
     ///
-    /// Only one arm of `check_thread_token` is compiled at a time — debug
-    /// aborts, release returns a status — so a name dropped from the arm you are
-    /// not building is invisible. It was: the release arm discarded `what`, and
-    /// an operator reading `TFT_ERR_WRONG_THREAD` in production learned that
-    /// *"this handle"* had moved between threads without learning which of
-    /// `tft_publisher` and `tft_bridge` it was.
+    /// Only one arm of `check_thread_token` is compiled at a time, so a name
+    /// dropped from the arm you are not building is invisible — and one was; see
+    /// `wrong_thread_message`'s own docs.
     ///
     /// Mutant: drop `{what}` from the format string (or restore the release
     /// arm's `let _ = what;` and its fixed sentence) ⇒ neither name appears and
@@ -805,8 +792,7 @@ mod tests {
                 m.contains("Send but not Sync"),
                 "the phrase `publish.rs` asserts on stderr: {m:?}"
             );
-            // `tft_error::set_message` substitutes `?` for non-ASCII, so a
-            // section sign here would reach the operator as `??`.
+            // `set_message` substitutes `?` for non-ASCII; see the fn's docs.
             assert!(m.is_ascii(), "message was {m:?}");
         }
     }

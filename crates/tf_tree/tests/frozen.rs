@@ -21,17 +21,14 @@ const MS: i64 = 1_000_000;
 /// test ends, pass or fail.
 ///
 /// The directory is the point. `freeze_to` writes its temporary as a *sibling*
-/// of the target — it has to, or the publishing `rename` stops being atomic
-/// whenever the target is on another filesystem — so
-/// [`freezing_replaces_the_target_by_rename_not_in_place`] proves the cleanup by
-/// looking at what the target's parent holds afterwards. With the target
-/// directly in the shared `std::env::temp_dir()`, that parent is a directory
-/// every other process on the machine also writes to, and the test spent its
-/// life either accusing `freeze_to` of another process's litter or narrowing its
-/// predicate until it only matched the litter it already knew about — a gate
-/// that a rename of `frozen.rs`'s private `temp_sibling` scheme would quietly
-/// turn into a no-op. A directory of our own makes the assertion the strict one:
-/// **exactly the target file is here**, whatever the temporary was called.
+/// of the target, so [`freezing_replaces_the_target_by_rename_not_in_place`]
+/// proves the cleanup by looking at what the target's parent holds afterwards.
+/// With the target directly in the shared `std::env::temp_dir()`, that parent is
+/// a directory every other process on the machine also writes to, and the test
+/// spent its life either accusing `freeze_to` of another process's litter or
+/// narrowing its predicate until it only matched the litter it already knew
+/// about. A directory of our own makes the assertion the strict one: **exactly
+/// the target file is here**, whatever the temporary was called.
 ///
 /// Per-pid and per-tag, so `nextest`'s process-per-test and a plain
 /// `cargo test`'s threads both get their own.
@@ -86,9 +83,7 @@ impl Drop for Scratch {
 ///
 /// The size is also load-bearing. Three 512-slot rings put the arena at ~130 KB,
 /// which is **more than one `SNAPSHOT_CHUNK`** (64 KiB), so `write_frozen`'s copy
-/// loop actually iterates. At the 128-slot size this fixture started at, the
-/// whole arena fitted in one chunk and every mutation of the loop's arithmetic
-/// was a no-op that the bit comparison could not see.
+/// loop actually iterates.
 fn fixture() -> Tree {
     let cfg = EdgeCfg::new(Capacity::slots(512)).interp(InterpPolicy::ScLerp);
     let tree = TreeBuilder::new()
@@ -224,19 +219,13 @@ fn a_frozen_lookup_is_bit_identical_to_the_live_one() {
 /// (`64 * 128 + 8 * 128` bytes — i.e. stop at the end of the Phase 1 regions,
 /// which is what a freeze written before v3 would do) ⇒ verified, this fails.
 ///
-/// Both counters are made non-zero deliberately: `lookups_ok` is the §5.4
-/// `Guard`-accumulated denominator and flushes on drop, so the guard is dropped
-/// before the freeze; `err_extrap_after` is an error-path counter and needs a
-/// query past the newest sample to move at all.
-///
 /// **Gated whole, and it is the only test in this crate whose gate had to be
-/// paid for in the justfile.** All three arena reads are load-bearing — the
-/// edge id comes out of the topology block, and the before/after counter values
-/// out of `edge_counters` — so nothing survives with `unstable` off. This target
-/// carries `required-features = ["shm"]`, so unlike the other gated tests it is
-/// *not* reached by `cargo nextest run --workspace`, which builds without `shm`.
-/// `just shm-check` runs it with `--features shm,unstable` for that reason, and
-/// says so where the line is.
+/// paid for in the justfile.** All three arena reads need `unstable` — the
+/// topology block, and the before/after `edge_counters` — so nothing survives
+/// with the feature off. This target also carries `required-features = ["shm"]`,
+/// so unlike the other gated tests it is *not* reached by
+/// `cargo nextest run --workspace`, which builds without `shm`; `just shm-check`
+/// runs it with `--features shm,unstable`, and says so where the line is.
 #[test]
 #[cfg(feature = "unstable")]
 fn freezing_carries_the_counter_regions() {
@@ -366,11 +355,12 @@ fn a_frozen_tree_refuses_every_mutation() {
 /// contain, against a **300 ms** budget, puts the mutant in the poll loop where
 /// both assertions can see it.
 ///
-/// The budget is short on purpose: a guard-less build must *fail* in under a
-/// second, not wedge the suite. **This repository has no `.config/` directory at
-/// all** — verified, the root dotfiles are `.cargo`, `.claude`, `.git`,
-/// `.github`, `.gitignore`, and `find` reports no `nextest.toml` anywhere — so
-/// there is no `slow-timeout` or `terminate-after` profile setting to bound it.
+/// The budget is short on purpose: a guard-less build polls for the whole
+/// budget before it answers `Timeout`, so the budget is what the mutant costs,
+/// and 300 ms keeps that failure under a second instead of wedging the suite.
+/// `.config/nextest.toml` would bound a wait only at 180 s (`slow-timeout`'s 60 s
+/// period, `terminate-after = 3`), and would report it as a timeout rather than
+/// as this assertion.
 ///
 /// **Mutants, each applied, run, observed and reverted:**
 /// - `if false && self.arena.is_frozen()` ⇒ *"assertion `left == right` failed:
@@ -398,9 +388,7 @@ fn a_frozen_tree_refuses_to_wait_for_a_frame() {
     let frozen = Tree::open_frozen(scratch.path()).unwrap();
     assert!(!frozen.is_writable(), "a .tft is permanently read-only");
 
-    // **The absent name first, because it is the one with somewhere to fail.**
-    // Without the guard this polls a file nobody can write to for the whole
-    // budget and then reports a timeout — wrong value *and* wrong cost.
+    // The absent name first, because it is the one with somewhere to fail.
     let budget = Duration::from_millis(300);
     let started = Instant::now();
     let absent = frozen.await_frames(["a_frame_that_was_never_declared"], budget);

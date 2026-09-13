@@ -18,10 +18,9 @@
 
 use std::process::{Command, Output};
 
-/// Run the shipped `shm_torture` binary.
-///
-/// `CARGO_BIN_EXE_shm_torture` is set for integration tests, so this is the
-/// binary the recipes run, not a re-implementation of it.
+/// Run the shipped `shm_torture` binary. `CARGO_BIN_EXE_shm_torture` is set for
+/// integration tests, so this is the binary the recipes run, not a
+/// re-implementation of it.
 fn torture(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_shm_torture"))
         .args(args)
@@ -101,11 +100,10 @@ fn a_corrupt_transform_is_caught_by_a_process_that_did_not_write_it() {
 fn a_run_that_validates_nothing_fails_instead_of_passing() {
     // `--children 4`, not 2: the owner-kill arm is on by default and since
     // 2026-09-10 refuses a fleet it cannot sustain
-    // (`MIN_ATTACHED_FOR_ORDINARY_KILL + 1`). At 2 this test stopped
-    // exercising its own subject — the parse-time refusal landed first and
-    // the run never reached the vacuity guard, so the assertion below was
-    // reading the wrong failure. The child count is incidental to what this
-    // test is about; `--readers-only` is what makes the run validate nothing.
+    // (`MIN_ATTACHED_FOR_ORDINARY_KILL + 1`). At 2 the parse-time refusal landed
+    // first, the run never reached the vacuity guard, and the assertion below
+    // was reading the wrong failure. The child count is incidental;
+    // `--readers-only` is what makes the run validate nothing.
     let out = torture(&["--duration", "3s", "--children", "4", "--readers-only"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -139,10 +137,9 @@ fn an_injected_run_that_detects_nothing_says_so() {
     let out = torture(&[
         "--duration",
         "3s",
-        // 4, raised from 2 on 2026-09-10: the owner-kill arm refuses a fleet
-        // below `MIN_ATTACHED_FOR_ORDINARY_KILL + 1`, and below that this test
-        // stopped reaching its own subject — the parse-time refusal landed first,
-        // so the assertion below was reading a failure it did not mean to cause.
+        // 4, raised from 2 on 2026-09-10: below
+        // `MIN_ATTACHED_FOR_ORDINARY_KILL + 1` the owner-kill arm's parse-time
+        // refusal lands first and this test never reaches its own subject.
         "--children",
         "4",
         "--readers-only",
@@ -164,8 +161,7 @@ fn an_injected_run_that_detects_nothing_says_so() {
 ///
 /// The control for the test above: without it, a harness that failed
 /// unconditionally would satisfy the injected half. The read count is asserted
-/// for the same reason the binary prints it — "0 violations" and "0 reads" are
-/// the same verdict from a harness that did nothing.
+/// for the same reason the binary prints it.
 ///
 /// Mutant (applied, **survived**): removing the `std::thread::sleep` pacing in
 /// `work` leaves this green at 11 989 composed reads. It was fatal against the
@@ -176,14 +172,12 @@ fn an_injected_run_that_detects_nothing_says_so() {
 /// rather than into one hot loop), and that reason has no mutant.
 ///
 /// **Seed 999 at six children, deliberately.** That is the configuration the
-/// shipped harness read *nothing* in — 0 composed reads over 15 s, exit 0 — and
-/// the default seed is the one it happened to survive, so a test bound to the
-/// default is a test of one lucky draw.
+/// shipped harness read *nothing* in — 0 composed reads over 15 s, exit 0 —
+/// while the default seed is the one it happened to survive.
 ///
 /// Mutant (applied, confirmed fatal): make `common_window` return `None`
 /// unconditionally — the composed count drops to 0 and the second assertion
-/// fails while the first still passes on the single-edge reads alone, which is
-/// exactly the gap that assertion is for.
+/// fails while the first still passes on the single-edge reads alone.
 ///
 /// Mutant (applied, **survived**, and named because the surprise is the point):
 /// restoring `observe`'s old hill-climbing aim leaves this green at 12 967
@@ -198,10 +192,9 @@ fn an_injected_run_that_detects_nothing_says_so() {
 /// kills — `t ≈ 9.5 s`. **This case runs for 8.** The margin was measured, not
 /// estimated: this exact invocation against the unfixed engine ends having made
 /// 50 kills with 47 slots leaked and 4 alive, so 52 of the 64 are gone and the
-/// wedge is **12 slots — two seconds — away**. And it is worth being precise
-/// about what it would have done past that margin, because the answer is not
-/// "fail on the read floor": four rings whose writers are
-/// all gone still answer every lookup inside the window they froze with, so the
+/// wedge is **12 slots — two seconds — away**. What it would have done past
+/// that margin is not "fail on the read floor": four rings whose writers are all
+/// gone still answer every lookup inside the window they froze with, so the
 /// composed count stays at the full 256 a round and the run reports a perfect
 /// score over a dead arena. Measured on this host at `--duration 60s`, before
 /// the fix: `writers=0.0/4 freshest=25670ms composed=25600/25600`, with 8193
@@ -216,13 +209,13 @@ fn an_injected_run_that_detects_nothing_says_so() {
 /// Two things changed, and neither is this test's duration. The owner now reaps
 /// a dead participant's record on hangup, which is what `docs/PHASE2.md` §3.9
 /// always said it did — measured after: 728 kills over 120 s with the
-/// registered-slot count flat at 5 of 64, and then the 30-minute nightly itself,
-/// green on `ubuntu-latest` at `adeb158` with 10 756 kills, `slots=5reg/4alive`
-/// in every one of its 107 health lines and `live` never below 86%. And `shm_torture` now checks on every
-/// round that some chain edge has a *live* writer and that the freshest sample
-/// is recent, failing a run that spends most of itself quiescent, so a
-/// regression of the first cannot hide the way it hid before. `check_recovery`
-/// reports leaked slots by name on top of that.
+/// registered-slot count flat at 5 of 64, and then the nightly itself, green on
+/// `ubuntu-latest` at `adeb158` with 10 756 kills, `slots=5reg/4alive` in every
+/// one of its 107 health lines and `live` never below 86%. And `shm_torture` now
+/// checks on every round that some chain edge has a *live* writer and that the
+/// freshest sample is recent, failing a run that spends most of itself
+/// quiescent, so a regression of the first cannot hide the way it hid before.
+/// `check_recovery` reports leaked slots by name on top of that.
 ///
 /// The two are independent, and this case is the place that shows it. Run the
 /// current harness against the *unfixed* engine (measured, in a scratch copy of
@@ -414,11 +407,10 @@ fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
         "the recovery check did not run, so nothing here judged a participant \
          record.\n{stdout}"
     );
-    // **The positive control for this whole case.** `check_recovery` reaches the
-    // strict verdict only when the run's owner never changed; on the migrating
-    // arm it downgrades to a sweep and a note. Without this assertion a change
-    // that downgraded every run would leave this test green and vacuous, which
-    // is the failure mode the file's own history is full of.
+    // **The positive control for this whole case.** Without this assertion a
+    // change that downgraded every run to the migrating arm's sweep-and-note
+    // verdict would leave this test green and vacuous, which is the failure mode
+    // the file's own history is full of.
     assert!(
         stdout.contains("judged on the STRICT path"),
         "this run did not put the leak check on its strict path, so passing says \
@@ -456,10 +448,9 @@ fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
     let out = torture(&[
         "--duration",
         "6s",
-        // 4, raised from 3 on 2026-09-10: the owner-kill arm refuses a fleet
-        // below `MIN_ATTACHED_FOR_ORDINARY_KILL + 1`, and below that this test
-        // stopped reaching its own subject — the parse-time refusal landed first,
-        // so the assertion below was reading a failure it did not mean to cause.
+        // 4, raised from 3 on 2026-09-10: below
+        // `MIN_ATTACHED_FOR_ORDINARY_KILL + 1` the owner-kill arm's parse-time
+        // refusal lands first and this test never reaches its own subject.
         "--children",
         "4",
         "--kill-hz",
@@ -572,8 +563,7 @@ fn a_kill_window_wide_enough_to_drain_the_pool_does_not_wedge_the_arena() {
     );
     // **The anti-vacuity half, and this test is worth nothing without it.** A
     // window that was never actually held open, or a marker that was never
-    // written, would both leave a green run that proved nothing — the same shape
-    // as the `0 violations` a harness that stopped reading prints. A non-zero
+    // written, would both leave a green run that proved nothing. A non-zero
     // suppression count is the evidence that the window was wide and that the
     // exemption is what carried the run.
     let suppressed = stdout

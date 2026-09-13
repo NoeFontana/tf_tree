@@ -189,6 +189,20 @@ is a bug.
   verbatim, so the trims reach it as text: no symbol, signature or constant
   moves, and the ABI version stays `0.8`. `tf_tree_unstable.h` is unchanged —
   none of the trimmed comments are emitted into it.
+- **A third batch, 18 files in the same six crates: 5449 -> 5194 comment lines,
+  4.7%**, every line with code on it identical to its parent. Graded the same
+  way, and not zero this time: **nine must-restore, all restored.** Eight were
+  the banner loss above again, for the same reason — 17 banners across
+  `tf_tree_c`'s `publisher.rs` and `unstable.rs` and `tf_tree_bench`'s
+  `step_cost.rs`, `owner_migration.rs` and `dds_report_aggregate.rs`. The ninth
+  was `unstable.rs`'s sentence naming `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`, without
+  which the comment under it opened on "Every other layout". Four trimmed doc
+  blocks reach `tf_tree_unstable.h` as comment lines only; `tf_tree.h` does not
+  change and the ABI version stays `0.8`. And `tf_tree/tests/frozen.rs` carried
+  the same false "no `.config/nextest.toml`" claim as `rendezvous.rs`: its
+  300 ms budget is now justified by what it is, the whole cost of a guard-less
+  build that polls until it answers `Timeout`, with nextest's 180 s bound beside
+  it.
 
 ### Fixed — three broken intra-doc links, a stale complexity claim, and a spliced doc comment
 
