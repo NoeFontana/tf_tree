@@ -2823,11 +2823,24 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
 # state. `kill_the_owner` censuses for a second eligible heir and defers rather
 # than killing the last one; the ordinary victim draw no longer takes the role
 # holder or draws a pool down to its floor; and a worker serving the rendezvous
-# no longer abdicates voluntarily — see `shm_torture.rs`. **This recipe reaches
-# the state probabilistically rather than reliably**, which is why it took three
-# nights: an armed abort at `takeover.after_ownership_lock_before_bind` destroys
-# an attached heir at the one instant the role is vacant, and that has to
-# coincide with a thin pool.
+# no longer detaches on its detach arm, and has its operation cap extended while
+# it serves — see `shm_torture.rs`. **This comment said that worker "no longer
+# abdicates voluntarily", which is false.** The extension is bounded by
+# `MAX_OWNER_CAP_EXTENSIONS` (10). After that the worker leaves through the cap,
+# and takes the role with it, with no census and no
+# `kill.in_progress` marker. Measured 2026-09-13 with
+# `--children 6 --kill-hz 6 --owner-kill-every 60s`: three such departures in
+# one 90 s run, at 23.285–23.405 s of tenure. The 2026-09-13 nightly's log is
+# consistent with its wedge being such an exit, two deferred owner kills having
+# kept one heir past the bound, but nothing in that log recorded the exit, so
+# that is a hypothesis. The binary's `[diag] role-holder-cap-exit` line names
+# each exit and exists to confirm or refute it. **This comment said the
+# diagnosis "places its wedge at that exit"**, which stated the hypothesis as a
+# finding, and quoted 23.3–23.5 s, a range that mixed two runs. **This recipe
+# reaches the state probabilistically rather than reliably**, which is why it
+# took three nights: an armed abort at
+# `takeover.after_ownership_lock_before_bind` destroys an attached heir at the
+# one instant the role is vacant, and that has to coincide with a thin pool.
 shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
     cargo build --release --features shm,crash-points -p tf_tree_bench --bin shm_torture
     ./target/release/shm_torture --crash-points {{ARGS}}
