@@ -52,7 +52,6 @@
 //! `tests/ingest.rs::a_reduce_pass_keeps_the_last_occurrence`, and it was not
 //! always: reversing the run order inside a reduce window used to leave every
 //! test in the workspace passing while resolving a duplicate to the wrong pose.
-//! Reasoning of this shape is exactly what a test is for.
 //!
 //! # The file is unlinked as soon as it exists, where the platform allows
 //!
@@ -168,8 +167,7 @@ fn clamp_usize(v: u64) -> usize {
 ///
 /// It costs runs: half as many samples per run is twice as many runs for the
 /// same edge, so the reduce loop does more passes. That is the price of the cap
-/// being a cap on this path, and the run *index* — which grows with the run
-/// count — is still outside it, as [`MIN_CAP`] says.
+/// being a cap on this path.
 pub(crate) fn spill_budget(user_cap: u64) -> (usize, usize) {
     let cap = cap_of(user_cap);
     let staging = staging_of(cap);
@@ -347,9 +345,8 @@ impl RunFile {
             .truncate(true)
             .open(&path)
             .map_err(|e| io(&e))?;
-        // Best-effort: on Unix this leaves an unnamed file the kernel reclaims
-        // unconditionally. Where it fails, `TempPath` is the fallback, so the
-        // error is deliberately not propagated.
+        // Best-effort, so the error is deliberately not propagated: `TempPath`
+        // is the fallback where the unlink fails (see the module docs).
         let path = TempPath(if std::fs::remove_file(&path).is_ok() {
             None
         } else {
@@ -439,12 +436,10 @@ impl RunFile {
     /// else.
     ///
     /// Reported separately from every sample buffer because it is the one
-    /// allocation on this path that `--max-memory` does **not** bound: it grows
-    /// with the run count, which grows as the cap shrinks, so at a small cap it
-    /// can exceed the cap several times over. Folding it into
-    /// `peak_buffer_bytes` would make that number a lie; leaving it out of the
-    /// report entirely would make the report one. `capacity`, not `len`, because
-    /// the allocation is what is resident.
+    /// allocation on this path that `--max-memory` does **not** bound (see
+    /// [`MIN_CAP`]). Folding it into `peak_buffer_bytes` would make that number
+    /// a lie; leaving it out of the report entirely would make the report one.
+    /// `capacity`, not `len`, because the allocation is what is resident.
     pub(crate) fn index_bytes(&self) -> u64 {
         self.runs.capacity() as u64 * core::mem::size_of::<RunSpan>() as u64
     }
@@ -597,8 +592,8 @@ mod tests {
         out
     }
 
-    /// The on-disk width and the in-memory width are the same number, so
-    /// `ingest::SAMPLE_BYTES` describes both paths.
+    /// The on-disk width equals the in-memory width, so `ingest::SAMPLE_BYTES`
+    /// describes both paths.
     ///
     /// Mutant: change `ENCODED` to `8 + 6 * 8` — applied, and this failed at
     /// `56 != 64`. `a_run_round_trips_exactly` and
@@ -688,11 +683,9 @@ mod tests {
     /// Two spill files in one process never share a name — across threads as
     /// well as within one.
     ///
-    /// This is the assertion that keeps two concurrent ingests off each other's
-    /// inode. `RunFile::create` opens with `truncate(true)`, so a shared name is
-    /// not a failed `create` but a silently emptied file that the other holder
-    /// keeps writing into at its own offsets; the merge then reads a mixture
-    /// that decodes perfectly into wrong poses.
+    /// This is the assertion behind [`NEXT_TAG`]'s argument: a shared name is
+    /// not a failed `create` but a silently emptied inode and wrong poses in
+    /// the arena.
     ///
     /// Mutant: derive the tag from a caller-supplied slot instead of
     /// [`NEXT_TAG`] — modelled here by `fetch_add(0, …)`, which is what any
@@ -758,10 +751,7 @@ mod tests {
     /// **The budget fits the cap** — spill phase and merge phase, over a grid of
     /// caps and run counts up to [`fan_in`].
     ///
-    /// This is the assertion `--max-memory` *is*. The reduce pass exists because
-    /// a single-pass merge cannot satisfy it: it holds at least one sample per
-    /// run, so beyond `fan_in` runs it exceeds the cap however the window is
-    /// chosen.
+    /// This is the assertion `--max-memory` *is*.
     ///
     /// Mutant: divide by `runs` instead of `runs + 1` in
     /// `merge_window_samples` — applied, and this failed at cap 1024, runs 1:
@@ -780,11 +770,10 @@ mod tests {
             let cap = cap_of(user_cap);
             let (run, staging) = spill_budget(user_cap);
             assert!(run >= 1 && staging >= ENCODED);
-            // **Twice the run, because `sort_run` is stable and allocates.** The
-            // run buffer is at capacity, its scratch is up to another full copy,
-            // and the staging buffer is live beside both. This assertion read
-            // `run * ENCODED + staging` until 2026-09-06 and passed while the
-            // phase used nearly twice the cap.
+            // **Twice the run, because `sort_run` is stable and allocates** —
+            // see `spill_budget`. This assertion read `run * ENCODED + staging`
+            // until 2026-09-06 and passed while the phase used nearly twice the
+            // cap.
             assert!(
                 2 * run as u64 * ENCODED as u64 + staging as u64 <= cap,
                 "spill phase over cap {cap}"
@@ -798,9 +787,7 @@ mod tests {
                 // and **two** write-staging buffers, not one: a reduce pass has
                 // the file it is reading and the file it is writing open at the
                 // same instant, and `RunFile::staging` is allocated to capacity
-                // at `create` and never released. `WINDOW_SHARE_*`'s three
-                // quarters was always chosen against `2 × staging ≤ cap / 4`;
-                // this line is what checks the pair rather than half of it.
+                // at `create` and never released.
                 let resident = (runs as u64 + 1) * w as u64 * ENCODED as u64 + 2 * staging_of(cap);
                 assert!(
                     resident <= cap,

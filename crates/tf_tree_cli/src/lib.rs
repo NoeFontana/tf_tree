@@ -7,14 +7,10 @@
 //!
 //! # Four sources, and the fixture is only the one you get by naming none
 //!
-//! A bare invocation builds the mobile-robot [`tf_tree_bench::fixture`] in
-//! process and inspects *that*, which is what keeps every subcommand runnable on
-//! a machine with nothing deployed. The other three are named on the command
-//! line: a live arena (`--attach`), an MCAP recording (`doctor --from-bag`,
-//! `tf_tree ingest`) and a frozen `.tft` index (`doctor --from-file`). The
-//! middle one needs nothing installed — `docs/PHASE5.md` §2.2's wedge — and the
-//! other two are Linux-plus-`--features shm` builds, because that is where the
-//! mapping code is.
+//! The `tf_tree --help` text names all four. The bare invocation's is the
+//! mobile-robot [`tf_tree_bench::fixture`], built in process; `--attach` and
+//! `doctor --from-file` are Linux-plus-`--features shm` builds, because that is
+//! where the mapping code is.
 //!
 //! What the Phase 1 design got right is the shape, and it is why adding those
 //! three cost no new checks: everything downstream reads a captured
@@ -58,9 +54,8 @@
 // another existing member would buy nothing: `just test-doc` is
 // `cargo test --doc --workspace`, and feature unification is graph-wide, so
 // `unstable` is on for every doctest in that invocation whoever hosts it.
-// What this gate catches today is the failure it was added for — a signature
-// change to `claim`, `plan` or `Capacity::history` silently breaking the front
-// page — and that is worth having on its own.
+// What this gate catches today is the failure it was added for, and that is
+// worth having on its own.
 #[cfg(doctest)]
 #[doc = include_str!("../../../README.md")]
 mod root_readme {}
@@ -1038,9 +1033,7 @@ fn source(live: Live<'_>) -> Result<(&'static Tree, Source)> {
 /// different argument surface. `doctor` is the one whose whole value is a
 /// verdict about data that already exists.
 ///
-/// The tree is `Box::leak`ed for the same reason [`source`] leaks its own: the
-/// process inspects once and exits, and a frozen mapping or an ingested arena
-/// has nothing useful to do between the last `println!` and `exit`.
+/// The tree is `Box::leak`ed for the reason [`source`] leaks its own.
 fn doctor_source(
     live: Live<'_>,
     from_bag: Option<&std::path::Path>,
@@ -1292,10 +1285,10 @@ fn fmt_iso(iso: &Iso3) -> String {
 /// `tf_tree doctor` — the `docs/PHASE5.md` §6 catalogue.
 ///
 /// **`--exit-code` is opt-in, and the previous unconditional `exit(1)` on any
-/// error is gone.** `doctor` is run by hand far more often than by CI, and a
-/// diagnostic that returns non-zero by default breaks `&&` in an operator's
-/// shell and gets wrapped in `|| true`, at which point the gate is worthless
-/// where it was wanted. §6 asks for the flag; the flag is the whole mechanism.
+/// error is gone** — §6 asks for the flag, and the flag's own help carries the
+/// argument. The half that is only here: a diagnostic that returns non-zero by
+/// default gets wrapped in `|| true`, at which point the gate is worthless
+/// where it was wanted.
 #[allow(clippy::too_many_arguments)]
 fn cmd_doctor(
     live: Live<'_>,
@@ -1813,14 +1806,6 @@ fn hex16(bytes: [u8; 16]) -> String {
     })
 }
 
-/// `tf_tree participants` — who is attached, from the lock file alone.
-///
-/// **Never maps the arena** (`docs/PHASE2.md` §3.3), and that is the entire
-/// value of it. Every other command needs a segment this build can read; this
-/// one answers when the segment is gone, when its layout hash does not match, or
-/// when the owner is wedged and nobody can complete a handshake. Those are
-/// exactly the situations in which somebody runs a diagnostic tool.
-///
 /// `tf_tree freeze --from-live` — `docs/PHASE5.md` §2, and §5.6's capture.
 ///
 /// Attaches **read-only** (`AttachArgs` defaults, D18) and copies the arena.
@@ -1858,12 +1843,10 @@ fn cmd_freeze(
         from_live,
         "`freeze` needs a source; pass `--from-live` or `--from-bag <PATH>`"
     );
-    // **The same rule `doctor` applies, for the same reason.** `IngestArgs` is
-    // flattened here so `--from-bag` takes the §3 knobs; `--from-live` reads no
-    // recording, so every one of them is dead on this path and accepting one
-    // silently tells a user their `--tf-prefix` was applied to a frozen index it
-    // never touched. `--report` is the deliberate exception and says so in its
-    // own help text — it names an output path, not an ingest behaviour.
+    // **The same rule `doctor` applies, for the same reason.** `--from-live`
+    // reads no recording, so every flattened §3 knob is dead on this path.
+    // `--report` is the deliberate exception and says so in its own help text —
+    // it names an output path, not an ingest behaviour.
     let set = ingest.flags_set();
     anyhow::ensure!(
         set.is_empty(),
@@ -2287,12 +2270,8 @@ fn observed_rate_hz(obs: &Observations, edge: u32) -> Option<f64> {
 
 /// Print this build's arena format version and what a mismatch means.
 ///
-/// `docs/PHASE5.md` §1.2 requires this alongside the `FORMAT_VERSION = 3` bump,
-/// and the reason is operational rather than tidy: a version mismatch is the
-/// one error an operator is *guaranteed* to hit during the upgrade, and the
-/// message the attach path can give them is necessarily terse — it comes from a
-/// library that has just declined to map a segment and has no vocabulary for
-/// "restart your fleet together".
+/// `docs/PHASE5.md` §1.2 requires this alongside the `FORMAT_VERSION = 3` bump;
+/// `--explain-version`'s own help carries the reason.
 ///
 /// It reads no arena and takes no lock, so it answers on a machine where
 /// nothing is running and on one where everything is wedged.
@@ -2797,13 +2776,8 @@ mod tests {
     }
 
     /// **The `CompressedChunk` remedy is a bare string, and it is now the message
-    /// for a *narrower* case than it used to be.**
-    ///
-    /// zstd and lz4 are decoded (`tf_tree_ingest`'s default-on `compression`
-    /// feature), so an ordinary compressed recording no longer reaches this arm at
-    /// all. What does is a codec name outside the MCAP specification, or a build
-    /// with the feature off — and a user cannot tell those apart from the outside,
-    /// which is why the message names both rather than being split on `#[cfg]`.
+    /// for a *narrower* case than it used to be.** Which case, and why one message
+    /// covers both builds, is on `ingest_err`'s arm.
     ///
     /// It is still only reachable at this level: `ingest_err` is a `match` on an
     /// error value, and an end-to-end test would have to fabricate a recording with
@@ -2929,9 +2903,8 @@ mod tests {
     /// **A refusal that came from a ceiling names the ceiling's flag, and never
     /// `--on-bad-chunk=skip`.**
     ///
-    /// The generic `BadChunk` advice is actively wrong for these two kinds. `skip`
-    /// is already the default, and following it drops a chunk that is not damaged —
-    /// the recording is sound and this reader declined to allocate for it. Both
+    /// The generic `BadChunk` advice is actively wrong for these two kinds, for the
+    /// reason `ingest_err`'s limit arm states. Both
     /// policies are covered because an operator meets the same condition as
     /// `BadChunk` under `halt` and as `AllChunksOverLimit` under `skip`, and a
     /// remedy that appears under only one of them is a remedy half the users never
@@ -3119,9 +3092,7 @@ mod tests {
     /// Before this, only the capacity-vs-latency half had a disclosure, so a
     /// run whose *counter* half was structurally silent — every arena that has
     /// served no lookups, which includes the reference fixture — reported a
-    /// bare `pass`. And when both halves are blind the check skips and its own
-    /// reason carries both sentences, so a note there would be the report
-    /// explaining itself twice.
+    /// bare `pass`.
     ///
     /// Mutant: change the `(Some(_), Some(_)) => {}` arm to push the counter
     /// note. Applied: the third assertion fails on a note beside a `not run`.
@@ -3234,11 +3205,9 @@ mod tests {
 
     /// **An ingest flag `doctor` will ignore is named, one at a time.**
     ///
-    /// `IngestArgs` is flattened whole so `--from-bag` takes the same knobs
-    /// `tf_tree ingest` does; the consequence was that all eleven parsed on
-    /// every `doctor` invocation and were dropped. The rejection is only as
-    /// good as [`IngestArgs::flags_set`] being able to tell a set flag from a
-    /// default, so this pins both directions.
+    /// The rejection [`IngestArgs::flags_set`] exists for is only as good as it
+    /// being able to tell a set flag from a default, so this pins both
+    /// directions.
     ///
     /// Mutant: make `flags_set` return `Vec::new()`. Applied: the second
     /// assertion fails.
@@ -3266,24 +3235,10 @@ mod tests {
     /// **"Cannot tell" is not "dead", and every arm that could have said
     /// otherwise is here.**
     ///
-    /// `record_is_alive`'s doc states the bias this test enforces: *a false
-    /// "dead" lets a rescuer take an entry from a running process, which is
-    /// corruption; a false "alive" only delays recovery*. `doctor` is where an
-    /// operator decides what to kill, so the corresponding corruption is
-    /// telling somebody a running process is gone — and `TFT014`'s fork arm
-    /// fires on *byte held plus process gone*, so a `/proc` failure classified
-    /// as death puts a `warn` on a healthy publisher.
-    ///
-    /// The revision this replaced was
-    /// `Err(_) if self_start_time().is_ok() => Gone`, which called **every**
-    /// non-`ENOENT` failure and every parse failure death. The three `Unknown`
-    /// rows below are the ones it got wrong; on a `hidepid=2` mount or under
-    /// `EMFILE`, every one of them is a live participant.
-    ///
-    /// `proc_answers` and the probe are parameters for the reason
-    /// `alive_given`'s are: neither is arrangeable from a test. Staging pid
-    /// reuse means exhausting the pid space, and unmounting `/proc` is not
-    /// something a test suite may do to the machine it runs on.
+    /// This is where [`recorded_given`]'s bias is asserted rather than stated.
+    /// The three `Unknown` rows below are the ones the revision it replaced got
+    /// wrong; on a `hidepid=2` mount or under `EMFILE`, every one of them is a
+    /// live participant.
     ///
     /// Mutant: restore `Err(_) if proc_answers => Gone` as a single arm.
     /// Applied: it panicked on the `EACCES` row with *left: Gone, right:

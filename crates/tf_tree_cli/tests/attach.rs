@@ -5,11 +5,6 @@
 //! upstream of here is tested by code that arranges its own processes and knows
 //! where the seams are. This does not — it goes through `clap`, through
 //! `tf_tree::open()`, and through whatever the arena actually says.
-//!
-//! `tf_tree participants` gets its own test because its contract is the
-//! opposite of the others': §3.3 requires it to work **without the arena**, and
-//! the only way to show that is to ask it about a lock file whose segment never
-//! existed.
 #![cfg(all(feature = "shm", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -208,10 +203,8 @@ fn echo_attaches_and_resolves() {
 /// and carries a note. A bare `pass` on either would be the lie by omission this
 /// asserts against.
 ///
-/// **The lookup in `publish` is load-bearing for that second half.** Without it
-/// the counters are all zero, `checks::no_counter_evidence` refuses both halves,
-/// and `TFT011` skips rather than disclosing — a different, also-correct
-/// outcome, and not the one this test is about.
+/// **The lookup in `publish` is load-bearing for that second half**: without it
+/// `TFT011` skips rather than disclosing.
 ///
 /// **And `TFT019` needs a third thing said, because an attach is not a source
 /// it can answer from.** A reader who meets a silent `TFT019` here must not read
@@ -255,9 +248,6 @@ fn doctor_names_the_checks_it_cannot_run_on_a_live_arena() {
         out.contains("instance "),
         "doctor did not report which arena instance it looked at:\n{out}"
     );
-    // TFT018/TFT019 have no verdict on an attach, so the skip has to send the
-    // operator to the source that does rather than let its silence read as an
-    // all-clear.
     let not_run_reasons = out.split("not run:").nth(1).unwrap_or("");
     assert!(
         not_run_reasons.contains("--from-bag"),
@@ -374,13 +364,11 @@ fn top_shows_the_live_arena_and_its_own_read_only_row() {
         out.contains("no arena participant record"),
         "the observer did not disclose how it is attached:\n{out}"
     );
-    // The publisher's topology, not the in-process fixture's.
     assert!(out.contains("map->base"), "no live edge:\n{out}");
     assert!(
         !out.contains("base_link"),
         "this is the fixture, not the live arena:\n{out}"
     );
-    // The observer's own lock-file row: read-only, and with no arena record.
     let pane = out
         .split("participants")
         .nth(1)
@@ -436,8 +424,6 @@ fn the_two_participant_censuses_disagree_by_the_read_only_population() {
     let scratch = Scratch::new("censuses");
     let publisher = publish(&scratch);
 
-    // D18's default, and the shape a `PROT_READ` mapping arrives in: a byte, and
-    // no arena record of its own.
     let consumer = tf_tree::Open::new()
         .mode(AttachMode::ReadOnly)
         .create(CreatePolicy::Never)
@@ -510,10 +496,6 @@ fn top_refuses_a_read_write_attach() {
         "unhelpful refusal: {err}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// `TFT014`'s participant half — `docs/decisions/0028` plan step 6
-// ---------------------------------------------------------------------------
 
 /// The lock file of the arena [`publish`] created, as a **second** open file
 /// description.
@@ -791,16 +773,13 @@ fn doctor_json_reports_a_read_only_fork_inheritor_with_no_arena_record() {
             pid: GONE,
             start_time: 4242,
             boot_id: [0u8; 16],
-            // Read-only: the mode that writes no arena record.
             mode: tf_tree_ipc::AccessMode::ReadOnly,
             name: comm("forked-consumer"),
             pid_ns_inode: 0,
         },
     )
     .expect("write the identity record");
-    // The byte the inheritor holds on the dead parent's behalf. No
-    // `register_at`: a read-only participant never wrote an arena record, so
-    // slot 9's record is `FREE` and stays that way.
+    // The byte the inheritor holds on the dead parent's behalf.
     assert_eq!(
         lock.try_take_participant(SLOT).expect("take the byte"),
         tf_tree_ipc::LockAttempt::Acquired
@@ -900,7 +879,6 @@ fn doctor_is_silent_about_a_joiner_that_is_mid_attach() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // `docs/decisions/0033` plan step 1 — the four arms of the namespace false
 // positive.
 //
@@ -923,14 +901,10 @@ fn doctor_is_silent_about_a_joiner_that_is_mid_attach() {
 //
 // A, B and C are staged through the lock file, the way the three `TFT014` tests
 // above are staged and for the reason
-// `doctor_json_reports_a_held_byte_over_a_dead_pid_as_a_fork_inheritor` gives:
-// the state under test is a set of bytes in a file plus a byte held by some
-// open file description, and the kernel cannot tell a second description in
-// this process from an inherited one. What a namespace adds to that is one
-// `u64` in the record and one in the observer, and only the second of those
-// needs a real namespace — which is arm D, and arm D is therefore the one
-// staged with a real `unshare`.
-// ---------------------------------------------------------------------------
+// `doctor_json_reports_a_held_byte_over_a_dead_pid_as_a_fork_inheritor` gives.
+// What a namespace adds to that is one `u64` in the record and one in the
+// observer, and only the second of those needs a real namespace — which is arm
+// D, and arm D is therefore the one staged with a real `unshare`.
 
 /// An nsfs inode that is not this process's.
 ///
@@ -991,9 +965,7 @@ fn stage_two_accusable_slots(
         .register_at(arena, id.pid, id.start_time, 0)
         .expect("the arena half of the non-FREE shape");
     // This process's own second open file description holds both bytes, which
-    // is what an inherited one looks like to the kernel — the premise §6.2
-    // rests on, and the reason the three `TFT014` tests above stage a fork
-    // without forking.
+    // is what an inherited one looks like to the kernel (§6.2).
     lock
 }
 
@@ -1081,9 +1053,8 @@ fn tft014_namespace_arm_a_a_namespaced_participant_is_not_a_fork_inheritor() {
 /// exists for. Only a guard before the whole `match probe` covers both and
 /// neither.
 ///
-/// `u32::MAX` is the deterministic form of "not in this `/proc`" — it exceeds
-/// every `pid_max`, so the classifier reaches its no-entry branch without
-/// racing pid reuse to get there.
+/// `u32::MAX` is "not in this `/proc`" deterministically, for the `pid_max`
+/// reason `doctor_json_reports_a_stale_live_record_as_an_abandoned_slot` gives.
 ///
 /// **What is staged here and what `0033` staged.** The record ran a container
 /// `doctor` over a bind-mounted runtime dir and the first slot it accused was
@@ -1098,9 +1069,7 @@ fn tft014_namespace_arm_a_a_namespaced_participant_is_not_a_fork_inheritor() {
 /// which is what makes A and B two tests rather than one.
 #[test]
 fn tft014_namespace_arm_b_a_host_participant_seen_from_elsewhere_is_not_one_either() {
-    /// The non-`FREE` shape: `checks::slot_leak`'s main match.
     const ARENA: u32 = 23;
-    /// The `FREE`-record shape: its `SlotState::Free` early return.
     const BARE: u32 = 24;
     const GONE: u32 = u32::MAX;
 
@@ -1155,9 +1124,7 @@ fn tft014_namespace_arm_b_a_host_participant_seen_from_elsewhere_is_not_one_eith
 /// and it is why A, B and C are three tests and not one.
 #[test]
 fn tft014_namespace_arm_c_a_real_fork_inheritor_in_this_namespace_still_fires() {
-    /// The non-`FREE` shape: `checks::slot_leak`'s main match.
     const ARENA: u32 = 25;
-    /// The `FREE`-record shape: its `SlotState::Free` early return.
     const BARE: u32 = 26;
     const GONE: u32 = u32::MAX;
 

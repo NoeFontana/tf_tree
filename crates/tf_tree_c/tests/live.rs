@@ -211,7 +211,6 @@ fn a_strided_batch_writes_into_caller_structs_without_touching_the_gaps() {
     assert_eq!(rc, TFT_OK);
 
     for i in 0..N {
-        // The 8 bytes past each payload must still be the sentinel.
         let gap = &buf[i * STRIDE + 56..i * STRIDE + 64];
         assert_eq!(gap, &[0xAA; 8], "element {i}'s gap was overwritten");
         // And each payload is a unit quaternion, i.e. real data was written.
@@ -346,11 +345,9 @@ fn a_plan_outlives_the_tree_handle_it_was_compiled_from() {
         TFT_OK
     );
 
-    // Free the tree first — the order a C programmer naturally writes.
     // SAFETY: created above, freed once.
     unsafe { tft_tree_free(t) };
 
-    // The plan must still evaluate.
     let mut out = [0u8; 128];
     // SAFETY: the plan is still live; it holds its own share of the tree.
     let rc = unsafe { tft_plan_at(p, 250_000_000, TFT_LAYOUT_MAT4_ROW, out.as_mut_ptr().cast()) };
@@ -467,9 +464,7 @@ fn fetch_error() -> tft_error {
     e
 }
 
-// ---------------------------------------------------------------------------
 // The unstable tier — `tf_tree_unstable.h`, §3.1
-// ---------------------------------------------------------------------------
 
 /// **Derivatives cross the boundary, and the twist is the one §2 defines.**
 ///
@@ -1071,7 +1066,6 @@ fn derivatives_write_only_what_was_asked_for() {
         },
         TFT_OK
     );
-    // Both NULL is refused rather than treated as a very fast success.
     // SAFETY: both output pointers NULL is the case under test.
     assert_eq!(
         unsafe {
@@ -1180,9 +1174,7 @@ fn a_private_arena_reports_no_instance_uuid_rather_than_zeros() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Time domains — `docs/decisions/0038`
-// ---------------------------------------------------------------------------
 
 /// A fixture whose dynamic edge publishes in a caller-chosen time domain:
 /// `map -> odom` dynamic, `odom -> sensor` static.
@@ -1246,7 +1238,6 @@ fn plan_in(
 fn a_plan_in_a_non_default_domain_reads_a_transform() {
     let tree = DomainTree::new(1);
 
-    // What a caller could say before this decision, and what it gets.
     let (rc, p) = plan_in(tree.0, "map", "odom", 0);
     assert_eq!(
         rc, TFT_ERR_TIME_DOMAIN,
@@ -1295,8 +1286,7 @@ fn a_plan_in_a_non_default_domain_reads_a_transform() {
     };
     assert_eq!(rc, TFT_OK, "a tagged plan evaluates");
     // A real transform, not arbitrary bytes: bottom row [0 0 0 1], and the
-    // translation is the fixture's at t = 0.15 s (15 samples of 0.05 m each,
-    // interpolated: x is between the 15th and 16th knot).
+    // translation is the fixture's at t = 0.15 s (15 samples of 0.05 m each).
     assert_eq!(read_f64(&out, 12), 0.0);
     assert_eq!(read_f64(&out, 13), 0.0);
     assert_eq!(read_f64(&out, 14), 0.0);
@@ -1461,9 +1451,7 @@ fn the_default_domain_is_what_tft_plan_create_always_meant() {
     assert_eq!(a, b, "the two spellings are one entry point");
 }
 
-// ---------------------------------------------------------------------------
 // Extrapolation — `docs/decisions/0039`
-// ---------------------------------------------------------------------------
 
 /// The fixture's newest sample: `tft_test_domain_tree_create` pushes 32 samples
 /// 10 ms apart starting at zero, so `map -> odom` has data over `0..=310 ms`.
@@ -1641,10 +1629,8 @@ fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
 ///
 /// **The `edge` assertion here reads a value only because the `by_ns` one
 /// proves a write happened.** The callee writes the whole struct or none of it,
-/// and its in-window answer is field-identical to
-/// [`tft_extrapolated::blank`] — so the seed is
-/// [`EXTRAP_OUT_UNWRITTEN_BY_NS`], and `by_ns == 0` is what separates *wrote
-/// the sentinel* from *wrote nothing*.
+/// and the seed is [`EXTRAP_OUT_UNWRITTEN_BY_NS`] for the reason that constant
+/// records.
 #[test]
 fn an_in_window_stamp_reports_no_extrapolation_under_any_policy() {
     let tree = DomainTree::new(1);

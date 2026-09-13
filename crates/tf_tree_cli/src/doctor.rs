@@ -8,16 +8,6 @@
 //! can never reach on its own (a topology cycle is rejected by the builder; a
 //! second writer is rejected by the claim table), which the tests exercise by
 //! constructing the offending snapshot directly.
-//!
-//! The seven checks (`docs/PHASE1.md` §12):
-//!
-//! 1. [`check_cycles`] — a parent chain that never reaches a root.
-//! 2. [`check_unclaimed_dynamic`] — a dynamic edge with no live writer.
-//! 3. [`check_multi_writer`] — more than one writer PID seen on one edge.
-//! 4. [`check_short_buffers`] — a ring shorter than the observed publish latency.
-//! 5. [`check_inconsistent_rates`] — a frame whose publish intervals vary widely.
-//! 6. [`check_unreachable`] — frames not connected to the main root component.
-//! 7. [`check_out_of_order`] — stamps arriving out of order on an edge.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -115,10 +105,6 @@ impl From<Severity> for crate::catalogue::Severity {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Captured tree model
-// ---------------------------------------------------------------------------
 
 /// One frame in a captured [`Snapshot`].
 #[derive(Clone, Debug)]
@@ -232,12 +218,9 @@ impl EdgeInfo {
 /// free, it has learnt nothing, and collapsing those into `Free` is how a warn
 /// starts firing on every arena `doctor` can reach without a rendezvous.
 ///
-/// The byte is the *only* liveness fact in this model. [`RecordedProcess`] is a
-/// `/proc` inference beside it, and the two are carried apart rather than
-/// composed because [`crate::checks::slot_leak`] has to tell a slot whose byte
-/// the kernel released from one a forked child is still holding on a dead
-/// process's behalf — and a single boolean cannot say which
-/// (`docs/decisions/0028` plan step 6).
+/// The byte is the *only* liveness fact in this model; [`RecordedProcess`] is a
+/// `/proc` inference carried beside it rather than composed with it, for the
+/// reason [`Snapshot::probe_lock_facts`] gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockByte {
     /// `F_OFD_GETLK` reported a conflicting lock: somebody's open file
@@ -491,12 +474,10 @@ impl Snapshot {
         // that wants to list the frames must do, therefore has no edge to
         // acquire and can materialize a record a concurrent interner is still
         // writing. The `name_hash != 0` filter below is not that missing edge
-        // and is not claimed to be: it is a plausibility filter that turns the
-        // usual lost race into "the frame appears one `doctor` run later"
-        // instead of "a frame with an empty name". Against a genuinely
-        // concurrent interner this walk — and its three siblings — is
-        // best-effort, and the consolidation onto `Tree` noted below is where
-        // the ordering can be stated once and checked by `just loom`.
+        // and is not claimed to be. Against a genuinely concurrent interner
+        // this walk — and its three siblings — is best-effort, and the
+        // consolidation onto `Tree` noted below is where the ordering can be
+        // stated once and checked by `just loom`.
         let frame_count = header.frame_count.load(Ordering::Relaxed);
         let mut frames = Vec::with_capacity(frame_count as usize);
         for id in 1..=frame_count {
@@ -604,9 +585,8 @@ impl Snapshot {
                 owner_slot,
                 // A3: the claim names a *participant slot*, not a PID, so the
                 // pid to print is resolved through the participant table. A
-                // slot that resolves to no `LIVE` identity prints as pid 0.
-                // **That is a label, not a verdict** — `identity` answers from
-                // `state`, and §5.1 forbids deciding liveness from `state`;
+                // slot that resolves to no `LIVE` identity prints as pid 0 — a
+                // label, not a verdict, for the reason the field's doc gives;
                 // `participants` below is where the verdict comes from.
                 owner_pid: owner_slot
                     .and_then(|slot| view.participants().identity(slot))
@@ -666,9 +646,6 @@ impl Snapshot {
                 // is precisely the record `identity` would decline to open.
                 pid: rec.pid.load(Ordering::Relaxed),
                 alive: alive || before != after,
-                // The arena has no lock file in it. A caller that has one
-                // probes it afterwards; one that has not says so rather than
-                // fabricating a byte.
                 byte: unasked.byte,
                 recorded: unasked.recorded,
                 recorded_pid: unasked.recorded_pid,
@@ -780,10 +757,6 @@ impl Snapshot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Observed publish history
-// ---------------------------------------------------------------------------
-
 /// The observed stream of pushes, in arrival order — the input to the four
 /// history-dependent checks (multi-writer, short-buffer, inconsistent-rate,
 /// out-of-order).
@@ -864,10 +837,6 @@ impl Observations {
         map
     }
 }
-
-// ---------------------------------------------------------------------------
-// The seven checks
-// ---------------------------------------------------------------------------
 
 /// (1) A parent chain that never reaches a root within the frame budget is a
 /// cycle. The builder rejects cycles, so on a live tree this is always clean;
@@ -1338,19 +1307,10 @@ mod tests {
     /// **The byte probe cannot run before the word was read, and this is what
     /// keeps the signature that says so meaningful.**
     ///
-    /// `docs/decisions/0028` piece 2's third constraint: the `state` word must
-    /// be observed before the lock byte is probed, or a sweep can see a byte
-    /// free before a registrant takes it and then read the record it published.
-    /// *Which* read the kernel performed first is invisible in any sequence of
-    /// stable slot states — `loom` is the only thing that can see an
-    /// interleaving, and `tf_tree`'s model of `reclamation_verdict` is where
-    /// that argument is proved. What this crate can pin is that `cmd_doctor`
-    /// makes the calls in that order, and [`Snapshot::probe_lock_facts`] does it
-    /// by type: the probe is handed the already-captured [`ParticipantInfo`],
-    /// so there is no lock-file value in `cmd_doctor` that could be computed
-    /// before `Snapshot::capture`.
-    ///
-    /// The revision this replaced took a precomputed
+    /// [`Snapshot::probe_lock_facts`]'s doc carries the ordering argument
+    /// (`docs/decisions/0028` piece 2's third constraint) and why only the call
+    /// order, not the kernel's read order, is pinnable from this crate. The
+    /// revision this replaced took a precomputed
     /// `&[(u32, LockByte, RecordedProcess)]` built by a free function of the
     /// lock file alone. Hoisting that function's call above `Snapshot::capture`
     /// compiled and passed all eleven attach tests — the order was asserted in
@@ -1422,8 +1382,6 @@ mod tests {
         }
     }
 
-    // --- (1) cycles -----------------------------------------------------
-
     #[test]
     fn detects_cycle() {
         // a -> b -> a is a cycle; neither reaches a root.
@@ -1453,8 +1411,6 @@ mod tests {
         assert!(check_cycles(&snap).is_empty());
     }
 
-    // --- (2) unclaimed dynamic edges ------------------------------------
-
     #[test]
     fn detects_unclaimed_dynamic_edge() {
         let snap = Snapshot {
@@ -1477,8 +1433,6 @@ mod tests {
         assert!(check_unclaimed_dynamic(&snap).is_empty());
     }
 
-    // --- (3) multi-writer contention ------------------------------------
-
     #[test]
     fn detects_multi_writer() {
         let obs = Observations::from_samples(vec![
@@ -1496,8 +1450,6 @@ mod tests {
         let obs = Observations::from_samples(vec![sample(1, 100, 0, 0), sample(1, 100, 1, 0)]);
         assert!(check_multi_writer(&obs).is_empty());
     }
-
-    // --- (4) buffers shorter than observed latency ----------------------
 
     #[test]
     fn detects_short_buffer() {
@@ -1561,8 +1513,6 @@ mod tests {
         assert_eq!(check_out_of_order(&obs).len(), 1);
     }
 
-    // --- (5) inconsistent publish rate ----------------------------------
-
     #[test]
     fn detects_inconsistent_rate() {
         // Wildly varying gaps: 1, 100, 1, 100 ms.
@@ -1610,8 +1560,6 @@ mod tests {
         assert!(spread.findings.is_empty());
     }
 
-    // --- (6) unreachable frames -----------------------------------------
-
     #[test]
     fn detects_unreachable_frame() {
         // map(1)<-odom(2)<-base(3) is the main tree; island(4) is its own root.
@@ -1645,8 +1593,6 @@ mod tests {
         assert!(check_unreachable(&snap).is_empty());
     }
 
-    // --- (7) out-of-order stamps ----------------------------------------
-
     #[test]
     fn detects_out_of_order_stamps() {
         let obs = Observations::from_samples(vec![
@@ -1667,13 +1613,9 @@ mod tests {
     /// **`longest_rejected_run` replays invariant 6, which is not the same
     /// question as counting adjacent inversions.**
     ///
-    /// A push is rejected when its stamp is older than the newest *accepted*
-    /// one, and a rejected push does not advance that mark — so one step
+    /// A rejected push does not advance the newest-accepted mark, so one step
     /// backwards rejects everything until the publisher climbs back over it,
-    /// however monotone those arrivals are among themselves. That run length is
-    /// the concentration evidence `TFT019` reads; `regressions` is 1 for both
-    /// the stray inversion and the clock step, which is exactly why a second
-    /// number is needed.
+    /// however monotone those arrivals are among themselves.
     ///
     /// The stream here is 0, 10, 20, then a 15-back step, then the publisher
     /// carrying on at 10: 5, 15, 25. `5` and `15` are below the newest accepted
@@ -1703,8 +1645,6 @@ mod tests {
         let runs = out_of_order_runs(&stream(&[0, 10, 20, 5, 15, 20]));
         assert_eq!(runs[0].longest_rejected_run, 2);
     }
-
-    // --- healthy live fixture -------------------------------------------
 
     /// **A live writer's claim must resolve to that writer's pid.**
     ///

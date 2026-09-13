@@ -3,13 +3,10 @@
 //! [`Described`].
 //!
 //! Per decision `0004` (`docs/decisions/0004-builder-time-edge-declaration.md`,
-//! still authoritative for this API), the tree's topology is declared on the [`TreeBuilder`]
-//! *before* [`TreeBuilder::build`]. `build()` sizes the arena from exactly those
-//! declarations (via `ArenaLayout` / `from_edges` sizing), so the arena reserves
-//! ring slots **only** for dynamic edges, each sized to its own capacity. There
-//! is no post-build `declare_*`; the only runtime topology change is
-//! [`Tree::reparent`], which reuses an already-declared edge and allocates no new
-//! capacity.
+//! still authoritative for this API), the tree's topology is declared on the
+//! [`TreeBuilder`] *before* [`TreeBuilder::build`], which sizes the arena from
+//! exactly those declarations (via `ArenaLayout` / `from_edges` sizing). There is
+//! no post-build `declare_*`.
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -730,9 +727,8 @@ impl ArenaBacking {
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ArenaBacking::Mapped(a) => a.is_writable(),
             // `docs/PHASE5.md` §2.4: a frozen arena's `AttachMode` is implicitly
-            // and permanently `ReadOnly`. There is no mode in which this can be
-            // true — the mapping is `PROT_READ`, so a store through it is a
-            // `SIGSEGV` and not an error anything can catch.
+            // and permanently `ReadOnly`, so there is no mode in which this can
+            // be true.
             #[cfg(all(feature = "shm", target_os = "linux"))]
             ArenaBacking::Frozen(_) => false,
         }
@@ -762,9 +758,7 @@ impl ArenaBacking {
     /// true of a heap arena; only the pair identifies a frozen one, and a
     /// predicate spelled as a conjunction of two unrelated answers is one
     /// backing variant away from being wrong. [`Tree::await_frames`] is the
-    /// caller: a wait on a frozen tree is futile *by construction* — §2.4 says
-    /// a frozen arena has no writers at all — and futility that is statically
-    /// known should be an answer, not a nap.
+    /// caller.
     fn is_frozen(&self) -> bool {
         match self {
             #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -787,13 +781,12 @@ impl ArenaBacking {
 /// drops struct fields in declaration order. That yields *clear the record,
 /// then unlock* — the order `0005` §5 specifies.
 ///
-/// **"Publisher first, `_lease` second" is an ordering and not an adjacency**,
-/// and the difference is worth stating because the `fork_gen` doc below has said
-/// otherwise since it was written: `fork_gen` is declared *between* them under
-/// `shm`, and without `shm` there is no `_lease` at all. What must hold is that
-/// no field carrying a `Drop` is declared between the two. The three
-/// clock-offset fields at the end own nothing and implement no `Drop`, which is
-/// why they are at the end and why they are harmless there.
+/// **"Publisher first, `_lease` second" is an ordering and not an adjacency**:
+/// `fork_gen` is declared *between* them under `shm`, and without `shm` there is
+/// no `_lease` at all. What must hold is that no field carrying a `Drop` is
+/// declared between the two. The three clock-offset fields at the end own
+/// nothing and implement no `Drop`, which is why they are at the end and why
+/// they are harmless there.
 ///
 /// Reversing it is not catastrophic but is wrong: it leaves a window in which
 /// the byte is free while the record still says held, which is precisely the
@@ -869,8 +862,7 @@ pub struct EdgeWriter<'a> {
     /// for exactly that reason — so the `compile_fail,E0277` pin on
     /// [`OwnedWriter`] is now over-determined rather than weakened. **No
     /// `unsafe impl` belongs here**, for the reason [`OwnedWriter`]’s doc
-    /// gives: it would keep compiling after somebody swapped a field for
-    /// something with no business crossing a thread.
+    /// gives.
     until_sample: Cell<u32>,
 }
 
@@ -1051,11 +1043,8 @@ impl EdgeWriter<'_> {
             return;
         }
 
-        // **A clock this process cannot read is not an offset of zero.**
-        // `now_nanos` returns `None` when the host clock predates the epoch, and
-        // subtracting a stamp from a `0` fallback would store a confident
-        // -1.79e18 — a fifty-six-year skew reported against a healthy
-        // publisher. Returning leaves the field at whatever it held, and on a
+        // **A clock this process cannot read is not an offset of zero** — see
+        // `now_nanos`. Returning leaves the field at whatever it held, and on a
         // fresh claim that is `0`, which reads as *no sample yet*.
         let Some(now) = now_nanos() else {
             return;
@@ -1092,8 +1081,33 @@ impl EdgeWriter<'_> {
 /// sampler* section tabulates both ends.
 const DEFAULT_SAMPLE_EVERY: u32 = 1024;
 
-/// Pushes between clock-offset samples for an edge, or **`0` for "never"**.
+/// The value the sampler stores for a push received at `now` bearing `stamp`.
 ///
+/// Split out of [`EdgeWriter::push`]'s sampler because both of its rules are
+/// about values a clock will not produce on demand, and a test that cannot
+/// construct its input is a test that does not exist.
+///
+/// **`saturating_sub`**, so a stamp far enough from the epoch to overflow an
+/// `i64` difference clamps instead of wrapping. Wrapping would turn a nonsense
+/// stamp into a *plausible* offset, which is the one failure mode a diagnostic
+/// must not have.
+///
+/// **Never `0`**, because `0` is the arena's *no sample yet* and this function's
+/// caller has just taken a sample. A publisher that stamps with its own clock —
+/// `let t = now(); push(t)` — yields a few hundred nanoseconds where the clock
+/// has nanosecond resolution and **exactly zero** where it does not: Windows'
+/// `SystemTime::now()` is coarser than a push, so both reads land in the same
+/// tick. Such a publisher would read as never-sampled forever, silently, on a
+/// platform this crate supports. One nanosecond is a cheaper lie than that, in a
+/// quantity `TFT004` compares in milliseconds.
+fn recorded_offset(now: i64, stamp: i64) -> i64 {
+    match now.saturating_sub(stamp) {
+        0 => 1,
+        offset => offset,
+    }
+}
+
+/// Pushes between clock-offset samples for an edge, or **`0` for "never"**.
 ///
 /// `nominal_rate_mhz` is **milli**hertz — [`EdgeCfg::nominal_rate_hz`] stores
 /// `rate_hz * 1000.0` — so the quotient by 1000 is pushes per second, and *one
@@ -1124,32 +1138,6 @@ const DEFAULT_SAMPLE_EVERY: u32 = 1024;
 /// is that `0` can mean *never* without ambiguity, which is what the paragraph
 /// above needs. Sampling every push is also the right answer for an edge that
 /// slow, at one clock read per two seconds or worse.
-/// The value the sampler stores for a push received at `now` bearing `stamp`.
-///
-/// Split out of [`EdgeWriter::push`]'s sampler because both of its rules are
-/// about values a clock will not produce on demand, and a test that cannot
-/// construct its input is a test that does not exist.
-///
-/// **`saturating_sub`**, so a stamp far enough from the epoch to overflow an
-/// `i64` difference clamps instead of wrapping. Wrapping would turn a nonsense
-/// stamp into a *plausible* offset, which is the one failure mode a diagnostic
-/// must not have.
-///
-/// **Never `0`**, because `0` is the arena's *no sample yet* and this function's
-/// caller has just taken a sample. A publisher that stamps with its own clock —
-/// `let t = now(); push(t)` — yields a few hundred nanoseconds where the clock
-/// has nanosecond resolution and **exactly zero** where it does not: Windows'
-/// `SystemTime::now()` is coarser than a push, so both reads land in the same
-/// tick. Such a publisher would read as never-sampled forever, silently, on a
-/// platform this crate supports. One nanosecond is a cheaper lie than that, in a
-/// quantity `TFT004` compares in milliseconds.
-fn recorded_offset(now: i64, stamp: i64) -> i64 {
-    match now.saturating_sub(stamp) {
-        0 => 1,
-        offset => offset,
-    }
-}
-
 fn sample_interval(domain: u8, nominal_rate_mhz: u32) -> u32 {
     if domain != <SystemDomain as Domain>::TAG {
         return 0;
@@ -1331,10 +1319,8 @@ pub struct OwnedWriter {
     ///
     /// Declared first so it drops first — see the type's doc comment.
     ///
-    /// **Boxed for soundness, not for size, and it must stay boxed.** See the
-    /// type's *Why the writer is behind a `Box`* section: with the `EdgeWriter`
-    /// inline, `drop(writer)` and [`Self::release`] are both Undefined Behavior
-    /// under Stacked *and* Tree Borrows, and `just miri` says so.
+    /// **Boxed for soundness, not for size, and it must stay boxed** — see the
+    /// type's *Why the writer is behind a `Box`* section.
     writer: Box<EdgeWriter<'static>>,
     /// The strong reference that makes the field above's `'static` true.
     ///
@@ -1413,13 +1399,10 @@ impl OwnedWriter {
 /// Fired inside [`Tree::claim`], after the arena CAS and before the lease
 /// `SETLK`.
 ///
-/// **Test scaffolding, and present only under `--features test-hooks`.** The
-/// window between those two operations is one syscall wide; a reaper that runs
-/// inside it sees `record held ∧ lease free`, which is its exact "the holder is
-/// dead" signature, and clears a claim that was in the middle of being taken.
-/// `take_claim_lease` recovers by re-reading the epoch, and there is no way to
-/// demonstrate that recovery — or to catch its removal — without putting a
-/// reaper in the window deliberately.
+/// **Test scaffolding, and present only under `--features test-hooks`.**
+/// `take_claim_lease`'s epoch re-check is what recovers from a reaper landing
+/// in that window, and there is no way to demonstrate that recovery — or to
+/// catch its removal — without putting a reaper in the window deliberately.
 ///
 /// Set it once, from a test, before the `claim` under test. `fn()` rather than a
 /// boxed closure so this is a bare function pointer with no allocation and no
@@ -1513,9 +1496,7 @@ struct TopologyLease<'a> {
 #[cfg(all(feature = "shm", target_os = "linux"))]
 impl Drop for TopologyLease<'_> {
     fn drop(&mut self) {
-        // Best effort, for `ClaimLease`'s reason: a failed unlock leaves a
-        // process in no state to react, and the kernel releases the byte at exit
-        // regardless — which is the property the lease exists for.
+        // Best effort, for `ClaimLease`'s reason.
         let _ = self.lock.release_topology();
     }
 }
@@ -1597,8 +1578,7 @@ pub struct Tree {
     /// per-acquisition token in the owner word instead.
     ///
     /// It also stops two threads of one process spending the arena lock's spin
-    /// budget on each
-    /// other before one of them gets to do any work.
+    /// budget on each other before one of them gets to do any work.
     decl: Mutex<()>,
     /// What keeps this process attached, for a tree obtained from
     /// [`crate::open`].
@@ -1929,14 +1909,13 @@ impl Tree {
     ///
     /// # Granularity
     ///
-    /// A bounded poll — `MIN_BACKOFF` 200 µs doubling to `MAX_BACKOFF` 4 ms,
-    /// this crate's pair, shared with `Open::await_open` — not a notification.
-    /// `docs/decisions/0018` records
-    /// why there is no arena-resident primitive to wake on (a `PROT_READ`
-    /// consumer cannot register on one without giving up D18's boundary), and
-    /// the argument applies here with more force because topology settles once,
-    /// at startup. This therefore returns *later* than the name appeared, by up
-    /// to one backoff interval plus scheduler granularity.
+    /// A bounded poll — `MIN_BACKOFF` 200 µs doubling to `MAX_BACKOFF` 4 ms —
+    /// not a notification. `docs/decisions/0018` records why there is no
+    /// arena-resident primitive to wake on (a `PROT_READ` consumer cannot
+    /// register on one without giving up D18's boundary), and the argument
+    /// applies here with more force because topology settles once, at startup.
+    /// This therefore returns *later* than the name appeared, by up to one
+    /// backoff interval plus scheduler granularity.
     ///
     /// # Errors
     ///
@@ -2017,10 +1996,8 @@ impl Tree {
         if self.is_writable() {
             return Err(AwaitError::WritableTree);
         }
-        // The other statically-futile handle. A frozen arena is read-only *and*
-        // writer-free (`docs/PHASE5.md` §2.4), so the poll below would run the
-        // caller's whole budget and report a timeout for something that was
-        // never coming. Distinct condition, distinct answer.
+        // The other statically-futile handle: distinct condition, distinct
+        // answer. See `AwaitError::FrozenTree`.
         if self.arena.is_frozen() {
             return Err(AwaitError::FrozenTree);
         }
@@ -2028,20 +2005,15 @@ impl Tree {
         let mut found: [Option<FrameId>; N] = [None; N];
         let mut backoff = MIN_BACKOFF;
         loop {
-            // **Per iteration, and before `view()`.** `view()` answers a fork
-            // victim with the poison arena, whose `find_frame` returns
-            // `Ok(None)` for every name — so without this a detached tree waits
-            // out the whole budget and then reports a timeout for something
-            // that is not one.
+            // **Per iteration, and before `view()`** — see
+            // `AwaitError::ChildDetached`.
             if self.detached() {
                 return Err(AwaitError::ChildDetached);
             }
             let view = self.view();
             for (slot, name) in found.iter_mut().zip(names.iter()) {
                 if slot.is_some() {
-                    // Memoized. Frames are append-only (D10), so a name once
-                    // found cannot become unfound and re-probing it would only
-                    // pay for the hash again.
+                    // Memoized; see this method's doc.
                     continue;
                 }
                 match view.find_frame(name) {
@@ -2155,11 +2127,10 @@ impl Tree {
     /// Three locks, doing three different jobs, taken in this order:
     ///
     /// * `self.decl`, a plain `Mutex`, keeps *this* process's threads out of
-    ///   each other's way. It serializes nothing across a process boundary and
-    ///   never did; it is kept because it is free and stops two threads of one
-    ///   process burning the arena lock's spin budget against each other. Two
-    ///   threads of one `Tree` share one lock-file description, so the byte
-    ///   below does not arbitrate between them and this does.
+    ///   each other's way — two threads of one `Tree` share one lock-file
+    ///   description, so the byte below does not arbitrate between them and
+    ///   this does. See the field's own doc for why it is load-bearing rather
+    ///   than an optimisation.
     /// * **The lock file's topology byte**, where the tree has a lock file. This
     ///   is what makes A2's exclusion a kernel fact: a holder that dies has it
     ///   released by the kernel with no cooperation and no timeout, and a holder
@@ -2368,7 +2339,7 @@ impl Tree {
         else {
             return Err(ClaimApiError::NotDynamic { child, edge: eid });
         };
-        // ---- Two-phase acquire (`docs/decisions/0005` §5) --------------
+        // Two-phase acquire (`docs/decisions/0005` §5).
         //
         // The arena CAS is the *decision*; the lock-file byte is a *lease* that
         // makes the holder's death observable. §6.1's literal "the lock file is
@@ -2377,10 +2348,9 @@ impl Tree {
         // one of them is the linearization point, and it is this CAS.
         let (epoch, owner) = claim(claim_rec, self.participant)?;
 
-        // The CAS has landed and the lease has not been taken: this is the
-        // one-syscall window `take_claim_lease`'s epoch re-check exists to
-        // recover from, and the only place a reaper can be placed inside it on
-        // purpose. Compiled out entirely without `test-hooks`.
+        // The CAS has landed and the lease has not been taken: the one place a
+        // reaper can be placed inside `take_claim_lease`'s window on purpose.
+        // Compiled out entirely without `test-hooks`.
         #[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
         if let Some(hook) = CLAIM_WINDOW_HOOK.get() {
             hook();
@@ -2435,11 +2405,9 @@ impl Tree {
     /// lives (`docs/decisions/0017`).
     ///
     /// The scoped [`Tree::claim`] is preferable where the claim's scope is
-    /// lexical — the borrow checker then enforces the claim's lifetime for free.
-    /// Use this where the writer is *stored*: a node that publishes for the life
-    /// of the process, or a binding whose handle type cannot carry a lifetime.
-    /// See [`OwnedWriter`] for the full argument, and `docs/API.md` §2.1 for the
-    /// rule this exists to satisfy.
+    /// lexical; use this where the writer is *stored*. See [`OwnedWriter`] for
+    /// the full argument, and `docs/API.md` §2.1 for the rule this exists to
+    /// satisfy.
     ///
     /// # Why `self: &Arc<Self>` and not `Arc<Tree>` by value
     ///
@@ -2615,16 +2583,16 @@ impl Tree {
         // 2064 bytes by value — 2112 when this was measured, then 4160 after
         // `0034` moved `MAX_DEPTH` 16 → 32, then halved again by `0042`. The
         // argument survives every one of those: a copy this size is worth the
-        // 80 ns whatever the exact figure — and this method is a tail
-        // expression so the
-        // compiler builds the result straight into the caller's slot. Binding it
-        // to a local in order to iterate `plan.steps()` costs a copy of all of
-        // it, and that copy is worth **80 ns on `first lookup after attach`**:
-        // 210 ns p50 against a 130 ns baseline, five runs to three, on the one
-        // row §7.1 exists to protect. The cause was isolated by applying the
-        // restructure *with the old population behaviour*, where it reproduced
-        // in full — so it is the binding, not the populating. `Result::inspect`
-        // is not an escape: it takes `self` by value and moves the same array.
+        // 80 ns whatever the exact figure — and this method is a tail expression
+        // so the compiler builds the result straight into the caller's slot.
+        // Binding it to a local in order to iterate `plan.steps()` costs a copy
+        // of all of it, and that copy is worth **80 ns on `first lookup after
+        // attach`**: 210 ns p50 against a 130 ns baseline, five runs to three,
+        // on the one row §7.1 exists to protect. The cause was isolated by
+        // applying the restructure *with the old population behaviour*, where it
+        // reproduced in full — so it is the binding, not the populating.
+        // `Result::inspect` is not an escape: it takes `self` by value and moves
+        // the same array.
         #[cfg(all(feature = "shm", target_os = "linux"))]
         let edge_meta = |eid| {
             self.populate_edge_rings(eid);
@@ -2716,8 +2684,7 @@ impl Tree {
     /// name it does not find. A name that was never declared is
     /// [`LookupError::UnknownFrame`] here, raised before any compile, which is
     /// why a typo is not one of the pairs the plan cache's refusal caching is
-    /// about. Keeps a small
-    /// per-thread plan cache keyed by
+    /// about. Keeps a small per-thread plan cache keyed by
     /// `(arena, target, source, generation)`.
     ///
     /// The `arena` component identifies the arena this tree reads, and is what
@@ -3173,12 +3140,8 @@ impl Tree {
                 if !tf_tree_ipc::peer_hung_up(socket.as_fd()).unwrap_or(false) {
                     return false;
                 }
-                // Hung up, which says **our channel** is dead and not that the
-                // role is vacant. After any takeover every survivor but the
-                // winner is in exactly this state, permanently, and answering
-                // `true` from here is what made the §3.5 loop re-attempt an
-                // `F_OFD_SETLK` every control cycle for the life of the process
-                // ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
+                // Hung up says **our channel** is dead, not that the role is
+                // vacant — this method's three-state table, and `0043`.
                 //
                 // The kernel knows which. A probe failure reads as *held* for
                 // the same reason the `poll` failure above reads as *no hangup*:
@@ -3264,16 +3227,11 @@ impl Tree {
     pub(crate) fn use_ofd_liveness(&mut self, probe: crate::open::LivenessProbe) {
         let own_slot = self.participant;
         // **One description, two holders — and the `Arc` is exactly the
-        // lifetime convenience.** The probe arrives by value, the closure below
-        // must own what it captures, and `Self::reap_participants` needs the
-        // same object for the three-valued answer this closure collapses.
-        // Nothing in a `Tree` can build a second one: `LivenessProbe::open`
-        // wants a `Rendezvous` and a `LockFile` keeps no path. Sharing is not a
-        // correctness property — this probe is *already* a description of its
-        // own, which the closure's own comment below and `LivenessProbe`'s doc
-        // comment both say, so a second one would agree about every byte
-        // including ours; it would cost an `open(2)` and an fd and decide
-        // nothing. See the `ofd_probe` field.
+        // lifetime convenience.** The closure below must own what it captures,
+        // and `Self::reap_participants` needs the same object for the
+        // three-valued answer this closure collapses. See the `ofd_probe`
+        // field for why nothing here can rebuild a probe, and why a second one
+        // would decide nothing.
         let probe = std::sync::Arc::new(probe);
         self.ofd_probe = Some(std::sync::Arc::clone(&probe));
         self.liveness = Box::new(move |slot, rec| {
@@ -3355,11 +3313,6 @@ impl Tree {
         if self.participant == u32::MAX || !self.arena.is_writable() {
             return 0;
         }
-        // Compare the *slot*, not the word. `pack_owner` is
-        // `(epoch << 16) | (slot + 1)`, so a whole-word comparison against
-        // `slot + 1` matches only at epoch 0 — which `claim` never produces.
-        // A reaper making that mistake does not recognise its own claims and
-        // revokes them.
         let own_slot = self.participant;
 
         reap_claims(&self.view(), lock, only_slot, own_slot)
@@ -3450,8 +3403,7 @@ impl Tree {
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[must_use]
     pub fn reap_participants(&self) -> usize {
-        // R6, and first: a `PROT_READ` mapping does not fault politely on a
-        // `compare_exchange`, it delivers `SIGSEGV`.
+        // R6, and first.
         //
         // **One check, not two**, and unlike `reap_inner`'s pair that is a
         // choice with a measurement behind it. The `participant == u32::MAX`
@@ -3662,8 +3614,6 @@ fn edge_meta(view: &ArenaView, eid: EdgeId) -> Option<EdgeMeta> {
     })
 }
 
-/// Best-effort Linux boot id folded to a `u64` (Phase 2 staleness input); `0` if
-/// unavailable. Phase 1 stores it and does nothing else with it.
 impl Drop for Tree {
     fn drop(&mut self) {
         // Release the participant slot on a clean exit. A slot leaked by a
@@ -3707,9 +3657,8 @@ impl Drop for Tree {
 /// the arguments alone, and a caller who gets it after a `SizeMismatch` would be
 /// told about the wrong thing.
 ///
-/// [`AttachMode::ReadOnly`] passes through untouched. It registers no
-/// participant record at all — `attach_shared_inner` gives a non-writable
-/// backing the `u32::MAX` sentinel instead — so it can strand no slot.
+/// [`AttachMode::ReadOnly`] passes through untouched: it registers no
+/// participant record, so it can strand no slot.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn refuse_a_byteless_writer(mode: AttachMode) -> Result<(), ShmError> {
     match mode {
@@ -3747,9 +3696,7 @@ fn fork_gen_for(backing: &ArenaBacking) -> Option<u64> {
         // A frozen mapping is `MAP_PRIVATE | PROT_READ` and deliberately *not*
         // `MADV_DONTFORK`, so a `fork` child inherits it intact and every
         // reference into it stays valid — the same situation as a heap arena,
-        // and the one §2.2's sixteen dataloader workers depend on. Poisoning it
-        // would break `multiprocessing` for offline users to defend against a
-        // hazard they do not have.
+        // and the one §2.2's sixteen dataloader workers depend on.
         ArenaBacking::Frozen(_) => None,
         ArenaBacking::Mapped(_) => {
             tf_tree_ipc::fork::arm();
@@ -3926,8 +3873,7 @@ fn register_participant_at(view: &ArenaView, slot: u32) -> Result<u64, Participa
         slot,
         std::process::id(),
         process_start_time().unwrap_or(UNKNOWN_START_TIME),
-        // `0` reads as *unknown attach time* in a participant record, which is what
-        // an unreadable clock is. Only the offset sampler cannot use it.
+        // `0` reads as *unknown attach time*; see `register_participant`.
         now_nanos().unwrap_or(0),
     )
 }
@@ -4078,10 +4024,8 @@ fn participant_is_alive(
     arena_boot: &[u8; 16],
 ) -> bool {
     // The arena outlived a reboot: every pid it records belongs to a previous
-    // boot and means nothing now. Only decided when *both* ids are known — an
-    // unreadable boot id is stored as all-zeros, and treating "unknown" as
-    // "different" would declare every participant dead, which is precisely the
-    // false negative this must never produce.
+    // boot and means nothing now. Decided only when *both* ids are known — see
+    // `liveness_for` for why "unknown" must not read as "different".
     let host_boot = host_boot_id();
     if *arena_boot != [0u8; 16] && *host_boot != [0u8; 16] && arena_boot != host_boot {
         return false;
@@ -4651,10 +4595,8 @@ impl From<TopoLockError> for ReparentError {
             // **The one place the core's sentinel is translated.**
             // `TopoLockView` reports `u32::MAX` for a holder its observation
             // could not name, because it is `no_std` and its own callers are
-            // engine code that reads its doc comment. A user of this crate is
-            // not, and a magic number that renders as "participant slot
-            // 4294967295" is a message they would have to disbelieve on
-            // authority. Translating here rather than there keeps the sentinel
+            // engine code that reads its doc comment; a user of this crate is
+            // not. Translating here rather than there keeps the sentinel
             // knowledge in one function instead of on every caller.
             TopoLockError::Contended { owner_slot } => ReparentError::LockContended {
                 owner_slot: (owner_slot != u32::MAX).then_some(owner_slot),
@@ -4771,12 +4713,9 @@ impl ClaimErrorExt for tf_tree_core::ClaimError {
 /// callback freed the participant *record* and left every claim that participant
 /// held, forever.
 ///
-/// * `only_slot` — `Some(slot)` for the D17 fast path: the hangup names the slot
-///   that went away, which turns an `O(edges)` sweep of `fcntl` calls into
-///   `O(edges)` relaxed loads plus one syscall per edge that slot actually held.
-/// * `own_slot` — never collected. `F_OFD_GETLK` reports only *conflicting*
-///   locks, so a description does not see its own byte and every edge this
-///   process holds would read free.
+/// * `only_slot` — `Some(slot)` for the D17 fast path; see
+///   `Tree::reap_participant`.
+/// * `own_slot` — never collected; see `Tree::reap_dead`'s predicate.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub(crate) fn reap_claims(
     view: &tf_tree_core::arena_view::ArenaView<'_>,
@@ -5039,8 +4978,8 @@ mod tests {
         });
     }
 
-    /// The host probe answers here, which is what makes the two tests above mean
-    /// what they say — on a host that answered `false` both would read alive.
+    // The host probe answers here, which is what makes the two tests above mean
+    // what they say — on a host that answered `false` both would read alive.
     #[cfg(target_os = "linux")]
     /// The probe latches a decisive answer and refuses to latch anything else.
     ///

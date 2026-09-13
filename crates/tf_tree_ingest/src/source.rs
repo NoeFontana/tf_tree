@@ -50,13 +50,13 @@ const RECORD_HEADER_LEN: usize = 1 + 8;
 
 /// How a topic name decides whether its edges are static.
 ///
-/// **This is the one thing that cannot come from the schema**, and it is worth
-/// being explicit about why: `/tf` and `/tf_static` carry the *identical*
-/// message type. What separates them is the QoS durability of the publisher,
-/// which MCAP does not record, so the topic name is the only evidence in the
-/// file. The default rule is the last path segment — `/robot1/tf_static`
-/// matches, `/tf_static_debug` does not — and `--static-topic` overrides it for
-/// a deployment that renamed the topic outright.
+/// **This is the one thing that cannot come from the schema**: `/tf` and
+/// `/tf_static` carry the *identical* message type. What separates them is the
+/// QoS durability of the publisher, which MCAP does not record, so the topic
+/// name is the only evidence in the file. The default rule is the last path
+/// segment — `/robot1/tf_static` matches, `/tf_static_debug` does not — and
+/// `--static-topic` overrides it for a deployment that renamed the topic
+/// outright.
 #[derive(Clone, Debug, Default)]
 pub struct TopicRoles {
     /// Topics to treat as static, in full. Empty means "use the suffix rule".
@@ -182,8 +182,7 @@ pub enum OnBadChunk {
 /// record ceiling, the chunk skip policy, and the bounds it will decompress a
 /// chunk within.
 ///
-/// **One argument rather than three, and the reason is a smell this type exists
-/// to stop growing.** `read_chunk` already carries
+/// **One argument rather than three.** `read_chunk` already carries
 /// `#[allow(clippy::too_many_arguments)]`; adding these beside [`OnBadChunk`] as
 /// loose scalars would have made that eight, nine and ten, and would have
 /// re-indented every `read_tf` call site for parameters that belong with the one
@@ -379,11 +378,10 @@ where
     let file = File::open(path).map_err(|e| IngestError::Io {
         raw_os_error: e.raw_os_error().unwrap_or(0),
     })?;
-    // Read once, at open: seeking past the end of a file succeeds, so a reader
-    // that steps over a record needs a length to compare against or it cannot
-    // tell a record it skipped from one the file never held. Snapshotted, so it
-    // is the length at open and not the length now — see the `complete` verdict
-    // below, which is taken on the declared length for that reason.
+    // Read once, at open; `skip_body` is where the comparison earns its keep.
+    // Snapshotted, so it is the length at open and not the length now — see the
+    // `complete` verdict below, which is taken on the declared length for that
+    // reason.
     let file_len = file
         .metadata()
         .map_err(|e| IngestError::Io {
@@ -404,8 +402,8 @@ where
         return Err(IngestError::Mcap);
     }
 
-    // Our own accumulators. Records are parsed by `mcap::parse_record`; what this
-    // module owns is which bytes are a record, and the bookkeeping across them.
+    // Our own accumulators; the split with `mcap::parse_record` is
+    // `RECORD_HEADER_LEN`'s.
     let mut book = Bookkeeping::default();
     let mut skips = SkipCounts::default();
     // One buffer for the whole file, reused for every record body, and a second
@@ -422,9 +420,8 @@ where
     let mut chunk_ordinal: u64 = 0;
 
     loop {
-        // **A truncated recording is a short recording, not a broken one, and
-        // the cut is honoured at *record* granularity — including inside a
-        // chunk.**
+        // **A truncated recording is a short recording, not a broken one** — cut
+        // at the record granularity [`SkipCounts::truncated`] describes.
         //
         // A recorder that was SIGKILLed, a disk that filled, an interrupted copy:
         // every record before the cut is intact and belongs to the caller.
@@ -474,18 +471,17 @@ where
         // it is the same fact — this reader will not allocate that much — and a
         // second variant would make the remedy depend on the host's word size.
         let fits = declared <= policy.max_record_bytes && usize::try_from(declared).is_ok();
-        // **The opcode is consulted before the length decides**, and that ordering
-        // is the whole point. `DEFAULT_MAX_RECORD_BYTES` bounds what this reader
-        // will *allocate*; a record it never reads costs no allocation, so
-        // refusing the recording for one is a ceiling enforced against a cost
-        // nobody pays. An attachment — a calibration YAML, a camera-intrinsics
-        // dump, a bag of images — is a top-level record like any other, and
-        // before this it aborted an ingest whose transforms were all intact.
+        // **The opcode is consulted before the length decides.**
+        // `DEFAULT_MAX_RECORD_BYTES` bounds what this reader will *allocate*; a
+        // record it never reads costs no allocation, so refusing the recording for
+        // one is a ceiling enforced against a cost nobody pays. An attachment — a
+        // calibration YAML, a camera-intrinsics dump, a bag of images — is a
+        // top-level record like any other, and before this it aborted an ingest
+        // whose transforms were all intact.
         //
-        // The refusal survives for every record the reader does need. That is the
-        // asymmetry [`reader_needs`] exists to state: skipping a `Chunk` loses
-        // transforms silently, which is strictly worse than a named error carrying
-        // the number to raise.
+        // The refusal survives for every record the reader does need — the
+        // asymmetry [`reader_needs`] exists to state, because a silently skipped
+        // `Chunk` is worse than a named error carrying the number to raise.
         if !fits {
             if reader_needs(opcode) {
                 return Err(IngestError::RecordTooLarge {
@@ -513,14 +509,13 @@ where
             // here" into a diagnosis.
             //
             // **What it cannot catch is a length that lands on a real record
-            // boundary**, which `tests/record_ceiling.rs`'s
+            // boundary**, which every check here passes —
+            // `tests/record_ceiling.rs`'s
             // `a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so`
-            // pins by aiming one there: everything between the skip and that
-            // boundary
-            // disappears and every check here passes. A linear walk has no way to
-            // tell that from a genuinely large record, which is why neither the
-            // summary row nor `SkipCounts::oversized_records_skipped` claims the
-            // transform stream is whole.
+            // pins that by aiming one there. A linear walk has no way to tell it
+            // from a genuinely large record, which is why neither the summary row
+            // nor `SkipCounts::oversized_records_skipped` claims the transform
+            // stream is whole.
             if !resyncs_here(&mut input, file_len)? {
                 return Err(IngestError::RecordTooLarge {
                     declared,
@@ -556,17 +551,16 @@ where
         // and `complete` is false exactly as it was before — the same truncation
         // verdict, reached without the allocation. That argument assumes the
         // length is still the one snapshotted at open; the `complete` block below
-        // names the case where it is not, which is why the verdict is taken on
-        // the *declared* length and the clamp only decides what is allocated.
+        // names the case where it is not.
         //
-        // **What it does not do**, said here rather than implied: it bounds the
-        // buffer by the whole file rather than by the bytes remaining after this
-        // record's header, so a corrupt length near the end of a large recording
-        // still allocates up to `min(ceiling, file length)`. The tighter bound
-        // needs a running offset maintained beside the three `stream_position`
-        // calls this function already has — a second spelling of "where are we",
-        // which `CLAUDE.md` forbids — for a bound that is already at most the
-        // size of the file the caller handed us.
+        // **What it does not do:** it bounds the buffer by the whole file rather
+        // than by the bytes remaining after this record's header, so a corrupt
+        // length near the end of a large recording still allocates up to
+        // `min(ceiling, file length)`. The tighter bound needs a running offset
+        // maintained beside the three `stream_position` calls this function
+        // already has — a second spelling of "where are we", which `CLAUDE.md`
+        // forbids — for a bound that is already at most the size of the file the
+        // caller handed us.
         //
         // Infallible after `fits`, which is where the two bounds were checked;
         // the clamp only lowers `declared`, so it cannot make the narrowing fail.
@@ -595,22 +589,19 @@ where
         body.reserve_exact(want.saturating_sub(body.len()));
         body.resize(want, 0);
         let got = read_full(&mut input, &mut body)?;
-        // **This is the branch the whole rewrite exists for.** A record cut short
-        // by the end of the file is not simply dropped: if it is a chunk, its
-        // prefix still holds complete records, and those are recovered. Asking a
-        // reader for whole records only would lose every transform in the final
-        // chunk — up to a few megabytes of a real recording, and all of a small
-        // one.
+        // **This is the branch the whole rewrite exists for** — the record-granular
+        // recovery [`SkipCounts::truncated`] describes. Asking a reader for whole
+        // records only would lose every transform in the final chunk: up to a few
+        // megabytes of a real recording, and all of a small one.
         //
         // **Compared against `declared`, not against `want`.** They are the same
         // number for every record whose body is in the file, and `want` is the
         // clamped one — so `got == want` would call a record complete on the
         // strength of a length this reader chose rather than the one the record
         // stated. That is not reachable on a file whose length does not change
-        // (the cursor is already past the magic and this header, so `got` is
-        // strictly below `file_len`), and it is reachable on one being appended
-        // to as it is read, since `file_len` is snapshotted at open. Naming the
-        // declared length costs nothing and needs no such argument.
+        // (`got <= file_len - 17 < want`, the clamp comment above), and it is
+        // reachable on one being appended to as it is read. Naming the declared
+        // length costs nothing and needs no such argument.
         let complete = got as u64 == declared;
         if !complete {
             skips.truncated = true;
@@ -682,9 +673,10 @@ fn read_exact_or_eof(input: &mut BufReader<File>, buf: &mut [u8]) -> Result<(), 
 ///
 /// Accepted: the end of the file, the eight-byte end magic, and a header whose
 /// opcode is one MCAP has assigned and whose own declared length is no larger
-/// than the whole file. Those last two bounds are deliberately loose — a record longer than the file it is in is corrupt on any reading, while
-/// a *truncated* file's final record legitimately declares more bytes than remain,
-/// and reporting that as truncation is `read_tf`'s job rather than this one's.
+/// than the whole file. Those last two bounds are deliberately loose — a record
+/// longer than the file it is in is corrupt on any reading, while a *truncated*
+/// file's final record legitimately declares more bytes than remain, and
+/// reporting that as truncation is `read_tf`'s job rather than this one's.
 ///
 /// **A private-use opcode (MCAP reserves `0x80`–`0xFF` for them) does not resync
 /// here**, so an application-extension record directly after a skipped one is
@@ -824,8 +816,7 @@ fn note_or_fail(
 /// Join a chunk fault to the ordinal of the chunk it came from.
 ///
 /// A callback failure passes straight through: it is the caller's own verdict on
-/// a transform, not a fact about the chunk, and dressing it as one would let a
-/// skip policy swallow a hard error.
+/// a transform, not a fact about the chunk to be dressed with an ordinal.
 fn chunk_error(fault: decompress::ChunkFault, ordinal: u64) -> IngestError {
     match fault {
         decompress::ChunkFault::Unsupported(codec) => IngestError::CompressedChunk { codec },

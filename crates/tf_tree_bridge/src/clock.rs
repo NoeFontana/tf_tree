@@ -68,14 +68,13 @@
 //!   "at the same time" means.
 //! - **P4. Time is injected, never read ambiently.** Nothing in this crate calls
 //!   `Instant::now()`. The receipt clock is read **once per message** by the
-//!   caller (the rclcpp bridge reads `rclcpp::Clock(RCL_STEADY_TIME)` at
-//!   callback entry) and rides in on [`crate::Sample::received`], so the tests
-//!   stay deterministic and the hot path stays free of syscalls.
+//!   caller and rides in on [`crate::Sample::received`], so the tests stay
+//!   deterministic and the hot path stays free of syscalls.
 //! - **P5. A diagnostic may never become a correctness dependency** (§5.3).
 //!   Attribution quality now changes only how well a clock event is *described*.
 //!   It cannot change whether the bridge halts.
 //!
-//! # The degradation ladder — this is what kills the bug class
+//! # The degradation ladder
 //!
 //! | Evidence | Action |
 //! | --- | --- |
@@ -187,13 +186,11 @@ pub enum ClockVerdict {
     /// Time went backwards, but by less than the threshold.
     ///
     /// **Not a reset**, and the distinction matters. A guard watches one edge,
-    /// so this is one publisher's stamps arriving slightly out of order — which
-    /// happens routinely, from a node that fills several `TransformStamped`s
-    /// with slightly different capture times into one `TFMessage`, from a
-    /// best-effort transport that reorders, and from any publisher with more
-    /// than one thread. The sample is dropped and counted; Phase 1 would have
-    /// rejected it anyway, and dropping it here means the engine never sees an
-    /// error worth logging.
+    /// so this is one publisher's stamps arriving slightly out of order, which
+    /// happens routinely — see [`DEFAULT_RESET_THRESHOLD_NANOS`] for the
+    /// sources. The sample is dropped and counted; Phase 1 would have rejected
+    /// it anyway, and dropping it here means the engine never sees an error
+    /// worth logging.
     Jitter {
         /// How far back, in nanoseconds.
         by_nanos: i64,
@@ -279,9 +276,8 @@ impl ClockGuard {
             self.newest = Some(stamp_nanos);
             return ClockVerdict::Forward;
         }
-        // `saturating_sub`: both stamps are caller-supplied, and a bag whose
-        // first message is near `i64::MIN` against a live clock near `i64::MAX`
-        // would otherwise overflow — in a *release* build, silently.
+        // `saturating_sub`: both stamps are caller-supplied, and `i64::MIN`
+        // against `i64::MAX` overflows — silently, in a release build.
         let by_nanos = newest.saturating_sub(stamp_nanos);
         if by_nanos < self.threshold_nanos {
             self.jitter_drops += 1;
@@ -313,8 +309,6 @@ impl ClockGuard {
     /// regressed, and the wrong one for every other edge in the arena after an
     /// [`OnClockReset::Recreate`] — seeding them all from one edge's stamp is
     /// precisely the cross-edge contamination per-edge guards exist to remove.
-    /// A caller rebuilding the arena whole wants each guard rewound to "no
-    /// stamp seen yet", which is this.
     ///
     /// The alternative — dropping the whole `parent → child → ClockGuard` map —
     /// also frees the two owned `String` keys per edge, so the first sample on
@@ -390,10 +384,9 @@ pub enum ClockEvidence {
     /// and agreed about the size of the step. Always ≥ 2: one witness never
     /// promotes.
     ///
-    /// Publishers and not edges, and the difference is the whole rule. One node
-    /// owning two dynamic edges moves both the instant it restarts, so an edge
-    /// count is met by exactly the single-publisher event the rule exists to
-    /// tolerate.
+    /// Publishers and not edges: one node owning two dynamic edges moves both
+    /// the instant it restarts, so an edge count is met by exactly the
+    /// single-publisher event the rule exists to tolerate.
     CommonMode {
         /// How many agreed, including the one whose step completed it.
         publishers: u32,
@@ -545,10 +538,8 @@ pub struct CommonMode {
 
 /// Per-publisher stamp-to-receipt offsets, and the common-mode rule over them.
 ///
-/// This is the **fallback** rung of the ladder (see the module docs): it exists
-/// for callers with no authoritative jump signal, for system-clock steps that
-/// `/clock` never reports, and as defence in depth. It sits above
-/// [`ClockGuard`], never inside it — the guard answers an exact per-edge
+/// This is the **fallback** rung of the ladder (see the module docs). It sits
+/// above [`ClockGuard`], never inside it — the guard answers an exact per-edge
 /// question and mixing a global judgment into it is the shape `0011` records as
 /// the original defect.
 #[derive(Debug)]
@@ -625,8 +616,7 @@ impl OffsetTable {
         stamp_nanos: i64,
         received: SteadyNanos,
     ) -> Option<CommonMode> {
-        // No physical reference, no inference. The honest degradation: this
-        // sample contributes nothing rather than contributing a fiction.
+        // No physical reference, no inference: see `SteadyNanos::UNKNOWN`.
         if received == SteadyNanos::UNKNOWN {
             return None;
         }
@@ -637,8 +627,7 @@ impl OffsetTable {
         // One hash, where this was a `BTreeMap<String, _>` descent — six
         // node-name comparisons at the cap — on every accepted transform.
         let Some(id) = self.ids.intern(owner) else {
-            // Past the cap. A publisher with no row can never corroborate
-            // anything, which makes a halt harder to reach and never easier.
+            // Past the cap; see "Bounded" above.
             return None;
         };
         if self.rows.len() <= id.get() {
@@ -651,8 +640,7 @@ impl OffsetTable {
                     stepped_at: None,
                     step_delta: 0,
                 });
-                // A publisher's first sample defines its baseline; there is
-                // nothing yet for it to have stepped away from.
+                // Nothing yet for it to have stepped away from.
                 return None;
             };
             let residual = offset.saturating_sub(row.baseline);
@@ -674,8 +662,7 @@ impl OffsetTable {
         };
         self.steps += 1;
 
-        // Agreement, not coincidence. A real `/clock` step moves everyone by the
-        // same amount; two nodes restarting independently do not.
+        // Agreement, not coincidence.
         let mut publishers: u32 = 1;
         for (other_id, other) in self.rows.iter().enumerate() {
             // An index compare, where this was a node-name `memcmp` per row.
@@ -733,13 +720,11 @@ impl OffsetTable {
     /// a step, and those steps would agree — so the bridge would report a second
     /// clock reset caused by nothing but its own response to the first.
     pub fn clear(&mut self) {
-        // **The rows are blanked and the ids are kept.** Forgetting the names
-        // too would make every publisher's first post-recreate sample re-intern
-        // and re-allocate, which is the same reason
-        // `Ingest::forget_the_old_recording` rewinds its guards in place rather
-        // than dropping them. `tracked()` counts live rows, so it still reports
-        // zero here — which is what the assertion in
-        // `clear_forgets_the_time_base_that_was_thrown_away` reads.
+        // Rows blanked, ids kept (see the `rows` field): re-interning every name
+        // would re-allocate, the same reason `Ingest::forget_the_old_recording`
+        // rewinds its guards in place rather than dropping them. `tracked()`
+        // counts live rows, so it still reports zero here — which is what the
+        // assertion in `clear_forgets_the_time_base_that_was_thrown_away` reads.
         //
         // `fill`, not a loop: `clippy::manual_slice_fill` became a `-D warnings`
         // error when the rolling stable toolchain moved to 1.98. `Offset` is
@@ -790,8 +775,7 @@ mod tests {
         let mut g = ClockGuard::new(OnClockReset::Halt);
         assert_eq!(g.observe(1_000 * MS), ClockVerdict::Forward);
         assert_eq!(g.observe(1_010 * MS), ClockVerdict::Forward);
-        // 8 ms late — a second publisher's message, arriving after a faster
-        // one's. Normal, and must not restart anything.
+        // 8 ms late — a second publisher's message, arriving after a faster one's.
         assert_eq!(
             g.observe(1_002 * MS),
             ClockVerdict::Jitter { by_nanos: 8 * MS }
@@ -817,10 +801,9 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(g.resets(), 1);
-        // **The mark does not move until the caller says the recreate worked.**
-        // A guard that reset itself here would make a *failed* recreate look
-        // like a successful one, and the next message would read as forward
-        // motion into an arena that still holds the previous recording.
+        // **The mark does not move until the caller says the recreate worked**:
+        // otherwise the next message reads as forward motion into an arena that
+        // still holds the previous recording.
         assert_eq!(g.newest(), Some(1_009 * MS));
         g.accept_reset(0);
         assert_eq!(g.observe(MS), ClockVerdict::Forward);
@@ -915,8 +898,6 @@ mod tests {
             "the counters describe the bridge's life, not the recording's"
         );
     }
-
-    // ---- OffsetTable -------------------------------------------------------
 
     /// A table under the shipped defaults, so the unit tests below exercise the
     /// constants an operator actually gets.
@@ -1145,9 +1126,7 @@ mod tests {
     ///
     /// `0011` measured this in transforms offered, so "at the same time" meant
     /// two seconds on a busy stream and minutes on a sparse one — a rule about
-    /// coincidence whose meaning was set by message rate. Both sides of the
-    /// boundary are pinned or the constant can drift by one with nothing
-    /// noticing.
+    /// coincidence whose meaning was set by message rate.
     ///
     /// Mutant: `age >= self.policy.correlation_window_nanos` instead of `>` —
     /// applied, and this failed at `a gap of 1000000000 ns`, `left: false,
@@ -1238,10 +1217,9 @@ mod tests {
 
     /// **The table is bounded**, because its keys are chosen by somebody else.
     ///
-    /// A publisher identity is a node name resolved from the ROS graph. A bridge
-    /// asked to run unattended for a fortnight against a graph that churns is
-    /// the growth bug `NameNormalizer::seen` already had to cap. Past the cap a
-    /// new publisher gets no row, which can only make a halt harder to reach.
+    /// A bridge asked to run unattended for a fortnight against a graph that
+    /// churns is the growth bug `NameNormalizer::seen` already had to cap; see
+    /// [`OffsetTable::observe`]'s "Bounded" for why the cap is safe.
     ///
     /// Mutant: drop the `self.rows.len() < MAX_TRACKED_PUBLISHERS` guard —
     /// applied, and this failed at `3000 != 64`, i.e. unbounded growth keyed on
@@ -1291,10 +1269,7 @@ mod tests {
 
     /// **A recreate throws the baselines away with the arena.**
     ///
-    /// They describe offsets against a time base that no longer exists. Kept,
-    /// every publisher's first post-reset sample is a step — and those steps
-    /// *agree*, because they are all the same jump — so the bridge would report
-    /// a second clock reset caused by nothing but its own response to the first.
+    /// The reason they cannot be carried across is on [`OffsetTable::clear`].
     ///
     /// Mutant: `pub fn clear(&mut self) {}` — applied, and this failed one line
     /// after the clear, at `left: 2, right: 0` on `tracked()`. With that

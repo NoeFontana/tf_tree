@@ -20,9 +20,9 @@
 //!    also be reported as a clock or authority problem. One fault, one
 //!    diagnostic.
 //! 4. **Static value** (§5.7), *before* authority and **only on
-//!    `/tf_static`**. §5.7 says it in that order and it means it: on a
-//!    differing value, *"a diagnostic naming both publishers and both values,
-//!    **then** apply the authority policy"*.
+//!    `/tf_static`**. §5.7 says it in that order: on a differing value,
+//!    *"a diagnostic naming both publishers and both values, **then** apply
+//!    the authority policy"*.
 //!
 //!    An earlier version of this pipeline asked authority first, and the
 //!    consequence was that §5.7 became **inert for exactly the case it exists
@@ -73,14 +73,11 @@
 //!
 //! The **startup** window is counted in transforms offered
 //! ([`BridgeStats::transforms`], incremented unconditionally at the top of
-//! `offer`), with an explicit [`Ingest::close_startup_window`] as the real
-//! mechanism and the ordinal only as a backstop. `0011` chose that because the
-//! crate had no clock at all; it now has one, and the ordinal is kept **by
-//! choice**. What the window asks is *"is this deployment still starting up"*,
-//! and the answer belongs to a caller that knows what it launched — the rclcpp
-//! node drives it from a one-shot steady timer. A backstop measured in
-//! transforms is deterministic, forgeable by nobody, and needs no reading from a
-//! caller who supplied none.
+//! `offer`); `STARTUP_WINDOW_TRANSFORMS` has why that ordinal is only a
+//! backstop behind [`Ingest::close_startup_window`]. `0011` chose it because
+//! the crate had no clock at all; it now has one, and the ordinal is kept **by
+//! choice** — a backstop measured in transforms is deterministic, forgeable by
+//! nobody, and needs no reading from a caller who supplied none.
 //!
 //! The **correlation** window in `crate::clock` is nanoseconds of receipt time
 //! ([`crate::SteadyNanos`]) and could not be anything else: it asks whether two
@@ -129,8 +126,7 @@ const MAX_UNDECLARED_CHILDREN: usize = 256;
 /// reporting them. 4096 transforms is roughly two seconds of a typical
 /// 20-transform, 100 Hz `/tf`, and proportionally longer on a sparse stream,
 /// where startup is correspondingly slower anyway. It is a poor proxy for a
-/// duration and `docs/decisions/0011` says so in as many words rather than
-/// pretending otherwise.
+/// duration and `docs/decisions/0011` says so in as many words.
 const STARTUP_WINDOW_TRANSFORMS: u64 = 4096;
 
 /// Which topic a sample arrived on.
@@ -448,8 +444,7 @@ pub struct Ingest {
     /// future; a SLAM node dates it hundreds of milliseconds behind. Either is
     /// a steady offset larger than any threshold on a correctly configured
     /// robot, and the lagging edge's next message then read as a backward jump
-    /// off the leading edge's high-water mark — a latched bridge, on a robot
-    /// with nothing wrong with it.
+    /// off the leading edge's high-water mark.
     ///
     /// Per edge, the guard measures one publisher's regression against its own
     /// last accepted stamp, which is exactly what Phase 1's ring would refuse
@@ -549,22 +544,20 @@ impl Ingest {
         // **`config` carries the names as the file writes them; everything this
         // pipeline keys on is the rewritten form.** `tf_prefix` (§5.6) rewrites
         // the wire, and the declared topology has to be rewritten with it or the
-        // two never meet: a prefixed bridge would look up `robot1/odom ->
-        // robot1/base` in a store seeded with `odom -> base` and report 100 % of
-        // a correctly configured robot's traffic as undeclared edges. The
-        // rewrite goes through *this* normalizer, the one the wire will use, so
-        // the two cannot drift — see `TopologyConfig::rewritten`.
+        // two never meet: a prefixed bridge reports 100 % of a correctly
+        // configured robot's traffic as undeclared edges. The rewrite goes
+        // through *this* normalizer, the one the wire will use, so the two
+        // cannot drift — see `TopologyConfig::rewritten`.
         let mut names = tf_prefix.map_or_else(NameNormalizer::new, NameNormalizer::with_prefix);
         let declared = config.rewritten(&mut names);
         let statics = StaticStore::seeded(&declared);
         // **One guard per declared edge, built here rather than on first sight.**
-        // `ClockGuard::with_threshold` is a pure value constructor, and creating
+        // `ClockGuard::with_threshold` is a pure value constructor, so creating
         // it now is observationally identical to creating it at an edge's first
-        // sample — which is what the old `lookup_mut`-then-`insert` pair did, one
-        // branch and one map write per new edge. Nothing exposes the guards, so
-        // an unsampled edge holding a fresh one is invisible; what it buys is
-        // that `forget_the_old_recording` has no keys to preserve and nothing on
-        // the post-recreate path allocates at all.
+        // sample. Nothing exposes the guards, so an unsampled edge holding a
+        // fresh one is invisible; what it buys is that `forget_the_old_recording`
+        // has no keys to preserve and nothing on the post-recreate path
+        // allocates at all.
         let clocks = (0..statics.slots())
             .map(|_| ClockGuard::with_threshold(clock.on_reset, clock.reset_threshold_nanos))
             .collect();
@@ -618,7 +611,6 @@ impl Ingest {
         let (parent, child) = (parent.name, child.name);
         match self.statics.resolve(&parent, &child) {
             Some(slot) => {
-                // Only declared pairs are cached, which is what bounds the table.
                 self.raw.insert(rp, rc, slot);
                 Resolved::Declared(slot)
             }
@@ -629,12 +621,9 @@ impl Ingest {
     /// Push one transform through every table.
     pub fn offer(&mut self, topic: Topic, sample: &Sample, publisher: &Publisher) -> Action {
         // 0. The startup window's backstop (§5.4), **before the transform is
-        //    counted**. A window-close halt is not an event about the arriving
-        //    sample — it is caused by samples already counted, minutes ago — so
-        //    charging it a bucket in `BridgeStats::balanced()`'s ledger would
-        //    make the ledger a lie in order to keep it balanced. The arriving
-        //    sample is not processed either: the bridge is stopping, and the
-        //    caller latches on this outcome.
+        //    counted** — see `close_startup_window` for why the close charges no
+        //    bucket. The arriving sample is not processed either: the bridge is
+        //    stopping, and the caller latches on this outcome.
         if self.startup_window_open && self.stats.transforms >= STARTUP_WINDOW_TRANSFORMS {
             if let Some(halt) = self.close_startup_window() {
                 return halt;
@@ -649,10 +638,10 @@ impl Ingest {
         //      normalizing, allocating or probing anything by name. See
         //      `Ingest::resolve` and `Ingest::raw`.
         //
-        //      Declared? is answered before the kind check, because an
-        //      undeclared edge has no declared kind to clash with, and reporting
-        //      `KindChange` for it would send an operator looking at
-        //      `/tf_static` for an edge nobody ever wrote down.
+        //      Declared? is answered before the kind check (module docs, step
+        //      2): reporting `KindChange` for an undeclared edge would send an
+        //      operator looking at `/tf_static` for an edge nobody ever wrote
+        //      down.
         let slot = match self.resolve(sample) {
             Resolved::Declared(slot) => slot,
             Resolved::BadName => {
@@ -711,7 +700,7 @@ impl Ingest {
         // Cloned from the declared topology rather than from the wire, so they
         // are §5.6's canonical spelling whichever way the sample spelled them.
 
-        // 3. Kind. A hard error, and one fault gets one diagnostic.
+        // 3. Kind (module docs, step 3).
         //
         //    One array read, where this used to be a second full two-level
         //    descent of `StaticStore::kinds` with the same key step 2 had just
@@ -867,7 +856,7 @@ impl Ingest {
             }
         }
 
-        // 6. Clock, last: only a sample that will be written may advance time.
+        // 6. Clock, last (module docs, step 6).
         //
         //    Two independent things happen here, and the order matters. First
         //    the *fallback* rung of `crate::clock`'s ladder folds this sample's
@@ -958,10 +947,8 @@ impl Ingest {
     /// actually written for — a bag loop, a sim reset — exactly, and it handles
     /// it without any of the ambiguity the fallback rung exists to manage.
     ///
-    /// `delta_nanos` is the new time minus the last time before the jump, so a
-    /// rewind is **negative**; that is `rcl_time_jump_t::delta`'s own convention
-    /// and passing it through unnegated is what keeps the two ends of the seam
-    /// agreeing about the sign.
+    /// `delta_nanos` is passed through unnegated; [`Action::RecreateArena`]'s
+    /// `delta_nanos` holds the sign convention and why it is signed at all.
     ///
     /// Under [`OnClockReset::Recreate`] every per-edge guard and every offset
     /// baseline is forgotten: they describe a time base that no longer exists,
@@ -1066,10 +1053,8 @@ impl Ingest {
     /// second call, and the `STARTUP_WINDOW_TRANSFORMS` backstop after an
     /// explicit close, return `None`.
     ///
-    /// **This is the mechanism; the backstop is the fallback.** A caller with a
-    /// real clock — the `rclcpp` node, from a one-shot steady timer — decides
-    /// what "startup" means in seconds, which is the unit the question is
-    /// actually about. See `STARTUP_WINDOW_TRANSFORMS`.
+    /// **This is the mechanism; the backstop is the fallback** — see
+    /// `STARTUP_WINDOW_TRANSFORMS`.
     ///
     /// **No counter moves.** A window-close halt is caused by transforms
     /// already counted and dropped, each in its own bucket, at the time they
@@ -1705,11 +1690,9 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     ///
     /// §5.4 requires *"a diagnostic naming **both** nodes and the edge"* and
     /// that it be *"loud, rate-limited"*. `Verdict::Reject` has carried all
-    /// three since it was written; the pipeline used to collapse it into
-    /// `Action::Drop { reason: NotTheOwner }`, which carries none of them — so
-    /// the sentence §5.4 calls the better sales pitch was unprintable by any
-    /// caller of `offer`, and a 1 kHz intruder could only be logged once per
-    /// message or not at all.
+    /// three since it was written; see [`Action::AuthorityConflict`] for what
+    /// collapsing it into a `Drop` cost. A 1 kHz intruder could then only be
+    /// logged once per message or not at all.
     ///
     /// Mutant: return `Action::Drop { reason: … }` from the `Reject` arm again
     /// ⇒ this fails to match. Mutant: return `first_time: true` unconditionally
@@ -1847,7 +1830,7 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         assert_eq!(i.stats().dropped_kind_change, 0);
     }
 
-    // ---- §5.5, the clock ladder --------------------------------------------
+    // §5.5, the clock ladder.
     //
     // Every test below fixes a receipt-clock origin `t0` and derives a healthy
     // publisher's stamp from it as `STAMP0 + (received - t0)`, so a correct
@@ -1933,12 +1916,9 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     /// **A lone edge regressing past the threshold is a drop, not a halt.**
     ///
-    /// The ladder's bottom rung. One publisher restarting, hiccuping, or
-    /// replaying its own buffer regresses exactly one edge, however far and
-    /// however often, and halting a healthy robot for it is an outage caused by
-    /// the diagnostic rather than by the fault. It is still refused and still
-    /// counted — Phase 1's ring would refuse it too — and `dropped_non_monotonic`
-    /// is what `tf_tree doctor` reads.
+    /// The ladder's bottom rung: `offer`'s `ClockVerdict::Jitter | Reset` arm
+    /// carries the argument for why a lone regression is refused and counted
+    /// rather than halted.
     ///
     /// The second edge keeps working throughout, which is the property a global
     /// guard could not offer.
@@ -2754,7 +2734,7 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     /// CommonMode { publishers: 2 } } }`, `left: true, right: false`.
     #[test]
     fn the_clock_policy_knobs_reach_the_pipeline() {
-        // --- reset_threshold_nanos --------------------------------------------
+        // reset_threshold_nanos.
         for (threshold, steps) in [(DEFAULT_RESET_THRESHOLD_NANOS, 1u64), (S, 0)] {
             let mut i = Ingest::with_policies(
                 &topo(),
@@ -2793,7 +2773,7 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             );
         }
 
-        // --- correlation_window_nanos -----------------------------------------
+        // correlation_window_nanos.
         for (window, halts) in [(S, true), (10 * MS, false)] {
             let mut i = Ingest::with_policies(
                 &topo(),
@@ -3252,10 +3232,10 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     /// message that matches the config's declared constant writes nothing — the
     /// value was placed by `TopologyConfig::builder` before the bridge started.
     ///
-    /// This is not a pedantic distinction. `/tf_static` is transient-local, so
-    /// every late joiner causes the whole latched set to be re-delivered; an
-    /// operator watching `applied` on a robot whose only edges are static used
-    /// to see a healthy write rate for an arena nothing was writing to.
+    /// `/tf_static` is transient-local, so every late joiner causes the whole
+    /// latched set to be re-delivered; an operator watching `applied` on a robot
+    /// whose only edges are static used to see a healthy write rate for an arena
+    /// nothing was writing to.
     ///
     /// The fixture pushes a real dynamic sample too, so `applied` is non-zero
     /// and the assertion cannot pass by everything being zero.
@@ -3325,13 +3305,9 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     /// **A cached spelling still produces its remap row**, because the cache is
     /// populated lazily rather than pre-seeded.
     ///
-    /// The config declares `odom`; the wire sends `/odom`. It is the *first*
-    /// `normalize` of `/odom` that appends `("/odom", "odom")` to `remaps()`,
-    /// and that row crosses the C ABI as `tft_bridge_get_remap` and is what
-    /// §5.6's "log the resulting mapping table at startup" prints. A cache
-    /// filled at construction from the declared names would never call
-    /// `normalize` on the slashed spelling and the row would vanish with no
-    /// error anywhere.
+    /// `Ingest::raw` owns the argument: only the *first* `normalize` of `/odom`
+    /// appends the row that §5.6 requires logged at startup, so a cache filled
+    /// at construction would lose it with no error anywhere.
     ///
     /// The second half — that a hundred repeats add no second row — is what says
     /// the cache is actually being taken; without it this test would pass on an

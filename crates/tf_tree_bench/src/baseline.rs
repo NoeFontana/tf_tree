@@ -22,14 +22,10 @@
 //! | directional metric values inside rows both sides call `measured` | metrics whose `drift` is `informational` |
 //! | directional metric values inside `where_we_are_worse` entries | a `where_we_are_worse` entry's `statement` and `metrics_absent_because` prose |
 //!
-//! **The last row is the one that was missing.** Until it existed the
-//! comparison read a `where_we_are_worse` entry's *id* and nothing inside it, so
-//! giving one of its metrics a direction and a tolerance gated nothing —
-//! `docs/decisions/0021` step 4 asks for exactly that and names its own
-//! falsifier ("a deliberate revert of step 2 making it fail"), which could not
-//! fire. A `Worse` entry has no `status`, so there is no measured/unmeasured
-//! gate in front of its metrics the way there is for a row; the direction on the
-//! metric is the whole contract.
+//! **The last row is the one that was missing**: `compare_worse` closes the
+//! hole `docs/decisions/0021` step 4 walked into. A `Worse` entry has no
+//! `status`, so there is no measured/unmeasured gate in front of its metrics the
+//! way there is for a row; the direction on the metric is the whole contract.
 //!
 //! The prose is ignored on purpose. `reason` strings embed measured host facts
 //! ("4 physical cores for 16 consumers"), so comparing them would make the gate
@@ -320,9 +316,6 @@ pub fn compare(baseline: &Value, current: &Report) -> Result<Comparison> {
         for (column, cur_metrics) in [("tf_tree", &cur.tf_tree), ("tf2", &cur.tf2)] {
             let what = format!("row `{id}`.{column}");
             let b_metrics = parse_metrics(b_row, column, &what)?;
-            // A row is status-gated above: reaching here means both sides call it
-            // `measured`, which is already an assertion that this host could
-            // measure it. There is no host explanation left to offer.
             compare_metrics(
                 &what,
                 &b_metrics,
@@ -601,10 +594,9 @@ mod tests {
 
     /// [`report_with`], with the metric's tolerance spelled out.
     ///
-    /// Separate because the two sides of a comparison must be able to disagree
-    /// about the tolerance: which of them the gate reads is a property this
-    /// module claims in its docs, and a fixture that hard-codes 0.10 on both
-    /// sides cannot tell the two apart.
+    /// Separate because the two sides must be able to disagree about the
+    /// tolerance: a fixture that hard-codes 0.10 on both sides cannot tell whose
+    /// the gate reads.
     fn report_tuned(value: f64, drift_hi: bool, tolerance: f64) -> Report {
         let m = crate::report::Metric::new("max_deviation", value, "rad or m");
         let m = if drift_hi {
@@ -1028,9 +1020,7 @@ mod tests {
 
     /// The tolerance the comparison uses is the **baseline's**.
     ///
-    /// This is the module's stated security property: reading the tolerance
-    /// from the running build would let one commit widen the gate and land the
-    /// regression it was widened for, with a green run.
+    /// The module's "Whose tolerance" property, under test.
     ///
     /// Mutant (applied, confirmed fatal): `let slack = b.value.abs() *
     /// c.tolerance;` in `compare_column` — the widened build's 50% growth then
@@ -1064,10 +1054,8 @@ mod tests {
 
     /// A comparison that matched nothing is not a pass.
     ///
-    /// The predicate `bench_report` refuses on. It lives here, next to the
-    /// thing it is a statement about, because reaching it through the binary
-    /// costs a full benchmark assembly — see the note on
-    /// [`Comparison::compared_nothing`].
+    /// The predicate `bench_report` refuses on. It lives here rather than in
+    /// the binary for the reason on [`Comparison::compared_nothing`].
     ///
     /// Mutant (applied, confirmed fatal): make `compared_nothing` return
     /// `false` — the second assertion fails.
@@ -1139,12 +1127,10 @@ mod tests {
     /// metric inside a `where_we_are_worse` entry is compared, and a regression
     /// in one fails the gate.
     ///
-    /// Until [`compare_worse`] existed, [`compare`] read a `where_we_are_worse`
-    /// entry's *id* and nothing inside it, so `0021`'s own falsifier — "a
-    /// deliberate revert of step 2 making it fail" — could not fire. That was
-    /// measured through the binary, not argued: with the alignment fix reverted
-    /// the idle arena goes back to ~100% resident and `just bench-check` printed
-    /// `PASS - 1 directional metric held`.
+    /// `0021`'s falsifier could not fire before [`compare_worse`] existed, and
+    /// that was measured through the binary, not argued: with the alignment fix
+    /// reverted the idle arena goes back to ~100% resident and
+    /// `just bench-check` printed `PASS - 1 directional metric held`.
     ///
     /// Mutant (applied, confirmed fatal): delete the `compare_worse(...)` call
     /// in [`compare`] — the 4x growth below then passes and `checked` is 1
@@ -1187,12 +1173,11 @@ mod tests {
     /// A gated metric this build no longer emits is a **failure** on a host that
     /// could have measured it and a **refusal** on one that could not.
     ///
-    /// "The code stopped producing this number" and "this machine cannot produce
-    /// it" are different answers. A `Worse` entry carries no per-metric
-    /// sensitivity for the gate to read, so the report's own axis verdict is what
-    /// decides — the same fact [`crate::report::Report::validate`] stands down
-    /// on, and the gate contradicting `validate` about the same host was the
-    /// defect this arm closes.
+    /// A `Worse` entry carries no per-metric sensitivity for the gate to read,
+    /// so the report's own axis verdict is what decides — the same fact
+    /// [`crate::report::Report::validate`] stands down on, and the gate
+    /// contradicting `validate` about the same host was the defect this arm
+    /// closes.
     ///
     /// **A refusal is not a pass, and the note says so.** It leaves the gate
     /// green on a host where this comparison could not run, which is the honest
@@ -1201,10 +1186,8 @@ mod tests {
     /// `just bench-check`, including CI's `bench-gate` — the axis passes and the
     /// absence is a failure.
     ///
-    /// The informational half matters too: a `where_we_are_worse` entry
-    /// publishes its Pss figures as a group, so one gated metric and two context
-    /// ones vanish together, and all three used to be reported as
-    /// "which the baseline gates".
+    /// The informational half matters too: those Pss figures vanish as a group,
+    /// and all three used to read as gated — see [`compare_metrics`].
     ///
     /// Mutant (applied, confirmed fatal): collapse both [`Absence`] arms into
     /// `out.failures.push(...)` — the second half below then fails, because the

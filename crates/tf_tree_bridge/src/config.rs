@@ -6,9 +6,9 @@
 //! runtime edge declaration**: `ArenaBuilder::declare_edge` takes `&mut dyn
 //! Arena`, `TreeBuilder::{static_edge, dynamic_edge}` consume the builder, and
 //! `Tree::claim` returns `NoEdge` whenever the child's topology record has
-//! `edge == 0` — which nothing can change after `build()`. `edge_headroom`
-//! reserves zero-capacity slots no API can fill. `docs/decisions/0004` is
-//! authoritative and D4 (fixed capacity, no growth) is why.
+//! `edge == 0` — which nothing can change after `build()`.
+//! `docs/decisions/0004` is authoritative and D4 (fixed capacity, no growth)
+//! is why.
 //!
 //! So a bridge cannot learn its topology from `/tf`. It has to be told, before
 //! the arena exists, and this module is the format it is told in — the file
@@ -25,13 +25,9 @@
 //! plus `serde` **silently ignores keys it does not know** unless every struct
 //! carries `deny_unknown_fields`, and a topology file whose `capaciy = 4096`
 //! typo is dropped on the floor gives an operator an edge sized 1 with no
-//! message. This parser's error set is mostly *refusals*: an unknown key, an
-//! unknown table, a duplicate key, and every TOML construct outside the schema
-//! (dotted keys, inline tables, literal strings, multi-line strings,
-//! datetimes) are errors that name the line. A config file is read once, at
-//! startup, by an operator who is already unsure whether they got it right;
-//! being told exactly what was not understood is worth more here than
-//! accepting the whole language.
+//! message. A config file is read once, at startup, by an operator who is
+//! already unsure whether they got it right; being told exactly what was not
+//! understood is worth more here than accepting the whole language.
 //!
 //! What it does **not** accept, deliberately: dotted keys (`a.b = 1`), inline
 //! tables, literal (`'…'`) and multi-line strings, datetimes, multi-line
@@ -84,13 +80,11 @@
 //!
 //! # Errors name the offending frame, and cost nothing to carry
 //!
-//! [`ConfigError`] is `Copy` and holds a `&str` **borrowed from the config
-//! text**, so "edge `base_link` -> `laser` declares both `capacity` and
-//! `rate_hz`" is reported without a single allocation and without a `String` in
-//! an error type (`CLAUDE.md`'s hard rules). That is only possible because
-//! validation runs while the source is still in hand — which is why the
-//! semantic checks live in [`TopologyConfig::parse`] rather than in a later
-//! pass over the owned struct.
+//! [`ConfigError`] holds a `&str` **borrowed from the config text**, so "edge
+//! `base_link` -> `laser` declares both `capacity` and `rate_hz`" costs no
+//! allocation. That is only possible because validation runs while the source
+//! is still in hand — which is why the semantic checks live in
+//! [`TopologyConfig::parse`] rather than in a later pass over the owned struct.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -101,10 +95,6 @@ use tf_tree::{
 };
 
 use crate::names::NameNormalizer;
-
-// ---------------------------------------------------------------------------
-// The parsed config
-// ---------------------------------------------------------------------------
 
 /// How a dynamic edge's ring is sized.
 ///
@@ -195,9 +185,7 @@ pub struct TopologyConfig {
     ///
     /// A `u8` and not one of the built-in domain *types*, because [`Domain`] is
     /// an open trait: a user-declared domain picks a free tag from 4 upwards
-    /// (`docs/API.md` §2.5) and there is no type here to name it with. The four
-    /// built-ins are spellable by name in the file — `system`, `sensor`, `sim`,
-    /// `steady` — and resolve to their [`Domain::TAG`] at parse time.
+    /// (`docs/API.md` §2.5) and there is no type here to name it with.
     pub default_domain: u8,
     /// The edges, in file order.
     pub edges: Vec<EdgeConfig>,
@@ -506,10 +494,9 @@ fn quote(s: &str) -> String {
 /// carries neither point nor exponent, and the emitted file matches the schema
 /// as documented.
 ///
-/// **This is cosmetic, and deliberately so**: [`as_f64`] also accepts an
-/// integer, because `history_secs = 10` is what a person writes and refusing it
-/// teaches nothing. The consequence is that the round-trip test does *not* pin
-/// this `.0` — do not read it as covered.
+/// **This is cosmetic, and deliberately so**: [`as_f64`] accepts an integer
+/// too, so the round-trip test does *not* pin this `.0` — do not read it as
+/// covered.
 fn float(v: f64) -> String {
     let s = format!("{v:?}");
     if s.contains('.') || s.contains('e') || s.contains('E') {
@@ -518,10 +505,6 @@ fn float(v: f64) -> String {
         format!("{s}.0")
     }
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
 
 /// What was wrong with a config file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -664,10 +647,6 @@ impl std::error::Error for DomainMismatch<'_> {}
 /// Tighter than this rejects correct files; looser lets a genuinely
 /// mis-scaled rotation through, and `Quat::rotate` mis-scales by `‖q‖²`.
 pub const POSE_UNIT_EPS: f64 = 1e-9;
-
-// ---------------------------------------------------------------------------
-// The parser
-// ---------------------------------------------------------------------------
 
 /// One TOML value, in the four scalar kinds this schema uses plus arrays.
 #[derive(Clone, Debug, PartialEq)]
@@ -925,8 +904,6 @@ fn parse_value(s: &str, line: u32) -> Result<(Value<'_>, &str), ConfigError<'_>>
     }
 }
 
-// --- schema application ----------------------------------------------------
-
 fn get<'a, 'b>(t: &'b Table<'a>, key: &str) -> Option<(&'b Value<'a>, u32)> {
     t.iter()
         .find(|(k, _, _)| *k == key)
@@ -1041,8 +1018,7 @@ fn parse_domain<'a>(v: &Value<'a>, line: u32) -> Result<u8, ConfigError<'a>> {
 
 /// A frame name usable as both an arena key and a TOML basic string.
 ///
-/// `"` and `\` are refused alongside control characters so [`quote`] never has
-/// to escape and the parser never has to unescape — see [`quote`]. ROS frame
+/// `"`, `\` and control characters are refused — see [`quote`]. ROS frame
 /// names are identifiers; none of the three has ever been one.
 fn check_frame_name<'a>(name: &'a str, line: u32) -> Result<&'a str, ConfigError<'a>> {
     if !frame_name_ok(name) {
@@ -1391,8 +1367,7 @@ domain = 0
         assert_eq!(c.edges[1].domain, Some(0));
     }
 
-    /// **`to_toml` round-trips**, which is what makes `--discover` an operator
-    /// workflow rather than a demo: they edit what it printed and hand it back.
+    /// **`to_toml` round-trips.**
     ///
     /// Mutant: drop the `domain = …` line from `to_toml`'s `[topology]` block ⇒
     /// the reparse falls back to tag 0 while the fixture says `"sensor"` (1),
@@ -1406,10 +1381,8 @@ domain = 0
         assert_eq!(c, c2);
     }
 
-    /// **An unknown key is an error, not a shrug.** This is the whole argument
-    /// for the hand-written parser: `serde` without `deny_unknown_fields` reads
-    /// `capaciy = 4096` as nothing at all, and the operator gets an edge sized
-    /// by the *other* branch with no message.
+    /// **An unknown key is an error, not a shrug** — the module docs' whole
+    /// argument for the hand-written parser.
     ///
     /// Mutant: delete the `reject_unknown` call for edges ⇒ this parses, and
     /// the typo'd edge falls into the `MissingKey` arm — a message about the
@@ -1423,9 +1396,7 @@ domain = 0
         assert_eq!(e.line, 5);
     }
 
-    /// **Every error names the offending frame or edge**, and does it while
-    /// borrowing from the text — `ConfigError` is `Copy` and carries no
-    /// `String`.
+    /// **Every error names the offending frame or edge.**
     ///
     /// Mutant: report `at: "edge"` (a constant) instead of `child` in any one
     /// of the six arms ⇒ that row fails on `e.at`, which is the half an
@@ -1578,10 +1549,9 @@ capacity = 512
     }
 
     /// **A quaternion a few ulps off unit is a correct file, not a bad one.**
-    ///
-    /// A URDF's RPY is converted and printed by somebody else's tool. Rejecting
-    /// at `1e-12` would refuse files that are right; accepting at `1e-3` would
-    /// admit a mis-scaled rotation, and `Quat::rotate` mis-scales by `‖q‖²`.
+    /// Rejecting at `1e-12` would refuse files that are right; accepting at
+    /// `1e-3` would admit a mis-scaled rotation, and `Quat::rotate` mis-scales
+    /// by `‖q‖²`.
     ///
     /// Mutant: tighten the bound to `1e-13` ⇒ the perturbed case is rejected.
     #[test]
@@ -1639,9 +1609,6 @@ capacity = 512
         assert_eq!((e.parent, e.child), ("odom", "base_footprint"));
         assert_eq!((e.declared, e.bridge), (0, 1));
 
-        // A static edge inheriting the mismatching default is exempt: its
-        // constant has no stamp. Without the exemption every sim deployment
-        // fails this check because of `/tf_static`.
         let statics_only = "[topology]\ndomain = 1\n[[edge]]\nparent=\"a\"\nchild=\"b\"\nkind=\"static\"\npose=[1.0,0.0,0.0,0.0,0.0,0.0,0.0]\n";
         let c = TopologyConfig::parse(statics_only).unwrap();
         assert_eq!(c.check_domain(0), Ok(()), "a static edge has no clock");
@@ -1743,11 +1710,7 @@ capacity = 512
     }
 
     /// **A trailing comment after a table header is a comment, not an unknown
-    /// table.** Comments are accepted at line start and after a value, so an
-    /// operator annotating `[[edge]] # left wheel` has every reason to expect
-    /// this to work — and the refusal it used to get named the wrong thing
-    /// entirely: `unknown table (expected [topology] or [[edge]])` pointing at
-    /// a line that says `[[edge]]`.
+    /// table** — [`header_name`] carries the diagnostic refusing it produced.
     ///
     /// Mutant: in `header_name`, go back to `rest.strip_suffix(close)` ⇒
     /// neither header matches and this fails on the `unwrap`.
@@ -1787,11 +1750,8 @@ capacity = 512
     }
 
     /// **A ring whose `rate_hz * history_secs` overflows to infinity is
-    /// refused, naming the child.** Both factors pass `is_finite() && > 0`
-    /// individually; their product does not, and `Capacity::history`'s
-    /// non-finite fallback is the *minimum*. So such an edge used to be given a
-    /// **one-slot ring** — the worst ring this sizing code can produce — with
-    /// no message at all.
+    /// refused, naming the child** — the silent **one-slot ring**
+    /// `Capacity::history`'s non-finite fallback used to hand out.
     ///
     /// The `1e10 * 1.0` half pins that the guard rejects overflow and not
     /// merely large numbers, so this cannot pass by refusing everything big.
@@ -1824,10 +1784,7 @@ capacity = 512
         );
     }
 
-    /// **An array needs its separators.** `[1.0 0.0 …]` is not TOML, and
-    /// `to_toml` always emits commas — accepting their absence means reading
-    /// files this tool can never write, in the one module whose whole argument
-    /// is that it refuses what it does not understand.
+    /// **An array needs its separators** — see [`parse_value`]'s array arm.
     ///
     /// A trailing comma stays legal, because TOML says so; without that second
     /// case the mutant below could be "fixed" by demanding a comma everywhere,
@@ -1857,10 +1814,8 @@ capacity = 512
         );
     }
 
-    /// **A cycle is reported by frame name, not by `FrameId`.** `build()` finds
-    /// the same cycle and calls it `WouldCreateCycle { child: FrameId(1) }` — an
-    /// index into an arena that was never constructed. This preflight exists to
-    /// fail on a laptop with something an operator can act on.
+    /// **A cycle is reported by frame name, not by `FrameId`** — the whole
+    /// reason [`TopologyConfig::cycle_child`] exists beside `build()`'s check.
     ///
     /// The acyclic half is a two-edge *chain*, not a single edge: a one-edge
     /// fixture would pass even if `cycle_child` reported any child that merely

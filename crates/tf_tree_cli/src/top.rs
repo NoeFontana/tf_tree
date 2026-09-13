@@ -39,14 +39,6 @@
 //!   claimed: `tests::capturing_the_arena_moves_no_counter` reads a populated
 //!   arena repeatedly and requires every counter to stand still.
 //!
-//! # Its ages are against `doctor`'s reference clock
-//!
-//! [`Capture::decide_clock`] delegates to [`crate::checks::Clock::decide`]
-//! rather than reducing the arena's stamps itself. The reduction that looks
-//! obvious — the newest stamp on any edge — is the one this repository already
-//! removed from `doctor`, because it lets a single broken publisher define
-//! "now" and invert every staleness reading in the view.
-//!
 //! # The clock-drift rule `TFT004` cannot have belongs here — unbuilt
 //!
 //! **This is the only place in the codebase that could answer it**, which is why
@@ -119,10 +111,6 @@ use crate::catalogue::{Severity, Tft};
 // reported nothing at all. One constant, one comparator.
 use crate::checks::{Clock, OCCUPANCY_LIMIT};
 use crate::doctor::Snapshot;
-
-// ---------------------------------------------------------------------------
-// Capture: one read of the arena, as plain data
-// ---------------------------------------------------------------------------
 
 /// The counter values read from one [`tf_tree_core::counters::EdgeCounters`] or
 /// [`tf_tree_core::counters::ParticipantCounters`].
@@ -513,10 +501,6 @@ impl Capture {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Derived statistics
-// ---------------------------------------------------------------------------
-
 /// Order statistics over a set of inter-arrival intervals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntervalStats {
@@ -670,10 +654,6 @@ pub fn select_edge_index(edges: &[EdgeSample], needle: &str) -> Option<usize> {
     }
     edges.iter().position(|e| e.label.contains(needle))
 }
-
-// ---------------------------------------------------------------------------
-// The rolling feed
-// ---------------------------------------------------------------------------
 
 /// One line of the rolling diagnostics feed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -953,10 +933,6 @@ impl Sampler {
         self.feed.push_back(ev);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
 
 /// ANSI colour codes, or empty strings when colour is off.
 #[derive(Clone, Copy, Debug)]
@@ -1464,10 +1440,6 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
 }
 
-// ---------------------------------------------------------------------------
-// The redraw loop
-// ---------------------------------------------------------------------------
-
 /// Terminal control for the redraw, or nothing at all when stdout is not a tty.
 ///
 /// A `top` whose output is piped into a file must not fill it with escape
@@ -1942,14 +1914,9 @@ mod tests {
     /// **One publisher with a units error must not define "now" for the whole
     /// view.**
     ///
-    /// The reference clock decides the `age(ms)` column and every participant's
-    /// `attached(s)`. Reducing the arena's newest stamps with `max()` hands it
-    /// to the single largest one, so a nanoseconds-into-a-seconds-field
-    /// overshoot makes the five *healthy* edges read ~54 years stale and the
-    /// *broken* one read `0.0` — the diagnostic inverted. `checks.rs` fixed this
-    /// once already (`a_single_units_error_cannot_capture_the_reference_clock`,
-    /// commit `90561fc`); `top` must not be a third copy of the rejected
-    /// estimator.
+    /// `checks.rs` fixed this once already
+    /// (`a_single_units_error_cannot_capture_the_reference_clock`, commit
+    /// `90561fc`); `top` must not be a third copy of the rejected estimator.
     ///
     /// The fixture is `checks.rs`'s: five distinct Unix stamps within a second
     /// of `UNIX_NOW`, plus one at `UNIX_NOW * 2`, which is the arena maximum by
@@ -2078,10 +2045,6 @@ mod tests {
 
     /// `p99` is the 99th of 100, not the maximum.
     ///
-    /// The detail pane prints `p99` and `max` side by side; a `p99` defined to
-    /// equal `max` makes that pair carry one number instead of two, on exactly
-    /// the round sample counts a 100- or 1000-slot ring produces.
-    ///
     /// **Mutant:** index with `sorted[n * 99 / 100]`. Applied: `p99` becomes
     /// 500 ms, equal to `max`, and both assertions fail.
     #[test]
@@ -2096,10 +2059,9 @@ mod tests {
 
     /// A ring holding exactly one sample says so.
     ///
-    /// Reconstructing the retained count from `intervals.len()` is right for
-    /// `n >= 2` and reads `0` at `n == 1` — while the line below it prints a
-    /// non-empty retained window. Two adjacent lines contradicting each other,
-    /// on a publisher that has just started, which is when somebody is watching.
+    /// Reconstructing it from `intervals.len()` reads `0` at `n == 1` while the
+    /// line below prints a non-empty retained window: two adjacent lines
+    /// contradicting each other.
     ///
     /// **Mutant:** print `e.intervals.len() + usize::from(!e.intervals
     /// .is_empty())` again. Applied: "retained 0 samples" and the assertion
@@ -2119,13 +2081,6 @@ mod tests {
 
     /// **A frame name is somebody else's UTF-8 and must not reach the terminal
     /// as an escape sequence.**
-    ///
-    /// Frame names are validated only by their hash, and the lock file's `comm`
-    /// is `from_utf8_lossy` of bytes another process wrote. Both are
-    /// interpolated into a full-screen ANSI frame, so `"\x1b[2J..."` repaints
-    /// the operator's terminal every redraw — and `--color never > report.txt`
-    /// stops producing the escape-free text that flag promises.
-    /// `catalogue::json_escape` guards the JSON path against the same input.
     ///
     /// **Mutant:** drop the `sanitize` call from `truncate` (and from
     /// `render_detail`'s label). Applied: the frame contains `\x1b[2J` and the
@@ -2149,10 +2104,6 @@ mod tests {
     }
 
     /// `top`'s occupancy colour fires on exactly the rule `TFT015` fires on.
-    ///
-    /// A local `0.80` with a `>=` comparator coloured a table sitting on the
-    /// line yellow, beside the words "TFT015 warns above 80%", while `doctor`
-    /// reported nothing about it.
     ///
     /// **Mutant:** compare with `frac >= OCCUPANCY_LIMIT`. Applied: the 80/100
     /// row is coloured and the first assertion fails.

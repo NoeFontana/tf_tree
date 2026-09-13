@@ -104,10 +104,8 @@
 //! the depth-3 path, so `I::eval` never ran there — `docs/decisions/0013`'s
 //! defect, which `stamp_ns` below was written to avoid in advance. That file now
 //! queries `fixture::QUERY_NS` and interpolates like this one. It is recorded
-//! here because a reason that stops being true is how a list like this rots, and
-//! the two reasons above are unaffected: they are about *where the code is
-//! compiled* and *how the two columns are paired*, neither of which a stamp
-//! changes.
+//! here because a reason that stops being true is how a list like this rots; the
+//! two reasons above are unaffected, since a stamp changes neither.
 //!
 //! The profile is **not** offered as a further reason: `cargo bench` accepts
 //! `--profile`, so a bench target could be built under `[profile.embedder]` too.
@@ -140,9 +138,8 @@
 //! **Every figure in this section was taken before 2026-08-29, while the row
 //! still had an independent variable.** It is kept as the record of what the
 //! boundary cost when it was last measurable; it is not a statement about this
-//! tree, where both columns are the same stub and the row reports 1.0 by
-//! construction. See the collapse note at the top of this module and
-//! `docs/API.md` §2.3's 2026-09-06 amendment.
+//! tree, where both columns are the same stub. See the collapse note at the top
+//! of this module and `docs/API.md` §2.3's 2026-09-06 amendment.
 //!
 //! Three consecutive `just embed-cost` runs on the host described under
 //! *Provenance*:
@@ -316,10 +313,8 @@ const WARMUP: usize = 200_000;
 /// The profile directory *this* binary was built into (see `build.rs`).
 pub const PROFILE_DIR: &str = env!("TF_TREE_BENCH_PROFILE_DIR");
 
-/// A digest of the sources that determine what this binary measures.
-///
-/// See `build.rs`. Two runs whose `source_id` differs are two programs, and
-/// [`Pair::load`] will not divide one by the other.
+/// A digest of the sources that determine what this binary measures (see
+/// `build.rs`).
 pub const SOURCE_ID: &str = env!("TF_TREE_BENCH_SOURCE_ID");
 
 /// What §9.2's 5% criterion says about a measured crate-boundary ratio.
@@ -331,10 +326,9 @@ pub enum Verdict {
     Over,
     /// The band straddles the threshold, so this run cannot answer.
     ///
-    /// Reported rather than rounded to a pass or a fail. The threshold is 5%
-    /// and the band is what the machine actually did across rounds; when the
-    /// second is wider than the distance to the first, a verdict would be
-    /// arithmetic on noise.
+    /// Reported rather than rounded to a pass or a fail: when the band the
+    /// machine actually did across rounds is wider than its distance to the 5%
+    /// threshold, a verdict would be arithmetic on noise.
     Unresolved,
 }
 
@@ -367,7 +361,6 @@ pub struct Run {
     /// numbers above: the two columns are timed back to back inside one round,
     /// so machine noise common to both cancels out of each round's ratio in a
     /// way it cannot cancel out of a quotient of two separate best-of-9 minima.
-    /// That is what makes a 5% criterion resolvable on a host like this one.
     pub boundary_ratio: f64,
     /// Smallest per-round ratio observed.
     pub ratio_lo: f64,
@@ -395,8 +388,7 @@ impl Run {
     ///
     /// [`Verdict::Unresolved`] whenever `[ratio_lo, ratio_hi]` contains the
     /// threshold: the run saw rounds on both sides of it and no honest
-    /// pass/fail exists. This is the check that stops the spread being an
-    /// advisory number printed next to a verdict it does not constrain.
+    /// pass/fail exists.
     #[must_use]
     pub fn verdict(&self) -> Verdict {
         let threshold = 1.0 + GATE;
@@ -696,11 +688,9 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
     let mut in_ns = Vec::with_capacity(rounds);
     let mut ratios = Vec::with_capacity(rounds);
     for _ in 0..rounds {
-        // Back to back inside one round, so a scheduling artefact lands on both
-        // and cancels out of the per-round ratio. Ordering is fixed rather than
-        // alternated: an alternation would put a different column first in
-        // different rounds, which changes which one pays for a cold branch
-        // predictor after the timing call.
+        // Ordering is fixed rather than alternated: an alternation would put a
+        // different column first in different rounds, which changes which one
+        // pays for a cold branch predictor after the timing call.
         let t0 = Instant::now();
         for _ in 0..sweeps {
             for &s in &stamps {
@@ -786,10 +776,6 @@ fn median_of(v: &[f64]) -> f64 {
 /// off all three, and 9631 ns — prime, so coprime with every grid — keeps the
 /// whole sweep off them. 1024 steps reach back 9.9 ms, which stays inside every
 /// ring.
-///
-/// This is `docs/decisions/0013`'s finding applied in advance: the Phase 1
-/// lookup benchmark queried on-grid stamps, `I::eval` never ran, and the number
-/// it published described a lookup with the interpolation taken out.
 #[cfg(feature = "embed-probe")]
 const fn stamp_ns(i: i64) -> i64 {
     crate::fixture::NOW_NS - 3_700_000 - i * 9_631
@@ -799,8 +785,7 @@ const fn stamp_ns(i: i64) -> i64 {
 /// embedder's position, and the numerator of §9.2's ratio.
 ///
 /// The body is byte-identical to `tf_tree_core::bench_probe::depth3_lookup`,
-/// which is the denominator. That is the entire experiment: same three lines,
-/// same attribute, different crate.
+/// which is the denominator.
 ///
 /// `#[inline(never)]` is what makes this a measurement of the *call*: without it
 /// the timing loop and the fold merge, and the number becomes a property of the
@@ -820,9 +805,8 @@ fn one(plan: &Plan, g: &Guard, s: Stamp) -> f64 {
 
 /// `(lto, codegen-units)` as the workspace manifest declares them for `profile`.
 ///
-/// This is what keeps a run's statement about its own build honest: the profile
-/// *directory* comes from `OUT_DIR` (see `build.rs`), and this maps that
-/// directory to the settings the manifest gives it.
+/// This is what keeps a run's statement about its own build honest: it maps the
+/// profile directory a run reports to the settings the manifest gives it.
 ///
 /// **The report's `lto = false, codegen-units = 16` *is* retyped**, as prose,
 /// in one string constant — `crate::report`'s `EMBEDDING_NOTE`. What this
@@ -1057,9 +1041,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Nothing else in the two documents distinguishes a stale half from a
-    /// fresh one: they are supposed to differ in their durations.
-    ///
     /// Mutant: drop the `embedder.source_id != reference.source_id` check in
     /// `Pair::load`.
     #[test]
@@ -1222,21 +1203,11 @@ mod tests {
             "false (cargo's default; [profile.dev] declares no `lto`)"
         );
         // And a directory nothing declares says so rather than defaulting to
-        // `false`, which would read as "LTO is off" — the claim that makes a
-        // boundary measurement believable.
+        // `false`.
         let unknown = lto_for_profile_dir(&m, "no-such-dir");
         assert!(unknown.starts_with("unknown"), "{unknown}");
     }
 
-    /// `[profile.bench]` and `[profile.release]` share the `release/` directory,
-    /// so that directory cannot identify which of the two produced a binary.
-    ///
-    /// That ambiguity is harmless only while the two agree about `lto`, which is
-    /// what this checks. If they ever diverge, [`lto_for_profile_dir`] starts
-    /// reporting `[profile.release]`'s answer for `cargo bench` binaries and a
-    /// provenance block goes quietly wrong — so this test is the thing standing
-    /// between that comment and a lie.
-    ///
     /// Mutant (applied, observed): set `[profile.bench]`'s `lto` to `false` in
     /// the workspace manifest. This test fails with
     /// `[profile.bench] and [profile.release] share target/release/ …
@@ -1257,13 +1228,9 @@ mod tests {
     /// A profile that declares no `lto` but does declare `inherits` gets its
     /// parent's, not cargo's default.
     ///
-    /// The real subject is `[profile.profiling]` in the workspace manifest,
-    /// which `inherits = "release"` and so is `lto = "thin"` in fact. A binary
-    /// built at `--profile profiling` used to print `false (cargo's default; …)`
-    /// — a wrong build fact with a confident parenthetical, which is worse than
-    /// no answer. It surfaced as a contradiction between two measurements rather
-    /// than by inspection: the tf2 ratio harness at `profiling` and at `release`
-    /// agreed to 0.6% on an arm that moves 21% when `lto` actually changes.
+    /// The real subject is the workspace's `[profile.profiling]`; the wrong
+    /// build fact it used to print, and the tf2 ratio harness contradiction that
+    /// caught it, are recorded on [`lto_for_profile_dir`].
     ///
     /// The synthetic manifest carries the interesting shapes the workspace's
     /// does not — a two-link chain, a missing parent, a self-inheriting section

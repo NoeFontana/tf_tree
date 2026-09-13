@@ -111,11 +111,9 @@ impl Kid {
     ///
     /// **No longer gated on `crash-points`, and the gate was not load-bearing —
     /// it only kept the method from being dead code where the crash sites
-    /// compile out.** `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`
-    /// is a caller that arms nothing: the child it waits for aborts inside a
-    /// closure the child itself supplies, so the method is live in every
-    /// configuration this file compiles in. Without this, that test would not
-    /// build under `just shm-check`'s `shm,test-hooks,unstable` line.
+    /// compile out.** That third caller arms nothing, so the method is live in
+    /// every configuration this file compiles in; without this, that test would
+    /// not build under `just shm-check`'s `shm,test-hooks,unstable` line.
     fn wait_within(&mut self, bound: std::time::Duration) -> Option<std::process::ExitStatus> {
         let deadline = std::time::Instant::now() + bound;
         loop {
@@ -139,8 +137,7 @@ impl Kid {
     }
 
     /// `SIGKILL`, then reap. After `wait` returns the kernel has torn down the
-    /// process's descriptors, so its locks are gone with no cooperation from
-    /// it — which is the entire point.
+    /// process's descriptors, so its locks are gone with no cooperation from it.
     /// Nudge a child that is waiting on stdin, **keeping the pipe**.
     ///
     /// It used to `take` the pipe and drop it, which closed the child's stdin as
@@ -246,8 +243,8 @@ fn a_consumer_that_will_not_create_fails_fast_on_an_empty_machine() {
 /// `create` default from `IfAbsent` to `Never`, and nothing but this test would
 /// notice if the move had broken the join path.
 ///
-/// Bit-for-bit, like `a_foreign_process_joins_and_reads_the_same_transform`:
-/// attaching to the wrong segment would still return `Ok`.
+/// Bit-for-bit, for the reason
+/// `a_foreign_process_joins_and_reads_the_same_transform` gives.
 ///
 /// **Mutant: make `open()` pass `CreatePolicy::IfAbsent`** ⇒ still passes here
 /// (an arena is serving, so the join path is taken either way), which is why
@@ -403,8 +400,6 @@ fn a_stopped_and_continued_owner_still_serves_the_rendezvous() {
 
     for signal in ["-STOP", "-CONT"] {
         if signal == "-CONT" {
-            // Between the two: the target is genuinely stopped, so the SIGCONT
-            // below is a *continue* rather than a no-op on a running process.
             await_stopped(pid);
         }
         assert!(
@@ -598,10 +593,9 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
 /// nowhere in the message. The `assert_ne!` below is that they no longer do.
 ///
 /// The holders are bare lock bytes rather than processes because a held byte is
-/// the entirety of what steps 2, 4 and 5 consult; a second process would add a
-/// socket, a mapping and a race without changing the input. Each is its own
-/// open file description, since `F_OFD_GETLK` reports only *conflicting* locks
-/// and a description's own byte does not conflict with itself.
+/// the entirety of what steps 2, 4 and 5 consult. Each is its own open file
+/// description, since `F_OFD_GETLK` reports only *conflicting* locks and a
+/// description's own byte does not conflict with itself.
 ///
 /// **Mutant: `ownership_held: false` hardcoded at the construction site**
 /// (`Open::held_but_unreachable`). Applied ⇒ measured: the sibling test below
@@ -1017,9 +1011,7 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
     // byte conflicts with everything that asks about it.
     //
     // **Staged through `tf_tree_ipc`, because no sequence of `tf_tree::Open`
-    // calls is known to produce it** — see the doc comment. An owner death
-    // frees byte 0 along with the ownership byte, so the operator scenario
-    // #201 names arrives here with byte 0 free and diverges from nothing.
+    // calls is known to produce it** — see the doc comment.
     let survivor = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
     assert_eq!(
         survivor.try_take_participant(0).unwrap(),
@@ -1042,8 +1034,8 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
     //    tells an operator that two integers disagreed; this tells them which
     //    slot to look at.
     //
-    // Everything else this test asserts is unchanged, and that is the point of
-    // keeping it: the refusal still disturbs nothing.
+    // Everything else this test asserts is unchanged: the refusal still
+    // disturbs nothing.
     let witness = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
     let err = tf_tree::Open::new()
         .mode(AttachMode::ReadWrite)
@@ -1068,11 +1060,10 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
         "expected ArenaHeldButUnreachable naming slot 0, got {err:?}"
     );
 
-    // **What this pins that its sibling cannot.** The guard compares two
-    // integers and consults nothing else. This byte 0 carries *no identity
-    // record at all* — `try_take_participant` writes none — so a guard that
-    // tried to decide from the lock file's identity rows, or to excuse a
-    // divergence whose byte names nobody, would have nothing to read here.
+    // The guard compares two integers and consults nothing else, and
+    // `try_take_participant` writes no identity: a guard that tried to decide
+    // from the lock file's identity rows, or to excuse a divergence whose byte
+    // names nobody, would have nothing to read here.
     assert!(
         witness.read_identity(0).unwrap().is_none(),
         "the staged survivor writes no identity, and the refusal must not need one"
@@ -1475,13 +1466,14 @@ fn a_consumer_waits_for_an_arena_that_starts_late() {
 /// A wait with no publisher at all gives up inside a bounded time.
 ///
 /// **Run on a worker thread with a `recv_timeout` on the main one, and that is
-/// deliberate.** This repository has **no `.config/nextest.toml`**, so there is
-/// no `slow-timeout` / `terminate-after` to bound a test that never returns: an
-/// `await_open` that ignored its deadline would hang the whole suite instead of
-/// failing one test. The channel is this test supplying its own bound.
+/// deliberate.** `.config/nextest.toml`'s `terminate-after` does bound a test
+/// that never returns, but only at 180 s and only as a timeout, which says
+/// "something hung"; the channel fails an `await_open` that ignored its
+/// deadline in 30 s, with a message that says so. A test should not depend on
+/// the runner for its own liveness.
 ///
 /// **Mutant: ignore the deadline** ⇒ the `recv_timeout` expires and this fails
-/// with the message below, rather than the run hanging.
+/// with the message below, rather than as a 180 s nextest timeout.
 #[test]
 fn a_wait_for_an_arena_that_never_starts_gives_up() {
     use std::sync::mpsc;
@@ -1561,8 +1553,7 @@ fn a_whole_second_wait_is_not_refused_by_the_socket_timeout() {
         let _ = tx.send((outcome.err(), started.elapsed()));
     });
 
-    // Same shape as the test above, and for the same reason: there is no
-    // `.config/nextest.toml`, so nothing else bounds a call that hangs.
+    // Same shape as the test above, and for the same reason.
     let (err, elapsed) = rx
         .recv_timeout(Duration::from_secs(30))
         .expect("await_open never returned");
@@ -1711,13 +1702,9 @@ fn a_consumer_waits_for_a_frame_interned_after_the_arena_exists() {
 /// first-missing-name hash, the `saturating_sub` clamp, and `all_interned::<0>`.
 ///
 /// **The wait runs on a worker thread and the main thread bounds it with
-/// `recv_timeout`.** This repository has **no `.config/` directory at all** —
-/// verified, the root dotfiles are `.cargo`, `.claude`, `.git`, `.github`,
-/// `.gitignore`, and `find` reports no `nextest.toml` anywhere — so there is no
-/// `slow-timeout` or `terminate-after` profile setting, and a call that
-/// ignored its deadline would wedge the whole run instead of failing one test.
-/// The channel is this test supplying the bound nextest does not. It is the same
-/// shape `a_wait_for_an_arena_that_never_starts_gives_up` uses one wait over.
+/// `recv_timeout`** — the same shape
+/// `a_wait_for_an_arena_that_never_starts_gives_up` uses one wait over, and for
+/// the reason stated there.
 ///
 /// The `Tree` is built *inside* the thread rather than moved into it: `Scratch`
 /// has already put `TF_TREE_RUNTIME_DIR` in this process's environment, so the
@@ -2039,9 +2026,8 @@ fn slot_recycling_under_abnormal_exit() {
             line.starts_with("joined "),
             "attach {cycle} of 128 was refused: {line}"
         );
-        // `kill` waits, so the kernel has torn down the child's descriptors by
-        // the time the next attach starts: its lock byte is released and its
-        // socket is closed with no cooperation from it.
+        // `kill` waits, so the next attach starts after the kernel has released
+        // this child's byte and closed its socket.
         joiner.kill();
     }
 }
@@ -2335,10 +2321,9 @@ fn the_hangup_collects_a_record_left_reserved_by_a_killed_registrant() {
         .find(|slot| **slot != 0 && **slot != mine)
         .expect("the peer holds a live record");
 
-    // Rewind the peer's record to the word `fill_slot` leaves between its CAS
-    // and its publishing store, then kill it. The peer never reads its own
-    // record, so this changes nothing about the process — only about what the
-    // owner finds when the socket closes.
+    // Rewind the record, then kill. The peer never reads its own record, so
+    // this changes nothing about the process — only about what the owner finds
+    // when the socket closes.
     table
         .get(peer_slot)
         .expect("slot in range")
@@ -2579,9 +2564,8 @@ fn a_restarted_publisher_gets_its_predecessors_slot_and_can_still_claim() {
         "the first publisher did not claim: {claimed}"
     );
 
-    // `kill` waits, so the kernel has released this process's claim lease and
-    // closed its attach socket before anything else runs. The owner's `epoll`
-    // has a hangup to process.
+    // `kill` waits, so the claim lease is released and the attach socket closed
+    // before anything else runs: the owner's `epoll` has a hangup to process.
     first.kill();
 
     // The restart. Same edge, and — because the assigner reclaims the byte the
@@ -2657,9 +2641,7 @@ fn a_killed_writers_edge_is_reaped_and_can_be_reclaimed() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // The CAS-to-lease window (`docs/decisions/0005` §5)
-// ---------------------------------------------------------------------------
 
 /// The tree the in-window hook reaps from. A second, independent participant —
 /// the reaper must not be the claimer, or the self-skip would fire.
@@ -2782,7 +2764,6 @@ fn the_acquire_window_backs_out() {
         .expect("and the reclaimed edge must be publishable");
 }
 
-// ---------------------------------------------------------------------------
 // `docs/decisions/0028` plan step 2 — the reclamation predicate, once.
 //
 // The predicate is `crate::open::reclamation_verdict`, and it is private. Its
@@ -2794,11 +2775,6 @@ fn the_acquire_window_backs_out() {
 // same reason `CLAIM_WINDOW_HOOK` exists — `Live` and `Unknown` are two
 // different reasons to collect nothing, and neither a count nor a grant can
 // tell them apart.
-//
-// Real processes, as everywhere else in this file: the two facts the predicate
-// is made of — that a `SIGSTOP`ped process keeps its lock byte and a `SIGKILL`ed
-// one loses it without cooperating — are the kernel's, and neither is stageable
-// in one process.
 
 /// The rendezvous lock file the predicate probes, for a scratch directory.
 ///
@@ -2943,8 +2919,7 @@ fn await_stopped(pid: u32) {
 fn a_stopped_participant_is_live_to_the_reclamation_predicate() {
     let scratch = Scratch::new("verdict-stopped");
 
-    // Slots are handed out in join order and each join is awaited before the
-    // next begins, so these numbers are determined rather than hoped for:
+    // Join order determines these, each join awaited before the next begins:
     // owner 0, this process 1, the target 2.
     let mut owner = Kid::spawn(&scratch.0, &["own"]);
     assert!(owner.line().starts_with("owning "), "owner did not start");
@@ -2989,8 +2964,6 @@ fn a_stopped_participant_is_live_to_the_reclamation_predicate() {
             .is_ok_and(|s| s.success()),
         "could not SIGSTOP the target"
     );
-    // Load-bearing: `kill` returning means the signal was queued, and this is
-    // what makes the rest of the test a measurement of a *stopped* process.
     await_stopped(pid);
     assert_eq!(
         proc_state(pid),
@@ -3329,7 +3302,6 @@ fn a_free_word_is_decided_without_asking_the_kernel() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // `docs/decisions/0028` plan step 5 — `Tree::reap_participants`, and it is not
 // owner-only.
 //
@@ -3360,13 +3332,11 @@ fn state_word(tree: &tf_tree::Tree, slot: u32) -> u32 {
 /// the case no hangup can ever cover.**
 ///
 /// This is `docs/decisions/0028` plan step 5's stated verification, and the
-/// target is the owner deliberately. #191's socket-hangup callback collects a
-/// killed **joiner's** record within milliseconds, so a test that killed one
-/// would be racing the owner's own fast path. Nothing hangs up on the owner:
-/// it registers itself, no socket of its own closes, and `epoll` has nothing to
-/// report — candidate B's hole 3, *"the owner's own slot leaks
-/// unconditionally"*. Its record stays `LIVE` over a byte the kernel released,
-/// for the life of the segment, and that is #184's wedge. A sweep by a
+/// target is the owner deliberately, for the reason
+/// `a_killed_participants_slot_is_reclaimable_to_the_reclamation_predicate`
+/// gives: nothing hangs up on an owner — candidate B's hole 3, *"the owner's own
+/// slot leaks unconditionally"* — so its record is the one that stays `LIVE`
+/// over a released byte for the life of the segment, #184's wedge. A sweep by a
 /// *survivor* is the only thing that collects it, which is what makes
 /// `PHASE2.md` §6.3's "reaping must not be owner-only" a property of the code
 /// rather than a sentence in a spec.
@@ -3384,9 +3354,8 @@ fn state_word(tree: &tf_tree::Tree, slot: u32) -> u32 {
 /// reclamation, not rejoin. A harness that conflated the two would report a
 /// §3.5 gap as a reclamation failure.
 ///
-/// `Kid::kill` waits, and after `wait` returns the kernel has torn the owner's
-/// descriptors down — so no polling and no sleep: unlike #191's asynchronous
-/// callback, this sweep runs in *this* process when it is called.
+/// No polling and no sleep: `Kid::kill` waits, and unlike #191's asynchronous
+/// callback this sweep runs in *this* process when it is called.
 ///
 /// Mutants, all applied to `Tree::reap_participants` and all measured:
 ///
@@ -3431,9 +3400,8 @@ fn a_survivor_reaps_the_killed_owners_slot_which_no_hangup_can() {
     let sweeper = join_as_sweeper();
     assert_eq!(sweeper.participant_slot(), 1, "the sweeper took slot 1");
 
-    // `0x6` is `live_word(1)`: the owner registered into a fresh record, so its
-    // incarnation is 1. Asserted as a word rather than as a state, because it
-    // is the word `reclaim` CASes against.
+    // `0x6` is `live_word(1)`, asserted as a word rather than a state because
+    // that is what `reclaim` CASes against.
     assert_eq!(
         state_word(&sweeper, 0),
         0x6,
@@ -4088,9 +4056,8 @@ fn a_live_holder_that_proc_calls_dead_keeps_the_topology_lock() {
 /// This is the property that makes the byte an improvement rather than a second
 /// thing to get stuck on: A2's lock became a kernel lock, so a holder that dies
 /// for any reason has it released by the kernel with no cooperation, no timeout
-/// and nothing running on its behalf. A thread cannot stage it — `SIGKILL`
-/// applies to a process, and an inherited descriptor would share the parent's
-/// open file description and make the contention vacuous.
+/// and nothing running on its behalf. A thread cannot stage it: `SIGKILL`
+/// applies to a process.
 ///
 /// **The `owner_slot: None` is the point of the first assertion, not an
 /// artefact.** The child holds the byte and has published no slot into the arena
@@ -4622,7 +4589,7 @@ fn two_survivors_race_and_exactly_one_inherits() {
         "survivor B's slot moved: {b_joined} -> {rb}"
     );
 
-    // And the arena is joinable again, which is the point of any of it.
+    // And the arena is joinable again.
     tf_tree::Open::new()
         .mode(AttachMode::ReadWrite)
         .create(CreatePolicy::Never)
@@ -4965,9 +4932,9 @@ fn a_creator_killed_before_or_after_the_arena_exists_leaves_nothing_behind() {
 /// site and no test were both in the list with no completeness check. That is
 /// not a coincidence — it is the loophole.
 ///
-/// **It pins index to name, not just the set**, and that is the whole point.
-/// The facade arms its sites *by index* — `CRASH_SITES[0]` at `open.rs`'s
-/// takeover, `[1]` at `tree.rs`'s topology lock, `[4]` at `reap_participants`,
+/// **It pins index to name, not just the set.** The facade arms its sites *by
+/// index* — `CRASH_SITES[0]` at `open.rs`'s takeover, `[1]` at `tree.rs`'s
+/// topology lock, `[4]` at `reap_participants`,
 /// `[5]` at the hangup callback — so a set-equality assertion would still pass
 /// after somebody reordered the array, at which point `reap_participants` arms
 /// the *hangup* name and the hangup callback arms the *reclaim* name. Every
@@ -5259,7 +5226,6 @@ fn a_killed_heir_leaves_the_role_for_the_next_survivor() {
         .expect("after the heir's death and the next survivor's takeover, a joiner must succeed");
 }
 
-// ---------------------------------------------------------------------------
 // `docs/PHASE2.md` §11.2 — the required integration scenarios.
 //
 // §11.2 asks for a `tf_tree_test_harness` that "spawns real child processes
@@ -5268,7 +5234,6 @@ fn a_killed_heir_leaves_the_role_for_the_next_survivor() {
 // the scenarios are written against it rather than against a second harness
 // beside it — a second one would be a second spelling of this file's
 // infrastructure (`docs/PROJECT.md` §6).
-// ---------------------------------------------------------------------------
 
 /// Read a `uuid <hex>` line from an `open-uuid` child, or its refusal.
 ///

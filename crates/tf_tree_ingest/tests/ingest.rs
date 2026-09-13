@@ -2,9 +2,8 @@
 //! §11's "ingest anomalies" and "out-of-order ingest" rows.
 //!
 //! Every recording here is fabricated by [`tf_tree_ingest::fixture`]; none of it
-//! came off a robot. That module's docs say so at length, and so does this one:
-//! what is proved below is that *this crate* classifies a stream the way §3.2
-//! specifies, not that any real bag looks like these.
+//! came off a robot. What is proved below is that *this crate* classifies a
+//! stream the way §3.2 specifies, not that any real bag looks like these.
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 
@@ -74,11 +73,10 @@ fn pose(k: f64) -> [f64; 7] {
 /// of the surveyed count — applied, and this test failed on the `map -> odom`
 /// rate, which came back as the ring's contents rather than the source's.
 ///
-/// A second mutant was tried and **survived**, which is worth recording: dropping
-/// the `if rec.is_static` early-return in the pass-two callback is inert, because
-/// a static edge is never in any buffer group and the `buffers.get_mut` lookup
-/// misses. The early return is a short-circuit, not a guard, and nothing here
-/// depends on it.
+/// A second mutant **survived**: dropping the `if rec.is_static` early-return in
+/// the pass-two callback is inert, because a static edge is never in any buffer
+/// group and the `buffers.get_mut` lookup misses. The early return is a
+/// short-circuit, not a guard, and nothing here depends on it.
 #[test]
 fn small_recording_ingests() {
     let dir = Scratch::new("small");
@@ -130,11 +128,10 @@ fn small_recording_ingests() {
 /// comparison whose *values* matched and whose `EdgeId`s did not. That mutant is
 /// how the canonical-order requirement was found in the first place.
 ///
-/// **The `sort_by_key` stability is not guarded by *this* test**, and is not
-/// claimed to be: swapping it for `sort_unstable_by_key` leaves this one
-/// passing, because this fixture has no duplicate stamps for stability to decide
-/// between. It *is* guarded elsewhere in this file —
-/// `an_oversized_edge_spills_and_matches_the_in_memory_path` and
+/// **The `sort_by_key` stability is not guarded by *this* test**: swapping it for
+/// `sort_unstable_by_key` leaves this one passing, because this fixture has no
+/// duplicate stamps for stability to decide between. It *is* guarded elsewhere in
+/// this file — `an_oversized_edge_spills_and_matches_the_in_memory_path` and
 /// `a_reduce_pass_keeps_the_last_occurrence` both fail under that swap, because
 /// both carry duplicates and compare the in-memory path against the spill path.
 /// An earlier revision of this paragraph said no test in the file caught it,
@@ -262,8 +259,7 @@ fn duplicates_resolve_last_wins() {
     let msgs = vec![
         FixtureMessage::dynamic("odom", "base_link", 1_000_000_000, pose(0.5)),
         FixtureMessage::dynamic("odom", "base_link", 2_000_000_000, pose(1.0)),
-        // Same edge, same stamp, different value, later in the recording —
-        // three deep, so the run is longer than one lookahead.
+        // Same edge, same stamp, different value, later in the recording.
         FixtureMessage::dynamic("odom", "base_link", 2_000_000_000, pose(1.5)),
         FixtureMessage::dynamic("odom", "base_link", 2_000_000_000, pose(2.0)),
         FixtureMessage::dynamic("odom", "base_link", 3_000_000_000, pose(3.0)),
@@ -1219,16 +1215,15 @@ fn a_recording_cut_before_any_record_says_it_was_truncated() {
 /// It matters because the magic is now the *only* structural check on the file as
 /// a whole — everything downstream tolerates a short or damaged tail by design.
 ///
-/// **No mutant kills this, and the reason is worth stating rather than hiding.**
-/// Dropping the `magic != *mcap::MAGIC` comparison was applied and survived: the
-/// eight bytes are consumed either way, so a file that fails the comparison is
-/// also misaligned by eight bytes and fails downstream on a nonsense record length
-/// — the same `IngestError::Mcap`, reached by accident. The comparison's value is
-/// that the refusal is *immediate and unambiguous* instead of incidental, which is
-/// a diagnostic property this test cannot distinguish. What the test does pin is
-/// that a headless file is refused at all, which is not free: everything after the
-/// magic tolerates damage by design, so without a structural check somewhere this
-/// would read as a recording containing nothing.
+/// **No mutant kills this.** Dropping the `magic != *mcap::MAGIC` comparison was
+/// applied and survived: the eight bytes are consumed either way, so a file that
+/// fails the comparison is also misaligned by eight bytes and fails downstream on a
+/// nonsense record length — the same `IngestError::Mcap`, reached by accident. The
+/// comparison's value is that the refusal is *immediate and unambiguous* instead of
+/// incidental, which is a diagnostic property this test cannot distinguish. What
+/// the test does pin is that a headless file is refused at all, which is not free:
+/// everything after the magic tolerates damage by design, so without a structural
+/// check somewhere this would read as a recording containing nothing.
 #[test]
 fn a_recording_without_its_start_magic_is_refused() {
     let dir = Scratch::new("nomagic");
@@ -1321,9 +1316,7 @@ fn report_json_is_well_formed() {
 /// never compares across runs. A stride permutation spreads the whole range
 /// through every run, so the heap does the work. The same construction is why
 /// the reset threshold has to stand down here, for the reason
-/// `out_of_order_ingest_matches_ordered` states at length: a deliberately
-/// reordered file's stamp inversions are the length of the recording and are
-/// indistinguishable from a bag loop.
+/// `out_of_order_ingest_matches_ordered` states at length.
 ///
 /// Mutant: in `fill_spilled`, drop the trailing `if !buf.is_empty()` flush —
 /// applied, and this failed on `spilled_bytes` at 35 840 B against the 38 400 B
@@ -1419,9 +1412,7 @@ fn an_oversized_edge_spills_and_matches_the_in_memory_path() {
     // And the **exact** value, which pins the reported bound from below, so a
     // term dropped from that bound is caught. The reported number is a bound by
     // construction — nothing in this process measures an allocator — so the
-    // `<= cap` assertion above is only half of it: without a lower bound of some
-    // kind, deleting every `peak_buffer_bytes` update in `fill_spilled` —
-    // reporting zero for the whole spill path — passes.
+    // `<= cap` assertion above is only half of it.
     //
     // It is exact rather than `>= cap * 3 / 4` because the loose bound could not
     // see the term that matters. `spill_budget(8192)` is `staging = 1024` and
@@ -1504,8 +1495,7 @@ fn an_oversized_edge_spills_and_matches_the_in_memory_path() {
 /// (`testdata/rosbag2/`), not sixteen bytes of magic.
 ///
 /// Mutant: delete the `is_sqlite` call in `read_tf` — applied, and this failed
-/// with `Mcap` where it expects `Rosbag2Sqlite`, which is exactly the unhelpful
-/// message the check exists to replace.
+/// with `Mcap` where it expects `Rosbag2Sqlite`.
 #[test]
 fn a_rosbag2_sqlite3_bag_is_named_as_one() {
     let bag =
@@ -1823,9 +1813,8 @@ fn a_reduce_pass_keeps_the_last_occurrence() {
 /// applied, and this failed; the observed output is in the commit message.
 #[test]
 fn the_per_run_sort_is_stable_so_last_wins_inside_a_run() {
-    // `spill::spill_budget(65_536)`'s samples per run. Spelled as a literal
-    // because the constant is crate-private, and a test that recomputed it from
-    // the same expression would be checking nothing.
+    // `spill::spill_budget(65_536)`'s samples per run, spelled as a literal for
+    // the reason `a_reduce_pass_keeps_the_last_occurrence`'s `RUN` gives.
     //
     // **The run length is the load-bearing number and it had to be measured, not
     // reasoned about.** A first version of this test used a 2 048 B cap — a run of
@@ -1922,14 +1911,12 @@ fn the_per_run_sort_is_stable_so_last_wins_inside_a_run() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The hand-rolled, summary-free fixture and the corrupt-chunk skip policy.
 //
 // `fixture`'s module docs say why these cannot be written against a fixture from
 // `mcap::Writer`: it cannot produce a damaged chunk, and its summary section
 // repeats every Schema and Channel record, which makes a skipped definitions
 // chunk harmless and the caveat in `OnBadChunk`'s docs unreachable.
-// ---------------------------------------------------------------------------
 
 /// Nine messages, three per child frame, so a chunk of three makes "the second
 /// chunk's messages" exactly "the `sensor_b` edge".
@@ -2035,11 +2022,10 @@ fn damaged_chunk_span(messages: &[FixtureMessage], per_chunk: usize) -> (u64, u6
 /// would send the next reader to assert on `/tf`'s sample count — the one number
 /// the mutant zeroes.)
 ///
-/// **This is also the regression the codec work most risks**, which is why it is
-/// named rather than left as one of the crowd: the uncompressed path is now one
-/// branch of a `match` on the codec, and it must still be returned by borrow with no
-/// decoder anywhere near it. Mutant: `ChunkCodec::parse("")` → `Self::Other` —
-/// applied, and this failed with `the recording uses an unrecognised
+/// **This is also the regression the codec work most risks**: the uncompressed
+/// path is now one branch of a `match` on the codec, and it must still be returned
+/// by borrow with no decoder anywhere near it. Mutant: `ChunkCodec::parse("")` →
+/// `Self::Other` — applied, and this failed with `the recording uses an unrecognised
 /// codec-compressed chunks, which this build cannot read`. **42 of the crate's 94
 /// tests died with it**, which is the right shape for a one-line change to codec
 /// classification: every uncompressed chunk in every recording refused.
@@ -2072,8 +2058,7 @@ fn an_uncompressed_chunked_recording_still_ingests() {
     assert_eq!(b.report.samples_pushed, 160, "the fixture's own count");
     assert_eq!(b.report.static_edges, 2);
     assert_eq!(b.report.dynamic_edges, 3);
-    // Times as well as counts: the two writers must agree on *when* each edge was
-    // published, not merely on how much of it there was.
+    // Times as well as counts, for the reason `edge_time_rows` gives.
     assert_eq!(edge_time_rows(&b.report), edge_time_rows(&a.report));
     // Nothing about a summary-free file is anomalous, and the reader must not
     // mistake the absence of one for a truncation.
@@ -2105,12 +2090,11 @@ fn an_uncompressed_chunked_recording_still_ingests() {
 /// Mutant: in `read_chunk`, return the fault instead of calling `note_or_fail`
 /// (i.e. no skip policy at all) — applied, and this failed with "chunk 1 is
 /// unreadable: its CRC32 is 0x91c0fdca but the data hashes to 0x77cb8a16": the
-/// whole recording lost to one bad chunk, which is the behaviour the policy exists
-/// to replace. Mutant 2: `break` out of `read_tf`'s record loop once
-/// `skips.bad_chunks > 0` — applied, and the edge rows came back as
-/// `[("base_link", "sensor_a", 3)]` alone: a skip that silently ends the read costs
-/// everything after the fault while still reporting exactly one bad chunk, which is
-/// the failure this test's *third* chunk exists to catch.
+/// whole recording lost to one bad chunk. Mutant 2: `break` out of `read_tf`'s
+/// record loop once `skips.bad_chunks > 0` — applied, and the edge rows came back
+/// as `[("base_link", "sensor_a", 3)]` alone: a skip that silently ends the read
+/// costs everything after the fault while still reporting exactly one bad chunk,
+/// which is the failure this test's *third* chunk exists to catch.
 #[test]
 fn one_corrupt_chunk_does_not_lose_the_recording() {
     let dir = Scratch::new("chunk_skip");
@@ -2455,8 +2439,7 @@ fn a_mislabelled_codec_is_damage_not_an_unsupported_codec() {
 ///
 /// It is the caveat [`OnBadChunk`]'s doc comment promises the report will surface,
 /// and it is only constructible because the hand-rolled writer emits **no summary
-/// section** — with one, the `Channel` record is repeated at the end of the file
-/// and the loss does not happen.
+/// section**.
 ///
 /// The control matters as much as the case: the same layout *undamaged* ingests the
 /// six messages that follow the definitions, and drops the three that precede them
@@ -2625,12 +2608,12 @@ fn a_lying_uncompressed_size_is_refused() {
 /// fix to the symptom: the counter has to distinguish a ceiling from damage, and
 /// the error has to be the one that names a flag.
 ///
-/// Mutant: drop the `chunks_over_limit > 0` arm from `ingest::fill`'s
-/// empty-edges branch — applied, and this failed with `NoTransforms`, which is
-/// exactly the diagnosis it exists to prevent. Mutant 2: count every skipped chunk
-/// in `chunks_over_limit` rather than only the two limit kinds — applied, and
-/// `a_lying_uncompressed_size_is_refused` fails, because a chunk with a rewritten
-/// header would then be reported as one this reader declined to allocate for.
+/// Mutant: drop the `chunks_over_limit > 0` arm from `ingest::fill`'s empty-edges
+/// branch — applied, and this failed with `NoTransforms`. Mutant 2: count every
+/// skipped chunk in `chunks_over_limit` rather than only the two limit kinds —
+/// applied, and `a_lying_uncompressed_size_is_refused` fails, because a chunk with
+/// a rewritten header would then be reported as one this reader declined to
+/// allocate for.
 ///
 /// **The fixture has to be compressed**, and that is the guards' design rather than
 /// a convenience: `chunk_records` returns an uncompressed chunk by borrow and
@@ -2715,7 +2698,6 @@ fn damage_is_not_counted_as_a_ceiling_refusal() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Compressed recordings — the case rosbag2 and Foxglove actually write.
 //
 // Every fixture below is compressed by the same crates that read it back, which
@@ -2726,7 +2708,6 @@ fn damage_is_not_counted_as_a_ceiling_refusal() {
 // hand from the LZ4 format, which no encoder in this dependency tree produced. The
 // asymmetry that remains is one of *scope*: zstd's evidence is a whole recording and
 // lz4's is one frame. `testdata/ATTRIBUTION.md` states it exactly.
-// ---------------------------------------------------------------------------
 
 /// **A zstd recording ingests byte-for-byte identically to the uncompressed one.**
 ///
@@ -2949,12 +2930,11 @@ fn a_truncated_compressed_recording_is_truncated_not_corrupt() {
 /// the uncompressed equivalent.**
 ///
 /// Every other compressed fixture in this repository is encoded by `ruzstd`, the
-/// same crate that decodes it. That proves round-trip and **not** conformance: an
-/// encoder and a decoder from one crate can agree with each other and both
-/// disagree with the zstd that rosbag2 links. `testdata/zstd_conformance.mcap`'s
-/// chunk payloads were produced by the `zstd` CLI, version 1.5.5, i.e. by libzstd
-/// itself; `testdata/ATTRIBUTION.md` records the command line and
-/// `examples/gen_zstd_conformance.rs` regenerates it.
+/// same crate that decodes it: an encoder and a decoder from one crate can agree
+/// with each other and both disagree with the zstd that rosbag2 links.
+/// `testdata/zstd_conformance.mcap`'s chunk payloads were produced by the `zstd`
+/// CLI, version 1.5.5, i.e. by libzstd itself; `testdata/ATTRIBUTION.md` records
+/// the command line and `examples/gen_zstd_conformance.rs` regenerates it.
 ///
 /// **A missing file fails loudly.** A `#[ignore]` or an early `return` here would
 /// leave the only conformance evidence in the repository silently unchecked, which

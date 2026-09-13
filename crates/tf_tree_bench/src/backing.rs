@@ -12,15 +12,12 @@
 //! 1. the call crosses a shared-library boundary the linker cannot see across;
 //! 2. the arena is a `MAP_SHARED` `memfd` rather than a private heap allocation.
 //!
-//! **The answer turned out to be neither of them** — see the ladder below. This
-//! module measures rung 2 (and, with [`measure_attached`], the cross-process
-//! rung), which is what made the elimination possible; the culprit is the C
-//! ABI's per-call `Guard`.
+//! **The answer turned out to be neither of them** — see the ladder below; the
+//! culprit is the C ABI's per-call `Guard`.
 //!
 //! `tf2.md` argued from a neighbouring row that it is not the mapping, and
-//! called that *an argument rather than a measurement*. It is worth being
-//! specific about why, because there are two priors and **both have a defect
-//! that points the same way**:
+//! called that *an argument rather than a measurement*. There are two such
+//! priors and **both have a defect that points the same way**:
 //!
 //! - **`mp_bench` 213 ns against `cost_model` 217 ns** (`tf2.md`, "there is no
 //!   penalty for the arena being shared"). Two different harnesses, in two
@@ -138,10 +135,10 @@ const ARENA: &str = "tf_tree_bench_backing";
 ///
 /// **Byte-identical to `ratio::stamp_ns`'s construction, deliberately.**
 /// `NOW_NS` is an exact multiple of all four dynamic periods, so a sweep
-/// anchored on it takes `SampleRing::sample`'s exact-hit branch and measures
-/// `bracket` plus a seqlock read — the defect `docs/decisions/0013` is about.
-/// Reintroducing it here would silently make *both* arms measure the cheap path,
-/// and since the quotient would still look plausible nothing would say so.
+/// anchored on it takes `SampleRing::sample`'s exact-hit branch — the defect
+/// `docs/decisions/0013` is about. Reintroducing it here would silently make
+/// *both* arms measure the cheap path, and the quotient would still look
+/// plausible, so nothing would say so.
 const fn stamp_ns(i: i64) -> i64 {
     crate::fixture::NOW_NS - 3_700_000 - i * 9_631
 }
@@ -211,13 +208,12 @@ impl Run {
     /// observed band.
     ///
     /// This is the number that actually answers `tf2.md`'s question, and it is
-    /// available whether or not [`Run::resolved`] could fix the sign — which
-    /// matters, because on this host the sign frequently cannot be fixed while
-    /// the bound stays tight. Runs measured at 1.4 ns and 2.2 ns with bands
-    /// reaching 1.0227x and 1.0476x: the point estimate flickers in and out of
-    /// significance, the bound does not move much, and the bound is what the
-    /// decomposition needs. "At most this" is a real finding when the residue is
-    /// two orders of magnitude larger.
+    /// available whether or not [`Run::resolved`] could fix the sign. Runs
+    /// measured at 1.4 ns and 2.2 ns with bands reaching 1.0227x and 1.0476x:
+    /// the point estimate flickers in and out of significance, the bound does
+    /// not move much, and the bound is what the decomposition needs. "At most
+    /// this" is a real finding when the residue is two orders of magnitude
+    /// larger.
     ///
     /// Taken from `ratio_hi` against the heap median, and floored at zero: a
     /// band lying entirely under 1.0 means the shared mapping was never observed
@@ -301,10 +297,10 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
 
     // **The two arenas must agree before either is timed**, for `ratio.rs`'s
     // reason and then a stronger one: this is the *same engine on both sides*,
-    // fed the same deterministic fixture, so the two answers are not merely
-    // close — they are the same arithmetic on the same inputs. Any difference at
-    // all means the two arenas were not populated identically, which would make
-    // the quotient a comparison of two different query sets.
+    // fed the same deterministic fixture, so the two answers are the same
+    // arithmetic on the same inputs. Any difference at all means the arenas were
+    // not populated identically, which would make the quotient a comparison of
+    // two different query sets.
     //
     // Hence a tolerance of 1e-15 rather than `ratio.rs`'s 1e-9: that module is
     // comparing two independent implementations and has to allow for them, and
@@ -650,8 +646,7 @@ pub fn measure_guard_cost_between(
     let mut h_ns = Vec::with_capacity(rounds);
     let mut p_ns = Vec::with_capacity(rounds);
     for r in 0..rounds {
-        // Alternate the leading arm, for the reason the rest of this module
-        // does: a fixed order hands one arm the colder cache every round.
+        // Alternate the leading arm, for the reason the rest of this module does.
         let (h, p) = if r % 2 == 0 {
             let t0 = std::time::Instant::now();
             let _ = hoisted();
@@ -798,12 +793,9 @@ pub fn guard_cost_both(
 /// `crates/tf_tree_c/examples/abi_cost.rs` builds, and the one whose R3 row
 /// `docs/decisions/0023` §7 gates.
 ///
-/// It exists here so the toy fixture and the §11.1 one can be measured **in one
-/// binary, one profile, interleaved**, which is the measurement `0023` open
-/// question 3 names as the thing that would make its recommendation airtight.
-/// Two arrays of 256 stamps are 2 KiB each and sit wholly in L1d on this host;
-/// §11.1's 1 kHz edge searches 128 KiB, which is 4x it. That contrast is the
-/// whole hypothesis.
+/// It exists for [`guard_cost_fixture_pair`]. Two arrays of 256 stamps are 2 KiB
+/// each and sit wholly in L1d on this host; §11.1's 1 kHz edge searches 128 KiB,
+/// which is 4x it. That contrast is the whole hypothesis.
 fn build_three_edge_tree() -> Result<Tree> {
     let cfg = tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(256));
     let mount = tf_tree_math::exp_se3([0.3, -0.7, 0.2, 0.11, -0.05, 0.37]);
@@ -998,9 +990,7 @@ mod tests {
     }
 
     /// The **bound** survives an unresolved sign, which is the whole reason it
-    /// exists: on this host the point estimate flickers in and out of
-    /// significance run to run while the bound stays put, and the bound is what
-    /// the decomposition subtracts against.
+    /// exists.
     ///
     /// Mutant: make `backing_ns_bound` return `0.0` when `resolved()` is `None`
     /// — i.e. gate it the way `backing_ns` is gated. This test then reads 0.0
@@ -1016,9 +1006,8 @@ mod tests {
     /// A band lying entirely below 1.0 bounds the cost at zero rather than
     /// reporting a negative one.
     ///
-    /// A negative upper bound on a cost reads as a *guaranteed saving*, which is
-    /// a stronger claim than a band can support and would be published as one by
-    /// the subtraction in `arena_backing`.
+    /// A negative one would be published as a guaranteed saving by the
+    /// subtraction in `arena_backing`.
     ///
     /// Mutant: drop the `.max(0.0)` — this yields -4.0 and fails.
     #[test]

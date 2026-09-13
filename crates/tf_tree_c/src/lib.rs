@@ -108,9 +108,7 @@ pub use unstable::{
 
 use error::{amend_error, guard, record_lookup, set_error};
 
-// ---------------------------------------------------------------------------
 // ABI version — §3.6
-// ---------------------------------------------------------------------------
 
 /// Major ABI version. **Must match exactly** between the header a caller
 /// compiled against and the library it links.
@@ -144,14 +142,13 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// `3` → `4`: two appended entry points, [`tft_stamp_from_parts`] and
 /// [`tft_stamp_from_timespec`] (`docs/API.md` §5.1), and the one status code
 /// they can return, [`TFT_ERR_BAD_STAMP`]. **This is the additive case §3.6's
-/// rule is for, and it is worth stating why a new *function* is a minor bump
-/// rather than no bump at all**: the minor is exactly the number a caller
-/// compares to find out whether the symbols its header declares are present in
-/// the library it linked. Adding a symbol without moving it would let a caller
-/// compiled against this header link against a `0.3` library, pass
-/// `tft_check_abi`, and then fail at the dynamic loader — or, on a static link,
-/// not build. Nothing existing moved, changed type or changed meaning, so the
-/// major does not move.
+/// rule is for, and why a new *function* is a minor bump rather than no bump at
+/// all**: the minor is exactly the number a caller compares to find out whether
+/// the symbols its header declares are present in the library it linked. Adding
+/// a symbol without moving it would let a caller compiled against this header
+/// link against a `0.3` library, pass `tft_check_abi`, and then fail at the
+/// dynamic loader — or, on a static link, not build. Nothing existing moved,
+/// changed type or changed meaning, so the major does not move.
 ///
 /// `TFT_ERR_BAD_STAMP` rides along for the reason its own documentation gives:
 /// only the two new functions return it, so a `0.3` caller cannot receive a
@@ -175,11 +172,9 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 ///
 /// `5` → `6`: one appended entry point, [`tft_plan_create_in_domain`]
 /// (`docs/decisions/0038`). It is `3` → `4`'s case exactly — a new *symbol*, so
-/// the minor has to move or a caller compiled against this header links a `0.5`
-/// library, passes `tft_check_abi`, and then fails at the loader. Nothing
-/// moved, changed type or changed meaning: [`tft_plan_create`] keeps its
-/// signature and its meaning, which `0038` defines as this function with
-/// `domain = 0`.
+/// the minor has to move. Nothing moved, changed type or changed meaning:
+/// [`tft_plan_create`] keeps its signature and its meaning, which `0038`
+/// defines as this function with `domain = 0`.
 ///
 /// **What a `0.5` caller can observe is a refusal arriving earlier**, and only
 /// on an arena where it was already receiving that refusal. On a tree whose
@@ -193,18 +188,13 @@ pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
 /// `6` → `7`: one appended entry point, [`tft_plan_at_extrapolating`], with
 /// the two values it needs — [`tft_extrap_policy`] and [`tft_extrapolated`]
 /// (`docs/decisions/0039`). A new *symbol*, so `3` → `4`'s argument applies
-/// unchanged: the minor is what a caller compares to find out whether the
-/// symbols its header declares are present in the library it linked, and
-/// without the bump a caller compiled against this header links a `0.6`
-/// library, passes [`tft_check_abi`], and then fails at the loader.
+/// unchanged.
 ///
 /// **No existing declaration moves, and no status code is added.** The
 /// refusal a caller can now ask *not* to receive, [`TFT_ERR_EXTRAPOLATION`],
 /// has been in this header since 1.0 — which is what keeps this bump smaller
 /// than `4` → `5`'s: there is no code an older caller could be handed and
-/// could not name. [`tft_plan_at`] keeps its signature and its meaning; it
-/// refuses, as it always has, and this function with [`TFT_EXTRAP_ERROR`] is
-/// that same refusal with a distance attached on success.
+/// could not name. [`tft_plan_at`] keeps its signature and its meaning.
 ///
 /// **A `0.6` caller can observe nothing at all.** Unlike `5` → `6`, which
 /// moved a refusal earlier on arenas that were already failing, nothing here
@@ -297,9 +287,7 @@ pub extern "C" fn tft_check_abi(compiled_major: u32, compiled_minor: u32) -> tft
     })
 }
 
-// ---------------------------------------------------------------------------
 // Stamps — `docs/API.md` §5.1
-// ---------------------------------------------------------------------------
 
 /// Assemble a stamp from a `(sec, nanos)` pair, exactly — `docs/API.md` §5.1.
 ///
@@ -408,9 +396,7 @@ fn bad_stamp(sec: i64, nanos: i64) -> tft_status {
     TFT_ERR_BAD_STAMP
 }
 
-// ---------------------------------------------------------------------------
 // Handles — §3.2
-// ---------------------------------------------------------------------------
 
 /// Magic words. Distinct per type, so passing a `tft_plan*` where a `tft_tree*`
 /// is expected is caught rather than followed into a type confusion.
@@ -438,13 +424,8 @@ pub struct tft_tree {
 
 /// An opaque handle to a compiled plan. `Send + Sync`, immutable.
 ///
-/// `#[repr(C)]` for the same reason as [`tft_tree`].
-/// **The generated header declares this as an incomplete type.** §3.2 says these
-/// are opaque handles, and a C caller who can see the fields can dereference
-/// them. `cbindgen`'s `cbindgen:opaque` annotation does not take effect on this
-/// shape, so `xtask headers` excludes the type and emits the forward
-/// declaration itself — which also satisfies §3.1's requirement that the stable
-/// header be reviewed by hand rather than merely generated.
+/// `#[repr(C)]`, and an incomplete type in the generated header, both for
+/// [`tft_tree`]'s reasons.
 #[repr(C)]
 pub struct tft_plan {
     magic: u64,
@@ -514,8 +495,7 @@ pub(crate) struct TreeShare {
 /// `addr_of!` is used rather than `&(*p).magic` so no reference to a
 /// possibly-invalid handle is ever created.
 ///
-/// **This is not a validator for arbitrary memory** — see the module docs. It
-/// cannot be: an out-of-bounds read stays out of bounds however it is spelled.
+/// **This is not a validator for arbitrary memory** — see the module docs.
 macro_rules! magic_check {
     ($name:ident, $ty:ty, $magic:expr) => {
         /// # Safety
@@ -559,9 +539,7 @@ pub(crate) fn tree_handle(share: Arc<TreeShare>) -> Box<tft_tree> {
     })
 }
 
-// ---------------------------------------------------------------------------
 // Lifecycle — §3.2
-// ---------------------------------------------------------------------------
 
 /// Join the running arena named by the environment, read-only.
 ///
@@ -761,16 +739,10 @@ pub unsafe extern "C" fn tft_plan_create_in_domain(
         };
         match h.share.tree.plan(tf, sf) {
             Ok(plan) => {
-                // The whole point of validating here rather than per lookup:
-                // `t` and `s` are the names the caller typed, and after this
-                // function returns nothing on either side of the ABI has them.
-                //
-                // `Plan::has_dynamic` is private, and `plan.domain()` alone
-                // cannot stand in for it — it is `0` both for "all static" and
-                // for "dynamic, tag 0". So reconstruct the engine's own
-                // predicate from `steps()`, which is public and whose `Step`
-                // is deliberately not `#[non_exhaustive]` for exactly this
-                // ("which edges does this plan sample?"). Scanning at most
+                // `Plan::has_dynamic` is private, so reconstruct the engine's
+                // own predicate from `steps()`, which is public and whose
+                // `Step` is deliberately not `#[non_exhaustive]` for exactly
+                // this ("which edges does this plan sample?"). Scanning at most
                 // MAX_DEPTH steps once per plan is off the hot path; getting
                 // the condition merely *close* is not, in either direction —
                 // see this function's *Errors*.
@@ -827,9 +799,7 @@ pub unsafe extern "C" fn tft_plan_free(plan: *mut tft_plan) {
     drop(unsafe { Box::from_raw(plan) });
 }
 
-// ---------------------------------------------------------------------------
 // Hot path — §3.7
-// ---------------------------------------------------------------------------
 
 /// Evaluate `plan` at `stamp`, writing the result into `out` in `layout`.
 ///
@@ -942,8 +912,7 @@ pub unsafe extern "C" fn tft_plan_at(
 /// `tft_plan_create`, and `out` must point to at least the layout's payload size
 /// in writable bytes. **Unlike `tft_plan_at` it does not catch unwinds**, so a
 /// panic crossing this boundary is undefined behaviour rather than
-/// `TFT_ERR_INTERNAL`. That is the whole point, and it is why this is not a
-/// shipped entry point.
+/// `TFT_ERR_INTERNAL`.
 #[cfg(feature = "test-hooks")]
 #[no_mangle]
 pub unsafe extern "C" fn tft_test_plan_at_unguarded(
@@ -1008,11 +977,10 @@ pub unsafe extern "C" fn tft_test_plan_at_unguarded(
 ///
 /// # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
 ///
-/// Accepted here as it is by [`tft_plan_at`], and with the same meaning: each
-/// element is thirteen `f64`, pose then body twist, evaluated with derivatives.
-/// `TFT_ERR_NO_DERIVATIVES` is a property of an *edge*, so it fires on the
-/// first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT` depends
-/// on the stamp and can fire part-way through.
+/// Accepted here as it is by [`tft_plan_at`], and with the same meaning, per
+/// element. `TFT_ERR_NO_DERIVATIVES` is a property of an *edge*, so it fires on
+/// the first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT`
+/// depends on the stamp and can fire part-way through.
 ///
 /// **Sort your stamps.** This layout is evaluated by the engine's batch fold,
 /// which rides a resumable cursor per plan step when the stamps are
@@ -1272,9 +1240,7 @@ pub extern "C" fn tft_layout_size(layout: tft_layout) -> usize {
     layout::payload_bytes(layout).unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------
 // Extrapolation — `docs/decisions/0039`
-// ---------------------------------------------------------------------------
 
 /// What to do when the requested stamp is newer than every published sample on
 /// the route.
@@ -1310,10 +1276,9 @@ pub const TFT_EXTRAP_CONSTANT_TWIST: tft_extrap_policy = 2;
 /// `policy` as the engine's enum, or `None` for a discriminant this build does
 /// not define.
 ///
-/// `None` rather than a default for the reason [`layout::payload_bytes`] gives:
-/// a caller compiled against a newer header must be refused, not quietly served
-/// a different policy than the one it named — and the two policies differ in
-/// what the answer *is*, not in how it is formatted.
+/// `None` rather than a default, for [`layout::payload_bytes`]'s reason — and
+/// here the policies differ in what the answer *is*, not in how it is
+/// formatted.
 fn extrap_policy(policy: tft_extrap_policy) -> Option<tf_tree::ExtrapPolicy> {
     Some(match policy {
         TFT_EXTRAP_ERROR => tf_tree::ExtrapPolicy::Error,
@@ -1368,12 +1333,8 @@ pub struct tft_extrapolated {
 }
 
 impl tft_extrapolated {
-    /// A well-formed "not extrapolated" value, with `struct_size` already set.
-    ///
-    /// `edge` is [`TFT_INVALID_ID`] rather than `0`, because that is what this
-    /// header already means by *"this field does not apply"* and `by_ns == 0`
-    /// is exactly that case — a zeroed value would hand a caller a plausible
-    /// edge id for an answer that was never extrapolated.
+    /// A well-formed "not extrapolated" value, with `struct_size` already set
+    /// and `edge` the sentinel [`Self::edge`] argues for.
     ///
     /// **Public because the alternative is `unsafe { core::mem::zeroed() }` at
     /// every caller**, which is the spelling `docs/decisions/0048` deletes.
@@ -1528,9 +1489,7 @@ pub unsafe extern "C" fn tft_plan_at_extrapolating(
     })
 }
 
-// ---------------------------------------------------------------------------
 // Test-only panic hook — §6.1
-// ---------------------------------------------------------------------------
 
 /// A guarded entry point that does nothing, for measuring what `guard` costs.
 ///
@@ -1566,12 +1525,11 @@ pub extern "C" fn tft_test_panic() -> tft_status {
 ///
 /// `tft_test_panic` proves the crate's status-returning guard converts a panic
 /// into `TFT_ERR_INTERNAL`. That guard cannot cover boundaries returning a count
-/// or a size, because those
-/// have nowhere to put a status — and until `guard_value` existed they carried
-/// no guard at all, which is the gap §6's "on every `extern \"C\"` boundary"
-/// checkbox names. This is the shape of `tft_tree_frame_count` and
-/// `tft_tree_edge_count`: panic inside, and the caller sees the fallback rather
-/// than losing the process.
+/// or a size, because those have nowhere to put a status — and until
+/// `guard_value` existed they carried no guard at all, which is the gap §6's
+/// "on every `extern \"C\"` boundary" checkbox names. This is the shape of
+/// `tft_tree_frame_count` and `tft_tree_edge_count`: panic inside, and the
+/// caller sees the fallback rather than losing the process.
 ///
 /// # Safety
 ///
@@ -1786,8 +1744,7 @@ pub unsafe extern "C" fn tft_test_domain_tree_create(
                 return TFT_ERR_INTERNAL;
             }
         }
-        // Held for the life of the tree, as the other fixtures do: a released
-        // claim would let a lookup race a reaper.
+        // Held for the life of the tree, as the other fixtures do.
         core::mem::forget(w);
         let h = Box::new(tft_tree {
             magic: MAGIC_TREE,
@@ -1850,9 +1807,7 @@ pub unsafe extern "C" fn tft_test_publishable_tree_create(out: *mut *mut tft_tre
     })
 }
 
-// ---------------------------------------------------------------------------
 // Small helpers, so every entry point reports failures identically
-// ---------------------------------------------------------------------------
 
 pub(crate) fn bad_handle(what: &str) -> tft_status {
     set_error(

@@ -269,11 +269,10 @@ pub struct IngestOptions {
     ///
     /// [`max_chunk_uncompressed_bytes`]: IngestOptions::max_chunk_uncompressed_bytes
     pub max_record_bytes: u64,
-    /// Ceiling on one chunk's `uncompressed_size / compressed_size`. Defaults to
-    /// [`DEFAULT_MAX_CHUNK_EXPANSION_RATIO`].
-    ///
-    /// The second half of the decompression-bomb guard; the absolute ceiling
-    /// above cannot do this job on its own.
+    /// Ceiling on one chunk's `uncompressed_size / compressed_size` — the second
+    /// half of the decompression-bomb guard. Defaults to
+    /// [`DEFAULT_MAX_CHUNK_EXPANSION_RATIO`], whose doc says why the absolute
+    /// ceiling cannot do the job alone.
     pub max_chunk_expansion_ratio: u64,
     /// Where §3.1's spill file goes when one edge alone exceeds
     /// [`max_memory_bytes`](IngestOptions::max_memory_bytes). `None` means
@@ -736,17 +735,11 @@ pub fn survey(
                     offered,
                     first_time,
                 } => {
-                    // First writer wins, matching the bridge's default
-                    // authority policy.
                     out.anomalies.static_conflicts += 1;
-                    // **And both values are kept, which the count cannot carry.**
-                    // §3.2's row is "report both values", and §5.7's whole point
-                    // is that the operator's next move is to work out which of two
-                    // URDFs is installed. `first_time` is `StaticStore`'s own
-                    // rate limit: `/tf_static` is latched, so the same
-                    // contradiction re-arrives for every late joiner and an
-                    // unfiltered push would grow this vector with the recording's
-                    // length rather than with its topology.
+                    // **And both values are kept, which the count cannot carry**
+                    // (§3.2 "report both values", §5.7). `first_time` is
+                    // `StaticStore`'s own rate limit; see `StaticConflict` for why
+                    // both the pair and the filter are needed.
                     if first_time {
                         out.static_conflict_details.push(StaticConflict {
                             parent,
@@ -774,13 +767,10 @@ pub fn survey(
         }
 
         // **The edge kind is a property of the slot the lookup above already
-        // resolved**, so it is read from there rather than re-probed by name.
-        // `StaticStore::observe_dynamic` is two `BTreeMap<String, _>` descents —
-        // ~ten `str` comparisons — and it ran on *every* dynamic transform in the
-        // recording to answer a question an index answers in one load.
-        // `static_pose` is `Some` exactly when the store holds `Static` for this
-        // edge: `observe_static` inserts `Static` only on its `Declare` path, and
-        // `Declare` is the only arm that sets `static_pose`.
+        // resolved**, so it is read from there rather than re-probed by name (see
+        // `dynamic_seen`). `static_pose` is `Some` exactly when the store holds
+        // `Static` for this edge: `observe_static` inserts `Static` only on its
+        // `Declare` path, and `Declare` is the only arm that sets `static_pose`.
         if out.edges[slot].static_pose.is_some() {
             return Err(IngestError::EdgeKindChanged {
                 parent,
@@ -795,10 +785,8 @@ pub fn survey(
             return Ok(());
         }
         // `stamp - log_time`: the recorder's clock is the reference, because the
-        // header stamp cannot check itself. This is the offline twin of the
-        // online `stamp - received` offset — see the module docs' section on the
-        // reference clock — and it is the reason `log_time_ns` exists on
-        // [`RawRecord`] at all.
+        // header stamp cannot check itself — see the module docs' section on the
+        // reference clock. It is the reason `log_time_ns` exists on `RawRecord`.
         let ahead = rec.stamp_ns.saturating_sub(rec.log_time_ns);
         if ahead > opts.future_horizon_ns {
             out.anomalies.future_stamps += 1;
@@ -841,13 +829,10 @@ pub fn survey(
         Ok(())
     })?;
 
-    // **Two fields, and the summary's single line is the sum of them.** A
-    // TF-schema channel this build cannot decode is skipped for a *different*
-    // reason than one the topic filter excluded, so the report's one "channels
-    // were skipped" line has to account for either or it under-reports silently
-    // — that argument is unchanged and lives in `IngestReport::summary`. What
-    // changed on 2026-09-06 is that the sum was also the only thing the JSON
-    // carried, under a key naming one of its two terms.
+    // **Two fields, and the summary's single line is the sum of them.** The two
+    // are skipped for different reasons, so that one "channels were skipped" line
+    // has to account for either or it under-reports silently — that argument
+    // lives in `IngestReport::summary`.
     out.anomalies.filtered_channels = skips.filtered_channels;
     out.anomalies.non_cdr_channels = skips.non_cdr;
     out.anomalies.truncated = skips.truncated;
@@ -978,14 +963,12 @@ pub struct FillStats {
 /// | The spill path's run index | 16 B per sorted run | **No** — reported as [`FillStats::peak_run_index_bytes`] |
 ///
 /// The third row is the one that was missing, and it was missing from the
-/// *budget* as well as from this table: `slice::sort_by_key` is stable and
-/// therefore allocates, the scratch is a sample buffer like the others, and it
-/// is live while every buffer this group has not drained yet is still held. The
-/// cap was overrun by up to 1.95× — measured, with a counting allocator, at
-/// every cap including the 4 GiB default. `plan_groups` reserves for it now
-/// and [`FillStats::peak_buffer_bytes`] reports it; the cost is that a group
-/// holds one edge fewer, and that an edge over half the cap takes the spill
-/// path.
+/// *budget* as well as from this table — `plan_groups`'s reserve section has the
+/// mechanism. The cap was overrun by up to 1.95× — measured, with a counting
+/// allocator, at every cap including the 4 GiB default. `plan_groups` reserves
+/// for it now and [`FillStats::peak_buffer_bytes`] reports it; the cost is that
+/// a group holds one edge fewer, and that an edge over half the cap takes the
+/// spill path.
 ///
 /// The arena is not capped because it *cannot* be: it is the output. Every
 /// sample the recording contains has to be resident in it for the index to
@@ -1004,8 +987,7 @@ pub struct FillStats {
 /// saving is bounded by how finely the edges divide — three equal edges are one
 /// per group under the reserve, so this is close to the worst case — and it is
 /// paid for with two extra sequential re-reads. That is the trade §3.1 asks for,
-/// reached without a temporary run-file to leak, to fill a different filesystem,
-/// or to leave behind when the process is killed.
+/// reached without a temporary run file.
 ///
 /// **The 164 was 142 until the sort's scratch was counted**, and the capped 121
 /// did not move: two buffers of 1 920 000 B is the same peak as one buffer plus
@@ -1140,12 +1122,9 @@ pub fn fill(
 
         for (slot, mut buf) in buffers {
             let held = buf.len() as u64 * SAMPLE_BYTES;
-            // **The bound, not a measurement of the standard library.** A stable
-            // sort's auxiliary allocation is not part of `slice::sort_by_key`'s
-            // contract; one full copy is the worst case for a merge-based one and
-            // is what today's implementation takes. Reporting the bound is what
-            // makes this number safe to size a container against — and it is the
-            // same number `plan_groups` packed against, so the two cannot drift.
+            // **The bound, not a measurement of the standard library** — see
+            // `FillStats::peak_buffer_bytes` and `plan_groups`. Reporting the
+            // bound is what makes this number safe to size a container against.
             stats.peak_buffer_bytes = stats.peak_buffer_bytes.max(remaining + held);
             // **Stable** sort, and that is what makes "last wins" mean the last
             // occurrence *in the recording*. An unstable sort would pick an
@@ -1307,13 +1286,12 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
             groups.push(Group::Spilled(i));
             continue;
         }
-        // `sum + max(scratch)`, and the largest scratch in a group is the largest
-        // buffer's. `packing` is decreasing, so `cur_max` is this group's first
-        // member; the `max` is written out anyway, because the invariant is about
-        // the group's contents and not about the packing order.
-        // Saturating, for the same reason `need` is: `cap` is a caller knob that
-        // reaches `u64::MAX`, and this sum grew a term. Saturation flushes, which
-        // is the safe direction.
+        // `sum + max(scratch)`, per the reserve section. `packing` is decreasing,
+        // so `cur_max` is this group's first member; the `max` is written out
+        // anyway, because the invariant is about the group's contents and not
+        // about the packing order. Saturating, for the same reason `need` is:
+        // `cap` is a caller knob that reaches `u64::MAX`, and this sum grew a
+        // term. Saturation flushes, which is the safe direction.
         if cur_bytes
             .saturating_add(need)
             .saturating_add(cur_max.max(need))
@@ -1380,11 +1358,10 @@ fn fill_spilled(
         }
         buf.push((rec.stamp_ns, rec.pose));
         if buf.len() == run_samples {
-            // **Stable**, for the same reason the in-memory path is stable: it
-            // is what makes "last wins" mean the last occurrence in the
-            // recording. `spill::sort_run` is the one spelling of that rule and
-            // carries the argument; see `spill`'s module docs for the other half
-            // — the tie break across runs.
+            // **Stable**, for the same reason the in-memory path is.
+            // `spill::sort_run` is the one spelling of that rule and carries the
+            // argument; see `spill`'s module docs for the other half — the tie
+            // break across runs.
             spill::sort_run(&mut buf);
             runs.write_run(&buf)?;
             buf.clear();
@@ -1630,9 +1607,8 @@ mod tests {
     /// was `need > cap`, which admitted exactly this edge and then overran by
     /// 1.2× — and by up to 1.95× as the edge approaches the cap.
     ///
-    /// **This is the visible cost of the reserve**, and it is a real one: an edge
-    /// between `cap / 2` and `cap` now writes a run file where it used to sort in
-    /// memory. `spill`'s module docs say why that is second choice.
+    /// **This is the visible cost of the reserve**, stated in `plan_groups`;
+    /// `spill`'s module docs say why a run file is second choice.
     ///
     /// Mutant: restore `if need > cap` — applied, and this failed with
     /// `[InMemory([0])]`.

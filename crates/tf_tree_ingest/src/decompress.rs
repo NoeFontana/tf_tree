@@ -78,10 +78,7 @@
 //! The one case still unrecoverable is a truncated **compressed** chunk: a partial
 //! codec frame is not decodable by a one-shot decoder. The bound is one chunk, and
 //! it is reported as truncation rather than as corruption, because nothing is
-//! wrong with the file beyond where it stops. [`chunk_records`] implements that by
-//! handing back an *empty* records field for such a chunk — no fault, so
-//! `SkipCounts::bad_chunks` never counts it, while `SkipCounts::truncated` (which
-//! `read_tf` has already set for any short record) says the recording is a prefix.
+//! wrong with the file beyond where it stops — see [`chunk_records`] for how.
 //!
 //! # Why decompression is bounded three times over
 //!
@@ -439,12 +436,8 @@ pub(crate) fn chunk_records<'a>(
     // not truncated — that is the distinction `complete` exists to make.
     let declared_fits = || match usize::try_from(head.compressed_size) {
         Ok(n) if n <= available => Ok(n),
-        // **`CompressedSizeMismatch` and not `LengthMismatch`**, because neither
-        // number here is an uncompressed byte count and no decoder has run: this is
-        // the header's `compressed_size` against the bytes on disk. Reported as a
-        // `LengthMismatch` it printed "it declared N uncompressed bytes and produced
-        // M" over two *compressed* figures, sending a reader to `uncompressed_size`
-        // and the decompressor — the two things this arm never consults.
+        // **`CompressedSizeMismatch` and not `LengthMismatch`**, for the reason
+        // that variant's own docs record: no decoder has run on this path.
         _ => Err(ChunkFault::Bad(BadChunkKind::CompressedSizeMismatch {
             declared: clamp_u32(head.compressed_size),
             present: clamp_u32(available as u64),
@@ -453,10 +446,9 @@ pub(crate) fn chunk_records<'a>(
 
     if head.codec == ChunkCodec::None {
         // **The uncompressed path, which is a borrow and allocates nothing.**
-        // `scratch` exists for the compressed one and is not read here, so the
-        // case that already worked gains no copy. Keeping the borrow in the
-        // signature rather than splitting the function is what lets the caller
-        // hold exactly one buffer for the whole file.
+        // `scratch` exists for the compressed one and is not read here. Keeping the
+        // borrow in the signature rather than splitting the function is what lets
+        // the caller hold exactly one buffer for the whole file.
         let _ = scratch;
         let payload = payload_of(if complete {
             declared_fits()?
@@ -464,19 +456,13 @@ pub(crate) fn chunk_records<'a>(
             available
         });
 
-        // **`uncompressed_size == compressed_size` is an invariant when the
-        // records are stored verbatim**, checkable from two `u64`s nine bytes
-        // apart, and until this commit a header rewritten by a bad sector passed.
-        // It needs no decoder: `mcap`'s own writer and reader treat the two as
-        // equal, and `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`
-        // asserts it of every chunk this repository writes. Only on a *complete*
-        // chunk — a truncated one's `compressed_size` describes bytes that were
-        // never written, so the two disagree for a reason that is not damage.
+        // **The `uncompressed_size == compressed_size` invariant**, whose grounds,
+        // history and complete-only condition are all on
+        // `BadChunkKind::StoredSizeMismatch`. `mcap`'s own writer and reader treat
+        // the two as equal, and
+        // `fixture::tests::a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`
+        // asserts it of every chunk this repository writes.
         if complete && head.uncompressed_size != head.compressed_size {
-            // **`StoredSizeMismatch` and not `LengthMismatch`**, for the reason
-            // that variant records: both numbers here are header fields and no
-            // decoder has run, so "declared N uncompressed bytes and produced M"
-            // named a decompressor this arm never reaches.
             return Err(ChunkFault::Bad(BadChunkKind::StoredSizeMismatch {
                 uncompressed: clamp_u32(head.uncompressed_size),
                 compressed: clamp_u32(head.compressed_size),
@@ -574,12 +560,9 @@ pub(crate) fn chunk_records<'a>(
     let records = &scratch[..];
     // The saved hash covers the **uncompressed** bytes, per the MCAP
     // specification, so this is the same check the uncompressed path makes and
-    // not a weaker one. Note what it is *not*: neither codec's own content
-    // checksum is verified here — ruzstd exposes the saved and computed zstd
-    // checksums but compares nothing, and lz4_flex's xxhash32 check only runs
-    // when its frame reaches its end mark. This CRC32 is the check that always
-    // runs, which is why the lz4 arm below still goes out of its way to reach
-    // that end mark.
+    // not a weaker one. Neither codec's own content checksum is verified here,
+    // which is why this CRC32 is the check that always runs — and why the lz4 arm
+    // below still goes out of its way to reach its frame's end mark.
     check_crc(records, head.uncompressed_crc)?;
     Ok(records)
 }
@@ -735,10 +718,9 @@ fn decode_zstd(payload: &[u8], want: usize, scratch: &mut Vec<u8>) -> Result<(),
     // the previous one doubles the buffer: measured, a 1 049 609-byte chunk
     // following a 1 048 585-byte one took the capacity to 2 097 170 — 1 047 561
     // bytes of overshoot that then stayed resident, since this buffer is
-    // deliberately never shrunk. Doubling is the right default when the final size
-    // is unknown; here it is `want`, checked against the ceiling two guards
-    // earlier, so the exact request is both cheaper and what makes
-    // `--max-chunk-size` mean what its help text says.
+    // deliberately never shrunk. Here the final size is `want`, checked against the
+    // ceiling two guards earlier, so the exact request is both cheaper and what
+    // makes `--max-chunk-size` mean what its help text says.
     //
     // `reserve_exact(0)` is a no-op, so the steady state of near-uniform chunks —
     // where `scratch` is already long enough — costs nothing.
@@ -757,15 +739,13 @@ fn decode_zstd(payload: &[u8], want: usize, scratch: &mut Vec<u8>) -> Result<(),
     // the damage either way; the lazy path is what keeps the bound from being paid at
     // all.
     let mut decoder = FrameDecoder::new();
-    // Bound the decoder's *working* allocation, which is a different number in a
-    // different header from the one `ChunkLimits` bounds. See `window_ceiling`.
+    // Bound the decoder's *working* allocation; see `window_ceiling`.
     let ceiling = window_ceiling(want);
     decoder.set_max_window_size(ceiling);
     match decoder.decode_all(payload, &mut scratch[..]) {
         Ok(written) if written == want => Ok(()),
-        // A frame that stopped early. **This is a correctness guard, not merely a
-        // safety one**: the short output would otherwise parse as a valid but
-        // shorter record list, losing transforms with no counter anywhere to say so.
+        // A frame that stopped early — a correctness guard as much as a safety one,
+        // for the reason `BadChunkKind::LengthMismatch` records.
         // The bytes past `written` are whatever the buffer held — zeros on a fresh
         // `scratch`, the previous chunk's records once it has been reused, since the
         // `clear()` above was removed. Either way the walk finds a plausible record
@@ -974,12 +954,10 @@ fn clamp_u32(v: u64) -> u32 {
 
 /// Verify a chunk's records against the CRC32 in its header.
 ///
-/// # This is a gain, not a cost, and the reason is easy to misread
-///
-/// `LinearReaderOptions` derives `Default`, so `validate_chunk_crcs` is `false`
-/// and the crate's own check has **never** run in this crate. Doing it here means
-/// chunk CRCs are validated for the first time — including on the uncompressed
-/// chunks that already worked.
+/// It is a gain and not a cost, for the reason the module doc's list gives:
+/// `LinearReaderOptions` derives `Default`, so `validate_chunk_crcs` is `false` and
+/// the crate's own check has never run — including on the uncompressed chunks that
+/// already worked.
 ///
 /// A saved CRC of `0` means "not computed" per the MCAP specification, so it is
 /// skipped rather than compared. Treating it as a real hash would fail every
@@ -1421,9 +1399,7 @@ mod tests {
                 assert_eq!(u64::from(uncompressed), len + 64);
                 assert_eq!(u64::from(compressed), len);
                 // **And it names two header fields rather than a decoder's
-                // output.** The fault this used to raise rendered as "it declared N
-                // uncompressed bytes and produced M", a sentence about a
-                // decompressor; nothing on this path decompresses anything.
+                // output** — Mutant 3 above is the message this replaced.
                 let text = kind.to_string();
                 assert!(
                     text.contains("stored uncompressed") && !text.contains("produced"),
@@ -1433,10 +1409,8 @@ mod tests {
             other => panic!("expected a StoredSizeMismatch, got {other:?}"),
         }
 
-        // **The same bytes as a truncated chunk are not damage.** A recording cut
-        // inside a chunk has a `compressed_size` describing bytes that were never
-        // written, so the two fields disagree for a reason that is the file being
-        // short rather than wrong.
+        // **The same bytes as a truncated chunk are not damage**, for the reason
+        // `BadChunkKind::StoredSizeMismatch` records.
         let mut scratch = Vec::new();
         assert!(
             chunk_records(&body, false, limits(), &mut scratch).is_ok(),
@@ -1473,11 +1447,9 @@ mod tests {
 
         let mut scratch = Vec::new();
         let err = chunk_records(&body, true, limits(), &mut scratch).unwrap_err();
-        // **The point of the guard, asserted first and directly.** An error alone is
-        // also what a reader returns after allocating a gigabyte and *then* failing
-        // to decode into it, which is the failure this bound exists to prevent — so
-        // the allocation is what this test is about and the fault kind is the
-        // corroboration.
+        // **The point of the guard, asserted first and directly**, for the reason
+        // this test's doc gives: the allocation is what it is about and the fault
+        // kind is the corroboration.
         assert_eq!(
             scratch.capacity(),
             0,

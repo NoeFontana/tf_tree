@@ -29,10 +29,9 @@
 //!   fitness probe, an unavailable row must carry a reason *and* the command
 //!   that would produce it elsewhere, §9.3's four "where we are worse"
 //!   topics must all be present, and each of those must carry either a number
-//!   or a stated reason it has none ([`Worse::metrics_absent_because`] — an
-//!   honesty section that cannot regress is the failure it is written against). The binary treats a validation failure as a
-//!   hard error, so the failure mode is "no report" rather than "a flattering
-//!   report".
+//!   or a stated reason it has none ([`Worse::metrics_absent_because`]). A
+//!   validation failure is a hard error, so the failure mode is "no report"
+//!   rather than "a flattering report".
 //! * [`Status::Indicative`] exists because `TF_TREE_BENCH_FORCE=1` already
 //!   exists (`crate::mp::require_quiet_machine`). Someone who overrides the
 //!   refusal gets numbers that are labelled, in the JSON and in the HTML, as
@@ -73,9 +72,7 @@ pub const SCHEMA: &str = "tf_tree.bench-report/2";
 /// Named once, so the HTML's "Reproducing this" line and the test that checks it
 /// against the real `justfile` cannot disagree. It is **not**
 /// `cargo xtask bench-report`: `xtask` dispatches `loom | bench-gate | headers`
-/// and nothing else, so that spelling exits non-zero. In an artifact
-/// whose whole thesis is that a benchmark nobody can reproduce persuades nobody,
-/// the reproduce line is the last place a wrong command can be afforded.
+/// and nothing else, so that spelling exits non-zero.
 pub const REPRODUCE_RECIPE: &str = "just bench-report";
 
 /// The row ids `docs/PHASE5.md` §9.2 requires the report to carry.
@@ -214,12 +211,9 @@ pub const REQUIRED_WORSE: &[&str] = &[
 /// be reported, and "we looked and the kernel does not say" is a report of it.
 ///
 /// **Two THP keys, not one.** §9.3 says "THP setting", singular, and there are
-/// two knobs: `transparent_hugepage/enabled` governs anonymous mappings and
-/// `transparent_hugepage/shmem_enabled` governs the shmem mapping a live arena
-/// actually is. `crates/tf_tree_cli/src/hostfacts.rs` records what reading only
-/// the first one cost — a host reported healthy while `MADV_HUGEPAGE` on the
-/// arena's `MAP_SHARED` memfd was a silent no-op — and this report had exactly
-/// that hole until both keys were required here. See §9.3's amendment.
+/// two knobs; [`Provenance::collect`] carries which governs what, and what
+/// reading only the first one cost. This report had exactly that hole until
+/// both keys were required here. See §9.3's amendment.
 pub const REQUIRED_FACTS: &[&str] = &[
     // Bullet 3, verbatim.
     "tf2_version",
@@ -275,15 +269,9 @@ impl Build {
 /// against that failure was a scan for the three phrases those two sentences
 /// happened to use. **A check keyed on how a claim is worded is defeated by
 /// rewording it**, and four further reasons in this same file had gone stale
-/// without ever using one of the three phrases: one said the tf2 column could
-/// not be reached in-process (false in the `--features tf2` build, where this
-/// binary times `tf2::BufferCore` directly), one said no configuration in this
-/// repository provides a DDS round trip (false since `ros/tf_tree_bench_ros`
-/// and `just dds-bench`), one said this harness builds only synthetic fixtures
-/// (false since `src/bin/frozen_workers.rs`, in this crate, builds a ~338 MiB
-/// `.tft`), and one — in its `reproduce:` command rather than its reason, which
-/// is the same prose wearing a different field name — demanded a core count
-/// that `Report::validate`'s own memory exemption says that row does not need.
+/// without ever using one of the three phrases —
+/// `tests::no_unavailable_reason_rests_on_a_claim_that_has_gone_stale` names
+/// all four.
 ///
 /// So the decisive half of a reason is moved out of the prose and into this
 /// enum, and [`Report::validate`] re-derives it on every run. The prose stays,
@@ -302,17 +290,8 @@ impl Build {
 /// resolves the recipe a `MeasuredElsewhere` row names against the real
 /// `justfile`, so a row that points at a recipe nobody wrote fails; and
 /// `MeasurementRefused` is at least paired with a row that carries no numbers.
-/// **The first mitigation was narrower than this paragraph said until
-/// 2026-09-04**: the test read each row's `reproduce` field and not its
-/// `reason`, and recipes are named in reasons that appear in no `reproduce`
-/// field — `just bench-report`, for one, which `frozen_row_reason` names in
-/// both `.tft` rows' reason while neither row's `reproduce` names it. It reads
-/// both now. **A count of those recipes stood here, and in the test, and in
-/// `docs/PHASE5.md`, and it was wrong**: it named a closed set and
-/// `just bench-report` was not in it. It is not replaced with a corrected
-/// count — the set is whatever differencing `reason` against `reproduce` over
-/// the emitted `results.json` answers on the day you ask, and a copy of that
-/// answer in prose is the thing that went stale. The check still says nothing
+/// That test reads both `reproduce` and `reason`, and the comment at its own
+/// `check(&row.reason, ...)` call is why it must. The check still says nothing
 /// about whether the recipe measures what the row claims it measures.
 /// **A row whose ground is `NoInstrument` is exactly as trustworthy as the
 /// person who wrote it**, which is why it is spelled out as its own variant
@@ -726,8 +705,7 @@ pub struct Worse {
     /// exists to close.** Two of the four §9.3 entries carried
     /// `metrics: Vec::new()` for their whole life, and an empty vector is
     /// indistinguishable from an oversight: nobody reading the report can tell
-    /// "this cost has no number *because*..." from "somebody forgot". Both
-    /// readings are bad, and only one of them is true of any given entry.
+    /// "this cost has no number *because*..." from "somebody forgot".
     ///
     /// [`Report::validate`] enforces the pair in both directions — empty
     /// metrics need a reason, and a reason beside metrics is a contradiction —
@@ -781,16 +759,14 @@ pub struct Fitness {
     /// True when this host can produce a trustworthy *ratio* between two
     /// engines measured by interleaving them within a round.
     ///
-    /// Strictly weaker than [`Fitness::fair_for_timing`], and deliberately so:
-    /// the governor, SMT and the machine's load all land on both arms of an
-    /// interleaved pair and divide out, so none of them invalidates a quotient
-    /// the way each invalidates an absolute duration.
+    /// Strictly weaker than [`Fitness::fair_for_timing`]; [`Sensitivity`]
+    /// carries which host facts divide out of an interleaved pair and which —
+    /// load — do not.
     pub fair_for_ratios: bool,
     /// True when this host can produce a trustworthy *memory* figure.
     ///
-    /// Also strictly weaker than [`Fitness::fair_for_timing`]. PSS is read out
-    /// of `/proc`, involves no clock, and does not move because a neighbour is
-    /// busy or the governor is unreadable.
+    /// Also strictly weaker than [`Fitness::fair_for_timing`]; see
+    /// [`Sensitivity::Memory`].
     pub fair_for_memory: bool,
     /// True when the host has at least `consumers + 1` physical cores. Says
     /// nothing about whether a clock reading here would be trustworthy.
@@ -840,9 +816,8 @@ impl Fitness {
             physical_cores(),
             crate::mp::busy_fraction(Duration::from_millis(300)),
             governors(),
-            // A debug build is not a slower release build; it is a different
-            // program. Checking it here means the CLI path (`cargo run` defaults
-            // to debug) cannot quietly publish debug latencies.
+            // Checking it here means the CLI path (`cargo run` defaults to
+            // debug) cannot quietly publish debug latencies.
             cfg!(debug_assertions),
             // Whether a Pss figure can be obtained at all. `self_pss_kib`
             // returns 0 when `smaps_rollup` is unreadable, and a silent 0 is a
@@ -949,15 +924,11 @@ impl Fitness {
         }
 
         // Load is the one timing check that does **not** divide out of a
-        // cross-engine quotient, and it fails in the direction that flatters us.
-        // Interleaving cancels a disturbance only when it lands on both arms the
-        // same way, and these two arms are asymmetric by construction:
-        // `tf2::BufferCore` takes a mutex on every lookup and `tf_tree`'s read
-        // path takes none. Under load the tf2 arm additionally suffers
-        // preemption while holding that lock, and the convoy behind it, which
-        // the tf_tree arm has no equivalent of — so a busy host does not add
-        // noise to the ratio, it *inflates* it. That is precisely the thumb on
-        // the scale §9.3 exists to catch, so `busy` reaches the ratio axis.
+        // cross-engine quotient, and it fails in the direction that flatters
+        // us: the two arms are asymmetric, so a busy host inflates the ratio
+        // rather than adding noise to it (`Sensitivity`'s docs carry the
+        // mechanism). That is precisely the thumb on the scale §9.3 exists to
+        // catch, so `busy` reaches the ratio axis.
         if busy > crate::mp::QUIET_ENOUGH {
             timing_and_ratio.push(format!(
                 "machine is {:.0}% busy before the run starts (threshold {:.0}%); a \
@@ -1304,12 +1275,8 @@ impl Provenance {
 pub struct Report {
     /// Environment description (§9.3).
     pub provenance: Provenance,
-    /// The build facts [`Ground`] is decided against.
-    ///
-    /// Carried rather than read from `cfg!` at the point of use so that
-    /// [`Report::validate`]'s ground rules can be red-tested: a test hands this
-    /// field a build in which `tf2` is linked and watches a row that says
-    /// otherwise be refused.
+    /// The build facts [`Ground`] is decided against. See [`Build`] for why
+    /// they are carried here rather than read from `cfg!` at the point of use.
     pub build: Build,
     /// Host fitness verdict, and why.
     pub fitness: Fitness,
@@ -1990,9 +1957,8 @@ impl Default for Options {
 /// Both rows previously carried a hand-written reason saying `docs/PHASE5.md`
 /// §2 and §3 "are not implemented". **Both are, and §0.0's status table — which
 /// those very strings cited as the source of truth — says so.** So the tool was
-/// printing a false statement, under a section (§9.3) whose whole subject is
-/// that an unmeasurable row must say *why*. A reason nobody can trust is worse
-/// than a missing row, which is exactly the argument §9.3 makes about numbers.
+/// printing a false statement, under the section (§9.3) whose whole subject is
+/// that an unmeasurable row must say *why*.
 ///
 /// The fix is to stop asserting anything about the roadmap. The frozen backend
 /// is `#[cfg(all(feature = "shm", target_os = "linux"))]`, and `just
@@ -2023,8 +1989,7 @@ impl Default for Options {
 /// workers and sums their Pss" — true of the Pss row, and false about the
 /// *open timing* the other row is waiting for, because `just gate4` never
 /// starts a clock. Each row names the recipe that takes its own measurement
-/// now (`just gate4`, `just gate2`). That changes nothing about the residual
-/// disclosed above: what is resolved is still a name.
+/// now (`just gate4`, `just gate2`).
 fn frozen_row_reason(attempt: &str, recipe: &str) -> String {
     if cfg!(all(feature = "shm", target_os = "linux")) {
         format!(
@@ -2065,18 +2030,10 @@ pub fn assemble(opts: &Options) -> Result<Report> {
 /// in rather than probed.
 ///
 /// **This seam exists because the all-clear host was unreachable from a test,
-/// and a defect lived there.** `assemble` probes; every committed test therefore
-/// ran on whatever host it ran on, and this repository's development host has
-/// four physical cores, so `fitness.core_reason` was always `Some` and the
-/// N-way rows always had at least one obstacle to name. On a host with none —
-/// ROS installed, at least `consumers + 1` physical cores, quiet, non-SMT,
-/// performance governor — `host_grounds` came out **empty**, the three N-way
-/// rows were `Status::Unavailable` resting on nothing, and
-/// [`Report::validate`]'s own new refusal rejected the whole report so
-/// `bench_report` wrote nothing at all. The fix is that every N-way row now
-/// states a ground that does not depend on the host — [`Ground::MeasuredElsewhere`]
-/// for the two whose named recipe takes the number, [`Ground::NoInstrument`]
-/// for `publish_to_visible`, whose reason says nobody takes it — and the seam
+/// and a defect lived there.** `assemble` probes, so every committed test ran
+/// on whatever host it ran on, and this repository's development host has four
+/// physical cores. The defect, and the host-independent ground every N-way row
+/// now states because of it, are in the `host_grounds` comment below; the seam
 /// is what lets `tests::a_host_with_no_obstacle_still_grounds_every_n_way_row`
 /// pin it.
 ///
@@ -2372,14 +2329,11 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
                 "mapping one .tft from sixteen worker processes",
                 "just gate4",
             ),
-            // **Not "on >= 16 physical cores".** This is a `Memory` row, and
-            // `Report::validate`'s core-budget clause exempts exactly this
-            // case: sixteen workers mapping one `.tft` share the pages they
-            // would share on sixteen cores, so Pss is decided by the page
-            // tables and not by who is running. `just gate4` measures it on
-            // this 4-core host and reports 1.024x. Naming a core count here
-            // asked the reader for a machine the row does not need, and
-            // contradicted the clause written to say so.
+            // **Not "on >= 16 physical cores".** This is a `Memory` row, which
+            // `Report::validate`'s core-budget clause exempts; `just gate4`
+            // measures it on this 4-core host and reports 1.024x. Naming a core
+            // count here asked the reader for a machine the row does not need,
+            // and contradicted the clause written to say so.
             "just gate4 (the Rust worker, which is what §12 criterion 4 is stated over; \
              `just gate4-python` reports the same measurement with a CPython worker and \
              does not gate)",
@@ -3226,12 +3180,10 @@ const LOOKUP_STAMP_NS: i64 = crate::fixture::QUERY_NS;
 /// left to the reader: the overhead distribution is not the same shape as the
 /// measurement's, so a subtracted percentile would be a fabrication.
 ///
-/// **The query stamp is [`crate::fixture::QUERY_NS`], which interpolates.** It
-/// was [`crate::fixture::NOW_NS`], a knot on every dynamic grid, so this row —
-/// the one the report publishes as a lookup latency — timed `bracket` plus the
-/// seqlock read with `I::eval` never running (`docs/decisions/0013`). Reading
-/// any figure published before that change against one published after it is a
-/// comparison between two different measurements.
+/// **The query stamp is [`crate::fixture::QUERY_NS`], which interpolates** —
+/// `LOOKUP_NOTE` (private, so named rather than linked) carries what it was
+/// before `docs/decisions/0013`, and why a figure published before that change
+/// is not comparable with one after.
 ///
 /// # Errors
 ///
@@ -3285,10 +3237,7 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
         bail!("lookup sink went NaN — the measured loop did not run as written");
     }
 
-    // `LATENCY_SLACK` is per-percentile and generous because these can only be
-    // `Measured` on a host that passed the fitness probe, and even a quiet,
-    // non-SMT, fixed-frequency machine moves a p99.9 by more than a few percent
-    // between runs. `samples` and `clock_overhead_p50_ns` stay informational:
+    // `samples` and `clock_overhead_p50_ns` stay informational:
     // the first is a run parameter, and the second describes the host's clock
     // rather than the engine — gating it would fail this repository's own
     // artifact on a kernel that made `clock_gettime` slower.
@@ -3873,8 +3822,7 @@ mod tests {
     }
 
     /// The core budget is a statement about the scheduler, and Pss is not
-    /// scheduled. Sixteen workers mapping one `.tft` share the same pages on
-    /// four cores as on sixteen, so `needs_n_cores` must not reach a memory row.
+    /// scheduled, so `needs_n_cores` must not reach a memory row.
     ///
     /// The fixture sets `fair_for_timing: true` so that only the core-budget
     /// rule could produce a failure here, exactly as
@@ -3911,12 +3859,10 @@ mod tests {
     /// The classification itself: which measured facts about a host invalidate
     /// which kind of claim.
     ///
-    /// SMT and an unreadable governor are common-mode: they land on both arms of
-    /// an interleaved pair and divide out, and neither moves a page count. A
-    /// **busy machine does not**, and that is the interesting row — the two arms
-    /// are asymmetric (only tf2 takes a lock), so load inflates the quotient
-    /// instead of cancelling. A debug build reaches everything, and an
-    /// unreadable `smaps_rollup` reaches memory alone.
+    /// SMT and an unreadable governor are common-mode, and neither moves a page
+    /// count. A **busy machine is not**, and that is the interesting row. A
+    /// debug build reaches everything, and an unreadable `smaps_rollup` reaches
+    /// memory alone.
     ///
     /// Mutant: set `fair_for_ratios: reasons.is_empty()` in `assess` (i.e. fold
     /// the axes back into one boolean) — this test fails on the first block.
@@ -3970,8 +3916,6 @@ mod tests {
         );
 
         // An unreadable smaps_rollup reaches the memory axis and nothing else.
-        // Without this, `self_pss_kib`'s silent 0 would let a memory row publish
-        // zeros as a measurement.
         let no_pss = Fitness::assess(
             2,
             4,
@@ -4153,11 +4097,9 @@ mod tests {
     /// state N." A report that timed something and discarded nothing is
     /// refused, and so is one whose N is not a number.
     ///
-    /// The rule is scoped to the two axes a warm-up is *for*. A `Memory` row
-    /// reads Pss out of `/proc` and a `HostIndependent` row compares arithmetic;
-    /// neither has a cold path, and refusing them for a warm-up they do not use
-    /// would be the same category error §9.3's `Sensitivity` amendment exists to
-    /// undo.
+    /// The rule is scoped to the two axes a warm-up is *for*; refusing a
+    /// `Memory` or `HostIndependent` row for a warm-up it does not use would be
+    /// the same category error §9.3's `Sensitivity` amendment exists to undo.
     ///
     /// Mutant (applied, confirmed fatal): delete the `warmup_discarded_s`
     /// clause from `validate` — the first two arms validate `Ok`.
@@ -4214,13 +4156,6 @@ mod tests {
 
     /// **§9.3 bullet 5**, the mechanical half: every row names a command that
     /// re-derives it, whatever its status.
-    ///
-    /// The bullet is "publish the harness source in the same repository", which
-    /// a running binary cannot check. What it can check is that no row is a
-    /// dead end — and the companion test
-    /// `every_command_the_report_names_is_a_command_that_exists` resolves each
-    /// named command against the real `justfile`, which is as close to the
-    /// bullet as this file gets.
     ///
     /// The `unavailable` half was already enforced; this pins the `measured`
     /// half, which was not — a number nobody outside this process can re-derive
@@ -4411,15 +4346,9 @@ mod tests {
     }
 
     /// **§9.3 bullet 3's "THP setting" is two knobs, and this report recorded
-    /// the one that does not govern its own arena.**
-    ///
-    /// `transparent_hugepage/enabled` governs anonymous mappings;
-    /// `transparent_hugepage/shmem_enabled` governs the `MAP_SHARED` `memfd` a
-    /// live arena is. `crates/tf_tree_cli/src/hostfacts.rs` was written after
-    /// reading only the first one reported a host as healthy while
-    /// `MADV_HUGEPAGE` on the arena was a silent no-op — and on the development
-    /// host the two disagree today: `enabled` reads `[madvise]` and
-    /// `shmem_enabled` reads `[never]`.
+    /// the one that does not govern its own arena.** On the development host
+    /// the two disagree today: `enabled` reads `[madvise]` and `shmem_enabled`
+    /// reads `[never]`.
     ///
     /// The values are compared against the sysfs files rather than against a
     /// hardcoded string, so this passes on a host configured either way and
@@ -4565,13 +4494,8 @@ mod tests {
     /// quote against us must be a cost that can *move*.
     ///
     /// This is the rule the rows have carried all along, arriving three months
-    /// late for the entries — and `arena_memory_floor` is why. It printed five
-    /// numbers from the day it was measured and gave none of them a direction,
-    /// so `crate::baseline` had nothing to compare and
-    /// `docs/decisions/0021` step 4's own falsifier could not fire. Run, not
-    /// argued: with `0021` step 2 reverted the idle arena returns to ~100%
-    /// resident and `just bench-check` printed `PASS - 1 directional metric
-    /// held`.
+    /// late for the entries — `arena_memory_floor` is why, and `validate`
+    /// carries what it cost.
     ///
     /// The rule is scoped to a host whose memory axis passed, because
     /// [`worse_entries`] withholds that entry's Pss metrics when it does not —
@@ -4703,9 +4627,6 @@ mod tests {
             "tolerance {} would make the gate always or never fire",
             resident.tolerance
         );
-        // The quotient stays context on purpose: it is this metric divided by
-        // the reserved bytes on the same line, so gating it too would be two
-        // spellings of one claim.
         let fraction = floor
             .metrics
             .iter()
@@ -4721,13 +4642,11 @@ mod tests {
     /// A §9.3 entry with no numbers must say why it has none, and one with
     /// numbers must not claim it has none.
     ///
-    /// **This is the rule that closes the hole two of the four entries sat in.**
-    /// `bridge_supervision` and `format_bump_cost` carried `metrics: Vec::new()`
-    /// from the day they were written, and nothing could tell that state apart
-    /// from an oversight — which is exactly the shape of failure this whole
-    /// module is built against, except pointed at the section that is supposed
-    /// to be quotable against us. An entry that cannot regress is not an honest
-    /// entry; an entry that explains why it cannot is.
+    /// **This is the rule that closes the hole two of the four entries sat in**
+    /// — `bridge_supervision` and `format_bump_cost` carried
+    /// `metrics: Vec::new()` from the day they were written. An entry that
+    /// cannot regress is not an honest entry; an entry that explains why it
+    /// cannot is.
     ///
     /// Mutants, each applied and confirmed to make this test fail: delete the
     /// `(true, None | Some(""))` arm from `validate` (the first half validates
@@ -5268,11 +5187,8 @@ CPU part\t: 0xd0c
     }
 
     /// The verdicts must degrade honestly when the physical core count is
-    /// unknown. A silent fallback to logical CPUs makes `logical > physical`
-    /// vacuously false — so the SMT reason never fires — and checks the core
-    /// budget against sibling threads, and the visible result is
-    /// `clock fitness: PASS` / `core budget: PASS` on a host nothing was learned
-    /// from. A false PASS is the one failure a refusal machine cannot afford.
+    /// unknown; `assess`'s fallback comment carries why a silent fallback to
+    /// logical CPUs is a false PASS about a host nothing was learned from.
     ///
     /// `debug_build: false` throughout, so `fair_for_timing` is decided by the
     /// host facts rather than by the fact that tests run in a debug build.
