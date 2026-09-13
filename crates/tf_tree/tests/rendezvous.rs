@@ -1490,9 +1490,10 @@ fn a_wait_for_an_arena_that_never_starts_gives_up() {
     });
 
     let (err, elapsed) = rx.recv_timeout(Duration::from_secs(30)).expect(
-        "await_open never returned: it ignored its deadline. There is no \
-         .config/nextest.toml in this repository, so nothing else would have \
-         bounded this",
+        "await_open did not report back (Timeout = it ignored its deadline and \
+         this thread's 30 s bound fired first, where nextest's terminate-after \
+         would have stopped it only at 180 s without saying why; Disconnected = \
+         the worker panicked before sending). Got",
     );
     let err = err.expect("an empty machine has no arena to open");
 
@@ -1718,9 +1719,9 @@ fn a_consumer_waits_for_a_frame_interned_after_the_arena_exists() {
 /// **Mutants, each applied, run, observed and reverted:**
 ///
 /// - `if false && start.elapsed() >= timeout` (the deadline) ⇒ *"FAIL
-///   [30.008s] … await_frames never returned: it ignored its deadline. There is
-///   no .config/nextest.toml in this repository, so nothing else would have
-///   bounded this: Timeout"*. Thirty seconds and a named failure, not a hang.
+///   [30.008s] … await_frames did not report back (Timeout = it ignored its
+///   deadline and this thread's 30 s bound fired first, …). Got: Timeout"*.
+///   Thirty seconds and a named failure, not a 180 s timeout.
 /// - `.next()` in place of `.find(|(_, slot)| slot.is_none())` (report
 ///   `names[0]` rather than the first *missing* name) ⇒ *"the timeout named the
 ///   wrong frame, or was not a timeout at all — left: Timeout { hash:
@@ -1769,9 +1770,10 @@ fn a_frames_wait_for_a_name_nobody_will_intern_gives_up() {
     });
 
     let (writable, empty, outcome, elapsed) = rx.recv_timeout(Duration::from_secs(30)).expect(
-        "await_frames never returned: it ignored its deadline. There is no \
-         .config/nextest.toml in this repository, so nothing else would have \
-         bounded this",
+        "await_frames did not report back (Timeout = it ignored its deadline and \
+         this thread's 30 s bound fired first, where nextest's terminate-after \
+         would have stopped it only at 180 s without saying why; Disconnected = \
+         the worker panicked before sending). Got",
     );
 
     assert!(!writable, "the default attach must be read-only (D18)");

@@ -1057,11 +1057,12 @@ mod tests {
     /// it.
     ///
     /// **The deadlines on the client side are the finding, not decoration.**
-    /// Called bare, `read_line` and `join` turn that mutant into a *hang*, and
-    /// there is no `.config/nextest.toml` in this repository to convert a hang
-    /// into a failure — `just test` would wedge with no diagnostic instead of
-    /// reporting a regression. A gate that never returns is a gate that does
-    /// not run.
+    /// Joining `h` bare instead of waiting on `recv_timeout` turns that mutant
+    /// into a *hang*, which only `.config/nextest.toml`'s `terminate-after` ends —
+    /// 180 s later, as a timeout that names the test and not the wedged `serve` —
+    /// and which `cargo test` never ends at all. The 20 s `recv_timeout` fails it
+    /// instead, naming what did not return; the client's read timeout bounds
+    /// `read_line` the same way, should the request itself go unanswered.
     #[test]
     fn a_client_that_never_speaks_does_not_wedge_the_server() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
