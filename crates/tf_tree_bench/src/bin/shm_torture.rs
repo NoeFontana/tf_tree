@@ -321,6 +321,14 @@ mod imp {
     /// the rest of the run. Ten extensions is 20 000 operations, comfortably
     /// longer than any owner-kill interval this harness is run at, so in
     /// practice the driver's `SIGKILL` arrives first — which is the intent.
+    ///
+    /// **"In practice" assumes no deferral, and the 2026-09-13 nightly had
+    /// two.** A deferred owner kill leaves the role holder in place for another
+    /// `--owner-kill-every`. Two deferrals 8 s apart kept one heir past this
+    /// budget, and it left through the cap. That departure is an owner death
+    /// with no census, no kill window and no `Migration`. The bound is
+    /// unchanged. `[diag]` instrument 3, `role-holder-cap-exit` at the end of
+    /// [`work`], prints each such departure.
     const MAX_OWNER_CAP_EXTENSIONS: u32 = 10;
 
     /// The attached read-write population below which the **ordinary** victim
@@ -827,6 +835,9 @@ mod imp {
         /// cannot say at which sites (see [`CrashLedger`]), so the module doc's
         /// reachability table would be unfalsifiable from a run.
         crash_at: Option<String>,
+        /// The first driver round at which this armed child showed
+        /// `CoreDumping: 1`. Diagnostic only; see [`note_core_dumping`].
+        dumping_seen: Option<Instant>,
     }
 
     impl Drop for Kid {
@@ -1342,6 +1353,514 @@ mod imp {
             .unwrap_or_default()
     }
 
+    /// The prefix of every diagnostic line, the driver's and the children's.
+    ///
+    /// # Instruments, not checks
+    ///
+    /// Two nightlies reached the absorbing state after #310 and #323 through an
+    /// owner departure that [`kill_the_owner`] never brackets: on 2026-09-12 an
+    /// armed heir aborted inside its own serving thread, and on 2026-09-13 a
+    /// role holder left through its own operation cap. Neither log could say
+    /// who was attached at the instant that mattered. Five instruments print
+    /// under this prefix, and each one says beside it which hypothesis it
+    /// tests and how many lines it can print.
+    ///
+    /// **None of them may change what the run does.** No RNG draw is added or
+    /// moved, so a seeded run replays the same decisions. No predicate, floor,
+    /// deferral, detach, cap, kill or teardown decision is touched. No sleep is
+    /// added. Nothing reads `/proc` or a file on the per-operation path.
+    ///
+    /// `tests/torture.rs` finds its numbers by phrase: ` kills, ` anywhere in a
+    /// line, `§3.5 owner kill 1:`, `UNRECOVERABLE`, `a fresh process joined`,
+    /// `recovery:`, and a few whole-line prefixes and suffixes. The wording
+    /// below avoids every one of them. The prefix alone would not be enough,
+    /// because several of those matches are `contains`.
+    const DIAG: &str = "shm_torture: [diag]";
+
+    /// `CLOCK_REALTIME` as `seconds.nanoseconds`.
+    ///
+    /// Driver lines go to stdout and child lines to stderr, and GitHub stamps
+    /// each line when it reads the pipe. The eight 2026-09-12 refusals landed
+    /// within 53 ms of each other by those stamps, which may describe the
+    /// reader rather than the events. A stamp taken by the writer is the only
+    /// order the two streams share.
+    fn wall_stamp() -> String {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
+    }
+
+    /// One diagnostic line from a child, written as **one** `write(2)`.
+    ///
+    /// Every child shares the driver's stderr pipe, and `eprintln!` writes a
+    /// line piece by piece. The 2026-09-12 log has two refusals spliced into
+    /// one line (`child shm_torture: child 6258 could not join: 6257 could not
+    /// join`). A pipe write under `PIPE_BUF` is atomic, so one pre-formatted
+    /// buffer keeps these lines parseable, for the reason
+    /// [`record_inheritance`] gives about `O_APPEND`.
+    fn child_diag(body: &str) {
+        let line = format!("{DIAG} {body}\n");
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }
+
+    /// `State/CoreDumping/Threads/wchan` for one process, read from
+    /// `/proc/<pid>/status` and `/proc/<pid>/wchan`. Returns `absent` when the
+    /// status file does not exist.
+    ///
+    /// For a child the driver has not yet `wait`ed, the file exists even after
+    /// exit (`State: Z`), so `absent` means the pid is not one this run holds.
+    /// `Threads` separates a serving owner, which runs a serving thread, from a
+    /// plain joiner without trusting the marker. `wchan` names where a sleeping
+    /// main thread is blocked, which is the question the 2026-09-13
+    /// common-mode-stall hypothesis asks.
+    fn proc_brief(pid: u32) -> String {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return "absent".to_string();
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .map(|v| v.trim().to_string())
+        };
+        let state = field("State:")
+            .and_then(|s| s.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "?".to_string());
+        let dumping = field("CoreDumping:").unwrap_or_else(|| "?".to_string());
+        let threads = field("Threads:").unwrap_or_else(|| "?".to_string());
+        let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan"))
+            .ok()
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .unwrap_or_else(|| "?".to_string());
+        format!("{state}/cd{dumping}/thr{threads}/{wchan}")
+    }
+
+    /// Whether `/proc/<pid>/status` reads `CoreDumping: 1`.
+    fn proc_core_dumping(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("CoreDumping:"))
+                    .map(|v| v.trim() == "1")
+            })
+            .unwrap_or(false)
+    }
+
+    /// **Instrument 1: the host's core-dump configuration, once, at startup.**
+    ///
+    /// Hypothesis (2026-09-12): an aborting owner dumps core before
+    /// `exit_files` releases its socket and byte 0. With a pipe `core_pattern`
+    /// that takes as long as the helper takes, and every survivor's
+    /// `owner_lost()` answers `false` for the whole of it. The runner's
+    /// settings were not in the log. `RLIMIT_CORE` is read from
+    /// `/proc/self/limits` because `getrlimit` would need `unsafe`, and the
+    /// children inherit this process's limits. `core_pipe_limit` is included
+    /// because it decides whether the kernel waits for a pipe helper to exit.
+    /// A soft limit of 0 does not stop a pipe dump; only a limit of 1 does.
+    ///
+    /// Bound: one line per run.
+    fn host_diag() -> String {
+        let read = |p: &str| {
+            std::fs::read_to_string(p)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|e| format!("<unreadable: {e}>"))
+        };
+        let core_rlimit = std::fs::read_to_string("/proc/self/limits")
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("Max core file size"))
+                    .map(|rest| {
+                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        format!(
+                            "soft={} hard={}",
+                            f.first().copied().unwrap_or("?"),
+                            f.get(1).copied().unwrap_or("?")
+                        )
+                    })
+            })
+            .unwrap_or_else(|| "<unreadable>".to_string());
+        format!(
+            "{DIAG} host: core_pattern=`{}` core_pipe_limit={} core_rlimit {} osrelease={} \
+             stamp={}",
+            read("/proc/sys/kernel/core_pattern"),
+            read("/proc/sys/kernel/core_pipe_limit"),
+            core_rlimit,
+            read("/proc/sys/kernel/osrelease"),
+            wall_stamp()
+        )
+    }
+
+    /// One participant slot as [`census_with`] read it: the same pass whose
+    /// count decided, not a second read taken afterwards.
+    #[derive(Clone, Copy)]
+    struct SlotSeen {
+        slot: u32,
+        /// The identity record's pid, when the record was `LIVE`.
+        pid: Option<u32>,
+        /// `participant_alive`, which is what `slots_alive` counts.
+        alive: bool,
+    }
+
+    /// `[slot:pid, ...]`, with `(dead-record)` on a `LIVE` record whose byte
+    /// is free and `(driver)` on the driver's observer.
+    fn seen_list(seen: &[SlotSeen], driver: Option<u32>) -> String {
+        let items: Vec<String> = seen
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}:{}{}{}",
+                    s.slot,
+                    s.pid.map_or_else(|| "?".to_string(), |p| p.to_string()),
+                    if s.alive { "" } else { "(dead-record)" },
+                    if s.pid.is_some() && s.pid == driver {
+                        "(driver)"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// **Instrument 2: the population by identity, not by count.**
+    ///
+    /// Hypothesis (2026-09-13): the census read 1 at both deferrals because
+    /// every non-owner was absent at once. The kill-time census is bimodal —
+    /// 6, 5, 4 or 3, or else 1, and never 2 — which points at a common-mode
+    /// stall on the rejoin path rather than independent churn. A count cannot
+    /// say which processes were missing or where they were. This line gives,
+    /// for every slot the driver tracks, the pid, what the census `seen` made
+    /// of it, whether the owner marker names it, and its `/proc` state. That
+    /// includes `CoreDumping`, which also tests a point the review of the
+    /// 2026-09-12 diagnosis raised: an aborted child that is still dumping
+    /// holds its byte, so the census counts it toward both floors.
+    ///
+    /// `census_when` names the instant `seen` was read. The `/proc` fields are
+    /// always read now, at the print.
+    ///
+    /// Bound: one line per deferred owner kill, plus one at an unrecoverable
+    /// kill, which stops the run. At most `--children + 1` entries plus any
+    /// census slot that matches no tracked process.
+    fn population_diag(
+        what: &str,
+        census_when: &str,
+        dir: &Path,
+        observer: &Tree,
+        owner_kid: Option<&Kid>,
+        kids: &[Option<Kid>],
+        seen: &[SlotSeen],
+    ) -> String {
+        let marker = read_owner_pid(dir);
+        let driver = std::process::id();
+        let census_of = |pid: u32| -> String {
+            let mine: Vec<&SlotSeen> = seen.iter().filter(|s| s.pid == Some(pid)).collect();
+            if let Some(s) = mine.iter().find(|s| s.alive) {
+                format!("counted@slot{}", s.slot)
+            } else if let Some(s) = mine.first() {
+                format!("dead-record@slot{}", s.slot)
+            } else {
+                "absent".to_string()
+            }
+        };
+        let entry = |label: String, pid: u32| {
+            format!(
+                "{label}={pid} census={} marker={} proc={}",
+                census_of(pid),
+                if marker == Some(pid) { "yes" } else { "no" },
+                proc_brief(pid)
+            )
+        };
+        let mut tracked: Vec<u32> = Vec::new();
+        let mut entries: Vec<String> = Vec::new();
+        for (i, kid) in kids.iter().enumerate() {
+            match kid {
+                Some(k) => {
+                    tracked.push(k.proc.id());
+                    entries.push(entry(format!("k{i}"), k.proc.id()));
+                }
+                None => entries.push(format!("k{i}=empty")),
+            }
+        }
+        if let Some(k) = owner_kid {
+            tracked.push(k.proc.id());
+            entries.push(entry("owner-child".to_string(), k.proc.id()));
+        }
+        let untracked: Vec<SlotSeen> = seen
+            .iter()
+            .copied()
+            .filter(|s| s.pid.is_none_or(|p| !tracked.contains(&p)))
+            .collect();
+        format!(
+            "{DIAG} population [{what}] stamp={} census_at={census_when} census_alive={} \
+             marker={} observer=pid{driver}/slot{} | {} | untracked census slots {}",
+            wall_stamp(),
+            seen.iter().filter(|s| s.alive).count(),
+            marker.map_or_else(|| "none".to_string(), |p| p.to_string()),
+            observer.participant_slot(),
+            entries.join("; "),
+            seen_list(&untracked, Some(driver)),
+        )
+    }
+
+    /// `/proc/loadavg`'s last field: the most recently allocated pid.
+    fn last_pid() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().last().map(str::to_string))
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// What instrument 5's poll knows about one child's core dump, as
+    /// [`reap_diag`] prints it.
+    #[derive(Clone, Copy)]
+    enum DumpPoll {
+        /// Nothing polled this child. Either it was unarmed, or it was reaped
+        /// by a blocking `wait()` before any round ran (`spawn_owner`).
+        NotPolled,
+        /// Polled once per driver round and never seen dumping. A dump shorter
+        /// than a round can pass between two polls.
+        NeverSeen,
+        /// First seen dumping at this instant.
+        SeenAt(Instant),
+    }
+
+    impl DumpPoll {
+        fn of(kid: &Kid) -> DumpPoll {
+            match (&kid.crash_at, kid.dumping_seen) {
+                (None, _) => DumpPoll::NotPolled,
+                (Some(_), None) => DumpPoll::NeverSeen,
+                (Some(_), Some(t)) => DumpPoll::SeenAt(t),
+            }
+        }
+    }
+
+    /// **Instrument 5: owner deaths nothing scheduled, and every reaped abort.**
+    ///
+    /// Hypothesis (2026-09-12): the heir armed at
+    /// `hangup.after_probe_before_cas` died inside its own serving thread, and
+    /// [`reap_finished`] counted it as an ordinary abort. Nothing said that
+    /// process held the role. `unscheduled_marker` is the owner marker at a
+    /// reap the driver did not cause, or `None` where the driver killed the
+    /// process itself. `last_pid` lets consecutive lines show how many pids
+    /// went by around an abort, which hints at a core-dump helper chain.
+    /// `dump_seen` is how long before the reap the once-a-round poll first saw
+    /// `CoreDumping: 1`, when it saw it at all.
+    ///
+    /// **A child `SIGKILL`ed while it dumps reaps as `SIGKILL`, not
+    /// `SIGABRT`.** Measured on 6.8 with a pipe `core_pattern`: an abort left
+    /// alone reaped at 1.8 s as signal 6 with a core, and the same abort
+    /// killed 50 ms into its dump reaped at once as signal 9 with no core. So
+    /// at a driver kill the status alone cannot show that the victim was
+    /// already dying, and a poll sighting prints the line too (tagged
+    /// `was-dumping-when-killed`). The sighting adds no read on the kill path.
+    /// The same measurement means [`CrashLedger`] does not count such a child
+    /// as aborted. The instrument reports that and does not change it.
+    ///
+    /// Bound: at most one line per reaped child that aborted, that the poll saw
+    /// dumping, or that exited on its own while the marker named it. Only an
+    /// armed crash site, a violation or a failed owner child ends a child
+    /// without a driver kill.
+    fn reap_diag(
+        site: &str,
+        slot: Option<usize>,
+        pid: u32,
+        crash_at: Option<&str>,
+        dump: DumpPoll,
+        status: std::process::ExitStatus,
+        unscheduled_marker: Option<u32>,
+    ) -> Option<String> {
+        use std::os::unix::process::ExitStatusExt as _;
+        let abort = status.signal() == Some(libc::SIGABRT);
+        let owner = unscheduled_marker == Some(pid);
+        let seen_dumping = matches!(dump, DumpPoll::SeenAt(_));
+        if !abort && !owner && !seen_dumping {
+            return None;
+        }
+        Some(format!(
+            "{DIAG} reap{}{} site={site} slot={} pid={pid} status=`{status}` core_dumped={} \
+             armed={} stamp={} last_pid={} dump_seen={}",
+            if owner {
+                " unscheduled-owner-death (the marker names this pid)"
+            } else {
+                ""
+            },
+            if seen_dumping && status.signal() == Some(libc::SIGKILL) {
+                " was-dumping-when-killed"
+            } else {
+                ""
+            },
+            slot.map_or_else(|| "-".to_string(), |s| s.to_string()),
+            status.core_dumped(),
+            crash_at.unwrap_or("no"),
+            wall_stamp(),
+            last_pid(),
+            match dump {
+                DumpPoll::NotPolled => "not-polled".to_string(),
+                DumpPoll::NeverSeen => "never(polled once per driver round)".to_string(),
+                DumpPoll::SeenAt(t) =>
+                    format!("{:.1}ms-before-reap", t.elapsed().as_secs_f64() * 1e3),
+            }
+        ))
+    }
+
+    /// Instrument 5's optional half. Once per driver round, and only for an
+    /// **armed** child, because in this harness only an armed site aborts: a
+    /// plain soak does no per-round `/proc` read at all. It records the first
+    /// round at which the child showed `CoreDumping: 1`, so that
+    /// [`reap_diag`] can bracket the dump.
+    ///
+    /// Bound: no output of its own. At most one `/proc` read per armed child
+    /// per round.
+    fn note_core_dumping(kid: &mut Kid) {
+        if kid.crash_at.is_some() && kid.dumping_seen.is_none() && proc_core_dumping(kid.proc.id())
+        {
+            kid.dumping_seen = Some(Instant::now());
+        }
+    }
+
+    /// **Instrument 4: the environment variable that carries a worker's spawn
+    /// instant.** The driver sets it immediately before `spawn()` as wall
+    /// nanoseconds. A child's first join is timed from it, so that `fork`,
+    /// `exec` and start-up are inside the measurement. Not a `TF_TREE_`
+    /// name, so no engine code can read it.
+    const SPAWNED_AT_ENV: &str = "SHM_TORTURE_SPAWNED_AT_NS";
+
+    /// Instrument 4's threshold. A healthy rejoin takes a handshake,
+    /// milliseconds at most. A stall that could empty the pool all at once has
+    /// to outlast a driver round, and the shortest round is about 80 ms at
+    /// 6 Hz.
+    const SLOW_JOIN: Duration = Duration::from_millis(100);
+
+    /// Instrument 4's per-process line cap.
+    const SLOW_JOIN_LINES: u32 = 20;
+
+    /// **Instrument 4: one trip from holding no `Tree` to holding one.**
+    ///
+    /// Hypothesis (2026-09-13): something common to every non-owner stalls
+    /// between dropping a `Tree` and holding the next, long enough that at two
+    /// deferrals and at a departure no non-owner was attached. A stall inside
+    /// `open()` would have to be shorter than its 2 s timeout, or a refusal
+    /// would have printed; one before `open()` has no such bound. The
+    /// candidates are the Tree drop, [`record_attachment`]'s
+    /// write and rename in `/tmp` together with the marker read, the
+    /// handshake inside `open()`, and, for a fresh process, `exec` and
+    /// start-up.
+    ///
+    /// **The rejoin is a loop in the same process, not a new process.** `work`
+    /// returns, `child` drops the `Tree`, and the next iteration of `child`'s
+    /// loop opens again. So an episode starts just before the drop. A
+    /// replacement for a killed child *is* a new process, and its episode
+    /// starts at the driver's spawn stamp ([`SPAWNED_AT_ENV`]).
+    struct JoinEpisode {
+        /// `rejoin` or `first-join`.
+        kind: &'static str,
+        /// Just before the drop (`rejoin`), or entry to `child` (`first-join`).
+        started: Instant,
+        /// Spawn stamp to `child` entry, by wall clock. `first-join` only, and
+        /// only when the variable was set.
+        exec: Option<Duration>,
+        /// `started` to the first attempt: the `Tree` drop for a rejoin, and
+        /// argument parsing plus ballast for a first join.
+        lead: Duration,
+        /// [`record_attachment`] and the marker read, summed over attempts.
+        pre_open: Duration,
+        /// `open()` itself, summed over attempts.
+        in_open: Duration,
+        /// The existing back-off sleeps between refused attempts.
+        backoff: Duration,
+        attempts: u32,
+        first_refusal: Option<tf_tree::OpenError>,
+        refusal_printed: bool,
+    }
+
+    impl JoinEpisode {
+        fn new(kind: &'static str, started: Instant, exec: Option<Duration>) -> JoinEpisode {
+            JoinEpisode {
+                kind,
+                started,
+                exec,
+                lead: Duration::ZERO,
+                pre_open: Duration::ZERO,
+                in_open: Duration::ZERO,
+                backoff: Duration::ZERO,
+                attempts: 0,
+                first_refusal: None,
+                refusal_printed: false,
+            }
+        }
+
+        fn total(&self) -> Duration {
+            self.exec.unwrap_or_default() + self.started.elapsed()
+        }
+
+        fn splits(&self) -> String {
+            let ms = |d: Duration| d.as_secs_f64() * 1e3;
+            format!(
+                "{}{}={:.1} pre_open_ms={:.1} in_open_ms={:.1} backoff_ms={:.1}",
+                self.exec
+                    .map_or_else(String::new, |d| format!("exec_ms={:.1} ", ms(d))),
+                if self.kind == "rejoin" {
+                    "drop_ms"
+                } else {
+                    "setup_ms"
+                },
+                ms(self.lead),
+                ms(self.pre_open),
+                ms(self.in_open),
+                ms(self.backoff),
+            )
+        }
+
+        /// A refused attempt. It prints once per episode, and only when the
+        /// episode has already passed [`SLOW_JOIN`].
+        fn refused(&mut self, e: tf_tree::OpenError, lines: &mut u32) {
+            self.first_refusal.get_or_insert(e);
+            if self.refusal_printed || *lines >= SLOW_JOIN_LINES || self.total() <= SLOW_JOIN {
+                return;
+            }
+            self.refusal_printed = true;
+            *lines += 1;
+            child_diag(&format!(
+                "join-refused pid={} kind={} since_ms={:.1} {} attempt={} error={e:?} stamp={} \
+                 line={}/{SLOW_JOIN_LINES}",
+                std::process::id(),
+                self.kind,
+                self.total().as_secs_f64() * 1e3,
+                self.splits(),
+                self.attempts,
+                wall_stamp(),
+                *lines,
+            ));
+        }
+
+        /// A successful attach. It prints when the whole trip passed
+        /// [`SLOW_JOIN`].
+        fn joined(&self, lines: &mut u32) {
+            if *lines >= SLOW_JOIN_LINES || self.total() <= SLOW_JOIN {
+                return;
+            }
+            *lines += 1;
+            child_diag(&format!(
+                "slow-join pid={} kind={} total_ms={:.1} {} attempts={} outcome=joined \
+                 first_refusal={} stamp={} line={}/{SLOW_JOIN_LINES}",
+                std::process::id(),
+                self.kind,
+                self.total().as_secs_f64() * 1e3,
+                self.splits(),
+                self.attempts,
+                self.first_refusal
+                    .map_or_else(|| "none".to_string(), |e| format!("{e:?}")),
+                wall_stamp(),
+                *lines,
+            ));
+        }
+    }
+
     /// The owner child: create the arena, serve the rendezvous, and park.
     ///
     /// **It does nothing else, and that is the point.** The obvious shortcut —
@@ -1418,6 +1937,7 @@ mod imp {
                     seed: 0,
                     inject: false,
                     crash_at,
+                    dumping_seen: None,
                 });
             }
             let status = proc.wait().ok();
@@ -1427,6 +1947,22 @@ mod imp {
                 if st.signal() == Some(libc::SIGABRT) {
                     ledger.record_abort(crash_at.as_deref());
                 }
+            }
+            // [diag] Instrument 5, for an owner child that aborted before
+            // `ready`. There is no marker yet, so only the abort half applies.
+            // Bound: at most six lines, one per attempt.
+            if let Some(line) = status.and_then(|st| {
+                reap_diag(
+                    "owner-startup",
+                    None,
+                    proc.id(),
+                    crash_at.as_deref(),
+                    DumpPoll::NotPolled,
+                    st,
+                    None,
+                )
+            }) {
+                println!("{line}");
             }
             last = format!(
                 "attempt {}: the owner child exited before reporting ready ({:?}){}",
@@ -1509,12 +2045,16 @@ mod imp {
         if let Some(site) = crash_at.as_deref() {
             cmd.env("TF_TREE_CRASH_AT", site);
         }
+        // [diag] Instrument 4: stamped last, immediately before `spawn()`, so a
+        // first join's `exec_ms` covers the spawn itself.
+        cmd.env(SPAWNED_AT_ENV, now_nanos().to_string());
         let proc = cmd.spawn().context("spawning a torture child")?;
         Ok(Kid {
             proc,
             seed,
             inject: spec.inject,
             crash_at,
+            dumping_seen: None,
         })
     }
 
@@ -1535,6 +2075,8 @@ mod imp {
             a.seed,
             dir.display()
         );
+        // [diag] Instrument 1. See `host_diag`. Bound: one line.
+        println!("{}", host_diag());
         if a.inject {
             println!(
                 "  --inject-violation: one child publishes a corrupt transform on purpose. \
@@ -1668,8 +2210,8 @@ mod imp {
                 window = Health::default();
             }
             rounds += 1;
-            reap_finished(&mut kids, &mut violations, &mut ledger);
-            reap_owner(&mut owner_kid, &mut ledger);
+            reap_finished(&mut kids, &mut violations, &mut ledger, &dir);
+            reap_owner(&mut owner_kid, &mut ledger, &dir);
             if !violations.is_empty() {
                 break;
             }
@@ -1744,6 +2286,25 @@ mod imp {
                         // which this file already calls "strictly worse than the
                         // red one the same wedge produced on CI".
                         let starved = m.heirs_before == Some(0);
+                        // [diag] Instrument 2, at every deferral. The starved
+                        // stop is a deferral too, so it is covered here. See
+                        // `population_diag`. Bound: one line per deferral.
+                        println!(
+                            "{}",
+                            population_diag(
+                                &format!(
+                                    "at deferral of owner kill {} (consecutive {}/{}, \
+                                     starved={starved})",
+                                    m.n, consecutive_deferrals, MAX_CONSECUTIVE_DEFERRALS
+                                ),
+                                "pre-kill census",
+                                &dir,
+                                &observer,
+                                owner_kid.as_ref(),
+                                &kids,
+                                &m.before_seen,
+                            )
+                        );
                         if starved || consecutive_deferrals >= MAX_CONSECUTIVE_DEFERRALS {
                             wedge = Some(format!(
                                 "owner kill {} could not be attempted and the deferral did not \
@@ -1807,6 +2368,22 @@ mod imp {
                         // ledger are reported in the tally below rather than
                         // silently re-labelling this verdict.
                         if m.recovered.is_none() && m.heirs_at_kill == Some(0) {
+                            // [diag] Instrument 2, at the unrecoverable stop.
+                            // The census is the post-reap one that read 0; the
+                            // `/proc` fields come from after the recovery
+                            // deadline. Bound: one line, because the run stops.
+                            println!(
+                                "{}",
+                                population_diag(
+                                    &format!("at unrecovered owner kill {}", m.n),
+                                    "post-reap census",
+                                    &dir,
+                                    &observer,
+                                    owner_kid.as_ref(),
+                                    &kids,
+                                    &m.at_kill_seen,
+                                )
+                            );
                             let tally = trigger_tally_line(&dir);
                             wedge = Some(format!(
                                 "owner kill {} left the arena in an UNRECOVERABLE state, and the \
@@ -1890,7 +2467,25 @@ mod imp {
                     role_holder_draws_skipped += 1;
                 } else {
                     let _ = kid.proc.kill();
-                    let _ = kid.proc.wait();
+                    let reaped = kid.proc.wait();
+                    // [diag] Instrument 5 at a driver kill. A draw victim that
+                    // had aborted, and was still dumping or already dead, is
+                    // reaped here and counted as an ordinary kill. See
+                    // `reap_diag` for why the status alone cannot show it.
+                    // Bound: one line per such draw.
+                    if let Some(line) = reaped.ok().and_then(|st| {
+                        reap_diag(
+                            "ordinary-draw",
+                            Some(victim),
+                            kid.proc.id(),
+                            kid.crash_at.as_deref(),
+                            DumpPoll::of(kid),
+                            st,
+                            None,
+                        )
+                    }) {
+                        println!("{line}");
+                    }
                     kids[victim] = None;
                     kills += 1;
                 }
@@ -1904,8 +2499,8 @@ mod imp {
         reads.add(observe(&observer, &mut rng, &mut violations, &mut round));
         health.add(round);
         rounds += 1;
-        reap_finished(&mut kids, &mut violations, &mut ledger);
-        reap_owner(&mut owner_kid, &mut ledger);
+        reap_finished(&mut kids, &mut violations, &mut ledger, &dir);
+        reap_owner(&mut owner_kid, &mut ledger, &dir);
         // Kill every remaining child *before* the recovery check: "no claim is
         // held by a dead participant" is only a statement about a quiescent
         // arena, and a live writer would fail it correctly and uselessly.
@@ -2625,6 +3220,11 @@ mod imp {
         /// the role holder extends its operation cap — so the window grows with
         /// the owner's tenure, which `owner_kill_every` sets.
         kill_to_reaped: Option<Duration>,
+        /// Diagnostic only: the slots behind `heirs_before`, from the same
+        /// census pass. See [`population_diag`].
+        before_seen: Vec<SlotSeen>,
+        /// Diagnostic only: the slots behind `heirs_at_kill`.
+        at_kill_seen: Vec<SlotSeen>,
     }
 
     impl Migration {
@@ -2800,6 +3400,10 @@ mod imp {
             deferred: false,
             heirs_before: None,
             kill_to_reaped: None,
+            // Reserved here, before any window opens, so the census inside the
+            // kill window below pushes without allocating.
+            before_seen: Vec::with_capacity(observer.arena_view().participants().capacity()),
+            at_kill_seen: Vec::with_capacity(observer.arena_view().participants().capacity()),
         };
         let before = inheritance_count(dir);
         let Some(pid) = read_owner_pid(dir) else {
@@ -2830,7 +3434,7 @@ mod imp {
         // `inherited=1956 owner-alive=11 contended=10` with **zero** `err-*`, so
         // the engine refused no heir; there was none left to ask.
         let mut before_kill = RoundHealth::default();
-        census(observer, &mut before_kill);
+        census_with(observer, &mut before_kill, Some(&mut m.before_seen));
         m.heirs_before = Some(before_kill.slots_alive);
         if before_kill.slots_alive < 2 {
             m.deferred = true;
@@ -2874,19 +3478,49 @@ mod imp {
                 }
             }
         }
+        // [diag] Instrument 5 at a driver kill. An owner that aborted and is
+        // still dumping holds its byte and counts in the census above, so this
+        // kill is recorded as an ordinary migration. One that has already died
+        // reaps as `SIGABRT`. See `reap_diag`. The line is formatted at the
+        // reap and printed only after the window closes, so a write to stdout
+        // never widens the interval `kill_to_reaped` measures. Bound: at most
+        // one line per owner kill.
+        let mut abort_line: Option<String> = None;
         if owner_kid.as_ref().is_some_and(|k| k.proc.id() == pid) {
             if let Some(kid) = owner_kid.as_mut() {
                 let _ = kid.proc.kill();
-                let _ = kid.proc.wait();
+                let reaped = kid.proc.wait();
+                abort_line = reaped.ok().and_then(|st| {
+                    reap_diag(
+                        "owner-kill",
+                        None,
+                        pid,
+                        kid.crash_at.as_deref(),
+                        DumpPoll::of(kid),
+                        st,
+                        None,
+                    )
+                });
             }
             *owner_kid = None;
             killed = true;
         } else {
-            for slot in kids.iter_mut() {
+            for (i, slot) in kids.iter_mut().enumerate() {
                 if slot.as_ref().is_some_and(|k| k.proc.id() == pid) {
                     if let Some(kid) = slot.as_mut() {
                         let _ = kid.proc.kill();
-                        let _ = kid.proc.wait();
+                        let reaped = kid.proc.wait();
+                        abort_line = reaped.ok().and_then(|st| {
+                            reap_diag(
+                                "owner-kill",
+                                Some(i),
+                                pid,
+                                kid.crash_at.as_deref(),
+                                DumpPoll::of(kid),
+                                st,
+                                None,
+                            )
+                        });
                     }
                     *slot = None;
                     killed = true;
@@ -2923,11 +3557,14 @@ mod imp {
         // engine-refused-every-heir case and the no-heir-existed case. That
         // aggregate cannot classify this; this field is not an aggregate.
         let mut at_kill = RoundHealth::default();
-        census(observer, &mut at_kill);
+        census_with(observer, &mut at_kill, Some(&mut m.at_kill_seen));
         m.heirs_at_kill = Some(at_kill.slots_alive);
         // From this instant the survivors churn again, and one of them is about
         // to inherit; see [`close_kill_window`] for why it closes here.
         close_kill_window(dir);
+        if let Some(line) = abort_line {
+            println!("{line}");
+        }
 
         // **Read and probe in one loop.** The observer keeps validating while
         // the role is vacant (§3.5's data-plane claim) and the fresh join is
@@ -3013,8 +3650,10 @@ mod imp {
     /// survivor inherits, which is the same recovery [`kill_the_owner`] drives
     /// deliberately. It is left un-replaced for the same reason a killed owner
     /// is — the role is inherited from here on.
-    fn reap_owner(owner: &mut Option<Kid>, ledger: &mut CrashLedger) {
+    fn reap_owner(owner: &mut Option<Kid>, ledger: &mut CrashLedger, dir: &Path) {
         let Some(kid) = owner.as_mut() else { return };
+        // [diag] Instrument 5's poll. See `note_core_dumping`.
+        note_core_dumping(kid);
         match kid.proc.try_wait() {
             Ok(Some(status)) => {
                 #[cfg(unix)]
@@ -3023,6 +3662,21 @@ mod imp {
                     if status.signal() == Some(libc::SIGABRT) {
                         ledger.record_abort(kid.crash_at.as_deref());
                     }
+                }
+                // [diag] Instrument 5. The creating owner is the role holder
+                // until the first inheritance, and an armed one can end its own
+                // life with no driver kill. Bound: one line, since this child
+                // is reaped once.
+                if let Some(line) = reap_diag(
+                    "reap_owner",
+                    None,
+                    kid.proc.id(),
+                    kid.crash_at.as_deref(),
+                    DumpPoll::of(kid),
+                    status,
+                    read_owner_pid(dir),
+                ) {
+                    println!("{line}");
                 }
                 let _ = status;
                 *owner = None;
@@ -3036,9 +3690,12 @@ mod imp {
         kids: &mut [Option<Kid>],
         violations: &mut Vec<String>,
         ledger: &mut CrashLedger,
+        dir: &Path,
     ) {
-        for slot in kids.iter_mut() {
+        for (i, slot) in kids.iter_mut().enumerate() {
             let Some(kid) = slot.as_mut() else { continue };
+            // [diag] Instrument 5's poll. See `note_core_dumping`.
+            note_core_dumping(kid);
             match kid.proc.try_wait() {
                 Ok(Some(status)) => {
                     // **A child that aborted at an armed §11.3 site**, counted
@@ -3065,6 +3722,22 @@ mod imp {
                             kid.seed,
                             if kid.inject { ", the injector" } else { "" }
                         ));
+                    }
+                    // [diag] Instrument 5. After a migration the role holder is
+                    // a worker in `kids`, so an heir that aborts in its own
+                    // hangup callback is reaped here as an ordinary abort. That
+                    // was 2026-09-12's owner death. The marker is read only for
+                    // a child that has exited. Bound: one line per such reap.
+                    if let Some(line) = reap_diag(
+                        "reap_finished",
+                        Some(i),
+                        kid.proc.id(),
+                        kid.crash_at.as_deref(),
+                        DumpPoll::of(kid),
+                        status,
+                        read_owner_pid(dir),
+                    ) {
+                        println!("{line}");
                     }
                     *slot = None;
                 }
@@ -3512,6 +4185,17 @@ mod imp {
     /// Their difference is §11.4's leaked participant slot, and it is invisible
     /// to either predicate alone.
     fn census(tree: &Tree, h: &mut RoundHealth) {
+        census_with(tree, h, None);
+    }
+
+    /// [`census`], optionally keeping each slot it counted.
+    ///
+    /// **`seen` is filled from the reads the counts are taken from, in the same
+    /// order**, so the `[diag]` population line names exactly the processes the
+    /// deferral decision counted. A second pass afterwards could disagree with
+    /// the count it is meant to explain. With `None` this is `census`
+    /// unchanged.
+    fn census_with(tree: &Tree, h: &mut RoundHealth, mut seen: Option<&mut Vec<SlotSeen>>) {
         let view = tree.arena_view();
         // **`1..=CHAIN.len()`, and this line read `0..CHAIN.len()` until
         // 2026-09-04.** `EdgeId` is 1-based: `TreeBuilder::build_with` sizes the
@@ -3550,11 +4234,22 @@ mod imp {
             if slot == me {
                 continue;
             }
-            if table.identity(slot).is_some() {
+            let identity = table.identity(slot);
+            if identity.is_some() {
                 h.slots_registered += 1;
             }
-            if tree.participant_alive(slot) {
+            let alive = tree.participant_alive(slot);
+            if alive {
                 h.slots_alive += 1;
+            }
+            if let Some(seen) = seen.as_deref_mut() {
+                if identity.is_some() || alive {
+                    seen.push(SlotSeen {
+                        slot,
+                        pid: identity.map(|(pid, _, _)| pid),
+                        alive,
+                    });
+                }
             }
         }
     }
@@ -4022,6 +4717,14 @@ mod imp {
 
     /// One worker: join the arena and hammer it until killed.
     fn child(argv: &[String]) -> Result<()> {
+        // [diag] Instrument 4's clock for this process's first join. Taken
+        // before anything else, so argument parsing and the ballast count as
+        // `setup_ms`. `exec_ms` runs from the driver's spawn stamp to here.
+        let entered = Instant::now();
+        let exec = std::env::var(SPAWNED_AT_ENV)
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|at| Duration::from_nanos(now_nanos().saturating_sub(at).max(0) as u64));
         let mut seed = 1u64;
         let mut inject = false;
         let mut readers_only = false;
@@ -4101,6 +4804,10 @@ mod imp {
         let dir = runtime_dir();
         // One `could not join` line per process; see the arm below.
         let mut reported = false;
+        // [diag] Instrument 4: see `JoinEpisode`. Bound: `SLOW_JOIN_LINES` per
+        // process, and at most one refusal line and one join line per episode.
+        let mut join = JoinEpisode::new("first-join", entered, exec);
+        let mut slow_join_lines = 0u32;
 
         loop {
             // `Never`, in every child: the **owner child** creates and serves
@@ -4116,14 +4823,24 @@ mod imp {
             // the `open()` — see [`record_attachment`]. It is what lets
             // `check_recovery` judge this child's record on the strict path
             // instead of exempting it as a `docs/decisions/0043` residue.
+            let attempt_started = Instant::now();
+            if join.attempts == 0 {
+                join.lead = attempt_started.duration_since(join.started);
+            }
             record_attachment(&dir, read_owner_pid(&dir));
+            let open_started = Instant::now();
+            join.pre_open += open_started.duration_since(attempt_started);
+            join.attempts += 1;
             let tree = match tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
                 .create(CreatePolicy::Never)
                 .timeout(Duration::from_secs(2))
                 .open()
             {
-                Ok(t) => t,
+                Ok(t) => {
+                    join.in_open += open_started.elapsed();
+                    t
+                }
                 // Expected while an owner is being killed: back off and retry
                 // rather than exiting, so the driver does not have to
                 // distinguish "lost a race" from "the arena is broken".
@@ -4137,6 +4854,7 @@ mod imp {
                 // needs it twice: a child retries this loop tens of times a
                 // second, and a healthy run prints none of these at all.
                 Err(e) => {
+                    join.in_open += open_started.elapsed();
                     if !reported {
                         reported = true;
                         eprintln!(
@@ -4144,11 +4862,22 @@ mod imp {
                             std::process::id()
                         );
                     }
+                    join.refused(e, &mut slow_join_lines);
+                    let backoff_started = Instant::now();
                     std::thread::sleep(Duration::from_millis(10 + rng.below(40)));
+                    join.backoff += backoff_started.elapsed();
                     continue;
                 }
             };
+            join.joined(&mut slow_join_lines);
             work(&tree, &dir, &mut rng, inject, readers_only, no_inherit)?;
+            // [diag] Instrument 4. The drop is spelled out rather than left to
+            // the end of the block, where it happened at the same point, so the
+            // next episode's `drop_ms` can time it. For an owner, the drop is
+            // also what stops the serving thread.
+            let detached = Instant::now();
+            drop(tree);
+            join = JoinEpisode::new("rejoin", detached, None);
         }
     }
 
@@ -4192,14 +4921,22 @@ mod imp {
         // rendezvous.** Returning here drops the attachment exactly as the
         // detach arm does, so it is the same unobserved owner death — see that
         // arm. A serving process keeps working until the driver kills it, which
-        // is the event this harness is built to require a recovery for; see
-        // [`MAX_OWNER_CAP_EXTENSIONS`] for why the extension is bounded.
+        // is the event this harness is built to require a recovery for, **or
+        // until its extensions run out**, at which point it leaves exactly this
+        // way. See [`MAX_OWNER_CAP_EXTENSIONS`] for why the extension is
+        // bounded and what that bound did on 2026-09-13.
         let mut extensions = 0u32;
         let mut ops_left: u32 = OPS_PER_ATTACHMENT;
         // Whether this attachment is already parked at its cap waiting for a
         // kill window to close, so the stall is recorded once rather than once
         // per re-check.
         let mut capped_in_window = false;
+        // [diag] Instrument 3's two counters, each advanced only on a rare
+        // branch, so nothing is added to an ordinary operation. `cap_rechecks`
+        // counts the one-operation budgets granted while a kill window holds
+        // the cap. `inherited_at` is when this attachment took the role.
+        let mut cap_rechecks = 0u32;
+        let mut inherited_at: Option<Instant> = None;
         while ops_left > 0 {
             ops_left -= 1;
             // **The cap is the detach arm's quieter twin, and it leaves the
@@ -4236,6 +4973,7 @@ mod imp {
                     record_detach_skip(dir);
                 }
                 ops_left = 1;
+                cap_rechecks += 1;
             } else if ops_left > 0 {
                 capped_in_window = false;
             }
@@ -4295,6 +5033,7 @@ mod imp {
                     // next victim, so the pid must never be behind.
                     publish_owner_pid(dir);
                     record_inheritance(dir);
+                    inherited_at = Some(Instant::now());
                 }
             }
 
@@ -4494,6 +5233,54 @@ mod imp {
                     }
                 }
             }
+        }
+        // [diag] **Instrument 3: the role holder leaving through its own cap.**
+        //
+        // Hypothesis (2026-09-13): H114 held the role past
+        // `MAX_OWNER_CAP_EXTENSIONS` because two owner kills were deferred, and
+        // then left here. Dropping the `Tree` stopped the serving thread and
+        // freed byte 0 with no census, no kill window and no `Migration`. That
+        // log could not say whether anybody was attached to inherit. The line
+        // gives the pid, how long it held the role, and the attached slots by
+        // identity as *this* process's attachment sees them immediately before
+        // the drop.
+        //
+        // The only way out of this loop is `ops_left` reaching zero, so this is
+        // exactly the cap exit. The detach arm returns earlier and cannot leave
+        // as the role holder, since it is gated on the marker. A `VIOLATION`
+        // exits the process. Operations are derived rather than counted per
+        // operation: the initial budget, one full budget per extension, and one
+        // operation per kill-window re-check.
+        //
+        // The marker is read after the loop, one operation after the cap
+        // decision, so an inheritance taken in that last operation is caught
+        // too. That is an unobserved owner departure all the same.
+        //
+        // Bound: one line per attachment, and only an attachment whose process
+        // the marker names reaches it, so at most one per inheritance.
+        if read_owner_pid(dir) == Some(std::process::id()) {
+            let mut h = RoundHealth::default();
+            let mut seen = Vec::new();
+            census_with(tree, &mut h, Some(&mut seen));
+            child_diag(&format!(
+                "role-holder-cap-exit pid={} attachment_ops={} extensions={}/{} tenure={} \
+                 attached_by_identity={} alive_other_than_self={} stamp={}",
+                std::process::id(),
+                u64::from(OPS_PER_ATTACHMENT) * u64::from(1 + extensions) + u64::from(cap_rechecks),
+                extensions,
+                MAX_OWNER_CAP_EXTENSIONS,
+                inherited_at.map_or_else(
+                    || {
+                        "unknown(the marker names this pid but this attachment recorded no \
+                         inheritance)"
+                            .to_string()
+                    },
+                    |t| format!("{:.3}s", t.elapsed().as_secs_f64())
+                ),
+                seen_list(&seen, Some(std::os::unix::process::parent_id())),
+                h.slots_alive,
+                wall_stamp(),
+            ));
         }
         Ok(())
     }

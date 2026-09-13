@@ -2823,7 +2823,17 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
 # state. `kill_the_owner` censuses for a second eligible heir and defers rather
 # than killing the last one; the ordinary victim draw no longer takes the role
 # holder or draws a pool down to its floor; and a worker serving the rendezvous
-# no longer abdicates voluntarily — see `shm_torture.rs`. **This recipe reaches
+# no longer detaches on its detach arm, and has its operation cap extended while
+# it serves — see `shm_torture.rs`. **This comment said that worker "no longer
+# abdicates voluntarily", which is false.** The extension is bounded by
+# `MAX_OWNER_CAP_EXTENSIONS` (10). After that the worker leaves through the cap,
+# and takes the role with it, with no census and no
+# `kill.in_progress` marker. Measured 2026-09-13 with
+# `--children 6 --kill-hz 6 --owner-kill-every 60s`: three such departures in
+# 90 s, at 23.3–23.5 s of tenure. The diagnosis of the 2026-09-13 nightly
+# places its wedge at that exit: two deferred owner kills kept one heir past the
+# bound. Nothing in that log recorded the exit itself. The binary's
+# `[diag] role-holder-cap-exit` line now names each one. **This recipe reaches
 # the state probabilistically rather than reliably**, which is why it took three
 # nights: an armed abort at `takeover.after_ownership_lock_before_bind` destroys
 # an attached heir at the one instant the role is vacant, and that has to
