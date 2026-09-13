@@ -2,7 +2,9 @@
 
 **Status:** draft
 **Owner:** @NoeFontana
-**Implementation:** (none yet)
+**Implementation:** step 1 (the `PHASE2.md` §3.7 step 9 correction, the index
+row and the evidence register's probe row) has landed beside this record; steps
+2–6 have not.
 
 ## Context
 
@@ -23,18 +25,37 @@ come before that: writing a core dump, and tearing down the address space. The
 socket's hangup and the release of every OFD lock the process holds, byte 0
 included, wait for both.
 
+**And the owner's exit is only the last close when nothing else shares its
+descriptions.** A `fork` without `exec` shares every open file description with
+the child. [`PHASE2.md`](../PHASE2.md) §6.2 says so of the OFD locks, and
+[`RUNBOOK.md`](../RUNBOOK.md)'s *The tree works in the parent and everything fails
+in a forked child* says the child keeps the rendezvous socket and the lock byte
+alive. So an owner whose forked child outlives it keeps
+the listener, every accepted connection and byte 0 held until **that child**
+exits, which can be never, and no survivor sees a hangup before then.
+[`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md) (`draft`)
+enumerates those descriptions in its question 2, items 1, 6 and 8. That third
+producer is unbounded, and it is not what this record measured: every figure
+below is an owner with no forked child. **The bound this record states is
+therefore the close of the last open file description on the owner's socket and
+byte 0**, which is the owner's exit only when no child shares them.
+
 ### What the documents promise, swept
 
 `rg -n -i 'microsecond|immediately|at once|instantly'` over `docs/`,
-`crates/tf_tree/src` and `crates/tf_tree_ipc/src`, kept where the match is about
-owner death, hangup, `owner_lost` or inheritance:
+`crates/tf_tree/src`, `crates/tf_tree_ipc/src` and `crates/*/README.md`, kept
+where the match is about owner death, hangup, `owner_lost`, inheritance or a
+dead holder's lock:
 
 | Site | What it says | What it should say |
 |---|---|---|
-| [`PHASE2.md`](../PHASE2.md) §3.7 step 9 | a participant learns the owner died *"in microseconds"* | when the owner's exit closes the socket. **Corrected in the same change as this record**, citing it as a draft |
+| [`PHASE2.md`](../PHASE2.md) §3.7 step 9 | a participant learns the owner died *"in microseconds"* | when the last descriptor on the owner's socket closes. **Corrected in the same change as this record**, citing it as a draft |
 | `Tree::owner_lost` rustdoc, `tree.rs:3081` | *"`POLLHUP` in microseconds, exactly"* | same; release-visible, so it goes in `CHANGELOG.md` (step 3) |
+| `tf_tree_ipc`'s `client.rs:8-11` module doc | process death *"closes the fd and the peer sees it immediately"* | same; release-visible (step 3) |
 | [`PROJECT.md`](../PROJECT.md) D17, quoted at `server.rs:15` and `client.rs:52` | the owner sees a participant's `EPOLLHUP` *"in microseconds — exact, immediate"* | same mechanism, from the other end (below) |
-| [`PHASE2.md`](../PHASE2.md) §3.3, *Verified behaviour* table, quoted at `runtime_dir.rs:172` | *"Holder dies without unlocking → lock released by the kernel, immediately"* | immediately **at the end of exit**. The `runtime_dir.rs` quote contrasts this with NFS lease expiry, and that contrast still holds |
+| [`PHASE2.md`](../PHASE2.md) §3.3, *Verified behaviour* table, quoted at `runtime_dir.rs:172` and `error.rs:186` | *"Holder dies without unlocking → lock released by the kernel, immediately"* | immediately **at the end of the holder's exit**. The `runtime_dir.rs` and `error.rs` quotes contrast this with NFS lease expiry, and that contrast still holds |
+| `tf_tree_ipc`'s crate doc, `lib.rs:22`, and its crates.io page, `crates/tf_tree_ipc/README.md:31` | *"A `SIGKILL`ed participant's lock is released by the kernel, immediately"* | same scoping as §3.3's row; both are release-visible (step 3), and the README is a package-index front page |
+| [`PHASE2.md`](../PHASE2.md) §11.4's blockquote on the kill marker | the marker is *"the width of one reap per owner kill. Tens of microseconds normally"* | a driver `SIGKILL`, so no dump, but §0.0's `shm_torture` row measures that reap at 0.3 ms median for a plain child, so *"sub-millisecond"* |
 | [`PHASE2.md`](../PHASE2.md) §12.2, *owner kill → new owner serving* | 0.6–1.2 ms p50 | not wrong: it is measured with `SIGKILL` on a small owner, and should say so |
 
 [`RUNBOOK.md`](../RUNBOOK.md)'s *The arena's owner died* gives no latency figure,
@@ -50,8 +71,8 @@ The teardown half was already known, from `SIGKILL`. §0.0's `shm_torture` row
 records that a `SIGKILL`ed process releases its socket and participant byte in
 `exit_files()`, which `do_exit` runs after `exit_mm()`, and that the delay scales
 with dirty pages at about 0.09 ms per resident MB. **What that row did not have is
-the dump**, and on the hosts measured here the dump is the larger term by an order
-of magnitude.
+the dump**, and on the dev host, the only one where a dump was timed, the dump is
+the larger term by an order of magnitude.
 
 ### What was measured
 
@@ -83,64 +104,76 @@ CSV of nanosecond stamps and a full log, and neither is in the repository.
 
 | Arm | How the owner died | Owner RSS | N | death → `owner_lost()` true, median / p90 / max | `core_dumped` |
 |---|---|---|---|---|---|
-| `K` | `SIGKILL` | 2.7 MB | 20 | 0.237 / 0.310 / 0.359 ms | 0 / 20 |
-| `AN` | `abort()` under `prlimit --core=1:1` | 2.7 MB | 20 | 0.292 / 0.437 / 0.494 ms | 0 / 20 |
-| `A0` | `abort()`, host default (pipe to apport) | 2.7 MB | 20 | **1097.1 / 1105.4 / 1107.9 ms** | 20 / 20 |
-| `A256` | `abort()`, host default | 265 MB | 20 | **1123.2 / 1127.1 / 1132.8 ms** | 20 / 20 |
-| `A1024` | `abort()`, host default | 1051 MB | 20 | **1200.1 / 1211.3 / 1215.4 ms** | 20 / 20 |
-| `K1024` | `SIGKILL` | 1051 MB | 20 | **98.0 / 103.1 / 106.6 ms** | 0 / 20 |
+| `K` | `SIGKILL` | 2.7 MiB | 20 | 0.237 / 0.310 / 0.359 ms | 0 / 20 |
+| `AN` | `abort()` under `prlimit --core=1:1` | 2.7 MiB | 20 | 0.292 / 0.437 / 0.494 ms | 0 / 20 |
+| `A0` | `abort()`, host default (pipe to apport) | 2.7 MiB | 20 | **1097.1 / 1105.4 / 1107.9 ms** | 20 / 20 |
+| `A256` | `abort()`, host default | 259 MiB | 20 | **1123.2 / 1127.1 / 1132.8 ms** | 20 / 20 |
+| `A1024` | `abort()`, host default | 1027 MiB | 20 | **1200.1 / 1211.3 / 1215.4 ms** | 20 / 20 |
+| `K1024` | `SIGKILL` | 1027 MiB | 20 | **98.0 / 103.1 / 106.6 ms** | 0 / 20 |
 
 Also measured, in the same trials:
 
-- **`owner_lost()` went true 0.04–0.11 ms before the reap in 120 of 120 trials,
-  and never while `CoreDumping: 1` was still readable.** That held in all 60
-  dump trials. Across the six arms, the first `Inherited` came 0.16–0.29 ms
-  after `owner_lost()` and the joiner's first success 0.42–0.50 ms after
-  (medians). So the survivor's trigger, the heir's bind and a fresh join are
-  all bounded by the owner's exit, and they follow it closely.
-- **Every join attempt during the dump was refused** with
-  `Rendezvous(ArenaHeldButUnreachable { holder_slots: 3, first_slot: Some(0), …,
-  ownership_held: true })`. That was 52 attempts per trial in `A0`, 53 in
-  `A256`, 56–57 in `A1024`, 4–5 in `K1024`, and 0 in `K` and `AN`. The counts
+- **`owner_lost()` went true 0.04–0.41 ms before the reap in 120 of 120 trials
+  (per-arm medians 0.05–0.11 ms), and never while `CoreDumping: 1` was still
+  readable.** That held in all 60 dump trials. 11 trials exceeded 0.11 ms, all
+  in the three ballast arms. Across the six arms, the per-trial median gap from
+  `owner_lost()` to the first `Inherited` was 0.16–0.27 ms, and to the joiner's
+  first success 0.41–0.48 ms. So the survivor's trigger, the heir's bind and a
+  fresh join are all bounded by the owner's exit, and they follow it closely.
+- **Every join attempt in the window, the dump and the teardown after it, was
+  refused** as `Rendezvous(ArenaHeldButUnreachable)`. That was 52 attempts per
+  trial in `A0`, 53 in `A256`, 56–57 in `A1024`, and 0 in `K` and `AN`.
+  `K1024`, which never dumps, was refused 4–5 times in its teardown alone. The
+  probe kept the full payload only for each trial's first and last refusal. 159
+  of those 160 read `holder_slots: 3, first_slot: Some(0), …, ownership_held:
+  true` and named the owner. The other is `A1024` trial 41's last refusal,
+  stamped 0.06 ms *after* `owner_lost()` went true: `holder_slots: 2,
+  first_slot: Some(1)`, the survivor's slot, while it was inheriting. The counts
   come from the joiner's 20 ms per-attempt timeout and mean only that it was
   refused for the whole window.
 - **After the last `CoreDumping: 1` reading, `owner_lost()` took a further
-  0.49–0.60 ms in `A0`, a median 26.0 ms in `A256` and 101.5 ms in `A1024`.**
-  That scales like `K1024`'s teardown, which fits the address space being torn
-  down after the dump and adding to it.
-- **The owner's `wchar` grew by 61 440–61 466 bytes during every dump**,
-  whatever the RSS.
+  0.35–0.60 ms (median 0.49) in `A0`, a median 26.0 ms in `A256` and 101.5 ms in
+  `A1024`.** That scales like `K1024`'s teardown, which fits the address space
+  being torn down after the dump and adding to it.
+- **The owner's `wchar` grew by exactly 61 440 bytes (60 KiB) during every
+  dump**, whatever the RSS. In three `A256` and three `A1024` trials the first
+  poll came before the owner's own 26-byte `DEATH` line, written before
+  `abort()`, and read 26 bytes lower.
 - **`CoreDumping: 1` showed on one poll in 16 of 20 `AN` trials**, with no dump,
   no `wchar` growth and a reap under 0.55 ms.
 
 **An independent re-run by a second agent, same host, the same day, reproduced
-every headline.**
+`K`, `A0` and `AN` with the probe, and the 1 GiB arms with the tf_tree-free
+program. `A256` was not re-run.**
 
 - The original binary, N=10 per arm, `K`/`A0`/`AN` interleaved: medians of
   0.221 ms, 1099.3 ms and 0.251 ms.
 - A variant with **no joiner and no `/proc` poller**: 0.213 ms, 1097.9 ms and
-  0.256 ms. So the poller is not a confound.
+  0.256 ms. So the two together are not a confound for the timing; neither was
+  removed alone.
 - **A tf_tree-free program**, the one under *Reproduction* below. At ballast 0,
   N=8, the hangup medians were `K` 0.413 ms, `A` 1097.3 ms and `AN` 0.496 ms.
-  At 1 GiB, N=6: `K` 106.9 ms, `AN` 102.4 ms and `A` 1203.0 ms. **In every arm
-  the hangup, byte 0 reading free and the reap arrived within about 0.1 ms of
-  each other.**
+  At 1 GiB, N=6: `K` 106.9 ms, `AN` 102.4 ms and `A` 1203.0 ms. **In every
+  ballast-0 trial the hangup, byte 0 reading free and the reap arrived within
+  0.14 ms of each other.** The 1 GiB run kept only medians, and those were
+  within 0.07 ms of each other in each arm.
 
 `AN` at 1 GiB is the arm the main run did not have: an abort with no dump still
 pays the teardown. This record's author ran the trimmed script before writing.
 At ballast 0, n=3, the medians were 0.380 ms, 1097.6 ms and 0.495 ms. At 1 GiB,
-n=2, `K` and `AN` were 102.9 ms and 102.8 ms.
+n=2, `K` and `AN` were 102.9 ms and 102.8 ms. Both outputs were copied from the
+session, not from a results file (*Reproduction* says which numbers are).
 
-**Measured, therefore:** on this host an owner that aborts and dumps through the
-pipe cannot be detected, inherited from or joined for about 1.1 s. An owner
-with 1 GiB of dirty 4 KiB anonymous pages cannot be for about 100 ms, whether it
-was killed or aborted. With the dump suppressed and the owner small, all three
-happen in under half a millisecond.
+**Measured, therefore:** on this host the probe's owner, aborting and dumping
+through the pipe, could not be detected, inherited from or joined for about
+1.1 s, or 1.2 s at 1 GiB. An owner with 1 GiB of dirty 4 KiB anonymous pages
+could not be for about 100 ms, whether it was killed or aborted. With the dump
+suppressed and the owner small, all three happened in under half a millisecond.
 
 **Inferred, not measured:**
 
 - **That the ~1.1 s is apport's own runtime, not the kernel writing a core.**
-  `wchar` stopped at about 60 KiB at every RSS, which fits the kernel filling a
+  `wchar` grew by exactly 60 KiB at every RSS, which fits the kernel filling a
   64 KiB pipe the helper never drains, then waiting for the helper to exit
   because `core_pipe_limit` is non-zero. apport's log is root-only and was not
   read. It is equally unconfirmed that `wchar` counts dump writes at all.
@@ -150,24 +183,27 @@ happen in under half a millisecond.
 - **That the brief `CoreDumping: 1` under `AN` is `coredump_wait()` running**
   before `do_coredump` reaches the limit-of-1 refusal. Also read from source.
 
-### The mechanism, and why nothing a survivor does can shorten it
+### The mechanism, and why nothing a survivor can take shortens it
 
 `owner_lost()` is a zero-timeout `poll` for `POLLHUP` on the survivor's attach
 socket, then `F_OFD_GETLK` on byte 0 ([`0043`](./0043-owner-lost-is-a-question-about-the-owner.md)).
 `inherit_ownership()` returns `OwnerAlive` without trying anything while
 `owner_lost()` is false (`crates/tf_tree/src/open.rs:594-596`). Both questions
-are about kernel objects the owner holds until `exit_files()`: its end of the
-connection, and the OFD lock on byte 0. So the facade inherits the kernel's
-delay exactly, and the tf_tree arms match the raw-socket arms to within about
-2 ms.
+are about kernel objects the owner holds until `exit_files()`, or a forked child
+holds past it: its end of the connection, and the OFD lock on byte 0. So the
+facade inherits the kernel's delay exactly. Across separate runs, the tf_tree
+arms match the raw-socket arms to within about 0.2 ms at ballast 0 (N=20 against
+N=8) and to within about 3–9 ms at 1 GiB (N=20 against N=6).
 
-**A survivor with more information still could not act on it.** `/proc` says
-`CoreDumping: 1` within a tenth of a millisecond, and a survivor that believed it
-would still find byte 0 **held**. `Session::take_over_ownership` would get
-`EAGAIN`, and it should: byte 0 is what makes one process the server
+**A survivor with more information still could not act on it by taking
+anything.** `/proc` says `CoreDumping: 1` within 0.3 ms of the death stamp
+(median under 0.1 ms, at a poll interval of about 0.19 ms), and a survivor that
+believed it would still find byte 0 **held**. `Session::take_over_ownership`
+would get `EAGAIN`, and it should: byte 0 is what makes one process the server
 ([`PHASE2.md`](../PHASE2.md) §3.3), and §3.4's split-brain argument depends on
-nobody serving without it. Only the dying process can release it earlier (option
-*a* below).
+nobody serving without it. The dying process could close it earlier (option
+*a* below), and a kill from outside ends a dump (alternative *e*). Neither
+releases anything while a forked child shares the descriptions.
 
 **The teardown half needs no dump, and no setting removes it.** `K1024` and the
 raw-socket `AN` arm at 1 GiB both pay about 100 ms. §0.0's row carries the
@@ -188,18 +224,29 @@ the probe:
   survivor, and a dump does not either.
 - **Existing publishers keep publishing.** `push` is arena-only. A claim on a
   free edge is an OFD lock on the lock file (§6.1) and involves no owner.
-- **The dying owner's own claims stay held**, and a successor asking for one of
-  those edges is refused, because the claim leases are OFD locks on a
-  description the owner holds until `exit_files()`. `Tree::reap()` cannot
-  collect them either, since `F_OFD_GETLK` still reports them held. That is §6.1 working: a dumping owner is not yet dead.
+- **The dying owner's own claims stay held.** A successor asking for one of
+  those edges is refused by the claim record's CAS
+  (`ClaimApiError::AlreadyClaimed(EdgeAlreadyClaimed)`), and `Tree::reap_dead`
+  cannot clear the record, because the lease is an OFD lock on a description
+  the owner holds until `exit_files()` and `F_OFD_GETLK` still reports it held.
+  That is §6.1 working: a dumping owner is not yet dead. **The refusal outlasts
+  the window**: no hangup callback covers a dead owner (§3.9, which still spells
+  the collector `Tree::reap()`), so the edge stays refused until some survivor
+  calls `reap_dead` (`tft_tree_reap_dead` in C, `reap_dead()` in Python).
+- **A `reparent` by any survivor is refused for the window** with
+  `ReparentError::LockContended` if the owner died holding A2's byte 1, which is
+  where §11.3's `topo.holding_lock` site aborts. Byte 1 sits on the same
+  description as the claim leases ([`0029`](./0029-the-topology-lock-is-a-kernel-lock.md)),
+  so it is released with them at the end of the owner's exit.
 - **A participant that dies during the window is not collected by any hangup
   callback**, because the owner's serving thread is not running. This is the
   ordinary state of an ownerless arena, and the byte-keyed collectors still
   work.
 - **Supervisors are not affected.** A supervisor restarts a process when it reaps
-  it, and the reap follows the files closing by about 0.1 ms, measured. So a
-  restarted process never meets its predecessor's held bytes. What the window
-  delays is every *other* process.
+  it, and the reap followed the files closing by 0.04–0.41 ms, measured. So a
+  restarted process never meets its predecessor's held bytes, unless the
+  predecessor left a forked child holding them. What the window delays is every
+  *other* process.
 
 The same mechanism applies to D17 from the other end: a participant that dumps
 core keeps its connection and participant byte for the length of its dump, so
@@ -215,14 +262,14 @@ recoverability.
   `std::terminate`, a Rust `panic = "abort"` and a null dereference all arrive
   this way. `SIGKILL` usually comes from an operator, a supervisor's stop
   timeout or the OOM killer, not from a bug in the process.
-- **A soft `RLIMIT_CORE` of 0 does not stop a pipe dump.** It is the shell
-  default on the dev host and on the runner below, and in both places aborts
-  reaped with `core_dumped` true. `core_pattern` is a host-wide sysctl, so a
-  container gets its host's helper.
-- **A pipe `core_pattern` is the default on the hosts this project has
-  measured.** The dev host uses apport. **The GitHub runner uses
-  systemd-coredump.** #332's `[diag] host:` line in nightly runs 34769883403 and
-  34769889900 (2026-09-13) reads:
+- **A soft `RLIMIT_CORE` of 0 does not stop a pipe dump.** It is the dev host's
+  shell default, and the harness process's soft limit read 0 on the runner
+  below. In both places aborts reaped with `core_dumped` true. `core_pattern` is
+  a host-wide sysctl, so a container gets its host's helper.
+- **A pipe `core_pattern` is what both measured hosts had configured.** The dev
+  host uses apport. **The GitHub runner uses systemd-coredump.** #332's
+  `[diag] host:` line in nightly runs 34769883403 and 34769889900 (2026-09-13)
+  reads:
 
   ```text
   core_pattern=`|/usr/lib/systemd/systemd-coredump %P %u %g %s %t 9223372036854775808 %h %d`
@@ -232,26 +279,37 @@ recoverability.
   The torture and crash-points jobs print it with `soft=0`. **In the two
   crash-points jobs, all 50 reaped aborts (21 and 29) read
   `core_dumped=true`.** The ASan job prints `soft=1`, which is inferred to be the
-  sanitizer runtime's doing, so its children do not dump. **No dump was timed on
-  the runner**: those aborts were ordinary participants, the harness polls
-  `CoreDumping` once per driver round, and every line reads `dump_seen=never`.
+  sanitizer runtime's doing and, going by the dev host's `AN` arm, should
+  suppress a pipe dump in the children that inherit it; no ASan-job abort was
+  observed. **No dump was timed on the runner**: those aborts were ordinary
+  participants, the harness polls `CoreDumping` once per driver round, and every
+  line reads `dump_seen=never`.
   So whether systemd-coredump drains the core, and the window grows with RSS, or
   behaves like apport here, is open question 2.
 - **The owner is often a large process.** The owner is whichever process
   created the arena or last inherited it — the bridge, under
   [`0015`](./0015-the-bridge-fills-a-shared-arena.md), or any node. On a robot that is a perception or
-  planning process as often as a thin one, and teardown alone costs it tens of
-  milliseconds per GiB.
+  planning process as often as a thin one, and on the dev host teardown alone
+  cost about 100 ms per GiB of 4 KiB pages (far less under THP `always`, per
+  §0.0's row).
 
 **The 2026-09-12 `shm_torture --crash-points` wedge is consistent with this, and
 not shown by it.** In that run, an heir that had inherited at owner kill 12 was
 armed at `hangup.after_probe_before_cas:1` and aborted in its own serving thread
-0.5 s later. The driver never entered its kill window. For an interval the log
-bounds below by several hundred milliseconds and above by about 2 s, no survivor
-saw the role vacant. All eight non-owner children left on their ordinary exits
-during it, their rejoins were refused, and the run ended. A dumping heir
-explains that interval. That run's log carries no core pattern and no dump
-timing, so this is an explanation, not a finding.
+0.5 s later. The driver never entered its kill window. No survivor saw the role
+vacant for an interval the log bounds below by about 54 ms and above by about
+2 s. The first eight `could not join` lines each follow a 2 s open timeout, so
+those opens began 1–54 ms after the abort: processes were still leaving, not
+inheriting, 54 ms in. Every refusal reports byte 0 free by its deadline. Two
+more follow 0.42 s later, and if those were respawns the driver could make only
+after reaping the heir, the upper bound is about 0.4 s. The
+attached survivors left on their ordinary exits during it (six, by pid
+accounting: two of the first eight refusers have consecutive pids and look like
+fresh processes), every join, those two included, was refused, and the run
+ended. A dumping heir explains that interval, although a window of 0.4 s or less
+would be shorter than the dev host's ~1.1 s dump, and the runner's helper is a
+different one. That run's log carries no core pattern and no dump timing, so
+this is an explanation, not a finding.
 
 ### The secondary finding: a single non-`Inherited` answer is not final
 
@@ -260,52 +318,67 @@ With the joiner running, the survivor's **first** `inherit_ownership()` after
 **21 of 120** trials: `Contended` 15 and `OwnerAlive` 6. It happened in every
 arm, dump or no dump (`K` 5, `A0` 3, `AN` 3, `A256` 1, `A1024` 8, `K1024` 1),
 and **every one of them returned `Inherited` on the next call.** The re-run
-found 10 of 30 with the joiner and **0 of 30 without it**.
+found 10 of 30 with the joiner and the `/proc` poller running, and **0 of 30
+with both removed**. No run removed the joiner alone.
 
 Nothing instrumented who held byte 0, so the cause is inferred. The joiner is
-the only other process, and removing it removed the effect. The mechanism fits
+the only other process that opens the arena, and removing it together with the
+poller removed the effect; the poller only reads `/proc`. The mechanism fits
 §3.4: a fresh `open()` that finds nobody serving takes byte 0 at step 2, meets
 the survivor's participant byte at step 4, and releases byte 0 again. If that
 lands between the survivor's poll and its lock attempt, the survivor sees a held
 byte (`OwnerAlive`) or loses the `F_OFD_SETLK` (`Contended`). **0043's table
 already has these rows. What it does not say is that the holder may be a joiner
-passing through, who hands the byte back.** Four documents describe a held
-byte 0 after a hangup as an heir:
+passing through, who hands the byte back.** These sites describe a held byte 0
+after a hangup as an heir:
 
 - `Inheritance::Contended`'s doc: *"Another survivor won the ownership byte and
-  is binding"*. The same text is in the C header.
+  is binding"*. The same text is in `crates/tf_tree_c/src/unstable.rs` and the
+  C header.
 - `inherit_ownership`'s example comment: *"Contended is fine: somebody won"*.
+- The Python binding's `owner_lost` docstring, `crates/tf_tree_py/src/tree.rs:604`
+  (*"`Contended` is fine: somebody else won"*), and the shipped stub
+  `python/tf_tree/_core.pyi:524` (*"somebody won"*).
+- [`RUNBOOK.md`](../RUNBOOK.md)'s recovery snippet, line 551:
+  *"another survivor won; keep going"*.
 - §3.5's pseudo-code: *"held -> somebody already took over, or is mid-bind"*.
 - `owner_lost`'s three-state table.
+
+The snippets in the bindings and the runbook are the ones integrators copy.
 
 The loop §3.5 and the runbook tell an integrator to write is unaffected. It keeps
 no latch, so the next cycle's `owner_lost()` answers `true` again and the call is
 retried. **A caller that treats one `Contended` or `OwnerAlive` as final is not
 unaffected.** An early smoke run, on an earlier revision of the probe with a
 one-shot survivor, left the arena ownerless for its full 90 s joiner deadline
-after one such answer. That run was not repeated, and such a caller already
-ignores the documented loop, so it is recorded here as a hazard in the prose,
-not as a defect in recovery.
+after one such answer. That run was not repeated, and its output survives only
+in the session transcript that produced it, because the probe's smoke results
+directory was later overwritten by a run with a retrying survivor. Such a caller
+already ignores the documented loop, so it is recorded here as a hazard in the
+prose, not as a defect in recovery.
 
 ## Decision
 
-**This is a draft and it authorises nothing beyond step 1, which is a factual
-correction and does not wait for review.** Three things are proposed and one is
-left open, and the open one is the record's substance.
+**This is a draft and it authorises nothing.** Step 1 landed beside it as a
+factual correction that stands on the measurement, not on this record. Three
+things are proposed and one is left open, and the open one is the record's
+substance.
 
-**1. The spec states the bound truthfully (landed with this record).** A
-survivor learns of the owner's death when the owner's exit closes its files. Any
-core dump and the address-space teardown come before that, and nothing a
-survivor can do shortens it. [`PHASE2.md`](../PHASE2.md) §3.7 step 9's
+**1. The spec states the bound truthfully (step 1, landed beside this record).**
+A survivor learns of the owner's death when the last open file description on
+the owner's socket and byte 0 closes. Normally that is the owner's exit, and any
+core dump and the address-space teardown come before it. For an owner whose
+`fork` child outlives it, it is that child's exit. Nothing the protocol lets a
+survivor take shortens it. [`PHASE2.md`](../PHASE2.md) §3.7 step 9's
 *"in microseconds"* is corrected now, citing this record as a draft, because it
 is a false statement of fact in the spec, not a design choice.
-The other sites in the sweep table are step 3's.
+The other sites in the sweep table belong to steps 3 and 4.
 
 **2. The runbook gains operator guidance** under *The arena's owner died*. It
 covers:
 
-- **the trade**: a crash dump, or recovery within about a millisecond, for any
-  process that can hold the role.
+- **the trade**: a crash dump, or recovery bounded by the process's teardown
+  time, for any process that can hold the role.
 - **how to suppress a dump for chosen processes only**:
   `prlimit --core=1:1 -- <cmd>`, `LimitCORE=1` in a systemd unit, or the same
   limit set in a launch wrapper. Only the first was measured; the other two set
@@ -322,8 +395,9 @@ dumps on today's owner alone protects one handover.
 
 **3. The inheritance docs stop implying that a held byte 0 means an heir.**
 `Inheritance::Contended` and `OwnerAlive`, `inherit_ownership`'s example,
-`owner_lost`'s table and §3.5's pseudo-code gain the case above: a fresh
-`open()` passing through §3.4 steps 2–4 holds byte 0 briefly and gives it back.
+`owner_lost`'s table, the Python docstring and stub, the runbook snippet and
+§3.5's pseudo-code gain the case above: a fresh `open()` passing through §3.4
+steps 2–4 holds byte 0 briefly and gives it back.
 While `owner_lost()` keeps answering `true`, no single non-`Inherited` answer is
 final.
 
@@ -342,8 +416,11 @@ sockets and the session's lock-file descriptor, then restore the default
 disposition and re-raise, so the process still dies of the same signal and still
 dumps. `close(2)` is async-signal-safe. This would remove the dump window and
 leave the teardown window, since it does nothing for `SIGKILL`. **It is the only
-option that shortens the window at all**, because only the dying process holds
-what has to be released.
+option the library could build that shortens the window and keeps the core.** A
+kill from outside (*e*) shortens it by forfeiting the core. And it shortens it
+only for an owner whose descriptions no forked child shares: `close(2)` in the
+dying parent releases nothing while such a child holds them, so for that owner
+it depends on `0030`'s hole being closed first.
 
 It is not rejected, because nothing established here refutes it. It is not
 recommended either, because each item below is real:
@@ -361,19 +438,36 @@ recommended either, because each item below is real:
 - **The fd registry is [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md)'s
   problem, in a different shape.** A handler needs descriptor numbers in
   async-signal-safe statics. `0030`'s draft prototype showed a bare
-  `[AtomicI32; N]` closing foreign descriptors when registration races, and five
-  rules to make it sound. Rule (v) changes the type of every fd-holding field in
-  the seam. Here the process is about to die, so the double close that drove
-  rule (v) can arise only between the handler's `close` and the re-raise, not
-  for a child's lifetime. **Racing registration arises in full**: a number
-  closed while another thread reuses it closes whatever that thread just opened.
-- **Closing the lock-file description releases every byte on it**: byte 0, the
-  participant byte, and byte 1 if a `reparent` is in flight. Claim leases live
-  on a separate description (`0030` question 2). Leave that one open and the
-  dead owner's edges stay held for the dump. Close it and they become reapable
-  while other threads of the dying process may still be inside `push`. A4's
-  epoch fence, which §6.1 keeps, exists for exactly that, but it must be walked,
-  not assumed.
+  `[AtomicI32; N]` closing foreign descriptors in a fork child three ways, and
+  built five rules against them. Mapped onto a handler, the hazards change:
+  - **`0030`'s skew does not arise.** A handler takes no snapshot of the
+    descriptor table, so the gap between `fork` copying the table and copying
+    memory has no analogue. Its defence, rule (ii)'s `prepare` spinlock that
+    `register` also takes, is inapplicable, and it would be wrong here: a fatal
+    signal can arrive on a thread that holds that lock inside `register`, and
+    `0030` already lists the fork-from-a-signal-handler form of that deadlock
+    among its unmeasured failure modes.
+  - **The double close does arise.** Every other thread keeps running until
+    the re-raise stops it. If the handler closes number N, another thread opens
+    a file and gets N, and an owning handle on a third thread then drops and
+    closes N, that close takes a descriptor it does not own. That is the race
+    rule (v) exists for: the registry slot owns the descriptor, and whichever of
+    the handler and the handle `swap`s the live number out is the only one that
+    closes it. With rule (i) `swap`-clear and rule (iii) unregister-before-close,
+    it holds without a lock, and rule (v) is also the rule that changes the type
+    of every fd-holding field in the seam.
+- **Two lock-file descriptions, and closing either releases every byte on it.**
+  The `Session`'s carries byte 0 and the participant byte. The tree's
+  `lock_file` carries the claim leases *and* A2's topology byte, byte 1
+  ([`0029`](./0029-the-topology-lock-is-a-kernel-lock.md); `Tree::lock_file`'s
+  field doc). Close only the first, and the dead owner's edges stay held for the
+  dump, and so does byte 1 if it died inside `reparent`. Close the second too,
+  and both become takeable while other threads of the dying process may still be
+  running. A claim can then be reaped beside a thread still inside `push`, which
+  is what A4's epoch fence, kept by §6.1, exists for. Byte 1 can be taken by a
+  stealer that reads the arena word's holder as dead and mutates topology beside
+  a holder thread still inside `reparent`, which is what `0029`'s steal argument
+  would have to be re-walked for. Both must be walked, not assumed.
 - **One process-wide disposition, and the application owns it.**
   `pthread_atfork` handlers stack, which is why `crates/tf_tree_ipc/src/fork.rs`
   could install one without asking anybody. `sigaction` replaces. A library
@@ -407,16 +501,18 @@ recommended either, because each item below is real:
 The survivor would read the owner's pid off its socket and treat
 `CoreDumping: 1` as death. This was rejected for three reasons:
 
-- **It does not help.** The dumping owner still holds byte 0, so the survivor
-  that detects the dump cannot take it. Serving without byte 0 breaks §3.4's
-  split-brain argument, which is the one invariant the design will not trade.
+- **It does not help by itself.** The dumping owner still holds byte 0, so the
+  survivor that detects the dump cannot take it. Serving without byte 0 breaks
+  §3.4's split-brain argument, which is the one invariant the design will not
+  trade. The one thing such a survivor could do with the knowledge is kill the
+  owner, which is *e*.
 - **It is a heuristic on a path whose premise is that there are none**
   (§3.3: *"`/proc` parsing and PID-reuse defence are no longer on the rendezvous
   path at all"*).
-  [`0033`](./0033-the-identity-record-cannot-name-a-namespace.md) already
-  showed a recorded pid cannot be resolved across namespaces.
-- **It gives false positives, measured.** `CoreDumping: 1` appeared in 16 of 20
-  `AN` trials that never dumped.
+- **Its signal does not say what it would be used for, measured.**
+  `CoreDumping: 1` appeared in 16 of 20 `AN` trials that never dumped and closed
+  their files within half a millisecond. Every one of those processes was dying,
+  but the flag cannot tell a second-long dump from an exit that is nearly over.
 
 ### c. Disabling dumps by default in the library: rejected as a default
 
@@ -434,22 +530,59 @@ This is (1) + (2) + (3). **It is the proposal for everything except question 1**
 and it is what remains if question 1 is answered *no*. What it cannot do is make
 recovery fast for a fleet that keeps its dumps, and that fleet is the default.
 
+### e. Killing a dumping owner from outside: rejected as library behaviour, open for the runbook
+
+A `SIGKILL` delivered to a process that is writing its core ends the dump. #332's
+instrument comment records it in `crates/tf_tree_bench/src/bin/shm_torture.rs`
+(*Instrument 5*): on 6.8 with a pipe `core_pattern`, an abort left alone reaped
+at 1.8 s as signal 6 with a core, and the same abort killed 50 ms into its dump
+reaped at once as signal 9 with no core. Its subject was not a tf_tree owner: the
+script matching that description, which is not in the repository, timed
+`python3 -c 'os.abort()'` from spawn. Since the reap followed the files closing
+by under half a millisecond in every trial above, a killed owner should release
+its socket and byte 0 at once and pay only its teardown. That is **inferred**,
+not measured on an owner.
+
+**That 1.8 s is not this record's ~1.1 s, and the difference is not
+explained.** It includes interpreter start-up, and apport kept a report for that
+packaged binary under `/var/crash`, where the probe's unpackaged binary left
+none: the directory was listed before and after the main run. Whether the
+report accounts for the other ~0.7 s is **not measured**, so the ~1.1 s figures
+in this record belong to the probe's owner on that host, not to every process
+there.
+
+So an external kill shortens the window, and it pays exactly what *c* was
+rejected for: the core. As a library mechanism it would be *b* with a signal on
+the end. It keeps *b*'s second objection. Its third becomes one about cost:
+the flag cannot tell a dump worth interrupting from an exit that is nearly over,
+so a survivor that kills on sight forfeits every core. It kills a process by a
+number that can name a different process once the owner's parent reaps it
+(unless it is held through a `pidfd`), and it makes one participant's crash
+evidence another participant's decision. **It is rejected as library
+behaviour.** An operator or a supervisor can do it with no code, and whether the
+runbook should offer it beside Decision 2's per-process limit is a question for
+step 2: it keeps the dump for every crash nobody is waiting on, and forfeits it
+only where somebody chose recovery. Like *a*, it releases nothing while a forked
+child shares the owner's descriptions.
+
 ## Consequences
 
 - **§3.5's recovery has a stated latency floor that belongs to the host, not to
   tf_tree.** The floor is the owner's exit time, with a core dump and
-  address-space teardown in it. No figure from any test in this workspace
-  bounds it, and no test could without choosing a `core_pattern`.
+  address-space teardown in it, or longer if a forked child shares the owner's
+  descriptions. No figure from any test in this workspace bounds it, and no test
+  could without choosing a `core_pattern`.
 - **§12.2's migration row becomes scoped, not wrong.** 0.6–1.2 ms p50 is a
   `SIGKILL` of a small owner, and has to say so beside the number.
 - **An operator gets a choice they did not know they were making.** Keeping
   dumps on processes that may hold the role costs about a second of refused
-  joins and no inheritance per crash on the measured hosts. Lookups continue
+  joins and no inheritance per crash on the dev host. Lookups continue
   throughout.
 - **[`0055`](./0055-the-recovery-capacity-a-fleet-cannot-add-later.md)'s vacancy
-  gets a second and longer producer.** `0055` holds that the set of eligible
-  heirs can only shrink while joins are refused. This record adds that joins are
-  refused for the whole of the owner's exit, before `owner_lost()` can answer
+  gets a second and longer producer.** `0055` holds that the eligible set can
+  only shrink from the instant byte 0 falls free. The same argument applies
+  earlier, for the whole of the owner's exit, because joins are already refused
+  while the dying owner still holds byte 0, before `owner_lost()` can answer
   `true` for anyone. So the census problem `0055` describes applies across a
   core dump, and a harness marker around a `kill()` cannot bracket a dump that
   starts inside the victim's own thread. How that affects `shm_torture` is
@@ -459,39 +592,59 @@ recovery fast for a fleet that keeps its dumps, and that fleet is the default.
 
 ## Implementation plan
 
-1. **Correct [`PHASE2.md`](../PHASE2.md) §3.7 step 9** and add this record and
-   its index row. **Landed with this record.** Verified by `just
+1. **Correct [`PHASE2.md`](../PHASE2.md) §3.7 step 9**, add this record and its
+   index row, and register the measurement as a probe in
+   [`EVIDENCE.md`](../benchmarks/EVIDENCE.md), as `0053` step 2 did for its
+   figures. **Landed beside this record.** Verified by `just
    artifact-versions`: relative links, table rows, and the draft-citation check,
-   which this citation passes because it uses no settled verb and says `draft`.
+   which this citation passes because it uses no settled verb. The (`draft`)
+   marker follows the pattern the spec's citations of `0052` and `0055` use, and
+   is held by review, not by the script.
 2. **[`RUNBOOK.md`](../RUNBOOK.md) guidance**, per Decision 2, as a subsection of
    *The arena's owner died* with a one-line pointer from
    *`ArenaHeldButUnreachable`*. It carries the trade, the three per-process
    spellings, the warning that soft 0 does not stop a pipe dump, the *every
    process that may hold the role* scope, and the teardown figure with its THP
-   caveat. It is not blocked on question 1: if *a* is built it removes one term
+   caveat. It also fixes the recovery snippet's *"another survivor won"*
+   comment (line 551) per Decision 3, and says whether it offers *e*'s external
+   kill. It is not blocked on question 1: if *a* is built it removes one term
    of the trade, and the guidance shrinks. Verified by `just artifact-versions`,
    and by reading the subsection against §3.7 step 9 so the two use the same
    figures and the same dates.
 3. **The release-visible prose.**
    - `Tree::owner_lost` (`tree.rs:3081`) and its three-state table.
-   - `tf_tree_ipc::peer_hung_up` (`client.rs:52`) and the `server.rs` module doc.
+   - `tf_tree_ipc`'s `client.rs` module doc (lines 8-11), `peer_hung_up`
+     (`client.rs:52`) and the `server.rs` module doc.
+   - `tf_tree_ipc`'s crate doc (`lib.rs:22`) and its crates.io page
+     (`crates/tf_tree_ipc/README.md:31`), scoped as §3.3's row is in step 4.
+     `error.rs:186` quotes that row for the NFS contrast, which still holds, and
+     follows it.
    - `Inheritance::Contended` and `OwnerAlive`, and `inherit_ownership`'s
      example, in `crates/tf_tree/src/open.rs`.
    - The matching text in `crates/tf_tree_c/src/unstable.rs` and
      `include/tf_tree_unstable.h`.
-   - §3.5's pseudo-code and §3.4 step 2's *"it will be serving shortly"* comment.
-   - A `CHANGELOG.md` entry, because `tf_tree/src`, `tf_tree_ipc/src` and the C
-     headers are release-visible.
+   - The Python binding's `owner_lost` docstring
+     (`crates/tf_tree_py/src/tree.rs:604`) and the shipped stub
+     (`python/tf_tree/_core.pyi:524`).
+   - A `CHANGELOG.md` entry, because `tf_tree/src`, `tf_tree_ipc/src`, the C
+     headers and the Python surface are release-visible.
 
-   Verified by `just doc`, `just lint`, `just c-header-check`, and `just
+   Verified by `just doc`, `just lint`, `just c-header-check`, `just py-lint`
+   (the only gate that reaches `tf_tree_py`'s rustdoc), and `just
    artifact-versions`, whose changelog-currency rule is what requires the entry.
-   A final `rg -n 'microsecond' crates/tf_tree/src crates/tf_tree_ipc/src` near
-   `POLLHUP`/`EPOLLHUP` should return nothing unqualified.
-4. **[`PROJECT.md`](../PROJECT.md) D17, §3.3's table row and §12.2's migration
-   row.** D17 is a decision-log entry, so it gets an amendment note under it,
-   the way D16 carries its own, and its text is not rewritten. §3.3's
-   *"immediately"* gains *"at the end of the holder's exit"*, and the
-   `runtime_dir.rs:172` quote follows it. Verified by `just artifact-versions`.
+   A final `rg -n -i 'microsecond|immediately|at once|instantly'
+   crates/tf_tree/src crates/tf_tree_ipc/src crates/*/README.md`, the sweep's own
+   pattern, should return nothing unqualified about a hangup or a dead holder's
+   lock.
+4. **[`PROJECT.md`](../PROJECT.md) D17, and [`PHASE2.md`](../PHASE2.md) §3.3's
+   table row, §3.4 step 2's comment, §3.5's pseudo-code, §11.4's kill-marker
+   blockquote and §12.2's migration row.** D17 is a decision-log entry, so it
+   gets an amendment note under it, the way D16 carries its own, and its text is
+   not rewritten. §3.3's *"immediately"* gains *"at the end of the holder's
+   exit"*, and the `runtime_dir.rs:172` quote follows it. §3.5's pseudo-code and
+   §3.4 step 2's *"it will be serving shortly"* comment gain Decision 3's case.
+   §11.4's *"tens of microseconds"* becomes the sub-millisecond reap §0.0
+   measures. Verified by `just artifact-versions`.
    **This step may not cite this record as settled while it is `draft`**; the
    wording has to stand on the measurement.
 5. **No regression test for steps 1–4**, and the reason has to be recorded in
@@ -520,15 +673,21 @@ This is option *a*, with its hazards listed there. What would decide it:
   byte 0 and shows no double grant, or shows a remaining window and its cost;
 - the chaining story for Rust's stack-overflow handler, CPython's
   `faulthandler`, sanitizers and a crash reporter, **measured**, not read;
-- whether claim leases are closed with it, argued against A4;
-- a registry design that survives `0030`'s racing-registration measurement
-  without its rule (v);
-- **a test that can fail.** The candidate is question 5's teardown control
+- whether the claim-lease description, and byte 1 with it, is closed too,
+  argued against A4 and `0029`'s steal;
+- a registry design that takes no lock reachable from the handler, so none of
+  `0030`'s rule (ii), and keeps rule (v) against a handler's `close` racing an
+  owning handle's;
+- what it does for an owner with a forked child, which is nothing until
+  `0030`'s hole is closed;
+- **a test that can fail.** The candidate is step 5's teardown control
   inverted: an aborting owner with dumps suppressed and ballast held, whose
   survivor must see `owner_lost()` before the reap by roughly the teardown time.
-  Without the handler, the probe measured that gap at 0.04–0.11 ms. With the
-  handler, the claim is that the gap becomes the teardown time. A handler that
-  closed nothing would leave it at 0.1 ms, so the test can fail.
+  Without the handler, the probe measured that gap at 0.04–0.41 ms. With the
+  handler, the claim is that the gap becomes the teardown time, about 100 ms at
+  1 GiB of 4 KiB pages on the dev host. A handler that closed nothing would
+  leave it under half a millisecond, so a threshold well above 0.4 ms and well
+  below the teardown can fail.
 
 ### 2. Does the GitHub runner's systemd-coredump drain the core?
 
@@ -549,16 +708,20 @@ consistent with a dumping heir. Suppressing dumps would make that class
 disappear from the nightly without explaining it. Keeping them makes the
 crash-points job's recovery depend on `core_pattern`. This is a question about
 what the harness pins, and **this record does not decide it**. `0055` holds the
-related population question.
+related population question. **Not decision-affecting**: nothing in Decisions
+1–4 depends on the answer, so it may stay open when this record moves to
+`ready`.
 
 ### 4. Does the bound deserve a NORMATIVE statement in §3.5?
 
 If it does, §3.5 would say something like: *"A survivor learns of the owner's
-death when the owner's exit closes its files; that includes any core dump and the
-teardown of its address space; nothing in this protocol shortens it."* Stating it
-normatively would stop the next document from promising microseconds. It would
-also be a normative line no test checks, and `0055`'s *Consequences* names that
-failure mode.
+death when the last open file description on the owner's socket and byte 0
+closes. For the owner that is the end of its exit, which includes any core dump
+and the teardown of its address space; a `fork` child sharing those
+descriptions holds them until it exits. Nothing in this protocol shortens
+it."* Stating it normatively would stop the next document from promising
+microseconds. It would also be a normative line no test checks, and `0055`'s
+*Consequences* names that failure mode.
 
 ## Reproduction
 
@@ -567,8 +730,13 @@ A program with no tf_tree in it. The forked "owner" holds a listening
 which is what a tf_tree owner holds. The parent blocks in `poll()` for the
 hangup, then spins on `F_OFD_GETLK`. It is trimmed from the second agent's
 program and was run in this form before being quoted. **It is not added to the
-repository**: a runnable file there would have to be registered with `just
-evidence-audit`, and this is evidence for a draft, not a gate.
+repository as a file.** `just evidence-audit` could not see one, since it
+enumerates only cargo `bin`, `example` and `bench` targets, and a script under
+`scripts/` would join `just py-lint`'s scope as upkeep for a draft's evidence.
+It is registered instead as a probe row in
+[`EVIDENCE.md`](../benchmarks/EVIDENCE.md), whose documented command is the one
+in the program's first line, the way that register carries its uncommitted MCAP
+survey.
 
 ```python
 # python3 hup_min.py N K,A,AN [BALLAST_MIB]    -- Linux only; no tf_tree
@@ -629,5 +797,8 @@ systemd-coredump keeps its journal entry), so run it where that is acceptable.
 The tf_tree probe was the four-role program described under *What was
 measured*. Its source, summariser and raw CSVs stayed outside the repository
 with the session that produced them. What a reader can rerun is the program
-above and the four roles as described; the numbers in this record come from
-that CSV and from the re-run.
+above and the four roles as described. The numbers in this record come from that
+CSV, from the re-run's result files and from the nightly logs cited, with three
+exceptions that no result file holds: the output above, the author's 1 GiB
+`n=2` run (`python3 hup_min.py 2 K,AN 1024`), and the 90 s one-shot-survivor
+smoke run. Those three were copied from session output.
