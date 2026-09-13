@@ -324,7 +324,7 @@ mod imp {
     /// longer.** Ten extensions is 20 000 operations past the first budget,
     /// 22 000 in all. One run at `--children 6 --kill-hz 6 --owner-kill-every
     /// 60s` on this host (2026-09-13) measured that as 23.285–23.405 s of
-    /// tenure, and all three of its role holders left through this cap before
+    /// tenure, and three of its role holders left through this cap before
     /// the driver came to kill them. **This doc said 20 000 operations was
     /// "comfortably longer than any owner-kill interval this harness is run
     /// at"**, and that run is the counterexample. At the default 8 s interval,
@@ -1384,10 +1384,11 @@ mod imp {
     /// moved, so a seeded run replays the same decisions. No predicate, floor,
     /// deferral, detach, cap, kill or teardown decision is touched. No sleep is
     /// added. Nothing reads `/proc` or a file on the per-operation path. The
-    /// children write two diagnostic ledgers, each only on a path that is
+    /// children write three diagnostic files, each only on a path that is
     /// already rare: [`role_left_path`] at a role holder's cap exit, after its
-    /// `Tree` is dropped, and [`slow_join_claims_path`] on a join that has
-    /// already taken more than [`SLOW_JOIN`].
+    /// `Tree` is dropped, and [`slow_join_claims_path`] and
+    /// [`slow_join_withheld_path`] on a join that has already taken more than
+    /// [`SLOW_JOIN`].
     ///
     /// **Every line is one `write(2)`**, the driver's through [`driver_diag`]
     /// and the children's through [`child_diag`]. A line longer than `PIPE_BUF`
@@ -5320,6 +5321,15 @@ mod imp {
                     continue;
                 }
             };
+            // [diag] Instrument 4 writes here, attached and before `work`'s first
+            // `owner_lost` poll — the one child-side site not moved past the
+            // drop, deliberately. Deferring it to the drop would lose the line
+            // whenever this attachment ends in the driver's `SIGKILL`, the usual
+            // end of one, and a join slow enough to report is exactly the episode
+            // worth keeping. The cost is one claim-file append and one `stderr`
+            // write, only after a join that already took more than
+            // [`SLOW_JOIN`]; a stalled `/tmp` or `stderr` reader delays this
+            // heir's first inheritance check by that much.
             join.joined(&mut slow_join_lines, &dir);
             let cap_exit = work(&tree, &dir, &mut rng, inject, readers_only, no_inherit)?;
             // [diag] Instrument 4. The drop is spelled out rather than left to
