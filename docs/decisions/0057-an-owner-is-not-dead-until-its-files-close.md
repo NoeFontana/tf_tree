@@ -49,7 +49,7 @@ dead holder's lock:
 
 | Site | What it says | What it should say |
 |---|---|---|
-| [`PHASE2.md`](../PHASE2.md) §3.7 step 9 | a participant learns the owner died *"in microseconds"* | when the last descriptor on the owner's socket closes. **Corrected in the same change as this record**, citing it as a draft |
+| [`PHASE2.md`](../PHASE2.md) §3.7 step 9 | a participant learns the owner died *"in microseconds"* | when the last open file description on the owner's socket and byte 0 closes. **Corrected in the same change as this record**, citing it as a draft |
 | `Tree::owner_lost` rustdoc, `tree.rs:3081` | *"`POLLHUP` in microseconds, exactly"* | same; release-visible, so it goes in `CHANGELOG.md` (step 3) |
 | `tf_tree_ipc`'s `client.rs:8-11` module doc | process death *"closes the fd and the peer sees it immediately"* | same; release-visible (step 3) |
 | [`PROJECT.md`](../PROJECT.md) D17, quoted at `server.rs:15` and `client.rs:52` | the owner sees a participant's `EPOLLHUP` *"in microseconds — exact, immediate"* | same mechanism, from the other end (below) |
@@ -63,7 +63,8 @@ and neither do [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md),
 [`0037`](./0037-a-takeover-is-not-a-second-open.md),
 [`0043`](./0043-owner-lost-is-a-question-about-the-owner.md) or
 [`0044`](./0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md).
-None of them mentions a core dump either; nothing under `docs/` does.
+None of them mentions a core dump either; nothing under `docs/` did before this
+record.
 [`PHASE2.md`](../PHASE2.md) §11.2 scenario 9's *"kill the owner, and immediately"*
 describes when a test starts its process, not a latency, and is left alone.
 
@@ -116,7 +117,7 @@ Also measured, in the same trials:
 - **`owner_lost()` went true 0.04–0.41 ms before the reap in 120 of 120 trials
   (per-arm medians 0.05–0.11 ms), and never while `CoreDumping: 1` was still
   readable.** That held in all 60 dump trials. 11 trials exceeded 0.11 ms, all
-  in the three ballast arms. Across the six arms, the per-trial median gap from
+  in the three ballast arms. Across the six arms, the per-arm median gap from
   `owner_lost()` to the first `Inherited` was 0.16–0.27 ms, and to the joiner's
   first success 0.41–0.48 ms. So the survivor's trigger, the heir's bind and a
   fresh join are all bounded by the owner's exit, and they follow it closely.
@@ -168,7 +169,9 @@ session, not from a results file (*Reproduction* says which numbers are).
 through the pipe, could not be detected, inherited from or joined for about
 1.1 s, or 1.2 s at 1 GiB. An owner with 1 GiB of dirty 4 KiB anonymous pages
 could not be for about 100 ms, whether it was killed or aborted. With the dump
-suppressed and the owner small, all three happened in under half a millisecond.
+suppressed and the owner small, detection took under half a millisecond (at
+most 0.49 ms), and inheritance and a fresh join followed within about 1 ms (at
+most 1.06 ms).
 
 **Inferred, not measured:**
 
@@ -243,7 +246,8 @@ the probe:
   ordinary state of an ownerless arena, and the byte-keyed collectors still
   work.
 - **Supervisors are not affected.** A supervisor restarts a process when it reaps
-  it, and the reap followed the files closing by 0.04–0.41 ms, measured. So a
+  it, and the reap followed `owner_lost()` by 0.04–0.41 ms, measured (and the
+  hangup by at most 0.14 ms in the tf_tree-free program). So a
   restarted process never meets its predecessor's held bytes, unless the
   predecessor left a forked child holding them. What the window delays is every
   *other* process.
@@ -298,15 +302,14 @@ not shown by it.** In that run, an heir that had inherited at owner kill 12 was
 armed at `hangup.after_probe_before_cas:1` and aborted in its own serving thread
 0.5 s later. The driver never entered its kill window. No survivor saw the role
 vacant for an interval the log bounds below by about 54 ms and above by about
-2 s. The first eight `could not join` lines each follow a 2 s open timeout, so
-those opens began 1–54 ms after the abort: processes were still leaving, not
-inheriting, 54 ms in. Every refusal reports byte 0 free by its deadline. Two
-more follow 0.42 s later, and if those were respawns the driver could make only
-after reaping the heir, the upper bound is about 0.4 s. The
-attached survivors left on their ordinary exits during it (six, by pid
-accounting: two of the first eight refusers have consecutive pids and look like
-fresh processes), every join, those two included, was refused, and the run
-ended. A dumping heir explains that interval, although a window of 0.4 s or less
+2 s — about 0.4 s if the two refusals that came 0.42 s after the first eight
+were respawns the driver could make only after reaping the heir. The first eight
+`could not join` lines each follow a 2 s open timeout, so those opens began
+1–54 ms after the abort: processes were still leaving, not inheriting, 54 ms in.
+Every refusal reports byte 0 free by its deadline. Attached survivors left on
+their ordinary exits during the interval — how many cannot be told, because the
+log has no spawn lines and its refusing pids hold more than one consecutive run —
+every join was refused, and the run ended. A dumping heir explains that interval, although a window of 0.4 s or less
 would be shorter than the dev host's ~1.1 s dump, and the runner's helper is a
 different one. That run's log carries no core pattern and no dump timing, so
 this is an explanation, not a finding.
@@ -333,7 +336,8 @@ passing through, who hands the byte back.** These sites describe a held byte 0
 after a hangup as an heir:
 
 - `Inheritance::Contended`'s doc: *"Another survivor won the ownership byte and
-  is binding"*. The same text is in `crates/tf_tree_c/src/unstable.rs` and the
+  is binding"*, and `OwnerAlive`'s: *"The owner is alive. Nothing was
+  attempted."* The same text is in `crates/tf_tree_c/src/unstable.rs` and the
   C header.
 - `inherit_ownership`'s example comment: *"Contended is fine: somebody won"*.
 - The Python binding's `owner_lost` docstring, `crates/tf_tree_py/src/tree.rs:604`
@@ -341,7 +345,9 @@ after a hangup as an heir:
   `python/tf_tree/_core.pyi:524` (*"somebody won"*).
 - [`RUNBOOK.md`](../RUNBOOK.md)'s recovery snippet, line 551:
   *"another survivor won; keep going"*.
-- §3.5's pseudo-code: *"held -> somebody already took over, or is mid-bind"*.
+- §3.5's pseudo-code: *"held -> somebody already took over, or is mid-bind"*,
+  and §3.4 step 2's comment: *"another process is mid-bind; it will be serving
+  shortly"*.
 - `owner_lost`'s three-state table.
 
 The snippets in the bindings and the runbook are the ones integrators copy.
@@ -351,9 +357,9 @@ no latch, so the next cycle's `owner_lost()` answers `true` again and the call i
 retried. **A caller that treats one `Contended` or `OwnerAlive` as final is not
 unaffected.** An early smoke run, on an earlier revision of the probe with a
 one-shot survivor, left the arena ownerless for its full 90 s joiner deadline
-after one such answer. That run was not repeated, and its output survives only
-in the session transcript that produced it, because the probe's smoke results
-directory was later overwritten by a run with a retrying survivor. Such a caller
+after one such answer. That run was not repeated. The probe's smoke results
+directory was later overwritten by a run with a retrying survivor, so its output
+was copied from the session transcript into a result file. Such a caller
 already ignores the documented loop, so it is recorded here as a hazard in the
 prose, not as a defect in recovery.
 
@@ -394,10 +400,9 @@ eligible heirs are exactly the processes that may hold it next), so suppressing
 dumps on today's owner alone protects one handover.
 
 **3. The inheritance docs stop implying that a held byte 0 means an heir.**
-`Inheritance::Contended` and `OwnerAlive`, `inherit_ownership`'s example,
-`owner_lost`'s table, the Python docstring and stub, the runbook snippet and
-§3.5's pseudo-code gain the case above: a fresh `open()` passing through §3.4
-steps 2–4 holds byte 0 briefly and gives it back.
+Every site listed under *The secondary finding* above — the Rust, C and Python
+docs, the runbook snippet and the two PHASE2 passages — gains the case: a fresh
+`open()` passing through §3.4 steps 2–4 holds byte 0 briefly and gives it back.
 While `owner_lost()` keeps answering `true`, no single non-`Inherited` answer is
 final.
 
@@ -538,8 +543,8 @@ instrument comment records it in `crates/tf_tree_bench/src/bin/shm_torture.rs`
 at 1.8 s as signal 6 with a core, and the same abort killed 50 ms into its dump
 reaped at once as signal 9 with no core. Its subject was not a tf_tree owner: the
 script matching that description, which is not in the repository, timed
-`python3 -c 'os.abort()'` from spawn. Since the reap followed the files closing
-by under half a millisecond in every trial above, a killed owner should release
+`python3 -c 'os.abort()'` from spawn. Since the reap followed `owner_lost()` by
+under half a millisecond in every trial above, a killed owner should release
 its socket and byte 0 at once and pay only its teardown. That is **inferred**,
 not measured on an owner.
 
@@ -617,8 +622,8 @@ child shares the owner's descriptions.
      (`client.rs:52`) and the `server.rs` module doc.
    - `tf_tree_ipc`'s crate doc (`lib.rs:22`) and its crates.io page
      (`crates/tf_tree_ipc/README.md:31`), scoped as §3.3's row is in step 4.
-     `error.rs:186` quotes that row for the NFS contrast, which still holds, and
-     follows it.
+     `error.rs:186` and `runtime_dir.rs:172` quote that row (the first for the
+     NFS contrast, which still holds) and follow it.
    - `Inheritance::Contended` and `OwnerAlive`, and `inherit_ownership`'s
      example, in `crates/tf_tree/src/open.rs`.
    - The matching text in `crates/tf_tree_c/src/unstable.rs` and
@@ -641,7 +646,8 @@ child shares the owner's descriptions.
    blockquote and §12.2's migration row.** D17 is a decision-log entry, so it
    gets an amendment note under it, the way D16 carries its own, and its text is
    not rewritten. §3.3's *"immediately"* gains *"at the end of the holder's
-   exit"*, and the `runtime_dir.rs:172` quote follows it. §3.5's pseudo-code and
+   exit"* (its two quotes in `tf_tree_ipc/src` follow in step 3, which carries
+   the changelog entry). §3.5's pseudo-code and
    §3.4 step 2's *"it will be serving shortly"* comment gain Decision 3's case.
    §11.4's *"tens of microseconds"* becomes the sub-millisecond reap §0.0
    measures. Verified by `just artifact-versions`.
@@ -799,6 +805,6 @@ measured*. Its source, summariser and raw CSVs stayed outside the repository
 with the session that produced them. What a reader can rerun is the program
 above and the four roles as described. The numbers in this record come from that
 CSV, from the re-run's result files and from the nightly logs cited, with three
-exceptions that no result file holds: the output above, the author's 1 GiB
-`n=2` run (`python3 hup_min.py 2 K,AN 1024`), and the 90 s one-shot-survivor
-smoke run. Those three were copied from session output.
+exceptions whose result files were copied from session output rather than
+written by the run itself: the output above, the author's 1 GiB `n=2` run
+(`python3 hup_min.py 2 K,AN 1024`), and the 90 s one-shot-survivor smoke run.
