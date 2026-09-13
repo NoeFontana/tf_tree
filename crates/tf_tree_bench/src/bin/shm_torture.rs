@@ -318,17 +318,30 @@ mod imp {
     /// Bounded rather than infinite: the predicate is the harness's own
     /// `owner.pid` marker, and a marker that somehow named a live process which
     /// was no longer serving would otherwise pin one child in its work loop for
-    /// the rest of the run. Ten extensions is 20 000 operations, comfortably
-    /// longer than any owner-kill interval this harness is run at, so in
-    /// practice the driver's `SIGKILL` arrives first — which is the intent.
+    /// the rest of the run.
     ///
-    /// **"In practice" assumes no deferral, and the 2026-09-13 nightly had
-    /// two.** A deferred owner kill leaves the role holder in place for another
-    /// `--owner-kill-every`. Two deferrals 8 s apart kept one heir past this
-    /// budget, and it left through the cap. That departure is an owner death
-    /// with no census, no kill window and no `Migration`. The bound is
-    /// unchanged. `[diag]` instrument 3, `role-holder-cap-exit` at the end of
-    /// [`work`], prints each such departure.
+    /// **The bound is a tenure, and some intervals this binary accepts are
+    /// longer.** Ten extensions is 20 000 operations past the first budget,
+    /// 22 000 in all. One run at `--children 6 --kill-hz 6 --owner-kill-every
+    /// 60s` on this host (2026-09-13) measured that as 23.285–23.405 s of
+    /// tenure, and all three of its role holders left through this cap before
+    /// the driver came to kill them. **This doc said 20 000 operations was
+    /// "comfortably longer than any owner-kill interval this harness is run
+    /// at"**, and that run is the counterexample. At the default 8 s interval,
+    /// with no deferral, the driver's `SIGKILL` does arrive first, which is the
+    /// intent. A deferred owner kill leaves the role holder in place for
+    /// another interval, so two deferrals in a row at 8 s put the next attempt
+    /// about 24 s after an inheritance, later than that tenure. A loaded
+    /// runner's operations are slower than this host's, so its tenure is not
+    /// this number.
+    ///
+    /// **Whether that is how the 2026-09-13 nightly wedged is not established.**
+    /// Its log has two deferrals and is consistent with its role holder leaving
+    /// through this cap, but nothing in it recorded a cap exit. Such a
+    /// departure is an owner death with no census, no kill window and no
+    /// `Migration`. `[diag]` instrument 3, `role-holder-cap-exit` at the end of
+    /// [`work`], prints each one, and exists to confirm or refute that
+    /// reading. The bound is unchanged.
     const MAX_OWNER_CAP_EXTENSIONS: u32 = 10;
 
     /// The attached read-write population below which the **ordinary** victim
@@ -1357,18 +1370,30 @@ mod imp {
     ///
     /// # Instruments, not checks
     ///
-    /// Two nightlies reached the absorbing state after #310 and #323 through an
-    /// owner departure that [`kill_the_owner`] never brackets: on 2026-09-12 an
-    /// armed heir aborted inside its own serving thread, and on 2026-09-13 a
-    /// role holder left through its own operation cap. Neither log could say
-    /// who was attached at the instant that mattered. Five instruments print
-    /// under this prefix, and each one says beside it which hypothesis it
-    /// tests and how many lines it can print.
+    /// Two nightlies reached the absorbing state after #310 and #323, each, by
+    /// its log, through an owner departure that [`kill_the_owner`] never
+    /// brackets. On 2026-09-12 an armed site in the hangup callback aborted a
+    /// process, and only a role holder runs that callback. The 2026-09-13 log
+    /// is consistent with a role holder leaving through its own operation cap,
+    /// which it did not record. Neither log could say who was attached at the
+    /// instant that mattered. Five instruments print under this prefix, and
+    /// each one says beside it which hypothesis it tests and how many lines it
+    /// can print.
     ///
     /// **None of them may change what the run does.** No RNG draw is added or
     /// moved, so a seeded run replays the same decisions. No predicate, floor,
     /// deferral, detach, cap, kill or teardown decision is touched. No sleep is
-    /// added. Nothing reads `/proc` or a file on the per-operation path.
+    /// added. Nothing reads `/proc` or a file on the per-operation path. The
+    /// children write two diagnostic ledgers, each only on a path that is
+    /// already rare: [`role_left_path`] at a role holder's cap exit, after its
+    /// `Tree` is dropped, and [`slow_join_claims_path`] on a join that has
+    /// already taken more than [`SLOW_JOIN`].
+    ///
+    /// **Every line is one `write(2)`**, the driver's through [`driver_diag`]
+    /// and the children's through [`child_diag`]. A line longer than `PIPE_BUF`
+    /// (4096 bytes on Linux) is still not atomic against another writer on the
+    /// same pipe: the kernel may place that writer's bytes inside it. A
+    /// population line at a large `--children` can be that long.
     ///
     /// `tests/torture.rs` finds its numbers by phrase: ` kills, ` anywhere in a
     /// line, `§3.5 owner kill 1:`, `UNRECOVERABLE`, `a fresh process joined`,
@@ -1385,9 +1410,14 @@ mod imp {
     /// reader rather than the events. A stamp taken by the writer is the only
     /// order the two streams share.
     fn wall_stamp() -> String {
-        let d = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+        stamp_of(std::time::SystemTime::now())
+    }
+
+    /// [`wall_stamp`] for an instant already captured, so a site that must
+    /// not format inside a measured interval can take the clock there and
+    /// format later.
+    fn stamp_of(t: std::time::SystemTime) -> String {
+        let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
     }
 
@@ -1398,10 +1428,34 @@ mod imp {
     /// one line (`child shm_torture: child 6258 could not join: 6257 could not
     /// join`). A pipe write under `PIPE_BUF` is atomic, so one pre-formatted
     /// buffer keeps these lines parseable, for the reason
-    /// [`record_inheritance`] gives about `O_APPEND`.
+    /// [`record_inheritance`] gives about `O_APPEND`. `Stderr` is unbuffered,
+    /// so the buffer reaches the descriptor whole.
     fn child_diag(body: &str) {
         let line = format!("{DIAG} {body}\n");
-        let _ = std::io::stderr().write_all(line.as_bytes());
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+    }
+
+    /// One diagnostic line from the driver, written as **one** `write(2)`.
+    ///
+    /// **`println!` is two writes for a long line.** `Stdout` is a
+    /// `LineWriter` over a 1024-byte buffer, and `println!` hands it the
+    /// formatted body and the newline as separate pieces. A body longer than
+    /// the buffer and holding no newline goes straight to the descriptor, and
+    /// the newline follows in a second `write(2)`, so a child's stderr line
+    /// can land between them when both streams are one pipe. A population line
+    /// is longer than 1024 bytes at six children. Here the body and its
+    /// newline are one buffer: the `LineWriter` flushes what it holds, which a
+    /// driver that only ever prints whole lines leaves empty, and passes a
+    /// buffer ending in a newline to the descriptor in one call. `write_all`
+    /// loops only on a short write. That, and a line past `PIPE_BUF`, are the
+    /// two ways this line can still be split; see [`DIAG`].
+    fn driver_diag(line: &str) {
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(buf.as_bytes());
+        let _ = out.flush();
     }
 
     /// `State/CoreDumping/Threads/wchan` for one process, read from
@@ -1639,17 +1693,245 @@ mod imp {
         }
     }
 
+    /// One reap as it happened: the status and two clock reads, and nothing
+    /// that touches a file.
+    ///
+    /// Taken at the `wait()` itself, and formatted later by [`reap_diag`]. So
+    /// a site inside a measured interval, [`kill_the_owner`]'s kill window
+    /// above all, pays two vDSO clock reads there and nothing else: no `/proc`
+    /// read, no allocation, no write.
+    #[derive(Clone, Copy)]
+    struct Reaped {
+        status: std::process::ExitStatus,
+        at: Instant,
+        wall: std::time::SystemTime,
+    }
+
+    impl Reaped {
+        fn now(status: std::process::ExitStatus) -> Reaped {
+            Reaped {
+                status,
+                at: Instant::now(),
+                wall: std::time::SystemTime::now(),
+            }
+        }
+    }
+
+    /// Everything [`reap_diag`] needs about one reaped child, owned, so the
+    /// `Kid` can be dropped or kept as its site already does.
+    struct Reap {
+        site: &'static str,
+        slot: Option<usize>,
+        pid: u32,
+        crash_at: Option<String>,
+        dump: DumpPoll,
+        reaped: Reaped,
+    }
+
+    impl Reap {
+        /// For a site outside any measured interval. Clones `crash_at`.
+        fn of(site: &'static str, slot: Option<usize>, kid: &Kid, reaped: Reaped) -> Reap {
+            Reap {
+                site,
+                slot,
+                pid: kid.proc.id(),
+                crash_at: kid.crash_at.clone(),
+                dump: DumpPoll::of(kid),
+                reaped,
+            }
+        }
+
+        /// For a site inside [`kill_the_owner`]'s kill window. **Moves**
+        /// `crash_at` out of a `Kid` its caller drops on the next line, so the
+        /// capture does not allocate either.
+        fn taken_from(
+            site: &'static str,
+            slot: Option<usize>,
+            kid: &mut Kid,
+            reaped: Reaped,
+        ) -> Reap {
+            let dump = DumpPoll::of(kid);
+            Reap {
+                site,
+                slot,
+                pid: kid.proc.id(),
+                crash_at: kid.crash_at.take(),
+                dump,
+                reaped,
+            }
+        }
+    }
+
+    /// Where a worker that held the rendezvous role records **that it left the
+    /// role alive**, one line per departure, `<pid>`. Diagnostic only.
+    ///
+    /// # Why instrument 5 needs a ledger, and not the marker
+    ///
+    /// Instrument 5 first asked the `owner.pid` marker at the reap whether it
+    /// named the reaped pid. A migration on this host completes in about a
+    /// millisecond and the heir publishes the marker as it completes, while
+    /// the driver reaps once per round, so a death the fleet recovered from
+    /// within that round was reaped under the next holder's marker and the tag
+    /// did not fire. Sampling the marker once per round and keeping every pid
+    /// it named would survive that, and is still wrong twice.
+    /// [`inherited_pids`] explains the first: the role can turn over faster
+    /// than a round, so a sample has holes, and the ledger the heirs write has
+    /// none.
+    ///
+    /// The second is that **a worker can stop holding the role and go on
+    /// living.** A worker takes the role only by inheriting, and
+    /// [`record_inheritance`] appends one line per inheritance. It gives the
+    /// role up alive in one place: the operation cap at the end of [`work`],
+    /// once `MAX_OWNER_CAP_EXTENSIONS` has run out. (The detach arm is gated on
+    /// the marker naming somebody else, which it cannot while this process
+    /// holds the role, and `work`'s early return comes before the first
+    /// operation, so before any inheritance by that attachment.) The process
+    /// does not exit there: [`child`] drops the `Tree` and joins again, under
+    /// the same pid, as an ordinary participant, and it can later die as one.
+    /// Control (a) of 2026-09-13 shows three such departures in 90 s. A tag
+    /// that fired on "this pid was once named" would call that later death an
+    /// owner's. A temporary mutant that aborted a worker 300 ms after its cap
+    /// exit was reaped here with
+    /// `role=held-earlier-and-left-alive(inherited=1,left-alive=1)` and no tag.
+    ///
+    /// So the attribution is a count: **a worker held the role when it exited
+    /// exactly when its inheritances outnumber its departures.** The creating
+    /// owner child never appears in either ledger and needs neither: it runs no
+    /// `work` loop, so it holds the role from creation until it exits.
+    ///
+    /// Appended after the `Tree` is dropped, so the write cannot lengthen the
+    /// tenure. That leaves one gap between the drop and the append, in which a
+    /// process that ends reads as having held the role. An abort inside the
+    /// drop ends it there, and that is a role holder dying as it leaves. So
+    /// does the driver's `SIGKILL`, and of the driver's kill sites only
+    /// teardown's batch consults these ledgers: a batch kill landing in that
+    /// gap, microseconds wide, would print `role-holder-in-teardown-batch`
+    /// about a process that had just left the role. Appended with one
+    /// `write(2)`, for [`record_inheritance`]'s reason.
+    fn role_left_path(dir: &Path) -> PathBuf {
+        dir.join("diag_role_left.log")
+    }
+
+    fn record_role_left(dir: &Path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(role_left_path(dir))
+        {
+            let _ = f.write_all(format!("{}\n", std::process::id()).as_bytes());
+        }
+    }
+
+    /// The two role ledgers and the marker, read once for a reap or a
+    /// teardown.
+    struct RoleLedgers {
+        inherited: Vec<u32>,
+        left: Vec<u32>,
+        marker: Option<u32>,
+    }
+
+    impl RoleLedgers {
+        /// Three small file reads in the driver. Called only where a line may
+        /// follow: at the reap of a child that exited on its own, which in this
+        /// harness is an abort, a violation or a harness error, and once at
+        /// teardown after the last child is reaped.
+        fn read(dir: &Path) -> RoleLedgers {
+            RoleLedgers {
+                inherited: inherited_pids(dir),
+                left: std::fs::read_to_string(role_left_path(dir))
+                    .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+                    .unwrap_or_default(),
+                marker: read_owner_pid(dir),
+            }
+        }
+
+        fn of(&self, pid: u32, creator: bool) -> RoleAtReap {
+            RoleAtReap::Read {
+                creator,
+                inherited: self.inherited.iter().filter(|&&p| p == pid).count(),
+                left: self.left.iter().filter(|&&p| p == pid).count(),
+                marker: self.marker,
+            }
+        }
+    }
+
+    /// What the driver knows, at a reap, about the reaped process and the
+    /// rendezvous role. See [`role_left_path`] for the argument.
+    #[derive(Clone, Copy)]
+    enum RoleAtReap {
+        /// Not read: the driver killed this process knowing what it was, as
+        /// the role holder in [`kill_the_owner`], as an ordinary draw that
+        /// skips the marker's pid, or as an owner child that never came up.
+        NotAsked,
+        Read {
+            /// The creating owner child.
+            creator: bool,
+            /// Lines naming this pid in [`inherited_path`].
+            inherited: usize,
+            /// Lines naming this pid in [`role_left_path`].
+            left: usize,
+            /// The marker when the ledgers were read.
+            marker: Option<u32>,
+        },
+    }
+
+    impl RoleAtReap {
+        fn held(self) -> bool {
+            match self {
+                RoleAtReap::NotAsked => false,
+                RoleAtReap::Read {
+                    creator,
+                    inherited,
+                    left,
+                    ..
+                } => creator || inherited > left,
+            }
+        }
+
+        fn field(self, pid: u32) -> String {
+            match self {
+                RoleAtReap::NotAsked => "role=not-asked".to_string(),
+                RoleAtReap::Read {
+                    creator,
+                    inherited,
+                    left,
+                    marker,
+                } => {
+                    let counts = format!("(inherited={inherited},left-alive={left})");
+                    let role = if creator {
+                        "held-at-exit(creating-owner)".to_string()
+                    } else if inherited > left {
+                        format!("held-at-exit{counts}")
+                    } else if inherited > 0 {
+                        format!("held-earlier-and-left-alive{counts}")
+                    } else {
+                        "never-held".to_string()
+                    };
+                    let marker = match marker {
+                        Some(m) if m == pid => "names-this-pid".to_string(),
+                        Some(m) => format!("no-longer-this-pid(now={m})"),
+                        None => "none".to_string(),
+                    };
+                    format!("role={role} marker={marker}")
+                }
+            }
+        }
+    }
+
     /// **Instrument 5: owner deaths nothing scheduled, and every reaped abort.**
     ///
     /// Hypothesis (2026-09-12): the heir armed at
     /// `hangup.after_probe_before_cas` died inside its own serving thread, and
     /// [`reap_finished`] counted it as an ordinary abort. Nothing said that
-    /// process held the role. `unscheduled_marker` is the owner marker at a
-    /// reap the driver did not cause, or `None` where the driver killed the
-    /// process itself. `last_pid` lets consecutive lines show how many pids
-    /// went by around an abort, which hints at a core-dump helper chain.
-    /// `dump_seen` is how long before the reap the once-a-round poll first saw
-    /// `CoreDumping: 1`, when it saw it at all.
+    /// process held the role. `role` says whether it held the role when it
+    /// exited, from the ledgers ([`role_left_path`]), and what the marker names
+    /// now. `held_tag` is the tag a held role earns at this site, or `None`
+    /// where holding the role is expected and prints nothing by itself.
+    /// `last_pid` lets consecutive lines show how many pids went by around an
+    /// abort, which hints at a core-dump helper chain; it is read when the
+    /// line is formatted, which at an owner kill is after the migration's
+    /// measured intervals. `dump_seen` is how long before the reap the poll
+    /// first saw `CoreDumping: 1`, when it saw it at all.
     ///
     /// **A child `SIGKILL`ed while it dumps reaps as `SIGKILL`, not
     /// `SIGABRT`.** Measured on 6.8 with a pipe `core_pattern`: an abort left
@@ -1662,48 +1944,45 @@ mod imp {
     /// as aborted. The instrument reports that and does not change it.
     ///
     /// Bound: at most one line per reaped child that aborted, that the poll saw
-    /// dumping, or that exited on its own while the marker named it. Only an
-    /// armed crash site, a violation or a failed owner child ends a child
-    /// without a driver kill.
-    fn reap_diag(
-        site: &str,
-        slot: Option<usize>,
-        pid: u32,
-        crash_at: Option<&str>,
-        dump: DumpPoll,
-        status: std::process::ExitStatus,
-        unscheduled_marker: Option<u32>,
-    ) -> Option<String> {
+    /// dumping, or that held the role at a site whose `held_tag` is set. Only
+    /// an armed crash site, a violation or a failed child ends a child without
+    /// a driver kill, and teardown's batch holds the role holder back.
+    fn reap_diag(r: &Reap, role: RoleAtReap, held_tag: Option<&str>) -> Option<String> {
         use std::os::unix::process::ExitStatusExt as _;
+        let status = r.reaped.status;
         let abort = status.signal() == Some(libc::SIGABRT);
-        let owner = unscheduled_marker == Some(pid);
-        let seen_dumping = matches!(dump, DumpPoll::SeenAt(_));
-        if !abort && !owner && !seen_dumping {
+        let held = held_tag.is_some() && role.held();
+        let seen_dumping = matches!(r.dump, DumpPoll::SeenAt(_));
+        if !abort && !held && !seen_dumping {
             return None;
         }
         Some(format!(
-            "{DIAG} reap{}{} site={site} slot={} pid={pid} status=`{status}` core_dumped={} \
-             armed={} stamp={} last_pid={} dump_seen={}",
-            if owner {
-                " unscheduled-owner-death (the marker names this pid)"
-            } else {
-                ""
+            "{DIAG} reap{}{} site={} slot={} pid={} status=`{status}` core_dumped={} armed={} \
+             {} stamp={} last_pid={} dump_seen={}",
+            match held_tag {
+                Some(tag) if held => format!(" {tag}"),
+                _ => String::new(),
             },
             if seen_dumping && status.signal() == Some(libc::SIGKILL) {
                 " was-dumping-when-killed"
             } else {
                 ""
             },
-            slot.map_or_else(|| "-".to_string(), |s| s.to_string()),
+            r.site,
+            r.slot.map_or_else(|| "-".to_string(), |s| s.to_string()),
+            r.pid,
             status.core_dumped(),
-            crash_at.unwrap_or("no"),
-            wall_stamp(),
+            r.crash_at.as_deref().unwrap_or("no"),
+            role.field(r.pid),
+            stamp_of(r.reaped.wall),
             last_pid(),
-            match dump {
+            match r.dump {
                 DumpPoll::NotPolled => "not-polled".to_string(),
                 DumpPoll::NeverSeen => "never(polled once per driver round)".to_string(),
-                DumpPoll::SeenAt(t) =>
-                    format!("{:.1}ms-before-reap", t.elapsed().as_secs_f64() * 1e3),
+                DumpPoll::SeenAt(t) => format!(
+                    "{:.1}ms-before-reap",
+                    r.reaped.at.saturating_duration_since(t).as_secs_f64() * 1e3
+                ),
             }
         ))
     }
@@ -1712,10 +1991,11 @@ mod imp {
     /// **armed** child, because in this harness only an armed site aborts: a
     /// plain soak does no per-round `/proc` read at all. It records the first
     /// round at which the child showed `CoreDumping: 1`, so that
-    /// [`reap_diag`] can bracket the dump.
+    /// [`reap_diag`] can bracket the dump. [`drive`]'s teardown also calls it
+    /// once, immediately before it kills the role holder last; see there.
     ///
     /// Bound: no output of its own. At most one `/proc` read per armed child
-    /// per round.
+    /// per round, and one more for an armed role holder at teardown.
     fn note_core_dumping(kid: &mut Kid) {
         if kid.crash_at.is_some() && kid.dumping_seen.is_none() && proc_core_dumping(kid.proc.id())
         {
@@ -1738,6 +2018,89 @@ mod imp {
 
     /// Instrument 4's per-process line cap.
     const SLOW_JOIN_LINES: u32 = 20;
+
+    /// Instrument 4's **run-wide** line cap, shared by every child.
+    ///
+    /// The per-process cap alone bounds nothing a reader wants, because a
+    /// replacement for a killed child is a new process with a fresh cap: a
+    /// 30-minute nightly at 6 Hz spawns about 10 800 of them. Two hundred
+    /// lines is enough to see whether stalls are common-mode, which is the
+    /// hypothesis, and the driver prints how many lines either cap withheld
+    /// ([`slow_join_budget_line`]).
+    const SLOW_JOIN_RUN_LINES: u64 = 200;
+
+    /// Instrument 4's run-wide budget, one byte per line claimed, shared
+    /// across processes with no lock and no `unsafe`.
+    ///
+    /// A child appends one byte through an `O_APPEND` descriptor of its own
+    /// and reads that descriptor's offset back. The append positions itself at
+    /// the end of the file and writes under the inode's lock, and it leaves the
+    /// descriptor's offset just past that byte, so the offset read back is the
+    /// byte's position plus one: this line's run-wide number, which no other
+    /// child can also be given. A child killed between its append and its
+    /// line has claimed a number it never printed, which only under-fills the
+    /// budget.
+    ///
+    /// Touched only on the already-slow path: a join past [`SLOW_JOIN`] that
+    /// has not already been accounted for in its episode, by a process still
+    /// under its own [`SLOW_JOIN_LINES`].
+    fn slow_join_claims_path(dir: &Path) -> PathBuf {
+        dir.join("diag_slow_join.claims")
+    }
+
+    /// Instrument 4's lines withheld by a process's own [`SLOW_JOIN_LINES`],
+    /// one byte each. The run-wide cap needs no such file: its withheld lines
+    /// are the claims past [`SLOW_JOIN_RUN_LINES`].
+    fn slow_join_withheld_path(dir: &Path) -> PathBuf {
+        dir.join("diag_slow_join.withheld")
+    }
+
+    /// Claim this line's run-wide number, or `None` when the budget is spent
+    /// or the claim could not be written. A claim that could not be written is
+    /// neither printed nor counted.
+    fn claim_slow_join_line(dir: &Path) -> Option<u64> {
+        use std::io::Seek as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(slow_join_claims_path(dir))
+            .ok()?;
+        f.write_all(b".").ok()?;
+        let n = f.stream_position().ok()?;
+        (n <= SLOW_JOIN_RUN_LINES).then_some(n)
+    }
+
+    fn record_slow_join_withheld(dir: &Path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(slow_join_withheld_path(dir))
+        {
+            let _ = f.write_all(b".");
+        }
+    }
+
+    /// The driver's closing line for instrument 4, when either cap withheld
+    /// anything. Read before the scratch directory is removed, like
+    /// `trigger_outcomes`. `None` when nothing was withheld, so a run whose
+    /// budget held prints nothing extra.
+    fn slow_join_budget_line(dir: &Path) -> Option<String> {
+        let bytes = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let claimed = bytes(slow_join_claims_path(dir));
+        let past_run_cap = claimed.saturating_sub(SLOW_JOIN_RUN_LINES);
+        let past_process_cap = bytes(slow_join_withheld_path(dir));
+        if past_run_cap + past_process_cap == 0 {
+            return None;
+        }
+        Some(format!(
+            "{DIAG} slow-join budget: {} line(s) withheld, {past_run_cap} past the run-wide cap of \
+             {SLOW_JOIN_RUN_LINES} and {past_process_cap} past a process's own cap of \
+             {SLOW_JOIN_LINES}; {} line number(s) were claimed within the run-wide cap (a child \
+             killed between its claim and its write printed none)",
+            past_run_cap + past_process_cap,
+            claimed.min(SLOW_JOIN_RUN_LINES),
+        ))
+    }
 
     /// **Instrument 4: one trip from holding no `Tree` to holding one.**
     ///
@@ -1765,7 +2128,9 @@ mod imp {
         /// only when the variable was set.
         exec: Option<Duration>,
         /// `started` to the first attempt: the `Tree` drop for a rejoin, and
-        /// argument parsing plus ballast for a first join.
+        /// argument parsing plus ballast for a first join. After a role
+        /// holder's cap exit it also holds instrument 3's two writes, which
+        /// [`child`] makes after the drop.
         lead: Duration,
         /// [`record_attachment`] and the marker read, summed over attempts.
         pre_open: Duration,
@@ -1775,7 +2140,10 @@ mod imp {
         backoff: Duration,
         attempts: u32,
         first_refusal: Option<tf_tree::OpenError>,
-        refusal_printed: bool,
+        /// Whether this episode's refusal has been printed **or withheld**, so
+        /// a refusal loop claims from the budget once rather than once per
+        /// attempt.
+        refusal_reported: bool,
     }
 
     impl JoinEpisode {
@@ -1790,7 +2158,7 @@ mod imp {
                 backoff: Duration::ZERO,
                 attempts: 0,
                 first_refusal: None,
-                refusal_printed: false,
+                refusal_reported: false,
             }
         }
 
@@ -1816,38 +2184,56 @@ mod imp {
             )
         }
 
-        /// A refused attempt. It prints once per episode, and only when the
-        /// episode has already passed [`SLOW_JOIN`].
-        fn refused(&mut self, e: tf_tree::OpenError, lines: &mut u32) {
+        /// Both caps, in order: this process's own first, so a process that
+        /// has spent its twenty does not also spend the run's. Returns this
+        /// process's and the run's line numbers, or `None` when either cap
+        /// withholds the line.
+        fn claim(dir: &Path, lines: &mut u32) -> Option<(u32, u64)> {
+            if *lines >= SLOW_JOIN_LINES {
+                record_slow_join_withheld(dir);
+                return None;
+            }
+            let run_line = claim_slow_join_line(dir)?;
+            *lines += 1;
+            Some((*lines, run_line))
+        }
+
+        /// A refused attempt. It is accounted for once per episode, and only
+        /// when the episode has already passed [`SLOW_JOIN`].
+        fn refused(&mut self, e: tf_tree::OpenError, lines: &mut u32, dir: &Path) {
             self.first_refusal.get_or_insert(e);
-            if self.refusal_printed || *lines >= SLOW_JOIN_LINES || self.total() <= SLOW_JOIN {
+            if self.refusal_reported || self.total() <= SLOW_JOIN {
                 return;
             }
-            self.refusal_printed = true;
-            *lines += 1;
+            self.refusal_reported = true;
+            let Some((line, run_line)) = Self::claim(dir, lines) else {
+                return;
+            };
             child_diag(&format!(
                 "join-refused pid={} kind={} since_ms={:.1} {} attempt={} error={e:?} stamp={} \
-                 line={}/{SLOW_JOIN_LINES}",
+                 line={line}/{SLOW_JOIN_LINES} run_line={run_line}/{SLOW_JOIN_RUN_LINES}",
                 std::process::id(),
                 self.kind,
                 self.total().as_secs_f64() * 1e3,
                 self.splits(),
                 self.attempts,
                 wall_stamp(),
-                *lines,
             ));
         }
 
-        /// A successful attach. It prints when the whole trip passed
+        /// A successful attach. It is accounted for when the whole trip passed
         /// [`SLOW_JOIN`].
-        fn joined(&self, lines: &mut u32) {
-            if *lines >= SLOW_JOIN_LINES || self.total() <= SLOW_JOIN {
+        fn joined(&self, lines: &mut u32, dir: &Path) {
+            if self.total() <= SLOW_JOIN {
                 return;
             }
-            *lines += 1;
+            let Some((line, run_line)) = Self::claim(dir, lines) else {
+                return;
+            };
             child_diag(&format!(
                 "slow-join pid={} kind={} total_ms={:.1} {} attempts={} outcome=joined \
-                 first_refusal={} stamp={} line={}/{SLOW_JOIN_LINES}",
+                 first_refusal={} stamp={} line={line}/{SLOW_JOIN_LINES} \
+                 run_line={run_line}/{SLOW_JOIN_RUN_LINES}",
                 std::process::id(),
                 self.kind,
                 self.total().as_secs_f64() * 1e3,
@@ -1856,7 +2242,6 @@ mod imp {
                 self.first_refusal
                     .map_or_else(|| "none".to_string(), |e| format!("{e:?}")),
                 wall_stamp(),
-                *lines,
             ));
         }
     }
@@ -1941,6 +2326,8 @@ mod imp {
                 });
             }
             let status = proc.wait().ok();
+            // [diag] Instrument 5's two clock reads, taken at the reap.
+            let reaped = status.map(Reaped::now);
             #[cfg(unix)]
             if let Some(st) = status {
                 use std::os::unix::process::ExitStatusExt as _;
@@ -1949,20 +2336,20 @@ mod imp {
                 }
             }
             // [diag] Instrument 5, for an owner child that aborted before
-            // `ready`. There is no marker yet, so only the abort half applies.
-            // Bound: at most six lines, one per attempt.
-            if let Some(line) = status.and_then(|st| {
-                reap_diag(
-                    "owner-startup",
-                    None,
-                    proc.id(),
-                    crash_at.as_deref(),
-                    DumpPoll::NotPolled,
-                    st,
-                    None,
-                )
+            // `ready`. It never served, so it never held the role and the
+            // ledgers are not read. Bound: at most six lines, one per attempt.
+            if let Some(line) = reaped.and_then(|reaped| {
+                let reap = Reap {
+                    site: "owner-startup",
+                    slot: None,
+                    pid: proc.id(),
+                    crash_at: crash_at.clone(),
+                    dump: DumpPoll::NotPolled,
+                    reaped,
+                };
+                reap_diag(&reap, RoleAtReap::NotAsked, None)
             }) {
-                println!("{line}");
+                driver_diag(&line);
             }
             last = format!(
                 "attempt {}: the owner child exited before reporting ready ({:?}){}",
@@ -2076,7 +2463,7 @@ mod imp {
             dir.display()
         );
         // [diag] Instrument 1. See `host_diag`. Bound: one line.
-        println!("{}", host_diag());
+        driver_diag(&host_diag());
         if a.inject {
             println!(
                 "  --inject-violation: one child publishes a corrupt transform on purpose. \
@@ -2289,22 +2676,19 @@ mod imp {
                         // [diag] Instrument 2, at every deferral. The starved
                         // stop is a deferral too, so it is covered here. See
                         // `population_diag`. Bound: one line per deferral.
-                        println!(
-                            "{}",
-                            population_diag(
-                                &format!(
-                                    "at deferral of owner kill {} (consecutive {}/{}, \
-                                     starved={starved})",
-                                    m.n, consecutive_deferrals, MAX_CONSECUTIVE_DEFERRALS
-                                ),
-                                "pre-kill census",
-                                &dir,
-                                &observer,
-                                owner_kid.as_ref(),
-                                &kids,
-                                &m.before_seen,
-                            )
-                        );
+                        driver_diag(&population_diag(
+                            &format!(
+                                "at deferral of owner kill {} (consecutive {}/{}, \
+                                 starved={starved})",
+                                m.n, consecutive_deferrals, MAX_CONSECUTIVE_DEFERRALS
+                            ),
+                            "pre-kill census",
+                            &dir,
+                            &observer,
+                            owner_kid.as_ref(),
+                            &kids,
+                            &m.before_seen,
+                        ));
                         if starved || consecutive_deferrals >= MAX_CONSECUTIVE_DEFERRALS {
                             wedge = Some(format!(
                                 "owner kill {} could not be attempted and the deferral did not \
@@ -2372,18 +2756,15 @@ mod imp {
                             // The census is the post-reap one that read 0; the
                             // `/proc` fields come from after the recovery
                             // deadline. Bound: one line, because the run stops.
-                            println!(
-                                "{}",
-                                population_diag(
-                                    &format!("at unrecovered owner kill {}", m.n),
-                                    "post-reap census",
-                                    &dir,
-                                    &observer,
-                                    owner_kid.as_ref(),
-                                    &kids,
-                                    &m.at_kill_seen,
-                                )
-                            );
+                            driver_diag(&population_diag(
+                                &format!("at unrecovered owner kill {}", m.n),
+                                "post-reap census",
+                                &dir,
+                                &observer,
+                                owner_kid.as_ref(),
+                                &kids,
+                                &m.at_kill_seen,
+                            ));
                             let tally = trigger_tally_line(&dir);
                             wedge = Some(format!(
                                 "owner kill {} left the arena in an UNRECOVERABLE state, and the \
@@ -2471,20 +2852,14 @@ mod imp {
                     // [diag] Instrument 5 at a driver kill. A draw victim that
                     // had aborted, and was still dumping or already dead, is
                     // reaped here and counted as an ordinary kill. See
-                    // `reap_diag` for why the status alone cannot show it.
+                    // `reap_diag` for why the status alone cannot show it. The
+                    // draw skips the marker's pid, so the ledgers are not read.
                     // Bound: one line per such draw.
                     if let Some(line) = reaped.ok().and_then(|st| {
-                        reap_diag(
-                            "ordinary-draw",
-                            Some(victim),
-                            kid.proc.id(),
-                            kid.crash_at.as_deref(),
-                            DumpPoll::of(kid),
-                            st,
-                            None,
-                        )
+                        let reap = Reap::of("ordinary-draw", Some(victim), kid, Reaped::now(st));
+                        reap_diag(&reap, RoleAtReap::NotAsked, None)
                     }) {
-                        println!("{line}");
+                        driver_diag(&line);
                     }
                     kids[victim] = None;
                     kills += 1;
@@ -2555,11 +2930,25 @@ mod imp {
             }
             let _ = kid.proc.kill();
         }
-        for kid in kids.iter_mut().flatten() {
+        // [diag] Instrument 5 at teardown. Neither teardown pass had a reap
+        // line, so a child that had aborted, or was still dumping core, when
+        // teardown killed it was invisible. Each wait keeps its status and two
+        // clock reads and nothing else; the lines are formatted and written
+        // after `check_recovery`, once every child is reaped. The vector is
+        // sized after the signals, so no allocation sits between two of them.
+        // Bound: one line per batch child that aborted, that the poll saw
+        // dumping, or that the ledgers say held the role, which the batch is
+        // built to hold back, so a normal teardown prints none (up to the
+        // microsecond gap `role_left_path` names).
+        let mut batch_reaps: Vec<(usize, Reaped)> = Vec::with_capacity(kids.len());
+        for (i, kid) in kids.iter_mut().enumerate() {
+            let Some(kid) = kid else { continue };
             if Some(kid.proc.id()) == current_owner {
                 continue;
             }
-            let _ = kid.proc.wait();
+            if let Ok(st) = kid.proc.wait() {
+                batch_reaps.push((i, Reaped::now(st)));
+            }
         }
         // **What a run that migrated cannot pin, and it is a limit rather than a
         // caveat.** Two things are true of the heir and both cut the same way.
@@ -2697,22 +3086,58 @@ mod imp {
         }
         // The owner last, wherever it lives — the original owner child on a run
         // that never migrated, a worker slot on one that did.
+        //
+        // [diag] **Instrument 5 for the role holder, which dies here.** The
+        // batch's hangups run this process's hangup callback, so an armed
+        // holder can abort *during* teardown, and its core dump can outlast
+        // the 200 ms above (this host's dumps were seen 0.5–1.2 s before their
+        // reaps): the kill below then reaps it as `SIGKILL` with no core. No
+        // driver round polls between the batch and this kill, so
+        // `note_core_dumping` is called once more, immediately before it: one
+        // `/proc` read, for an armed holder only, so a plain soak's teardown
+        // reads nothing. The line prints only for an abort or a dump, since
+        // this process is expected to hold the role. Bound: one line.
+        let mut owner_last: Option<(Option<usize>, Reaped)> = None;
         if let Some(pid) = current_owner {
             if owner_kid.as_ref().is_some_and(|k| k.proc.id() == pid) {
                 if let Some(kid) = owner_kid.as_mut() {
+                    note_core_dumping(kid);
                     let _ = kid.proc.kill();
-                    let _ = kid.proc.wait();
+                    if let Ok(st) = kid.proc.wait() {
+                        owner_last = Some((None, Reaped::now(st)));
+                    }
                 }
             } else {
-                for slot in kids.iter_mut() {
+                for (i, slot) in kids.iter_mut().enumerate() {
                     if slot.as_ref().is_some_and(|k| k.proc.id() == pid) {
                         if let Some(kid) = slot.as_mut() {
+                            note_core_dumping(kid);
                             let _ = kid.proc.kill();
-                            let _ = kid.proc.wait();
+                            if let Ok(st) = kid.proc.wait() {
+                                owner_last = Some((Some(i), Reaped::now(st)));
+                            }
                         }
                         break;
                     }
                 }
+            }
+        }
+        // [diag] What the teardown lines need from each `Kid`, taken before the
+        // drop below. `true` marks the role holder killed last.
+        let mut teardown_reaps: Vec<(Reap, bool)> = batch_reaps
+            .into_iter()
+            .filter_map(|(i, reaped)| {
+                let kid = kids[i].as_ref()?;
+                Some((Reap::of("teardown-batch", Some(i), kid, reaped), false))
+            })
+            .collect();
+        if let Some((slot, reaped)) = owner_last {
+            let kid = match slot {
+                None => owner_kid.as_ref(),
+                Some(i) => kids[i].as_ref(),
+            };
+            if let Some(kid) = kid {
+                teardown_reaps.push((Reap::of("teardown-owner-last", slot, kid, reaped), true));
             }
         }
         // `Kid::drop` kills and waits, so this collects anything the two passes
@@ -2723,6 +3148,32 @@ mod imp {
 
         let recovery = check_recovery(&observer, &unreachable_by_hangup, hangup_collector_pinned);
         drop(observer);
+        // [diag] Instrument 5's teardown lines and instrument 4's closing line,
+        // written here: every child is reaped, the recovery check has run, and
+        // the ledgers are still on disk. In the batch, holding the role is the
+        // anomaly and earns a tag; for the process killed last it is the norm,
+        // and the ledgers only annotate an abort or a dump. The role holder
+        // killed last is the creating owner exactly when it lives in
+        // `owner_kid`, which is the `slot == None` case.
+        {
+            let ledgers = RoleLedgers::read(&dir);
+            for (reap, last) in &teardown_reaps {
+                let (role, tag) = if *last {
+                    (ledgers.of(reap.pid, reap.slot.is_none()), None)
+                } else {
+                    (
+                        ledgers.of(reap.pid, false),
+                        Some("role-holder-in-teardown-batch"),
+                    )
+                };
+                if let Some(line) = reap_diag(reap, role, tag) {
+                    driver_diag(&line);
+                }
+            }
+            if let Some(line) = slow_join_budget_line(&dir) {
+                driver_diag(&line);
+            }
+        }
         // **Read before the scratch directory is removed, printed long after.**
         // `Scratch::drop` deletes the runtime dir, and every ledger in it, on
         // the line below; the §3.5 summary that reports this is ~90 lines
@@ -3481,26 +3932,23 @@ mod imp {
         // [diag] Instrument 5 at a driver kill. An owner that aborted and is
         // still dumping holds its byte and counts in the census above, so this
         // kill is recorded as an ordinary migration. One that has already died
-        // reaps as `SIGABRT`. See `reap_diag`. The line is formatted at the
-        // reap and printed only after the window closes, so a write to stdout
-        // never widens the interval `kill_to_reaped` measures. Bound: at most
-        // one line per owner kill.
-        let mut abort_line: Option<String> = None;
+        // reaps as `SIGABRT`. See `reap_diag`.
+        //
+        // **Only the status and two clock reads are taken here.** This is
+        // inside `kill_to_reaped` and before the at-kill census, so the
+        // `/proc/loadavg` read, the formatting and the write all wait until
+        // this function has finished measuring: after the window closes and
+        // after the recovery probe, whose `recovered` a stalled stdout would
+        // otherwise shorten. `Reap::taken_from` moves `crash_at` out of the
+        // `Kid` dropped on the next line, so nothing here allocates. Bound: at
+        // most one line per owner kill.
+        let mut owner_reap: Option<Reap> = None;
         if owner_kid.as_ref().is_some_and(|k| k.proc.id() == pid) {
             if let Some(kid) = owner_kid.as_mut() {
                 let _ = kid.proc.kill();
-                let reaped = kid.proc.wait();
-                abort_line = reaped.ok().and_then(|st| {
-                    reap_diag(
-                        "owner-kill",
-                        None,
-                        pid,
-                        kid.crash_at.as_deref(),
-                        DumpPoll::of(kid),
-                        st,
-                        None,
-                    )
-                });
+                if let Ok(st) = kid.proc.wait() {
+                    owner_reap = Some(Reap::taken_from("owner-kill", None, kid, Reaped::now(st)));
+                }
             }
             *owner_kid = None;
             killed = true;
@@ -3509,18 +3957,14 @@ mod imp {
                 if slot.as_ref().is_some_and(|k| k.proc.id() == pid) {
                     if let Some(kid) = slot.as_mut() {
                         let _ = kid.proc.kill();
-                        let reaped = kid.proc.wait();
-                        abort_line = reaped.ok().and_then(|st| {
-                            reap_diag(
+                        if let Ok(st) = kid.proc.wait() {
+                            owner_reap = Some(Reap::taken_from(
                                 "owner-kill",
                                 Some(i),
-                                pid,
-                                kid.crash_at.as_deref(),
-                                DumpPoll::of(kid),
-                                st,
-                                None,
-                            )
-                        });
+                                kid,
+                                Reaped::now(st),
+                            ));
+                        }
                     }
                     *slot = None;
                     killed = true;
@@ -3562,9 +4006,6 @@ mod imp {
         // From this instant the survivors churn again, and one of them is about
         // to inherit; see [`close_kill_window`] for why it closes here.
         close_kill_window(dir);
-        if let Some(line) = abort_line {
-            println!("{line}");
-        }
 
         // **Read and probe in one loop.** The observer keeps validating while
         // the role is vacant (§3.5's data-plane claim) and the fresh join is
@@ -3626,6 +4067,15 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        // [diag] Instrument 5's line for this kill, formatted and written now
+        // that nothing above is being timed. The driver killed the role holder
+        // on purpose, so the ledgers are not read.
+        if let Some(line) = owner_reap
+            .as_ref()
+            .and_then(|r| reap_diag(r, RoleAtReap::NotAsked, None))
+        {
+            driver_diag(&line);
+        }
         m
     }
 
@@ -3656,6 +4106,8 @@ mod imp {
         note_core_dumping(kid);
         match kid.proc.try_wait() {
             Ok(Some(status)) => {
+                // [diag] Instrument 5's two clock reads, taken at the reap.
+                let reaped = Reaped::now(status);
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::ExitStatusExt as _;
@@ -3663,20 +4115,19 @@ mod imp {
                         ledger.record_abort(kid.crash_at.as_deref());
                     }
                 }
-                // [diag] Instrument 5. The creating owner is the role holder
-                // until the first inheritance, and an armed one can end its own
-                // life with no driver kill. Bound: one line, since this child
-                // is reaped once.
-                if let Some(line) = reap_diag(
-                    "reap_owner",
-                    None,
-                    kid.proc.id(),
-                    kid.crash_at.as_deref(),
-                    DumpPoll::of(kid),
-                    status,
-                    read_owner_pid(dir),
-                ) {
-                    println!("{line}");
+                // [diag] Instrument 5. **The creating owner holds the role
+                // from creation until it exits**: it runs no `work` loop, so it
+                // has no cap and no detach arm, and `kill_the_owner` sets this
+                // slot to `None` when it kills it. So a child reaped here held
+                // the role when it died, whatever the marker names by now. An
+                // armed one can end its own life with no driver kill, and a
+                // survivor can inherit and publish before this round's reap,
+                // which is why the marker is printed and not asked. Bound: one
+                // line, since this child is reaped once.
+                let reap = Reap::of("reap_owner", None, kid, reaped);
+                let role = RoleLedgers::read(dir).of(reap.pid, true);
+                if let Some(line) = reap_diag(&reap, role, Some("unscheduled-owner-death")) {
+                    driver_diag(&line);
                 }
                 let _ = status;
                 *owner = None;
@@ -3698,6 +4149,8 @@ mod imp {
             note_core_dumping(kid);
             match kid.proc.try_wait() {
                 Ok(Some(status)) => {
+                    // [diag] Instrument 5's two clock reads, taken at the reap.
+                    let reaped = Reaped::now(status);
                     // **A child that aborted at an armed §11.3 site**, counted
                     // so a `--crash-points` run can say the sites *fired*
                     // rather than only that they were armed. Not a failure:
@@ -3725,19 +4178,16 @@ mod imp {
                     }
                     // [diag] Instrument 5. After a migration the role holder is
                     // a worker in `kids`, so an heir that aborts in its own
-                    // hangup callback is reaped here as an ordinary abort. That
-                    // was 2026-09-12's owner death. The marker is read only for
-                    // a child that has exited. Bound: one line per such reap.
-                    if let Some(line) = reap_diag(
-                        "reap_finished",
-                        Some(i),
-                        kid.proc.id(),
-                        kid.crash_at.as_deref(),
-                        DumpPoll::of(kid),
-                        status,
-                        read_owner_pid(dir),
-                    ) {
-                        println!("{line}");
+                    // hangup callback is reaped here as an ordinary abort,
+                    // which is where 2026-09-12's would have been. Whether this
+                    // worker held the role when it exited comes from the
+                    // ledgers, not from the marker: see `role_left_path`. They
+                    // are read only for a child that has exited on its own.
+                    // Bound: one line per such reap.
+                    let reap = Reap::of("reap_finished", Some(i), kid, reaped);
+                    let role = RoleLedgers::read(dir).of(reap.pid, false);
+                    if let Some(line) = reap_diag(&reap, role, Some("unscheduled-owner-death")) {
+                        driver_diag(&line);
                     }
                     *slot = None;
                 }
@@ -4805,7 +5255,8 @@ mod imp {
         // One `could not join` line per process; see the arm below.
         let mut reported = false;
         // [diag] Instrument 4: see `JoinEpisode`. Bound: `SLOW_JOIN_LINES` per
-        // process, and at most one refusal line and one join line per episode.
+        // process and `SLOW_JOIN_RUN_LINES` per run, and at most one refusal
+        // line and one join line per episode.
         let mut join = JoinEpisode::new("first-join", entered, exec);
         let mut slow_join_lines = 0u32;
 
@@ -4862,27 +5313,42 @@ mod imp {
                             std::process::id()
                         );
                     }
-                    join.refused(e, &mut slow_join_lines);
+                    join.refused(e, &mut slow_join_lines, &dir);
                     let backoff_started = Instant::now();
                     std::thread::sleep(Duration::from_millis(10 + rng.below(40)));
                     join.backoff += backoff_started.elapsed();
                     continue;
                 }
             };
-            join.joined(&mut slow_join_lines);
-            work(&tree, &dir, &mut rng, inject, readers_only, no_inherit)?;
+            join.joined(&mut slow_join_lines, &dir);
+            let cap_exit = work(&tree, &dir, &mut rng, inject, readers_only, no_inherit)?;
             // [diag] Instrument 4. The drop is spelled out rather than left to
             // the end of the block, where it happened at the same point, so the
             // next episode's `drop_ms` can time it. For an owner, the drop is
             // also what stops the serving thread.
             let detached = Instant::now();
             drop(tree);
+            // [diag] Instrument 3's two writes, after the drop so neither can
+            // lengthen the tenure `CapExit` reports. The ledger line is written
+            // only when this attachment inherited, which is the one way a
+            // worker leaves the role alive; see `role_left_path`. Both land in
+            // the next episode's `drop_ms`.
+            if let Some(exit) = cap_exit {
+                if exit.tenure.is_some() {
+                    record_role_left(&dir);
+                }
+                child_diag(&exit.line());
+            }
             join = JoinEpisode::new("rejoin", detached, None);
         }
     }
 
     /// The random-operation loop against one attachment. Returns when it decides
     /// to detach and re-join, which is §11.4's "attach/detach".
+    ///
+    /// `Some` is `[diag]` instrument 3's reading at a cap exit the marker names
+    /// or that follows an inheritance, for [`child`] to write once the `Tree`
+    /// is dropped. It decides nothing.
     fn work(
         tree: &Tree,
         dir: &Path,
@@ -4890,14 +5356,14 @@ mod imp {
         inject: bool,
         readers_only: bool,
         no_inherit: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<CapExit>> {
         // Interning can fail while another participant is mid-mutation; that is
         // not a violation, it is a retry.
         let mut ids = Vec::new();
         for (parent, child) in CHAIN {
             match (tree.frame(parent), tree.frame(child)) {
                 (Ok(p), Ok(c)) => ids.push((p, c)),
-                _ => return Ok(()),
+                _ => return Ok(None),
             }
         }
         let (map, tool) = (ids[0].0, ids[ids.len() - 1].1);
@@ -4924,7 +5390,7 @@ mod imp {
         // is the event this harness is built to require a recovery for, **or
         // until its extensions run out**, at which point it leaves exactly this
         // way. See [`MAX_OWNER_CAP_EXTENSIONS`] for why the extension is
-        // bounded and what that bound did on 2026-09-13.
+        // bounded and what that bound may have done on 2026-09-13.
         let mut extensions = 0u32;
         let mut ops_left: u32 = OPS_PER_ATTACHMENT;
         // Whether this attachment is already parked at its cap waiting for a
@@ -5123,7 +5589,7 @@ mod imp {
                             record_detach_skip(dir);
                             continue;
                         }
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
                 // Publish.
@@ -5238,8 +5704,8 @@ mod imp {
         //
         // Hypothesis (2026-09-13): H114 held the role past
         // `MAX_OWNER_CAP_EXTENSIONS` because two owner kills were deferred, and
-        // then left here. Dropping the `Tree` stopped the serving thread and
-        // freed byte 0 with no census, no kill window and no `Migration`. That
+        // then left here. Dropping the `Tree` stops the serving thread and
+        // frees byte 0 with no census, no kill window and no `Migration`. That
         // log could not say whether anybody was attached to inherit. The line
         // gives the pid, how long it held the role, and the attached slots by
         // identity as *this* process's attachment sees them immediately before
@@ -5256,33 +5722,82 @@ mod imp {
         // decision, so an inheritance taken in that last operation is caught
         // too. That is an unobserved owner departure all the same.
         //
-        // Bound: one line per attachment, and only an attachment whose process
-        // the marker names reaches it, so at most one per inheritance.
-        if read_owner_pid(dir) == Some(std::process::id()) {
+        // **The census is taken here, while still attached, and nothing is
+        // written.** [`child`] writes the line, and the `role_left_path` ledger
+        // line, after it has dropped the `Tree`, so a stalled stderr reader or
+        // a slow `/tmp` cannot lengthen the tenure being reported.
+        //
+        // Bound: one reading per attachment, and only an attachment whose
+        // process the marker names, or that inherited, reaches it, so at most
+        // one per inheritance.
+        let named = read_owner_pid(dir) == Some(std::process::id());
+        if named || inherited_at.is_some() {
             let mut h = RoundHealth::default();
             let mut seen = Vec::new();
             census_with(tree, &mut h, Some(&mut seen));
-            child_diag(&format!(
-                "role-holder-cap-exit pid={} attachment_ops={} extensions={}/{} tenure={} \
-                 attached_by_identity={} alive_other_than_self={} stamp={}",
-                std::process::id(),
-                u64::from(OPS_PER_ATTACHMENT) * u64::from(1 + extensions) + u64::from(cap_rechecks),
+            return Ok(Some(CapExit {
+                named,
+                attachment_ops: u64::from(OPS_PER_ATTACHMENT) * u64::from(1 + extensions)
+                    + u64::from(cap_rechecks),
                 extensions,
-                MAX_OWNER_CAP_EXTENSIONS,
-                inherited_at.map_or_else(
-                    || {
-                        "unknown(the marker names this pid but this attachment recorded no \
-                         inheritance)"
-                            .to_string()
-                    },
-                    |t| format!("{:.3}s", t.elapsed().as_secs_f64())
-                ),
-                seen_list(&seen, Some(std::os::unix::process::parent_id())),
-                h.slots_alive,
-                wall_stamp(),
-            ));
+                tenure: inherited_at.map(|t| t.elapsed()),
+                seen,
+                wall: std::time::SystemTime::now(),
+            }));
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// `[diag]` instrument 3's reading at a cap exit, taken in [`work`] while
+    /// the attachment is still held and written by [`child`] after the drop.
+    struct CapExit {
+        /// Whether the marker named this process at the cap exit.
+        named: bool,
+        attachment_ops: u64,
+        extensions: u32,
+        /// Since this attachment inherited. `None` when it did not, which with
+        /// `named` set means the marker named a process that this attachment
+        /// never made the role holder.
+        tenure: Option<Duration>,
+        /// The census's slots, excluding this process's own.
+        seen: Vec<SlotSeen>,
+        wall: std::time::SystemTime,
+    }
+
+    impl CapExit {
+        /// **`heirs_attached_after_exit` means what the driver's post-kill
+        /// count means** (`N after it` on a `§3.5 owner kill` line): read-write
+        /// participants alive other than the departing role holder and the
+        /// driver's observer, which never inherits. The census skips its own
+        /// slot and counts the observer's, and this line used to print that
+        /// raw figure as `alive_other_than_self`, one more than the heirs this
+        /// departure could leave behind. The driver is this process's parent.
+        /// The identity list still names the observer's slot, marked
+        /// `(driver)`.
+        fn line(&self) -> String {
+            let driver = std::os::unix::process::parent_id();
+            let heirs = self
+                .seen
+                .iter()
+                .filter(|s| s.alive && s.pid != Some(driver))
+                .count();
+            format!(
+                "role-holder-cap-exit pid={} marker_named_this_pid={} attachment_ops={} \
+                 extensions={}/{} tenure={} attached_by_identity={} \
+                 heirs_attached_after_exit={heirs} stamp={}",
+                std::process::id(),
+                self.named,
+                self.attachment_ops,
+                self.extensions,
+                MAX_OWNER_CAP_EXTENSIONS,
+                self.tenure.map_or_else(
+                    || "unknown(this attachment recorded no inheritance)".to_string(),
+                    |t| format!("{:.3}s", t.as_secs_f64())
+                ),
+                seen_list(&self.seen, Some(driver)),
+                stamp_of(self.wall),
+            )
+        }
     }
 
     /// A random rigid transform — or, under `--inject-violation`, one that is
