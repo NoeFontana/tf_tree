@@ -1467,7 +1467,8 @@ tft_status tft_plan_at_with_derivatives(const tft_plan *plan,
  * index `0` can mean "root / no parent". Passing `0` to
  * [`tft_tree_frame_name`] is therefore `TFT_ERR_UNKNOWN_FRAME`, not the first
  * frame — and a C loop written `for (i = 0; i < n; i++)` gets one error and
- * then misses the last frame.
+ * then misses the last frame, which is why this says so here rather than
+ * leaving it to be discovered.
  *
  * Returns `0` for a NULL or dead handle, which is indistinguishable from an
  * empty tree — deliberately, because there is no error channel on a function
@@ -1492,7 +1493,8 @@ uint32_t tft_tree_frame_count(const tft_tree *tree);
  * The header stores `declared + 1`: `TreeBuilder` reserves index `0` and
  * `tf_tree doctor` iterates `1..edge_count` to skip it. The two id spaces
  * therefore agree from outside while disagreeing in the header, and *this
- * function is where they are reconciled* — it subtracts the reservation.
+ * function is where they are reconciled* — it subtracts the reservation so the
+ * count means the same thing for edges as it does for frames.
  *
  * The first version returned the header field raw. Its test asserted 3 for a
  * three-edge tree and got 4, which is how the reservation was found — from
@@ -1624,9 +1626,10 @@ tft_status tft_tree_owner_lost(const tft_tree *tree,
  * attached process
  * ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
  *
- * Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. **None of
- * them is a reason to stop reading** — lookups are unaffected by ownership in
- * every one of these states, and unaffected *during* a takeover as well.
+ * Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. **Anything
+ * but `TFT_INHERITED` means this process is not the owner, and none of them is
+ * a reason to stop reading** — lookups are unaffected by ownership in every one
+ * of these states, and unaffected *during* a takeover as well.
  *
  * On failure the process keeps its participant slot, its byte and its mapping,
  * and gives back the ownership byte if it had taken one — so a failed attempt
@@ -1653,9 +1656,11 @@ tft_status tft_tree_inherit_ownership(const tft_tree *tree,
  * walk, and a caller in C has no basis to choose between them — the Rust
  * surface keeps them separate for a supervisor that does.
  *
- * **The name overlaps the narrower Rust `Tree::reap_dead` on purpose.** Two
- * functions here would be two things a C caller has to learn the difference
- * between in order to call both of them every time.
+ * **The name overlaps a narrower Rust one on purpose, and it is worth knowing
+ * which you have.** `tf_tree::Tree::reap_dead` is the *claim* sweep alone;
+ * this is that plus `reap_participants`. Two functions here would be two
+ * things a C caller has to learn the difference between in order to call both
+ * of them every time.
  *
  * **Most of the time there is nothing to do, and that is the design.** The
  * owner's socket-hangup callback already revokes a dead participant's claims

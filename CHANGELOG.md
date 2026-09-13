@@ -189,6 +189,11 @@ is a bug.
   entire doc — the domain gate, the "`0` means never" contract, the clamp
   argument — was glued to the end of `recorded_offset`'s, so one function had no
   documentation and the other carried a contract that was not its own.
+- **A C consumer sees this as `tf_tree.h` changing in comment lines only.**
+  cbindgen copies `tf_tree_c`'s doc comments into the installed headers
+  verbatim, so the trims reach it as text: no symbol, signature or constant
+  moves, and the ABI version stays `0.8`. `tf_tree_unstable.h` is unchanged —
+  none of the trimmed comments are emitted into it.
 
 ### Fixed — three broken intra-doc links, a stale complexity claim, and two spliced doc comments
 
