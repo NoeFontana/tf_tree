@@ -19,12 +19,10 @@
 //! # The ratio is a statement about the corpus's DENSITY, and that is gated
 //!
 //! At an identical per-transform cost, a 10 Hz x 5-transform recording reads a
-//! hundred times higher than a 100 Hz x 50 one. So "10x real time" is a claim
-//! about the corpus unless the density is pinned, and under `--gate` this
-//! binary **refuses** a corpus sparser than §12's own representative recording
-//! (100 Hz x 50 transforms = `GATE_DENSITY_FLOOR` transforms per second of
-//! recording). A sparser corpus passes without checking anything, which is the
-//! empty-subject-set shape: green exactly when the measurement did not happen.
+//! hundred times higher than a 100 Hz x 50 one, so under `--gate` this binary
+//! **refuses** a corpus sparser than `GATE_DENSITY_FLOOR`. A sparser corpus
+//! passes without checking anything, which is the empty-subject-set shape:
+//! green exactly when the measurement did not happen.
 //!
 //! The density is also *reported* on every run, in transforms per second of
 //! recording and in transforms per second of wall clock, so that a later change
@@ -49,22 +47,11 @@
 //! * `grouped` — the cap lowered until pass two takes the same number of groups
 //!   the criterion's own recording forces. **This is the gated arm**, because it
 //!   is the regime the criterion's own words put the measurement in — not
-//!   because it is the slower one. The two arms are measured in a fixed order
-//!   and nothing interleaves them, so the first absorbs any first-touch cost and
-//!   the ordering is reported as observed rather than asserted; under
-//!   `--reuse-corpus` it has been seen to invert.
+//!   because it is the slower one.
 //!
-//! **The grouped cap is derived from the SURVEY, not from the arguments.** It is
-//! the sum of the largest `ceil(n / CRITERION_PASSES)` edges as pass one
-//! measured them, which is `plan_groups`' own first-fit-decreasing rule read
-//! backwards. Taking it from `--edges`/`--rate-hz`/`--seconds` described the
-//! corpus this binary *generates* rather than the one it read, and the cap is
-//! what decides the gated arm's regime — so under `--reuse-corpus` those three
-//! arguments now decide nothing at all, and the run says so.
-//!
-//! Each arm asserts the pass count it declares and **REFUSES** if the run did
-//! not take it. An arm that silently ran in the other regime is comparing
-//! different amounts of work.
+//! **The grouped cap is derived from the SURVEY, not from the arguments**
+//! (`grouped_cap_from`), and each arm asserts the pass count it declares and
+//! **REFUSES** if the run did not take it.
 //!
 //! # Why this may be gated on a host that fails the timing probe
 //!
@@ -79,18 +66,11 @@
 //! # The falsifier
 //!
 //! `--gate` on a corpus **denser** than the declared one, which drives the
-//! ratio down through the floor without editing a threshold — and which is the
-//! same fact the density floor above exists to state: the criterion is
-//! corpus-relative. `just gate5`'s red test uses it. `--floor` exists and is the
-//! weaker falsifier, because moving a threshold proves only that the comparison
-//! is wired — and under `--gate` it is a falsifier in one direction only.
-//!
-//! `--floor` is the **whole** of this gate's comparison, so a gated run that
-//! PASSES against a floor below `FLOOR` is refused: otherwise one flag turns any
-//! FAIL into `§12 gate 5 — PASS (gated)` at exit 0, which is a verdict about the
-//! argument rather than about the code. `frozen_workers`'s `--gate` is the
-//! precedent — its `GATE` is a constant, not a flag. Tightening stays legal,
-//! because it can only turn a PASS into a FAIL.
+//! ratio down through the floor without editing a threshold. `just gate5`'s red
+//! test uses it. `--floor` exists and is the weaker falsifier, because moving a
+//! threshold proves only that the comparison is wired — and under `--gate` it is
+//! a falsifier in one direction only: a gated PASS against a floor below `FLOOR`
+//! is refused, and tightening stays legal.
 //!
 //! # What this does not measure
 //!
@@ -101,10 +81,7 @@
 //! that does and does not cover. The corpus is also written and then read
 //! immediately, so every figure here is **page-cache warm**; a first-touch
 //! ingest off cold storage is slower by an amount this does not measure.
-//! `--reuse-corpus` is the one path that does not *write* the corpus, so it is
-//! also the one path that does not delete it — and it REFUSES a path that does
-//! not exist, because generating one there would report a fabricated corpus
-//! under the name of a recording.
+//! `--reuse-corpus` is the one path that does not *write* the corpus.
 //!
 //! # Usage
 //!
@@ -169,10 +146,8 @@ fn main() -> Result<()> {
     // not warm, or one day a real recording — and it is the shape `just gate4`'s
     // `rm -f` line exists to defeat, so the recipe generates every time.
     //
-    // It implies `--keep-corpus` for the file it reads (`drive` removes only
-    // what it wrote) and it REFUSES a path that does not exist rather than
-    // fabricating one there; both live in `drive`, beside the code that would
-    // otherwise do the damage.
+    // Its implied `--keep-corpus` and its refusal on a missing path both live
+    // in `drive`, beside the code that would otherwise do the damage.
     let mut reuse = false;
 
     let mut args = std::env::args().skip(1);
@@ -385,17 +360,15 @@ fn measure(label: &'static str, path: &Path, rounds: usize, max_memory_bytes: u6
 /// density puts the total orders of magnitude above it — and the same
 /// pass-count assertion reports it if it ever is.
 ///
-///
-/// **The reserve above is what closed a measured flakiness**, recorded here
-/// because the number is the argument: without it the cap on the recipe's own
-/// default corpus was exactly half the total with no slack, and `just gate5`
-/// refused — exit 1, nothing published — twice in about thirty release runs on
-/// the development host. The failing runs read a `peak_buffer_bytes` of exactly
-/// one edge more than the passing ones: the sort's scratch copy, in flight and
-/// counted. It failed safe, never as a pass, which is why the repair is a
-/// reserve in the planner rather than a wider threshold — a gate whose bound is
-/// moved to stop it going red is the shape this binary's `--gate` refusals
-/// exist to prevent.
+/// **The reserve above is what closed a measured flakiness**: without it the
+/// cap on the recipe's own default corpus was exactly half the total with no
+/// slack, and `just gate5` refused — exit 1, nothing published — twice in about
+/// thirty release runs on the development host. The failing runs read a
+/// `peak_buffer_bytes` of exactly one edge more than the passing ones: the
+/// sort's scratch copy, in flight and counted. It failed safe, never as a pass,
+/// which is why the repair is a reserve in the planner rather than a wider
+/// threshold — a gate whose bound is moved to stop it going red is the shape
+/// this binary's `--gate` refusals exist to prevent.
 fn grouped_cap_from(edge_bytes_desc: &[u64]) -> u64 {
     let first_group = edge_bytes_desc
         .len()
@@ -416,9 +389,8 @@ fn drive(d: &Drive) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     // **`--reuse-corpus` on a path that does not exist is a REFUSAL, not a
-    // fabrication.** The flag's whole content is "measure the corpus that is
-    // there"; a typo, a moved recording or a cleaned target directory would
-    // otherwise silently hand the arm a synthetic corpus built from
+    // fabrication.** A typo, a moved recording or a cleaned target directory
+    // would otherwise silently hand the arm a synthetic corpus built from
     // `--edges`/`--rate-hz`/`--seconds` and label it as one this process wrote.
     // This binary's other premises — the pass counts, the density — refuse
     // rather than proceed, and this is the same shape.
@@ -461,12 +433,10 @@ fn drive(d: &Drive) -> Result<()> {
     // **The density is MEASURED, not declared.** `transforms_read / span` comes
     // off the survey the arm just ran, so the floor below is a fact about the
     // corpus rather than about the arguments. So is the grouped arm's cap, and
-    // that half was the one that mattered: the cap decides the gated arm's
-    // regime, so deriving it from `--edges`/`--rate-hz`/`--seconds` left
-    // `--reuse-corpus --gate` able to pass while being told about a corpus that
-    // did not exist. Both come off the survey now, which is what makes
-    // `--reuse-corpus` safe and what would make pointing this at a real
-    // recording possible.
+    // that half was the one that mattered, because the cap decides the gated
+    // arm's regime — `grouped_cap_from` carries the run it let through. Both
+    // coming off the survey is what makes `--reuse-corpus` safe and what would
+    // make pointing this at a real recording possible.
     let density = in_memory.transforms as f64 / in_memory.span_s;
 
     println!(

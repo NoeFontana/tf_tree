@@ -13,12 +13,9 @@
 //! rule out.
 //!
 //! This is that pin, and it is deliberately **two** assertions rather than one:
-//!
-//! * the four arm labels are all in the rendered table — a run that produced
-//!   three arms is a run whose fourth arm did not happen, whatever the other
-//!   three say;
-//! * no "NOT MEASURED" text is anywhere in the output — so the sentence cannot
-//!   come back, in any spelling, without this failing.
+//! the four arm labels are all in the rendered table, and no "NOT MEASURED"
+//! text is anywhere in the output — so the sentence cannot come back, in any
+//! spelling, without this failing.
 //!
 //! It runs the binary rather than calling `aggregate`, for the reason
 //! `bench_report_cli.rs` does the same: `aggregate` prints, and what is being
@@ -123,11 +120,9 @@ fn aggregate(dir: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// The other half: what the tool says when it refuses.
-///
-/// Asserts the refusal is a refusal — non-zero exit **and** nothing resembling
-/// a table on stdout — because a diagnostic printed after four plausible rows
-/// is a diagnostic somebody quotes the rows from.
+/// The other half: what the tool says when it refuses — non-zero exit **and**
+/// nothing resembling a table on stdout, because a diagnostic printed after
+/// four plausible rows is a diagnostic somebody quotes the rows from.
 fn refusal(dir: &Path) -> String {
     let out = run(dir);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -174,11 +169,10 @@ fn the_report_states_all_four_arms_and_declares_none_unmeasurable() {
         );
     }
 
-    // The `MISSING_ARM` paragraph, in any spelling. `docs/decisions/0015` step 6
-    // deletes it *because the gap is closed* — reintroducing the words while the
-    // arm exists would be the report disclaiming a measurement it made, and
-    // reintroducing them because the arm broke is what the assertion above
-    // catches first.
+    // The `MISSING_ARM` paragraph, in any spelling. Reintroducing the words
+    // while the arm exists would be the report disclaiming a measurement it
+    // made; reintroducing them because the arm broke is what the assertion
+    // above catches first.
     //
     // **These are fragments the deleted constant actually contained**, checked
     // against `git show origin/main:...dds_report.rs`. Two of the three this
@@ -218,13 +212,13 @@ fn the_report_states_all_four_arms_and_declares_none_unmeasurable() {
 /// 1.00/4/15 = **1.667 %** without it. PSS is 4 x 16000 + 24000 = **85.94 MiB**
 /// against **62.50 MiB**.
 ///
-/// **The control is a bridge that cost nothing, not a missing bridge**, and the
-/// change is not cosmetic: `check_structure` now *refuses* a
-/// `tf_tree.processes` arm with no `consumers 0` process in it, so deleting the
-/// file — which is what this control did first — no longer produces a row to
-/// compare against. A zero-cost bridge is the better control anyway. It differs
-/// from the real fixture in exactly the quantity under test and in nothing
-/// else: same five processes, same four consumers, same `bridge_transforms`.
+/// **The control is a bridge that cost nothing, not a missing bridge**:
+/// `check_structure` now *refuses* a `tf_tree.processes` arm with no
+/// `consumers 0` process in it, so deleting the file — which is what this
+/// control did first — no longer produces a row to compare against. A zero-cost
+/// bridge is the better control anyway: it differs from the real fixture in
+/// exactly the quantity under test and in nothing else — same five processes,
+/// same four consumers, same `bridge_transforms`.
 ///
 /// Mutant: in `aggregate`'s per-arm fold, `if p.consumers == 0 { continue; }`.
 /// The row then reads 1.667 % and 62.50 MiB and every other assertion in this
@@ -296,13 +290,13 @@ fn truncated_out() -> String {
 
 /// **Gate.** A process file missing a cost line is refused, by name.
 ///
-/// `parse_proc` cannot tell "field absent" from "field zero", and the
-/// difference is not academic: against this project's own raw run, a bridge
-/// `.out` truncated after its histograms aggregates to 0.146 %/consumer where
-/// the truth is 0.847, and to a PSS that puts `tf_tree.processes` on the
-/// winning side of the one comparison it loses. Nothing else in the output
-/// changes — `procs` still reads 5, `fail%` still reads 0.00, the exit status
-/// is still 0 — so the flattering row is indistinguishable from a real one.
+/// `parse_proc` cannot tell "field absent" from "field zero": against this
+/// project's own raw run, a bridge `.out` truncated after its histograms
+/// aggregates to 0.146 %/consumer where the truth is 0.847, and to a PSS that
+/// puts `tf_tree.processes` on the winning side of the one comparison it loses.
+/// Nothing else in the output changes — `procs` still reads 5, `fail%` still
+/// reads 0.00, the exit status is still 0 — so the flattering row is
+/// indistinguishable from a real one.
 ///
 /// Mutant: in `parse_proc`, drop the `bail!` loop over the two fields (return
 /// `Ok(p)` directly) and give the fold `p.cpu_ns.unwrap_or(0)` /
@@ -331,13 +325,12 @@ fn a_process_file_missing_its_cost_lines_is_refused_by_name() {
 
 /// **Gate.** A `tf_tree.processes` arm with no bridge process in it is refused.
 ///
-/// This is the structural invariant the whole fairness argument rests on: the
-/// arm's claim is that *one* process pays the deserialization for all of them,
-/// and the accounting that makes it fair is that that process reports
-/// `consumers 0` so its cost lands in the numerator and not the denominator. An
-/// arm that lost its bridge — a crash, a rendezvous it never published, a
-/// driver edited to stop launching it — prints a **better** row than the real
-/// one, with no column showing the difference.
+/// This is the structural invariant the whole fairness argument rests on: *one*
+/// process pays the deserialization for all of them, and reports `consumers 0`
+/// so its cost lands in the numerator and not the denominator. An arm that lost
+/// its bridge — a crash, a rendezvous it never published, a driver edited to
+/// stop launching it — prints a **better** row than the real one, with no
+/// column showing the difference.
 ///
 /// `tf2.processes` ends in the same word and must NOT be subject to this: it
 /// has no bridge by construction, which is what the control below asserts.
@@ -363,8 +356,8 @@ fn a_bridge_and_attach_arm_with_no_bridge_process_is_refused() {
         "the refusal must name the arm and the missing `consumers 0` process:\n{err}"
     );
 
-    // Control: `tf2.processes` has no bridge and never will. The unmodified
-    // fixture must aggregate cleanly, or this gate is refusing the wrong arm.
+    // Control: the unmodified fixture must aggregate cleanly, or this gate is
+    // refusing the wrong arm.
     let control = Scratch::new("no-bridge-control");
     write_four_arms(control.path());
     let text = aggregate(control.path());
@@ -407,10 +400,10 @@ fn a_bridge_that_received_no_transforms_is_refused() {
 ///
 /// The `<-- FAILING` flag's own comment says it exists so the table cannot
 /// print the best latencies for an empty row, and for the emptiest row possible
-/// it did not fire: with no lookups `fail_pct` is `NaN`, and `NaN > 5.0` is
-/// `false`. An arm whose consumers all timed out on `--attach-timeout` reaches
-/// that state — header-only `.out` files, zero everything, `service_p50_ns: 0`
-/// recorded under `lower_is_better` in `results.json`.
+/// it did not fire: with no lookups `fail_pct` is `NaN`. An arm whose consumers
+/// all timed out on `--attach-timeout` reaches that state — header-only `.out`
+/// files, zero everything, `service_p50_ns: 0` recorded under
+/// `lower_is_better` in `results.json`.
 ///
 /// Mutant: `let flag = if fail_pct > 5.0` in `aggregate` — the pre-fix
 /// spelling. The row prints `0.00` in every latency column with no flag and
@@ -642,11 +635,11 @@ type RunFile = tf_tree_bench::runstore::Run;
 /// both.
 ///
 /// **One axis at a time**, so each key carries its own weight rather than
-/// hiding behind another. The exception is stated rather than papered over:
-/// `dds_c_abi_lto` is a function of `dds_c_abi_profile` and one manifest, so
-/// they cannot be varied independently here — that pair is exactly the
-/// `build_profile` / `build_lto` relationship, and `build_lto` earns its place
-/// against a *manifest* edit, which no fixture in this file can make.
+/// hiding behind another. The exception: `dds_c_abi_lto` is a function of
+/// `dds_c_abi_profile` and one manifest, so they cannot be varied independently
+/// here — that pair is exactly the `build_profile` / `build_lto` relationship,
+/// and `build_lto` earns its place against a *manifest* edit, which no fixture
+/// in this file can make.
 ///
 /// Mutant (applied, observed): delete all three `dds_*` keys from
 /// `runstore::BUILD_CRITICAL_FACTS`. Both cases below fail on `!comparable()`

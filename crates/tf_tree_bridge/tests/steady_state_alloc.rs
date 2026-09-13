@@ -16,15 +16,13 @@
 //!
 //! # Two windows, and both of them are asserted
 //!
-//! Every figure below is measured over **two consecutive equal windows**, and
-//! the assertion pins both.
-//!
-//! The second window is the property this file names in its own first line: a
-//! *rate*, `offer` must not allocate **more as it runs longer**. The first is
-//! pinned alongside it because on these fixtures the intercept is zero as well,
-//! and an amortized growth that only ever landed in window one — a `Vec`
-//! doubling, an index rehash, a capped table filling — would otherwise be
-//! exactly the thing a slope cannot see.
+//! Every figure below is measured over **two consecutive equal windows**. The
+//! second is the property this file names in its own first line: a *rate*,
+//! `offer` must not allocate **more as it runs longer**. The first is pinned
+//! alongside it because on these fixtures the intercept is zero as well, and an
+//! amortized growth that only ever landed in window one — a `Vec` doubling, an
+//! index rehash, a capped table filling — would otherwise be exactly the thing a
+//! slope cannot see.
 //!
 //! **This is where #178 lived, and it is answered rather than routed around.**
 //! Three CI runs failed here with `4004` against `4000` — the same four
@@ -40,19 +38,10 @@
 //! per-offer count recorded individually, and not one offer after the warm-up
 //! was off the modal count of two.
 //!
-//! Verified by mutation in three directions: one extra allocation *per offer*
-//! inside a measured loop fails; a one-off allocation before the windows passes;
-//! a one-off allocation *inside the first window* fails, which is the watch the
-//! second assertion restores.
-//!
 //! The `CountingAllocator` is copied from `crates/tf_tree_bench/tests/zero_alloc.rs`,
-//! which established the pattern; the `unsafe` is confined to this test target
-//! and the library crate stays `#![forbid(unsafe_code)]`.
-//!
-//! **A copied instrument does not inherit its original's later fixes**, and this
-//! file is the evidence: the copy was taken on 2026-07-27, `zero_alloc.rs` was
-//! made thread-local six days later, nothing carried that across, and #178 is
-//! the bill for it.
+//! which established the pattern. **A copied instrument does not inherit its
+//! original's later fixes**, and this file is #178's evidence for it;
+//! `ALLOCATIONS` has the dates.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 // **`docs/decisions/0007` rule 1, kind 6 — a trait the language requires be
 // implemented unsafely, in a target that never ships** (`docs/decisions/0048`:
@@ -269,8 +258,7 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> (usize, usize) {
         ingest.offer(Topic::Tf, &s, publisher),
         Action::Publish { .. }
     ));
-    // …and then the publisher restarts and replays from five seconds ago. The
-    // first of these is the one step this fixture contains.
+    // …and then the publisher restarts and replays from five seconds ago.
     for k in 0..8i64 {
         s.stamp_nanos = STAMP0 - 5_000 * MS + k * MS;
         s.received = SteadyNanos(T0 + (1 + k) * MS);
@@ -304,8 +292,7 @@ fn allocs_per_regressing_offer(publisher: &Publisher) -> (usize, usize) {
 /// **No path allocates for its table lookups — including the path a *broken*
 /// publisher occupies.** All three budgets are exact figures for the *current*
 /// code, and each sits strictly below what the flat-tuple maps cost, so the
-/// regression they exist to catch cannot slip back in under them. Each is
-/// asserted over both windows.
+/// regression they exist to catch cannot slip back in under them.
 ///
 /// The undeclared case is the one `first_time` was supposed to have solved:
 /// it silenced the log for a 1 kHz undeclared edge and left the allocator
@@ -388,9 +375,8 @@ fn offer_does_not_allocate_for_its_table_lookups() {
     //
     // And the totals, because the old `(after - before) / ITERS` was integer
     // division by 2000: one allocation every 2001 messages rounded to zero.
-    // That is the shape an amortized table growth has — a `Vec` doubling, an
-    // index rehash, a capped table filling — and it is what this file has to be
-    // able to see, since §5.8 gave `Ingest` two hash tables.
+    // That is the shape an amortized table growth has, and it is what this file
+    // has to be able to see, since §5.8 gave `Ingest` two hash tables.
     //
     // **There is none, and that is measured rather than argued.** Both windows
     // are asserted, so a growth event landing in either one fails; and each

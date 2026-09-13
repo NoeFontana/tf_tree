@@ -52,12 +52,11 @@
 //! direction of the error: every timing check the probe applies — SMT, a busy
 //! machine, an unreadable governor — can only make a measured open **slower**,
 //! so a PASS with margin on an unfit host is a conservative claim, and a FAIL
-//! is not attributable to the code. That is the whole of the licence. It buys a
-//! PASS and it does not buy a FAIL, which is why the verdict line prints the
-//! fitness reasons whichever way it goes, and why the gated arm is the resident
-//! one: its margin against the budget is two orders of magnitude, where the
-//! evicted arm's is a factor of four and one seek on a slower device would eat
-//! it.
+//! is not attributable to the code. It buys a PASS and not a FAIL, which is why
+//! the verdict line prints the fitness reasons whichever way it goes, and why
+//! the gated arm is the resident one: its margin against the budget is two
+//! orders of magnitude, where the evicted arm's is a factor of four and one
+//! seek on a slower device would eat it.
 //!
 //! **A debug build is not refused, and that is the direction argument again
 //! rather than an exception to it.** §9.3 says a debug build reaches every axis
@@ -74,23 +73,17 @@
 //! # The vacuous passes this deliberately avoids
 //!
 //! An `mmap` of a small file is fast for reasons that have nothing to do with
-//! this design, so two floors are checked before any verdict:
-//!
-//! * the gated fixture must be at least `GATE_INDEX_FLOOR_BYTES` — the
-//!   criterion's own "233 MB index". A gate run against the 24-frame fixture
-//!   passes 10 ms trivially and says nothing;
-//! * the two fixtures must differ in size by at least `SCALE_SPAN`x, or the
-//!   scale-invariance arm is comparing two files of the same size and cannot
-//!   fail.
-//!
-//! Both **refuse** rather than passing, because a check whose subject set is
-//! empty is green exactly when the measurement did not happen.
+//! this design, so two floors are checked before any verdict: the gated fixture
+//! must be at least `GATE_INDEX_FLOOR_BYTES`, the criterion's own "233 MB
+//! index", and the two fixtures must differ in size by at least `SCALE_SPAN`x,
+//! or the scale-invariance arm is comparing two files of the same size. Both
+//! **refuse** rather than passing, because a check whose subject set is empty is
+//! green exactly when the measurement did not happen.
 //!
 //! Likewise the evicted arm verifies its own premise: `dd oflag=nocache` is
-//! asked to drop the file's cache and the child then reports its own major
-//! fault count, which is 1 when the open genuinely faulted the file in and 0
-//! when it did not. This is not hypothetical — a "cold" loop that keeps an
-//! earlier mapping alive reports the resident number and calls it cold, because
+//! asked to drop the file's cache and the child's own major-fault count is the
+//! witness. This is not hypothetical — a "cold" loop that keeps an earlier
+//! mapping alive reports the resident number and calls it cold, because
 //! `POSIX_FADV_DONTNEED` cannot evict a page another mapping still holds.
 //!
 //! **A `--gate` run whose eviction did not take REFUSES; an ungated one voids
@@ -120,11 +113,7 @@
 //!
 //! The fourth is that rule applied to a threshold rather than to a mode. Gate 4
 //! has no threshold flag at all, and a gate whose comparison a caller can move
-//! in the loosening direction is a gate a caller can green. So `--budget-ms`
-//! keeps both of the directions that can only make a run *harder* — lowering
-//! it, and raising it on a run that still fails, which is how `tests/gate2.rs`
-//! isolates each half of the conjunctive verdict — and loses the one that can
-//! only make it easier.
+//! in the loosening direction is a gate a caller can green.
 //!
 //! # The falsifier
 //!
@@ -135,9 +124,9 @@
 //! matching on the backing rather than by discipline — and it edits no
 //! threshold: it is the gate's own arithmetic on an open that does
 //! size-proportional work. `--budget-ms` exists too and is the **weaker** of the
-//! two, because moving a threshold proves only that the comparison is wired —
-//! and under `--gate` it is the weaker one in one direction only: a raised
-//! budget that would produce a PASS is refused, per the section above.
+//! two, because moving a threshold proves only that the comparison is wired;
+//! under `--gate` a raised budget that would produce a PASS is refused, per the
+//! section above.
 //!
 //! A fault-count assertion would *not* catch that regression in every form:
 //! prefaulting inside `mmap(MAP_POPULATE)` costs the time and generates no
@@ -414,11 +403,10 @@ fn open_once(path: &Path, prefault: bool) -> Result<()> {
 
 /// Read every byte of the file, returning how many.
 ///
-/// The `--prefault` control. It is a `read(2)` walk rather than a page-touch
-/// walk of the mapping, and the header says why that is the right stand-in: the
-/// property under test is that no step of an open is proportional to the index,
-/// and the mechanism by which a proportional step would arrive does not change
-/// whether it fits in 10 ms.
+/// The `--prefault` control: a `read(2)` walk rather than a page-touch walk of
+/// the mapping, because the property under test is that no step of an open is
+/// proportional to the index, and the mechanism by which a proportional step
+/// would arrive does not change whether it fits in 10 ms.
 fn read_whole(path: &Path) -> Result<u64> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path)?;
@@ -610,9 +598,7 @@ fn drive(d: &Drive) -> Result<()> {
     let large_bytes = std::fs::metadata(&d.path)?.len();
     let small_bytes = std::fs::metadata(&d.small)?.len();
 
-    // **The two floors, checked before anything is measured.** Both refuse
-    // rather than passing: a gate whose subject is too small to fail is green
-    // exactly when it checked nothing.
+    // **The two floors, checked before anything is measured.**
     if d.gate && large_bytes < GATE_INDEX_FLOOR_BYTES {
         bail!(
             "{} is {large_bytes} B and PHASE5 §12 gate 2 is stated over a 233 MB index. An \
@@ -718,19 +704,14 @@ fn drive(d: &Drive) -> Result<()> {
         );
     }
 
-    // **The evicted arm's premise, checked rather than assumed — and the
-    // consequence of a failed premise depends on whether this run is a gate.**
-    //
-    // A gated run REFUSES: a gate that cannot establish its own premise must
-    // not publish. An ungated run degrades and says so, which is
+    // **The evicted arm's premise, checked rather than assumed.** A gated run
+    // REFUSES: a gate that cannot establish its own premise must not publish.
+    // An ungated run degrades and says so, which is
     // `src/bin/contended_scaling.rs`'s shape when its `taskset` helper is
-    // unavailable. The asymmetry is not a softening: the evicted arm gates
-    // nothing (the size dependence there is the storage device), so a *report*
-    // that loses it still carries every gated number, while a **gate** that
-    // loses it is a gate that did not measure what it names.
+    // unavailable; the header says why that asymmetry is not a softening.
     //
     // The ordinary way this fires is not a bug in `dd` — it is a filesystem
-    // that cannot evict, because its pages are RAM. `$TMPDIR` is a tmpfs on
+    // that cannot evict, because its pages are RAM: `$TMPDIR` is a tmpfs on
     // many hosts, and a container can have a RAM-backed workdir.
     let evicted_premise = evicted_large.all_major() && evicted_small.all_major();
     if !evicted_premise {
@@ -765,9 +746,9 @@ fn drive(d: &Drive) -> Result<()> {
     let ratio = resident_large.best_ms / resident_small.best_ms;
 
     // **A loosened budget may not produce a gated PASS.** `SCALE_BOUND` is a
-    // constant, but `--budget-ms` is not, and the verdict is a conjunction of
-    // the two — so a raised budget can only ever help a run pass. Refused in
-    // the loosening direction only, and before any verdict line is printed: a
+    // constant, `--budget-ms` is not, and the verdict is a conjunction of the
+    // two, so a raised budget can only ever help a run pass. Refused in the
+    // loosening direction only, and before any verdict line is printed: a
     // refusal must publish nothing. Lowering it stays legal, which is what
     // `tests/gate2.rs` uses to drive the budget half red on its own; so does
     // raising it *while the run still fails*, which is how that file isolates

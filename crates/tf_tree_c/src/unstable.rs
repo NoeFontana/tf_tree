@@ -7,10 +7,9 @@
 //! anything a C++ user does not need in the hot path waits until Phase 7 has
 //! told us what is actually used.
 //!
-//! What that means concretely, and it is not a formality: **a symbol in this
-//! module may change signature, change meaning, or disappear in a patch
-//! release.** The `#define` is a speed bump so that nobody reaches this by
-//! accident and then reports the removal as a regression.
+//! Concretely: **a symbol in this module may change signature, change meaning,
+//! or disappear in a patch release.** The `#define` is a speed bump so nobody
+//! reaches this by accident and then reports the removal as a regression.
 //!
 //! Two families live here today:
 //!
@@ -115,8 +114,7 @@ pub unsafe extern "C" fn tft_plan_at_with_derivatives(
             // SAFETY: the caller contracts `n` writable bytes at `out_pose`.
             let dst = unsafe { core::slice::from_raw_parts_mut(out_pose.cast::<u8>(), n) };
             // With `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` the caller gets pose and twist
-            // contiguous in a single 13-element row — `docs/API.md` §3.3's
-            // `(N, 13)` shape — instead of two buffers holding the same numbers.
+            // contiguous in one 13-element row (see this function's docs).
             // Every other layout writes the pose alone and ignores the twist,
             // which is already in `out_twist` if the caller asked for it.
             if layout::carries_twist(layout) {
@@ -149,8 +147,7 @@ pub unsafe extern "C" fn tft_plan_at_with_derivatives(
 /// index `0` can mean "root / no parent". Passing `0` to
 /// [`tft_tree_frame_name`] is therefore `TFT_ERR_UNKNOWN_FRAME`, not the first
 /// frame — and a C loop written `for (i = 0; i < n; i++)` gets one error and
-/// then misses the last frame, which is why this says so here rather than
-/// leaving it to be discovered.
+/// then misses the last frame.
 ///
 /// Returns `0` for a NULL or dead handle, which is indistinguishable from an
 /// empty tree — deliberately, because there is no error channel on a function
@@ -189,8 +186,7 @@ pub unsafe extern "C" fn tft_tree_frame_count(tree: *const tft_tree) -> u32 {
 /// The header stores `declared + 1`: `TreeBuilder` reserves index `0` and
 /// `tf_tree doctor` iterates `1..edge_count` to skip it. The two id spaces
 /// therefore agree from outside while disagreeing in the header, and *this
-/// function is where they are reconciled* — it subtracts the reservation so the
-/// count means the same thing for edges as it does for frames.
+/// function is where they are reconciled* — it subtracts the reservation.
 ///
 /// The first version returned the header field raw. Its test asserted 3 for a
 /// three-edge tree and got 4, which is how the reservation was found — from
@@ -298,10 +294,9 @@ pub unsafe extern "C" fn tft_tree_frame_name(
             );
             return crate::TFT_ERR_UNKNOWN_FRAME;
         };
-        // `FrameRecord` stores the name NUL-padded in 48 bytes with an explicit
-        // length, and has no accessor — reading it here rather than adding one
-        // to `tf_tree_core` keeps the unstable tier from widening the engine's
-        // API for a diagnostic.
+        // `FrameRecord` has no name accessor — reading the NUL-padded bytes and
+        // explicit length here, rather than adding one to `tf_tree_core`, keeps
+        // the unstable tier from widening the engine's API for a diagnostic.
         let n = usize::from(rec.name_len).min(rec.name.len());
         let name = core::str::from_utf8(&rec.name[..n]).unwrap_or("");
         let need = name.len() + 1;
@@ -533,10 +528,9 @@ pub unsafe extern "C" fn tft_tree_owner_lost(tree: *const tft_tree, out: *mut bo
 /// attached process
 /// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
 ///
-/// Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. **Anything
-/// but `TFT_INHERITED` means this process is not the owner, and none of them is
-/// a reason to stop reading** — lookups are unaffected by ownership in every one
-/// of these states, and unaffected *during* a takeover as well.
+/// Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. **None of
+/// them is a reason to stop reading** — lookups are unaffected by ownership in
+/// every one of these states, and unaffected *during* a takeover as well.
 ///
 /// On failure the process keeps its participant slot, its byte and its mapping,
 /// and gives back the ownership byte if it had taken one — so a failed attempt
@@ -573,10 +567,8 @@ pub unsafe extern "C" fn tft_tree_inherit_ownership(
                     tf_tree::Inheritance::Contended => TFT_CONTENDED,
                     tf_tree::Inheritance::ReadOnly => TFT_READ_ONLY,
                     // `Inheritance` is `#[non_exhaustive]`, so a variant added
-                    // later lands here rather than failing to compile. Reporting
-                    // it as "not applicable" is the safe reading: it is the one
-                    // value that tells a caller to keep behaving as a plain
-                    // participant, which is never wrong.
+                    // later lands here rather than failing to compile, and
+                    // "not applicable" is the safe reading of one.
                     _ => TFT_NOT_APPLICABLE,
                 };
                 // SAFETY: the caller contracts a writable byte at `out`.
@@ -604,11 +596,9 @@ pub unsafe extern "C" fn tft_tree_inherit_ownership(
 /// walk, and a caller in C has no basis to choose between them — the Rust
 /// surface keeps them separate for a supervisor that does.
 ///
-/// **The name overlaps a narrower Rust one on purpose, and it is worth knowing
-/// which you have.** `tf_tree::Tree::reap_dead` is the *claim* sweep alone;
-/// this is that plus `reap_participants`. Two functions here would be two
-/// things a C caller has to learn the difference between in order to call both
-/// of them every time.
+/// **The name overlaps the narrower Rust `Tree::reap_dead` on purpose.** Two
+/// functions here would be two things a C caller has to learn the difference
+/// between in order to call both of them every time.
 ///
 /// **Most of the time there is nothing to do, and that is the design.** The
 /// owner's socket-hangup callback already revokes a dead participant's claims

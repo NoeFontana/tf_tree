@@ -23,11 +23,10 @@
 //
 // **It does not bind a downstream consumer, and an earlier version of this
 // comment claimed it did.** Cargo builds registry dependencies with
-// `--cap-lints allow`, which caps an attribute-level `deny` as well, so for
-// somebody building `tf_tree` from crates.io this attribute has no effect at
-// all. What it binds is builds of this repository and its path dependents —
-// which is where a missing doc would be introduced, so the box is still worth
-// closing this way.
+// `--cap-lints allow`, which caps an attribute-level `deny` too, so for somebody
+// building `tf_tree` from crates.io this attribute does nothing. What it binds
+// is builds of this repository and its path dependents — which is where a
+// missing doc would be introduced, so the box is still worth closing this way.
 #![deny(missing_docs)]
 //! `std` facade for the `tf_tree` transform engine.
 //!
@@ -142,9 +141,9 @@
 //!
 //! Everything arena-generic — [`Plan`], [`Step`], [`Guard`], [`Stamp`],
 //! [`Domain`], [`Query`], the compile/evaluate engine — lives in the `no_std`
-//! [`tf_tree_core`]. This crate adds only what needs `std`: the concrete [`Tree`]
-//! owning a heap arena, the per-thread plan cache behind [`Tree::lookup`]
-//! (`thread_local!`), and [`Described`]'s `Display`.
+//! [`tf_tree_core`]. This crate adds only what needs `std`: the heap arena,
+//! [`Tree::lookup`]'s per-thread plan cache (`thread_local!`), and
+//! [`Described`]'s `Display`.
 //!
 //! # [`Tree`] is not `Clone`, and `Arc<Tree>` is the embedding idiom
 //!
@@ -180,13 +179,12 @@
 //! assert_eq!(joined.unwrap(), Iso3::IDENTITY);
 //! ```
 //!
-//! This is not new advice, which is the point of writing it down: `tests/tsan.rs`
-//! shares a tree between threads this way, `tf_tree_c` hands out
-//! `Arc<TreeShare>` (a one-field wrapper around a `Tree`, so the refcount is on
-//! the wrapper rather than on the `Tree` itself), and PyO3's `Py<PyTree>` is the
-//! same refcount spelled in CPython's allocator. Three surfaces arrived here
-//! independently and none of them said so where an embedder would look
-//! (`docs/API.md` §2.2).
+//! This is not new advice: `tests/tsan.rs` shares a tree between threads this
+//! way, `tf_tree_c` hands out `Arc<TreeShare>` (a one-field wrapper around a
+//! `Tree`, so the refcount is on the wrapper rather than on the `Tree` itself),
+//! and PyO3's `Py<PyTree>` is the same refcount spelled in CPython's allocator.
+//! Three surfaces arrived here independently and none of them said so where an
+//! embedder would look (`docs/API.md` §2.2).
 //!
 //! # Set `lto = "thin"` and `codegen-units = 1` in your release profile
 //!
@@ -206,9 +204,8 @@
 //! between the first and the second carrying no attribute, so your build still
 //! emits one real cross-crate call. Its doc comment says why that is deliberate
 //! and what measuring it costs.** What an attribute buys depends in any case on
-//! **your** profile, not on ours: cargo's
-//! `--release` defaults are `lto = false, codegen-units = 16`, and this
-//! workspace's are not, so every latency number this project publishes is taken
+//! **your** profile, not on ours: this workspace's release profile is not
+//! cargo's default, so every latency number this project publishes is taken
 //! under whole-program optimisation and your node's is not.
 //!
 //! Measured rather than asserted, because the last claim made here about this
@@ -226,9 +223,8 @@
 //! read it as "about a quarter", not as three digits — the ratio itself moved
 //! between 1.19× and 1.24× across those runs.
 //!
-//! **The same runs also say *why*, which is the part that makes this advice
-//! rather than folklore.** They time a second, identical body compiled *inside*
-//! `tf_tree_core`, and compare it against the one outside:
+//! **The same runs also say *why*.** They time a second, identical body
+//! compiled *inside* `tf_tree_core` and compare it against the one outside:
 //!
 //! | downstream profile | from outside the engine | from inside it |
 //! | --- | --- | --- |
@@ -243,11 +239,10 @@
 //!
 //! The cost of taking this advice is build time: thin LTO adds a link-time
 //! optimisation pass, and `codegen-units = 1` gives up intra-crate build
-//! parallelism. Both are compile-time costs and neither changes what the shipped
-//! binary computes. How the 25% splits between the two settings has **not** been
-//! measured here, so if your release builds are slow enough that you want to
-//! take only one of them, measure your own case rather than trusting a guess
-//! from this paragraph.
+//! parallelism. Neither changes what the shipped binary computes. How the 25%
+//! splits between the two settings has **not** been measured here, so if your
+//! release builds are slow enough that you want to take only one of them,
+//! measure your own case rather than trusting a guess from this paragraph.
 
 // **The crates.io front page, compiled.** `README.md`'s `rust` fence is the
 // example a stranger reads first, and no recipe parses a README — the next
@@ -298,9 +293,8 @@ pub use tf_tree_arena::{AttachMode, ShmError};
 /// Re-exported as a function rather than the constant so the facade keeps its
 /// promise of exposing no arena internals: a caller gets the number it needs
 /// for a diagnostic without a path into `tf_tree_arena`. That promise is
-/// unchanged by `docs/decisions/0017` moving the crate from
-/// `#![forbid(unsafe_code)]` to `deny` with one exception — the exception is a
-/// lifetime extension, not a widening of what this surface hands out.
+/// unchanged by the crate's one `unsafe` exception (`docs/decisions/0017`): a
+/// lifetime extension is not a widening of what this surface hands out.
 #[must_use]
 pub fn arena_format_version() -> u32 {
     tf_tree_arena::FORMAT_VERSION
@@ -337,13 +331,12 @@ pub use open::CRASH_SITES;
 pub use open::{open, CreatePolicy, Open, OpenError};
 
 /// Test scaffolding for `docs/decisions/0028` plan step 2's reclamation
-/// predicate, which is private. Its two production callers are the owner's
-/// slot assigner (that record's step 3) and [`Tree::reap_participants`] (step
-/// 5); both act on the verdict without reporting one — the assigner stops at
-/// the first grantable slot, the sweep reports a count — and neither a grant
-/// nor a count can separate the two verdicts that collect nothing. Absent
-/// unless `--features test-hooks`; see
-/// [`open::reclamation_verdict_for_test`].
+/// predicate, which is private. Its two production callers are the owner's slot
+/// assigner (that record's step 3) and [`Tree::reap_participants`] (step 5);
+/// both act on the verdict without reporting one — the assigner stops at the
+/// first grantable slot, the sweep reports a count — and neither a grant nor a
+/// count can separate the two verdicts that collect nothing. Absent unless
+/// `--features test-hooks`; see [`open::reclamation_verdict_for_test`].
 #[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
 #[doc(hidden)]
 pub use open::reclamation_verdict_for_test;
@@ -353,12 +346,9 @@ pub use open::reclamation_verdict_for_test;
 #[cfg(feature = "unstable")]
 pub mod unstable;
 
-// Re-export the core engine surface so downstream code depends only on `tf_tree`.
-//
-// Everything below is the **stable** tier: at a published tag each line is a
-// semver promise. `ArenaView`, `EdgeKind` and `EdgeMeta` used to be here and are
-// now in the `unstable` module — see it for the test that separates them, which
-// is "does its shape follow the arena layout", not "is it low-level".
+// Re-export the core engine surface so downstream code depends only on
+// `tf_tree`. What moved to the `unstable` module moved on the test "does its
+// shape follow the arena layout", not "is it low-level" — see that module.
 
 pub use tf_tree_core::edge::Publisher;
 pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
@@ -381,18 +371,17 @@ pub use tf_tree_core::{
 // for the reason the rest of this block exists: a consumer who reaches
 // `LerpSlerp` through this facade and its kernel through `tf_tree_math` has two
 // direct dependencies to keep in lockstep on a `0.0.x` line where every release
-// breaks every other — which is a worse position than the `Iso3` round trip
-// `docs/API.md` §2.7 told them to abandon. **`ScLerp`'s kernel is here on the
-// same argument**, and it took a review pass to see that leaving it out
-// reproduced the asymmetry one layer up: exporting `LerpSlerp` + `slerp` but
-// `ScLerp` with no route to `screw_pow` puts an `ScLerp` consumer in exactly the
-// two-dependency position this block exists to prevent. What is *not* done is a
-// bare `screw_pow` at this root, which would be a second spelling
-// (`PROJECT.md` §6) of `tf_tree_math::dualquat::screw_pow`. Re-exporting the
-// module is the *same* spelling, so `tf_tree::dualquat::screw_pow` and
-// `tf_tree_math::dualquat::screw_pow` are one path with one prefix swapped.
-// `tests/math_reexports.rs` is what says this list and `tf_tree_math`'s are one
-// set of items rather than two.
+// breaks every other — worse than the `Iso3` round trip `docs/API.md` §2.7 told
+// them to abandon. **`ScLerp`'s kernel is here on the same argument**, and it
+// took a review pass to see that leaving it out reproduced the asymmetry one
+// layer up: exporting `LerpSlerp` + `slerp` but `ScLerp` with no route to
+// `screw_pow` leaves an `ScLerp` consumer in the same two-dependency position.
+// What is *not* done is a bare `screw_pow` at this root: that would be a second
+// spelling (`PROJECT.md` §6) of `tf_tree_math::dualquat::screw_pow`, whereas
+// re-exporting the module is the *same* spelling — `tf_tree::dualquat::screw_pow`
+// and `tf_tree_math::dualquat::screw_pow` are one path with one prefix swapped.
+// `tests/math_reexports.rs` says this list and `tf_tree_math`'s are one set of
+// items rather than two.
 pub use tf_tree_math::dualquat;
 pub use tf_tree_math::{
     exp_se3, exp_so3, log_se3, log_so3, quat_from_rot3, slerp, Interp, Iso3, LerpSlerp, Quat,

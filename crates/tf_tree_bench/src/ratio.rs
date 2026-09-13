@@ -71,9 +71,9 @@
 //! | `[profile.embedder]` — cargo's release defaults, i.e. a consumer | `false` | 244.2 ns | 506.1 ns | **2.075×** | 2.063–2.080 |
 //!
 //! **The tf2 column is the control and it holds: 504.4 → 506.1 ns, +0.34%.**
-//! That arm goes through `tf_tree_tf2_sys`, an `extern "C"` call into a C++ shim
-//! that no Rust LTO setting can inline into, so it *should* be invariant across
-//! the two builds — and it is, to well inside this host's run-to-run spread.
+//! That arm is an `extern "C"` call into a C++ shim that no Rust LTO setting
+//! can inline into, so it *should* be invariant across the two builds — and it
+//! is, to well inside this host's run-to-run spread.
 //! The tf_tree column moves +21.1% and is the whole of the difference. Without
 //! that control the two runs would be two numbers from two processes and the
 //! comparison would not be evidence, which is the failure this file's history is
@@ -84,7 +84,7 @@
 //! measures 200.4 ns / 2.468× — the LTO arm, not the embedder one. So the number
 //! tracks `lto` and not "a profile other than release".
 //!
-//! **The consequence for [`FLOOR`] is stated there, and it is not comfortable.**
+//! **The consequence for [`FLOOR`] is stated there.**
 
 use anyhow::{anyhow, bail, Result};
 
@@ -105,15 +105,13 @@ use crate::tf2::Tf2Fixture;
 ///
 /// # The floor is **not** defensible for a consumer's default `--release`
 ///
-/// Say it plainly, because the arithmetic is short and the conclusion is
-/// unwelcome. At `[profile.embedder]` — cargo's release defaults, what somebody
-/// who `cargo add`s this crate compiles — the tf_tree arm is 244.2 ns, not
-/// 201.6. Against the *native C++* tf2 figure, which is the only tf2 number with
-/// no binding in it, that is [`UNBIASED_ESTIMATE_DEFAULT_RELEASE`] ≈ **1.80×**,
-/// and 1.80 < 2.0. **The relationship this file's compile-time check exists to
-/// enforce — floor under the unbiased estimate — is false at a consumer's
-/// default build.** The row still *passes* there, at a paired 2.075×, and that
-/// is the point: it passes on 0.27× of binding bias it is not entitled to.
+/// At `[profile.embedder]` the tf_tree arm is 244.2 ns, not 201.6. Against the
+/// *native C++* tf2 figure, which is the only tf2 number with no binding in it,
+/// that is [`UNBIASED_ESTIMATE_DEFAULT_RELEASE`] ≈ **1.80×**, and 1.80 < 2.0.
+/// **The relationship this file's compile-time check exists to enforce — floor
+/// under the unbiased estimate — is false at a consumer's default build.** The
+/// row still *passes* there, at a paired 2.075×, on 0.27× of binding bias it is
+/// not entitled to.
 ///
 /// Three things follow, and only the first is done here.
 ///
@@ -122,13 +120,11 @@ use crate::tf2::Tf2Fixture;
 ///    never measured in, and it would be a change made to make a number look
 ///    right — the sample-selection move this repository has caught before. The
 ///    constant stays, and its scope is now written down instead of assumed.
-/// 2. **The claim is scoped, not withdrawn.** `just tf2-bench-check` builds
-///    `--release` in this workspace; the gate therefore *is* a statement about
-///    this workspace's build, and always was. That is honest as a **regression
-///    detector**, which is all the module docs ever claimed for it, and it is
-///    *not* a consumer-facing guarantee. The headline a consumer should be
-///    quoted remains `tf2.md`'s ~2.7× recorded-stream row, whose provenance is
-///    its own.
+/// 2. **The claim is scoped, not withdrawn.** The gate *is* a statement about
+///    this workspace's build, and always was: honest as a **regression
+///    detector**, which is all the module docs ever claimed for it, and *not* a
+///    consumer-facing guarantee. The headline a consumer should be quoted
+///    remains `tf2.md`'s ~2.7× recorded-stream row, whose provenance is its own.
 /// 3. **Gating the consumer build instead would change what this floor means**,
 ///    and by `CLAUDE.md`'s rule that is a decision record, not an edit here. The
 ///    honest shape of it — a second gated row at `[profile.embedder]` with its
@@ -164,8 +160,7 @@ const UNBIASED_ESTIMATE: f64 = 2.25;
 ///
 /// Against `UNBIASED_ESTIMATE`'s older tf2 half (452.9 ns) it is 1.86× instead;
 /// the range 1.80–1.86 is this host's spread on an unpaired quotient and nothing
-/// in it reaches 2.0. That is the whole point of the constant, so it is recorded
-/// at the pessimistic end.
+/// in it reaches 2.0; it is recorded at the pessimistic end.
 ///
 /// It bounds nothing — no gate reads it — and that is deliberate: it exists so
 /// that [`FLOOR`]'s prose is checkable arithmetic rather than a claim, via
@@ -191,14 +186,14 @@ const UNBIASED_ESTIMATE: f64 = 2.25;
 /// precondition for revisiting is therefore concrete: a host on which this row
 /// resolves across repeated runs.
 ///
-/// `pub` where [`UNBIASED_ESTIMATE`] is private, and the asymmetry is the point
-/// rather than an oversight: the private one is machinery, consumed by the
-/// compile-time assertion below and by nothing else, while this one is the
-/// caveat on a number people quote. A reader who reaches [`FLOOR`] in rendered
-/// documentation should be able to follow the link that says the floor does not
-/// hold for their build. (It is also the only thing keeping `dead_code` quiet
-/// outside `cfg(test)`, which is a symptom of the same fact: a constant nothing
-/// executes is documentation, so it should be documentation people can see.)
+/// `pub` where [`UNBIASED_ESTIMATE`] is private, deliberately: the private one
+/// is machinery, consumed by the compile-time assertion below and by nothing
+/// else, while this one is the caveat on a number people quote. A reader who
+/// reaches [`FLOOR`] in rendered documentation should be able to follow the link
+/// that says the floor does not hold for their build. (It is also the only thing
+/// keeping `dead_code` quiet outside `cfg(test)`, which is a symptom of the same
+/// fact: a constant nothing executes is documentation, so it should be
+/// documentation people can see.)
 pub const UNBIASED_ESTIMATE_DEFAULT_RELEASE: f64 = 1.80;
 
 /// [`FLOOR`] must stay under the unbiased estimate, or this row could be passed
@@ -208,9 +203,9 @@ pub const UNBIASED_ESTIMATE_DEFAULT_RELEASE: f64 = 1.80;
 /// constants: there is nothing to run.
 ///
 /// **It is a statement about this workspace's `lto = "thin"` build only.** The
-/// same relationship at a consumer's default `--release` is false, which is a
-/// fact about the gate rather than about these two constants, so it is pinned by
-/// a test below rather than by a second `assert!` that would refuse to compile.
+/// same relationship at a consumer's default `--release` is false — a fact about
+/// the gate rather than about these two constants — and is pinned by a test
+/// below.
 const _: () = assert!(FLOOR < UNBIASED_ESTIMATE);
 
 /// Rounds of the interleaved pair. Odd, so the median is an observation.
@@ -273,10 +268,9 @@ impl Verdict {
 pub struct Run {
     /// Median per-round `tf2_ns / tf_tree_ns`.
     ///
-    /// **Paired, and deliberately not the quotient of the two medians below.**
-    /// The arms are timed back to back inside one round, so drift common to both
-    /// cancels out of each round's ratio in a way it cannot cancel out of a
-    /// quotient of two separately-timed loops.
+    /// **Paired, and deliberately not the quotient of the two medians below**:
+    /// the arms are timed back to back inside one round, so drift common to both
+    /// cancels out of each round's ratio.
     pub ratio: f64,
     /// Smallest per-round ratio observed.
     pub ratio_lo: f64,
@@ -438,8 +432,8 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
     // own caches, and ours faults in the rings.
     // `sweeps * per_sweep`, not `per_sweep`: one call to `sweep_ours` is
     // `sweeps` passes over the table, so dividing by the table alone overshot
-    // the documented warmup by 40x and made `measure_with`'s loop counts unable
-    // to bound the cost — which is the whole reason that escape hatch exists.
+    // the documented warmup by 40x and left `measure_with`'s loop counts unable
+    // to bound the cost.
     let per_sweep = stamps.len();
     let per_call = sweeps.saturating_mul(per_sweep).max(1);
     for _ in 0..warmup.div_ceil(per_call) {
@@ -543,12 +537,10 @@ mod tests {
 
     /// [`FLOOR`]'s scope, as arithmetic rather than as prose.
     ///
-    /// The compile-time `assert!` above pins one half — the floor sits under the
-    /// unbiased estimate for this workspace's `lto = "thin"` build, so the
-    /// binding's bias cannot pass it. This pins the *other* half, the one that
-    /// is unwelcome and therefore the one most likely to be quietly forgotten:
-    /// at cargo's release defaults the same relationship is **false**, and the
-    /// floor is above the unbiased figure rather than under it.
+    /// The compile-time `assert!` above pins one half. This pins the *other*
+    /// half, the one most likely to be quietly forgotten: at cargo's release
+    /// defaults the same relationship is **false**, and the floor is above the
+    /// unbiased figure rather than under it.
     ///
     /// A test and not a second `const _: () = assert!(...)`, because the second
     /// relationship is the one that does **not** hold: spelling it as a
@@ -570,12 +562,11 @@ mod tests {
     /// compile-time one keeps holding, which is the point of separating them.
     ///
     /// `assertions_on_constants` is expected rather than worked around. The lint
-    /// exists to catch a tautology nobody will ever revisit, and this is the
-    /// opposite: two of the three constants are measurements, they are expected
-    /// to move, and asserting on them *is* the mechanism by which a future edit
-    /// to one is forced to re-read the other two. Rewriting the comparison
-    /// through a helper to dodge the lint would leave the same assertion with
-    /// its intent hidden.
+    /// catches a tautology nobody will ever revisit; this is the opposite: two of
+    /// the three constants are measurements, expected to move, and asserting on
+    /// them *is* the mechanism by which a future edit to one forces a re-read of
+    /// the other two. Rewriting the comparison through a helper to dodge the lint
+    /// would leave the same assertion with its intent hidden.
     #[expect(
         clippy::assertions_on_constants,
         reason = "the constants are measurements that are expected to move; pinning their \

@@ -150,9 +150,7 @@ macro_rules! catalogue {
                 match self { $( Tft::$variant => $title, )+ }
             }
 
-            /// Fixed per id rather than per finding: `--exit-code` is only a
-            /// usable gate if the set of ids that can fail it is knowable from
-            /// the documentation, without running anything.
+            /// This check's severity — fixed per id, not per finding.
             #[must_use]
             pub fn severity(self) -> Severity {
                 match self { $( Tft::$variant => Severity::$sev, )+ }
@@ -438,9 +436,8 @@ pub struct Meta {
     /// directory was searched, and that is exactly the run where there is no
     /// arena to read it from. It is a property of the host and the environment
     /// (`$TF_TREE_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/tf_tree`, `/run/tf_tree`,
-    /// `/tmp/tf_tree-<uid>`), not of any tree, so it is resolved independently
-    /// of the source and a failure to resolve degrades to `None` rather than
-    /// failing the command.
+    /// `/tmp/tf_tree-<uid>`), not of any tree, so a failure to resolve degrades
+    /// to `None` rather than failing the command.
     pub runtime_dir: Option<String>,
     /// Frame count, for the one-line summary.
     pub frames: usize,
@@ -464,8 +461,7 @@ pub struct Meta {
     ///
     /// [`Status`] is deliberately three-valued, so there is nowhere in an
     /// outcome to record "ran, but half blind". Dropping the fact instead would
-    /// leave a `pass` that was never earned, which is the one thing this
-    /// report's shape exists to prevent.
+    /// leave a `pass` that was never earned.
     pub notes: Vec<String>,
     /// What the declared ring capacities reserve, in slots and in bytes.
     ///
@@ -555,11 +551,10 @@ pub fn render_human(report: &Report, meta: &Meta) -> String {
         report.outcomes.len()
     );
     if skipped > 0 {
-        // **Say what was not checked.** A live arena has no recorded push
-        // stream, a build without the bridge cannot see a publisher conflict,
-        // and a bag-sourced arena records ingest-time clock offsets rather than
-        // any publisher's — none of which are visible in a
-        // report that lists only findings.
+        // A live arena has no recorded push stream, a build without the bridge
+        // cannot see a publisher conflict, and a bag-sourced arena records
+        // ingest-time clock offsets rather than any publisher's — none of which
+        // are visible in a report that lists only findings.
         let _ = writeln!(s, "  not run:");
         for o in &report.outcomes {
             if let Status::Skipped(why) = &o.status {
@@ -821,10 +816,9 @@ mod tests {
     /// **Every identifier is distinct, parses back to itself, and appears in
     /// the catalogue exactly once.**
     ///
-    /// The ids are a wire contract: `--suppress`, `--json` consumers and the
-    /// runbook all key on them. A duplicate would silently make one check
-    /// unsuppressable and unreferenceable, and `Tft::parse` — a linear scan of
-    /// `ALL` — would resolve the shadowed id to the wrong variant.
+    /// A duplicate would silently make one check unsuppressable and
+    /// unreferenceable, and `Tft::parse` — a linear scan of `ALL` — would
+    /// resolve the shadowed id to the wrong variant.
     ///
     /// Mutant: give `Tft::Tft011` the id `"TFT010"`. Applied: the uniqueness
     /// assertion fires (`duplicate identifier in the catalogue`), and so does
@@ -840,8 +834,6 @@ mod tests {
             assert_eq!(Tft::parse(c.id()), Some(c));
             assert_eq!(Tft::parse(&c.id().to_ascii_lowercase()), Some(c));
         }
-        // A near miss must not resolve to something: silently suppressing
-        // nothing is the failure mode worth refusing.
         assert_eq!(Tft::parse("TFT10"), None);
         assert_eq!(Tft::parse("10"), None);
         // One past the end of the catalogue, so this line moves every time the
@@ -853,11 +845,7 @@ mod tests {
 
     /// **A hostile frame name must not be able to break the JSON document.**
     ///
-    /// Frame names arrive from somebody else's robot and are interpolated into
-    /// `subject` and `message` verbatim. A name containing a quote would end the
-    /// string early and produce a document no CI consumer can parse; one
-    /// containing a newline would produce a document that parses into something
-    /// else.
+    /// Frame names are interpolated into `subject` and `message` verbatim.
     ///
     /// Mutant: make `json_escape` the identity (`s.to_owned()`). Applied: the
     /// first `assert_eq!` fails, and so do the two `render_json` assertions
@@ -891,15 +879,11 @@ mod tests {
             !json.contains("then\nleft"),
             "a raw newline reached the output"
         );
-        // Non-ASCII passes through: JSON strings are Unicode.
+        // Non-ASCII passes through.
         assert!(json_escape("naïve/frame").contains('ï'));
     }
 
     /// **`--suppress` removes a check from the gate, not from the report.**
-    ///
-    /// An operator who silenced a known-benign finding on a fleet still wants to
-    /// see it when they run `doctor` by hand; a suppression that hid it would
-    /// make the report a record of the flags rather than of the robot.
     ///
     /// Mutant A: drop the `!o.suppressed` filter from `Report::at`. Applied: the
     /// `has_error` assertion fails. Mutant B: skip suppressed outcomes when
@@ -1012,9 +996,8 @@ mod tests {
         assert!(!warn_only.is_healthy());
     }
 
-    /// Info findings are printed but do not make a tree unhealthy: a host
-    /// without THP (`TFT016`) is a normal state, and a `doctor` that called it a
-    /// defect would be one nobody runs.
+    /// Info findings are printed but do not make a tree unhealthy: a `doctor`
+    /// that called a THP-less host (`TFT016`) a defect would be one nobody runs.
     ///
     /// Mutant: add `|| self.count_at(Severity::Info) > 0` to `is_healthy`.
     /// Applied: the first assertion fails.
