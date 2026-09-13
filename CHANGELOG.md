@@ -180,15 +180,26 @@ is a bug.
   range check** (a publisher writing nanoseconds into a seconds field is off by
   10^9, which no plausible-range predicate distinguishes from a valid stamp) and
   its note that `TFT010`'s skip belongs to the same compared-nothing family as
-  `TFT007` and `TFT008`; and `bridge/ingest.rs`'s `Recreate` rung, without which
+  `TFT007` and `TFT008`; `bridge/ingest.rs`'s `Recreate` rung, without which
   `note_time_jump`'s pointer at "the argument for **both rungs**" led to a
-  section arguing only `Halt`.
-- Two comment defects fixed in passing. `impl Drop for Tree` carried a stray doc
-  describing a boot id "folded to a `u64`"; `boot_id()` returns `[u8; 16]` and
-  its own doc says **not** hashed to 64 bits (PHASE2 A7). And `sample_interval`'s
+  section arguing only `Halt`; and `tf_tree_ingest`'s `source.rs` clause saying
+  why a short read compared against the clamped length could not call a record
+  complete on a file whose length does not change
+  (`got <= file_len - 17 < want`), which the trim had swapped for a pointer at
+  "the paragraph above" — a paragraph that does not make that argument.
+- Three comment defects fixed in passing. `impl Drop for Tree` carried a stray
+  doc describing a boot id "folded to a `u64`"; `boot_id()` returns `[u8; 16]`
+  and its own doc says **not** hashed to 64 bits (PHASE2 A7). `sample_interval`'s
   entire doc — the domain gate, the "`0` means never" contract, the clamp
   argument — was glued to the end of `recorded_offset`'s, so one function had no
-  documentation and the other carried a contract that was not its own.
+  documentation and the other carried a contract that was not its own. And
+  `tf_tree/tests/rendezvous.rs` justified bounding its deadline tests with a
+  worker thread by saying the repository has no `.config/nextest.toml` — one doc
+  "verified" there is no `.config/` directory at all — when that file exists and
+  sets `terminate-after`. The thread is still right, for the reason now stated:
+  it fails in 30 s naming the ignored deadline, not at 180 s as an anonymous
+  timeout. The two `expect` messages that repeat the claim are code, and are left
+  for a follow-up.
 - **A C consumer sees this as `tf_tree.h` changing in comment lines only.**
   cbindgen copies `tf_tree_c`'s doc comments into the installed headers
   verbatim, so the trims reach it as text: no symbol, signature or constant

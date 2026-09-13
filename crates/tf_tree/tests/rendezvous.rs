@@ -1466,13 +1466,14 @@ fn a_consumer_waits_for_an_arena_that_starts_late() {
 /// A wait with no publisher at all gives up inside a bounded time.
 ///
 /// **Run on a worker thread with a `recv_timeout` on the main one, and that is
-/// deliberate.** This repository has **no `.config/nextest.toml`**, so there is
-/// no `slow-timeout` / `terminate-after` to bound a test that never returns: an
-/// `await_open` that ignored its deadline would hang the whole suite instead of
-/// failing one test. The channel is this test supplying its own bound.
+/// deliberate.** `.config/nextest.toml`'s `terminate-after` does bound a test
+/// that never returns, but only at 180 s and only as a timeout, which says
+/// "something hung"; the channel fails an `await_open` that ignored its
+/// deadline in 30 s, with a message that says so. A test should not depend on
+/// the runner for its own liveness.
 ///
 /// **Mutant: ignore the deadline** ⇒ the `recv_timeout` expires and this fails
-/// with the message below, rather than the run hanging.
+/// with the message below, rather than as a 180 s nextest timeout.
 #[test]
 fn a_wait_for_an_arena_that_never_starts_gives_up() {
     use std::sync::mpsc;
@@ -1703,10 +1704,7 @@ fn a_consumer_waits_for_a_frame_interned_after_the_arena_exists() {
 /// **The wait runs on a worker thread and the main thread bounds it with
 /// `recv_timeout`** — the same shape
 /// `a_wait_for_an_arena_that_never_starts_gives_up` uses one wait over, and for
-/// the reason stated there, put more strongly: this repository has **no
-/// `.config/` directory at all** — verified, the root dotfiles are `.cargo`,
-/// `.claude`, `.git`, `.github`, `.gitignore`, and `find` reports no
-/// `nextest.toml` anywhere.
+/// the reason stated there.
 ///
 /// The `Tree` is built *inside* the thread rather than moved into it: `Scratch`
 /// has already put `TF_TREE_RUNTIME_DIR` in this process's environment, so the

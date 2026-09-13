@@ -599,9 +599,9 @@ where
         // clamped one — so `got == want` would call a record complete on the
         // strength of a length this reader chose rather than the one the record
         // stated. That is not reachable on a file whose length does not change
-        // (the paragraph above), and it is reachable on one being appended to as
-        // it is read. Naming the declared length costs nothing and needs no such
-        // argument.
+        // (`got <= file_len - 17 < want`, the clamp comment above), and it is
+        // reachable on one being appended to as it is read. Naming the declared
+        // length costs nothing and needs no such argument.
         let complete = got as u64 == declared;
         if !complete {
             skips.truncated = true;
