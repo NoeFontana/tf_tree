@@ -207,6 +207,18 @@ is a bug.
   constant; and a `statics.rs` test doc said its fixture holds 2 contradicted
   edges against 7 observations, where it holds 3 and asserts 9, and named a
   `slot_for` that is `slot_or_insert`.
+- **The follow-up: the same claim in code, and one more test.** The two
+  `rendezvous.rs` `expect` messages now say what each outcome means — `Timeout`
+  is an ignored deadline caught by the test's own 30 s bound, where nextest
+  would have stopped a hang only at 180 s without saying why; `Disconnected` is
+  a worker that panicked first — and the mutant note quoting one is re-quoted
+  from a fresh run (30.008 s), not edited to match. `tf_tree_cli/src/web.rs`'s
+  silent-client test said a hang would wedge `just test` with no diagnostic. Its
+  20 s `recv_timeout` fails the `set_read_timeout` mutant in 20 s (re-run); only
+  without it would the test hang, which nextest ends at 180 s and `cargo test`
+  never does. Two comments that called the same situation a hang rather than a
+  failure — `tf_tree_ipc`'s silent-client test and a `justfile` note — now say
+  it is a failure at 180 s.
 
 ### Fixed — three broken intra-doc links, a stale complexity claim, and a spliced doc comment
 

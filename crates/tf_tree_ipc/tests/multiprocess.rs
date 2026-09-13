@@ -585,9 +585,9 @@ fn an_overlong_socket_path_is_refused_with_its_length() {
 /// either side.
 ///
 /// The assertion is that a *second, well-behaved* client still gets through.
-/// Removing the server's `SO_RCVTIMEO` makes this hang rather than fail, which
-/// is exactly the production symptom: an arena that stops accepting nodes and
-/// says nothing.
+/// Removing the server's `SO_RCVTIMEO` makes this hang until nextest's 180 s
+/// `terminate-after` rather than fail on its own, which is exactly the
+/// production symptom: an arena that stops accepting nodes and says nothing.
 #[test]
 fn a_silent_client_cannot_wedge_the_owner() {
     let scratch = Scratch::new("silent-client");

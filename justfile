@@ -2677,7 +2677,8 @@ shm-check:
     # `join-rw-report` arm needs `Tree::arena_view`, and `crash-points` because
     # without it the site is compiled out and the armed child never dies — which
     # would leave `a_killed_heir_leaves_the_role_for_the_next_survivor` waiting
-    # on a `wait()` that never returns rather than failing. Every other recipe
+    # on a `wait()` that never returns until nextest's 180 s `terminate-after`,
+    # rather than failing on its own. Every other recipe
     # compiles at least one of the three out, so this line is the only one that
     # runs it, which is the same argument the `--test frozen` line above makes
     # about `unstable`.
