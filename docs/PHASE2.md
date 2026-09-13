@@ -632,7 +632,7 @@ Step 5 is load-bearing:
 9. KEEP THE SOCKET OPEN for the lifetime of the attachment
 ```
 
-**Step 9:** the socket is not a handshake channel to be closed after use — it is how a participant learns the *owner* has died, in microseconds, with no polling. Participant death is detected by the lock file; owner death is detected by the socket. Both are kernel-maintained; neither involves a timeout.
+**Step 9:** the socket is not a handshake channel to be closed after use — it is how a participant learns the *owner* has died, with no polling. **It learns it when the owner's exit closes the socket, not when the owner was signalled, and this read *"in microseconds"* until 2026-09-13**: the kernel closes a process's files — releasing byte 0 with them — only after writing any core dump and tearing down its address space, so on one host a `SIGKILL`ed 2.7 MB owner was detected in ~0.24 ms median, a 1 GiB one in ~98 ms, and an `abort()` whose core went to the host's pipe `core_pattern` in ~1.1 s, during which no survivor could inherit and every fresh join was refused ([`0057`](./decisions/0057-an-owner-is-not-dead-until-its-files-close.md) (`draft`)). Participant death is detected by the lock file; owner death is detected by the socket. Both are kernel-maintained; neither involves a timeout.
 
 Message structs are fixed-size `#[repr(C)]`, little-endian, over `SOCK_SEQPACKET` so framing comes from the kernel:
 
