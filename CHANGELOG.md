@@ -187,22 +187,26 @@ is a bug.
 - **A C consumer sees this as `tf_tree.h` changing in comment lines only.**
   cbindgen copies `tf_tree_c`'s doc comments into the installed headers
   verbatim, so the trims reach it as text: no symbol, signature or constant
-  moves, and the ABI version stays `0.8`. `tf_tree_unstable.h` is unchanged —
-  none of the trimmed comments are emitted into it.
-- **A third batch, 18 files in the same six crates: 5449 -> 5194 comment lines,
-  4.7%**, every line with code on it identical to its parent. Graded the same
-  way, and not zero this time: **nine must-restore, all restored.** Eight were
-  the banner loss above again, for the same reason — 17 banners across
-  `tf_tree_c`'s `publisher.rs` and `unstable.rs` and `tf_tree_bench`'s
-  `step_cost.rs`, `owner_migration.rs` and `dds_report_aggregate.rs`. The ninth
-  was `unstable.rs`'s sentence naming `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`, without
-  which the comment under it opened on "Every other layout". Four trimmed doc
+  moves, and the ABI version stays `0.8`. None of these 33 files' trimmed
+  comments reach `tf_tree_unstable.h`; the third batch's do (below).
+- **A third batch, 18 files in the same six crates: 5449 -> 5196 comment lines,
+  4.6%**, every line with code on it identical to its parent. Graded the same
+  way, and not zero this time. The banner loss above recurred — 18 banners
+  across `tf_tree_c`'s `publisher.rs` and `unstable.rs` and `tf_tree_bench`'s
+  `step_cost.rs`, `owner_migration.rs`, `dds_report_aggregate.rs` and `mp.rs`,
+  all restored — and `unstable.rs` lost the sentence naming
+  `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`, without which the comment under it opened on
+  "Every other layout"; restored. Four trimmed doc
   blocks reach `tf_tree_unstable.h` as comment lines only; `tf_tree.h` does not
   change and the ABI version stays `0.8`. And `tf_tree/tests/frozen.rs` carried
   the same false "no `.config/nextest.toml`" claim as `rendezvous.rs`: its
   300 ms budget is now justified by what it is, the whole cost of a guard-less
   build that polls until it answers `Timeout`, with nextest's 180 s bound beside
-  it.
+  it. Two stale comments fixed in passing: `owner_migration.rs`'s histogram doc
+  said "10 ns linear buckets" where `BUCKET_NS` is 2, and now links the
+  constant; and a `statics.rs` test doc said its fixture holds 2 contradicted
+  edges against 7 observations, where it holds 3 and asserts 9, and named a
+  `slot_for` that is `slot_or_insert`.
 
 ### Fixed — three broken intra-doc links, a stale complexity claim, and a spliced doc comment
 

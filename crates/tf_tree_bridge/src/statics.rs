@@ -533,8 +533,8 @@ mod tests {
     /// halt's `detail` "enumerates **every** recorded edge with both of its
     /// publishers, not the first".
     ///
-    /// The fixture keeps the two numbers apart on purpose — 2 contradicted edges
-    /// against 7 conflicting observations — so a substitution of one for the
+    /// The fixture keeps the two numbers apart on purpose — 3 contradicted edges
+    /// against 9 conflicting observations — so a substitution of one for the
     /// other cannot pass by coincidence, the same shape
     /// `ingest::tests::the_startup_halt_counts_faults_not_observations` uses one
     /// level up.
@@ -545,7 +545,7 @@ mod tests {
     /// The fixture puts two distinct intruders on one edge for exactly that.
     ///
     /// Mutant (applied, confirmed fatal): set `first_intruder[slot]` in
-    /// `slot_for`, where every other parallel vector is grown — the two
+    /// `slot_or_insert`, where every other parallel vector is grown — the two
     /// never-contradicted edges then appear, and this fails at 5 entries
     /// against 3. Fatal to five tests: the other four are `ingest`'s
     /// startup-window tests, which is the cross-check that the halt reads this
@@ -624,7 +624,7 @@ mod tests {
         // The count that already existed sees nine observations...
         assert_eq!(s.conflicts(), 9, "observations");
 
-        // ...and the accessor sees two faults, names them, and names who
+        // ...and the accessor sees three faults, names them, and names who
         // disagreed — which is what §5.4:1403 asks for and what the private
         // counter this replaced structurally could not do.
         let mut found: Vec<(String, String, Publisher, Publisher, u64)> = s

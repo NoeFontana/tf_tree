@@ -442,6 +442,8 @@ pub fn self_pss_kib() -> u64 {
     0
 }
 
+// ---- machine-quiet accounting ------------------------------------------
+//
 // Every latency number in this harness is a measurement of the *scheduler* as
 // much as of the engine, so a row taken while something else was running is not
 // a slightly-worse number — it is a different experiment. The check below

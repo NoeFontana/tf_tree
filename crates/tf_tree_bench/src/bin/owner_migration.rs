@@ -293,7 +293,7 @@ mod imp {
 
     // ---------------------------------------------------------------- histogram
 
-    /// Sparse latency histogram: [`BUCKET_NS`] buckets plus one overflow.
+    /// Sparse latency histogram: linear buckets [`BUCKET_NS`] wide, plus one overflow.
     #[derive(Clone)]
     struct Hist {
         buckets: Vec<u32>,
