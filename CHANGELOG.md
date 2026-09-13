@@ -83,24 +83,6 @@ is a bug.
   completeness test is deleted rather than kept — its premise is now structural,
   and a test that cannot fail is the thing this entry is about. Net 53 lines.
 
-### Fixed — the one stored-name decode in `tf_tree` that did not clamp
-
-- **`Tree::frame_name` sliced `&rec.name[..rec.name_len as usize]` directly.**
-  `FrameRecord::name` is 48 bytes and `name_len` is a `u8`, so any stored length
-  above 48 panics on that slice. `FrameRecord::for_name` clamps at intern time, so
-  this is not reachable by writing a long name — but the bytes are read back out
-  of a shared segment or a `.tft` on disk, and `validate_arena_header` validates
-  the header, not per-record fields. **Six sites in the workspace decode a stored
-  name and five already clamped**; this was the sixth, and it is on the
-  *error-display* path reached through `Tree::describe`, which is where a caller
-  looking at a bad arena already is.
-- **It now goes through the file-local `stored_name`**, which is the same helper
-  the other in-crate sites use, so the fix removes a third spelling as well as the
-  panic. **One visible change**: an invalid-UTF-8 stored name used to collapse the
-  whole name to `"<invalid-utf8>"` and now gets `from_utf8_lossy`'s per-byte
-  replacement, which is what the other five already did and what a reader staring
-  at one corrupt frame among ninety needs.
-
 ### Fixed — `Tft::ALL` is the one list a new check can be left out of, and its doc said the opposite
 
 - **The guarantee the doc claimed is not one the type gives.** `Tft::ALL`'s
@@ -168,7 +150,7 @@ is a bug.
   yielded 2-3%; `tf_tree_cli/src/top.rs` yielded 6% and the `tf_tree_bench`
   files similar. Benchmark and CLI code narrates; the arena protocols argue, and
   an argument has nothing to cut.
-- Three files were reverted rather than kept. `tf_tree_c/src/bridge.rs` lost all
+- Two files were reverted rather than kept. `tf_tree_c/src/bridge.rs` lost all
   six of its section banners, which would have left it the only file in a crate
   where three siblings still carry them; `tf_tree_c/src/layout.rs` lost the one
   marking where its tests stop exercising `write` and start on `read` (restored
@@ -182,31 +164,33 @@ is a bug.
   its note that `TFT010`'s skip belongs to the same compared-nothing family as
   `TFT007` and `TFT008`; `bridge/ingest.rs`'s `Recreate` rung, without which
   `note_time_jump`'s pointer at "the argument for **both rungs**" led to a
-  section arguing only `Halt`; and `tf_tree_ingest`'s `source.rs` clause saying
-  why a short read compared against the clamped length could not call a record
-  complete on a file whose length does not change
-  (`got <= file_len - 17 < want`), which the trim had swapped for a pointer at
-  "the paragraph above" — a paragraph that does not make that argument.
-- Three comment defects fixed in passing. `impl Drop for Tree` carried a stray
+  section arguing only `Halt`.
+- Two comment defects fixed in passing. `impl Drop for Tree` carried a stray
   doc describing a boot id "folded to a `u64`"; `boot_id()` returns `[u8; 16]`
   and its own doc says **not** hashed to 64 bits (PHASE2 A7). `sample_interval`'s
   entire doc — the domain gate, the "`0` means never" contract, the clamp
   argument — was glued to the end of `recorded_offset`'s, so one function had no
-  documentation and the other carried a contract that was not its own. And
-  `tf_tree/tests/rendezvous.rs` justified bounding its deadline tests with a
-  worker thread by saying the repository has no `.config/nextest.toml` — one doc
-  "verified" there is no `.config/` directory at all — when that file exists and
-  sets `terminate-after`. The thread is still right, for the reason now stated:
-  it fails in 30 s naming the ignored deadline, not at 180 s as an anonymous
-  timeout. The two `expect` messages that repeat the claim are code, and are left
-  for a follow-up.
+  documentation and the other carried a contract that was not its own.
+- Two more found in review of the PR, after grading. `tf_tree_ingest`'s
+  `source.rs` had its reason that a short read compared against the clamped
+  length cannot call a record complete on a file whose length does not change
+  (`got <= file_len - 17 < want`) swapped for a pointer at "the paragraph
+  above", a paragraph that does not make that argument; the inequality is back
+  inline. And `tf_tree/tests/rendezvous.rs` justified bounding its deadline tests
+  with a worker thread by saying the repository has no `.config/nextest.toml` —
+  one doc, rewritten by the trim, "verified" there is no `.config/` directory at
+  all — when that file exists and sets `terminate-after`. The thread is still
+  right, for the reason now stated: it fails in 30 s naming the ignored
+  deadline, where nextest would stop it at 180 s with a timeout that says only
+  that something hung. The two `expect` messages that repeat the claim are code,
+  and are left for a follow-up.
 - **A C consumer sees this as `tf_tree.h` changing in comment lines only.**
   cbindgen copies `tf_tree_c`'s doc comments into the installed headers
   verbatim, so the trims reach it as text: no symbol, signature or constant
   moves, and the ABI version stays `0.8`. `tf_tree_unstable.h` is unchanged —
   none of the trimmed comments are emitted into it.
 
-### Fixed — three broken intra-doc links, a stale complexity claim, and two spliced doc comments
+### Fixed — three broken intra-doc links, a stale complexity claim, and a spliced doc comment
 
 - **Three intra-doc links resolved to nothing, and no gate could see them.**
   `sample.rs` linked `crate::edge::EdgeCfg`, which does not exist — the item is
@@ -235,12 +219,6 @@ is a bug.
   tail was standing alone 150 lines later as
   `extrapolation_is_selectable_and_reports_how_far_it_reached`'s entire doc.
   Rejoined and moved onto the test it describes.
-- **A stray orphan doc on `impl Drop for Tree`** described a boot-id-folded-to-
-  `u64` that does not exist — `boot_id()` returns `[u8; 16]` and its own doc says
-  "**Not hashed to 64 bits**" (PHASE2 A7). Deleted. And `sample_interval`'s whole
-  doc block — the domain gate, the "`0` means never" contract, the clamp
-  argument — was glued to the end of `recorded_offset`'s, so one function had no
-  doc and the other was documented with a contract that is not its own.
 
 ### Changed — comments in the four `no_std` crates say why, not what
 
