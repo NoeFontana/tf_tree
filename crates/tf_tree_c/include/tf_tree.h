@@ -80,14 +80,13 @@ typedef struct tft_publisher tft_publisher;
  * `3` → `4`: two appended entry points, [`tft_stamp_from_parts`] and
  * [`tft_stamp_from_timespec`] (`docs/API.md` §5.1), and the one status code
  * they can return, [`TFT_ERR_BAD_STAMP`]. **This is the additive case §3.6's
- * rule is for, and it is worth stating why a new *function* is a minor bump
- * rather than no bump at all**: the minor is exactly the number a caller
- * compares to find out whether the symbols its header declares are present in
- * the library it linked. Adding a symbol without moving it would let a caller
- * compiled against this header link against a `0.3` library, pass
- * `tft_check_abi`, and then fail at the dynamic loader — or, on a static link,
- * not build. Nothing existing moved, changed type or changed meaning, so the
- * major does not move.
+ * rule is for, and why a new *function* is a minor bump rather than no bump at
+ * all**: the minor is exactly the number a caller compares to find out whether
+ * the symbols its header declares are present in the library it linked. Adding
+ * a symbol without moving it would let a caller compiled against this header
+ * link against a `0.3` library, pass `tft_check_abi`, and then fail at the
+ * dynamic loader — or, on a static link, not build. Nothing existing moved,
+ * changed type or changed meaning, so the major does not move.
  *
  * `TFT_ERR_BAD_STAMP` rides along for the reason its own documentation gives:
  * only the two new functions return it, so a `0.3` caller cannot receive a
@@ -111,11 +110,9 @@ typedef struct tft_publisher tft_publisher;
  *
  * `5` → `6`: one appended entry point, [`tft_plan_create_in_domain`]
  * (`docs/decisions/0038`). It is `3` → `4`'s case exactly — a new *symbol*, so
- * the minor has to move or a caller compiled against this header links a `0.5`
- * library, passes `tft_check_abi`, and then fails at the loader. Nothing
- * moved, changed type or changed meaning: [`tft_plan_create`] keeps its
- * signature and its meaning, which `0038` defines as this function with
- * `domain = 0`.
+ * the minor has to move. Nothing moved, changed type or changed meaning:
+ * [`tft_plan_create`] keeps its signature and its meaning, which `0038`
+ * defines as this function with `domain = 0`.
  *
  * **What a `0.5` caller can observe is a refusal arriving earlier**, and only
  * on an arena where it was already receiving that refusal. On a tree whose
@@ -129,18 +126,13 @@ typedef struct tft_publisher tft_publisher;
  * `6` → `7`: one appended entry point, [`tft_plan_at_extrapolating`], with
  * the two values it needs — [`tft_extrap_policy`] and [`tft_extrapolated`]
  * (`docs/decisions/0039`). A new *symbol*, so `3` → `4`'s argument applies
- * unchanged: the minor is what a caller compares to find out whether the
- * symbols its header declares are present in the library it linked, and
- * without the bump a caller compiled against this header links a `0.6`
- * library, passes [`tft_check_abi`], and then fails at the loader.
+ * unchanged.
  *
  * **No existing declaration moves, and no status code is added.** The
  * refusal a caller can now ask *not* to receive, [`TFT_ERR_EXTRAPOLATION`],
  * has been in this header since 1.0 — which is what keeps this bump smaller
  * than `4` → `5`'s: there is no code an older caller could be handed and
- * could not name. [`tft_plan_at`] keeps its signature and its meaning; it
- * refuses, as it always has, and this function with [`TFT_EXTRAP_ERROR`] is
- * that same refusal with a distance attached on success.
+ * could not name. [`tft_plan_at`] keeps its signature and its meaning.
  *
  * **A `0.6` caller can observe nothing at all.** Unlike `5` → `6`, which
  * moved a refusal earlier on arenas that were already failing, nothing here
@@ -905,11 +897,10 @@ tft_status tft_plan_at(const tft_plan *plan, int64_t stamp, tft_layout layout, v
  *
  * # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
  *
- * Accepted here as it is by [`tft_plan_at`], and with the same meaning: each
- * element is thirteen `f64`, pose then body twist, evaluated with derivatives.
- * `TFT_ERR_NO_DERIVATIVES` is a property of an *edge*, so it fires on the
- * first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT` depends
- * on the stamp and can fire part-way through.
+ * Accepted here as it is by [`tft_plan_at`], and with the same meaning, per
+ * element. `TFT_ERR_NO_DERIVATIVES` is a property of an *edge*, so it fires on
+ * the first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT`
+ * depends on the stamp and can fire part-way through.
  *
  * **Sort your stamps.** This layout is evaluated by the engine's batch fold,
  * which rides a resumable cursor per plan step when the stamps are
