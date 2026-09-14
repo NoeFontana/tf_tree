@@ -79,7 +79,9 @@ text changes**, and message text is not a compatibility promise
   header or ABI changes**.
 - **Python:** `open_file`, `build` and `open` no longer end a message with
   `The engine's reason, raw: ` and a `Debug` dump; they forward the engine's
-  sentence.
+  sentence. `open_file` on a `.tft` whose *arena* header's layout hash does not
+  match now says to re-freeze, as the container header's mismatch already did
+  (`PHASE5.md` §2.4).
 - `just shm-check` now *runs* `tf_tree`'s `tests/error_payloads.rs` under
   `shm`; it had only clippied that target.
 

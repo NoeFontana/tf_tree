@@ -553,7 +553,7 @@ fn not_on_this_platform() -> PyErr {
 /// a `.tft` is a cache and not an archive.
 #[cfg(target_os = "linux")]
 fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
-    use tf_tree::{FrozenError, FrozenFileError};
+    use tf_tree::{FrozenError, FrozenFileError, ShmError};
     // `Path` has no `Display`; `display()` is lossy for a non-UTF-8 path, which
     // is right for a *message*. The `filename` attribute below keeps the real
     // bytes, because that is the one a caller may reopen with.
@@ -597,15 +597,15 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                 // a tenth variant is a compile error here rather than a
                 // `SizeMismatch { actual: 4096, expected: 8192 }` shown to a
                 // Python user as if it were a sentence. Nine variants, and only
-                // the three above had prose; the five arms below are the other
-                // six.
+                // the three above had prose; the arms below are the other six.
                 //
                 // None of them says "re-freeze the recording", which is the
                 // remedy the three above carry. Those three mean *wrong build*
                 // and re-freezing is the fix; these mean damaged file, wrong
                 // permissions or no memory, and sending someone to re-run an
                 // hour of bag ingest for a truncated write is worse advice than
-                // none.
+                // none. The one exception is the arena header's own layout-hash
+                // mismatch, below, because §2.4 is NORMATIVE about it.
                 FrozenError::Truncated => {
                     "ends before a structure its own header promises — the write \
                      was interrupted, or the file is still being written"
@@ -628,7 +628,7 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                     "could not be read or mapped: {}",
                     std::io::Error::from_raw_os_error(errno.raw_os_error())
                 ),
-                // **The one arm that forwards the engine's text.** `ShmError` is
+                // **The two arms that forward the engine's text.** `ShmError` is
                 // the arena-header check a `memfd` attach makes, with sixteen
                 // variants; enumerating a second enum from this module would
                 // re-spell `check.rs`'s reasons in a place that cannot see them
@@ -636,6 +636,20 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                 // ending in the variant name, and that name is the only handle
                 // anyone has on which check failed: the reader is looking at a
                 // corrupt file. It printed `Debug`, labelled raw, until then.
+                //
+                // `LayoutMismatch` is split out because `PHASE5.md` §2.4 is
+                // NORMATIVE that a `layout_hash` mismatch states that the file
+                // must be re-frozen, and §2.4's read path checks the hash in the
+                // arena header as well as in the container header above
+                // (`docs/decisions/0059` decision 2(d)). The engine's text names
+                // both values; `ShmError`'s own says nothing about re-freezing,
+                // because a `memfd` attach shares it.
+                FrozenError::Arena(inner @ ShmError::LayoutMismatch { .. }) => format!(
+                    "contains an arena image whose layout hash is not this \
+                     build's. Re-freeze the source recording — a .tft is a cache, \
+                     not an archive (`tf_tree doctor --explain-version`). The \
+                     engine's reason: {inner}"
+                ),
                 FrozenError::Arena(inner) => format!(
                     "contains an arena image whose header did not validate; the \
                      file is corrupt, or was written by a build with a different \

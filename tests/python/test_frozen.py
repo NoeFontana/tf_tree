@@ -305,8 +305,10 @@ def test_a_damaged_arena_header_reports_the_engines_reason_as_prose(live, tmp_pa
     ``raw: LayoutMismatch { found: 1024475540, expected: 1024475541 }``.
 
     Structure only, because message text is not a compatibility promise
-    (``docs/API.md`` R5): no brace, no ``raw``, and the variant name, which is
-    the search key ``docs/RUNBOOK.md`` is headed by, still present.
+    (``docs/API.md`` R5): no brace, no ``raw``, the variant name, which is
+    the search key ``docs/RUNBOOK.md`` is headed by, still present, and a
+    statement that the file must be re-frozen, which ``PHASE5.md`` §2.4 is
+    NORMATIVE about for a ``layout_hash`` mismatch.
 
     The magic-byte flip is deliberately not a second case: ``BadMagic`` has no
     braces, and its ``Debug`` is a substring of its ``Display``, so no assertion
@@ -318,6 +320,13 @@ def test_a_damaged_arena_header_reports_the_engines_reason_as_prose(live, tmp_pa
     ``FrozenError::Arena`` arm. Applied: this test fails on its brace
     assertion, the message ending ``The engine's reason, raw: LayoutMismatch
     { found: 1024475540, expected: 1024475541 }``.
+
+    Mutant (added in review): guard ``offline.rs``'s
+    ``FrozenError::Arena(ShmError::LayoutMismatch)`` arm with ``if false``, so
+    the general ``Arena`` arm answers. Applied: this test fails on its
+    re-freeze assertion, the message ending ``The engine's reason: arena layout
+    hash 0x3D104194 is not this build's 0x3D104195 (LayoutMismatch)`` and
+    saying nothing about re-freezing.
     """
     path = tmp_path / "bad_hash.tft"
     live.freeze(str(path), source="synthetic")
@@ -336,6 +345,7 @@ def test_a_damaged_arena_header_reports_the_engines_reason_as_prose(live, tmp_pa
     assert "{" not in msg and "}" not in msg, msg
     assert "raw" not in msg, msg
     assert "LayoutMismatch" in msg, msg
+    assert "re-freez" in msg.lower(), msg
 
 
 def test_freeze_replaces_the_path_atomically_and_leaves_no_litter(live, tmp_path):

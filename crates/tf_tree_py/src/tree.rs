@@ -2761,8 +2761,10 @@ pub fn open_arena(
     }
     // Both failures route through the same mapper, because `Open::name` returns
     // an `OpenError` too — a rejected arena name is `Rendezvous(IpcError)`, and
-    // that arm was already prose. What was not is `Build`, which carries every
-    // one of `BuildError`'s Debug dumps into the call a consumer makes first.
+    // that arm was already prose. What was not is `Build`, which carried
+    // `BuildError`'s Debug dumps into the call a consumer makes first (all five
+    // wrappers print their payload's `Display` since #339 and
+    // `docs/decisions/0059`); `open_err` is still where its remedies are written.
     // **A config path must not reach `open_err`'s build prose.** That prose is
     // written about the `create=` edge list and the `capacity=` keyword, and a
     // config caller passed neither — so it would report "0 pairs", advise
