@@ -4,8 +4,9 @@
 **Owner:** @NoeFontana
 **Implementation:** none. The prototype this record measures was built in a
 detached worktree at `681e601`, was never committed and is not coming in as it
-stands; *Implementation plan* step 0 is a measurement, and its only code is a
-bail-out arm on that uncommitted prototype (step 0b).
+stands. *Implementation plan* steps 0 and 1 are measurements, and none of their
+code is committed: a classifier harness over a recorded stream (step 0a), and
+arms built on that uncommitted prototype (steps 0b and 1).
 
 ## Context
 
@@ -29,8 +30,10 @@ two of its findings are the starting point:
   1.67× on LerpSlerp quaternions alone,** and said it was *"unreachable from where
   the engine stands"*. Getting there means splitting the fold so every bracket is
   read first and interpolated second: *"That restructure is not in this record,
-  is not costed by it."* Its Withdrawal then measured `-C target-cpu=x86-64-v3`
-  as 8–14% **slower** on `at_many`: wider lanes lose in this fold.
+  is not costed by it, and **is a prerequisite for step 4 as much as for step
+  3**"*, its steps 3 and 4 being the autovectorised loop and `pulp`. Its
+  Withdrawal then measured `-C target-cpu=x86-64-v3` as 8–14% **slower** on
+  `at_many`: wider lanes lose in this fold.
 
 [`fast-path.md`](../design/fast-path.md) §14 **falsified Lever 2**, which split
 the fold across *steps* so a plan's *d* dependent load chains could overlap. It
@@ -42,7 +45,8 @@ The *d* steps still run in plan order and still never overlap.
 A skeptic-verified plan asked for this lever to start as a measurement on the
 real fold rather than as an implementation. It asked that the stop rule be
 stated before any number, and that the gates be named. This record carries that
-measurement and an independent re-measurement of it.
+measurement and an independent re-measurement of it, and the next section
+separates the rules fixed before the numbers from those added after them.
 
 **Constraints every arm held, and any implementation must hold.** No `unsafe`
 in `tf_tree_math`, which is `#![forbid(unsafe_code)]`, and none added to
@@ -54,17 +58,34 @@ kinds rather than files, and nothing here adds a row to
 unchanged, `f64` only. **Batch results must be
 bit-identical (`to_bits`) to `Plan::at` for the same stamp.**
 
-## The stop rule, stated before the numbers
+## The stop rule: what was fixed first, and what was added after
 
-**A lever that wins under ~5% stops.** 0016 §3 set that floor as its own
-measurement's noise, with a single run moving by up to +50% on a shared host.
-The rule is applied **per lever, against that lever's own control**:
+**Fixed before any engine number:**
 
-- the restructure (two-phase fold, scalar `Interp::eval`) against `681e601`;
-- the kernel against the restructure. Because the restructure's arm turned out to
-  be a weak control on one entry point, the kernel is also checked against the
-  same kernel built with `-C no-vectorize-loops`, which isolates what is actually
-  SIMD.
+- **A lever that wins under ~5% stops.** 0016 §3 set that floor as its own
+  measurement's noise, with a single run moving by up to +50% on a shared host.
+- **A kernel must clear 1.3× in the probe** (§2: the kernel against
+  `Interp::eval` in a loop, on the same pose pairs) before an engine prototype
+  was worth building. The `v1` kernels cleared it, at 1.676× (LerpSlerp) and
+  2.008× (ScLerp), and the prototype was built. **`v2`'s LerpSlerp kernel fails
+  it, at 1.268×.** `v2`'s ScLerp kernel clears it at 1.796×. The selects that
+  cost the margin were added after the engine prototype existed, and the first
+  campaign recorded the shortfall without applying the bar to it. This record
+  applies it, in Decision B.
+
+**Added after the measurements, and why:**
+
+- **The floor is applied per lever, each against its own control:** the
+  restructure (two-phase fold, scalar `Interp::eval`) against `681e601`, and the
+  kernel against the restructure. `scal` was built in the first campaign as an
+  attribution control, but that campaign's report read the floor per lever only
+  after its numbers were in. Deciding the restructure on its own was the
+  re-measurement's recommendation (§7).
+- **The kernel is also checked against itself built with
+  `-C no-vectorize-loops`**, which isolates what is actually SIMD. On the probe
+  that control was part of the first campaign (§2). On the engine it was added by
+  the re-measurement, which found `scal` a weak control on `into_mat4` (§7
+  item 2).
 
 ## What was measured
 
@@ -176,8 +197,9 @@ run-medians.
 - **v2's endpoint selects cost ceiling**, in a separate 5-rotation run: F is
   14.168 ns, so A/F drops to **1.268×**, below the 1.3× bar for LerpSlerp. H is
   26.579 ns, so A'/H drops to **1.796×**. Compared across the two runs, the
-  selects cost ~3.4 ns (F) and ~2.8 ns (H) per element on data with no
+  selects cost ~3.4 ns (F) and ~2.7 ns (H) per element on data with no
   endpoints. The loop vectoriser is still worth 1.102× on F and 1.687× on H.
+  Decision B draws the consequence of the LerpSlerp failure.
 
 ### 3. Evidence the widening is across stamps
 
@@ -261,10 +283,12 @@ delta under ~3% is not read as an effect.
 
 **Stop-rule reading of this campaign.** The restructure clears 5% in every
 matrix cell, by 3.4× at its weakest (−16.8%). **On `into_mat4` it only just
-clears it:** −6.9% here and −6.2% in §7's re-measurement, close enough to the
-±1–3% noise band that this entry point alone would not carry it. The kernel
-clears 5% against `scal` in every series-region cell, by 2.4× at its weakest
-(−12.1%).
+clears it:** −6.9% here and −6.2% in §7's re-measurement, both paired medians,
+close enough to the ±1–3% noise band that this entry point alone would not carry
+it. The kernel clears 5% against `scal` in every series-region cell, by 2.4× at
+its weakest (−12.1%, LerpSlerp) and by 6.2× under ScLerp (−31.0%). That
+LerpSlerp margin does not outrank the 1.3× probe bar `v2`'s LerpSlerp kernel
+fails (§2).
 
 ### 5. Where it loses: stationary edges
 
@@ -316,9 +340,10 @@ On-grid minus off-grid under `v1` at N = 64 is 1.5–1.95 µs per chunk per
 dynamic step, derived from the table and assuming every step's first stamp is a
 knot: 1.53–1.81 µs in the mono cells, 1.61–1.95 µs in the nonmono cells, whose
 difference from off-grid also carries the stamp order. The off-grid arm
-attributes that cost to knots, and nothing attributes it further. **A cheaper
-design was not built:** copy phase 1's recorded exact
-hits over the kernel's output afterwards, with no select in the loop.
+attributes that cost to knots, and nothing attributes it further. **A design
+that may be cheaper was not built:** copy phase 1's recorded exact hits over the
+kernel's output afterwards, with no select in the loop. Step 0b builds and times
+it, as `copy`.
 
 ### 7. Independent re-measurement
 
@@ -339,16 +364,26 @@ the SMT sibling included, and the maximum was 2%.**
 | stationary ScLerp generic | 108.66 | 52.84 | 135.60 | 114.05 | +5.0% | +115.3% | +155.9% | — |
 | `into_quat_twist_1024` | 325.22 | 325.44 | 325.65 | 325.20 | −0.0% | −0.2% | −0.1% | — |
 
-The last column is (v2nlv − v2) / (base − v2): the part of the total saving that
-disappears when only the loop vectoriser is switched off.
+Figures are ns/stamp medians over reps. The delta columns are paired medians
+over reps, as in §4. The last column is (v2nlv − v2) / (base − v2), computed
+from the table's medians: the part of the total saving that disappears when only
+the loop vectoriser is switched off. Two deltas the table has no column for, both
+on `into_mat4`, are quoted below as paired medians: `scal` against `base` is
+**−6.2%** [−7.4, −5.3], and `v2` against `v2nlv` is **−34.2%** [−36.1, −34.0].
+The ratios of the table's medians give −6.1% and −34.4%.
 
 **Every headline figure reproduces within ~1%.** The re-measurement agreed with
 the verdict. Four of its findings bear on the first campaign, and **where the two
 disagree, this record takes the conservative reading**:
 
-1. **On `at_many`, the kernel's gain over `scal` is entirely the loop
-   vectoriser.** `v2nlv` sits within 0.4–2.6% of `scal`, which confirms §2's
-   probe on the real engine, where the first campaign had never run that control.
+1. **On `at_many`, the kernel's gain over `scal` is the loop vectoriser, but
+   only under §4's ±1–3% noise rule.** `v2nlv` is 0.4–2.6% faster than `scal`,
+   which confirms §2's probe on the real engine, where the first campaign had
+   never run that control. The residue is not zero: every cell's rep range
+   excludes zero except 1dyn LerpSlerp's. In the ScLerp cells and 1dyn LerpSlerp
+   it is 3–5% of the kernel's gain. **On 3dyn LerpSlerp it is −2.6% [−3.7,
+   −2.0], about 18% of that cell's kernel gain** (3.09 of 17.24 ns/stamp).
+   "Entirely" would be true only by reading that as noise.
 2. **On `into_mat4`, "87% kernel, −49.9%" is withdrawn.** `v2nlv` is still
    −23.8% against `scal` there, so about half of the "kernel alone" gain is not
    SIMD. `scal` is a weak control on that entry point: it reads 245.5 ns/stamp
@@ -360,7 +395,8 @@ disagree, this record takes the conservative reading**:
    arithmetic. Nearly all of the growth is shared with the arms that are fast
    on `into_mat4`; what is specific to `scal` is ~400–450 instructions.
 
-   The SIMD figure for `into_mat4` is `v2` against `v2nlv`, **−34.2%**.
+   The SIMD figure for `into_mat4` is `v2` against `v2nlv`, **−34.2%** (paired
+   median).
 3. **The attribution moves on `into_mat4` only.** On `at_many` the
    re-measurement confirms the first campaign's split. The non-SIMD share of
    `v2`'s saving (one minus the last column) is 56%, 53% and 42% in the three
@@ -377,16 +413,25 @@ disagree, this record takes the conservative reading**:
    ~1%.
 
 One process note. The first campaign's saved `base` and `scal` binaries differ by
-sha256 from fresh rebuilds, most likely because bench cells were added after
-those binaries were built. The five engine batch functions are mnemonic-identical
-between the two builds, so no figure moves. **Rebuild rather than reuse the
-saved binaries.**
+sha256 from the re-measurement's rebuilds, and **the cause is unknown**. It is
+not missing bench cells: both saved binaries contain the stationary and off-grid
+cell names, and `run_final.sh` ran those cells with them. They were saved before
+the `v2` kernel edit touched `interp.rs` and `plan.rs` behind the feature. The
+saved `v2` binary, from after that edit, is byte-identical to its rebuild, and
+the only source difference between the `v2` build and the rebuild is a
+`Cargo.toml` `[[example]]` entry. Whether the edit explains the other two was not
+tested. The five engine batch functions are mnemonic-identical between the two
+builds, so no figure moves. **Rebuild rather than reuse the saved binaries.**
 
 ### 8. Bit identity and mutants
 
-**Bit identity: PASS, at three levels, in every arm.**
+**Bit identity: PASS, at three levels.** Which arm and profile each level has a
+log for is stated per level.
 
-1. **Kernel pin** (`tf_tree_math`, release and debug).
+1. **Kernel pin** (`tf_tree_math`). Its passing log is a release run on `v1`
+   code, inside the crate's 35 lib tests. On `v2` code its only log is M6's
+   mutant run, in which two of its three tests pass and the third catches M6. No
+   debug run of it was logged.
    - Every element the classifier calls safe matches `LerpSlerp::eval` /
      `ScLerp::eval` by `to_bits`. The test asserts more than 8 000 safe elements
      per policy.
@@ -395,9 +440,9 @@ saved binaries.**
      straddling `1e-290`, and a NaN rotation.
    - Under `v2`, the SoA output is exactly `a` at `s == 0` and exactly `b` at
      `s == 1`.
-2. **Engine test** (`crates/tf_tree/tests/soa_proto.rs`, 3 tests). It compares
-   `at_many`, `at_many_into` (Quat and Mat4) and `at_many_into_f32` (Affine32)
-   against `Plan::at` on a fresh `Guard`.
+2. **Engine test** (`crates/tf_tree/tests/soa_proto.rs`, 3 tests in its final
+   form). It compares `at_many`, `at_many_into` (Quat and Mat4) and
+   `at_many_into_f32` (Affine32) against `Plan::at` on a fresh `Guard`.
    - **Inputs:** crafted branch regions repeated 4×, plus 200 random series
      steps, for 2 350 stamps per plan. The crafted regions are knots; `t ==
      t_new`; `s` rounding to exactly 1.0 over a 2⁶⁰ ns segment; identical
@@ -406,15 +451,21 @@ saved binaries.**
      zeros; NaN and ±inf translations.
    - **Plans and policies:** ScLerp, LerpSlerp and a mixed plan. One dynamic
      step, and dyn/static/dyn in both directions, so both `inverted` flags are
-     exercised. Identity and all-static plans.
+     exercised. Identity and all-static plans, which are the third test,
+     `identity_and_static_only_plans_match_at`, added last.
    - **Batches:** the full batch; slices of 1, 2, 63, 64, 65 and 129 at three
      offsets; **every stamp alone, and paired with a known-safe stamp in lane 0
      and in lane 1**.
    - **Error contract:** 5 lengths × 6 positions × 3 failure kinds. It asserts
      the error, the rows before it, a sentinel in every row from it on, and the
      per-edge counters.
-   - Passes with the feature off, on `v1`, `v2` and `scal`, in release and
-     debug.
+   - **Which runs have a log.** The two-test version, once its fixture had
+     random series and isolated stamps, passes with the feature off in
+     release, on `v1` in release and debug, on `scal` in release, and on `v2` in
+     release and debug. The three-test version has one log, 3 of 3 passing,
+     which records neither the arm nor the profile. The re-measurement reports
+     3 of 3 on `v2` in release and kept no log. **Every mutant below ran against
+     the two-test version.**
 3. **Benchmarked data.** All 16 128 rows of the 27 benchmarked matrix, off-grid
    and stationary cells are bit-identical to `Plan::at`, in `base`, `v1`, `v2` and
    `scal`. **No speedup here is fast because it is wrong.**
@@ -456,14 +507,15 @@ no log of them was kept:
 |---|---|
 | the restructure wins 17–50% on `at_many` and 6–7% on `into_mat4`, synthetic data, this host | MEASURED |
 | the restructure wins 44–51% on stationary data | MEASURED (3 cells) |
-| the kernel's gain over the restructure on `at_many` is the loop vectoriser | MEASURED (`v2nlv`, 5 cells) |
+| the kernel's gain over the restructure on `at_many` is the loop vectoriser, within ±1–3% build noise | MEASURED (`v2nlv`, 5 cells); up to 18% of the gain is not, on 3dyn LerpSlerp (§7 item 1) |
+| `v2`'s LerpSlerp kernel fails the 1.3× probe bar; its ScLerp kernel clears it | MEASURED (1.268× and 1.796×, §2) |
 | the kernel loses 80–115% to the restructure on all-fallback data | MEASURED |
-| batch output is bit-identical to `Plan::at` in every arm | MEASURED (three levels, mutants) |
+| batch output is bit-identical to `Plan::at` in `base`, `v1`, `v2` and `scal` | MEASURED (three levels, mutants); §8 states which arm and profile each log covers |
 | **why** the restructure is faster (per-chunk sampler and policy resolution hoisted, the out-of-line `fold_at_cursors` call gone, loop layout) | INFERRED: hypotheses, none isolated |
 | why `scal` is weak on `into_mat4` | **UNEXPLAINED**: the census does not tell `scal` from `v1`/`v2` (§7 item 2) |
 | the real `/tf` mix of series, stationary, large-arc and knot segments | **UNMEASURED**, and it decides the kernel's sign |
 | a rough break-even for `v2` over `scal`: ~27% of elements falling back under ScLerp, ~24% under LerpSlerp | INFERRED, see below |
-| the 16 kB frame's per-call cost (zeroing 14.8 kB) at small N | UNMEASURED; N < 64 was not benchmarked |
+| the 16 kB frame's per-call cost (zeroing 14.8 kB) at small N | UNMEASURED; N < 64 was not benchmarked (step 1 measures it) |
 | aarch64/NEON, `[profile.embedder]` (`lto = false`, `codegen-units = 16`), AVX hosts | UNMEASURED |
 | `read_bracket_from`'s earlier lap check is as sound as `sample_from`'s | ARGUED (below) and audited by the re-measurement; **no loom model** |
 
@@ -492,56 +544,89 @@ accept an argument in place of a model. The three `loom_tests.rs` lap models
 
 ## Decision (proposed, not taken)
 
-**Verdict: PROCEED, to two separable decisions taken in order, not to the
-prototype as built.** The two campaigns agree on the verdict. Where their
-attributions differ, the conservative reading above is the one carried forward.
+**Verdict: PROCEED to the measurements in *Implementation plan* step 0, not to an
+implementation and not to the prototype as built.** **This is a draft and
+authorises nothing.** What steps 0 and 1 feed is two separable decisions, taken
+in order. The two campaigns agree on the verdict. Where their attributions
+differ, the conservative reading above is the one carried forward.
 
 1. **Decision A — the restructure, with no kernel.** Rewrite `Plan::fold_batch`,
    and `at_many`'s loop through it, as a chunked two-phase fold. Per chunk and per
    step, phase 1 reads every bracket through **the one** seqlocked read path and
    phase 2 calls the scalar `Interp::eval`. It is proposed first because:
    - it is the only lever that wins in **every** cell whose fold it touches,
-     stationary data included (−6.2% to −50.8%), though `into_mat4`'s −6.2%
-     (§7; −6.9% in §4) is barely past the rule;
+     stationary data included (−6.2% to −50.8%, paired medians), though
+     `into_mat4`'s −6.2% (§7; −6.9% in §4) is barely past the rule;
    - it needs no second body of any arithmetic;
    - it is the prerequisite for Decision B whatever B becomes.
 
-   Before it lands, its mechanism is measured (step 1). Its chunk size and stack
-   frame are decided (open question 2). Its read path is **one body**:
+   Before it lands, step 1 measures its mechanism, its chunk size (a 16-lane arm
+   beside 64) and batches under 64 stamps, and applies its stop rule. Open
+   question 2 is answered from those rows. Its read path is **one body**:
    `sample_from` becomes the bracket read plus `eval`, not a copy beside it
    (open question 3).
-2. **Decision B — the SoA kernel, on top of A, only if step 0 says the data
-   wants it.** It applies only to chunks the classifier admits, with a
+2. **Decision B — an SoA kernel for ScLerp, on top of A, only if step 0 says the
+   data wants it.** It applies only to chunks the classifier admits, with a
    chunk-level bail-out: classify first, and skip the kernel when the chunk is
-   mostly fallback. Its knot handling is chosen by measurement between `v2`'s
-   selects and a post-kernel copy of phase 1's exact hits.
+   mostly fallback. Its knot handling is whichever of `v2`'s selects and a
+   post-kernel copy of phase 1's exact hits clears the 1.3× bar and is faster on
+   the recorded mix. Step 0b builds and times both.
 
-**The stop rule binds each separately.** A is abandoned if, after step 1, it
-wins under ~5% against `681e601` on the recorded mix. B is abandoned if it wins
-under ~5% against **A**, measured on the recorded mix. The SIMD part of that
-claim must hold against a `-C no-vectorize-loops` build of B, not only against A.
-**B is also abandoned if it loses to A by more than noise on the mix,** because
-its synthetic win does not transfer.
+   **B proposes no LerpSlerp kernel.** `v2`'s LerpSlerp kernel is 1.268× in the
+   probe, under the 1.3× bar fixed before any engine number (§2), so a
+   `v2`-shaped LerpSlerp kernel is not proposed, whatever its end-to-end margin
+   on synthetic data. A LerpSlerp kernel re-enters B only if a variant clears
+   the 1.3× bar with its knot handling included, and then clears the stop rule
+   against A on the recorded mix. Until then, B's LerpSlerp edges take A's
+   scalar phase 2.
+
+**The stop rules bind each separately, at named steps.**
+
+- **A** is abandoned if the arm step 1 would land wins under ~5% against
+  `681e601` on step 0a's recorded stream, through either `at_many` or
+  `at_many_into(Layout::Mat4)`. Step 1's stop point applies it.
+- **B** is abandoned if it wins under ~5% against **A** on the recorded mix, a
+  loss included, since then its synthetic win does not transfer. It is also
+  abandoned if it wins under ~5% against its own `-C no-vectorize-loops` build,
+  since then its win over A is not loop vectorisation. Step 0b applies both, and
+  step 3 applies them again at both profiles.
 
 ## Rationale
 
 - **Adopt `v2` as prototyped.** Its headline (−52% flagship) was measured on
   synthetic data that keeps nearly every element in the series region. On the only
   other data shape measured, it is at parity with `681e601` under LerpSlerp, 5–6%
-  slower under ScLerp, and 1.8–2.2× slower than A. Its kernels are
-  term-for-term second bodies of `slerp`'s series arm and of `screw_parts` /
-  `ScrewParts::pow` / `inv_mul`. The only thing keeping them in
+  slower under ScLerp, and 1.8–2.2× slower than A. Its LerpSlerp kernel fails
+  the 1.3× probe bar that was fixed before the engine prototype (1.268×). Its
+  kernels are term-for-term second bodies of `slerp`'s series arm and of
+  `screw_parts` / `ScrewParts::pow` / `inv_mul`. The only thing keeping them in
   step with the scalar arms is a bit-identity test. Adopting that maintenance
   cost before knowing which data it serves is backwards.
 - **Adopt A and B together.** They were measured as separable, and A carries
   82–87% of the saving under LerpSlerp and 38–54% under ScLerp. Bundling them
   would let B's unmeasured sign ride in on A's measured one.
+- **A LerpSlerp kernel in B.** Not proposed. `v2`'s is 1.268× in the probe,
+  under the 1.3× bar. Its end-to-end margin over `scal` (−12.1% to −16.8%) does
+  clear the ~5% floor, but both rules were fixed before any engine number, and
+  the bar is the one that decided whether an engine kernel was worth building at
+  all. LerpSlerp is also where the kernel carries least (13% of the saving by
+  `v2nlv`, §7), and it is `py_parity`'s all-fallback policy. A variant that
+  clears the bar re-enters B on the terms Decision B states.
 - **Stop.** The stop rule does not permit it. A clears ~5% by 3.4× in its
   weakest matrix cell (and by only 1.2× on `into_mat4`: −6.2% in §7, −6.9% in
-  §4). B clears it against A by 2.4× in the series region, and the negative
-  control is flat.
-- **`-C target-cpu=x86-64-v3`, or `pulp`.** Excluded by the constraints, and
-  measured slower by 0016. This record changes nothing about either.
+  §4, both paired medians). B's ScLerp kernel clears it against A by 6.2× in the
+  series region (−31.0%), and the negative control is flat. Stopping B's
+  LerpSlerp half is the bar's doing, not the floor's.
+- **`-C target-cpu=x86-64-v3`.** `0016`'s Withdrawal permits it and did not
+  adopt it, because it measured 8–14% slower on `at_many`. Every arm here held
+  the SSE2 baseline, so this record adds nothing about it.
+- **`pulp`.** Excluded as a new dependency: D14's budget, which `CLAUDE.md`
+  states for `tf_tree_math` as `libm` + `bytemuck`. It is also unmeasured:
+  `0016`'s spike checked its gates and lane counts and never timed it, and its
+  Withdrawal says it *"is not rejected in principle; it is rejected on the
+  evidence available"*. By `0016` §3 it cannot vectorise a loop containing a
+  seqlock either, so the restructure measured here would be its prerequisite
+  too.
 - **NLERP or any other approximation in the kernel.** Excluded. It breaks
   bit-identity with `Plan::at`, and bit-identity is what makes batch a layout
   rather than a second answer.
@@ -580,22 +665,32 @@ its synthetic win does not transfer.
   - **The reservation** and its page touches. The five 64-lane buffers are
     14 848 B of it, and `v2`'s `at_many_into_tagged` prologue probes each page
     it reserves (`sub $0x1000,%rsp; movq $0x0,(%rsp)`) whether or not the
-    buffers are written. It scales only with lane count or chunk size, which
-    is open question 2. `MaybeUninit` does not shrink it.
-  - **The zeroing** of those buffers on every call. Only
-    `MaybeUninit::assume_init` could remove it, and that is `unsafe` of no kind
-    `0007` rule 1, as amended by `0048`, permits.
-- **If B lands, two arithmetic bodies must stay bit-identical forever.** Any
-  edit to `slerp`'s series arm or to `ScrewParts::pow`'s must be mirrored in the
-  kernel, and the private thresholds must reach the classifier by value. The
-  kernel pin and the isolated-stamp engine test are what hold that, and a mutant
-  run is what proves they still can fail.
+    buffers are written. While the buffers live in the frame it scales only
+    with lane count or chunk size, which is open question 2. `MaybeUninit` does
+    not shrink it.
+  - **The zeroing** of those buffers on every call. `MaybeUninit::assume_init`
+    would remove it, and that is `unsafe` of no kind `0007` rule 1, as amended
+    by `0048`, permits. Safe routes exist, and none was built or measured:
+    smaller chunks zero less, and scratch buffers owned by the caller or the
+    plan, which outlive the call, move both the reservation and the per-call
+    zeroing out of the frame. The second is an API shape, so `API.md` §1
+    applies to it.
+- **If B lands, two arithmetic bodies must stay bit-identical forever.** That is
+  D13's shape (`docs/PROJECT.md` §5): *"Every non-obvious numeric routine gets
+  an obvious slow version that is kept in the tree and a fast version tested
+  against it by proptest."* `ScLerp::eval` is the reference and the kernel is
+  the fast version. Any edit to `screw_parts` or `ScrewParts::pow`'s series arm
+  (and, if a LerpSlerp kernel ever re-enters, to `slerp`'s) must be mirrored in
+  the kernel, and the private thresholds must reach the classifier by value.
+  D13's proptest, the kernel pin and the isolated-stamp engine test are what hold
+  that, and a mutant run is what proves they still can fail.
 - **PHASE3 §12.2 criterion 2's denominator moves.** `py_parity`'s
   `native_mat4_4096` is the native per-sample cost that criterion divides the
   Python batch cost by, and `Plan.at(stamps)` reaches the same
   `at_many_into_tagged`. Its data is all-fallback, so A should make it faster
-  and B, as prototyped, slower again (§5's cells, not measured on `py_parity`).
-  A saving that reaches both sides by the same absolute amount still raises the
+  and B as prototyped slower again (§5's cells, not measured on `py_parity`).
+  B as proposed has no LerpSlerp kernel and would not reach it. A saving that
+  reaches both sides by the same absolute amount still raises the
   Python-to-native ratio, because the binding's own per-call cost does not
   shrink with it (inferred, not measured). Whichever lands retakes that
   criterion's reading in the same change.
@@ -633,26 +728,62 @@ its synthetic win does not transfer.
        Without both, a classifier reading everything as series passes.
      - **Verified by** the fraction table and the two controls, recorded in
        this record.
-   - **0b. Timing, on the uncommitted prototype.** Build the chunk-level
-     bail-out arm, which was never built, on the prototype worktree, and time
-     `scal` (A as prototyped), `v2` and `v2` with the bail-out, interleaved, on
-     0a's stream and on `py_parity`'s existing one-dynamic-step,
-     all-fallback `at_many_into` rows.
-     - **Verified by** the interleaved timings recorded in this record.
-     - **Stop point:** if B loses to A on the recorded mix, B is closed here
-       and this record says what would reopen it.
-1. **Attribute A's mechanism before adopting it.** Build arms that separately:
+   - **0b. Timing, on the uncommitted prototype.** Two arms that were never
+     built are built on the prototype worktree:
+     - `copy`: `v1`'s kernel, which has no select, with `v2`'s monomorphic
+       fix-up. Phase 1 records each exact hit, the fix-up predicate skips hits,
+       and a pass after the kernel copies `a` over the output at each hit;
+     - the chunk-level bail-out.
+
+     Then, interleaved:
+     1. **Knot handling.** Time `v2` and `copy` on 0a's stream and on the
+        matrix's on-grid and off-grid cells, and time `copy`'s kernels in §2's
+        probe, hit copy included, against the 1.3× bar. Of the arms that clear
+        the bar, the faster on 0a's stream is B's knot handling.
+     2. **B against A.** Put the bail-out on the kept arm. Time `base`, `scal`
+        (A as prototyped), the kept arm with and without the bail-out, and the
+        kept arm rebuilt with `-C no-vectorize-loops` (`v2nlv` when the kept arm
+        is `v2`), on 0a's stream and on `py_parity`'s existing
+        one-dynamic-step, all-fallback `at_many_into` rows. B's arms run
+        LerpSlerp edges through `scal`'s phase 2, and the kept arm's LerpSlerp
+        kernel is timed as a separate row.
+     - **Verified by** the interleaved timings and probe ceilings, per policy,
+       recorded in this record.
+     - **Stop points:**
+       - **B closes here** if its faster arm, with or without the bail-out,
+         wins under ~5% against `scal` on 0a's stream. It also closes if that
+         arm wins under ~5% against its own `-C no-vectorize-loops` build,
+         because then its win over A is not loop vectorisation. This record
+         then says what would reopen it.
+       - **The LerpSlerp kernel stays out of B** unless `copy`'s clears 1.3×
+         in the probe and ~5% against `scal` on 0a's LerpSlerp edges. `v2`'s
+         is not a candidate: it already failed the bar (§2).
+1. **Attribute A's mechanism, size its chunk, and apply A's stop rule.** Build
+   arms on the prototype that separately:
    - hoist `view.sampler(edge)` and the policy dispatch per chunk into
      `681e601`'s fused loop;
    - inline, or remove the call to, `fold_at_cursors`;
-   - change only the loop order.
+   - change only the loop order;
+   - run `scal` with 16-lane buffers beside its 64.
 
    Also explain `scal`'s weakness on `into_mat4`, and the baseline's
    monotone-slower-than-non-monotone inversion (§1).
+   - **Data:** 0a's recorded stream, swept through `at_many` and through
+     `at_many_into(Layout::Mat4)`; the matrix, stationary and `into_mat4_1024`
+     cells; and `at_many` rows at N = 1, 2, 8, 16 and 63, which no campaign has
+     run.
    - **Verified by** each arm's interleaved delta against `base` and against
-     `scal`, with the flat `into_quat_twist_1024` control.
-   - **Stop point:** if one sub-change carries A's saving without phase
-     buffering, land that and not A.
+     `scal`, with the flat `into_quat_twist_1024` control, and each arm's stack
+     reservation read from its prologue as in §3, all recorded in this record.
+   - **Stop points:**
+     - **A's stop rule.** If the arm step 2 would land wins under ~5% against
+       `base` on 0a's recorded stream through either entry point, A is
+       abandoned here. `into_mat4` is the entry point to watch (−6.2%, §7).
+     - If one sub-change carries A's saving without phase buffering, land that
+       and not A.
+     - No chunk size goes to step 2 whose N < 64 rows lose to `base` by more
+       than noise. Open question 2 is answered from these rows, in this record,
+       before step 2 starts.
 2. **Land A.**
    - **One read body.** `sample_from` expressed through the bracket read, so the
      scalar path runs the same lap check in the same position.
@@ -661,7 +792,8 @@ its synthetic win does not transfer.
      `LOOM_MAX_PREEMPTIONS >= 3`.
    - **A one-dynamic-step fixture** in `crates/tf_tree/tests/` under both
      policies. It must reproduce §8's engine test in full: branch regions,
-     isolated stamps in lanes 0 and 1, the error-contract grid, counters.
+     isolated stamps in lanes 0 and 1, the error-contract grid, counters, and
+     the identity and all-static plans.
    - **A one-dynamic-step `at_many` bench row,** plus the off-grid and stationary
      rows.
    - **A run mutant:** M5 (an error does not lower the chunk limit) applied,
@@ -675,18 +807,36 @@ its synthetic win does not transfer.
      commit, at `[profile.bench]` **and** `[profile.embedder]`.
    - **Stop point:** if the embedder profile loses what the bench profile wins,
      A does not land as measured.
-3. **Only if step 0 left B open, land B on A.**
-   - **The kernel pin** in `tf_tree_math`, including `v2`-style endpoint
-     assertions if selects are kept.
-   - **All of §8's mutants plus M6 and M6b,** each run and recorded with its
-     catching assertion. Survivors must be argued equivalent.
-   - **The chunk bail-out.**
+3. **Only if step 0b left B open, land B on A.**
+   - **The kernel:** ScLerp only unless step 0b re-admitted LerpSlerp, with
+     step 0b's knot handling, and the chunk bail-out if step 0b kept it.
+   - **The kernel pin,** in the crate the kernel lands in (open question 5),
+     including endpoint assertions if selects are kept.
+   - **A D13 proptest.** D13 (`docs/PROJECT.md` §5) requires the fast version
+     to be *"tested against it by proptest"*, so fixed tests alone do not meet
+     it. Generate pose pairs, `s` and chunk fills, including chunks that mix
+     safe and unsafe elements, and compare the kernel plus fix-up with
+     `ScLerp::eval` by `to_bits`. It lives in the crate the kernel lands in.
+     `proptest` is already a dev-dependency of both `tf_tree_math` and
+     `tf_tree_core`, so it adds nothing under D14. The fixed tests stay,
+     because a generated distribution cannot be relied on to land on
+     `s == 1.0`, the `1e-290` degenerate band or either side of the series
+     threshold.
+   - **Every §8 mutant that applies to the kernel as landed** (M2 and M3 only
+     with a LerpSlerp kernel, M6 and M6b only with selects), each run and
+     recorded with its catching assertion. Survivors must be argued
+     equivalent.
    - **The per-symbol census** under *Reproduction*, run on the shipped bench
      binary: the kernel symbols' packed arithmetic must collapse under
      `-C no-vectorize-loops`, with zero `%ymm`.
    - **The B-versus-A delta,** on the matrix, the stationary rows, `py_parity`
-     and step 0's recorded stream, at both profiles and against `v2nlv`.
-   - **Verified by** everything step 2 names, plus that census and those deltas.
+     and step 0's recorded stream, at both profiles and against B's own
+     `-C no-vectorize-loops` build.
+   - **Verified by** everything step 2 names, plus that proptest, that census
+     and those deltas.
+   - **Stop point:** B does not land if, at either profile, it wins under ~5%
+     against A on step 0's recorded stream or against its own
+     `-C no-vectorize-loops` build, or if the census does not collapse.
 4. **Re-time on a second architecture.** Run the `ubuntu-24.04-arm` CI hardware,
    or any aarch64 host, for A and, if it landed, B. NEON's lanes and shuffle costs
    are not x86's. Verified by the same interleaved rows. **B's claim is x86-64
@@ -699,13 +849,16 @@ its synthetic win does not transfer.
    periods, duplicate stamps, late frames), a bag through PHASE5 §3's MCAP
    ingest, or both. Not the soak's `robot` workload, which is the synthetic
    fixture the matrix bench already used and serves only as step 0a's
-   ~100%-series positive control. Step 0 cannot start without an answer, and it
-   decides B.
-2. **Chunk size and stack.** 64 lanes cost ~16 kB of frame. 16 lanes would cost
-   ~4 kB and give the loop vectoriser a shorter trip count. Nobody has measured
-   the trade, or N < 64 at all. Is a batch-entry frame of that size acceptable
-   for `no_std` and small-stack embedders, and for the real-time envelope
-   `API.md` §8 states?
+   ~100%-series positive control. Step 0 cannot start without an answer, and
+   both stop rules are applied to it (steps 0b and 1).
+2. **Chunk size and stack.** 64 lanes cost ~16 kB of frame. At 16 lanes the five
+   buffers would be 3 712 B, so the frame would be about 4.8–5.0 kB if nothing
+   else in it changed (derived from §3's frame sizes, which carry 1 096–1 320 B
+   outside the buffers; not built). 16 lanes also give the loop vectoriser a
+   shorter trip count. Nobody has measured the trade, or N < 64 at all; step 1
+   does, and this question is answered from its rows. Is a batch-entry frame of
+   that size acceptable for `no_std` and small-stack embedders, and for the
+   real-time envelope `API.md` §8 states?
 3. **One read body: is the lap check's move acceptable on the scalar path?**
    Decision A requires `sample_from` to become "read the bracket, then `eval`",
    which moves `Plan::at`'s lap check before `eval` too. The argument is above
