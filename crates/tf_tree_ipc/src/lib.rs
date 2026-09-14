@@ -19,9 +19,10 @@
 //! Concretely, that buys three things that a heartbeat protocol cannot have at
 //! any price:
 //!
-//! * A `SIGKILL`ed participant's lock is released *by the kernel, immediately at
-//!   the end of its exit* — after any core dump and the teardown of its address
-//!   space, which is when the kernel closes a dying process's files
+//! * A dead participant's lock, `SIGKILL`ed or crashed, is released *by the
+//!   kernel, immediately at the end of its exit* — after any core dump and the
+//!   teardown of its address space, which is when the kernel closes a dying
+//!   process's files
 //!   ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
 //!   There is no timeout to tune and no state left behind to reap.
 //! * A `SIGSTOP`ped participant **still holds its lock**, so it can never be

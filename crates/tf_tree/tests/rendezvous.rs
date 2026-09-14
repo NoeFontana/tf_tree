@@ -4684,6 +4684,19 @@ fn two_survivors_race_and_exactly_one_inherits() {
 /// hangup seen. Both pins fail. Here the first poke read `false OwnerAlive 1`:
 /// both calls fell inside the grace period, nothing was attempted, and a vacant
 /// role was reported as held.
+///
+/// Neither of those reaches the migration assertion: both fail at the heir's
+/// first poke. **Mutant, run (2026-09-14), a latch on the migration path
+/// only:** in `Tree::owner_lost`, replacing
+/// `!session.ownership_held().unwrap_or(true)` with a
+/// `static SEEN_HELD: AtomicBool` set whenever byte 0 reads held after a
+/// hangup, and a `static FIRED: AtomicBool` that answers `false` on the first
+/// byte-0-free reading taken after `SEEN_HELD`. The heir's first poke stays
+/// green (it never saw byte 0 held), and so does the read-only pin (its only
+/// post-hangup reading is free). This test fails on the migration assertion,
+/// `the second owner died and the survivor did not notice: false Inherited 2`:
+/// the survivor was told the role was held after the last description holding
+/// it had closed, and `inherit_ownership`'s own call then took it.
 #[test]
 fn a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone() {
     let dir = Scratch::new("inherit-loser");
@@ -4829,6 +4842,11 @@ fn a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone() {
 /// **Mutant, run (2026-09-14), a grace period:** the same site, a
 /// `static FIRST: OnceLock<Instant>` and `false` until 100 ms after the first
 /// hangup seen. Both pins fail; this one on the same assertion.
+///
+/// The migration-only latch recorded on
+/// `a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone` passes
+/// here, as it must: this survivor never reads byte 0 held after a hangup, so
+/// that half of the pin is the other test's alone.
 #[test]
 fn a_read_only_survivor_reports_that_it_cannot_inherit() {
     use tf_tree::{AttachMode, Inheritance};

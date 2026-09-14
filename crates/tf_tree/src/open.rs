@@ -494,7 +494,8 @@ pub enum Inheritance {
     /// **Not final either way** while [`Tree::owner_lost`] keeps answering
     /// `true`: `0057` measured a first-call `Contended` or `OwnerAlive` in 21 of
     /// 120 trials with a joiner running, and `Inherited` on the next call every
-    /// time. The loop below retries by itself, because it keeps no latch.
+    /// time. The loop §3.5 recommends (see [`Tree::inherit_ownership`]'s
+    /// example) retries by itself, because it keeps no latch.
     ///
     /// Not an error, and **this process kept its slot** — which is the property
     /// the deleted takeover arm could not provide, because it went looking for a

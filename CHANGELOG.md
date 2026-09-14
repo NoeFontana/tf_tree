@@ -56,11 +56,15 @@ what the code has always done.
   dumping through a piped `core_pattern` was not visible, inheritable or
   joinable for about 1.1 s, and a 1 GiB `SIGKILL`ed owner for about 100 ms. The
   rustdoc, the C `tft_tree_owner_lost` doc and the Python `owner_lost` docstring
-  and stub now say so, and point at `RUNBOOK.md`'s per-process trade (a core
-  limit of 1 byte suppresses the dump; nothing removes the teardown).
+  and stub now say so, the C and Python texts as *"about a second"* with a
+  pointer to `0057`. Only the rustdoc gives these figures and points at
+  `RUNBOOK.md`'s per-process trade (a core limit of 1 byte suppresses the dump;
+  nothing removes the teardown).
 - **`tf_tree_ipc`'s crate doc and its crates.io page** said a `SIGKILL`ed
   participant's lock is released *"by the kernel, immediately"*; it is
-  immediately **at the end of the holder's exit**. `client.rs`'s module doc,
+  immediately **at the end of the holder's exit**, and the sentence now names
+  any dead participant, `SIGKILL`ed or crashed, because only a crashing one
+  dumps core and holds its lock through the dump. `client.rs`'s module doc,
   `peer_hung_up`, `server.rs`'s quote of D17, and the two NFS-refusal docs
   (`IpcError::NetworkFilesystem`, `reject_network_filesystem`) follow §3.3's
   corrected row. The NFS contrast they draw still holds.
@@ -76,13 +80,20 @@ what the code has always done.
   `LockFile::try_take_ownership`'s *"will be serving shortly"* now name that
   case. **A caller that treats one such answer as final can leave the arena
   ownerless**; the documented loop, which keeps no latch, retries by itself.
+  `take_over_ownership` says what to retry on: a hung-up socket **and**
+  `Session::ownership_held` reading byte 0 free, the pair `Tree::owner_lost`
+  checks. A hangup alone is not vacancy, and retrying on it is the spin `0043`
+  removed.
 - **§3.5's NORMATIVE sentence has a pin, and it is two existing tests.**
   `a_read_only_survivor_reports_that_it_cannot_inherit` and
   `a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone` already
   required the first `owner_lost()` after a `SIGKILL`ed owner's reap to answer
   `true`, with no timing threshold. Both now cite the sentence, and both fail
   against the two mutants `0057` names, run and recorded in their doc comments:
-  a two-observation latch and a 100 ms grace period in `owner_lost`. They pin the
+  a two-observation latch and a 100 ms grace period in `owner_lost`. Both of
+  those fail at the heir's first poke, so a third mutant, a latch that withholds
+  `true` only after byte 0 has been seen held following a hangup, was run
+  against the migration assertion and fails it alone. They pin the
   event, not a duration, and each failure message names the one legitimate
   cause: another task, such as a `/proc/<pid>/fd` reader, holding a transient
   reference to the dead owner's socket or lock-file description.

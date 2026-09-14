@@ -28,9 +28,10 @@ open file description locks provide all three, maintained by the kernel, with no
 timeouts, no heartbeats, and no state that can survive a `SIGKILL`. Three things
 follow that a heartbeat protocol cannot buy at any price:
 
-* A `SIGKILL`ed participant's lock is released **by the kernel, immediately at
-  the end of its exit** — after any core dump and the teardown of its address
-  space, which is when the kernel closes a dying process's files
+* A dead participant's lock, `SIGKILL`ed or crashed, is released **by the
+  kernel, immediately at the end of its exit** — after any core dump and the
+  teardown of its address space, which is when the kernel closes a dying
+  process's files
   ([`docs/decisions/0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
   There is no timeout to tune and nothing left to reap.
 * A `SIGSTOP`ped participant **still holds its lock**, so it can never be
