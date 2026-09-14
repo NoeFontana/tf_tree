@@ -1,8 +1,10 @@
 # 0059: the arena errors that cannot describe themselves
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** (none yet)
+**Implementation:** step 0 (re-reading #339's merged code) was done on
+2026-09-14, in the change that moved this record to `ready`, and found nothing
+that moves the plan; step 1 has not landed.
 
 ## Context
 
@@ -25,8 +27,9 @@ A workspace sweep for `impl .*Display for` and `impl .*Error for` over every
 `tf_tree_ipc` and `tf_tree` finds these four and three more with neither trait.
 The three are out of scope, and *Decision* 7 says why.
 
-**#339, in flight, fixed everything around these four and stopped at them on
-purpose.** On its tip (`b2fa6c2`) the facade prints `BuildError::Frame`,
+**#339, merged as `0761583` on 2026-09-14, fixed everything around these four
+and stopped at them on purpose.** On its tip (`b2fa6c2`), and on `main` since,
+the facade prints `BuildError::Frame`,
 `BuildError::Topology`, `ReparentError::Topology` and `AwaitError::Frame` with
 their payload's `Display`. It also re-exports `LayoutError` and
 `ParticipantError` at the root, and amends `tf_tree_core`'s crate docs to put
@@ -40,10 +43,34 @@ their payload's `Display`. It also re-exports `LayoutError` and
 
 This is that record.
 
+**Step 0's reading, 2026-09-14: #339 merged as the draft read it.** `0761583`
+was squashed onto `35270bd`, and `git diff 35270bd 0761583` has no added or
+removed line that `git diff 3465717 b2fa6c2` (the PR tip against its own base)
+does not have, so #339's own change is what the draft read. The code around it
+did move. #338, which the merge sits on and `b2fa6c2` did not, changes `SAFETY`
+comments in `crates/tf_tree_c/src/bridge.rs` and leaves the lines cited below
+(`1045-1049`, `1089`) as they were. The three commits on `main` after it (#340,
+#341, #342, to `d7868b5`) change comments and docstrings in library sources
+(`crates/tf_tree/src/tree.rs` and `open.rs`, seven files of `tf_tree_ipc/src`,
+`tf_tree_py/src/tree.rs`, `tf_tree_c/src/unstable.rs` and its unstable header,
+`python/tf_tree/_core.pyi`), and code only in test, bench and tooling files
+(`crates/tf_tree/tests/rendezvous.rs`, `tf_tree_bench`'s `shm_torture.rs`,
+`scripts/no-network.sh`, and the `justfile`, whose `prlimit` prefix step 1(c)
+cites). What the plan rests on is narrower: none of them touches
+`tests/error_payloads.rs`, `tf_tree_py`'s `errors.rs` or `offline.rs`, the CLI,
+`tf_tree_c`'s `error.rs` or the four defining files, so every citation below taken *at
+`b2fa6c2`* holds at `d7868b5` with one exception: `tft_tree_open_named`'s message is
+`unstable.rs:482` at `d7868b5`, not `:475`. `git grep -n '{0:?}'
+crates/tf_tree/src` names exactly the five attributes this record changes:
+`frozen.rs:44` (`FrozenFileError::Frozen`), `open.rs:721` (`OpenError::Map`), and
+`tree.rs:4542`, `:4552` and `:4555` (`BuildError::Layout`, `Shm`,
+`Participant`).
+
 ### What a user reads today, measured
 
-These were measured on #339's tip, because that is the base this record's
-implementation lands on. A scratch binary depends on `tf_tree` (`shm`) from a
+These were measured on #339's tip, which was the base this record's
+implementation would land on when it was written, and which merged unchanged
+(step 0's reading, above). A scratch binary depends on `tf_tree` (`shm`) from a
 checkout of `b2fa6c2`. It **constructs** each wrapper around a chosen payload and
 prints its `Display` and its `source()`. So the table shows how each wrapper
 renders; it does not claim each combination occurs. The two marked *constructed*
@@ -137,7 +164,8 @@ crate.
 
   Flipping the arena's magic byte instead ends the same message in `raw: BadMagic`.
 - **C.** `tft_tree_open_named` writes `could not open the arena: {e}` into the
-  message buffer (`crates/tf_tree_c/src/unstable.rs:475`), and the bridge writes
+  message buffer (`crates/tf_tree_c/src/unstable.rs:475` at `b2fa6c2`, `:482`
+  at `d7868b5`), and the bridge writes
   `shared arena could not be created: {detail} …` (`bridge.rs:1089`). The
   bridge's comment at `bridge.rs:1045-1049` says *"a refused memfd … arrives with
   its own text"*. It does not: that text is the `BuildError::Shm` row above,
@@ -199,6 +227,12 @@ crate.
 
 ## Decision
 
+The four judgement calls the draft named as likeliest to be reopened were
+accepted as written on 2026-09-14, under the owner's explicit delegation to
+*"choose the most desirable approach for the library goals"*. *Open questions*
+below gives each and its reason. Nothing else in this section changed in that
+move.
+
 **1. `ShmError`, `FrozenError`, `LayoutError` and `ParticipantError` implement
 `core::fmt::Display` and `core::error::Error`, by hand, in the file that defines
 each.**
@@ -230,8 +264,8 @@ fails to compile there. The impls use no `thiserror` and add no dependency.
   in each binding's own prose. **One remedy is required, not allowed**:
   `FrozenError::LayoutMismatch` names both hashes and states that the file must be
   re-frozen, because `PHASE5.md` §2.4 is NORMATIVE that it does. The same holds
-  for `FrozenError::Arena`, which appends the re-freeze statement after its
-  payload's text. Its one producer is `validate_arena_header` in
+  for `FrozenError::Arena`, which states re-freezing **before** its payload's
+  text, so that 2(g)'s trailing variant name is still the last thing it prints. Its one producer is `validate_arena_header` in
   `FrozenArena::open`, so every value it carries is an arena-header failure
   inside a `.tft` whose container header validated: a damaged or mis-written
   file, a `.tft` is a cache, and
@@ -251,7 +285,10 @@ fails to compile there. The impls use no `thiserror` and add no dependency.
   which is not this record's change (*Consequences*).
 - **(g) The text ends with the innermost variant's name as a search key**, in
   parentheses: `(LayoutMismatch)`, `(BadMagic)`. `FrozenError::Arena` adds none
-  of its own, because its payload's name is the more specific key. This is the
+  of its own, because its payload's name is the more specific key, and it ends
+  with that name too, which is why 2(d) puts its re-freeze statement first. So
+  does `FrozenError::LayoutMismatch`, whose required remedy comes before
+  `(LayoutMismatch)`. This is the
   choice `push_msg` already made for `NonMonotonicStamp` in the Python binding
   (*"the variant name is back, and it is a search key rather than a dump"*), for
   the same reason: `docs/RUNBOOK.md` heads its entries with the name, and a C
@@ -421,7 +458,7 @@ with `std` can restore it. Python already does for `FrozenError::Io`, through
 
 **Why ASCII.** `tft_error::set_message` replaces every non-ASCII *byte* with `?`
 (`crates/tf_tree_c/src/error.rs:253-265`), so an em dash reaches C as `???`. The
-hazard is live next door. On #339's tip, `IpcError`'s `Display` arms for
+hazard is live next door. On #339's tip, and still at `d7868b5`, `IpcError`'s `Display` arms for
 `NetworkFilesystem` and `ArenaHeldButUnreachable` contain em dashes and `§`, and
 name `CreatePolicy::Always`, and they reach C through the same `{e}`. That is
 recorded here as an observation. It is a sibling defect in a type this record
@@ -457,7 +494,7 @@ discriminator, to prevent a leak the other assertions already catch.
   `Box<dyn Error>` and `anyhow::Error`.
 - Four public types gain two trait impls each: 31 variants, each written once.
   A variant added later is a compile error in its `Display` and in the test's
-  exhaustiveness guard (step 2).
+  exhaustiveness guard (step 1(b)).
 - Every user-visible rendering in *What a user reads today* becomes one clause
   with no braces, ending in its variant name. The CLI shows errno numbers where
   the dump showed strerror text (*Rationale*).
@@ -465,9 +502,16 @@ discriminator, to prevent a leak the other assertions already catch.
   for the first time, rather than through the CLI's and Python's sentences.
 - The Python binding's three "raw" arms and its false comments go. The C
   bridge's comment becomes true.
-- **The dependency on #339 is hard.** The facade attributes, the root
-  re-exports and `tests/error_payloads.rs`'s `prints_its_payload` are all #339's.
-  If that PR changes in review, step 0 re-reads it.
+- **The dependency on #339 is hard, and it is met.** The facade attributes, the
+  root re-exports and `tests/error_payloads.rs`'s `prints_its_payload` are all
+  #339's. It merged as `0761583` with the shape this record was written
+  against (*Context*, step 0's reading).
+- **This lands before `0058`'s implementation.**
+  [`0058`](./0058-the-fields-a-python-exception-only-printed.md) rewrites
+  mappers in `crates/tf_tree_py/src/errors.rs` (they gain a `py` token and set
+  attributes, `open_err` among them), and step 1(d) below rewrites two arms and
+  four comments in the same file, one of those arms `open_err`'s. Landing this first keeps `0058`'s diffs off lines whose
+  meaning this record changes.
 - **Not decided here, and named so that nobody reads it as decided:**
   `IpcError`'s non-ASCII text on the C path; `WireError`, `ProcParseError` and
   `TopoLockError`; the arena manifest's `rustix`/`std` comment;
@@ -482,20 +526,32 @@ discriminator, to prevent a leak the other assertions already catch.
 
 ## Implementation plan
 
-Steps 1 to 4 land as **one PR**. Steps 3 and 4 fix sentences that step 1 makes
-false (the facade attributes' `{0:?}`, Python's "raw" arms and comments, the
-bridge's comment), so landing them apart would ship code and comments that
-contradict each other for as long as the gap lasted.
+**Order: step 0 is done; step 1 is one PR; step 2 follows it.** This record's
+implementation lands **before** any step of
+[`0058`](./0058-the-fields-a-python-exception-only-printed.md)'s, because both
+edit `crates/tf_tree_py/src/errors.rs`: step 1(d) rewrites two of its arms and
+four of its comments, and `0058`'s steps rewrite its mappers, `open_err`, which
+holds one of those arms, among them.
 
-0. **Rebase onto `main` after #339 merges**, and re-read its five attributes,
-   its re-exports and `tests/error_payloads.rs`. Verified by `git grep -n
-   '{0:?}' crates/tf_tree/src` naming exactly the five sites listed in *Context*.
-1. **The four impls, following decisions 1–3 and 5, and
-   `ShmError::ParticipantTableFull`'s rustdoc per decision 2(f).** Verified by
+0. **Re-read #339's merged code.** **Done on 2026-09-14**, when this record
+   moved to `ready`; *Context* records the reading. #339 merged as `0761583`
+   with the change the draft read, one cited line number moved
+   (`unstable.rs:475` to `:482`), and nothing in the plan below changed.
+   Verified by `git grep -n '{0:?}' crates/tf_tree/src` at `d7868b5` naming
+   exactly the five sites *Context* lists, and it did.
+1. **The implementing PR** (one PR, in four parts). Parts (c) and (d) fix
+   sentences that part (a) makes false (the facade attributes' `{0:?}`, Python's
+   "raw" arms and comments, the bridge's comment), so landing them apart would
+   ship code and comments that contradict each other for as long as the gap
+   lasted.
+
+   **(a) The four impls**, following decisions 1–3 and 5, and
+   `ShmError::ParticipantTableFull`'s rustdoc per decision 2(f). Verified by
    `just lint`, `just shm-check` (`cargo clippy -p tf_tree_arena --features shm
    --all-targets` compiles `check.rs` and `frozen.rs`), `just doc` and
    `just msrv`.
-2. **A rendering test beside each type**, in the style of `tf_tree_core`'s
+
+   **(b) A rendering test beside each type**, in the style of `tf_tree_core`'s
    `every_error_variant_renders_as_prose_naming_what_it_carries`. Each test does
    the following:
    - Construct one value of every variant, with every carried integer at its
@@ -508,9 +564,11 @@ contradict each other for as long as the gap lasted.
      - it contains no `{` or `}`;
      - it `is_ascii()`;
      - it is at most 120 bytes;
-     - it contains the innermost variant's name (the identifier before the first
-       `(` or ` {` of `format!("{e:?}")`, computed rather than hard-coded, and
-       taken from the inner value for `FrozenError::Arena`);
+     - it **ends with** the innermost variant's name in parentheses, `(Name)`
+       (the identifier before the first `(` or ` {` of `format!("{e:?}")`,
+       computed rather than hard-coded, and taken from the inner value for
+       `FrozenError::Arena`), which is decision 2(g)'s position and not only
+       containment;
      - it contains every carried integer in decision 2(a)'s spelling, an `Errno`
        as `errno {raw_os_error()}`.
    - For `FrozenError`, **also wrap every value from `ShmError`'s list in
@@ -536,24 +594,29 @@ contradict each other for as long as the gap lasted.
    - (M5) `FrozenError::Arena`'s arm → `write!(f, "arena header did not
      validate: {inner:?}")`, which the unit-variant payloads must catch.
    - (M6) drop the re-freeze clause from `FrozenError::LayoutMismatch`'s arm.
+   - (M9) move `FrozenError::Arena`'s re-freeze statement after its payload's
+     text, which the ends-with assertion must catch.
 
    Verified by `cargo nextest run -p tf_tree_arena --features shm` (a line of
    `just shm-check`) and by `just test` for `ParticipantError` and
-   `LayoutError`.
-3. **The facade.**
+   `LayoutError`, each red under its mutants and green without them.
+
+   **(c) The facade.**
    - Change the five attributes to `{0}` per decision 4.
    - Extend #339's `wrapped_payloads_print_their_display` with
      `prints_its_payload` over `BuildError::Layout` and `BuildError::Participant`.
      Under `cfg(all(feature = "shm", target_os = "linux"))`, cover
      `BuildError::Shm`, `OpenError::Map` and `FrozenFileError::Frozen`, plus a
      `?` from `Tree::attach_shared` into `Box<dyn Error>`.
-   - **Make a recipe run it with `shm`.** On #339's tip `just shm-check` only
-     *clippies* that target under `shm`: `grep -n error_payloads justfile`
-     finds nothing, and the recipe's `tf_tree --features shm` nextest lines
-     name `--lib`, `--test frozen`, `--test rendezvous` and `--test
-     owned_writer`. So a runtime assertion under that `cfg` would be compiled
-     and never executed. Add `cargo nextest run -p tf_tree --features shm
-     --test error_payloads` to `just shm-check` in the same commit as the
+   - **Make a recipe run it with `shm`.** On #339's tip, and still at
+     `d7868b5`, `just shm-check` only *clippies* that target under `shm`:
+     `grep -n error_payloads justfile` finds nothing, and the recipe's `tf_tree`
+     nextest lines with `shm` name `--lib`, `--test frozen`, `--test rendezvous`
+     and `--test owned_writer` (at `d7868b5` the `rendezvous` line carries
+     `0057` step 4's `prlimit --core=1:1 --` prefix and
+     `shm,unstable,crash-points`). So a runtime assertion under that `cfg` would
+     be compiled and never executed. Add `cargo nextest run -p tf_tree --features
+     shm --test error_payloads` to `just shm-check` in the same commit as the
      `shm`-only case, which is the spirit of `CLAUDE.md`'s `just shm-check` row
      (*"a new `shm`-only target belongs on that list in the commit that adds
      it"*), though this target is not new.
@@ -562,7 +625,8 @@ contradict each other for as long as the gap lasted.
    Verified by `cargo nextest list -p tf_tree --features shm --test
    error_payloads` naming the new cases, and by M7 failing under
    `just shm-check`.
-4. **The follow-ons in decision 8.**
+
+   **(d) The follow-ons in decision 8.**
    - Python: the three arms, the comments decision 8 lists, and a
      `tests/python/test_frozen.py` case that flips one `layout_hash` bit of the
      arena header inside a frozen `.tft`, which is this record's own probe. It
@@ -570,34 +634,72 @@ contradict each other for as long as the gap lasted.
      magic-byte flip is not a row**: `BadMagic` has no braces, and under decision
      2(g) its `Debug` spelling is a substring of its `Display`, so no structural
      assertion on the Python message can tell `{inner}` from `{inner:?}` there.
-     The Rust nested test (step 2) is what holds that case.
+     The Rust nested test (part (b)) is what holds that case.
    - **Mutant (M8):** restore `{inner:?}` in `offline.rs`, which the hash row's
      brace assertion must catch.
    - C: the comment at `bridge.rs:1045-1049`.
    - `CHANGELOG.md`, and R5's citation.
 
-   Verified by `just py-lint`, `just py-test`, `just c-header-check` (no
-   header change is expected, and the check is what shows none happened), and
-   `just artifact-versions`.
+   Verified by `just py-lint`, `just py-test` (red under M8), `just
+   c-header-check` (no header change is expected, and the check is what shows
+   none happened), and `just artifact-versions`, whose changelog-currency rule
+   fails without the entry. A final `git grep -n '{0:?}' crates/tf_tree/src` and
+   `git grep -n 'raw: {inner:?}' crates/tf_tree_py/src` must each print nothing;
+   at `d7868b5` they print five lines and three.
+2. **Status to `implemented`** when step 1 has landed.
 
 ## Open questions
 
-None. Four judgement calls were made while writing, and they are the ones a
-reviewer is likeliest to reopen, so each names its alternative:
+Resolved before status moves from `draft` to `ready`. A `ready` doc has none.
 
-- **The `errno N` spelling** over `Errno`'s strerror text. The alternative is
-  more informative today and loses on feature-dependence, locale and house
-  style (*Rationale*).
-- **`source()` staying `None`.** The alternative is a real error chain, and it
-  loses because the C buffer and Python message cannot walk one and `anyhow`
-  would print the payload twice.
-- **The variant name kept as a trailing search key** (decision 2(g)). The
-  alternative forbids it in the text and rewrites `docs/RUNBOOK.md`'s headings
-  to the new sentences, and loses because those sentences are uncontracted and
-  would have to be re-synchronised with the runbook every time one changed.
-- **Scope at four types rather than every public error type** (decision 7). The
-  alternative adds `WireError`, `ProcParseError` and `TopoLockError`, none of
-  which a facade wrapper prints with `Debug` or a facade entry point returns bare.
+None. The draft had none either: it named four judgement calls instead, as the
+ones a reviewer was likeliest to reopen. All four were accepted as written on
+2026-09-14, under the owner's explicit delegation to *"choose the most desirable
+approach for the library goals"*; the date is recorded once, here and in
+*Decision*, for all four. Each keeps the draft's text struck through above its
+answer and the one-line reason it stands on.
+
+### 1. ~~The `errno N` spelling over `Errno`'s strerror text~~ — accepted
+
+~~The alternative is more informative today and loses on feature-dependence,
+locale and house style (*Rationale*).~~
+
+**Accepted.** `errno N` is already the house spelling (`IpcError`'s errno arms,
+`FrozenFileError::Path`), and it is the only one whose bytes do not depend on a
+`rustix` feature this `no_std` crate never chose or on the `LC_MESSAGES` of a C
+host that can make `strerror_r`'s text non-ASCII.
+
+### 2. ~~`source()` staying `None`~~ — accepted
+
+~~The alternative is a real error chain, and it loses because the C buffer and
+Python message cannot walk one and `anyhow` would print the payload twice.~~
+
+**Accepted.** Neither the C message buffer nor a Python message can walk a
+chain, so a chain would serve Rust callers alone, and there `anyhow`'s `{:#}`
+would print twice a payload that `Display` already writes inline.
+
+### 3. ~~The variant name kept as a trailing search key (decision 2(g))~~ — accepted
+
+~~The alternative forbids it in the text and rewrites `docs/RUNBOOK.md`'s
+headings to the new sentences, and loses because those sentences are
+uncontracted and would have to be re-synchronised with the runbook every time
+one changed.~~
+
+**Accepted.** `docs/RUNBOOK.md`'s headings are the variant names, and R5 already
+contracts the discriminant, so repeating it in the text finds the entry and
+promises nothing the type did not.
+
+### 4. ~~Scope at four types rather than every public error type (decision 7)~~ — accepted
+
+~~The alternative adds `WireError`, `ProcParseError` and `TopoLockError`, none
+of which a facade wrapper prints with `Debug` or a facade entry point returns
+bare.~~
+
+**Accepted.** The other three never reach a user printed with `Debug`:
+`TopoLockError` becomes `ReparentError` at the facade boundary, and `IpcError`'s
+`Display` describes `WireError` and `ProcParseError` in words. Decision 7's last
+paragraph keeps what would reopen it: a caller who propagates
+`HelloResponse::from_bytes` or `parse_start_time` directly.
 
 The 120-byte bound is a derived number rather than a question. Moving it changes
 one constant in four tests.
