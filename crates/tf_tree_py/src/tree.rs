@@ -17,8 +17,8 @@ use crate::errors::open_err;
 use tf_tree::AttachMode;
 
 use crate::errors::{
-    build_err, claim_err, edge_label_of, lookup_err, plan_domain_err, push_class, push_err,
-    push_msg, resolve_frame, unknown_frame_err, BufferError, TfTreeError,
+    build_err, claim_err, detached_err, edge_label_of, lookup_err, plan_domain_err, push_class,
+    push_err, push_msg, resolve_frame, unknown_frame_err, BufferError, TfTreeError,
 };
 
 /// Releasing the GIL costs a measured 40 ns; a depth-3 lookup costs ~193 ns
@@ -329,16 +329,57 @@ fn samples_anything(plan: &tf_tree::Plan) -> bool {
 /// This is the most-questioned decision in the API, so the exception carries
 /// the number rather than an opinion: users argue with rules and accept
 /// measurements.
+///
+/// # A numpy float scalar that is not a Python `float`
+///
+/// `np.float64` subclasses `float` and meets the first check. `np.float32`,
+/// `np.float16` and `np.longdouble` do not, and until 2026-09-14 they met
+/// PyO3's `'numpy.float32' object cannot be interpreted as an integer` on every
+/// entry point — `Plan.at` included — while §3's amendment said the refusal
+/// was universal. They are recognised **only after the integer conversion has
+/// already failed**, so an accepted stamp pays nothing for it and the import
+/// happens on an error path.
+///
+/// **Scalars only, on purpose.** `isinstance(x, np.floating)` is false for an
+/// array, so a `float64` stamps *array* that falls through to here from `at` /
+/// `at_into` keeps numpy's own `TypeError`, which
+/// `test_the_layout_path_reports_a_bad_stamps_array_exactly_as_at_does` pins as
+/// byte-identical between the two. A 0-d float array is an array too.
 fn stamp_from_any(obj: &Bound<'_, PyAny>) -> PyResult<i64> {
     if obj.is_instance_of::<pyo3::types::PyFloat>() {
-        return Err(PyTypeError::new_err(
-            "stamps are integer nanoseconds, not float seconds. At a 2026 epoch \
-             the ULP of float64 seconds is 238 ns, so every interval in a 1 kHz \
-             stream is wrong after a round trip. Use tf_tree.from_sec(x) if you \
-             genuinely have float seconds and accept the loss.",
-        ));
+        return Err(float_stamp_err());
     }
-    obj.extract::<i64>()
+    obj.extract::<i64>().map_err(|e| {
+        if is_numpy_floating_scalar(obj) {
+            float_stamp_err()
+        } else {
+            e
+        }
+    })
+}
+
+/// [`stamp_from_any`]'s refusal, and its only spelling.
+fn float_stamp_err() -> PyErr {
+    PyTypeError::new_err(
+        "stamps are integer nanoseconds, not float seconds. At a 2026 epoch \
+         the ULP of float64 seconds is 238 ns, so every interval in a 1 kHz \
+         stream is wrong after a round trip. Use tf_tree.from_sec(x) if you \
+         genuinely have float seconds and accept the loss.",
+    )
+}
+
+/// `isinstance(obj, numpy.floating)`, and `false` if that cannot be asked.
+///
+/// A failed import or attribute lookup answers `false` rather than raising:
+/// this runs only to *choose the message* of a refusal that is already
+/// happening, and replacing the caller's conversion error with an import error
+/// would name the wrong problem.
+fn is_numpy_floating_scalar(obj: &Bound<'_, PyAny>) -> bool {
+    obj.py()
+        .import("numpy")
+        .and_then(|np| np.getattr("floating"))
+        .and_then(|floating| obj.is_instance(&floating))
+        .unwrap_or(false)
 }
 
 #[pymethods]
@@ -441,6 +482,7 @@ impl PyTree {
         Ok(PyPublisher {
             edge: edge_label_of(parent, child),
             inner: Mutex::new(Some(writer)),
+            tree: Arc::downgrade(&this.inner),
         })
     }
 
@@ -2001,6 +2043,19 @@ pub struct PyPublisher {
     /// [`OwnedWriter::push`](tf_tree::OwnedWriter::push), which forwards to the
     /// fork-checked `EdgeWriter::push`.
     inner: Mutex<Option<OwnedWriter>>,
+    /// The tree this claim was made on, for the one refusal no `push` reaches.
+    ///
+    /// An **empty** `push_many` runs no `push`, so `EdgeWriter::push`'s fork
+    /// check never fires and a fork child's call returned `None` where
+    /// `docs/PHASE3.md` §8.1 (NORMATIVE) requires `ChildProcessDetachedError`.
+    /// `OwnedWriter` exposes no `detached()` of its own, so this asks the tree.
+    ///
+    /// **`Weak`, not `Arc`**: the writer in [`Self::inner`] already owns the
+    /// tree for as long as the claim is held, and a strong count here would
+    /// keep the tree — and its participant slot — alive past `release()` for as
+    /// long as the Python object is reachable, which is a change to when a
+    /// `Tree`'s drop runs, bought for an error path.
+    tree: std::sync::Weak<Tree>,
 }
 
 #[pymethods]
@@ -2074,6 +2129,15 @@ impl PyPublisher {
 
         let g = self.lock()?;
         let p = g.as_ref().ok_or_else(released)?;
+        // **An empty batch is still a call on a fork-inherited handle.** The
+        // per-sample `push` below is where the fork check lives, and a
+        // zero-length batch never reaches it — so without this a fork child's
+        // `push_many` of nothing answered `None` (`docs/PHASE3.md` §8.1). Only
+        // for `n == 0`: every other batch meets the same refusal on sample 0,
+        // with the index prefixed, and this is not on that path.
+        if st.is_empty() && self.tree.upgrade().is_some_and(|t| t.detached()) {
+            return Err(detached_err());
+        }
         for (i, stamp) in st.iter().enumerate() {
             let iso = iso_from_quat7(&po[i * 7..(i + 1) * 7])?;
             p.push(*stamp, &iso).map_err(|e| {

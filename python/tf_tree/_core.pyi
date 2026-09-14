@@ -31,7 +31,8 @@ class ChildProcessDetachedError(TfTreeError):
 
     The shared mapping is `MADV_DONTFORK`, so a forked child has no arena where
     its inherited `Tree`, `Plan` or `Publisher` points, and every call on one
-    raises this rather than faulting (`docs/PHASE3.md` §8.1). It is not
+    that reaches the arena raises this rather than faulting (`docs/PHASE3.md`
+    §8.1, whose amendment lists the few that answer from the handle). It is not
     retryable and not repairable: open a new tree in the child, or use
     `multiprocessing`'s `"spawn"` or `"forkserver"` start method.
 

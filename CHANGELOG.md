@@ -55,24 +55,34 @@ is a bug.
   traceback prints `tf_tree.ExtrapolationError`, not `_core.ExtrapolationError`.
   The class objects are unchanged, and `tf_tree._core.X is tf_tree.X` still
   holds.
-- **A `float` stamp meets §3's `TypeError` on every entry point.**
+- **A scalar float stamp meets §3's `TypeError` on every entry point.**
   `Tree.lookup`, `Publisher.push`, the module-level `tf_tree.push` and both
   stamps of `Plan.adaptive` took a bare integer, so a float was refused by
   PyO3's conversion (`'float' object cannot be interpreted as an integer`)
   without the 238 ns measurement §3 requires; they now go through the same
-  refusal as `Plan.at`. The accepted types are unchanged (`int`, `np.int64`),
-  and so is `Publisher.push`'s `METH_FASTCALL`. `PHASE3.md` §14's box for this
-  was ticked throughout, and §3 gains an amendment saying so — and that the
-  ULP is still stated at a fixed 2026 epoch, not at the caller's magnitude.
+  refusal as `Plan.at`. That refusal, in turn, recognised only a Python `float`
+  and its subclasses, so `np.float32` and `np.float16` scalars met PyO3's
+  message on every entry point, `Plan.at` included; they meet the measurement
+  now. The accepted types are unchanged, and so is `Publisher.push`'s
+  `METH_FASTCALL`. **Not every float refusal carries it:** a float stamps
+  *array* still raises numpy's own `TypeError` from `at` / `at_into` (on
+  purpose — the two answer identically), and PyO3's `'ndarray' object is not an
+  instance of 'ndarray'` from `Publisher.push_many`. `PHASE3.md` §14's box for
+  this was ticked throughout and is split now; §3's amendment is the account,
+  and says the ULP is still stated at a fixed 2026 epoch, not at the caller's
+  magnitude.
 - **`Plan.at_into` on the default `mat4` layout accepts an `np.int64` scalar
   and refuses a `float` with the measurement**, as `at` and `at_into(...,
   layout=...)` already did. It refused the first and reported the second as
   `tf_tree.BufferError`, and its own doc comment recorded that as "outstanding,
-  not decided". **Behaviour change:** a `list`, or a stamps array that is not
-  `(N,) int64`, passed to that path now raises numpy's or PyO3's own
-  `TypeError` — byte-identical to what `at` raises for it — instead of
-  `tf_tree.BufferError`, so `except tf_tree.TfTreeError` no longer catches a
-  bad stamps argument on any path.
+  not decided". **Behaviour change:** every stamps value now gets exactly
+  what `Plan.at` does for it, where anything but an `int` or an `(N,) int64`
+  array used to be `tf_tree.BufferError`. So integer-valued numpy scalars of
+  any width (`np.int32`, ...) and 0-d integer arrays are **accepted**; anything
+  else — a `list`, a float array — raises numpy's or PyO3's own conversion
+  error, a `TypeError`, or an `OverflowError` for a `np.uint64` at or above
+  2^63. `except tf_tree.TfTreeError` no longer catches a bad stamps argument on
+  any path.
 - **`from tf_tree import *` no longer shadows the builtins `open` and
   `BufferError`.** Both were in `__all__`, so a star-importer's `open("f")`
   raised `TypeError: open_arena() takes 0 positional arguments` and a bare
@@ -89,7 +99,20 @@ is a bug.
 
 ### Added — `ChildProcessDetachedError`, the class `PHASE3.md` §8.1 names
 
-- **Every refusal in a fork child raises `tf_tree.ChildProcessDetachedError`**,
+- **`Tree.freeze` in a fork child raised nothing: it killed the child with
+  `SIGSEGV`**, and did from before this class existed. `Tree::freeze_to` reads
+  the arena's manifest and bytes without asking whether the mapping survived the
+  fork, and the binding did not ask either. It raises
+  `ChildProcessDetachedError` now. **The Rust facade's `Tree::freeze_to` still
+  has no check of its own** — recorded in `PHASE3.md` §8.1's amendment, not
+  fixed here. **`Publisher.push_many` of zero samples** answered `None` in a
+  fork child, since the fork check lives in the per-sample push; it raises too.
+  **Not every call raises:** `is_shared`, `is_writable`, `Plan.depth`,
+  `Tree.source`, `Publisher.release`, `owner_lost`, `reap_dead` and
+  `inherit_ownership` answer without faulting, and §8.1's amendment
+  lists what each says.
+
+- **Every fork-child refusal raises `tf_tree.ChildProcessDetachedError`**,
   a subclass of `TfTreeError`, where it raised the base class — including
   `Publisher.push` and `push_many`, which chose their class apart from
   `detached_err`. §8.1 is NORMATIVE and names it. The earlier judgement (commit

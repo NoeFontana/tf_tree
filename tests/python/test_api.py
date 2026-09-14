@@ -126,10 +126,78 @@ def test_every_scalar_stamp_accepts_a_numpy_int64(tree, call, ok):
     Here so the refusal above cannot be bought by narrowing what is accepted: a
     change that refused everything but a Python ``int`` would pass that test and
     fail this one. Each row must *succeed*, not merely avoid a ``TypeError``.
+
+    Mutant: in ``Publisher.push``, refuse anything that is neither a ``float``
+    nor an ``int`` ahead of ``stamp_from_any`` (``if
+    !stamp_ns.is_instance_of::<PyFloat>() { stamp_ns.cast::<PyInt>()?; }``) —
+    a narrowing that leaves the ``float`` refusal above untouched. **Applied,
+    rebuilt and run** over ``tests/python``: ``3 failed, 255 passed`` — this
+    test's ``Publisher.push`` row on ``TypeError: 'int64' object is not an
+    instance of 'int'``, and the two ``Publisher.push`` rows of the numpy float
+    scalar test below, whose stamps the narrowing now refuses before
+    ``stamp_from_any`` can measure them. The ``float`` / ``np.float64`` rows
+    above all pass under it, which is why this test exists.
     """
     t = np.array([0, ok], dtype=np.int64)[1]
     assert isinstance(t, np.int64) and not isinstance(t, int)
     call(tree, t)
+
+
+# Every scalar-stamp route, `Plan.at`'s dispatch included this time: the numpy
+# float scalars below reach `stamp_from_any` through all of them.
+NUMPY_FLOAT_ROUTES = [
+    *SCALAR_STAMP_ENTRY_POINTS,
+    ("Plan.at", lambda t, s: t.plan("map", "base").at(s), 1_500),
+    (
+        "Plan.at_into mat4",
+        lambda t, s: t.plan("map", "base").at_into(s, np.zeros((4, 4))),
+        1_500,
+    ),
+    (
+        "Plan.at_into quat",
+        lambda t, s: t.plan("map", "base").at_into(s, np.zeros(7), layout="quat"),
+        1_500,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [row[1] for row in NUMPY_FLOAT_ROUTES],
+    ids=[row[0] for row in NUMPY_FLOAT_ROUTES],
+)
+@pytest.mark.parametrize(
+    "stamp",
+    [np.float32(1500.0), np.float16(1500.0)],
+    ids=["f32", "f16"],
+)
+def test_a_numpy_float_scalar_that_is_not_a_float_meets_the_measurement(
+    tree, call, stamp
+):
+    """§3's refusal for the numpy float scalars that do not subclass ``float``.
+
+    ``np.float64`` does, and the ``isinstance`` check above catches it.
+    ``np.float32`` and ``np.float16`` do not, so until
+    2026-09-14 they met PyO3's ``'numpy.float32' object cannot be interpreted as
+    an integer`` on every route — ``Plan.at`` included — while §3's amendment
+    said the refusal was universal. A float32 stamp is what a caller holding a
+    sensor's ``float32`` timestamp column indexes out of it. (``np.longdouble``
+    has no row: where it is 64 bits wide its relation to ``float`` is a
+    platform's, and this suite also runs off Linux.)
+
+    **Scalars only**: a ``float64`` stamps *array* keeps numpy's own message,
+    pinned by ``test_the_layout_path_reports_a_bad_stamps_array_exactly_as_at_does``.
+
+    Mutant: ``stamp_from_any``'s ``map_err`` answering the conversion error
+    unchanged (``.map_err(|e| e)``). **Applied, rebuilt and run** over
+    ``tests/python``: ``16 failed, 242 passed`` — exactly these 16 rows, each
+    on ``Regex pattern did not match`` against ``'numpy.float32' object cannot
+    be interpreted as an integer`` (or ``'numpy.float16' ...``); the pinned
+    array-message tests pass under it.
+    """
+    assert not isinstance(stamp, float)
+    with pytest.raises(TypeError, match="238 ns"):
+        call(tree, stamp)
 
 
 def test_from_sec_is_the_only_route_from_float_seconds():
