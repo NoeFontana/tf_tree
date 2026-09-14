@@ -60,6 +60,41 @@ pub enum LayoutError {
     },
 }
 
+// `Display` and `core::error::Error` follow `docs/decisions/0059`; the text
+// rules are in `check.rs`'s comment beside `ShmError`'s impl. The match is
+// exhaustive: `#[non_exhaustive]` grants no catch-all inside this crate, so a
+// variant added later fails to compile here.
+
+/// A one-clause diagnostic that ends with the variant's name in parentheses.
+///
+/// **The text is a diagnostic and not a compatibility promise**
+/// (`docs/API.md` R5): it may change in any release, and the discriminant is
+/// what a caller matches on. [`core::error::Error::source`] returns `None`,
+/// and that is not promised either.
+impl core::fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            LayoutError::CapacityNotPowerOfTwo { edge, capacity } => write!(
+                f,
+                "edge {edge} capacity {capacity} is neither 0 nor a power of two (CapacityNotPowerOfTwo)"
+            ),
+            LayoutError::EdgeCountMismatch { max_edges, got } => write!(
+                f,
+                "{got} edge capacities were given for {max_edges} edges (EdgeCountMismatch)"
+            ),
+            LayoutError::ArenaTooLarge { total_size } => write!(
+                f,
+                "the arena would be {total_size} bytes, past its u32 offsets (ArenaTooLarge)"
+            ),
+        }
+    }
+}
+
+/// Lets a `LayoutError` leave a function through `?` into `Box<dyn Error>` or
+/// `anyhow::Error`. [`source`](core::error::Error::source) is the default
+/// `None`, which is not a compatibility promise.
+impl core::error::Error for LayoutError {}
+
 /// Description of an arena's fixed capacities and the derived region layout.
 ///
 /// Fields are private so the power-of-two invariant on `edge_capacities`
@@ -724,5 +759,59 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// `docs/decisions/0059` step 1(b) for `LayoutError`: every variant renders
+    /// by decision 2's rules, structurally and never as a pinned sentence.
+    ///
+    /// **Mutant (M3):** drop `{total_size}` from `LayoutError::ArenaTooLarge`'s
+    /// arm (applied as `too many` in its place). Applied: this test fails —
+    /// `ArenaTooLarge { total_size: 18446744073709551615 } carries
+    /// 18446744073709551615 1 time(s) and renders it 0`.
+    #[test]
+    fn every_layout_error_variant_renders_by_0059s_rules() {
+        use crate::render_test::{assert_structure, variant_name};
+        use alloc::format;
+        use alloc::string::ToString;
+
+        fn index(e: &LayoutError) -> usize {
+            match e {
+                LayoutError::CapacityNotPowerOfTwo { .. } => 0,
+                LayoutError::EdgeCountMismatch { .. } => 1,
+                LayoutError::ArenaTooLarge { .. } => 2,
+            }
+        }
+
+        let all = vec![
+            (
+                LayoutError::CapacityNotPowerOfTwo {
+                    edge: usize::MAX,
+                    capacity: u32::MAX,
+                },
+                vec![usize::MAX.to_string(), u32::MAX.to_string()],
+            ),
+            (
+                LayoutError::EdgeCountMismatch {
+                    max_edges: u32::MAX,
+                    got: usize::MAX,
+                },
+                vec![u32::MAX.to_string(), usize::MAX.to_string()],
+            ),
+            (
+                LayoutError::ArenaTooLarge {
+                    total_size: u64::MAX,
+                },
+                vec![u64::MAX.to_string()],
+            ),
+        ];
+        let mut hit: Vec<usize> = all.iter().map(|(e, _)| index(e)).collect();
+        hit.sort_unstable();
+        hit.dedup();
+        assert_eq!(hit, vec![0, 1, 2], "one value of every LayoutError variant");
+
+        for (e, numbers) in &all {
+            let debug = format!("{e:?}");
+            assert_structure(&format!("{e}"), &debug, variant_name(&debug), numbers);
+        }
     }
 }

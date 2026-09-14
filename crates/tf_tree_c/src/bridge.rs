@@ -1046,7 +1046,9 @@ fn open_shared(name: &str, builder: tf_tree::TreeBuilder) -> Result<tf_tree::Tre
         // file that will not open, no participant slots, a refused memfd, a
         // name this rendezvous will not take — arrives with its own text, and
         // that text is what separates "the runtime directory is unusable" from
-        // the case above.
+        // the case above. For a refused memfd that has only been true since
+        // `docs/decisions/0059`: `ShmError` had no `Display`, and
+        // `BuildError::Shm` printed its `Debug` dump here instead.
         Err(e) => Err(arena_unavailable(&generic_failure_message(name, &e))),
     }
 }

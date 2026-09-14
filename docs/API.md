@@ -108,7 +108,8 @@ Name resolution against the arena is `Described`, a `Display` wrapper, not a
 field. Across an FFI boundary the *code* is the contract and the message is a
 diagnostic.
 
-**Three layers, and only the middle one is new** ([`0040`](./decisions/0040-the-error-that-cannot-be-returned.md)):
+**Three layers, and only the middle one is new** ([`0040`](./decisions/0040-the-error-that-cannot-be-returned.md), and
+[`0059`](./decisions/0059-the-arena-errors-that-cannot-describe-themselves.md) for `ShmError`, `FrozenError`, `LayoutError` and `ParticipantError`):
 
 | Layer | Knows | Says |
 |---|---|---|

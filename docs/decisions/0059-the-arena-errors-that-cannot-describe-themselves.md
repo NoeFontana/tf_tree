@@ -1,10 +1,11 @@
 # 0059: the arena errors that cannot describe themselves
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
 **Implementation:** step 0 (re-reading #339's merged code) was done on
 2026-09-14, in the change that moved this record to `ready`, and found nothing
-that moves the plan; step 1 has not landed.
+that moves the plan; step 1 (this change), all four parts in one PR, which is
+also step 2's condition.
 
 ## Context
 

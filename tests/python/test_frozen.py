@@ -295,6 +295,49 @@ def test_open_file_of_a_file_that_is_not_a_tft_says_so(tmp_path):
     assert ".tft" in str(e.value)
 
 
+def test_a_damaged_arena_header_reports_the_engines_reason_as_prose(live, tmp_path):
+    """One flipped ``layout_hash`` bit in the *arena* header inside a ``.tft``.
+
+    The container header still validates, so the failure is
+    ``FrozenError::Arena(ShmError::LayoutMismatch)``, and the binding forwards
+    the engine's reason. Before ``docs/decisions/0059`` that reason was
+    ``ShmError``'s ``Debug``, labelled ``raw:`` —
+    ``raw: LayoutMismatch { found: 1024475540, expected: 1024475541 }``.
+
+    Structure only, because message text is not a compatibility promise
+    (``docs/API.md`` R5): no brace, no ``raw``, and the variant name, which is
+    the search key ``docs/RUNBOOK.md`` is headed by, still present.
+
+    The magic-byte flip is deliberately not a second case: ``BadMagic`` has no
+    braces, and its ``Debug`` is a substring of its ``Display``, so no assertion
+    on this message could tell ``{inner}`` from ``{inner:?}`` there.
+    ``frozen::tests::every_frozen_error_variant_renders_by_0059s_rules`` in
+    ``tf_tree_arena`` holds that case.
+
+    Mutant (M8): restore ``raw: {inner:?}`` in ``offline.rs``'s
+    ``FrozenError::Arena`` arm. Applied: this test fails on its brace
+    assertion, the message ending ``The engine's reason, raw: LayoutMismatch
+    { found: 1024475540, expected: 1024475541 }``.
+    """
+    path = tmp_path / "bad_hash.tft"
+    live.freeze(str(path), source="synthetic")
+    data = bytearray(path.read_bytes())
+    # `FrozenHeader` (PHASE5.md §2.3): `arena_off` is the u64 at offset 32.
+    # `ArenaHeader`: `layout_hash` is the u32 at offset 12, after an 8-byte
+    # magic and a 4-byte `format_version`.
+    arena_off = int.from_bytes(data[32:40], "little")
+    data[arena_off + 12] ^= 1
+    path.write_bytes(bytes(data))
+
+    with pytest.raises(tf_tree.TfTreeError) as e:
+        tf_tree.open_file(str(path))
+    msg = str(e.value)
+    assert str(path) in msg, msg
+    assert "{" not in msg and "}" not in msg, msg
+    assert "raw" not in msg, msg
+    assert "LayoutMismatch" in msg, msg
+
+
 def test_freeze_replaces_the_path_atomically_and_leaves_no_litter(live, tmp_path):
     """The temporary is a *sibling* and is renamed over the target (§2.3).
 

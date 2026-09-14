@@ -155,6 +155,40 @@ pub enum ParticipantError {
     },
 }
 
+// `Display` and `core::error::Error` follow `docs/decisions/0059`, which extends
+// `0040` to this type: ASCII, decimal numbers, one clause, and the variant name
+// last in parentheses as a search key. Only `TableFull` says the table is full,
+// because only it can mean that. The match is exhaustive: `#[non_exhaustive]`
+// grants no catch-all inside this crate.
+
+/// A one-clause diagnostic that ends with the variant's name in parentheses.
+///
+/// **The text is a diagnostic and not a compatibility promise**
+/// (`docs/API.md` R5): it may change in any release, and the discriminant is
+/// what a caller matches on. [`core::error::Error::source`] returns `None`,
+/// and that is not promised either.
+impl core::fmt::Display for ParticipantError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            ParticipantError::TableFull => {
+                write!(f, "the arena's participant table is full (TableFull)")
+            }
+            ParticipantError::SlotTaken { slot } => {
+                write!(f, "participant slot {slot} is already taken (SlotTaken)")
+            }
+            ParticipantError::SlotOutOfRange { slot, capacity } => write!(
+                f,
+                "participant slot {slot} is past the table's {capacity} slots (SlotOutOfRange)"
+            ),
+        }
+    }
+}
+
+/// Lets a `ParticipantError` leave a function through `?` into
+/// `Box<dyn Error>` or `anyhow::Error`. [`source`](core::error::Error::source)
+/// is the default `None`, which is not a compatibility promise.
+impl core::error::Error for ParticipantError {}
+
 /// Take one slot and publish an identity into it, or fail if it is not free.
 ///
 /// The single implementation of the publication protocol both
@@ -458,5 +492,93 @@ impl<'a> ParticipantTable<'a> {
             rec.start_time.load(Ordering::Relaxed),
             rec.incarnation.load(Ordering::Relaxed),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::ParticipantError;
+    use alloc::format;
+    use alloc::string::{String, ToString};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// `docs/decisions/0059` step 1(b) for `ParticipantError`: every variant
+    /// renders by decision 2's rules — non-empty, not its `Debug`, no brace,
+    /// ASCII, at most 120 bytes with every carried integer at `u32::MAX`, ending
+    /// with the variant's name in parentheses, and containing every number it
+    /// carries. Structure only: `docs/API.md` R5 makes the sentence
+    /// uncontracted, which is why no literal appears here. `tf_tree_arena`'s
+    /// `render_test` holds the same rules for its three types; this crate
+    /// cannot share it, because a test module is not part of either crate's API.
+    ///
+    /// **Mutant (M2):** `ParticipantError::TableFull`'s arm → `Ok(())`.
+    /// Applied: this test fails — `TableFull renders as nothing` — and so does
+    /// `a_participant_error_can_leave_a_function_as_box_dyn_error`.
+    #[test]
+    fn every_participant_error_variant_renders_by_0059s_rules() {
+        fn index(e: &ParticipantError) -> usize {
+            match e {
+                ParticipantError::TableFull => 0,
+                ParticipantError::SlotTaken { .. } => 1,
+                ParticipantError::SlotOutOfRange { .. } => 2,
+            }
+        }
+        let max = || u32::MAX.to_string();
+        let all: Vec<(ParticipantError, Vec<String>)> = vec![
+            (ParticipantError::TableFull, vec![]),
+            (ParticipantError::SlotTaken { slot: u32::MAX }, vec![max()]),
+            (
+                ParticipantError::SlotOutOfRange {
+                    slot: u32::MAX,
+                    capacity: u32::MAX,
+                },
+                vec![max(), max()],
+            ),
+        ];
+        let mut hit: Vec<usize> = all.iter().map(|(e, _)| index(e)).collect();
+        hit.sort_unstable();
+        hit.dedup();
+        assert_eq!(hit, vec![0, 1, 2], "one value of every variant");
+
+        for (e, numbers) in &all {
+            let debug = format!("{e:?}");
+            let shown = format!("{e}");
+            let name = &debug[..debug.find(" {").unwrap_or(debug.len())];
+            assert!(!shown.is_empty(), "{debug} renders as nothing");
+            assert_ne!(shown, debug, "{debug} renders as its Debug");
+            assert!(
+                !shown.contains('{') && !shown.contains('}'),
+                "{debug} renders with a brace: {shown:?}"
+            );
+            assert!(shown.is_ascii(), "{debug} renders non-ASCII: {shown:?}");
+            assert!(
+                shown.len() <= 120,
+                "{debug} renders past 120 bytes: {shown:?}"
+            );
+            assert!(
+                shown.ends_with(&format!("({name})")),
+                "{debug} does not end with its search key ({name}): {shown:?}"
+            );
+            assert!(
+                shown.matches(max().as_str()).count() >= numbers.len(),
+                "{debug} drops a carried number: {shown:?}"
+            );
+        }
+    }
+
+    /// A `ParticipantError` leaves a function through `?` into
+    /// `Box<dyn core::error::Error>`, which is what `0059` adds the trait for.
+    #[test]
+    fn a_participant_error_can_leave_a_function_as_box_dyn_error() {
+        use alloc::boxed::Box;
+
+        fn join() -> Result<(), Box<dyn core::error::Error>> {
+            Err(ParticipantError::TableFull)?;
+            Ok(())
+        }
+        assert!(join().unwrap_err().to_string().ends_with("(TableFull)"));
     }
 }

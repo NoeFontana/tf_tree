@@ -2728,6 +2728,14 @@ shm-check:
     # edge is permanently unclaimable and invisible to every reaper — and
     # `--workspace` compiles them out. The other half runs under `just test`.
     cargo nextest run -p tf_tree --features shm --test owned_writer
+    # **`docs/decisions/0059` part (c): `tests/error_payloads.rs` under `shm`.**
+    # The target itself is not new, and `just test` runs it in default features,
+    # but its `shared_memory_wrappers_print_their_display` is `shm`-gated: it
+    # holds that `BuildError::Shm`, `OpenError::Map` and `FrozenFileError::Frozen`
+    # print their payload's `Display`, and that a bare `ShmError` from
+    # `Tree::attach_shared` `?`s into `Box<dyn Error>`. This recipe's clippy line
+    # compiled it and nothing executed it until this line.
+    cargo nextest run -p tf_tree --features shm --test error_payloads
     # **The facade's own unit tests, under `shm`, which ran in no recipe.** The
     # two lines above name integration *targets*; `--lib` was missing, so a
     # `#[cfg(feature = "shm")]` unit test inside `crates/tf_tree/src` was

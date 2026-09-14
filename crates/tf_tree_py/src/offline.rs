@@ -628,20 +628,18 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                     "could not be read or mapped: {}",
                     std::io::Error::from_raw_os_error(errno.raw_os_error())
                 ),
-                // **The one arm that still shows a `Debug`, and it says so.**
-                // `ShmError` is the arena-header check a `memfd` attach makes;
-                // it has no `Display`, sixteen variants, and several of them are
-                // struct-shaped (`SizeMismatch { actual, expected }`), so its
-                // `Debug` is a dump and not a sentence. Enumerating a second
-                // enum from this module would be re-spelling `check.rs`'s
-                // reasons in a place that cannot see them change. Labelling the
-                // dump as raw is the honest option: the reader is looking at a
-                // corrupt file and the discriminant is the only handle anyone
-                // has on which check failed.
+                // **The one arm that forwards the engine's text.** `ShmError` is
+                // the arena-header check a `memfd` attach makes, with sixteen
+                // variants; enumerating a second enum from this module would
+                // re-spell `check.rs`'s reasons in a place that cannot see them
+                // change. Its `Display` (`docs/decisions/0059`) is one clause
+                // ending in the variant name, and that name is the only handle
+                // anyone has on which check failed: the reader is looking at a
+                // corrupt file. It printed `Debug`, labelled raw, until then.
                 FrozenError::Arena(inner) => format!(
                     "contains an arena image whose header did not validate; the \
                      file is corrupt, or was written by a build with a different \
-                     arena layout. The engine's reason, raw: {inner:?}"
+                     arena layout. The engine's reason: {inner}"
                 ),
             };
             TfTreeError::new_err(format!("{shown}: {detail}"))

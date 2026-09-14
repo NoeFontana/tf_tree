@@ -183,6 +183,76 @@ impl From<ShmError> for FrozenError {
     }
 }
 
+// `Display` and `core::error::Error` follow `docs/decisions/0059`, as
+// `ShmError`'s do in `check.rs`, and that module's comment gives the text rules.
+// Two arms here carry a remedy, and only these two: `docs/PHASE5.md` §2.4 is
+// NORMATIVE that a layout-hash mismatch *states that the file must be
+// re-frozen*, and §2.4's read path checks the hash twice, in this container
+// header (`LayoutMismatch`) and in the arena header inside it (`Arena`, whose
+// one producer is `validate_arena_header` in `FrozenArena::open`, after the
+// container header validated). `Arena` states it *before* its payload, so that
+// the payload's own trailing variant name is still the last thing printed and
+// stays the search key. `ShmError::LayoutMismatch` itself says nothing about
+// re-freezing, because a `memfd` attach shares it and there it means a
+// different build (`docs/PHASE2.md` §3.7).
+//
+// The match is exhaustive and there is no catch-all.
+
+/// A one-clause diagnostic that ends with the innermost variant's name in
+/// parentheses.
+///
+/// **The text is a diagnostic and not a compatibility promise**
+/// (`docs/API.md` R5): it may change in any release, and the discriminant is
+/// what a caller matches on. [`core::error::Error::source`] returns `None`,
+/// and that is not promised either.
+impl core::fmt::Display for FrozenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            FrozenError::Io(e) => write!(
+                f,
+                "reading, writing or sizing the .tft failed with errno {} (Io)",
+                e.raw_os_error()
+            ),
+            FrozenError::Map(e) => write!(
+                f,
+                "mapping the .tft's arena image failed with errno {} (Map)",
+                e.raw_os_error()
+            ),
+            FrozenError::Truncated => write!(
+                f,
+                "the .tft ends before a structure its header promises (Truncated)"
+            ),
+            FrozenError::BadMagic => write!(f, "the file does not start with the .tft magic (BadMagic)"),
+            FrozenError::VersionMismatch { found, expected } => write!(
+                f,
+                ".tft format version {found} is not this build's {expected} (VersionMismatch)"
+            ),
+            FrozenError::LayoutMismatch { found, expected } => write!(
+                f,
+                ".tft layout hash 0x{found:08X} is not this build's 0x{expected:08X}, so it must be re-frozen (LayoutMismatch)"
+            ),
+            FrozenError::HeaderInconsistent => write!(
+                f,
+                "the .tft header's offsets do not describe a consistent file (HeaderInconsistent)"
+            ),
+            FrozenError::SizeMismatch { actual, expected } => write!(
+                f,
+                ".tft is {actual} bytes but its header says {expected} (SizeMismatch)"
+            ),
+            FrozenError::Arena(inner) => write!(f, "the .tft must be re-frozen: {inner}"),
+        }
+    }
+}
+
+/// Lets a `FrozenError` leave a function through `?` into `Box<dyn Error>` or
+/// `anyhow::Error`.
+///
+/// [`source`](core::error::Error::source) is the default `None`, including for
+/// [`FrozenError::Arena`], whose payload is written inline into its `Display`;
+/// a chain-walker would otherwise print it twice. That choice is not a
+/// compatibility promise.
+impl core::error::Error for FrozenError {}
+
 /// Bytes copied per pass when snapshotting a live arena. One 64 KiB buffer, not
 /// one arena-sized one: freezing must not need a second copy of a 233 MB index
 /// resident at once.
@@ -1043,5 +1113,140 @@ mod tests {
         wraps.file_size = u64::MAX;
         assert!(wraps.arena_off.is_multiple_of(ARENA_FILE_ALIGN));
         assert_eq!(check_extents(&wraps), Err(FrozenError::HeaderInconsistent));
+    }
+
+    /// `docs/PHASE5.md` §2.4 requires the re-freeze statement, so this is the
+    /// one thing about the text a test may hold beyond its structure
+    /// (`docs/decisions/0059` decision 6).
+    fn mentions_refreezing(shown: &str) -> bool {
+        shown.contains("re-freez") || shown.contains("re-frozen")
+    }
+
+    /// `docs/decisions/0059` step 1(b) for `FrozenError`: every variant renders
+    /// by decision 2's rules, and so does **every `ShmError` wrapped in
+    /// `FrozenError::Arena`**, whose nested rendering must also contain the
+    /// payload's own `Display` and state re-freezing before it.
+    ///
+    /// The nested half is what holds an arm written as `{inner:?}`: for a unit
+    /// payload such as `BadMagic`, `Debug` has no brace to catch and is a
+    /// substring of the search key, so only "contains the payload's `Display`"
+    /// separates the two.
+    ///
+    /// **Mutants, each applied alone:**
+    /// - (M5) `FrozenError::Arena`'s arm → `write!(f, "arena header did not
+    ///   validate: {inner:?}")`. Applied: this test fails —
+    ///   `Arena(Create(Os { code: 4095, kind: Uncategorized, message: "Unknown
+    ///   error 4095" })) does not contain its payload's Display "memfd_create
+    ///   failed with errno 4095 (Create)"`. Applied to the unit payload alone (an
+    ///   extra arm printing `ShmError::BadMagic` with `{:?}`): `Arena(BadMagic)
+    ///   does not contain its payload's Display "the arena header does not start
+    ///   with the tf_tree magic (BadMagic)"`.
+    /// - (M6) drop `, so it must be re-frozen` from `FrozenError::LayoutMismatch`'s
+    ///   arm. Applied: this test fails — `LayoutMismatch { found: 4294967295,
+    ///   expected: 4294967295 } does not state that the file must be re-frozen`.
+    /// - (M9) `FrozenError::Arena`'s arm → `"{inner}; the .tft must be
+    ///   re-frozen"`. Applied: this test fails — `Arena(Create(Os { .. })) does
+    ///   not end with its search key (Create): "memfd_create failed with errno
+    ///   4095 (Create); the .tft must be re-frozen"`.
+    #[test]
+    fn every_frozen_error_variant_renders_by_0059s_rules() {
+        use crate::check::every_shm_error;
+        use crate::render_test::{assert_structure, variant_name};
+        use alloc::format;
+        use alloc::string::ToString;
+
+        fn index(e: &FrozenError) -> usize {
+            match e {
+                FrozenError::Io(_) => 0,
+                FrozenError::Map(_) => 1,
+                FrozenError::Truncated => 2,
+                FrozenError::BadMagic => 3,
+                FrozenError::VersionMismatch { .. } => 4,
+                FrozenError::LayoutMismatch { .. } => 5,
+                FrozenError::HeaderInconsistent => 6,
+                FrozenError::SizeMismatch { .. } => 7,
+                FrozenError::Arena(_) => 8,
+            }
+        }
+
+        let errno = rustix::io::Errno::from_raw_os_error(4095);
+        let e = || vec!["errno 4095".to_string()];
+        let own = vec![
+            (FrozenError::Io(errno), e()),
+            (FrozenError::Map(errno), e()),
+            (FrozenError::Truncated, vec![]),
+            (FrozenError::BadMagic, vec![]),
+            (
+                FrozenError::VersionMismatch {
+                    found: u32::MAX,
+                    expected: u32::MAX,
+                },
+                vec![u32::MAX.to_string(), u32::MAX.to_string()],
+            ),
+            (
+                FrozenError::LayoutMismatch {
+                    found: u32::MAX,
+                    expected: u32::MAX,
+                },
+                vec!["0xFFFFFFFF".to_string(), "0xFFFFFFFF".to_string()],
+            ),
+            (FrozenError::HeaderInconsistent, vec![]),
+            (
+                FrozenError::SizeMismatch {
+                    actual: u64::MAX,
+                    expected: u64::MAX,
+                },
+                vec![u64::MAX.to_string(), u64::MAX.to_string()],
+            ),
+        ];
+        let nested: Vec<_> = every_shm_error()
+            .into_iter()
+            .map(|(inner, numbers)| (inner, FrozenError::Arena(inner), numbers))
+            .collect();
+
+        let mut hit: Vec<usize> = own
+            .iter()
+            .map(|(e, _)| e)
+            .chain(nested.iter().map(|(_, e, _)| e))
+            .map(index)
+            .collect();
+        hit.sort_unstable();
+        hit.dedup();
+        assert_eq!(
+            hit,
+            (0..9).collect::<Vec<_>>(),
+            "the lists must hold one value of every FrozenError variant"
+        );
+
+        for (e, numbers) in &own {
+            let debug = format!("{e:?}");
+            let shown = format!("{e}");
+            assert_structure(&shown, &debug, variant_name(&debug), numbers);
+            if matches!(e, FrozenError::LayoutMismatch { .. }) {
+                assert!(
+                    mentions_refreezing(&shown),
+                    "{debug} does not state that the file must be re-frozen: {shown:?}"
+                );
+            }
+        }
+
+        for (inner, e, numbers) in &nested {
+            let debug = format!("{e:?}");
+            let inner_debug = format!("{inner:?}");
+            let shown = format!("{e}");
+            // First, because it is the one assertion that holds a unit payload:
+            // `BadMagic`'s `Debug` has no brace and ends the `Display` anyway.
+            let inner_shown = format!("{inner}");
+            assert!(
+                shown.contains(&inner_shown),
+                "{debug} does not contain its payload's Display {inner_shown:?}: {shown:?}"
+            );
+            // The innermost name is the key (decision 2(g)), not `Arena`.
+            assert_structure(&shown, &debug, variant_name(&inner_debug), numbers);
+            assert!(
+                mentions_refreezing(&shown),
+                "{debug} does not state that the file must be re-frozen: {shown:?}"
+            );
+        }
     }
 }
