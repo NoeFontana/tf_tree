@@ -582,9 +582,16 @@ differ, the conservative reading above is the one carried forward.
 
 **The stop rules bind each separately, at named steps.**
 
-- **A** is abandoned if the arm step 1 would land wins under ~5% against
-  `681e601` on step 0a's recorded stream, through either `at_many` or
-  `at_many_into(Layout::Mat4)`. Step 1's stop point applies it.
+- **A** binds **per entry point**, not across them. A lands for each batch
+  entry point where the arm step 1 would land wins at least ~5% against
+  `681e601` on step 0a's recorded stream, and an entry point where it does not
+  keeps the per-stamp fold. A is abandoned outright only if no entry point
+  clears it. Abandoning a measured 17–51% on `at_many` because
+  `at_many_into(Layout::Mat4)` is marginal would trade a large win for one path's
+  uniformity; the cost of the split is a second fold body to keep bit-identical,
+  which step 2's `to_bits` test covers for every entry point that takes it.
+  Step 1's stop point applies it (principal ruling on the owner's delegation,
+  2026-09-14).
 - **B** is abandoned if it wins under ~5% against **A** on the recorded mix, a
   loss included, since then its synthetic win does not transfer. It is also
   abandoned if it wins under ~5% against its own `-C no-vectorize-loops` build,
@@ -776,9 +783,10 @@ differ, the conservative reading above is the one carried forward.
      `scal`, with the flat `into_quat_twist_1024` control, and each arm's stack
      reservation read from its prologue as in §3, all recorded in this record.
    - **Stop points:**
-     - **A's stop rule.** If the arm step 2 would land wins under ~5% against
-       `base` on 0a's recorded stream through either entry point, A is
-       abandoned here. `into_mat4` is the entry point to watch (−6.2%, §7).
+     - **A's stop rule, per entry point.** Each batch entry point whose arm wins
+       under ~5% against `base` on 0a's recorded stream keeps the per-stamp fold;
+       A is abandoned here only if no entry point clears ~5%. `into_mat4` is the
+       entry point to watch (−6.2%, §7).
      - If one sub-change carries A's saving without phase buffering, land that
        and not A.
      - No chunk size goes to step 2 whose N < 64 rows lose to `base` by more
