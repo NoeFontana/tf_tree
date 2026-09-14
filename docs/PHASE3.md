@@ -258,7 +258,7 @@ The distinction is worth stating in the docstring rather than only here: the lay
 
 ### 4.4 Errors
 
-Rust's typed errors map to an exception hierarchy carrying **structured attributes**, not just messages, so users can program against them. **This block is [`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md)'s** (2026-09-14), which replaced the one written for this phase; the amendment below it is the account of what shipped before that record's steps, and each step edits the bullet it makes false.
+Rust's typed errors map to an exception hierarchy carrying **structured attributes**, not just messages, so users can program against them. **This block is [`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md)'s** (2026-09-14), which replaced the one written for this phase, and **it is what ships**, except `ClaimRevokedError`, which waits (last bullet). The amendment below it is historical: the account of what shipped before that record's steps, each of which corrected the bullet it made false.
 
 ```python
 class TfTreeError(Exception): ...
@@ -289,7 +289,9 @@ class ArenaAbsentError(TfTreeError): ...
 
 `str(e)` names ids as the arena's names, resolved by the binding against the arena the caller holds (`edge_label` / `frame_label` in `crates/tf_tree_py/src/errors.rs`), and its text is not a compatibility promise (`docs/API.md` R5). `TopologyChangedError` must document that the correct response is to re-`plan`, since it is the one error a correct program routinely hits.
 
-> **Amendment (2026-09-14) — what ships, which is not the block above.** This
+> **Amendment (2026-09-14) — historical since `0058`'s steps landed; the block
+> above is what ships.** It was titled *"what ships, which is not the block
+> above"*, and the corrections inside it are dated by step. This
 > section is not marked NORMATIVE, and the block it first carried was never
 > implemented as written. The
 > package exports **ten** exception classes: `TfTreeError` (an `Exception`) and
@@ -345,14 +347,13 @@ class ArenaAbsentError(TfTreeError): ...
 >   date they were declared under `_core`, which is not importable, and none
 >   could.
 >
-> **Decided by a record since the same date, and not yet shipped:** the
+> **Decided by a record since the same date, and shipped by its steps:** the
 > attributes — including how an id-shaped one (`.edge`, `.target`, `.cut_at`)
 > reaches a language that is never handed an id — the `KeyError` base, and the
 > unbuilt classes, which [`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md)
-> answers and the block above now states. **This list stays what ships until
-> that record's steps land**, and each step edits the bullet it makes false.
-> This sentence read *"Until one is `ready`, the list above is what a caller
-> can rely on"*, which expired when `0058` moved to `ready`.
+> answers and the block above states. This sentence read *"Until one is
+> `ready`, the list above is what a caller can rely on"*, and then that the
+> list stayed what ships until the record's steps landed; they have.
 
 ---
 
@@ -716,7 +717,13 @@ Two upgrades in this set change *default* behaviour, and both intersect somethin
 
 - Hypothesis property tests mirroring the Rust proptests where the boundary can break them: `at(t)` scalar equals `at([t])[0]` **bit-exactly**; every `layout` yields the same transform; `at_into` equals `at`; endpoint stamps return stored poses exactly.
 - Differential test against the Rust CLI over a recorded MCAP session (Phase 2 §10), asserting bit-identical `f64`.
-- Every error type raised at least once with its attributes asserted.
+- Every error type raised at least once with its attributes asserted. **Met for every class `tests/python` can make raise, and four things cannot meet it** ([`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md), stated above its plan's steps):
+  - the `None` arm of every resolved-id attribute (`.edge`, `.target`, `.source`, `.cut_at`), which has no known Python trigger: a fork child refuses before any id is resolved;
+  - `FrameNotDeclaredError.name`'s `None` arm, from `lookup_err`'s `UnknownFrame { hash }` fallback, which `Tree.lookup` reaches only when a peer's intern lands between two reads;
+  - `EdgeAlreadyClaimedError.owner_slot`'s `None` arm, which only a claim word held in `CLAIMING` produces — a window of a few instructions with no §11.3 crash site inside it;
+  - `ClaimRevokedError`, which is not built until a Python caller can make `PushError::ClaimRevoked` raise.
+
+  `TopologyChangedError`'s two generations are **not** in that list: `tests/python/test_shared.py` raises the class through `tf_tree_rendezvous_child join-reparent`, which `just py-test` and `just py-test-freethreaded` build first.
 
 ### 11.2 Buffer safety
 
@@ -814,8 +821,9 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 Implemented and gated locally (`just py-test`, `py-test-freethreaded`,
 `py-lint`, `tsan`): `open()`/`build()`, `Plan.at` scalar and batch, `at_into`
 with DLPack device classification, `adaptive`, `Publisher` with `push` and
-`push_many`, the exception hierarchy — as §4.4's 2026-09-14 amendment lists it,
-which is classes and messages, not the attributes §4.4 specifies — hand-written
+`push_many`, the exception hierarchy — §4.4's block, fifteen classes with their
+attributes on raised instances, less `ClaimRevokedError`, and with §11.1's four
+unreachable arms recorded there — hand-written
 stubs with a bidirectional
 drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
 path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and

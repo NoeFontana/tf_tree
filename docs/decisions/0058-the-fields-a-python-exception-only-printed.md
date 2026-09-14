@@ -2,13 +2,12 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** in progress, after
+**Implementation:** steps 1–8, all in the change that carries them, after
 [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
-implementation (#345), as the plan orders. Step 1, the specs, and step 2, the
-attributes on the seven existing classes, step 3, `TimeDomainMismatchError`, and
-step 4, `NonMonotonicStampError`, step 5, `EdgeAlreadyClaimedError`, step 6,
-`ArenaHeldButUnreachableError`, and step 7, `ArenaAbsentError`, are in this
-change; step 2 did not take its fallback.
+implementation (#345), as the plan orders. Step 2 did not take its fallback.
+**Status stays `ready` until that change merges**, and moving it to
+`implemented` names its PR number, as `0059` step 2 did: an implemented record
+is frozen, and a line reading "this change" would then point at nothing.
 
 ## Context
 
