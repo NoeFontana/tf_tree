@@ -788,7 +788,7 @@ def test_a_batch_push_keeps_the_scalar_sentence_and_only_prefixes_it():
 #: Every exception class the package exports. Counted, not just collected: a
 #: set built from `vars(tf_tree)` that came back empty would make the class
 #: test below pass on nothing.
-EXPECTED_EXCEPTION_COUNT = 14
+EXPECTED_EXCEPTION_COUNT = 15
 
 
 def _exception_classes():

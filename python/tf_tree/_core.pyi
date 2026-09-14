@@ -150,6 +150,17 @@ class ArenaHeldButUnreachableError(TfTreeError):
     holder_slots: tuple[int, ...]
     ownership_held: bool
 
+class ArenaAbsentError(TfTreeError):
+    """No arena is serving under this name, and `open` was not asked to create.
+
+    Raised at once by `tf_tree.open` without `create=` when nothing serves the
+    name: there is no timeout to wait out, because none could change the answer.
+    A supervisor waiting for its robot to start retries on it, and on its
+    sibling: `except (ArenaAbsentError, ArenaHeldButUnreachableError)`. It
+    carries no attributes. Registered on every platform; only a Linux `open`
+    raises it.
+    """
+
 class ChildProcessDetachedError(TfTreeError):
     """This handle was inherited across a `fork()` and cannot be used.
 

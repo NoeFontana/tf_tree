@@ -183,6 +183,13 @@ create_exception!(
 );
 create_exception!(
     tf_tree,
+    ArenaAbsentError,
+    TfTreeError,
+    "No arena is serving under this name, and this open was not asked to \
+     create one: retry once its owner has started."
+);
+create_exception!(
+    tf_tree,
     ChildProcessDetachedError,
     TfTreeError,
     "This handle was inherited across a fork(); the child has no mapping and \
@@ -233,6 +240,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "ArenaHeldButUnreachableError",
         py.get_type::<ArenaHeldButUnreachableError>(),
     )?;
+    m.add("ArenaAbsentError", py.get_type::<ArenaAbsentError>())?;
     Ok(())
 }
 
@@ -673,6 +681,15 @@ pub(crate) fn open_err(
                 e.setattr("holder_slots", PyTuple::new(py, slots)?)?;
                 e.setattr("ownership_held", ownership_held)
             })
+        }
+        // **A leaf with no attributes and no parent** (`0058` §4): the variant
+        // is a unit, and a parent shared with `ArenaHeldButUnreachableError`
+        // would take the name C's `TFT_ERR_ARENA_UNAVAILABLE` already gives
+        // every open failure. It inherits the facade's classification: an
+        // absent arena, and the few other failures inside `Open::open` that
+        // report as `ArenaAbsent`, all of which `is_retryable` calls retryable.
+        OpenError::Rendezvous(inner @ IpcError::ArenaAbsent) => {
+            ArenaAbsentError::new_err(format!("{inner}"))
         }
         // `Rendezvous`, `NoLayoutToCreate`, `ReadOnlyCannotCreate`,
         // `ArenaAlreadyLive` — prose already. (`TakeoverUnsupported` was a fifth

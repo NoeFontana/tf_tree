@@ -100,6 +100,13 @@ existing `except` clause catches exactly what it caught before.
   `os.kill` signal your own process group. The message is unchanged and still
   prints one. The class is registered on every platform. **Migration:** a
   `type(e) is tf_tree.TfTreeError` check around `open` no longer matches.
+- **`ArenaAbsentError(TfTreeError)` is new**, a leaf with no attributes.
+  `tf_tree.open` without `create=` raises it at once when nothing serves the
+  name. A loop waiting for a robot to start catches `(tf_tree.ArenaAbsentError,
+  tf_tree.ArenaHeldButUnreachableError)`; the two have no shared parent. The
+  class is registered on every platform. **Migration:** a
+  `type(e) is tf_tree.TfTreeError` check, or a match on the message "no arena is
+  serving", around `open` should become `except tf_tree.ArenaAbsentError`.
 - `just py-test` and `just py-test-freethreaded` now run `cargo build -p tf_tree
   --features shm --bin tf_tree_rendezvous_child` first: `TopologyChangedError`'s
   two attributes are held by a test that spawns that helper's `join-reparent`.

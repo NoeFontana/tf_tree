@@ -465,6 +465,32 @@ def test_a_refused_claim_raises_edge_already_claimed_with_the_holders_slot(
         creator.wait(timeout=30)
 
 
+@shm
+def test_opening_a_name_nothing_serves_raises_arena_absent(runtime_dir):
+    """`ArenaAbsentError` (`0058` step 7), the retry a supervisor writes.
+
+    `tf_tree.open` without `create=` is `CreatePolicy::Never`, and with no
+    participant byte held the rendezvous refuses at once rather than waiting out
+    a timeout that could not change the answer — `test_api.py`'s
+    `test_open_validates_interp_even_with_nothing_to_create` names this as the
+    call past its `interp` check. The class carries nothing, and the stub
+    annotates nothing: the Rust variant is a unit.
+
+    Mutant: `open_err`'s ``IpcError::ArenaAbsent`` arm deleted, so the error
+    reaches the forwarding arm => this test alone fails, ``tf_tree.TfTreeError:
+    no arena is serving and CreatePolicy::Never forbids creating one`` escaping
+    ``pytest.raises``.
+    """
+    with pytest.raises(tf_tree.ArenaAbsentError) as excinfo:
+        tf_tree.open(name="tf_tree_test_nothing_serves_this")
+    e = excinfo.value
+    assert type(e) is tf_tree.ArenaAbsentError
+
+    from test_stubs import _stub_annotations
+
+    assert set(vars(e)) == set(_stub_annotations("ArenaAbsentError")) == set()
+
+
 def _rendezvous_child() -> pathlib.Path:
     """The Rust test helper `tf_tree_rendezvous_child`, which the pytest recipes build.
 
