@@ -4,8 +4,12 @@
 **Owner:** @NoeFontana
 **Implementation:** step 1 (the `PHASE2.md` §3.7 step 9 correction, the index
 row and the evidence register's probe row) landed beside this record as a
-`draft` (#333); step 2 (this change) landed the specs and the runbook;
-steps 3–5 have not.
+`draft` (#333); step 2 (#337) landed the specs and the runbook; step 4 (this
+change) runs `shm_torture`'s recipes, and the bounded rendezvous reaps in
+`just shm-check`, `just shm-rendezvous` and `just no-network`, under
+`RLIMIT_CORE=1`, with its runner-side verification (the `AN` arm on the runner
+and the first crash-points nightly after landing) still owed; steps 3 and 5
+have not.
 
 ## Context
 
@@ -513,12 +517,16 @@ points run with a pipe `core_pattern` and a soft core limit other than 1. The
 warning is reported, and changes no verdict. The harness gates PHASE2 §12.3
 gate 3 and §3.5 recovery, so its result must not depend on the host's crash
 helper. This record explains and documents the dump window, so suppressing it no
-longer hides an unexplained *mechanism*. **It does not explain the 2026-09-12 or
-2026-09-13 crash-points wedges**: the first is consistent with a dumping heir and
-was never shown to be one, and the second is instrumented as a role-holder cap
-exit. A green crash-points run after step 4 is therefore not evidence about
-either, and a recurrence of the 09-12 shape under `RLIMIT_CORE=1` would refute the
-dump explanation for it. The dumping configuration stays runnable without a new
+longer hides an unexplained *mechanism*. **It does not explain the 2026-09-12
+crash-points wedge**: that wedge is consistent with a dumping heir and was never
+shown to be one. A green crash-points run after step 4 is therefore not evidence
+about it, and a recurrence of its shape under `RLIMIT_CORE=1` would refute the
+dump explanation for it. **The 2026-09-13 wedge was not a crash-points wedge**,
+though this record called it one until 2026-09-14: per job, nightly run
+34747459144's `shm_torture (30 min)` failed and its `shm_torture --crash-points`
+job passed. The plain soak arms no crash points, so that wedge cannot be a
+dumping armed heir; the justfile's hypothesis for it is a role-holder cap exit,
+which the `[diag] role-holder-cap-exit` line exists to confirm or refute. The dumping configuration stays runnable without a new
 knob: the bare binary, invoked outside the recipe, inherits the shell's limit, and
 step 4's positive control runs exactly that.
 
@@ -829,7 +837,8 @@ child shares the owner's descriptions.
   runner's `core_pattern`, and it no longer tests what a dumping heir does to a
   fleet. That is this record's measurement's job, not the nightly's, and the bare
   binary still runs the dumping configuration for anyone who wants it. A green
-  crash-points run afterwards says nothing about the 2026-09-12 or 09-13 wedges
+  crash-points run afterwards says nothing about the 2026-09-12 crash-points
+  wedge, and the 2026-09-13 wedge was the plain soak's, not a crash-points job's
   (Decision 6). It also removes the helper's run from every abort, which was
   about a second on the dev host (the runner's was not timed), and one source of the undercount behind §0.0's
   *"`aborted` is a floor rather than a count"*: a child the driver `SIGKILL`s
@@ -955,7 +964,9 @@ child shares the owner's descriptions.
      `a_killed_heir_leaves_the_role_for_the_next_survivor`,
      `a_killed_topology_holder_leaves_a_word_the_next_acquirer_steals` and
      `a_creator_killed_before_or_after_the_arena_exists_leaves_nothing_behind`
-     reap with an unbounded `wait()`, so a dump only slows them;
+     reap with a `wait()` bounded only by nextest's 180 s terminate-after
+     (`.config/nextest.toml`), so a dump slows them and would have to run for
+     minutes to decide them;
      `a_killed_sweeper_leaves_the_record_for_the_next_one` and
      `a_killed_owner_in_its_hangup_callback_leaves_the_role_inheritable` reap
      through `wait_within(20 s)`, so a crash helper slower than 20 s **decides**
@@ -970,14 +981,22 @@ child shares the owner's descriptions.
      saying why: their bounded reaps (three on `shm-check`'s line, one on
      `shm-rendezvous`'s) include the host's crash helper, which is the dependence
      Decision 6 removes. Both recipes
-     are Linux-only already, so `prlimit` is present wherever they run.
+     are Linux-only already, so `prlimit` is present wherever they run. **It
+     has a third runner, which this list omitted until 2026-09-14**: `just
+     no-network` (`scripts/no-network.sh`, in `ci.yml`'s `shm` job on both
+     architectures) traces the `rendezvous` test binary built with
+     `tf_tree/shm,tf_tree_arena/shm` directly, outside nextest, so there
+     `wait_within(20 s)` is the only bound and a failure is a REFUSAL of §5.1's
+     check. Its `strace -f` invocation gets the same prefix; the script is
+     Linux-only already (it requires `strace`).
      `crates/tf_tree_core/src/crash_tests.rs` re-executes its test binary and
      asserts `SIGABRT` in seven tests, under `just test`'s
      `cargo nextest run -p tf_tree_core --features crash-points` line. **That
      line gets no prefix**, and its comment says why: `run_child` waits with an
-     unbounded `output()`, so a dump slows those tests without deciding them, and
-     `just test` is the one recipe here not already Linux-only, where a
-     `prlimit` prefix would break it on a host without util-linux. The cost is
+     `output()` bounded only by nextest's 180 s terminate-after, so a dump slows
+     those tests and would have to run for minutes to decide them, and
+     `just test` is the one recipe here expected to work off Linux (a
+     contributor's macOS host), where there is no `prlimit`. The cost is
      stated beside it: on CI those aborts dump into systemd-coredump's journal on
      every push.
    - The driver's `[diag]` warning when armed crash points run with a pipe
@@ -1113,9 +1132,11 @@ recovery. With dumps on, the crash-points job's recovery depends on the runner's
 that the risk of making the 2026-09-12 wedge's class disappear without explaining
 it. The mechanism, a dumping process holding the role, is now explained and
 documented here, so suppressing it no longer hides an unexplained mechanism.
-**The wedges themselves stay unexplained**: the 09-12 run was never shown to be
-an instance of it, the 09-13 run is instrumented as a role-holder cap exit, and a
-green crash-points run after step 4 is evidence about neither. Suppression also
+**The wedges themselves stay unexplained**: the 09-12 crash-points run was never
+shown to be an instance of it, and a green crash-points run after step 4 is not
+evidence about it. The 09-13 wedge, which this answer paired with it until
+2026-09-14, was the plain `shm_torture (30 min)` job's, which arms no crash
+points (Decision 6). Suppression also
 removes the helper's run from every abort and the kill-mid-dump source of the
 *"`aborted` is a floor"* undercount. What it gives up, that the recipes no longer
 exercise recovery across a dump, is recorded under *Consequences*: that is this
