@@ -368,6 +368,31 @@ large-arc branch.
 
 ### 2. Why it is not vectorised across stamps — the blockers, named
 
+> **Line numbers, 2026-09-14.** Every `file:line` in the list below is cited
+> against `7aa7888`, the commit that wrote it, and none of them points at what it
+> names any more: the code has moved under every one. At `7aa7888` nine of the
+> ten were exact; `plan.rs:1329` was already six lines off (it was the
+> *"Hoisted"* comment, and the `?` was at `:1335`). **The list and its argument
+> are unchanged** — the engine still has every blocker it names — so read each by
+> its symbol, not its line:
+>
+> 1. `SampleRing::sample_from`'s `self.head.load(Ordering::Acquire)` at entry,
+>    and its lapped-ring recheck after the read. (`SampleRing::sample` has its
+>    own pair, which this list did not cite: the batch path goes through
+>    `sample_from`.)
+> 2. `SampleRing::read_slot`, and its `fence(Ordering::Acquire)`.
+> 3. The `?` on `self.note(.., self.fold_at_cursors(..))` in `Plan::fold_batch`
+>    and in `Plan::at_many`.
+> 4. `sample_from`'s `bracket_from` call, and `stamp_at`.
+> 5. `LerpSlerp::eval`'s `s == 0.0` / `s == 1.0` shortcuts (not `ScLerp::eval`'s,
+>    which has the same pair); then, in `slerp`, the `h <= 0.0` return, the
+>    `THETA_SLERP_SMALL` branch, and `libm::acos` / `libm::sin`.
+>
+> For a reader at `5d6154e` only, and not to be read as current after it:
+> `sample.rs:248` and `:307`; `buffer.rs:411`–`:432`, fence at `:426`;
+> `plan.rs:1933` and `:1723`; `sample.rs:293` and `:327`–`:328`;
+> `interp.rs:164`–`:169`, `:441`–`:443`, `:447`–`:456` and `:460`–`:463`.
+
 In descending order of how immovable they are. The first four are properties of
 the *engine*, not of the arithmetic, and **`pulp` does not remove any of them**:
 
