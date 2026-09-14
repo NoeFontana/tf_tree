@@ -58,12 +58,13 @@ test-rust:
     # **No `prlimit --core=1:1 --` here, unlike the rendezvous lines in
     # `shm-check` and `shm-rendezvous` (`docs/decisions/0057` step 4).** Those
     # children dump core on a host with a pipe `core_pattern`, and there the
-    # dump decides nothing: `run_child` waits with an unbounded `output()`, so a
-    # slow crash helper slows these tests and cannot fail them. And this is the
-    # one recipe of the four that is not Linux-only already — it runs on the
-    # aarch64 matrix and wherever a contributor types `just test` — so a
-    # `prlimit` prefix would break it on a host without util-linux. The cost,
-    # stated rather than implied: on CI these aborts dump into
+    # dump decides nothing: `run_child` waits with an `output()` bounded only by
+    # nextest's 180 s terminate-after (`.config/nextest.toml`), so a crash
+    # helper would have to run for minutes to fail these tests — far outside the
+    # ~1.1 s dump `0057` measured on the dev host. And `just test` is the one
+    # recipe step 4 weighs that is expected to work off Linux (a contributor's
+    # macOS host), where there is no `prlimit`, so a prefix would break it
+    # there. The cost, stated rather than implied: on CI these aborts dump into
     # systemd-coredump's journal on every push.
     cargo nextest run -p tf_tree_core --features crash-points
 
@@ -2704,13 +2705,18 @@ shm-check:
     # `wait_within(20 s)`. On a host with a pipe `core_pattern` the crash helper
     # runs inside that wait, before the child's files close, so a helper slower
     # than 20 s would decide them — a property of the host, not of §3.5. A soft
-    # limit of 0, the usual shell default, does not stop a pipe dump; only 1
-    # does. The other three abort sites reap with an unbounded `wait()`, so a
-    # dump only slows them. `prlimit` is util-linux, `Essential: yes` on the
-    # Ubuntu images CI runs, and this recipe is Linux-only already (`shm`).
-    # Setting `1:1` only lowers the hard limit, so it needs no privilege; a host
-    # whose hard limit is already 0 refuses it, loudly, rather than running
-    # unsuppressed.
+    # limit of 0, the usual shell default, does not stop a pipe dump (measured
+    # on the dev host and on the runner); a limit of 1 does (measured on kernel
+    # 6.8 with apport, pending on the runner, per `0057` step 4). The other
+    # three abort sites reap with a `wait()` bounded only by nextest's 180 s
+    # terminate-after (`.config/nextest.toml`), so a helper would have to run
+    # for minutes to fail them — far outside the ~1.1 s dump `0057` measured on
+    # the dev host. The same test runs a third time, outside nextest, under
+    # `just no-network`, and `scripts/no-network.sh` carries the same prefix.
+    # `prlimit` is util-linux, `Essential: yes` on the Ubuntu images CI runs,
+    # and this recipe is Linux-only already (`shm`). Setting `1:1` only lowers
+    # the hard limit, so it needs no privilege; a host whose hard limit is
+    # already 0 refuses it, loudly, rather than running unsuppressed.
     prlimit --core=1:1 -- cargo nextest run -p tf_tree --features shm,unstable,crash-points --test rendezvous
     cargo clippy -p tf_tree --features shm,unstable,crash-points --all-targets -- -D warnings
     # **`docs/decisions/0017` steps 2 and 3 — and this line is the rule three
@@ -2798,14 +2804,17 @@ shm-check:
 # stay held: an owner or heir dumping core holds the role, nothing can inherit,
 # and joins are refused. The harness gates §12.3 gate 3 and §3.5 recovery, and
 # neither verdict may depend on the host's `core_pattern`. On a pipe pattern —
-# apport on the dev host, systemd-coredump on the runner — a soft
-# `RLIMIT_CORE` of 0, the shell default in both places, does **not** stop the
-# dump; only a limit of exactly 1 does. The limit is set here rather than in
-# the binary so no `unsafe` is added and every child inherits it, and CI, which
-# invokes these recipes, gets it with them. The binary's `[diag] host:` line
-# reads `core_rlimit soft=1 hard=1` under the prefix, and `hard=1` is what only
-# the prefix produces. A `--crash-points` run without the limit on a pipe host
-# prints a `[diag] warning:` line and is **not** failed for it.
+# apport on the dev host, systemd-coredump on the runner — a soft `RLIMIT_CORE`
+# of 0, the shell default in both places, does **not** stop the dump (measured
+# in both places); a limit of exactly 1 does, **measured on kernel 6.8 with
+# apport and pending on the runner** (kernel 6.17, systemd-coredump): `0057`
+# step 4 asks the first crash-points nightly after landing to show
+# `core_dumped=false` on every reaped armed abort. The limit is set here rather
+# than in the binary so no `unsafe` is added and every child inherits it, and
+# CI, which invokes these recipes, gets it with them. The binary's
+# `[diag] host:` line reads `core_rlimit soft=1 hard=1` under the prefix, and
+# `hard=1` is what only the prefix produces. A `--crash-points` run without the limit on
+# a pipe host prints a `[diag] warning:` line and is **not** failed for it.
 #
 # What this gives up, stated: these recipes no longer exercise recovery across
 # a core dump. That is `0057`'s measurement's job, and the bare binary,
@@ -2882,18 +2891,20 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
 # it serves — see `shm_torture.rs`. **This comment said that worker "no longer
 # abdicates voluntarily", which is false.** The extension is bounded by
 # `MAX_OWNER_CAP_EXTENSIONS` (10). After that the worker leaves through the cap,
-# and takes the role with it, with no census and no
-# `kill.in_progress` marker. Measured 2026-09-13 with
-# `--children 6 --kill-hz 6 --owner-kill-every 60s`: three such departures in
-# one 90 s run, at 23.285–23.405 s of tenure. The 2026-09-13 nightly's log is
-# consistent with its wedge being such an exit, two deferred owner kills having
-# kept one heir past the bound, but nothing in that log recorded the exit, so
-# that is a hypothesis. The binary's `[diag] role-holder-cap-exit` line names
-# each exit and exists to confirm or refute it. **This comment said the
-# diagnosis "places its wedge at that exit"**, which stated the hypothesis as a
-# finding, and quoted 23.3–23.5 s, a range that mixed two runs. **This recipe
-# reaches the state probabilistically rather than reliably**, which is why it
-# took three nights: an armed abort at
+# and takes the role with it, with no census and no `kill.in_progress` marker.
+# Measured 2026-09-13 with `--children 6 --kill-hz 6 --owner-kill-every 60s`:
+# three such departures in one 90 s run, at 23.285–23.405 s of tenure. The
+# 2026-09-13 nightly's wedge was **not this job's**: per job, run 34747459144's
+# `shm_torture (30 min)` — `just shm-torture`, which arms no crash points —
+# failed, and this job was green that night. Its log is consistent with that
+# wedge being such an exit, two deferred owner kills having kept one heir past
+# the bound, but nothing in that log recorded the exit, so that is a hypothesis.
+# (This paragraph read it as this recipe's wedge until 2026-09-14.) The binary's
+# `[diag] role-holder-cap-exit` line names each exit and exists to confirm or
+# refute it. **This comment said the diagnosis "places its wedge at that
+# exit"**, which stated the hypothesis as a finding, and quoted 23.3–23.5 s, a
+# range that mixed two runs. **This recipe reaches the state probabilistically
+# rather than reliably**, which is why it took three nights: an armed abort at
 # `takeover.after_ownership_lock_before_bind` destroys an attached heir at the
 # one instant the role is vacant, and that has to coincide with a thin pool.
 #
@@ -2908,9 +2919,9 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
 # **What a green run after the prefix is NOT evidence about: the 2026-09-12
 # wedge.** It is consistent with a dumping heir and was never shown to be one; a
 # recurrence of that shape under `RLIMIT_CORE=1` would refute the dump
-# explanation for it. (`0057` also names a 2026-09-13 wedge. Per job, that one
-# was `shm_torture (30 min)`'s, this recipe's plain sibling; this job was green
-# that night.)
+# explanation for it. The 2026-09-13 wedge is not this job's (the paragraph on
+# `MAX_OWNER_CAP_EXTENSIONS` above), and it cannot have been a dumping armed
+# child, because the job it happened in arms no crash points.
 #
 # **The pre-change rate, per job and not per run, so a later rate has something
 # to be compared against.** Read on 2026-09-14 with
