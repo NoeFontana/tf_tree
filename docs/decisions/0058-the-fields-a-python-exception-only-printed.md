@@ -2,9 +2,9 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** none yet. No step lands before
+**Implementation:** in progress, after
 [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
-implementation (*Implementation plan*).
+implementation (#345), as the plan orders. Step 1, the specs, is in this change.
 
 ## Context
 

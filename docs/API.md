@@ -105,7 +105,10 @@ expressible. Any future typed binding does the same.
 
 Error types stay `Copy`, `String`-free and `no_std` (`PROJECT.md` §5 D11).
 Name resolution against the arena is `Described`, a `Display` wrapper, not a
-field. Across an FFI boundary the *code* is the contract and the message is a
+field. That is D11's rule for a `Copy`, allocation-free Rust error; it does not
+reach a binding's own exception, which is neither, so a Python attribute
+holding a resolved name puts no field on a Rust type
+([`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md) §7). Across an FFI boundary the *code* is the contract and the message is a
 diagnostic.
 
 **Three layers, and only the middle one is new** ([`0040`](./decisions/0040-the-error-that-cannot-be-returned.md), and
