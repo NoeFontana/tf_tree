@@ -130,6 +130,26 @@ class EdgeAlreadyClaimedError(TfTreeError):
     edge: tuple[str, str] | None
     owner_slot: int | None
 
+class ArenaHeldButUnreachableError(TfTreeError):
+    """Participants still hold an arena's lock bytes, but nothing serves it.
+
+    Raised by `tf_tree.open` after its open timeout, typically when an owner
+    died and no survivor has called `Tree.inherit_ownership` yet. Retrying is
+    the first response; `except (ArenaAbsentError,
+    ArenaHeldButUnreachableError)` is the retry loop's clause. Registered on
+    every platform; only a Linux `open` raises it.
+
+    The attributes exist only on instances the library raises:
+    `holder_slots` is the held participant slots, ascending, and
+    `ownership_held` whether the ownership byte was held when the timeout
+    expired. No pid is carried — a recorded pid can name an unrelated process
+    from another pid namespace. `tf_tree participants` lists the held slots,
+    and `tf_tree doctor` names the process behind one.
+    """
+
+    holder_slots: tuple[int, ...]
+    ownership_held: bool
+
 class ChildProcessDetachedError(TfTreeError):
     """This handle was inherited across a `fork()` and cannot be used.
 

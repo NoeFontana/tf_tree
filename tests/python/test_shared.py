@@ -9,6 +9,7 @@ either — `crates/tf_tree_py` is excluded from the workspace, so `just test`
 never built it at all.
 """
 
+import gc
 import os
 import pathlib
 import subprocess
@@ -552,6 +553,23 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
     away without its cooperation, which is the whole state under test. It is
     started with `subprocess`, not `multiprocessing`, because a fork of this
     (multi-threaded) process is the *other* failure this file tests.
+
+    **The window between the owner's death and `inherit_ownership` is also
+    `ArenaHeldButUnreachableError`'s trigger** (`docs/decisions/0058` step 6):
+    the survivors hold their bytes and nothing serves, so a fresh
+    `tf_tree.open(mode="rw")` refuses after its 5 s open timeout, which Python
+    cannot shorten. A second, read-only participant is attached first so that
+    two slots are held — with one, `holder_slots` would be ascending and
+    descending at once — and released before the inheritance assertion.
+
+    Mutants, each applied alone, rebuilt and run with ``just py-test``; each
+    fails this test and nothing else:
+
+    * ``ownership_held`` set ``true`` => ``assert True is False``.
+    * ``holder_slots`` decoded from bit 63 down => ``assert (2, 1) == (1, 2)``.
+    * `open_err`'s ``ArenaHeldButUnreachable`` arm deleted, so the forwarding
+      arm raises the base class => ``tf_tree.TfTreeError: an arena is alive but
+      unreachable: participant slots 0x6 ...`` escapes ``pytest.raises``.
     """
     owner = subprocess.Popen(
         [
@@ -570,6 +588,8 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
         assert owner.stdout.readline().strip() == "owning", "the owner did not come up"
 
         tree = tf_tree.open(mode="rw")
+        # A read-only attach takes a lock-file participant byte too.
+        second = tf_tree.open(mode="ro")
 
         # The owner is alive: the loop is cheap and does nothing.
         assert not tree.owner_lost()
@@ -582,6 +602,22 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
         owner.wait(timeout=30)
 
         assert tree.owner_lost(), "the owner is gone and its socket hung up"
+
+        with pytest.raises(tf_tree.ArenaHeldButUnreachableError) as excinfo:
+            tf_tree.open(mode="rw")
+        held = excinfo.value
+        assert type(held) is tf_tree.ArenaHeldButUnreachableError
+        assert held.ownership_held is False
+        assert len(held.holder_slots) >= 2, held.holder_slots
+        assert held.holder_slots == tuple(sorted(held.holder_slots))
+        assert not hasattr(held, "first_pid")
+
+        from test_stubs import _stub_annotations
+
+        annotated = set(_stub_annotations("ArenaHeldButUnreachableError"))
+        assert set(vars(held)) == annotated
+        del second
+        gc.collect()
         assert tree.inherit_ownership() == "Inherited", (
             "the sole read-write survivor should have taken the vacant role"
         )

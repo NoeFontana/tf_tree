@@ -60,6 +60,7 @@ use pyo3::prelude::*;
 use pyo3::{
     create_exception,
     exceptions::{PyBaseException, PyException},
+    types::PyTuple,
 };
 
 use tf_tree::unstable::ArenaView;
@@ -74,7 +75,7 @@ use tf_tree::{
 // the name exists. Importing it unconditionally is what made `tf_tree_py` fail
 // to compile on macOS and Windows.
 #[cfg(target_os = "linux")]
-use tf_tree::OpenError;
+use tf_tree::{IpcError, OpenError};
 
 use crate::offline::{named_edge_in, named_frame_in};
 use crate::tree::interp_name;
@@ -173,6 +174,15 @@ create_exception!(
 );
 create_exception!(
     tf_tree,
+    ArenaHeldButUnreachableError,
+    TfTreeError,
+    "An arena's participant bytes are held, but nothing serves it: retry, then \
+     find the holders.\n\n\
+     Attributes: holder_slots (held participant slots, ascending), \
+     ownership_held. They exist only on instances the library raises."
+);
+create_exception!(
+    tf_tree,
     ChildProcessDetachedError,
     TfTreeError,
     "This handle was inherited across a fork(); the child has no mapping and \
@@ -215,6 +225,13 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "EdgeAlreadyClaimedError",
         py.get_type::<EdgeAlreadyClaimedError>(),
+    )?;
+    // Registered on every platform although only a Linux `open` raises it, so
+    // `except tf_tree.ArenaHeldButUnreachableError` is valid code everywhere
+    // (`docs/decisions/0058` §4).
+    m.add(
+        "ArenaHeldButUnreachableError",
+        py.get_type::<ArenaHeldButUnreachableError>(),
     )?;
     Ok(())
 }
@@ -615,8 +632,24 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
 /// `Build` is the whole of [`build_err`] — `open(create=[...])` is the second
 /// entry point a program calls first, and it reaches every arm of that mapper
 /// through one `From` impl.
+///
+/// # The one arm with a class of its own
+///
+/// `ArenaHeldButUnreachable` raises [`ArenaHeldButUnreachableError`], still with
+/// `IpcError`'s sentence, and carries `.holder_slots` (the mask decoded,
+/// ascending) and `.ownership_held` — the two facts that separate the remedies,
+/// which that `Display` spends the same way (`docs/decisions/0058` §4). **Not
+/// `first_pid`**: a recorded pid is namespace-local (`0033`), `0` when no
+/// identity record was written, and `os.kill(0, sig)` signals the caller's own
+/// process group. `first_slot` is `holder_slots[0]`. The message still prints
+/// the pid, because that text is `IpcError`'s.
 #[cfg(target_os = "linux")]
-pub(crate) fn open_err(edges: &[(String, String)], capacity: u32, e: OpenError) -> PyErr {
+pub(crate) fn open_err(
+    py: Python<'_>,
+    edges: &[(String, String)],
+    capacity: u32,
+    e: OpenError,
+) -> PyErr {
     match e {
         OpenError::Build(inner) => build_err(edges, capacity, inner),
         // The stage in this binding's words, then `ShmError`'s own `Display`,
@@ -625,6 +658,22 @@ pub(crate) fn open_err(edges: &[(String, String)], capacity: u32, e: OpenError) 
             "the arena's shared-memory segment was handed over but could not be \
              mapped: {inner}"
         )),
+        OpenError::Rendezvous(
+            inner @ IpcError::ArenaHeldButUnreachable {
+                holder_slots,
+                ownership_held,
+                ..
+            },
+        ) => {
+            let err = ArenaHeldButUnreachableError::new_err(format!("{inner}"));
+            with_attrs(py, err, |e| {
+                let slots: Vec<u32> = (0..u64::BITS)
+                    .filter(|slot| holder_slots >> slot & 1 == 1)
+                    .collect();
+                e.setattr("holder_slots", PyTuple::new(py, slots)?)?;
+                e.setattr("ownership_held", ownership_held)
+            })
+        }
         // `Rendezvous`, `NoLayoutToCreate`, `ReadOnlyCannotCreate`,
         // `ArenaAlreadyLive` — prose already. (`TakeoverUnsupported` was a fifth
         // until `0037` question 3 deleted it along with `OpenOutcome::TookOver`:

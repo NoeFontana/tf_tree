@@ -91,6 +91,15 @@ existing `except` clause catches exactly what it caught before.
   **Migration:** `except tf_tree.TfTreeError` still catches it; a
   `type(e) is tf_tree.TfTreeError` check around a claim no longer matches, and
   a handler reading `owner_slot` must allow `None`.
+- **`ArenaHeldButUnreachableError(TfTreeError)` is new**, with
+  `.holder_slots` (the held participant slots, ascending, as a tuple) and
+  `.ownership_held`. `tf_tree.open` raises it when participants still hold an
+  arena's lock bytes and nothing serves it — typically after an owner died and
+  before a survivor calls `inherit_ownership`. It carries no pid: a recorded pid
+  can name an unrelated process in another pid namespace, and `0` would make
+  `os.kill` signal your own process group. The message is unchanged and still
+  prints one. The class is registered on every platform. **Migration:** a
+  `type(e) is tf_tree.TfTreeError` check around `open` no longer matches.
 - `just py-test` and `just py-test-freethreaded` now run `cargo build -p tf_tree
   --features shm --bin tf_tree_rendezvous_child` first: `TopologyChangedError`'s
   two attributes are held by a test that spawns that helper's `join-reparent`.

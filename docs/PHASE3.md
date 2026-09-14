@@ -322,7 +322,9 @@ class ArenaAbsentError(TfTreeError): ...
 >   this list never named, ships for `PushError::NonMonotonicStamp` from
 >   `Publisher.push`, `push_many` and `tf_tree.push`. *And by step 5:*
 >   `EdgeAlreadyClaimedError` ships, with `.owner_slot` in place of the first
->   block's `.owner_pid`. The package exports **thirteen** classes. **`ChildProcessDetachedError` was a fifth and
+>   block's `.owner_pid`. *And by step 6:* `ArenaHeldButUnreachableError`
+>   ships, with `.holder_slots` and `.ownership_held` in place of the first
+>   block's `.holders`, and no pid. The package exports **fourteen** classes. **`ChildProcessDetachedError` was a fifth and
 >   ships as of this date**, because §8.1 is NORMATIVE and names it; it replaced
 >   a base `TfTreeError` from every fork-child refusal, including `Publisher.push`
 >   and `push_many`. §8.1's amendment of the same date lists the two calls that

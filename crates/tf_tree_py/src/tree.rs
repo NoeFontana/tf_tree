@@ -2684,7 +2684,12 @@ pub fn push(
 #[cfg(target_os = "linux")]
 #[pyfunction]
 #[pyo3(signature = (*, name = None, domain = None, mode = "ro", create = None, capacity = None, interp = None, frame_headroom = 0))]
+// Seven Python arguments, as before; the eighth is PyO3's token, which
+// `open_err` needs to attach `ArenaHeldButUnreachableError`'s attributes
+// (`docs/decisions/0058` §5).
+#[allow(clippy::too_many_arguments)]
 pub fn open_arena(
+    py: Python<'_>,
     name: Option<&str>,
     domain: Option<u32>,
     mode: &str,
@@ -2779,7 +2784,7 @@ pub fn open_arena(
     let created: &[(String, String)] = pairs.as_deref().unwrap_or(&[]);
     let map_err = |e: tf_tree::OpenError| match (&config, e) {
         (Some(_), tf_tree::OpenError::Build(inner)) => config_build_err(inner),
-        (_, e) => open_err(created, capacity, e),
+        (_, e) => open_err(py, created, capacity, e),
     };
     if let Some(n) = name {
         o = o.name(n).map_err(&map_err)?;
