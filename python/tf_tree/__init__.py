@@ -48,7 +48,7 @@ from ._core import (
     SIM_DOMAIN,
     STEADY_DOMAIN,
     SYSTEM_DOMAIN,
-    BufferError,
+    ChildProcessDetachedError,
     DerivativesUnavailableError,
     DisconnectedError,
     ExtrapolationError,
@@ -73,12 +73,24 @@ from ._core import (
     push,
 )
 
+# `BufferError` is public — `tf_tree.BufferError` — and kept out of `__all__`
+# below, so `from tf_tree import *` does not shadow the builtin of the same
+# name. They are unrelated classes: `tf_tree.BufferError` subclasses
+# `TfTreeError` only, and a resized exported `bytearray` raises the builtin one,
+# which a star-importer's bare `except BufferError` stopped catching for as long
+# as the name was in `__all__`. The redundant alias is `__version__`'s reason
+# below: without it, a name absent from `__all__` is F401 to ruff and private to
+# a downstream strict type checker (`reportPrivateImportUsage`).
+from ._core import (
+    BufferError as BufferError,
+)
+
 # Its own statement, and the redundant alias is not a typo. `__version__` is
 # deliberately absent from `__all__` (the note below it says why), so the alias
 # is what marks it as re-exported — without it ruff reports F401 and a type
 # checker treats the name as private to this module. ruff's isort keeps aliased
 # imports in a separate statement from plain ones, which is why it is down here
-# rather than inside the block above.
+# rather than inside the first block.
 from ._core import (
     __version__ as __version__,
 )
@@ -88,7 +100,7 @@ __all__ = [
     "SIM_DOMAIN",
     "STEADY_DOMAIN",
     "SYSTEM_DOMAIN",
-    "BufferError",
+    "ChildProcessDetachedError",
     "DerivativesUnavailableError",
     "DisconnectedError",
     "ExtrapolationError",
@@ -108,7 +120,6 @@ __all__ = [
     "from_sec",
     "has_shared_memory",
     "ingest_bag",
-    "open",
     "open_arena",
     "open_file",
     "push",
@@ -121,6 +132,12 @@ __all__ = [
 # those two sets differ by exactly this name. `from tf_tree import *` binding a
 # `__version__` is not something anyone wants either.
 
-# `open` shadows the builtin inside this module only; the public spelling is
-# `tf_tree.open()`, which is what §4.1 promises.
+# `open` is `open_arena` under the spelling §4.1 promises, `tf_tree.open()`, and
+# like `BufferError` it is deliberately absent from `__all__`. This comment said
+# the shadowing was "inside this module only" while `"open"` sat in `__all__`,
+# so `from tf_tree import *` rebound every star-importer's `open` and
+# `open("notes.txt")` raised `TypeError: open_arena() takes 0 positional
+# arguments`. It still shadows the builtin inside this module, which calls
+# neither. No alias is needed: it is assigned here rather than imported, so
+# neither ruff nor a type checker reads it as an unused import.
 open = open_arena  # noqa: A001

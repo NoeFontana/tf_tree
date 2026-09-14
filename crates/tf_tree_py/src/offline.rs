@@ -489,6 +489,16 @@ pub(crate) fn freeze_impl(
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
         .unwrap_or(0);
+    // **Refuse a fork-detached tree before anything reads it.** `freeze_to`
+    // reads the manifest and the arena's backing bytes directly, not through a
+    // `Guard`, so in a fork child — where the mapping is `MADV_DONTFORK` and
+    // gone — it faulted: `SIGSEGV`, where `docs/PHASE3.md` §8.1 (NORMATIVE)
+    // requires `ChildProcessDetachedError`. The facade's `Tree::freeze_to`
+    // has no such check of its own, so this is the Python caller's guard, not
+    // a second copy of one.
+    if tree.detached() {
+        return Err(detached_err());
+    }
     py.detach(|| tree.freeze_to(path, source, source_digest, created))
         .map(|_| ())
         .map_err(|e| frozen_err(path, e))

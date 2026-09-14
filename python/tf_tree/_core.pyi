@@ -26,6 +26,21 @@ class TopologyChangedError(TfTreeError): ...
 class FrameNotDeclaredError(TfTreeError): ...
 class BufferError(TfTreeError): ...
 
+class ChildProcessDetachedError(TfTreeError):
+    """This handle was inherited across a `fork()` and cannot be used.
+
+    The shared mapping is `MADV_DONTFORK`, so a forked child has no arena where
+    its inherited `Tree`, `Plan` or `Publisher` points, and every call on one
+    that reaches the arena raises this rather than faulting (`docs/PHASE3.md`
+    §8.1, whose amendment lists the few that answer from the handle). It is not
+    retryable and not repairable: open a new tree in the child, or use
+    `multiprocessing`'s `"spawn"` or `"forkserver"` start method.
+
+    A subclass of `TfTreeError`, so a handler catching that still catches this.
+    A retry loop around the retryable `TfTreeError`s should catch this *first*
+    and stop.
+    """
+
 class DerivativesUnavailableError(TfTreeError):
     """This edge's interpolator has no exact derivative.
 
@@ -81,7 +96,7 @@ class Plan:
     """A compiled lookup path. Build with `Tree.plan`."""
 
     @overload
-    def at(self, stamps: int, /) -> NDArray[np.float64]:
+    def at(self, stamps: int | np.int64, /) -> NDArray[np.float64]:
         """One stamp in, one `(4, 4)` float64 transform out.
 
         The default layout is `"mat4"`, which is float64 — so this returns
@@ -99,13 +114,17 @@ class Plan:
 
     @overload
     def at(
-        self, stamps: int | NDArray[np.int64], /, *, layout: F32Layout
+        self, stamps: int | np.int64 | NDArray[np.int64], /, *, layout: F32Layout
     ) -> NDArray[np.float32]:
         """`layout="affine32"`: `(12,)` or `(N, 12)` **float32**, row-major 3x4."""
 
     @overload
     def at(
-        self, stamps: int | NDArray[np.int64], /, *, layout: F64Layout | None = ...
+        self,
+        stamps: int | np.int64 | NDArray[np.int64],
+        /,
+        *,
+        layout: F64Layout | None = ...,
     ) -> NDArray[np.float64]:
         """`layout=` selects what is written per stamp (see `Layout`).
 
@@ -120,7 +139,11 @@ class Plan:
 
     @overload
     def at(
-        self, stamps: int | NDArray[np.int64], /, *, layout: Layout | None = ...
+        self,
+        stamps: int | np.int64 | NDArray[np.int64],
+        /,
+        *,
+        layout: Layout | None = ...,
     ) -> NDArray[np.float64] | NDArray[np.float32]:
         """The fallback, for a `layout` whose value is not statically known.
 
@@ -131,7 +154,7 @@ class Plan:
 
     @overload
     def at_into(
-        self, stamps: int, out: object, /, *, layout: Layout | None = ...
+        self, stamps: int | np.int64, out: object, /, *, layout: Layout | None = ...
     ) -> None:
         """Evaluate one stamp into a caller-provided `(4, 4)` float64 array.
 
@@ -169,9 +192,9 @@ class Plan:
         than a `BufferError` naming `(N,) int64`. That is the trade for the two
         things it bought: an `np.int64` scalar is accepted, and a `float` stamp
         meets the `TypeError` carrying the 238 ns measurement instead of a
-        complaint about a buffer. The default `mat4` path still gives the
-        shape-naming `BufferError`, and still refuses `np.int64`; the
-        difference is in `Plan.at_into.__doc__`.
+        complaint about a buffer. **The default `mat4` path answers the same
+        way since 2026-09-14**; until then it refused `np.int64` and reported a
+        `float` as a `BufferError`, which `docs/PHASE3.md` §3 forbids.
 
         `out` is typed `object` rather than `NDArray` because the device check
         below accepts anything and then refuses it by message. **Only
@@ -192,8 +215,8 @@ class Plan:
 
     def adaptive(
         self,
-        start_ns: int,
-        end_ns: int,
+        start_ns: int | np.int64,
+        end_ns: int | np.int64,
         /,
         *,
         lin: float = ...,
@@ -208,7 +231,12 @@ class Plan:
 
     @overload
     def at_extrapolating(
-        self, stamps: int, policy: ExtrapPolicy, /, *, layout: Layout | None = ...
+        self,
+        stamps: int | np.int64,
+        policy: ExtrapPolicy,
+        /,
+        *,
+        layout: Layout | None = ...,
     ) -> tuple[NDArray[np.float64], int]:
         """One stamp in; `((4, 4)` float64, `by_ns` as an `int)` out."""
 
@@ -233,7 +261,7 @@ class Plan:
     @overload
     def at_extrapolating(
         self,
-        stamps: int | NDArray[np.int64],
+        stamps: int | np.int64 | NDArray[np.int64],
         policy: ExtrapPolicy,
         /,
         *,
@@ -267,7 +295,7 @@ class Plan:
 
     def at_extrapolating_into(
         self,
-        stamps: int | NDArray[np.int64],
+        stamps: int | np.int64 | NDArray[np.int64],
         policy: ExtrapPolicy,
         poses: object,
         by_ns: object,
@@ -310,7 +338,8 @@ class Plan:
         cannot list what it no longer knows. Use `Tree.edges()` for the
         topology; this is what *this path samples at evaluation time*.
 
-        Raises `TfTreeError` on a tree inherited across a `fork()`.
+        Raises `ChildProcessDetachedError` on a tree inherited across a
+        `fork()`.
         """
 
 class Publisher:
@@ -321,7 +350,7 @@ class Publisher:
     def release(self) -> None:
         """Drop the claim now, rather than at an unspecified finalization."""
 
-    def push(self, stamp_ns: int, quat7: list[float], /) -> None:
+    def push(self, stamp_ns: int | np.int64, quat7: list[float], /) -> None:
         """Publish `[qw, qx, qy, qz, tx, ty, tz]` at `stamp_ns`."""
 
     def push_many(
@@ -360,7 +389,13 @@ class Tree:
         """Claim `child`'s edge. Argument order is **(child, parent)**."""
 
     def lookup(
-        self, target: str, source: str, stamp_ns: int, /, *, domain: int = ...
+        self,
+        target: str,
+        source: str,
+        stamp_ns: int | np.int64,
+        /,
+        *,
+        domain: int = ...,
     ) -> NDArray[np.float64]:
         """One transform, without compiling a plan first.
 
@@ -456,8 +491,8 @@ class Tree:
         two ids. Rare — it needs the rescue path — but it means `len()` is an
         upper bound and `dict(zip(tree.frames(), ...))` can lose an entry.
 
-        Raises `TfTreeError` on a tree inherited across a `fork()` — the child's
-        mapping is gone, so there is nothing to list.
+        Raises `ChildProcessDetachedError` on a tree inherited across a
+        `fork()` — the child's mapping is gone, so there is nothing to list.
         """
 
     def edges(self) -> list[tuple[str, str]]:
@@ -483,7 +518,8 @@ class Tree:
         *retained*, which is not what the publisher produced, and a rate derived
         from the one and reported as the other is worse than no rate at all.
 
-        Raises `TfTreeError` on a tree inherited across a `fork()`.
+        Raises `ChildProcessDetachedError` on a tree inherited across a
+        `fork()`.
         """
 
     def instance_uuid(self) -> str:
@@ -492,11 +528,12 @@ class Tree:
         All-zero in-process. Two processes that resolved the same *name* can
         still hold different segments; this is what tells them apart.
 
-        Raises `TfTreeError` on a tree inherited across a `fork()`, rather than
-        returning the all-zero value the child's poison mapping holds — which is
-        the spelling that means "in-process", so two peers chasing a split brain
-        would conclude they had never been shared. `repr()` does not raise; it
-        prints `detached-by-fork` in place of the instance.
+        Raises `ChildProcessDetachedError` on a tree inherited across a
+        `fork()`, rather than returning the all-zero value the child's poison
+        mapping holds — which is the spelling that means "in-process", so two
+        peers chasing a split brain would conclude they had never been shared.
+        `repr()` does not raise; it prints `detached-by-fork` in place of the
+        instance.
         """
 
     def is_shared(self) -> bool:
@@ -598,7 +635,12 @@ def build(
     """
 
 def push(
-    tree: Tree, child: str, parent: str, stamp_ns: int, quat7: list[float], /
+    tree: Tree,
+    child: str,
+    parent: str,
+    stamp_ns: int | np.int64,
+    quat7: list[float],
+    /,
 ) -> None:
     """Publish `[qw, qx, qy, qz, tx, ty, tz]` onto an edge at `stamp_ns`.
 

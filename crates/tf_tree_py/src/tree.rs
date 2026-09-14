@@ -17,8 +17,8 @@ use crate::errors::open_err;
 use tf_tree::AttachMode;
 
 use crate::errors::{
-    build_err, claim_err, edge_label_of, lookup_err, plan_domain_err, push_err, push_msg,
-    resolve_frame, unknown_frame_err, BufferError, TfTreeError,
+    build_err, claim_err, detached_err, edge_label_of, lookup_err, plan_domain_err, push_class,
+    push_err, push_msg, resolve_frame, unknown_frame_err, BufferError, TfTreeError,
 };
 
 /// Releasing the GIL costs a measured 40 ns; a depth-3 lookup costs ~193 ns
@@ -329,16 +329,57 @@ fn samples_anything(plan: &tf_tree::Plan) -> bool {
 /// This is the most-questioned decision in the API, so the exception carries
 /// the number rather than an opinion: users argue with rules and accept
 /// measurements.
+///
+/// # A numpy float scalar that is not a Python `float`
+///
+/// `np.float64` subclasses `float` and meets the first check. `np.float32`,
+/// `np.float16` and `np.longdouble` do not, and until 2026-09-14 they met
+/// PyO3's `'numpy.float32' object cannot be interpreted as an integer` on every
+/// entry point — `Plan.at` included — while §3's amendment said the refusal
+/// was universal. They are recognised **only after the integer conversion has
+/// already failed**, so an accepted stamp pays nothing for it and the import
+/// happens on an error path.
+///
+/// **Scalars only, on purpose.** `isinstance(x, np.floating)` is false for an
+/// array, so a `float64` stamps *array* that falls through to here from `at` /
+/// `at_into` keeps numpy's own `TypeError`, which
+/// `test_the_layout_path_reports_a_bad_stamps_array_exactly_as_at_does` pins as
+/// byte-identical between the two. A 0-d float array is an array too.
 fn stamp_from_any(obj: &Bound<'_, PyAny>) -> PyResult<i64> {
     if obj.is_instance_of::<pyo3::types::PyFloat>() {
-        return Err(PyTypeError::new_err(
-            "stamps are integer nanoseconds, not float seconds. At a 2026 epoch \
-             the ULP of float64 seconds is 238 ns, so every interval in a 1 kHz \
-             stream is wrong after a round trip. Use tf_tree.from_sec(x) if you \
-             genuinely have float seconds and accept the loss.",
-        ));
+        return Err(float_stamp_err());
     }
-    obj.extract::<i64>()
+    obj.extract::<i64>().map_err(|e| {
+        if is_numpy_floating_scalar(obj) {
+            float_stamp_err()
+        } else {
+            e
+        }
+    })
+}
+
+/// [`stamp_from_any`]'s refusal, and its only spelling.
+fn float_stamp_err() -> PyErr {
+    PyTypeError::new_err(
+        "stamps are integer nanoseconds, not float seconds. At a 2026 epoch \
+         the ULP of float64 seconds is 238 ns, so every interval in a 1 kHz \
+         stream is wrong after a round trip. Use tf_tree.from_sec(x) if you \
+         genuinely have float seconds and accept the loss.",
+    )
+}
+
+/// `isinstance(obj, numpy.floating)`, and `false` if that cannot be asked.
+///
+/// A failed import or attribute lookup answers `false` rather than raising:
+/// this runs only to *choose the message* of a refusal that is already
+/// happening, and replacing the caller's conversion error with an import error
+/// would name the wrong problem.
+fn is_numpy_floating_scalar(obj: &Bound<'_, PyAny>) -> bool {
+    obj.py()
+        .import("numpy")
+        .and_then(|np| np.getattr("floating"))
+        .and_then(|floating| obj.is_instance(&floating))
+        .unwrap_or(false)
 }
 
 #[pymethods]
@@ -441,6 +482,7 @@ impl PyTree {
         Ok(PyPublisher {
             edge: edge_label_of(parent, child),
             inner: Mutex::new(Some(writer)),
+            tree: Arc::downgrade(&this.inner),
         })
     }
 
@@ -717,8 +759,9 @@ impl PyTree {
     ///
     /// # Errors
     ///
-    /// `TfTreeError` on a tree inherited across a `fork()`. The engine
-    /// substitutes a zeroed poison arena for a detached tree, so answering would report the one arena identity whose
+    /// `ChildProcessDetachedError` on a tree inherited across a `fork()`. The
+    /// engine substitutes a zeroed poison arena for a detached tree, so
+    /// answering would report the one arena identity whose
     /// entire job is to be comparable as *all-zero* — the spelling this binding
     /// documents as "in-process". Two peers debugging a split brain would
     /// conclude they were never shared. Same refusal as
@@ -794,9 +837,15 @@ impl PyTree {
         py: Python<'py>,
         target: &str,
         source: &str,
-        stamp_ns: i64,
+        stamp_ns: &Bound<'py, PyAny>,
         domain: u8,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        // `&PyAny` rather than `i64`, and only so the refusal is §3's: an `i64`
+        // parameter rejects a `float` inside PyO3's own conversion, with "'float'
+        // object cannot be interpreted as an integer" and no measurement. The
+        // accepted set is unchanged, and so is `ml_flags` — that follows the
+        // `signature`, not the argument's Rust type.
+        let stamp_ns = stamp_from_any(stamp_ns)?;
         let iso = self
             .inner
             .lookup_tagged(target, source, stamp_ns, domain)
@@ -1062,41 +1111,26 @@ impl PyPlan {
     /// `_into` form, and a layout reachable only through the allocating one
     /// would be a batch path with no allocation-free tier.
     ///
-    /// # The two paths disagree about what a stamp is, and the `mat4` one is
-    /// the one that is wrong
+    /// # One stamp dispatch in spirit, and until 2026-09-14 there were two
     ///
-    /// This method has two stamp dispatches — one for the default `mat4`
-    /// layout, in the body below, and one in `at_into_layout` for the other
-    /// three. They are **not** the same, and until one of them moves a caller
-    /// can observe which one they are on:
+    /// The default `mat4` path, in the body below, and `at_into_layout` for
+    /// the other three do the same thing now: probe `int`, fall *through* the
+    /// `(N,) int64` array cast, and let [`stamp_from_any`] have the last word —
+    /// which is `at`'s dispatch. `docs/PHASE3.md` §3 is NORMATIVE that an
+    /// `np.int64` scalar is accepted and that a `float` meets the `TypeError`
+    /// carrying the 238 ns ULP, and the `mat4` path met neither: an `if PyInt
+    /// { .. } else { cast_or_BufferError }` reported both as a `BufferError`.
+    /// The `layout=` path was fixed first (#128), and this path was recorded as
+    /// "outstanding, not decided" in a table here until it was fixed too.
     ///
-    /// | `stamps` | `at`, and `at_into(layout=..)` | `at_into` (`mat4`) |
-    /// | --- | --- | --- |
-    /// | `np.int64(t)` | accepted (§3 lists it) | `BufferError` |
-    /// | `1.5` | `TypeError`, 238 ns ULP (§3) | `BufferError` |
-    /// | a `list`, or a non-`int64` array | numpy's or PyO3's own conversion `TypeError` | `BufferError` naming `(N,) int64` |
-    ///
-    /// `docs/PHASE3.md` §3 is NORMATIVE about the first two rows, so the
-    /// `mat4` column is a defect on both: `np.int64` is what `stamps[i]` hands
-    /// you, and a `float` must meet the measurement rather than a complaint
-    /// about a buffer. The `layout=` path was fixed to match `at`; **the
-    /// `mat4` path is outstanding, not decided.** It is deferred rather than
-    /// done because closing it moves the third row too — the shape-naming
-    /// `BufferError` that this path, alone, still gives — and that is a
-    /// change to the default overload's error surface with its own tests,
-    /// not a line inside a layout feature. Recorded rather than silently
-    /// tolerated: a reader who finds this table is looking at the last place
-    /// the two shapes differ.
-    ///
-    /// The third row is the price the fix charged, and it is charged
-    /// **symmetrically**: `at` has always answered a `list` or a `float64`
-    /// array that way, because there is no cast left to fail once the array
-    /// probe has been fallen through — [`stamp_from_any`] has the last word
-    /// and raises PyO3's or numpy's own conversion error. Matching `at`
-    /// exactly was the point, so `at_into(.., layout=..)` gives up the
-    /// shape-naming `BufferError` for it. §3's two rows are worth more than
-    /// one message: they are what a caller *writes*, and the message is what
-    /// they read once.
+    /// **The price is one message, charged symmetrically.** A `list`, or a
+    /// stamps array that is not `(N,) int64`, now raises numpy's or PyO3's own
+    /// conversion `TypeError` — from `stamp_from_any`, because there is no cast
+    /// left to fail once the array probe has been fallen through — rather than
+    /// a `BufferError` naming `(N,) int64`. `at` has always answered exactly
+    /// that way, so `except tf_tree.TfTreeError` no longer catches it on any
+    /// path. §3's two rows are worth more than one message: they are what a
+    /// caller *writes*, and the message is what they read once.
     #[pyo3(signature = (stamps, out, /, *, layout = None))]
     fn at_into(
         &self,
@@ -1146,93 +1180,102 @@ impl PyPlan {
         // got right.
         //
         // `is_instance_of::<PyInt>` is a pointer comparison against the type
-        // object, so the scalar path still leads.
-        if stamps.is_instance_of::<pyo3::types::PyInt>() {
-            let stamp = stamp_from_any(stamps)?;
-            let arr = out.cast::<PyArray2<f64>>().map_err(|_| {
-                BufferError::new_err(
-                    "a scalar stamp needs out to be a writable, C-contiguous (4, 4) \
-                     float64 numpy array",
-                )
-            })?;
-            if !arr.is_c_contiguous() {
-                return Err(BufferError::new_err(
-                    "out must be C-contiguous; pass np.ascontiguousarray(...) \
-                     explicitly if you meant to copy",
-                ));
+        // object, so an `int` still leads: it skips the array cast, whose
+        // failure builds a `DowncastError` it would throw away (`at`'s ~150 ns).
+        //
+        // **The array cast is fallen through, not `else`-d**, and that is
+        // `docs/PHASE3.md` §3 rather than style. An `if PyInt { scalar } else {
+        // cast_or_BufferError }` — which is what this path was — refuses an
+        // `np.int64` scalar as a buffer and reports a `float` as one too, where
+        // §3 lists the first as accepted and requires the second to meet the
+        // 238 ns measurement. [`stamp_from_any`] has the last word, exactly as
+        // in `at` and `at_into_layout`.
+        if !stamps.is_instance_of::<pyo3::types::PyInt>() {
+            if let Ok(stamps) = stamps.cast::<PyArray1<i64>>() {
+                let arr = match out.cast::<PyArray3<f64>>() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        // Not a numpy array, so it may be device memory. Refuse
+                        // rather than fault (§5.5): a CPU store to a
+                        // `cudaMalloc` pointer is undefined, not slow.
+                        reject_device_memory(out)?;
+                        // **Only `numpy.ndarray` is accepted, subclasses
+                        // included.** The message used to offer "an object
+                        // exposing the buffer protocol", and `PHASE3.md` §5.5
+                        // still describes pinned torch and CuPy allocations as
+                        // qualifying — but `cast` matches the numpy type, so a
+                        // `memoryview` or a pinned torch tensor is refused here
+                        // whatever its layout. Advertising a path that does not
+                        // exist sends people to debug their buffer instead of
+                        // their expectations.
+                        return Err(BufferError::new_err(
+                            "out must be a writable, C-contiguous (N, 4, 4) float64 numpy array \
+                             — or (4, 4) for a scalar stamp. Other buffer-protocol objects are \
+                             not accepted yet; np.asarray(...) it first",
+                        ));
+                    }
+                };
+                let n = stamps.len();
+                return self.fill(py, stamps, arr, n);
             }
-            let shape = arr.shape();
-            if shape != [4, 4] {
-                return Err(BufferError::new_err(format!(
-                    "a scalar stamp needs out of shape (4, 4), got {shape:?}"
-                )));
-            }
-            // **Writability, before anything is evaluated.** `as_slice_mut` is
-            // `unsafe` because it checks neither `NPY_ARRAY_WRITEABLE` nor
-            // aliasing, and skipping the check does not merely produce a wrong
-            // answer: a read-only `np.memmap` is a `PROT_READ` page, and storing
-            // into it is `SIGSEGV`, not an error. §5.5's rule is refuse rather
-            // than fault, and it applies to host memory the caller cannot write
-            // exactly as much as to device memory.
-            //
-            // `try_readwrite` is the safe API and was tried first: it also
-            // consults rust-numpy's borrow registry, which costs a global
-            // lookup and measured **+50 ns on a 173 ns call** — enough to put
-            // `at_into` back above `at` and undo the reason it exists. The
-            // registry answers a question this code was not getting wrong;
-            // writability is the one it was. `is_writeable` reads the same
-            // `flags` field `is_c_contiguous` already reads, for about a
-            // nanosecond.
-            if !is_writeable(arr.as_untyped()) {
-                return Err(BufferError::new_err(
-                    "out is not writable (NumPy reports NPY_ARRAY_WRITEABLE clear); \
-                     a read-only mapping cannot receive a transform",
-                ));
-            }
-            let g = self.tree().guard();
-            let iso = self
-                .plan
-                .at_tagged(&g, stamp, self.domain)
-                .map_err(|e| lookup_err(self.tree(), e))?;
-            // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
-            // slice is exactly 16 writable f64. Aliasing remains the caller's
-            // to avoid, as it was before — `as_slice_mut` documents that, and
-            // handing the same array to two threads is already a data race in
-            // NumPy's own terms. Nothing is written before every check passes:
-            // a half-written output is worse than none, because it looks like
-            // data.
-            let slice = unsafe { arr.as_slice_mut()? };
-            tf_tree::write_mat4(&iso, slice);
-            return Ok(());
         }
 
-        let stamps = stamps
-            .cast::<PyArray1<i64>>()
-            .map_err(|_| BufferError::new_err("stamps must be an (N,) int64 array, or an int"))?;
-        let arr = match out.cast::<PyArray3<f64>>() {
-            Ok(a) => a,
-            Err(_) => {
-                // Not a numpy array, so it may be device memory. Refuse rather
-                // than fault (§5.5): a CPU store to a `cudaMalloc` pointer is
-                // undefined, not slow.
-                reject_device_memory(out)?;
-                // **Only `numpy.ndarray` is accepted, subclasses included.** The
-                // message used to offer "an object exposing the buffer
-                // protocol", and `PHASE3.md` §5.5 still describes pinned torch
-                // and CuPy allocations as qualifying — but `cast` matches the
-                // numpy type, so a `memoryview` or a pinned torch tensor is
-                // refused here whatever its layout. Advertising a path that does
-                // not exist sends people to debug their buffer instead of their
-                // expectations.
-                return Err(BufferError::new_err(
-                    "out must be a writable, C-contiguous (N, 4, 4) float64 numpy array \
-                     — or (4, 4) for a scalar stamp. Other buffer-protocol objects are \
-                     not accepted yet; np.asarray(...) it first",
-                ));
-            }
-        };
-        let n = stamps.len();
-        self.fill(py, stamps, arr, n)
+        let stamp = stamp_from_any(stamps)?;
+        let arr = out.cast::<PyArray2<f64>>().map_err(|_| {
+            BufferError::new_err(
+                "a scalar stamp needs out to be a writable, C-contiguous (4, 4) \
+                 float64 numpy array",
+            )
+        })?;
+        if !arr.is_c_contiguous() {
+            return Err(BufferError::new_err(
+                "out must be C-contiguous; pass np.ascontiguousarray(...) \
+                 explicitly if you meant to copy",
+            ));
+        }
+        let shape = arr.shape();
+        if shape != [4, 4] {
+            return Err(BufferError::new_err(format!(
+                "a scalar stamp needs out of shape (4, 4), got {shape:?}"
+            )));
+        }
+        // **Writability, before anything is evaluated.** `as_slice_mut` is
+        // `unsafe` because it checks neither `NPY_ARRAY_WRITEABLE` nor
+        // aliasing, and skipping the check does not merely produce a wrong
+        // answer: a read-only `np.memmap` is a `PROT_READ` page, and storing
+        // into it is `SIGSEGV`, not an error. §5.5's rule is refuse rather
+        // than fault, and it applies to host memory the caller cannot write
+        // exactly as much as to device memory.
+        //
+        // `try_readwrite` is the safe API and was tried first: it also
+        // consults rust-numpy's borrow registry, which costs a global
+        // lookup and measured **+50 ns on a 173 ns call** — enough to put
+        // `at_into` back above `at` and undo the reason it exists. The
+        // registry answers a question this code was not getting wrong;
+        // writability is the one it was. `is_writeable` reads the same
+        // `flags` field `is_c_contiguous` already reads, for about a
+        // nanosecond.
+        if !is_writeable(arr.as_untyped()) {
+            return Err(BufferError::new_err(
+                "out is not writable (NumPy reports NPY_ARRAY_WRITEABLE clear); \
+                 a read-only mapping cannot receive a transform",
+            ));
+        }
+        let g = self.tree().guard();
+        let iso = self
+            .plan
+            .at_tagged(&g, stamp, self.domain)
+            .map_err(|e| lookup_err(self.tree(), e))?;
+        // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
+        // slice is exactly 16 writable f64. Aliasing remains the caller's
+        // to avoid, as it was before — `as_slice_mut` documents that, and
+        // handing the same array to two threads is already a data race in
+        // NumPy's own terms. Nothing is written before every check passes:
+        // a half-written output is worse than none, because it looks like
+        // data.
+        let slice = unsafe { arr.as_slice_mut()? };
+        tf_tree::write_mat4(&iso, slice);
+        Ok(())
     }
 
     /// Evaluate past the newest sample under an explicit policy, and get back
@@ -1521,11 +1564,15 @@ impl PyPlan {
     fn adaptive<'py>(
         &self,
         py: Python<'py>,
-        start_ns: i64,
-        end_ns: i64,
+        start_ns: &Bound<'py, PyAny>,
+        end_ns: &Bound<'py, PyAny>,
         lin: f64,
         ang: f64,
     ) -> PyResult<Knots<'py>> {
+        // Both stamps before the tolerances, so a float stamp meets §3's
+        // measurement whatever else is wrong with the call. See `lookup`.
+        let start_ns = stamp_from_any(start_ns)?;
+        let end_ns = stamp_from_any(end_ns)?;
         if !(lin.is_finite() && ang.is_finite()) || lin <= 0.0 || ang <= 0.0 {
             return Err(PyValueError::new_err(
                 "lin and ang must be finite and positive",
@@ -1996,6 +2043,19 @@ pub struct PyPublisher {
     /// [`OwnedWriter::push`](tf_tree::OwnedWriter::push), which forwards to the
     /// fork-checked `EdgeWriter::push`.
     inner: Mutex<Option<OwnedWriter>>,
+    /// The tree this claim was made on, for the one refusal no `push` reaches.
+    ///
+    /// An **empty** `push_many` runs no `push`, so `EdgeWriter::push`'s fork
+    /// check never fires and a fork child's call returned `None` where
+    /// `docs/PHASE3.md` §8.1 (NORMATIVE) requires `ChildProcessDetachedError`.
+    /// `OwnedWriter` exposes no `detached()` of its own, so this asks the tree.
+    ///
+    /// **`Weak`, not `Arc`**: the writer in [`Self::inner`] already owns the
+    /// tree for as long as the claim is held, and a strong count here would
+    /// keep the tree — and its participant slot — alive past `release()` for as
+    /// long as the Python object is reachable, which is a change to when a
+    /// `Tree`'s drop runs, bought for an error path.
+    tree: std::sync::Weak<Tree>,
 }
 
 #[pymethods]
@@ -2025,7 +2085,12 @@ impl PyPublisher {
 
     /// Publish `[qw, qx, qy, qz, tx, ty, tz]` at `stamp_ns`.
     #[pyo3(signature = (stamp_ns, quat7, /))]
-    fn push(&self, stamp_ns: i64, quat7: Vec<f64>) -> PyResult<()> {
+    fn push(&self, stamp_ns: &Bound<'_, PyAny>, quat7: Vec<f64>) -> PyResult<()> {
+        // The stamp first, as `at_into` checks it first: §3's refusal is the
+        // one that carries a measurement, and `Tree.lookup` says why this is
+        // `&PyAny`. The `signature` above is what keeps `METH_FASTCALL`, and
+        // `test_the_hot_methods_are_emitted_as_meth_fastcall` reads it back.
+        let stamp_ns = stamp_from_any(stamp_ns)?;
         let iso = iso_from_quat7(&quat7)?;
         let g = self.lock()?;
         let p = g.as_ref().ok_or_else(released)?;
@@ -2064,6 +2129,15 @@ impl PyPublisher {
 
         let g = self.lock()?;
         let p = g.as_ref().ok_or_else(released)?;
+        // **An empty batch is still a call on a fork-inherited handle.** The
+        // per-sample `push` below is where the fork check lives, and a
+        // zero-length batch never reaches it — so without this a fork child's
+        // `push_many` of nothing answered `None` (`docs/PHASE3.md` §8.1). Only
+        // for `n == 0`: every other batch meets the same refusal on sample 0,
+        // with the index prefixed, and this is not on that path.
+        if st.is_empty() && self.tree.upgrade().is_some_and(|t| t.detached()) {
+            return Err(detached_err());
+        }
         for (i, stamp) in st.iter().enumerate() {
             let iso = iso_from_quat7(&po[i * 7..(i + 1) * 7])?;
             p.push(*stamp, &iso).map_err(|e| {
@@ -2071,8 +2145,10 @@ impl PyPublisher {
                 // otherwise indistinguishable from a rejected batch, and the
                 // samples before it *were* published. Prefixed rather than
                 // re-worded, so the sentence after the colon is the same one a
-                // scalar `push` produces for the same failure.
-                TfTreeError::new_err(format!(
+                // scalar `push` produces for the same failure — and not
+                // re-typed, so a fork child meets `ChildProcessDetachedError`
+                // here as it does from `push` (`docs/PHASE3.md` §8.1).
+                push_class(e)(format!(
                     "sample {i} (stamp {stamp}): {}",
                     push_msg(&self.edge, e)
                 ))
@@ -2480,9 +2556,12 @@ pub fn push(
     tree: &PyTree,
     child: &str,
     parent: &str,
-    stamp_ns: i64,
+    stamp_ns: &Bound<'_, PyAny>,
     quat7: Vec<f64>,
 ) -> PyResult<()> {
+    // `Tree.lookup`'s reason, and first: a refused stamp then costs neither
+    // the two frame resolutions nor the claim below.
+    let stamp_ns = stamp_from_any(stamp_ns)?;
     if quat7.len() != 7 {
         return Err(PyValueError::new_err(
             "expected [qw, qx, qy, qz, tx, ty, tz]",

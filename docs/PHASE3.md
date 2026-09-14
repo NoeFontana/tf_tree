@@ -137,6 +137,37 @@ tf_tree.now(domain="steady")            # CLOCK_MONOTONIC, int ns
 
 Passing a `float` raises `TypeError` naming `from_sec` and stating the ULP at the caller's magnitude.
 
+> **Amendment (2026-09-14) — two corrections to how far this was true.**
+> **"Anywhere" was not.** `Tree.lookup`, `Publisher.push`, the module-level
+> `tf_tree.push` and `Plan.adaptive` took their stamps as a bare integer, so a
+> `float` was refused inside PyO3's own conversion — `'float' object cannot be
+> interpreted as an integer`, no measurement — and `Plan.at_into` on its
+> default `mat4` layout refused an `np.int64` scalar and reported a `float` as
+> a `BufferError`. All five now go through the one refusal `Plan.at` uses.
+> And that refusal recognised only a Python `float` and its subclasses
+> (`np.float64`): an `np.float32` or `np.float16` scalar met PyO3's `'numpy.float32'
+> object cannot be interpreted as an integer` on every entry point, `Plan.at`
+> included. It now meets the measurement too.
+>
+> **So the `TypeError` with the ULP is what every *scalar* float stamp meets, and
+> no more than that.** A float stamp is accepted nowhere, but three refusals
+> still carry no measurement, recorded here rather than fixed:
+>
+> - **A float stamps *array*** (`np.array([1.5e9])`, or a 0-d float array)
+>   passed to `Plan.at`, `at_into` or the extrapolating calls raises numpy's own
+>   `TypeError: only integer scalar arrays can be converted to a scalar index`.
+>   This one is pinned on purpose: `at_into` falls through to `at`'s dispatch so
+>   that it answers byte-for-byte as `at` does, and the tests say so.
+> - **`Publisher.push_many` with a float stamps array** raises PyO3's
+>   argument-cast message, `'ndarray' object is not an instance of 'ndarray'`,
+>   which names neither `from_sec` nor the dtype.
+> - A `list` of stamps meets PyO3's `'list' object cannot be interpreted as an
+>   integer`.
+>
+> §14's box is split to say this. **"At the caller's magnitude" is still not
+> true either**: the message states the fixed 238 ns ULP of a 2026 epoch,
+> whatever stamp was passed. That half is recorded rather than fixed.
+
 ---
 
 ## 4. API
@@ -244,6 +275,55 @@ class FrameNotDeclaredError(TfTreeError, KeyError)
 ```
 
 `str(e)` uses the Rust `Described` wrapper so frame and edge IDs appear as names. `TopologyChangedError` must document that the correct response is to re-`plan`, since it is the one error a correct program routinely hits.
+
+> **Amendment (2026-09-14) — what ships, which is not the block above.** This
+> section is not marked NORMATIVE and was never implemented as written. The
+> package exports **ten** exception classes: `TfTreeError` (an `Exception`) and
+> nine direct subclasses of it — `ExtrapolationError`, `DisconnectedError`,
+> `NoDataError`, `TopologyChangedError`, `FrameNotDeclaredError`,
+> `BufferError`, `DerivativesUnavailableError`, `NoSegmentError` and
+> `ChildProcessDetachedError`.
+>
+> - **No class carries an attribute.** An instance holds `args == (message,)`
+>   and nothing else, so a caller programs against the *class*.
+>   `crates/tf_tree_py/src/errors.rs`'s module doc said "the fields are attached
+>   to the exception rather than only formatted into it" from its first commit
+>   until this date; it was never true, and §11.1's "attributes asserted" had
+>   nothing to assert.
+> - **`FrameNotDeclaredError` has no `KeyError` base.** Adding one is not
+>   additive: `KeyError.__str__` quotes the message, and every `except
+>   KeyError` and `except LookupError` around a tf_tree call would start
+>   catching it.
+> - **`str(e)` does not use `Described`.** The binding names ids itself, against
+>   the arena the caller holds (`edge_label` / `frame_label` in `errors.rs`).
+> - **Four classes were never built:** `TimeDomainMismatchError`,
+>   `EdgeAlreadyClaimedError`, `ClaimRevokedError` and
+>   `ArenaHeldButUnreachableError`. Those failures reach Python as the base
+>   `TfTreeError` with a message. **`ChildProcessDetachedError` was a fifth and
+>   ships as of this date**, because §8.1 is NORMATIVE and names it; it replaced
+>   a base `TfTreeError` from every fork-child refusal, including `Publisher.push`
+>   and `push_many`. §8.1's amendment of the same date lists the two calls that
+>   did not refuse at all and the ones that still answer.
+> - **Two listed attributes no longer match the Rust errors.** `.owner_pid`:
+>   since amendment A3 a claim records a participant *slot*, not a pid, and an
+>   attribute spelled `pid` would point an operator at an unrelated process.
+>   `.holders -> [(pid, name)]`: `IpcError::ArenaHeldButUnreachable` carries
+>   `holder_slots`, `first_slot`, `first_pid` and `ownership_held`.
+> - **`BufferError` is not in the block above and ships.** It is public as
+>   `tf_tree.BufferError` and deliberately absent from `__all__`, so `from
+>   tf_tree import *` does not shadow the builtin `BufferError`, an unrelated
+>   class. `tf_tree.open` is kept out of `__all__` for the same reason.
+> - **Every class's `__module__` is `"tf_tree"`**, so an exception raised in a
+>   `multiprocessing` worker pickles back to its parent as itself. Until this
+>   date they were declared under `_core`, which is not importable, and none
+>   could.
+>
+> **Still open, and a decision record's rather than this section's:** the
+> attributes — including how an id-shaped one (`.edge`, `.target`, `.cut_at`)
+> reaches a language that is never handed an id, when `docs/API.md` R5 says
+> name resolution is a display wrapper and not a field — the `KeyError` base,
+> and the four unbuilt classes. Until one is `ready`, the list above is what a
+> caller can rely on.
 
 ---
 
@@ -517,6 +597,31 @@ os.register_at_fork(after_in_child=_poison_all_handles)
 
 Poisoning marks every `Tree`, `Plan`, and `Publisher` in the child dead; any use raises `ChildProcessDetachedError` with a message saying to call `tf_tree.open()` in the child. **A clear Python exception instead of a segfault** is the whole deliverable here, and it must be tested with `pytest-forked` under all three start methods.
 
+> **Amendment (2026-09-14) — what a fork child's call does, measured.** Each
+> public method was called on an inherited `Tree`, `Plan` and `Publisher` in a
+> forked child, one child per call.
+>
+> - **`Tree.freeze` faulted** — `SIGSEGV`, status 139 — from before
+>   `ChildProcessDetachedError` existed. `Tree::freeze_to` reads the manifest and
+>   the backing bytes without a detachment check, and the binding asked none
+>   either. The binding now refuses before the call. **The Rust facade's
+>   `Tree::freeze_to` still has no check of its own**; that is recorded here,
+>   not fixed, because this document is the Python binding's.
+> - **`Publisher.push_many` of zero samples answered `None`**, because the fork
+>   check lives in the per-sample `push`. It now refuses.
+> - **Every other call that reaches the arena raises
+>   `ChildProcessDetachedError`**: `lookup`, `plan`, `span`, `edges`, `frames`,
+>   `instance_uuid`, `publisher`, `Plan.at` / `at_into` / `at_extrapolating` /
+>   `at_extrapolating_into` / `adaptive` / `edges` / `latest`, `Publisher.push` /
+>   `push_many`, and the module-level `push`.
+> - **Not every call raises, so "any use raises" above is still not what
+>   ships.** `is_shared`, `is_writable`, `Plan.depth`, `Tree.source` and
+>   `Publisher.release` answer from state the handle holds. `owner_lost`
+>   answers `False`, `reap_dead` `0` and `inherit_ownership` `"NotApplicable"` —
+>   none of them faults. Whether those should refuse is not decided here.
+> - §14's box for `os.register_at_fork` poisoning under all three start methods
+>   stays unticked: the tests use bare `os.fork()`.
+
 ### 8.2 Interpreter shutdown
 
 Explicit `close()` and context-manager support are the documented path. An `atexit` hook detaches anything still open.
@@ -658,7 +763,7 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 - [ ] `import tf_tree; tf_tree.open()` works with zero arguments on a machine with a running arena, and in a bare notebook with none
 - [x] `#[pymodule(gil_used = false)]` set; asserted on `3.14t` — but see §1.2's correction, the attribute is not what the assertion proves
 - [x] Every `#[pyclass]` is `Send + Sync`; `Publisher` wrapped
-- [x] No `float` stamp accepted anywhere; `TypeError` names `from_sec` and states the ULP
+- [~] No `float` stamp accepted anywhere; `TypeError` names `from_sec` and states the ULP — **split on 2026-09-14.** *No float accepted anywhere* holds. *The `TypeError` with the ULP* holds for every **scalar** float stamp as of that date (it was false for five entry points and for non-`float` numpy float scalars), and not for a float stamps **array**, which meets numpy's or PyO3's own message; the ULP is also stated at a fixed epoch rather than the caller's magnitude. §3's amendment is the account
 - [ ] No API returns a view into the arena (grep-able review item, documented in the README)
 - [x] `at_into` validates fully before writing; non-contiguous `out` rejected
 - [x] `out` device classification via `__dlpack_device__`; CUDA device memory rejected with an actionable message
@@ -680,7 +785,9 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 Implemented and gated locally (`just py-test`, `py-test-freethreaded`,
 `py-lint`, `tsan`): `open()`/`build()`, `Plan.at` scalar and batch, `at_into`
 with DLPack device classification, `adaptive`, `Publisher` with `push` and
-`push_many`, the exception hierarchy, hand-written stubs with a bidirectional
+`push_many`, the exception hierarchy — as §4.4's 2026-09-14 amendment lists it,
+which is classes and messages, not the attributes §4.4 specifies — hand-written
+stubs with a bidirectional
 drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
 path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and
 verified to import and run on 3.14.
