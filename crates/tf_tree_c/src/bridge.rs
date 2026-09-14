@@ -1557,10 +1557,11 @@ pub unsafe extern "C" fn tft_bridge_offer(
         // fields a caller could misread would trade a rule stated in one line
         // for a rule with an exception list. The cost is a couple of
         // nanoseconds against a call measured in the hundreds.
-        //
-        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
-        // invariants, so a bitwise write is a complete initialisation.
         let mut o = tft_bridge_outcome::blank();
+        // SAFETY: `out` is non-null and its `struct_size` just matched
+        // `size_of::<tft_bridge_outcome>()`, so the caller's storage is the whole
+        // struct; `tft_bridge_outcome` is `Copy` with no padding invariants, so a
+        // bitwise write is a complete initialisation of possibly-uninit memory.
         unsafe { core::ptr::write(out, o) };
 
         // SAFETY: the caller contracts a live handle.
@@ -2500,10 +2501,11 @@ pub unsafe extern "C" fn tft_bridge_note_time_jump(
         }
         // A blank outcome before the handle is validated, for the same reason
         // and with the same promise as `tft_bridge_offer`'s.
-        //
-        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
-        // invariants, so a bitwise write is a complete initialisation.
         let mut o = tft_bridge_outcome::blank();
+        // SAFETY: `out` is non-null and its `struct_size` just matched
+        // `size_of::<tft_bridge_outcome>()`, so the caller's storage is the whole
+        // struct; `tft_bridge_outcome` is `Copy` with no padding invariants, so a
+        // bitwise write is a complete initialisation of possibly-uninit memory.
         unsafe { core::ptr::write(out, o) };
 
         let kind = match kind {
@@ -2654,10 +2656,11 @@ pub unsafe extern "C" fn tft_bridge_close_startup_window(
         }
         // A blank outcome before the handle is validated, for the same reason
         // and with the same promise as `tft_bridge_offer`'s.
-        //
-        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
-        // invariants, so a bitwise write is a complete initialisation.
         let mut o = tft_bridge_outcome::blank();
+        // SAFETY: `out` is non-null and its `struct_size` just matched
+        // `size_of::<tft_bridge_outcome>()`, so the caller's storage is the whole
+        // struct; `tft_bridge_outcome` is `Copy` with no padding invariants, so a
+        // bitwise write is a complete initialisation of possibly-uninit memory.
         unsafe { core::ptr::write(out, o) };
 
         // SAFETY: the caller contracts a live handle.

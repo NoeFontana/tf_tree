@@ -339,8 +339,8 @@ fn a_plan_outlives_the_tree_handle_it_was_compiled_from() {
     let name_a = std::ffi::CString::new("map").unwrap();
     let name_b = std::ffi::CString::new("base").unwrap();
     let mut p: *mut tft_plan = ptr::null_mut();
-    // SAFETY: live handle, NUL-terminated names, live out-pointer.
     assert_eq!(
+        // SAFETY: live handle, NUL-terminated names, live out-pointer.
         unsafe { tft_plan_create(t, name_a.as_ptr(), name_b.as_ptr(), &mut p) },
         TFT_OK
     );
@@ -502,8 +502,8 @@ fn derivatives_match_a_central_difference_of_the_pose() {
     let err_at = |h_ns: i64| {
         let sample = |s: i64| {
             let mut b = [0u8; 56];
-            // SAFETY: live plan, correctly sized buffer.
             assert_eq!(
+                // SAFETY: live plan, correctly sized buffer.
                 unsafe { tft_plan_at(p.0, s, TFT_LAYOUT_QVEC7_WXYZ, b.as_mut_ptr().cast()) },
                 TFT_OK
             );
@@ -568,9 +568,9 @@ fn the_twist_layout_writes_the_pose_and_the_twist_contiguously() {
 
     let mut row = [0u8; 104];
     let mut twist = [0.0f64; 6];
-    // SAFETY: live plan; `row` is exactly `tft_layout_size` bytes and `twist`
-    // exactly `TFT_TWIST_BYTES`.
     assert_eq!(
+        // SAFETY: live plan; `row` is exactly `tft_layout_size` bytes and `twist`
+        // exactly `TFT_TWIST_BYTES`.
         unsafe {
             tft_plan_at_with_derivatives(
                 p.0,
@@ -585,8 +585,8 @@ fn the_twist_layout_writes_the_pose_and_the_twist_contiguously() {
 
     // The pose half against the layout it extends, from an independent call.
     let mut pose = [0u8; 56];
-    // SAFETY: live plan, correctly sized buffer.
     assert_eq!(
+        // SAFETY: live plan, correctly sized buffer.
         unsafe { tft_plan_at(p.0, at, TFT_LAYOUT_QVEC7_WXYZ, pose.as_mut_ptr().cast()) },
         TFT_OK
     );
@@ -661,9 +661,9 @@ fn the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call() {
 
     const STRIDE: usize = 128; // > 104, so the rows are not tightly packed
     let mut rows = vec![0u8; stamps.len() * STRIDE];
-    // SAFETY: live plan; `stamps` is `len` readable i64 and `rows` holds
-    // `(len - 1) * STRIDE + 104` bytes, which is what the call touches.
     assert_eq!(
+        // SAFETY: live plan; `stamps` is `len` readable i64 and `rows` holds
+        // `(len - 1) * STRIDE + 104` bytes, which is what the call touches.
         unsafe {
             tft_plan_at_many(
                 p.0,
@@ -680,9 +680,9 @@ fn the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call() {
     // The same batch, tightly packed — the `Quat7Twist6[]` the C++ wrapper
     // passes, and the only shape that reaches the zero-copy arm.
     let mut packed = vec![0u8; stamps.len() * 104];
-    // SAFETY: live plan; `stamps` is `len` readable i64 and `packed` is exactly
-    // `len * 104` bytes, which is what a zero stride makes the call touch.
     assert_eq!(
+        // SAFETY: live plan; `stamps` is `len` readable i64 and `packed` is exactly
+        // `len * 104` bytes, which is what a zero stride makes the call touch.
         unsafe {
             tft_plan_at_many(
                 p.0,
@@ -701,8 +701,8 @@ fn the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call() {
         // The reference: the unstable scalar call, into its own buffers.
         let mut pose = [0u8; 104];
         let mut twist = [0.0f64; 6];
-        // SAFETY: live plan; both buffers are exactly the documented sizes.
         assert_eq!(
+            // SAFETY: live plan; both buffers are exactly the documented sizes.
             unsafe {
                 tft_plan_at_with_derivatives(
                     p.0,
@@ -743,8 +743,8 @@ fn the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call() {
 
     // The scalar stable entry point serves it too, with the same bytes.
     let mut one = [0u8; 104];
-    // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
     assert_eq!(
+        // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
         unsafe {
             tft_plan_at(
                 p.0,
@@ -823,8 +823,8 @@ fn a_twist_batch_that_fails_part_way_reports_the_element_and_keeps_the_prefix() 
         // scalar call gives at the same stamps.
         for (i, &s) in stamps[..2].iter().enumerate() {
             let mut one = [0u8; 104];
-            // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
             assert_eq!(
+                // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
                 unsafe {
                     tft_plan_at(
                         p.0,
@@ -915,8 +915,8 @@ fn an_unaligned_packed_twist_batch_is_written_correctly() {
 
     for (i, &s) in stamps.iter().enumerate() {
         let mut one = [0u8; 104];
-        // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
         assert_eq!(
+            // SAFETY: live plan, 104-byte buffer for a 104-byte layout.
             unsafe {
                 tft_plan_at(
                     p.0,
@@ -976,17 +976,17 @@ fn a_lerpslerp_edge_refuses_the_twist_layout_with_a_typed_status() {
     // Non-vacuity: the pose layouts work over this plan and this stamp, so the
     // refusals below are about the derivative and not about the fixture.
     let mut pose = [0u8; 56];
-    // SAFETY: live plan, 56-byte buffer for a 56-byte layout.
     assert_eq!(
+        // SAFETY: live plan, 56-byte buffer for a 56-byte layout.
         unsafe { tft_plan_at(p.0, at, TFT_LAYOUT_QVEC7_WXYZ, pose.as_mut_ptr().cast()) },
         TFT_OK
     );
 
     const SENTINEL: u8 = 0xAA;
     let mut row = [SENTINEL; 104];
-    // SAFETY: live plan; the buffer is the layout's full size, so a write that
-    // wrongly went ahead would be in bounds and visible rather than UB.
     assert_eq!(
+        // SAFETY: live plan; the buffer is the layout's full size, so a write that
+        // wrongly went ahead would be in bounds and visible rather than UB.
         unsafe {
             tft_plan_at(
                 p.0,
@@ -1010,8 +1010,8 @@ fn a_lerpslerp_edge_refuses_the_twist_layout_with_a_typed_status() {
 
     let stamps = [at, at + 10_000_000];
     let mut rows = [SENTINEL; 208];
-    // SAFETY: live plan, two readable i64, 2 x 104 writable bytes.
     assert_eq!(
+        // SAFETY: live plan, two readable i64, 2 x 104 writable bytes.
         unsafe {
             tft_plan_at_many(
                 p.0,
@@ -1037,8 +1037,8 @@ fn derivatives_write_only_what_was_asked_for() {
     let t = Tree::new();
     let p = t.plan("map", "sensor");
     let mut twist = [0.0f64; 6];
-    // SAFETY: live plan; `out_pose` NULL is the case under test.
     assert_eq!(
+        // SAFETY: live plan; `out_pose` NULL is the case under test.
         unsafe {
             tft_plan_at_with_derivatives(
                 p.0,
@@ -1053,8 +1053,8 @@ fn derivatives_write_only_what_was_asked_for() {
     assert!(twist.iter().any(|v| v.abs() > 1e-12), "a twist was written");
 
     let mut pose = [0u8; 56];
-    // SAFETY: live plan; `out_twist` NULL is the case under test.
     assert_eq!(
+        // SAFETY: live plan; `out_twist` NULL is the case under test.
         unsafe {
             tft_plan_at_with_derivatives(
                 p.0,
@@ -1066,8 +1066,8 @@ fn derivatives_write_only_what_was_asked_for() {
         },
         TFT_OK
     );
-    // SAFETY: both output pointers NULL is the case under test.
     assert_eq!(
+        // SAFETY: both output pointers NULL is the case under test.
         unsafe {
             tft_plan_at_with_derivatives(
                 p.0,
@@ -1097,8 +1097,8 @@ fn derivatives_write_only_what_was_asked_for() {
 fn introspection_reports_the_tree_and_refuses_to_truncate() {
     let t = Tree::new();
     // Four frames, three edges, both counted the same way.
-    // SAFETY: `t.0` is a live handle.
     assert_eq!(
+        // SAFETY: `t.0` is a live handle.
         unsafe { tft_tree_frame_count(t.0) },
         4,
         "map/odom/base/sensor"
@@ -1163,8 +1163,8 @@ fn introspection_reports_the_tree_and_refuses_to_truncate() {
 fn a_private_arena_reports_no_instance_uuid_rather_than_zeros() {
     let t = Tree::new();
     let mut a = [0xAAu8; 16];
-    // SAFETY: live handle; a 16-byte buffer.
     assert_eq!(
+        // SAFETY: live handle; a 16-byte buffer.
         unsafe { tft_tree_instance_uuid(t.0, a.as_mut_ptr()) },
         TFT_ERR_NO_DATA
     );

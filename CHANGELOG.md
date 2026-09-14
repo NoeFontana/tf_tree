@@ -41,6 +41,36 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — `0007` rule 3 is a lint, not a count
+
+- **An `unsafe` block with no `// SAFETY:` comment of its own now fails
+  `clippy -D warnings`.** `clippy::undocumented_unsafe_blocks` is `deny` in the
+  root `[workspace.lints.clippy]` and, because neither can inherit it, in
+  `tf_tree_py`'s and `tf_tree_tf2_sys`' own `[lints.clippy]`. Until now only
+  review held the rule, and the evidence `PHASE1.md` §13 cited for it — 449
+  `unsafe {` blocks against 463 `// SAFETY:` comments, repeated in the §13 entry
+  below — was a count, which cannot see two blocks under one comment.
+- **Fifty blocks had no comment the lint accepts**, across every clippy
+  configuration the justfile runs. Ten are library code, and each now has a
+  comment of its own naming its invariant: in `tf_tree_core`'s `arena_view.rs`
+  the topology-block slices (three blocks under one comment) and a ring's pose
+  slice (under the stamp slice's); in `tf_tree_c` the batched push's byte slice
+  (under the stamp slice's) and the three `tft_bridge_outcome` blank writes,
+  whose comment sat a statement too far up — `--features bridge` only, so the
+  default pass never saw them; and three in `tf_tree_py`'s `Plan`, two of them
+  above the `match` rather than the arm holding the block. **The other forty
+  are `tf_tree_c` tests and examples.** Thirty-nine had a comment above an
+  `assert_eq!(` wrapping the block, which the lint does not accept, and each
+  moved inside the macro directly above `unsafe`; the fortieth, in
+  `tests/abi.rs`, leaned on a neighbour's "here and below" and has its own now.
+- **What the lint does not check**, stated where a reader looks: that the
+  comment names anything (still review), module-level `// SAFETY:` blocks
+  (still review), and any configuration no clippy line compiles.
+  `scripts/unsafe-budget.sh`'s *What it does NOT prove* lists those, and
+  `tf_tree_tf2_sys` is linted only inside the ROS 2 container, by
+  `just tf2-check`. **No behaviour changed**: with comment lines stripped, every
+  touched `.rs` file is identical to its parent.
+
 ### Fixed — the Python binding's contract, where `PHASE3.md` §3 and §8.1 are NORMATIVE and the code was not
 
 - **Every tf_tree exception pickles, and reaches a `multiprocessing` parent as

@@ -1452,9 +1452,9 @@ impl PyPlan {
             }
             None => [stamp_from_any(stamps)?],
         };
-        // SAFETY: checked C-contiguous above; the borrow is held across the
-        // fold below for §6.2's reason.
         let src: &[i64] = match &src_arr {
+            // SAFETY: checked C-contiguous above; the borrow is held across the
+            // fold below for §6.2's reason.
             Some(a) => unsafe { a.as_slice()? },
             None => &src_owned,
         };
@@ -1746,12 +1746,12 @@ impl PyPlan {
         };
         let dist = PyArray1::<i64>::zeros(py, [n], false);
         {
+            let flat = poses.cast::<numpy::PyArrayDyn<f64>>()?;
             // SAFETY: `stamps` was checked C-contiguous above; `poses` and
             // `dist` were just allocated here, so nothing else holds a
             // reference to either and both are contiguous by construction. The
             // borrows are held across the `detach` below for §6.2's reason —
             // NumPy refuses to resize an array while a buffer is exported.
-            let flat = poses.cast::<numpy::PyArrayDyn<f64>>()?;
             let (src, pd, dd) = unsafe {
                 (
                     stamps.as_slice()?,
@@ -1917,9 +1917,9 @@ impl PyPlan {
             }
             None => [stamp_from_any(stamps)?],
         };
-        // SAFETY: checked C-contiguous above; held across `eval_*`'s `detach`
-        // per §6.2.
         let src: &[i64] = match &src_arr {
+            // SAFETY: checked C-contiguous above; held across `eval_*`'s `detach`
+            // per §6.2.
             Some(a) => unsafe { a.as_slice()? },
             None => &src_owned,
         };

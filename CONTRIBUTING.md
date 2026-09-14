@@ -137,8 +137,10 @@ home stays in the entry, or moves to the document that should own it.
 - [ ] The `CHANGELOG.md` entry links its argument rather than repeating it.
 - [ ] Public Rust items have doc comments (`missing_docs` is a warn lint, and CI
       builds docs with `-D warnings`).
-- [ ] Every `unsafe` block has a `// SAFETY:` comment; `unsafe` stays within its
-      budgeted crates/modules.
+- [ ] Every `unsafe` block has its own `// SAFETY:` comment naming the invariant
+      it relies on; `unsafe` stays within its budgeted crates/modules. `just
+      lint` fails a block with no comment (`clippy::undocumented_unsafe_blocks`),
+      but not one whose comment names nothing — that half is yours.
 - [ ] If the change is architectural, it cites the `docs/PHASE1.md` /
       `docs/PHASE2.md` section it implements, or a linked decision that is
       `ready` or `implemented`.
