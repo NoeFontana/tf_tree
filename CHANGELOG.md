@@ -56,14 +56,16 @@ text changes**, and message text is not a compatibility promise
   `write_frozen` and `ArenaLayout::new` into `Box<dyn Error>` and
   `anyhow::Error`; `Tree::attach_shared`'s was `E0277`. `source()` is `None` on
   all four, and that is not promised either.
-- **The text is one ASCII clause ending in the variant's name in
-  parentheses**, such as `(LayoutMismatch)`, the key `docs/RUNBOOK.md` is
-  headed by. Layout hashes print as `0x{:08X}`, the spelling every document
-  and `tf_tree doctor --explain-version` use, not in decimal, and an errno as `errno N` rather than the `Os { code, kind,
+- **The text is ASCII and names the variant**, such as `LayoutMismatch`, the
+  key `docs/RUNBOOK.md` is headed by. Layout hashes print in hex, the spelling
+  `IpcError`'s `Display` and `tf_tree doctor --explain-version` already use,
+  not in decimal, and an errno as `errno N` rather than the `Os { code, kind,
   message }` dump, so an operator no longer sees the strerror text the dump
-  happened to carry. `FrozenError::LayoutMismatch` and `FrozenError::Arena`
-  state that the `.tft` must be re-frozen, which `PHASE5.md` §2.4 requires of
-  the message and which the Rust facade had never said on its own.
+  happened to carry. `FrozenError::LayoutMismatch` states that the `.tft` must
+  be re-frozen, because `PHASE5.md` §2.4 requires that of a layout-hash
+  mismatch and the Rust facade had never said it on its own.
+  `FrozenError::Arena` states it too, for every arena-header failure inside a
+  `.tft`.
 - **`ShmError::ParticipantTableFull` no longer claims a full table**, in its
   text or its rustdoc: on `Open`'s joiner path it is what a taken or
   out-of-range granted slot is reported as.

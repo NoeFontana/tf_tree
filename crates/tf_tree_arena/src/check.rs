@@ -125,8 +125,6 @@ pub enum ShmError {
 // The match is exhaustive and there is no catch-all, so a variant added later
 // fails to compile here rather than rendering as something generic.
 
-/// A one-clause diagnostic that ends with the variant's name in parentheses.
-///
 /// **The text is a diagnostic and not a compatibility promise**
 /// (`docs/API.md` R5): it may change in any release, and the discriminant is
 /// what a caller matches on. [`core::error::Error::source`] returns `None`,

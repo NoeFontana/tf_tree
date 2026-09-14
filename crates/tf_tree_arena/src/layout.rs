@@ -65,8 +65,6 @@ pub enum LayoutError {
 // exhaustive: `#[non_exhaustive]` grants no catch-all inside this crate, so a
 // variant added later fails to compile here.
 
-/// A one-clause diagnostic that ends with the variant's name in parentheses.
-///
 /// **The text is a diagnostic and not a compatibility promise**
 /// (`docs/API.md` R5): it may change in any release, and the discriminant is
 /// what a caller matches on. [`core::error::Error::source`] returns `None`,
