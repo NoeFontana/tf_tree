@@ -115,6 +115,21 @@ class NonMonotonicStampError(TfTreeError):
     last: int
     got: int
 
+class EdgeAlreadyClaimedError(TfTreeError):
+    """Another publisher holds this edge's claim: one writer per edge.
+
+    Raised by `Tree.publisher` and `tf_tree.push`. The holder must release the
+    edge, or be reaped, first. The attributes exist only on instances the
+    library raises: `edge` is the arena's stored `(parent, child)` pair, and
+    `owner_slot` is the holder's participant **slot**, not a pid — `tf_tree
+    participants` lists the held slots and `tf_tree doctor` names the process
+    behind one. `owner_slot` is `None` while the holder's claim is still being
+    taken, or was abandoned mid-claim, which records no slot yet.
+    """
+
+    edge: tuple[str, str] | None
+    owner_slot: int | None
+
 class ChildProcessDetachedError(TfTreeError):
     """This handle was inherited across a `fork()` and cannot be used.
 

@@ -83,6 +83,14 @@ existing `except` clause catches exactly what it caught before.
   `Tree.edges()` lists and not the one you typed; the message keeps your
   spelling. **Migration:** `except tf_tree.TfTreeError` still catches it; a
   `type(e) is tf_tree.TfTreeError` check around a push no longer matches.
+- **`EdgeAlreadyClaimedError(TfTreeError)` is new**, with `.edge` and
+  `.owner_slot`. `Tree.publisher` and `tf_tree.push` raise it when another
+  participant holds the edge. `.owner_slot` is the holder's participant
+  **slot**, never a pid, and is `None` while the holder's claim is still being
+  taken (the message says so instead of printing slot `4294967295`, as it did).
+  **Migration:** `except tf_tree.TfTreeError` still catches it; a
+  `type(e) is tf_tree.TfTreeError` check around a claim no longer matches, and
+  a handler reading `owner_slot` must allow `None`.
 - `just py-test` and `just py-test-freethreaded` now run `cargo build -p tf_tree
   --features shm --bin tf_tree_rendezvous_child` first: `TopologyChangedError`'s
   two attributes are held by a test that spawns that helper's `join-reparent`.

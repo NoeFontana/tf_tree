@@ -378,6 +378,92 @@ def test_a_forked_child_identifies_the_arena_as_gone_not_as_in_process(runtime_d
     assert os.WEXITSTATUS(wstatus) == 0
 
 
+#: A child name past the 48 bytes a frame record stores, so the arena's pair and
+#: the typed pair differ (`docs/decisions/0058` measurement 5).
+LONG_CHILD = "sensor_" + "x" * 60
+
+
+@shm
+def test_a_refused_claim_raises_edge_already_claimed_with_the_holders_slot(
+    runtime_dir,
+):
+    """`EdgeAlreadyClaimedError.owner_slot` and `.edge` (`0058` step 5).
+
+    A subprocess creates the arena and claims nothing, so it holds slot 0
+    (`CREATOR_SLOT`); this process joins read-write as the first joiner, slot
+    1, and claims two edges; a second read-write handle, a different participant,
+    is refused both. **`owner_slot == 1` is what holds the slot**: a claim held
+    by the creator would read `0`, which a hard-coded `0` could not be told
+    apart from.
+
+    The second edge's child is 67 bytes, so `.edge` — the stored pair, a member
+    of `Tree.edges()` — differs from the pair the caller typed there and nowhere
+    else. **That half depends on `0027`**: if `intern` comes to refuse names
+    over 48 bytes it cannot be built, and the change that lands `0027` deletes
+    it.
+
+    `owner_slot`'s `None` arm, the `CLAIMING` sentinel, is not reached: no test
+    can hold a claim word in that window.
+
+    Mutants, each applied alone, rebuilt and run with ``just py-test``; each
+    fails this test and nothing else:
+
+    * ``owner_slot`` set to ``Some(0)`` => ``{'edge': ('map', 'base'),
+      'owner_slot': 0}``, ``assert 0 == 1``.
+    * `claimed_by` answering ``None`` for every slot => ``assert None == 1``.
+    * the ``EdgeAlreadyClaimed`` arm guarded ``if false``, so the cause reaches
+      the bug-report arm => ``tf_tree.TfTreeError: edge "map" -> "base": tf_tree
+      reported a claim failure this binding has no message for ...`` escapes
+      ``pytest.raises``.
+    * ``.edge`` set from the typed ``(parent, child)`` => the long-name half
+      fails, ``At index 1 diff``: the 67-byte typed child against the 48-byte
+      stored one. The short edge passes under it, as it must.
+
+    **Not a mutant: `claimed_by` hard-coded to ``Some``**, which would hand a
+    handler ``4294967295``. No test can put a claim word in ``CLAIMING``, so
+    nothing could kill it; the arm is held by its type and its review.
+    """
+    edges = [("map", "base"), ("base", LONG_CHILD)]
+    creator = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import tf_tree, time;"
+            f"t = tf_tree.open(mode='rw', create={edges!r});"
+            "print('owning', flush=True);"
+            "time.sleep(3600)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "TF_TREE_RUNTIME_DIR": runtime_dir},
+    )
+    try:
+        assert creator.stdout.readline().strip() == "owning", "no creator"
+        holder = tf_tree.open(mode="rw")
+        other = tf_tree.open(mode="rw")
+        with (
+            holder.publisher("base", "map"),
+            holder.publisher(LONG_CHILD, "base"),
+        ):
+            with pytest.raises(tf_tree.EdgeAlreadyClaimedError) as short:
+                other.publisher("base", "map")
+            with pytest.raises(tf_tree.EdgeAlreadyClaimedError) as long:
+                tf_tree.push(other, LONG_CHILD, "base", 1_000, [1.0, 0, 0, 0, 0, 0, 0])
+
+        from test_stubs import _stub_annotations
+
+        for e in (short.value, long.value):
+            assert type(e) is tf_tree.EdgeAlreadyClaimedError
+            assert e.owner_slot == 1, vars(e)
+            assert set(vars(e)) == set(_stub_annotations("EdgeAlreadyClaimedError"))
+        assert short.value.edge == ("map", "base")
+        assert long.value.edge == holder.edges()[1]
+        assert long.value.edge != ("base", LONG_CHILD)
+    finally:
+        creator.kill()
+        creator.wait(timeout=30)
+
+
 def _rendezvous_child() -> pathlib.Path:
     """The Rust test helper `tf_tree_rendezvous_child`, which the pytest recipes build.
 

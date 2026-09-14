@@ -6,8 +6,8 @@
 [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
 implementation (#345), as the plan orders. Step 1, the specs, and step 2, the
 attributes on the seven existing classes, step 3, `TimeDomainMismatchError`, and
-step 4, `NonMonotonicStampError`, are in this change; step 2 did not take its
-fallback.
+step 4, `NonMonotonicStampError`, and step 5, `EdgeAlreadyClaimedError`, are in
+this change; step 2 did not take its fallback.
 
 ## Context
 

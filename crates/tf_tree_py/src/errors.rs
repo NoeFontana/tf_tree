@@ -164,6 +164,15 @@ create_exception!(
 );
 create_exception!(
     tf_tree,
+    EdgeAlreadyClaimedError,
+    TfTreeError,
+    "Another publisher holds this edge's claim: one writer per edge.\n\n\
+     Attributes: edge, owner_slot (a participant slot, not a pid; None while \
+     the claim is still being taken). They exist only on instances the library \
+     raises."
+);
+create_exception!(
+    tf_tree,
     ChildProcessDetachedError,
     TfTreeError,
     "This handle was inherited across a fork(); the child has no mapping and \
@@ -202,6 +211,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "NonMonotonicStampError",
         py.get_type::<NonMonotonicStampError>(),
+    )?;
+    m.add(
+        "EdgeAlreadyClaimedError",
+        py.get_type::<EdgeAlreadyClaimedError>(),
     )?;
     Ok(())
 }
@@ -1292,11 +1305,19 @@ pub(crate) fn push_msg(edge: &str, e: PushError) -> String {
 /// `tree.publisher(child, parent)` and nothing else.
 ///
 /// So the arms are re-spelled around those two names rather than around ids.
-/// Everything but `ChildDetached` raises the base `TfTreeError`, which is what
-/// the previous `format!("{e}")` raised for all of them — `docs/API.md` R5
-/// again: the type is the contract, the prose is not. `ChildDetached` goes
-/// through [`detached_err`], and so raises [`ChildProcessDetachedError`].
-pub(crate) fn claim_err(tree: &Tree, parent: &str, child: &str, e: ClaimApiError) -> PyErr {
+/// Two arms raise a class of their own and the rest the base `TfTreeError`,
+/// which is what the previous `format!("{e}")` raised for all of them —
+/// `docs/API.md` R5 again: the type is the contract, the prose is not.
+/// `ChildDetached` goes through [`detached_err`], and so raises
+/// [`ChildProcessDetachedError`]; `AlreadyClaimed` raises
+/// [`EdgeAlreadyClaimedError`] (`docs/decisions/0058` §4).
+pub(crate) fn claim_err(
+    py: Python<'_>,
+    tree: &Tree,
+    parent: &str,
+    child: &str,
+    e: ClaimApiError,
+) -> PyErr {
     let edge = edge_label_of(parent, child);
     match e {
         ClaimApiError::ChildDetached => detached_err(),
@@ -1359,12 +1380,33 @@ pub(crate) fn claim_err(tree: &Tree, parent: &str, child: &str, e: ClaimApiError
                 None => "the root (no parent)".to_owned(),
             }
         )),
-        ClaimApiError::AlreadyClaimed { cause, .. } => TfTreeError::new_err(format!(
-            "{edge}: already claimed by participant slot {}. One writer per \
-             edge (invariant 4): the other publisher must release it, or be \
-             reaped, first",
-            claimed_by(cause)
-        )),
+        // **`.edge` is resolved from the variant's `EdgeId`, `.owner_slot`
+        // from its cause** (`0058` §4). The message keeps the caller's
+        // spelling, as every arm here does. Only `EdgeAlreadyClaimed` carries a
+        // slot; a later `ClaimError` cause falls to the bug-report arm below
+        // rather than inventing one, because `0` is a real slot and `None`
+        // already means `CLAIMING` (see [`claimed_by`]).
+        ClaimApiError::AlreadyClaimed {
+            edge: id,
+            cause: tf_tree::ClaimError::EdgeAlreadyClaimed { owner_slot },
+        } => {
+            let owner_slot = claimed_by(owner_slot);
+            let holder = match owner_slot {
+                Some(slot) => format!("participant slot {slot}"),
+                None => "a claim that is still being taken, which has no slot \
+                         recorded yet"
+                    .to_owned(),
+            };
+            let err = EdgeAlreadyClaimedError::new_err(format!(
+                "{edge}: already claimed by {holder}. One writer per edge \
+                 (invariant 4): the other publisher must release it, or be \
+                 reaped, first"
+            ));
+            with_attrs(py, err, |e| {
+                e.setattr("edge", named_edge_in(&tree.arena_view(), id))?;
+                e.setattr("owner_slot", owner_slot)
+            })
+        }
         ClaimApiError::ReadOnly => TfTreeError::new_err(format!(
             "{edge}: this arena is mapped read-only, so no edge can be claimed \
              for writing. tf_tree.open(...) defaults to mode='ro' (D18); pass \
@@ -1378,20 +1420,23 @@ pub(crate) fn claim_err(tree: &Tree, parent: &str, child: &str, e: ClaimApiError
     }
 }
 
-/// The participant slot holding a claim, for [`claim_err`]'s message.
+/// The participant slot holding a claim, for [`claim_err`]'s message and
+/// `EdgeAlreadyClaimedError.owner_slot`.
 ///
 /// A slot, **not a pid**: amendment A3 made the claim word an indirection into
 /// the participant table, and the number is only useful next to `tf_tree
 /// doctor`, which prints both. Saying "pid" here would send an operator to
 /// `kill` an unrelated process.
 ///
-/// `ClaimError` is `#[non_exhaustive]` and today has one variant; a later one
-/// that carries no slot gets the word rather than a number, because `0` is a
-/// real participant slot and printing it as a stand-in would name an innocent
-/// process.
-fn claimed_by(e: tf_tree::ClaimError) -> String {
-    match e {
-        tf_tree::ClaimError::EdgeAlreadyClaimed { owner_slot } => owner_slot.to_string(),
-        _ => "(unknown)".to_owned(),
-    }
+/// **`None` exactly for `u32::MAX`**, which `tf_tree_core::edge::slot_of`
+/// returns for a claim word in `CLAIMING`: a claim between its
+/// `compare_exchange` and its owner store, or a claimer killed there, and
+/// `Tree::claim` does not retry. A lost `compare_exchange` against `0` cannot
+/// observe a free word, and a packed slot is at most 65 534, so from `claim`
+/// that value means nothing else. The facade refuses the same sentinel as a
+/// number in `ReparentError::LockContended.owner_slot` and
+/// `IpcError::ArenaHeldButUnreachable.first_slot`. **No Python test reaches
+/// this arm**: the window has no §11.3 crash site (`docs/decisions/0058` §4).
+fn claimed_by(owner_slot: u32) -> Option<u32> {
+    (owner_slot != u32::MAX).then_some(owner_slot)
 }

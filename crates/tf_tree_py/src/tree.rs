@@ -479,7 +479,7 @@ impl PyTree {
         let writer = this
             .inner
             .claim_owned(c, p)
-            .map_err(|e| claim_err(&this.inner, parent, child, e))?;
+            .map_err(|e| claim_err(py, &this.inner, parent, child, e))?;
 
         Ok(PyPublisher {
             edge: edge_label_of(parent, child),
@@ -2625,7 +2625,7 @@ pub fn push(
     let publisher = tree
         .inner
         .claim(c, p)
-        .map_err(|e| claim_err(&tree.inner, parent, child, e))?;
+        .map_err(|e| claim_err(py, &tree.inner, parent, child, e))?;
     publisher
         .push(stamp_ns, &iso)
         .map_err(|e| push_err(py, Some(&tree.inner), &edge_label_of(parent, child), e))
