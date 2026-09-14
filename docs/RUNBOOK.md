@@ -643,7 +643,8 @@ child*, above). tf_tree adds no delay to that event, and nothing it lets a
 survivor do shortens it ([`0057`](./decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
 
 **What the window does.** Lookups and existing publishers carry on. Nobody
-inherits, and every fresh join is refused with `ArenaHeldButUnreachable` naming
+inherits, and no fresh join can complete: an `open()` blocks for the window, and
+one whose timeout ends inside it is refused with `ArenaHeldButUnreachable` naming
 the dying owner (`ownership_held: true`) — it is still holding the byte. Edges the
 dying owner had claimed stay refused past the window, until a survivor calls
 `reap_dead`.
