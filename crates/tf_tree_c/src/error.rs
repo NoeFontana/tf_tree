@@ -45,14 +45,14 @@ pub const TFT_ERR_BUFFER_TOO_SMALL: tft_status = -5;
 /// A frame name that this tree never interned.
 ///
 /// From plan compilation it can also mean something else; see
-/// [`tft_plan_create`](crate::tft_plan_create)'s *Errors*.
+/// `tft_plan_create`'s *Errors*.
 pub const TFT_ERR_UNKNOWN_FRAME: tft_status = -10;
 /// Target and source are in different connected components.
 pub const TFT_ERR_DISCONNECTED: tft_status = -11;
 /// The edge has no published samples yet.
 ///
 /// From plan compilation it can also mean something else; see
-/// [`tft_plan_create`](crate::tft_plan_create)'s *Errors*.
+/// `tft_plan_create`'s *Errors*.
 pub const TFT_ERR_NO_DATA: tft_status = -12;
 /// The requested stamp lies outside the edge's retained history.
 pub const TFT_ERR_EXTRAPOLATION: tft_status = -13;
@@ -61,7 +61,7 @@ pub const TFT_ERR_TOPOLOGY_CHANGED: tft_status = -14;
 /// The query's time domain does not match the plan's.
 ///
 /// From plan compilation it can also mean something else; see
-/// [`tft_plan_create`](crate::tft_plan_create)'s *Errors*.
+/// `tft_plan_create`'s *Errors*.
 pub const TFT_ERR_TIME_DOMAIN: tft_status = -15;
 /// The ring lapped the reader mid-read. Retryable.
 pub const TFT_ERR_SLOT_RECYCLED: tft_status = -16;
