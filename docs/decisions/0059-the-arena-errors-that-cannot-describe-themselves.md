@@ -47,13 +47,18 @@ This is that record.
 was squashed onto `35270bd`, and `git diff 35270bd 0761583` has no added or
 removed line that `git diff 3465717 b2fa6c2` (the PR tip against its own base)
 does not have, so #339's own change is what the draft read. The code around it
-did move, by comments only: #338, which the merge sits on and `b2fa6c2` did not,
-changes `SAFETY` comments in `crates/tf_tree_c/src/bridge.rs` and leaves the
-lines cited below (`1045-1049`, `1089`) as they were; and the three commits on
-`main` after it (#340, #341, #342, to `d7868b5`) change comments only in
-`crates/tf_tree/src/tree.rs`, `open.rs` and `crates/tf_tree_c/src/unstable.rs`.
-None touches `error_payloads.rs`, the Python mappers, the CLI, `tf_tree_c`'s
-`error.rs` or the four defining files, so every citation below taken *at
+did move. #338, which the merge sits on and `b2fa6c2` did not, changes `SAFETY`
+comments in `crates/tf_tree_c/src/bridge.rs` and leaves the lines cited below
+(`1045-1049`, `1089`) as they were. The three commits on `main` after it (#340,
+#341, #342, to `d7868b5`) change comments and docstrings in library sources
+(`crates/tf_tree/src/tree.rs` and `open.rs`, seven files of `tf_tree_ipc/src`,
+`tf_tree_py/src/tree.rs`, `tf_tree_c/src/unstable.rs` and its unstable header,
+`python/tf_tree/_core.pyi`), and code only in test, bench and tooling files
+(`crates/tf_tree/tests/rendezvous.rs`, `tf_tree_bench`'s `shm_torture.rs`,
+`scripts/no-network.sh`, and the `justfile`, whose `prlimit` prefix step 1(c)
+cites). What the plan rests on is narrower: none of them touches
+`tests/error_payloads.rs`, `tf_tree_py`'s `errors.rs` or `offline.rs`, the CLI,
+`tf_tree_c`'s `error.rs` or the four defining files, so every citation below taken *at
 `b2fa6c2`* holds at `d7868b5` with one exception: `tft_tree_open_named`'s message is
 `unstable.rs:482` at `d7868b5`, not `:475`. `git grep -n '{0:?}'
 crates/tf_tree/src` names exactly the five attributes this record changes:
@@ -259,8 +264,8 @@ fails to compile there. The impls use no `thiserror` and add no dependency.
   in each binding's own prose. **One remedy is required, not allowed**:
   `FrozenError::LayoutMismatch` names both hashes and states that the file must be
   re-frozen, because `PHASE5.md` §2.4 is NORMATIVE that it does. The same holds
-  for `FrozenError::Arena`, which appends the re-freeze statement after its
-  payload's text. Its one producer is `validate_arena_header` in
+  for `FrozenError::Arena`, which states re-freezing **before** its payload's
+  text, so that 2(g)'s trailing variant name is still the last thing it prints. Its one producer is `validate_arena_header` in
   `FrozenArena::open`, so every value it carries is an arena-header failure
   inside a `.tft` whose container header validated: a damaged or mis-written
   file, a `.tft` is a cache, and
@@ -280,7 +285,10 @@ fails to compile there. The impls use no `thiserror` and add no dependency.
   which is not this record's change (*Consequences*).
 - **(g) The text ends with the innermost variant's name as a search key**, in
   parentheses: `(LayoutMismatch)`, `(BadMagic)`. `FrozenError::Arena` adds none
-  of its own, because its payload's name is the more specific key. This is the
+  of its own, because its payload's name is the more specific key, and it ends
+  with that name too, which is why 2(d) puts its re-freeze statement first. So
+  does `FrozenError::LayoutMismatch`, whose required remedy comes before
+  `(LayoutMismatch)`. This is the
   choice `push_msg` already made for `NonMonotonicStamp` in the Python binding
   (*"the variant name is back, and it is a search key rather than a dump"*), for
   the same reason: `docs/RUNBOOK.md` heads its entries with the name, and a C
@@ -556,9 +564,11 @@ holds one of those arms, among them.
      - it contains no `{` or `}`;
      - it `is_ascii()`;
      - it is at most 120 bytes;
-     - it contains the innermost variant's name (the identifier before the first
-       `(` or ` {` of `format!("{e:?}")`, computed rather than hard-coded, and
-       taken from the inner value for `FrozenError::Arena`);
+     - it **ends with** the innermost variant's name in parentheses, `(Name)`
+       (the identifier before the first `(` or ` {` of `format!("{e:?}")`,
+       computed rather than hard-coded, and taken from the inner value for
+       `FrozenError::Arena`), which is decision 2(g)'s position and not only
+       containment;
      - it contains every carried integer in decision 2(a)'s spelling, an `Errno`
        as `errno {raw_os_error()}`.
    - For `FrozenError`, **also wrap every value from `ShmError`'s list in
@@ -584,6 +594,8 @@ holds one of those arms, among them.
    - (M5) `FrozenError::Arena`'s arm → `write!(f, "arena header did not
      validate: {inner:?}")`, which the unit-variant payloads must catch.
    - (M6) drop the re-freeze clause from `FrozenError::LayoutMismatch`'s arm.
+   - (M9) move `FrozenError::Arena`'s re-freeze statement after its payload's
+     text, which the ends-with assertion must catch.
 
    Verified by `cargo nextest run -p tf_tree_arena --features shm` (a line of
    `just shm-check`) and by `just test` for `ParticipantError` and

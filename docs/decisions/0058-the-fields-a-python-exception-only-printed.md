@@ -277,7 +277,8 @@ for the handlers real programs write, no promise the plan cannot test, and the
 smallest surface that does both. *Open questions* below gives each answer and
 its reason. Against the draft, `ArenaHeldButUnreachableError.first_pid` is
 dropped, `ClaimRevokedError` is deferred, `NonMonotonicStampError` is added,
-`EdgeAlreadyClaimedError.owner_slot` is a plain `int`, and the stub stays
+`EdgeAlreadyClaimedError.owner_slot` is a plain `int` (with a constraint
+found after the move, recorded in §4), and the stub stays
 precise with no class-level defaults.
 
 ### 1. Attributes on the classes that exist
@@ -318,10 +319,17 @@ not added (question 1).
 
 `FrameNotDeclaredError.name` is not in §4.4's list. It is included because it
 is the one fact the class exists to report, and `resolve_frame` already holds it
-as a `&str`. **Omitted by the same rule:** `DerivativesUnavailableError.interp`,
-whose Rust field is a stored discriminant that `stored_interp` may not be able to
-name, and `push_many`'s sample index, which `push_many`'s raises would carry and
-`Publisher.push`'s raises of the same class would not.
+as a `&str`. **Omitted by the same rule:** `push_many`'s sample index, which `push_many`'s
+raises would carry and `Publisher.push`'s raises of the same class would not.
+**Omitted for a different reason:** `DerivativesUnavailableError.interp`. That
+class has one raise site (`lookup_err`'s `DerivativesUnavailable { edge, interp }`
+arm), so an `interp` would be on every instance and the rule does not exclude it.
+It is left out because no handler branches on it: the remedy (a policy with an
+exact derivative, or a layout that needs none) is the same for every policy the
+refusal can name. Its value is also a raw `u8` discriminant, which is id-shaped
+(§2 hands Python no integer id) and which `stored_interp` cannot always name, so
+it would need a `str | None` arm to serve a branch no handler takes. That is the
+minimal-surface cut.
 
 ### 2. An id reaches Python as the arena's names, or as `None`
 
@@ -389,6 +397,27 @@ it does not name, is added (question 4). `first_slot` is not carried, because it
 is `holder_slots[0]` when the tuple is non-empty and a second copy of the same
 fact otherwise.
 
+**`owner_slot` is not always a slot. Review found this after the move to
+`ready`, and it is not settled here.** `claim()` builds
+`EdgeAlreadyClaimed { owner_slot: slot_of(held) }`
+(`crates/tf_tree_core/src/edge.rs`), and `slot_of` returns `u32::MAX` when the
+word the `compare_exchange` lost to is `CLAIMING`. That is a claim between its
+`compare_exchange` and its owner store, or a claimer killed in that window,
+whose word stays `CLAIMING` until a reaper clears it. `Tree::claim` maps the
+error with no retry. So, as decided above, `EdgeAlreadyClaimedError.owner_slot`
+is `4294967295` in that state, and a handler would pass that number to
+`tf_tree participants` or `tf_tree doctor` as a slot. The facade has already
+refused this sentinel twice: `ReparentError::LockContended.owner_slot` is an
+`Option<u32>` because *"held by live participant slot 4294967295"* is what the
+sentinel printed, and `IpcError::ArenaHeldButUnreachable.first_slot` is an
+`Option` so that no consumer logs a slot that does not exist. The plain `int`
+rested on the reading that only a later `ClaimError` variant could lack a slot,
+and that reading missed this state. The two candidate answers are
+`owner_slot: int | None`, with `None` for `u32::MAX` (no Python test can reach
+that arm, so it would join the gap stated above the plan's steps), or routing
+the `CLAIMING` state to another class or arm, with the reason for doing so.
+**Step 5 does not start until the owner settles it.**
+
 **`first_pid` is dropped.** The Rust field's doc calls it advisory (*"the lock
 is the liveness, this is the name"*), and `identity.rs` records that a pid
 written inside a container or `unshare --fork --pid` names a *different* process
@@ -397,11 +426,23 @@ when resolved against an observer's `/proc`
 carries no namespace inode that would let a caller tell. That is the hazard that
 strikes `.owner_pid`, and it is sharper here, because `os.kill(e.first_pid, ..)`
 is the natural use a Python supervisor would make of it, and it can signal an
-unrelated process. `holder_slots` and `ownership_held` are what separate the
-remedies (the Rust `Display` spends `ownership_held` to choose between its two),
-and turning a slot into a process is the job of `tf_tree participants`, which
-`docs/RUNBOOK.md` uses for it, and of `tf_tree doctor`, which since `0033` reads
-the namespace a recorded pid was drawn from. The class docstring points at both.
+unrelated process. There is a sharper case: `first_pid` is `0` when the identity
+record was never written, and `os.kill(0, sig)` signals the caller's own process
+group. `holder_slots` and `ownership_held` are what separate the remedies (the
+Rust `Display` spends `ownership_held` to choose between its two). Turning a slot
+into a process safely is `tf_tree doctor`'s job, because since `0033` it reads the
+namespace a recorded pid was drawn from. `tf_tree participants`, which
+`docs/RUNBOOK.md` reaches for first, prints the recorded pid raw with no namespace
+check (`cmd_participants` in `crates/tf_tree_cli/src/lib.rs`), so its pid column
+carries the same hazard. The class docstring points at `participants` for the list
+of held slots and at `doctor` for the process behind one.
+
+**The message still prints the pid.** `open_err` forwards `IpcError`'s `Display`,
+which reads `(slot {slot}, pid {first_pid})` and *"Stop the process holding slot
+0"*. So `str(e)` still hands a Python supervisor the number this record declines
+to give it as an attribute, and R5 already forbids parsing it out. That text
+belongs to `IpcError`, a sibling of `0033`'s scope, and this record does not
+change it.
 
 **`ClaimRevokedError` is deferred, not built.** No Python caller is known to be
 able to make `PushError::ClaimRevoked` raise. Its two known producers are a
@@ -438,8 +479,9 @@ question 4's criterion.
   arm, and the three that produce every named `FrameNotDeclaredError`
   (`resolve_frame`, `frame_not_declared` and `unresolvable_name`). So does
   `push_many`'s inline `push_class(e)(format!(..))` arm, which has to set
-  `NonMonotonicStampError`'s attributes too. That is 14 `lookup_err` call sites (`tree.rs`
-  ×12, `offline.rs` ×2), 8 `resolve_frame` call sites (`tree.rs` ×6,
+  `NonMonotonicStampError`'s attributes too. That is 15 `lookup_err` call sites (`tree.rs`
+  ×12, `offline.rs` ×2, and `errors.rs` ×1 in `unknown_frame_err`), 8
+  `resolve_frame` call sites (`tree.rs` ×6,
   `offline.rs` ×2), plus the rest. **The token is what keeps attribute
   construction off a detached thread, and the compiler enforces it.**
   `Python<'py>` holds `PhantomData<NotSend>` (pyo3 0.29.0 `marker.rs:357-361`)
@@ -477,9 +519,10 @@ Under the `0.0.x` line, *every release may break every other*, and that does not
 change.
 
 The `None` arms are part of the type (`str | None`). **For resolved ids, no
-Python trigger for `None` is known** (measurement 6): the arm is typed so that a
-caller's code is correct on the day one exists, not because a caller meets it
-today. Question 5 keeps the arm, and the plan records where no test reaches it.
+Python trigger for `None` is known** (measurement 6), and
+`FrameNotDeclaredError.name`'s `None` is reached only through an intern race
+that no test can make happen on demand. The arms are typed so that a caller's
+code is correct whenever one is met, not because a caller meets it today. Question 5 keeps the arm, and the plan records where no test reaches it.
 
 **The promise is about raised instances, and a type checker cannot see that
 line.** `_core.pyi` will annotate `requested: int` in the class body, which
@@ -544,10 +587,13 @@ as the `PHASE5.md` status text that names it. So R5's argument by itself would
 admit every row of the Context table that has a distinct remedy, and a spec
 having named a class is no criterion either: §4.4 named `ClaimRevokedError`,
 which no Python test can make raise. **The criterion is two conditions, both
-necessary** (question 4): a Python handler needs to branch on the failure, and a
-Python test can make it raise. The first is what earns a class its surface; the
-second is what lets a test hold its mapper arm. The four classes here meet both,
-and question 4 lists each deferred candidate with what holds it back.
+necessary and together not sufficient** (question 4): a Python handler needs to
+branch on the failure, and a Python test can make it raise. The first is what
+earns a class its surface; the second is what lets a test hold its mapper arm.
+The four classes here meet both. Question 4 lists each deferred candidate with
+what holds it back, and for `ArenaAbsent`, which meets both, that is a third
+thing: its shape (a leaf, or a parent above `ArenaHeldButUnreachableError`) is
+not settled.
 
 **Why not leave §4.4 as amended and build nothing.** Because the gap the
 amendment records is the one R5 says a caller must not bridge by parsing text.
@@ -575,9 +621,11 @@ reaches its parent intact (#335), and still cannot say which stamp it was about.
   pickling test is built from `vars(tf_tree)`, so it covers the new classes
   without a new row.
 - §4.4, §11.1 (*"every error type raised at least once with its attributes
-  asserted"*) and Appendix B stop being prose about something absent, with two
-  gaps recorded rather than closed: the `None` arm of every resolved id, and the
-  deferred `ClaimRevokedError` (question 5).
+  asserted"*) and Appendix B stop being prose about something absent, with four
+  gaps recorded rather than closed: the `None` arm of every resolved id,
+  `FrameNotDeclaredError.name`'s `None` arm, `TopologyChangedError`'s two
+  attributes, and the deferred `ClaimRevokedError` (the gap stated above the
+  plan's steps, and question 5).
 - **`0059`'s implementation lands first.** Both records edit
   `crates/tf_tree_py/src/errors.rs`, and `0059` step 1(d) rewrites `open_err`'s
   `OpenError::Map` arm and its doc comment, in the function step 6 here gives a
@@ -622,12 +670,28 @@ and its PR quotes the failure it produced**; none is recorded on a predicted
 failure.
 
 **The gap §11.1 is left with, stated once for every step's tests.** §11.1 asks
-for *"every error type raised at least once with its attributes asserted"*. Two
-things this plan ships cannot meet it: the `None` arm of every resolved-id
-attribute, which has no known Python trigger (measurement 6), and
-`ClaimRevokedError`, which is not built (question 5). No test below claims to
-reach either, no mutant is listed against either, and step 7 writes both into
-§11.1.
+for *"every error type raised at least once with its attributes asserted"*. Four
+things this plan ships cannot meet it:
+
+- the `None` arm of every resolved-id attribute, which has no known Python
+  trigger (measurement 6);
+- `FrameNotDeclaredError.name`'s `None` arm. It comes from `lookup_err`'s
+  `UnknownFrame { hash }` fallback, which is not a resolved id: `Tree.plan` and
+  `span_impl` resolve both names first, and `Tree.lookup` reaches the fallback
+  only through `unknown_frame_err` when both names resolve on its second probe,
+  which is a peer's intern landing between two reads;
+- `TopologyChangedError.plan_generation` and `.current_generation`. The class
+  ships, but no Python test can make it raise. The generation moves only on a
+  topology publication, which is a reparent, and neither the binding
+  (`offline.rs`: *"the binding exposes no `reparent`"*), the CLI nor the C header
+  has one. `test_errors.py`'s class-pickling test says no row of `CASES` raises
+  it. The nearest candidate trigger is `tf_tree`'s `tf_tree_rendezvous_child`
+  binary, whose `join-reparent` mode reparents a shared arena from another
+  process, but no Python test drives it and `just py-test` does not build it;
+- `ClaimRevokedError`, which is not built (question 5).
+
+No test below claims to reach any of them, no mutant is listed against any of
+them, and step 7 writes all four into §11.1.
 
 1. **The specs say what is decided** (docs only; one PR).
    - `PHASE3.md` §4.4's block is replaced by the hierarchy *Decision* §1 and §4
@@ -655,8 +719,11 @@ reach either, no mutant is listed against either, and step 7 writes both into
    carries an attribute"* bullet is corrected. Verified by:
    - a `test_errors.py` table asserting each attribute's **value** on a raised
      instance. The fixture values are pairwise distinct (`requested=99`,
-     `oldest=1000`, `newest=2000`, generations that differ, a `target` that is
-     not the `source`), so a swapped pair cannot pass;
+     `oldest=1000`, `newest=2000`, a `target` that is not the `source`), so a
+     swapped pair cannot pass. `TopologyChangedError` has no row, because
+     nothing a Python test can do raises it (the gap above);
+   - for every raised instance in `CASES`, `len(e.args) == 1` and
+     `str(e) == e.args[0]`, which is what the `args` mutant below has to fail;
    - a `SIM_DOMAIN` row for `ExtrapolationError.domain`, so a tag hardcoded to
      `0` cannot pass;
    - `test_a_raised_exception_survives_a_pickle_round_trip` extended to
@@ -666,7 +733,10 @@ reach either, no mutant is listed against either, and step 7 writes both into
      "sensor_c")`-shaped and a member of `t.edges()`. That test's tree resolves
      every id, and asserting that no fallback happens is what it is for;
    - a stub test asserting that each class body's annotated names equal
-     `set(vars(raised))`, with `_stub_members` widened to see annotations;
+     `set(vars(raised))` for every class a row of `CASES` raises, with
+     `_stub_members` widened to see annotations. `TopologyChangedError`'s
+     annotations are compared against *Decision* §1's table instead, which checks
+     the stub and not the mapper;
    - question 6's pin: a caller-constructed `tf_tree.ExtrapolationError("m")`
      has no `requested` attribute, and the stub annotates `requested: int`
      without `None`.
@@ -676,8 +746,8 @@ reach either, no mutant is listed against either, and step 7 writes both into
    - hardcode `domain` to `0`;
    - resolve `NoDataError.edge` as `(child, parent)`;
    - swap `DisconnectedError.target` and `.source`;
-   - pass `requested` in `args`, which should fail both the `args` assertion and
-     `str(e)`;
+   - pass `requested` in `args` while still setting the attribute, which the
+     `len(e.args) == 1` / `str(e) == e.args[0]` assertion above must fail;
    - drop `oldest: int` from `_core.pyi`;
    - set a class-level `requested = None` on `ExtrapolationError` in
      `register()`, which question 6's pin must catch.
@@ -706,12 +776,19 @@ reach either, no mutant is listed against either, and step 7 writes both into
    in `push_err` only, which should fail the `push_many` row while the scalar
    rows pass, because `push_many` builds its exception through `push_class`
    inline; swap `last` and `got`; and set `edge` from the caller's typed pair
-   instead of the resolved `EdgeId`, which only a stored-truncated name tells
-   apart. **That last mutant depends on
-   [`0027`](./0027-the-48-byte-frame-name-store.md)**: if `intern` refuses names
-   over 48 bytes, the two spellings never differ, the mutant is equivalent, and
-   the step says so.
-5. **`EdgeAlreadyClaimedError`.** Verified by a test in which a subprocess
+   instead of the resolved `EdgeId`. The three rows use `_chain()`'s short
+   names, where the typed and stored pairs are equal, so none of them can kill
+   that last mutant. **A fourth row does**: a backwards push on an edge whose
+   child name is longer than 48 bytes (measurement 5's `"sensor_" + "x" * 60`),
+   asserting `e.edge == t.edges()[i]`, the truncated stored pair, and
+   `e.edge != (typed_parent, typed_child)`. **That row depends on
+   [`0027`](./0027-the-48-byte-frame-name-store.md)**: if `intern` comes to refuse
+   names over 48 bytes, the two spellings never differ, the row cannot be built
+   and the mutant is equivalent, and the change that lands `0027` deletes the row
+   and says so.
+5. **`EdgeAlreadyClaimedError`.** Does not start until *Decision* §4's
+   `owner_slot` constraint is settled; if the answer is `int | None`, the `None`
+   arm joins the gap above and gets no mutant. Verified by a test in which a subprocess
    creates the arena and claims nothing (slot 0, `CREATOR_SLOT` in
    `tf_tree_ipc/src/open.rs`), the test process joins read-write (slot 1: the
    first joiner of a fresh arena, which `rendezvous.rs` already relies on) and
@@ -720,15 +797,25 @@ reach either, no mutant is listed against either, and step 7 writes both into
    pair. Mutants: hardcode `owner_slot` to `0`, which a claim held by the creator
    could not tell apart and this one can; route the `EdgeAlreadyClaimed` cause to
    the bug-report arm, so the class is the base `TfTreeError` again; and set
-   `edge` from the caller's typed pair, with step 4's `0027` caveat.
+   `edge` from the caller's typed pair. That last mutant is killed only by a
+   second refused claim on an edge whose child name is longer than 48 bytes,
+   asserting the truncated stored pair as step 4's fourth row does, and that row
+   is deleted under the same `0027` condition.
 6. **`ArenaHeldButUnreachableError`.** Verified inside
    `test_a_python_consumer_recovers_an_arena_whose_owner_died`. Between the
    owner's reap and `inherit_ownership`, the survivor holds its byte and nothing
    serves, so a fresh `tf_tree.open(mode="rw")` there is the trigger. Python's
    `open` takes no `timeout=`, so the row costs `DEFAULT_OPEN_TIMEOUT` (5 s,
-   `tf_tree_ipc/src/open.rs`). The test asserts the exact class,
-   `ownership_held is False`, `holder_slots` non-empty and ascending, and that
-   the instance has no `first_pid`. Mutants: `ownership_held` hardcoded `True`;
+   `tf_tree_ipc/src/open.rs`). Before the owner is killed, the test
+   attaches a second participant from its own process
+   (`tf_tree.open(mode="ro")`, which takes a lock-file byte, or a second
+   `mode="rw"` handle if the implementing PR finds a read-only byte outside
+   `held_participants`' mask), so at least two slots are held when the trigger
+   fires, and releases it before the test's own `inherit_ownership` assertion.
+   With one survivor `holder_slots` has one element, which is ascending and
+   descending at once. The test asserts the exact class, `ownership_held is
+   False`, `len(holder_slots) >= 2` and `holder_slots ==
+   tuple(sorted(holder_slots))`, and that the instance has no `first_pid`. Mutants: `ownership_held` hardcoded `True`;
    `holder_slots` decoded descending; drop the `open_err` arm, so the error is
    the base `TfTreeError` again.
 7. **The specs close, and status to `implemented`** (docs only; one PR; after
@@ -753,6 +840,11 @@ recorded once, here and in *Decision*, for all six. The reasons were weighed in
 the order *Decision* gives: typed correctness for real handlers, no untested
 promise, minimal surface. Each question keeps the draft's text, struck through,
 above its answer, because the reasoning is what the answer rests on.
+
+One constraint was found in review after the move to `ready`, and none of the six
+answers covers it: `EdgeAlreadyClaimedError.owner_slot` is `u32::MAX` when the
+claim word is `CLAIMING`. It is recorded where it applies, in *Decision* §4, and
+it holds step 5 only.
 
 ### 1. ~~Is the attribute set right, and is `.edge` the arena's pair?~~ — Decision §1's set, less `first_pid`; the stored pair, as a plain tuple
 
@@ -784,14 +876,18 @@ above its answer, because the reasoning is what the answer rests on.
 
 - **The set is *Decision* §1's**, `FrameNotDeclaredError.name` included: it is
   the one fact that class exists to report.
-- **Omitted:** `DerivativesUnavailableError.interp`, `push_many`'s sample index,
-  and a `BufferError` shape. None of the three is present on every instance of
-  its class, which is §1's own rule for what an attribute of a class is.
+- **Omitted:** `push_many`'s sample index and a `BufferError` shape. Neither is
+  present on every instance of its class, which is §1's own rule for what an
+  attribute of a class is. `DerivativesUnavailableError.interp` is on every
+  instance of its class and is omitted for another reason: no handler branches
+  on it, and its raw discriminant cannot always be named (*Decision* §1).
 - **Dropped:** `ArenaHeldButUnreachableError.first_pid`. It is advisory and
-  pid-namespace-local (`0033`), and its natural use, `os.kill`, can signal an
-  unrelated process. `holder_slots` and `ownership_held`, with `tf_tree
-  participants` and `tf_tree doctor` to turn a slot into a process, are the safe
-  path (*Decision* §4).
+  pid-namespace-local (`0033`), its natural use, `os.kill`, can signal an
+  unrelated process, and at `0` (no identity record) it signals the caller's own
+  process group. `holder_slots` and `ownership_held` separate the remedies, and
+  `tf_tree doctor` is the namespace-aware way to turn a slot into a process;
+  `tf_tree participants` prints the raw pid. The message still prints the pid,
+  which is `IpcError`'s text and not this record's (*Decision* §4).
 - **`.edge` is the arena's stored `(parent, child)` pair, as a plain tuple.** It
   is the one spelling `Tree.edges()` already returns, and a named tuple would add
   a public type for it. The typed pair's advantages, that a caller can grep for
@@ -868,8 +964,10 @@ is cold (*Decision* §5).
 ~~- **`FrameOutOfRange` and `MissingEdge`**, which `errors.rs` calls *"arguably
   `FrameNotDeclaredError`"*.~~
 
-**The criterion: a class is added when a Python handler needs to branch on the
-failure *and* a Python test can make it raise.** Both conditions are necessary.
+**The criterion: a class is added only when a Python handler needs to branch on
+the failure *and* a Python test can make it raise.** Both conditions are
+necessary. They are not sufficient, and `ArenaAbsent` below is the one candidate
+for which that matters.
 
 **`NonMonotonicStampError(TfTreeError)` meets both and is added**, with `.edge`
 (resolved from the `EdgeId` #339 added), `.last` and `.got`. It is the commonest
@@ -880,7 +978,8 @@ mutex, and, from the module-level `push`, every `claim_err` arm and
 `unresolvable_name`'s two arms. A backwards push triggers it, and
 `test_errors.py`'s three `_non_monotonic_*` rows already do.
 
-**Deferred**, each with what holds it back; the criterion is what reopens each:
+**Deferred**, each with what holds it back. The criterion reopens the first
+three; `ArenaAbsent`, which already meets it, reopens on a choice of shape:
 
 - **The retryable family** (`SlotRecycled`, `SlotContended`, `InternContended`,
   `LeaseContended`, `ReapedDuringClaim`). No Python test makes any of them raise
@@ -903,8 +1002,9 @@ mutex, and, from the module-level `push`, every `claim_err` arm and
   whose natural name sits close to C's `TFT_ERR_ARENA_UNAVAILABLE`, which covers
   every open failure rather than the retryable two. Either is additive later:
   inserting a parent between `ArenaHeldButUnreachableError` and `TfTreeError`
-  keeps every existing `except` clause matching. It reopens on a record that
-  chooses the shape, not on the criterion.
+  keeps every existing `except` clause matching. The shape is the third condition, and
+  the only one holding it back: it reopens on a record that chooses the shape,
+  not on the criterion.
 
 ### 5. ~~Does a class ship when no Python caller can make it raise?~~ — no; an attribute's `None` arm does
 
@@ -934,8 +1034,13 @@ attributes asserted"*. Three answers, each with its cost:~~
 `TfTreeError`. **The resolved-id attributes keep their `| None` arm**: an arena
 record the binding cannot resolve is a real state even with no known Python
 trigger, and typing it away would make the stub wrong on the day one appears.
-The gap §11.1 is left with is recorded once, above the plan's steps, and step 7
-writes it into §11.1. The test-only trigger is not built, because it is new
+`FrameNotDeclaredError.name`'s `None` arm, which only an intern race reaches,
+is kept on the same reasoning. So are `TopologyChangedError`'s two attributes,
+although no Python test can make that class raise: the class already ships, a
+correct program attached to a shared arena meets it whenever a peer reparents
+(`lookup_err`'s comment on `TopologyChanged`), and C's `tft_error` already
+carries both generations. The gap §11.1 is left with is recorded once, above the
+plan's steps, and step 7 writes it into §11.1. The test-only trigger is not built, because it is new
 surface in a wheel to test a state the wheel cannot otherwise reach.
 
 ### 6. ~~What does a caller-constructed instance carry?~~ — nothing: the stub stays precise
