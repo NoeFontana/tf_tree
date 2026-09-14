@@ -1,9 +1,23 @@
 //! The exception hierarchy (`docs/PHASE3.md` §4.4).
 //!
-//! Rust's errors are `Copy` and carry structured fields; Python's carry
-//! messages. The gap matters: a user who has to parse a string to find out
-//! *which edge* extrapolated cannot program against it, so the fields are
-//! attached to the exception rather than only formatted into it.
+//! Rust's errors are `Copy` and carry structured fields; **Python's carry a
+//! message and a class, and nothing else.** No exception here has an attribute:
+//! every mapper below builds its exception from a formatted string, and has
+//! since this module's first commit. This paragraph said the opposite — "the
+//! fields are attached to the exception rather than only formatted into it" —
+//! for as long as the module existed, and `PHASE3.md` §4.4's dated amendment is
+//! the account of what ships instead. The gap it described is real: a caller
+//! who has to parse a string to find out *which edge* extrapolated cannot
+//! program against it. Closing it means choosing how an id-shaped attribute
+//! reaches a language that is never handed an id (next section), and that is
+//! a decision record, not an edit here.
+//!
+//! **What a caller can program against today is the class.** That is why
+//! [`ChildProcessDetachedError`] exists (`PHASE3.md` §8.1, NORMATIVE) and why
+//! every class is declared under the module path `tf_tree`: the macro's first
+//! argument becomes `__module__`, and `_core` — what it said until 2026-09-14 —
+//! is not importable, so no exception could be pickled back out of a
+//! `multiprocessing` worker as itself.
 //!
 //! # This module is `docs/API.md` R5's "separate layer", and it has to earn it
 //!
@@ -49,60 +63,67 @@ use crate::offline::{named_edge_in, named_frame_in};
 use crate::tree::interp_name;
 
 create_exception!(
-    _core,
+    tf_tree,
     TfTreeError,
     PyException,
     "Base of every tf_tree error."
 );
 create_exception!(
-    _core,
+    tf_tree,
     ExtrapolationError,
     TfTreeError,
     "The requested stamp lies outside an edge's retained history."
 );
 create_exception!(
-    _core,
+    tf_tree,
     DisconnectedError,
     TfTreeError,
     "No path joins the two frames."
 );
 create_exception!(
-    _core,
+    tf_tree,
     NoDataError,
     TfTreeError,
     "An edge on the path has no samples yet."
 );
 create_exception!(
-    _core,
+    tf_tree,
     TopologyChangedError,
     TfTreeError,
     "The tree was re-parented after this plan was compiled; re-plan."
 );
 create_exception!(
-    _core,
+    tf_tree,
     FrameNotDeclaredError,
     TfTreeError,
     "No such frame in this arena."
 );
 create_exception!(
-    _core,
+    tf_tree,
     BufferError,
     TfTreeError,
     "An output buffer was the wrong shape, dtype, or size."
 );
 create_exception!(
-    _core,
+    tf_tree,
     DerivativesUnavailableError,
     TfTreeError,
     "This edge's interpolator has no exact derivative; layout='quat_twist' \
      cannot be served over it."
 );
 create_exception!(
-    _core,
+    tf_tree,
     NoSegmentError,
     TfTreeError,
     "A pose exists at this stamp but there is no segment to differentiate; \
      layout='quat_twist' needs two samples spanning a non-zero interval."
+);
+create_exception!(
+    tf_tree,
+    ChildProcessDetachedError,
+    TfTreeError,
+    "This handle was inherited across a fork(); the child has no mapping and \
+     the handle cannot be repaired. Open a new tree in the child."
 );
 
 /// Add every exception type to the module.
@@ -126,6 +147,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<DerivativesUnavailableError>(),
     )?;
     m.add("NoSegmentError", py.get_type::<NoSegmentError>())?;
+    m.add(
+        "ChildProcessDetachedError",
+        py.get_type::<ChildProcessDetachedError>(),
+    )?;
     Ok(())
 }
 
@@ -580,20 +605,6 @@ fn nameless(tree: &Tree) -> &'static str {
 // The errors themselves
 // ---------------------------------------------------------------------------
 
-/// The error every entry point raises on a tree inherited across a `fork()`.
-///
-/// # Why a message rather than a class of its own
-///
-/// `TfTreeError` is the base, and this is deliberately not a new leaf: a
-/// detached tree is not a condition a program branches on — it is not
-/// retryable, not repairable, and the only response is to open a new tree in the
-/// child. `docs/PHASE3.md` §4.4's hierarchy exists so a caller can *program*
-/// against a distinction (which edge extrapolated, which frame is missing), and
-/// there is nothing to program against here.
-///
-/// The message says what to do because the caller almost never typed `fork` —
-/// `multiprocessing` did, and its default start method on Linux is what put
-/// them here.
 /// A failed `inherit_ownership`, as prose plus what it did *not* cost.
 ///
 /// **The reassurance is the point, not padding.** Every error path inside
@@ -613,8 +624,29 @@ pub(crate) fn inherit_err(e: &tf_tree::OpenError) -> PyErr {
     ))
 }
 
+/// The error every entry point raises on a tree inherited across a `fork()`.
+///
+/// # A class of its own, because `docs/PHASE3.md` §8.1 is NORMATIVE
+///
+/// **This used to raise the base `TfTreeError`, on an argument that does not
+/// survive its own best case.** Commit 4c040a3 reasoned that a detached tree is
+/// "not a condition a program branches on" — not retryable, not repairable — so
+/// a leaf class would have nothing to program against. The program that has to
+/// branch on it is the *retry loop*: `SlotContended`, `InternContended` and
+/// `LeaseContended` all reach Python as `TfTreeError` saying "retry", and a loop
+/// catching `TfTreeError` to retry them cannot stop on a handle that will never
+/// work again except by matching this sentence, which `docs/API.md` R5 says is
+/// not a promise. §8.1 names the class; the judgement was never recorded as a
+/// decision, so it could not override that.
+///
+/// It subclasses `TfTreeError`, so every existing `except TfTreeError` still
+/// catches it.
+///
+/// The message says what to do because the caller almost never typed `fork` —
+/// `multiprocessing` did, and on 3.13 and earlier its default start method on
+/// Linux is what put them here.
 pub(crate) fn detached_err() -> PyErr {
-    TfTreeError::new_err(DETACHED)
+    ChildProcessDetachedError::new_err(DETACHED)
 }
 
 /// [`detached_err`]'s sentence, so [`push_msg`] can embed it rather than
@@ -624,7 +656,12 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
      (tf_tree.open(...)), or use multiprocessing's 'spawn' or 'forkserver' \
      start method";
 
-/// Map a `LookupError` to its Python exception, keeping the structured detail.
+/// Map a `LookupError` to its Python exception: a class and a sentence.
+///
+/// The structured detail the Rust error carries is formatted into the sentence
+/// and not attached — this line used to say "keeping the structured detail",
+/// which was the module doc's false claim again (`docs/PHASE3.md` §4.4's
+/// 2026-09-14 amendment).
 ///
 /// `TopologyChanged` is the one a *correct* program routinely hits — a peer
 /// re-parented the tree — so its message says what to do rather than only what
@@ -966,12 +1003,27 @@ fn stored_interp(interp: u8) -> String {
 /// arena would be a slower way to reach a worse answer — the caller's own
 /// spelling is what they will search their source for.
 ///
-/// Every arm raises the base `TfTreeError` — which is what the `format!
-/// ("{e:?}")` this replaces raised — so the message is split out as
-/// [`push_msg`] for `push_many`, which prefixes the sample index and must not
-/// re-word the rest.
+/// Every arm but one raises the base `TfTreeError` — which is what the
+/// `format! ("{e:?}")` this replaces raised. The one is `ChildDetached`, which
+/// raises [`ChildProcessDetachedError`] exactly as [`detached_err`] does: a
+/// forked child's first call on an inherited `Publisher` is `push`, and §8.1
+/// does not have a per-method exception. The class and the sentence are
+/// therefore chosen apart — [`push_class`] and [`push_msg`] — because
+/// `push_many` prefixes the sample index to the sentence and must not re-word
+/// it, and must not re-*type* it either.
 pub(crate) fn push_err(edge: &str, e: PushError) -> PyErr {
-    TfTreeError::new_err(push_msg(edge, e))
+    push_class(e)(push_msg(edge, e))
+}
+
+/// The exception class for a failed push, apart from its sentence.
+///
+/// A constructor rather than a `PyErr`, so `push_many` can hand it a message
+/// with the sample index already in front.
+pub(crate) fn push_class(e: PushError) -> fn(String) -> PyErr {
+    match e {
+        PushError::ChildDetached => ChildProcessDetachedError::new_err,
+        _ => TfTreeError::new_err,
+    }
 }
 
 /// [`push_err`]'s sentence.
@@ -1034,9 +1086,10 @@ pub(crate) fn push_msg(edge: &str, e: PushError) -> String {
 /// `tree.publisher(child, parent)` and nothing else.
 ///
 /// So the arms are re-spelled around those two names rather than around ids.
-/// Everything raises the base `TfTreeError`, which is what the previous
-/// `format!("{e}")` raised for all of them — `docs/API.md` R5 again: the type
-/// is the contract, the prose is not.
+/// Everything but `ChildDetached` raises the base `TfTreeError`, which is what
+/// the previous `format!("{e}")` raised for all of them — `docs/API.md` R5
+/// again: the type is the contract, the prose is not. `ChildDetached` goes
+/// through [`detached_err`], and so raises [`ChildProcessDetachedError`].
 pub(crate) fn claim_err(tree: &Tree, parent: &str, child: &str, e: ClaimApiError) -> PyErr {
     let edge = edge_label_of(parent, child);
     match e {

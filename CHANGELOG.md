@@ -41,6 +41,69 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — the Python binding's contract, where `PHASE3.md` §3 and §8.1 are NORMATIVE and the code was not
+
+- **Every tf_tree exception pickles, and reaches a `multiprocessing` parent as
+  itself.** All nine classes were declared with `create_exception!(_core, ...)`,
+  which makes `_core` their `__module__`, and there is no importable module of
+  that name: `pickle.dumps` raised `PicklingError` for every one, a
+  `multiprocessing.Pool` worker's `FrameNotDeclaredError` reached the parent as
+  `MaybeEncodingError`, and `ProcessPoolExecutor` handed back a bare
+  `PicklingError`, so `except tf_tree.FrameNotDeclaredError` never matched in
+  the parent. They are declared under `tf_tree` now, which is where `Tree`,
+  `Plan` and `Publisher` already said they lived. **Visible change:** a
+  traceback prints `tf_tree.ExtrapolationError`, not `_core.ExtrapolationError`.
+  The class objects are unchanged, and `tf_tree._core.X is tf_tree.X` still
+  holds.
+- **A `float` stamp meets §3's `TypeError` on every entry point.**
+  `Tree.lookup`, `Publisher.push`, the module-level `tf_tree.push` and both
+  stamps of `Plan.adaptive` took a bare integer, so a float was refused by
+  PyO3's conversion (`'float' object cannot be interpreted as an integer`)
+  without the 238 ns measurement §3 requires; they now go through the same
+  refusal as `Plan.at`. The accepted types are unchanged (`int`, `np.int64`),
+  and so is `Publisher.push`'s `METH_FASTCALL`. `PHASE3.md` §14's box for this
+  was ticked throughout, and §3 gains an amendment saying so — and that the
+  ULP is still stated at a fixed 2026 epoch, not at the caller's magnitude.
+- **`Plan.at_into` on the default `mat4` layout accepts an `np.int64` scalar
+  and refuses a `float` with the measurement**, as `at` and `at_into(...,
+  layout=...)` already did. It refused the first and reported the second as
+  `tf_tree.BufferError`, and its own doc comment recorded that as "outstanding,
+  not decided". **Behaviour change:** a `list`, or a stamps array that is not
+  `(N,) int64`, passed to that path now raises numpy's or PyO3's own
+  `TypeError` — byte-identical to what `at` raises for it — instead of
+  `tf_tree.BufferError`, so `except tf_tree.TfTreeError` no longer catches a
+  bad stamps argument on any path.
+- **`from tf_tree import *` no longer shadows the builtins `open` and
+  `BufferError`.** Both were in `__all__`, so a star-importer's `open("f")`
+  raised `TypeError: open_arena() takes 0 positional arguments` and a bare
+  `except BufferError` stopped catching the builtin — while `__init__.py` said
+  the shadowing was "inside this module only". Both stay public as
+  `tf_tree.open` and `tf_tree.BufferError`; neither is in `__all__`. **Visible
+  change:** after `from tf_tree import *`, the bare names mean the builtins.
+- **The `.pyi` types every scalar stamp as `int | np.int64`**, which is what
+  §3 lists and the runtime accepts: `plan.at(np.int64(t))` and
+  `plan.at(stamps.max())` were strict-mode errors on correct code. `just
+  py-lint` now also runs `pyright` over `tests/python/typecheck_stamps.py`, a
+  file of call sites, because nothing looked at what a caller's type checker
+  said.
+
+### Added — `ChildProcessDetachedError`, the class `PHASE3.md` §8.1 names
+
+- **Every refusal in a fork child raises `tf_tree.ChildProcessDetachedError`**,
+  a subclass of `TfTreeError`, where it raised the base class — including
+  `Publisher.push` and `push_many`, which chose their class apart from
+  `detached_err`. §8.1 is NORMATIVE and names it. The earlier judgement (commit
+  `4c040a3`) was that a detached tree is nothing a program branches on; a retry
+  loop around the `TfTreeError`s that say "retry" is exactly such a program,
+  and could stop on a dead handle only by matching message text. Existing
+  `except TfTreeError` handlers keep catching it.
+- **Out of scope, and said so:** §4.4's structured attributes (`.edge`,
+  `.requested`, ...), a `KeyError` base for `FrameNotDeclaredError`, and the
+  four classes §4.4 lists that were never built. No exception carries an
+  attribute; `crates/tf_tree_py/src/errors.rs` claimed otherwise from its first
+  commit and no longer does, and `PHASE3.md` §4.4 gains a dated amendment of
+  what ships. The attributes need a decision record.
+
 ### Fixed — the one stored-name decode in `tf_tree` that did not clamp
 
 - **`Tree::frame_name` sliced `&rec.name[..rec.name_len as usize]` directly.**

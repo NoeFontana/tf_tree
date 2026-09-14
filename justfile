@@ -3357,6 +3357,14 @@ py-lint: py-compile
     # ~120 errors that are numpy's and not ours, and a gate nobody can keep
     # green is a gate nobody runs.
     .venv/bin/pyright python
+    # **One file of tests/ is the exception, because it is written for this.**
+    # The line above checks the stub from the inside and `test_stubs.py` checks
+    # that names exist, so neither sees what a *caller's* type checker says —
+    # and the stub typed every scalar stamp `int` while PHASE3 §3 and the
+    # runtime accept `np.int64`, a strict-mode error on correct code that
+    # nothing here could see. The file is call sites and nothing else, so it
+    # stays clean under strict; its docstring records its mutants.
+    .venv/bin/pyright tests/python/typecheck_stamps.py
 
 # **Builds a wheel. Does not install one — `just quickstart` is what installs.**
 #

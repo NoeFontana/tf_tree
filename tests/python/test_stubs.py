@@ -16,6 +16,7 @@ be phrased against the package is.
 """
 
 import ast
+import builtins
 import pathlib
 
 import tf_tree
@@ -24,8 +25,9 @@ from tf_tree import _core
 STUB = pathlib.Path(tf_tree.__file__).with_name("_core.pyi")
 
 #: Names the package adds on top of `_core`. `open` is `open_arena` under the
-#: spelling `docs/PHASE3.md` §4.1 promises, and shadows the builtin inside
-#: `__init__` only.
+#: spelling `docs/PHASE3.md` §4.1 promises. It shadows the builtin inside
+#: `__init__`, and — since it left `__all__` — nowhere else;
+#: `test_dunder_all_is_exactly_the_package_namespace` is what holds that.
 PACKAGE_ONLY = {"open"}
 
 
@@ -134,15 +136,38 @@ def test_dunder_all_is_exactly_the_package_namespace():
     => `AssertionError: __all__ and the package namespace disagree: only in
     __all__ [], only in the namespace ['Publisher']`. Dropping the import
     instead makes the *first* branch fire, on the same name.
+
+    **A public name that is also a builtin is the one exemption, and it is
+    computed, not listed.** `tf_tree.open` and `tf_tree.BufferError` are public
+    and were both in `__all__`, so `from tf_tree import *` rebound the
+    star-importer's `open` (after which `open("f")` raised `TypeError:
+    open_arena() takes 0 positional arguments`) and its `BufferError` (an
+    unrelated class, so a bare `except BufferError` stopped catching the
+    builtin). `__init__.py`'s comment said the shadowing was "inside this module
+    only". Subtracting `dir(builtins)` rather than naming the two means a later
+    export spelled like a builtin — a `LookupError`, say — fails here too.
+
+    Mutant: put `"open"` back in `__all__` => `AssertionError: from tf_tree
+    import * would shadow builtins: ['open']`. **Applied, and run.** At the
+    parent commit the same line reported `['BufferError', 'open']`.
     """
     declared = set(tf_tree.__all__)
     phantom = {n for n in declared if not hasattr(tf_tree, n)}
     assert not phantom, f"in __all__ but not defined: {sorted(phantom)}"
-    assert declared == _public(tf_tree), (
-        "__all__ and the package namespace disagree: "
-        f"only in __all__ {sorted(declared - _public(tf_tree))}, "
-        f"only in the namespace {sorted(_public(tf_tree) - declared)}"
+    shadowed = declared & set(dir(builtins))
+    assert not shadowed, (
+        f"from tf_tree import * would shadow builtins: {sorted(shadowed)}"
     )
+    public = _public(tf_tree) - set(dir(builtins))
+    assert declared == public, (
+        "__all__ and the package namespace disagree: "
+        f"only in __all__ {sorted(declared - public)}, "
+        f"only in the namespace {sorted(public - declared)}"
+    )
+    # The exemption above must not become a way to lose the names: both stay
+    # reachable under the package, which is what §4.1 promises for `open`.
+    assert tf_tree.open is tf_tree.open_arena
+    assert issubclass(tf_tree.BufferError, tf_tree.TfTreeError)
 
 
 def test_the_package_adds_nothing_beyond_the_documented_alias():

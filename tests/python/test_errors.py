@@ -31,6 +31,7 @@ with a hole exactly the shape of the entry points is worth less than it looks,
 so the rows are here now and the shared-arena half is the test after the table.
 """
 
+import pickle
 import re
 import tempfile
 
@@ -586,3 +587,93 @@ def test_a_batch_push_keeps_the_scalar_sentence_and_only_prefixes_it():
     # The scalar failure is against a newest of 2000, the batch's against the
     # 9000 it just published, so only the shape of the sentence can be equal.
     assert str(batch.value)[len(prefix) :].replace("9000", "2000") == str(scalar.value)
+
+
+# ---------------------------------------------------------------------------
+# An exception has to leave the process it was raised in
+# ---------------------------------------------------------------------------
+
+#: Every exception class the package exports. Counted, not just collected: a
+#: set built from `vars(tf_tree)` that came back empty would make the class
+#: test below pass on nothing.
+EXPECTED_EXCEPTION_COUNT = 10
+
+
+def _exception_classes():
+    return sorted(
+        (
+            obj
+            for obj in vars(tf_tree).values()
+            if isinstance(obj, type) and issubclass(obj, BaseException)
+        ),
+        key=lambda c: c.__name__,
+    )
+
+
+def test_every_exception_class_pickles_as_itself():
+    """**A worker's exception is pickled to reach its parent**, and none could.
+
+    ``create_exception!(_core, ...)`` makes the first argument the class's
+    ``__module__``, and there is no importable module called ``_core`` — so
+    ``pickle.dumps`` raised ``PicklingError: Can't pickle <class
+    '_core.FrameNotDeclaredError'>: No module named '_core'`` for every class
+    here. A ``multiprocessing.Pool`` worker's ``FrameNotDeclaredError`` reached
+    the parent as ``MaybeEncodingError``, and ``ProcessPoolExecutor`` handed back
+    a bare ``PicklingError``, so ``except tf_tree.FrameNotDeclaredError`` never
+    matched in the parent. ``open_file``'s own docstring shows exactly that
+    worker pattern. The classes are declared under ``tf_tree`` now, which is
+    where ``Tree``, ``Plan`` and ``Publisher`` already said they lived.
+
+    Built from the package's namespace rather than listed, so a class added
+    later under the old module path fails here without anyone remembering to add
+    a row — and counted, so the loop cannot pass by being empty.
+    ``BufferError`` and ``TopologyChangedError`` are here because no row of
+    ``CASES`` raises them.
+
+    Mutant: declare ``TopologyChangedError`` with ``create_exception!(_core, ...)``
+    again. **Applied, rebuilt and run** over this file: ``1 failed, 45 passed``
+    — this test, on ``TopologyChangedError.__module__ is '_core'``. Every row of
+    the instance test below still passes, because no row of ``CASES`` raises
+    that class — which is the reason this test is not folded into that one.
+    """
+    classes = _exception_classes()
+    assert len(classes) == EXPECTED_EXCEPTION_COUNT, [c.__name__ for c in classes]
+    for cls in classes:
+        assert cls.__module__ == "tf_tree", (
+            f"{cls.__name__}.__module__ is {cls.__module__!r}; pickle resolves a "
+            "class by importing its module, so anything but 'tf_tree' cannot "
+            "cross a process boundary"
+        )
+        back = pickle.loads(pickle.dumps(cls("m")))
+        assert type(back) is cls and back.args == ("m",)
+    # The rename is of a *spelling*, not of an object: the private module still
+    # hands out the very same classes.
+    from tf_tree import _core
+
+    assert all(getattr(_core, c.__name__) is c for c in classes)
+
+
+@pytest.mark.parametrize(
+    "trigger,exc_type",
+    [(c[0], c[1]) for c in CASES],
+    ids=[c[0].__name__.lstrip("_") for c in CASES],
+)
+def test_a_raised_exception_survives_a_pickle_round_trip(trigger, exc_type):
+    """The instances a caller actually catches, not only freshly built ones.
+
+    A raised exception is what a worker sends back, and it is the object that
+    would stop round-tripping if a later change passed structured attributes to
+    the constructor: Python rebuilds an exception from ``args`` and restores
+    ``__dict__``, so the two have to agree.
+
+    Mutant: as in the test above but on ``ExtrapolationError``. **Applied, rebuilt
+    and run** over this file: ``2 failed, 44 passed`` — the ``extrapolation``
+    row here, on ``_pickle.PicklingError: Can't pickle <class
+    '_core.ExtrapolationError'>: No module named '_core'``, and the class test
+    above.
+    """
+    with pytest.raises(exc_type) as excinfo:
+        trigger()
+    back = pickle.loads(pickle.dumps(excinfo.value))
+    assert type(back) is type(excinfo.value)
+    assert back.args == excinfo.value.args

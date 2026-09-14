@@ -137,6 +137,17 @@ tf_tree.now(domain="steady")            # CLOCK_MONOTONIC, int ns
 
 Passing a `float` raises `TypeError` naming `from_sec` and stating the ULP at the caller's magnitude.
 
+> **Amendment (2026-09-14) — two corrections to how far this was true.**
+> **"Anywhere" was not.** `Tree.lookup`, `Publisher.push`, the module-level
+> `tf_tree.push` and `Plan.adaptive` took their stamps as a bare integer, so a
+> `float` was refused inside PyO3's own conversion — `'float' object cannot be
+> interpreted as an integer`, no measurement — and `Plan.at_into` on its
+> default `mat4` layout refused an `np.int64` scalar and reported a `float` as
+> a `BufferError`. All five now go through the one refusal `Plan.at` uses, and
+> §14's box, ticked throughout, is true as of this date. **"At the caller's
+> magnitude" is still not**: the message states the fixed 238 ns ULP of a 2026
+> epoch, whatever stamp was passed. That half is recorded rather than fixed.
+
 ---
 
 ## 4. API
@@ -244,6 +255,54 @@ class FrameNotDeclaredError(TfTreeError, KeyError)
 ```
 
 `str(e)` uses the Rust `Described` wrapper so frame and edge IDs appear as names. `TopologyChangedError` must document that the correct response is to re-`plan`, since it is the one error a correct program routinely hits.
+
+> **Amendment (2026-09-14) — what ships, which is not the block above.** This
+> section is not marked NORMATIVE and was never implemented as written. The
+> package exports **ten** exception classes: `TfTreeError` (an `Exception`) and
+> nine direct subclasses of it — `ExtrapolationError`, `DisconnectedError`,
+> `NoDataError`, `TopologyChangedError`, `FrameNotDeclaredError`,
+> `BufferError`, `DerivativesUnavailableError`, `NoSegmentError` and
+> `ChildProcessDetachedError`.
+>
+> - **No class carries an attribute.** An instance holds `args == (message,)`
+>   and nothing else, so a caller programs against the *class*.
+>   `crates/tf_tree_py/src/errors.rs`'s module doc said "the fields are attached
+>   to the exception rather than only formatted into it" from its first commit
+>   until this date; it was never true, and §11.1's "attributes asserted" had
+>   nothing to assert.
+> - **`FrameNotDeclaredError` has no `KeyError` base.** Adding one is not
+>   additive: `KeyError.__str__` quotes the message, and every `except
+>   KeyError` and `except LookupError` around a tf_tree call would start
+>   catching it.
+> - **`str(e)` does not use `Described`.** The binding names ids itself, against
+>   the arena the caller holds (`edge_label` / `frame_label` in `errors.rs`).
+> - **Four classes were never built:** `TimeDomainMismatchError`,
+>   `EdgeAlreadyClaimedError`, `ClaimRevokedError` and
+>   `ArenaHeldButUnreachableError`. Those failures reach Python as the base
+>   `TfTreeError` with a message. **`ChildProcessDetachedError` was a fifth and
+>   ships as of this date**, because §8.1 is NORMATIVE and names it; it replaced
+>   a base `TfTreeError` from every fork-child refusal, including `Publisher.push`
+>   and `push_many`.
+> - **Two listed attributes no longer match the Rust errors.** `.owner_pid`:
+>   since amendment A3 a claim records a participant *slot*, not a pid, and an
+>   attribute spelled `pid` would point an operator at an unrelated process.
+>   `.holders -> [(pid, name)]`: `IpcError::ArenaHeldButUnreachable` carries
+>   `holder_slots`, `first_slot`, `first_pid` and `ownership_held`.
+> - **`BufferError` is not in the block above and ships.** It is public as
+>   `tf_tree.BufferError` and deliberately absent from `__all__`, so `from
+>   tf_tree import *` does not shadow the builtin `BufferError`, an unrelated
+>   class. `tf_tree.open` is kept out of `__all__` for the same reason.
+> - **Every class's `__module__` is `"tf_tree"`**, so an exception raised in a
+>   `multiprocessing` worker pickles back to its parent as itself. Until this
+>   date they were declared under `_core`, which is not importable, and none
+>   could.
+>
+> **Still open, and a decision record's rather than this section's:** the
+> attributes — including how an id-shaped one (`.edge`, `.target`, `.cut_at`)
+> reaches a language that is never handed an id, when `docs/API.md` R5 says
+> name resolution is a display wrapper and not a field — the `KeyError` base,
+> and the four unbuilt classes. Until one is `ready`, the list above is what a
+> caller can rely on.
 
 ---
 
@@ -658,7 +717,7 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 - [ ] `import tf_tree; tf_tree.open()` works with zero arguments on a machine with a running arena, and in a bare notebook with none
 - [x] `#[pymodule(gil_used = false)]` set; asserted on `3.14t` — but see §1.2's correction, the attribute is not what the assertion proves
 - [x] Every `#[pyclass]` is `Send + Sync`; `Publisher` wrapped
-- [x] No `float` stamp accepted anywhere; `TypeError` names `from_sec` and states the ULP
+- [x] No `float` stamp accepted anywhere; `TypeError` names `from_sec` and states the ULP — **ticked while false for five entry points until 2026-09-14**, and the ULP is stated at a fixed epoch rather than the caller's magnitude; §3's amendment is the account
 - [ ] No API returns a view into the arena (grep-able review item, documented in the README)
 - [x] `at_into` validates fully before writing; non-contiguous `out` rejected
 - [x] `out` device classification via `__dlpack_device__`; CUDA device memory rejected with an actionable message
@@ -680,7 +739,9 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 Implemented and gated locally (`just py-test`, `py-test-freethreaded`,
 `py-lint`, `tsan`): `open()`/`build()`, `Plan.at` scalar and batch, `at_into`
 with DLPack device classification, `adaptive`, `Publisher` with `push` and
-`push_many`, the exception hierarchy, hand-written stubs with a bidirectional
+`push_many`, the exception hierarchy — as §4.4's 2026-09-14 amendment lists it,
+which is classes and messages, not the attributes §4.4 specifies — hand-written
+stubs with a bidirectional
 drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
 path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and
 verified to import and run on 3.14.

@@ -71,6 +71,67 @@ def test_a_float_stamp_is_refused_with_the_measurement(tree):
         p.at(1.5)
 
 
+POSE7 = [1.0, 0.0, 0.0, 0.0, 9.0, 9.0, 9.0]
+
+# `(id, call, a stamp the call accepts)` for every entry point that takes a
+# scalar stamp without going through `Plan.at`'s dispatch. The `tree` fixture's
+# samples are at 1000 and 2000, so 1500 is inside every window and 3000 is newer
+# than every sample, which is what a push needs.
+SCALAR_STAMP_ENTRY_POINTS = [
+    ("Tree.lookup", lambda t, s: t.lookup("map", "base", s), 1_500),
+    ("Publisher.push", lambda t, s: t.publisher("base", "map").push(s, POSE7), 3_000),
+    ("tf_tree.push", lambda t, s: tf_tree.push(t, "base", "map", s, POSE7), 3_000),
+    ("adaptive start", lambda t, s: t.plan("map", "base").adaptive(s, 2_000), 1_500),
+    ("adaptive end", lambda t, s: t.plan("map", "base").adaptive(1_000, s), 1_500),
+]
+SCALAR_STAMP_IDS = [row[0] for row in SCALAR_STAMP_ENTRY_POINTS]
+
+
+@pytest.mark.parametrize(
+    "call", [row[1] for row in SCALAR_STAMP_ENTRY_POINTS], ids=SCALAR_STAMP_IDS
+)
+@pytest.mark.parametrize("stamp", [1.5, np.float64(1500.0)], ids=["float", "f64"])
+def test_every_scalar_stamp_refuses_a_float_with_the_measurement(tree, call, stamp):
+    """§3 is NORMATIVE, and §14 ticked "no `float` stamp accepted anywhere".
+
+    It was true of `Plan.at`, `at_into` and the extrapolating calls, which go
+    through `stamp_from_any`. These five took the stamp as a bare `i64`, so a
+    float was still refused — but inside PyO3's own integer conversion, with
+    ``TypeError: 'float' object cannot be interpreted as an integer`` and no
+    measurement, which is the one thing §3 requires the refusal to carry.
+    ``np.float64`` is a row of its own because it is a ``float`` subclass, and
+    the check is ``isinstance``, not a type identity.
+
+    Mutant: give ``lookup``, ``Publisher.push``, the module-level ``push`` and
+    ``adaptive`` back their ``stamp_ns: i64`` / ``start_ns: i64, end_ns: i64``
+    parameters (and drop the ``stamp_from_any`` lines). **Applied, rebuilt and
+    run** over ``tests/python``: ``10 failed, 232 passed`` — exactly these ten
+    rows, each on ``Regex pattern did not match`` against ``'float' object
+    cannot be interpreted as an integer`` (or ``'numpy.float64' object ...``)
+    ``while processing`` the parameter's name. The ``np.int64`` test below keeps
+    passing under the same mutant, because the accepted set did not move.
+    """
+    with pytest.raises(TypeError, match="238 ns"):
+        call(tree, stamp)
+
+
+@pytest.mark.parametrize(
+    ("call", "ok"),
+    [row[1:] for row in SCALAR_STAMP_ENTRY_POINTS],
+    ids=SCALAR_STAMP_IDS,
+)
+def test_every_scalar_stamp_accepts_a_numpy_int64(tree, call, ok):
+    """The other half of §3's list, on the same five entry points.
+
+    Here so the refusal above cannot be bought by narrowing what is accepted: a
+    change that refused everything but a Python ``int`` would pass that test and
+    fail this one. Each row must *succeed*, not merely avoid a ``TypeError``.
+    """
+    t = np.array([0, ok], dtype=np.int64)[1]
+    assert isinstance(t, np.int64) and not isinstance(t, int)
+    call(tree, t)
+
+
 def test_from_sec_is_the_only_route_from_float_seconds():
     assert tf_tree.from_sec(1.5) == 1_500_000_000
     with pytest.raises(ValueError):
@@ -918,9 +979,10 @@ def test_the_layout_path_reports_a_bad_stamps_array_exactly_as_at_does(
     That is a **regression in one message and a fix in two behaviours**, and it
     is deliberate because ``at`` has always answered exactly this way: the
     assertion below is that the two are byte-identical, which is the property
-    that was actually wanted. ``at_into``'s default ``mat4`` path still gives
-    the shape-naming ``BufferError`` — the last place the two stamp dispatches
-    disagree, recorded in ``Plan.at_into.__doc__``.
+    that was actually wanted. ``at_into``'s default ``mat4`` path gave the
+    shape-naming ``BufferError`` for one more wave and has paid the same price
+    since; ``test_the_mat4_path_reports_a_bad_stamps_array_exactly_as_at_does``
+    is that row.
 
     Mutant: restore the ``else`` on the ``layout=`` path => ``BufferError`` is
     raised, which is not a ``TypeError``, so ``pytest.raises`` fails.
@@ -958,6 +1020,78 @@ def test_a_numpy_int64_scalar_is_an_accepted_stamp(twistable, layout, elems, dty
     # `at` has always accepted it; the two must not disagree about what a stamp
     # is, which is the whole reason this fix was "match the pose path exactly".
     np.testing.assert_array_equal(p.at(t, layout=layout), out)
+
+
+# The default layout, spelled both ways: `layout="mat4"` goes back to the same
+# body as no keyword at all, so one row alone would leave the other spelling
+# unpinned. Not folded into `LAYOUT_OUT`, which is built from an element count
+# and cannot express `(4, 4)` / `(N, 4, 4)`.
+MAT4_SPELLINGS = [{}, {"layout": "mat4"}]
+MAT4_IDS = ["default", "explicit"]
+
+
+@pytest.mark.parametrize("kw", MAT4_SPELLINGS, ids=MAT4_IDS)
+def test_the_mat4_path_refuses_a_float_stamp_with_the_measurement(twistable, kw):
+    """§3 on the default overload, which is the one most callers write.
+
+    ``Plan.at_into``'s ``mat4`` body dispatched ``if PyInt { .. } else {
+    cast_or_BufferError }``, so ``at_into(1.5, out)`` raised
+    ``tf_tree.BufferError: stamps must be an (N,) int64 array, or an int`` — a
+    complaint about the argument the caller got right, not a ``TypeError``, and
+    without the 238 ns number. Its own doc comment carried a table recording it
+    as "outstanding, not decided".
+
+    Mutant: restore that ``else`` on the ``mat4`` path — a failed array cast raising
+    ``BufferError`` instead of falling through to ``stamp_from_any``. **Applied,
+    rebuilt and run** over ``tests/python``: ``6 failed, 236 passed`` — every
+    row of this test and of the two after it, all six on ``tf_tree.BufferError:
+    stamps must be an (N,) int64 array, or an int``, and nothing else in the
+    suite.
+    """
+    p = twistable.plan("map", "base")
+    out = np.zeros((4, 4))
+    with pytest.raises(TypeError, match="238 ns"):
+        p.at_into(1.5, out, **kw)
+    assert not out.any(), "the buffer was written before the stamp was validated"
+
+
+@pytest.mark.parametrize("kw", MAT4_SPELLINGS, ids=MAT4_IDS)
+def test_the_mat4_path_accepts_a_numpy_int64_scalar(twistable, kw):
+    """§3's middle accepted type, on the default overload.
+
+    What ``stamps[i]`` and ``stamps.max()`` hand back, and what callers in this
+    repository had been converting with ``int(...)`` or ``.tolist()`` to get
+    past the refusal.
+    """
+    p = twistable.plan("map", "base")
+    out = np.zeros((4, 4))
+    t = np.array([1_250_000_000, 1_500_000_000], dtype=np.int64)[1]
+    assert isinstance(t, np.int64) and not isinstance(t, int)
+    p.at_into(t, out, **kw)
+    np.testing.assert_array_equal(out, p.at(1_500_000_000))
+    np.testing.assert_array_equal(p.at(t), out)
+
+
+@pytest.mark.parametrize("kw", MAT4_SPELLINGS, ids=MAT4_IDS)
+def test_the_mat4_path_reports_a_bad_stamps_array_exactly_as_at_does(twistable, kw):
+    """The price, on the default overload too, and charged on purpose.
+
+    A ``float64`` stamps array used to meet ``tf_tree.BufferError`` naming
+    ``(N,) int64`` here — the last place in the binding that said so. It now
+    raises what ``at`` raises for the same argument, byte for byte, which is
+    also what the ``layout=`` path already raised. So ``except
+    tf_tree.TfTreeError`` no longer catches a bad stamps array on any path;
+    ``CHANGELOG.md`` says so.
+    """
+    p = twistable.plan("map", "base")
+    out = np.zeros((1, 4, 4))
+    bad = np.array([1_500_000_000.0])
+    with pytest.raises(TypeError) as into_exc:
+        p.at_into(bad, out, **kw)
+    with pytest.raises(TypeError) as at_exc:
+        p.at(bad)
+    assert str(into_exc.value) == str(at_exc.value)
+    assert not out.any(), "the buffer was written before the stamp was validated"
 
 
 # ---------------------------------------------------------------------------

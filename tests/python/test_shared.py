@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 
+import numpy as np
 import pytest
 import tf_tree
 
@@ -137,6 +138,90 @@ def test_a_forked_child_is_refused_rather_than_faulting(runtime_dir):
 
     # And the parent is unharmed — it still owns the edge it claimed.
     pub.push(3_000, [1.0, 0.0, 0.0, 0.0, 7.0, 8.0, 9.0])
+    pub.release()
+
+
+@shm
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded:DeprecationWarning"
+)
+def test_a_forked_child_is_refused_with_child_process_detached_error(runtime_dir):
+    """**`docs/PHASE3.md` §8.1 is NORMATIVE and names the class.**
+
+    Every refusal in a fork child raised the base `TfTreeError`, on a judgement
+    that a detached tree is "not a condition a program branches on". The
+    program that branches on it is a retry loop: `SlotContended`,
+    `InternContended` and `LeaseContended` also reach Python as `TfTreeError`
+    saying "retry", so a loop catching `TfTreeError` could not stop on a handle
+    that will never work again except by matching message text, which
+    `docs/API.md` R5 says is not a promise.
+
+    The test above catches `Exception`, so it pins *refused, not faulted* and is
+    blind to the class. This one pins the class on every entry point that has
+    its own route to the refusal: the publisher's `push` and `push_many` (both
+    through `push_err`'s class, not `detached_err`), the module-level `push`
+    (through `resolve_frame`), a precompiled plan's `at` and `lookup` (through
+    `lookup_err`), `plan` itself, and the introspection walk.
+
+    **The report travels through a pipe**, not the exit status: an assertion in
+    a fork child is invisible to pytest, and a pipe lets the parent say *which*
+    call raised *what* instead of decoding a number.
+
+    Mutants, each applied, rebuilt and run, and the outcome observed:
+
+    * `detached_err` raising `TfTreeError` again => this test fails on
+      `lookup`, `module push`, `plan`, `plan.at` and `frames` reporting
+      `TfTreeError`; `push` and `push_many` still pass, because they do not go
+      through it.
+    * `push_class`'s `ChildDetached` arm answering `TfTreeError::new_err` =>
+      it fails on `push` and `push_many` alone.
+    * `push_many`'s wrapper in `crates/tf_tree_py/src/tree.rs` building
+      `TfTreeError::new_err` again instead of taking `push_class` => it fails
+      on `push_many` alone — the sentence is prefixed there, and the class used
+      to be re-chosen with it.
+    """
+    tree = tf_tree.open(mode="rw", create=EDGES)
+    pub = tree.publisher("base", "map")
+    pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
+    plan = tree.plan("map", "base")
+    pose = [1.0, 0.0, 0.0, 0.0, 4.0, 5.0, 6.0]
+    calls = {
+        "push": lambda: pub.push(2_000, pose),
+        "push_many": lambda: pub.push_many(
+            np.array([2_000], dtype=np.int64), np.array([pose])
+        ),
+        "module push": lambda: tf_tree.push(tree, "cam", "base", 2_000, pose),
+        "lookup": lambda: tree.lookup("map", "base", 1_000),
+        "plan": lambda: tree.plan("map", "base"),
+        "plan.at": lambda: plan.at(1_000),
+        "frames": tree.frames,
+    }
+
+    read_end, write_end = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover — the child never returns to pytest
+        os.close(read_end)
+        lines = []
+        for name, call in calls.items():
+            try:
+                call()
+                lines.append(f"{name}=answered")
+            except Exception as e:
+                lines.append(f"{name}={type(e).__name__}")
+        os.write(write_end, "\n".join(lines).encode())
+        os._exit(0)
+
+    os.close(write_end)
+    with os.fdopen(read_end, "rb") as r:
+        report = r.read().decode()
+    _, wstatus = os.waitpid(pid, 0)
+    assert os.WIFEXITED(wstatus) and os.WEXITSTATUS(wstatus) == 0, wstatus
+    got = dict(line.split("=", 1) for line in report.splitlines())
+    assert got == dict.fromkeys(calls, "ChildProcessDetachedError"), got
+
+    # A subclass, so every `except tf_tree.TfTreeError` written before it
+    # existed still catches it.
+    assert issubclass(tf_tree.ChildProcessDetachedError, tf_tree.TfTreeError)
     pub.release()
 
 
