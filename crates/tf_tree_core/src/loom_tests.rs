@@ -211,6 +211,106 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
     });
 }
 
+/// The same lap, through [`SampleRing::sample_from`] and a **caller-held cursor
+/// that points at the slot the lap destroys** — the shape `Plan::at` and every
+/// monotone batch actually use.
+///
+/// # Why the model above does not cover it
+///
+/// [`writer_wraps_reader_gets_valid_or_recycled`] calls [`SampleRing::sample`],
+/// which production reaches from `Plan::latest` alone. `Plan::at` samples
+/// through `Guard::sample_hinted` -> `sample_from`, and so do
+/// `at_extrapolating`, `latest_common`, the adaptive path and both batch loops.
+/// `sample_from` carries **its own copy** of the trailing `head - i > retained`
+/// revalidation, and no loom model executed that copy: deleting it passes
+/// `writer_wraps_...` (run, 20.9 s green).
+///
+/// # Shape
+///
+/// Capacity 4. `10, 20, 30` are published **before** the threads start and the
+/// writer lands `40, 50` concurrently; the fifth push overwrites physical slot
+/// 0, logical 0, stamp 10. Publishing the first three up front costs nothing
+/// the model is about — the only bracket for `t = 25` is `(20, 30)`, answerable
+/// at `head` 3 or 4, which a reader only meets once three samples exist either
+/// way — and it takes the model from a writer of five pushes to one of two.
+///
+/// The reader's cursor is seeded **`0`**, the index a batch starts from and the
+/// one the fifth push recycles. The only legal `Ok` is `(20, 30)` at `s = 0.5`,
+/// bit for bit. A hint at 0 makes `bracket_from` load `stamp[0]` first; once the
+/// lap has landed that slot holds stamp 50, the gallop turns downward and the
+/// search settles on logical 0 — a slot from the next era — which only the
+/// trailing check can refuse.
+///
+/// **Mutant, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`, which the
+/// environment cannot lower): delete `sample_from`'s trailing
+/// `if self.head.load(Ordering::Acquire) - i > retained { return
+/// Err(LookupError::SlotRecycled { .. }); }` (`sample.rs`). **FAILS** on the
+/// assertion below, found in the first milliseconds of the search.
+/// `writer_wraps_...` passes under the same deletion.
+///
+/// **The seed is the test.** Under that same deletion, seeding the cursor at `1`
+/// or `2` instead **passes** (in 0.01 s: such a reader loads no atomic the writer
+/// stores except `head`, so there is almost nothing to interleave) — a hint
+/// inside the surviving window never steers the search into the recycled slot. So this model checks the
+/// revalidation *against a stale caller-held cursor*, not in general; the
+/// interior-bracket race without a stale hint is `sample_from`'s share of
+/// `sample.rs`'s hazard 1, which nothing here claims to close.
+///
+/// **What it does not control, run and recorded so nobody tries it as the
+/// control:** dropping the `.clamp(lo_logical, newest)` in `bracket_from`
+/// **passes** this model (12.2 s). `rebase_hint` and the clamp are arithmetic on
+/// values the reader already holds, loom adds nothing to arithmetic, and the
+/// sequential cursor sweeps in `tests.rs` are what kill that mutant.
+///
+/// Not reached: `sample_from`'s `Hold` and exact-newest short-circuit arms,
+/// which read the *newest* slot. A lap reaches that slot only after `capacity`
+/// further pushes, so a model for them needs capacity 2: one arm per model
+/// measured 31.7 s (`Hold`) and 34.2 s (exact-newest) against this one's 12.2 s,
+/// and both arms behind one reader 234.6 s.
+#[test]
+fn sample_from_with_a_stale_cursor_across_a_lap() {
+    model(|| {
+        let hr = Arc::new(HeapRing::new(4));
+        {
+            let ring = hr.ring();
+            for i in 1..=3u64 {
+                ring.push(i as i64 * 10, &pose(i)).unwrap();
+            }
+        }
+        let expect = <LerpSlerp as tf_tree_math::Interp>::eval(&pose(2), &pose(3), 0.5).to_bits();
+
+        let w = Arc::clone(&hr);
+        let writer = thread::spawn(move || {
+            let ring = w.ring();
+            ring.push(40, &pose(4)).unwrap();
+            ring.push(50, &pose(5)).unwrap();
+        });
+
+        let r = Arc::clone(&hr);
+        let reader = thread::spawn(move || {
+            let ring = r.ring();
+            // Caller-held, as `Plan::fold_at_cursors` holds one per step.
+            let mut cursor = 0u64;
+            match ring.sample_from::<LerpSlerp>(25, ExtrapPolicy::Error, &mut cursor) {
+                Ok(iso) => assert_eq!(
+                    iso.to_bits(),
+                    expect,
+                    "sample_from followed a stale cursor into a recycled slot"
+                ),
+                Err(
+                    LookupError::Extrapolation { .. }
+                    | LookupError::SlotRecycled { .. }
+                    | LookupError::SlotContended { .. },
+                ) => {}
+                Err(other) => panic!("undocumented error: {other:?}"),
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
 /// Loom test 3 (`docs/PHASE1.md` §10.2's *mutation test*): the invariant
 /// `head`'s `Release` store carries — that observing `head == h` makes the
 /// stamps of all `h` published samples visible.
