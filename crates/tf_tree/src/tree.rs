@@ -4539,7 +4539,7 @@ pub enum BuildError {
     #[error("too many edges for the u32 id space")]
     TooManyEdges,
     /// The arena layout was rejected (e.g. it would exceed the `u32` offset model).
-    #[error("arena layout error: {0:?}")]
+    #[error("arena layout error: {0}")]
     Layout(LayoutError),
     /// A frame name could not be interned (table full or 64-bit hash collision).
     #[error("frame error: {0}")]
@@ -4549,10 +4549,13 @@ pub enum BuildError {
     Topology(TopologyError),
     /// The shared-memory segment could not be created, sized, mapped or sealed.
     #[cfg(all(feature = "shm", target_os = "linux"))]
-    #[error("shared memory error: {0:?}")]
+    #[error("shared memory error: {0}")]
     Shm(ShmError),
     /// The participant table is full, so this process cannot join the arena.
-    #[error("participant table full: {0:?}")]
+    // Bare, with no "participant table full" prefix (`docs/decisions/0059`
+    // decision 4): both producers go through `ParticipantTable::register`, whose
+    // only error is `TableFull`, and that payload's own text already says so.
+    #[error("{0}")]
     Participant(ParticipantError),
 }
 

@@ -59,6 +59,10 @@ pub mod heap;
 pub mod layout;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub mod mapped;
+// `docs/decisions/0059`'s structural checks on an error's `Display`, shared by
+// the rendering tests of the three error types this crate defines.
+#[cfg(test)]
+mod render_test;
 
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use check::ShmError;

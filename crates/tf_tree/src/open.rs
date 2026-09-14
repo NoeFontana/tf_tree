@@ -718,7 +718,7 @@ pub enum OpenError {
     #[error("{0}")]
     Rendezvous(IpcError),
     /// The segment was handed over but could not be mapped.
-    #[error("{0:?}")]
+    #[error("{0}")]
     Map(tf_tree_arena::ShmError),
     /// This process had to create the arena and could not.
     #[error("{0}")]
@@ -1465,10 +1465,11 @@ fn spawn_owner_server(rv: &Rendezvous, tree: &Tree) -> Result<OwnerThread, OpenE
                         // this decides something else: whether `fill_slot`'s
                         // `FREE -> RESERVED` CAS could succeed at this index.
                         // Granting a slot whose word is not `FREE` hands the
-                        // joiner `ShmError::ParticipantTableFull` — *"Every
-                        // participant slot is taken, so this process cannot
-                        // join"* — about the very slot this loop just decided
-                        // was free, and there is nothing it can usefully retry.
+                        // joiner `ShmError::ParticipantTableFull` — whose
+                        // rustdoc said *"Every participant slot is taken"* until
+                        // `docs/decisions/0059` corrected it — about the very
+                        // slot this loop just decided was free, and there is
+                        // nothing it can usefully retry.
                         let word = rec.state.load(Ordering::Acquire);
                         if tf_tree_core::participant::state_of(word)
                             != tf_tree_core::participant::FREE

@@ -389,8 +389,9 @@ fn unresolvable_name(name: &str, e: FrameError) -> PyErr {
 /// # The two entry points every program calls first shipped five Debug dumps
 ///
 /// `BuildError`'s `thiserror` attributes were `#[error("topology error: {0:?}")]`
-/// and four more like it (two of the five print their payload's `Display`
-/// now), forwarded here as `format!("{e}")` — so
+/// and four more like it (all five print their payload's `Display` now: two
+/// since #339, and the three whose payloads had none since
+/// `docs/decisions/0059`), forwarded here as `format!("{e}")` — so
 /// `tf_tree.build([("a","b"),("b","a")])`, which is a *typo-grade* mistake,
 /// raised `topology error: WouldCreateCycle { child: FrameId(1) }`. That is both
 /// things this module exists to keep out of a Python message at once, on the
@@ -415,11 +416,13 @@ fn unresolvable_name(name: &str, e: FrameError) -> PyErr {
 ///
 /// Three of `BuildError`'s variants describe the arena rather than the edge
 /// list, and they say so in words instead of dumping the struct that carries
-/// the detail. The exception is `Shm`, which follows [`crate::offline`]'s
-/// `FrozenError::Arena` precedent for the identical reason: `ShmError` has no
-/// `Display`, sixteen variants and several struct-shaped ones, so enumerating it
-/// here would re-spell `tf_tree_arena`'s reasons in a file that cannot see them
-/// change. Labelling the discriminant as raw is the honest option.
+/// the detail. `Layout` and `Participant` carry this binding's own remedies.
+/// `Shm` names the stage and then forwards `ShmError`'s own `Display`, as
+/// [`crate::offline`] does for `FrozenError::Arena`: sixteen variants
+/// enumerated here would re-spell `tf_tree_arena`'s reasons in a file that
+/// cannot see them change, and since `docs/decisions/0059` that crate's text is
+/// one clause ending in the variant name, which is the search key
+/// `docs/RUNBOOK.md` is headed by.
 pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError) -> PyErr {
     TfTreeError::new_err(match e {
         // Named from the list, not from the hash the error carries: the hash is
@@ -499,7 +502,7 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
         #[cfg(target_os = "linux")]
         BuildError::Shm(inner) => format!(
             "the shared-memory segment for this arena could not be created, \
-             sized, mapped or sealed. The engine's reason, raw: {inner:?}"
+             sized, mapped or sealed: {inner}"
         ),
         other => format!(
             "tf_tree could not build this tree, and this binding has no message \
@@ -514,16 +517,17 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
 /// Every arm of `OpenError` except two is already a sentence, so this forwards
 /// their `Display`; the two are the ones that wrap a *different* error type.
 /// `Build` is the whole of [`build_err`] — `open(create=[...])` is the second
-/// entry point a program calls first, and it reaches every one of those five
-/// Debug dumps through one `From` impl.
+/// entry point a program calls first, and it reaches every arm of that mapper
+/// through one `From` impl.
 #[cfg(target_os = "linux")]
 pub(crate) fn open_err(edges: &[(String, String)], capacity: u32, e: OpenError) -> PyErr {
     match e {
         OpenError::Build(inner) => build_err(edges, capacity, inner),
-        // `#[error("{0:?}")]`, and the same argument as `BuildError::Shm`.
+        // The stage in this binding's words, then `ShmError`'s own `Display`,
+        // for the same reason as `BuildError::Shm`.
         OpenError::Map(inner) => TfTreeError::new_err(format!(
             "the arena's shared-memory segment was handed over but could not be \
-             mapped. The engine's reason, raw: {inner:?}"
+             mapped: {inner}"
         )),
         // `Rendezvous`, `NoLayoutToCreate`, `ReadOnlyCannotCreate`,
         // `ArenaAlreadyLive` — prose already. (`TakeoverUnsupported` was a fifth

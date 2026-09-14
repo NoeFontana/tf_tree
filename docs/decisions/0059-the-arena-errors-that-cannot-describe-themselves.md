@@ -4,7 +4,8 @@
 **Owner:** @NoeFontana
 **Implementation:** step 0 (re-reading #339's merged code) was done on
 2026-09-14, in the change that moved this record to `ready`, and found nothing
-that moves the plan; step 1 has not landed.
+that moves the plan; step 1 is in progress (this change), all four parts in one
+PR; step 2 follows its merge, and names its PR number.
 
 ## Context
 
