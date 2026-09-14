@@ -784,9 +784,11 @@ void tft_tree_free(tft_tree *tree);
  * topology and can meet a state those definitions were not written for:
  *
  * * [`TFT_ERR_UNKNOWN_FRAME`] — before compilation: a name is not UTF-8, or
- *   does not resolve. On a read-only attachment that is a name nobody
- *   declared; on a writable tree, which declares a name it does not find, it
- *   is a full frame table or a name that cannot be interned. **From
+ *   does not resolve. On a read-only attachment that is usually a name nobody
+ *   declared, and rarely a name whose hash slot a different name holds
+ *   (permanent) or a name another participant is interning right now
+ *   (transient — retry); on a writable tree, which declares a name it does not
+ *   find, it is a full frame table or a name that cannot be interned. **From
  *   compilation**, with `frame_a` set, it is not a misspelt name: the topology
  *   read found no consistent snapshot within its retry limit while another
  *   participant re-parented (transient — retry), or the arena records a parent
