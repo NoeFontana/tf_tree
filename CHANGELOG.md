@@ -41,6 +41,75 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — the two writer refusals name their edge (D11), and error payloads print as prose and can be named
+
+**Breaking, on the `0.0.x` line.** Two variant shapes changed and one public
+trait impl is gone; migration is mechanical:
+
+- **`PushError::NonMonotonicStamp` gains `edge: EdgeId`** (`tf_tree_core`, and
+  `tf_tree` re-exports it). It was the one `PushError` variant that did not name
+  its edge, though the ring raising it always held one. A pattern that listed
+  the fields — `NonMonotonicStamp { last, got }` — needs `, ..` or `edge`; its
+  `Display` now begins `edge N:`.
+- **`ClaimApiError::AlreadyClaimed(ClaimError)` is now
+  `AlreadyClaimed { edge: EdgeId, cause: ClaimError }`.** `Tree::claim` knew the
+  edge and dropped it on the `?` that converted the core error; it names it now,
+  and the message reads `edge N: the edge is already claimed by participant slot
+  S (one writer per edge)`. **`impl From<ClaimError> for ClaimApiError` is
+  removed** — it was the conversion that lost the edge, and a bare `ClaimError`
+  has no edge to give — along with a private shim whose fallback would have
+  printed slot `0`, a real slot, for an unknown variant.
+- **C ABI, no ABI change:** `tft_error.edge` is filled for
+  `TFT_ERR_ALREADY_CLAIMED` and `TFT_ERR_NON_MONOTONIC` (it read
+  `TFT_INVALID_ID`), and for a `TFT_ERR_TIME_DOMAIN` raised because a path's
+  dynamic edges disagree among themselves. The field already existed and the
+  header already allowed either value. `frame_a` still carries the owner slot on
+  `TFT_ERR_ALREADY_CLAIMED` from `tft_tree_claim` — but not from
+  `tft_bridge_create`, which overwrites `frame_a`/`frame_b` with the refused
+  link's parent and child frame ids, as it did before. `tft_plan_create` gains
+  an *Errors* section saying
+  what `TFT_ERR_UNKNOWN_FRAME`, `TFT_ERR_NO_DATA` and `TFT_ERR_TIME_DOMAIN` mean
+  when compilation raises them — a topology read that found no consistent
+  snapshot or a corrupt parent index, a parent link with no edge, and a path
+  whose edges disagree — and those three codes' docs point at it.
+
+Additive and message-only:
+
+- **Every public error variant's payload is nameable from `tf_tree`.**
+  `TopologyError`, `ParticipantError` and `LayoutError` are re-exported at the
+  root, and under `shm` so are `IpcError` and the eight types its variants
+  carry (`EnvVar`, `HelloStatus`, `LockRole`, `NameProblem`, `ProcError`,
+  `ProcParseError`, `RuntimeDirSource`, `WireError`). A caller could match
+  `BuildError::Topology` but not name what was inside it without a second
+  direct dependency. `docs/API.md` §6 row 19.
+- **Payloads that have a `Display` are printed with it.** `BuildError::Frame`,
+  `BuildError::Topology`, `ReparentError::Topology` and `AwaitError::Frame` used
+  `{0:?}`, so a two-edge cycle read `topology error: WouldCreateCycle { child:
+  FrameId(1) }`; it reads `topology error: attaching frame 1 under that parent
+  would create a cycle`. `tf_tree_ingest`'s `IngestError::Push` likewise, under a
+  comment that said the core had no `Display`. `ClaimApiError`'s three lease
+  variants print `edge N`, not `edge EdgeId(N)`. **Not in this change:**
+  `BuildError::Layout`/`Shm`/`Participant`, `OpenError::Map` and
+  `FrozenFileError::Frozen` still print `Debug`, because their payloads
+  (`LayoutError`, `ShmError`, `ParticipantError`, `FrozenError`) have no
+  `Display`, and adding one to a published type is a trait commitment that
+  wants a record extending `0040`.
+- **`IpcError`'s sentence no longer splices in `Debug`**:
+  `HandshakeMalformed` and `ProcError::Parse` describe the malformed reply and
+  the unparseable `/proc/<pid>/stat` in words. No `Display` impl was added to
+  `WireError` or `ProcParseError`.
+- **`tf_tree participants`** reports an unopenable lock file through `anyhow`'s
+  context chain (`opening <path>` / `cannot open the lock file (errno 13)`)
+  instead of `LockFileOpen { raw_os_error: 13 }`, and loses a comment claiming
+  `IpcError` was not `std::error::Error`, which it already was when the comment
+  was written.
+- **`Tree::lookup`'s `# Errors` says what `LookupError::UnknownFrame` also
+  covers**: a name whose hash slot a different name holds (permanent) and a
+  name an anonymous claimant is interning right now (transient). It names the
+  write-free way to tell them apart and warns that `Tree::frame` on a writable
+  tree is not one — it interns. `Tree::describe`'s remedy for an unknown frame
+  mentions both causes rather than advising only a wait.
+
 ### Fixed — the Python binding's contract, where `PHASE3.md` §3 and §8.1 are NORMATIVE and the code was not
 
 - **Every tf_tree exception pickles, and reaches a `multiprocessing` parent as

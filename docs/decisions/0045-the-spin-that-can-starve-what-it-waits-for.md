@@ -107,6 +107,13 @@ is what this layer can express, and its calibration is the same kind of number
 - `Tree::lookup`, `tft_plan_create` and `tree.plan()` gain a failure mode they
   did not have. Their docs must say so — a call that could not fail and now can
   is a breaking change in behaviour even where the signature is unchanged.
+  **Note (2026-09-14):** on `Tree::lookup` that failure does not arrive as
+  `FrameError::InternContended`. The facade's resolver (`find` in
+  `crates/tf_tree/src/tree.rs`) maps every `find_frame` error onto
+  `LookupError::UnknownFrame { hash }`, so the contention step 2 makes reachable
+  reaches a Rust caller disguised as an undeclared name. `Tree::lookup`'s
+  `# Errors` now says so and names a write-free way to tell the cases apart; a
+  distinct variant or a cause field would be a record of its own.
 - A8's text changes, so `docs/PHASE2.md` §1 needs an amendment recorded the way
   §3.5's was rather than an edit.
 - The `loom` models that exercise interning gain a reachable `Contended` arm.

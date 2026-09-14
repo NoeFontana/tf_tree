@@ -365,6 +365,9 @@ impl<'a> ArenaView<'a> {
     /// # Errors
     ///
     /// [`FrameError::FrameHashCollision`] if a different name occupies this hash.
+    /// [`FrameError::InternContended`] if an anonymous claimant of the name's
+    /// slot is mid-publish past the reader's wait, so the name exists but has no
+    /// id to report yet.
     pub fn find_frame(&self, name: &str) -> Result<Option<FrameId>, FrameError> {
         let hash = blake3_64(name);
         let table = self.intern_table();

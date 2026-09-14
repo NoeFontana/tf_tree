@@ -610,6 +610,8 @@ pub fn intern_core(
 /// # Errors
 ///
 /// [`FrameError::FrameHashCollision`] if a different name occupies this hash.
+/// [`FrameError::InternContended`] if the slot's claimant is anonymous and still
+/// mid-publish when the reader's wait gives up (`Wait::Contended`).
 pub fn find_core(
     table: &InternTable<'_>,
     hash: u64,

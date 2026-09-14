@@ -2209,12 +2209,12 @@ fn cmd_participants(live: Live<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // `IpcError` is `Copy` and `String`-free by design (`docs/PROJECT.md` §5),
-    // so it is not `std::error::Error` and cannot be `?`-ed into `anyhow`
-    // directly. Formatting it here is the seam where a `no_std` error becomes a
-    // human-facing one.
-    let lock = tf_tree_ipc::LockFile::open(path)
-        .map_err(|e| anyhow::anyhow!("opening {}: {e:?}", path.display()))?;
+    // `IpcError` implements `Display` and `std::error::Error`, so it chains into
+    // `anyhow` like any other error — `attach.rs` does the same — and the
+    // operator reads its sentence rather than its struct literal.
+    use anyhow::Context as _;
+    let lock =
+        tf_tree_ipc::LockFile::open(path).with_context(|| format!("opening {}", path.display()))?;
 
     println!("  slot       pid  mode    state    comm");
     let mut live_count = 0;

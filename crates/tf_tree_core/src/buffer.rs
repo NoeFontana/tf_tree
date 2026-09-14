@@ -297,7 +297,11 @@ impl SampleRing<'_> {
         if h > 0 {
             let last = self.stamps[((h - 1) & self.mask()) as usize].load(Ordering::Relaxed);
             if stamp < last {
-                return Err(PushError::NonMonotonicStamp { last, got: stamp });
+                return Err(PushError::NonMonotonicStamp {
+                    edge: self.edge,
+                    last,
+                    got: stamp,
+                });
             }
         }
         let idx = (h & self.mask()) as usize;

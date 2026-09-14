@@ -302,6 +302,15 @@ fn push_many_honours_a_stride() {
 ///
 /// Mutant: return the writer without going through `Tree::claim` ⇒ two live
 /// publishers on one edge, which is the invariant the whole engine is built on.
+///
+/// **And the refusal names the edge (D11).** `world -> robot` is the fixture's
+/// first declared edge, and the builder numbers edges from 1, so the refused
+/// edge is `1` — not `TFT_INVALID_ID`, which is what `tft_error.edge` read here
+/// until `ClaimApiError::AlreadyClaimed` carried the edge.
+///
+/// **Mutant:** delete `d.edge = edge.get();` from `map::claim`'s
+/// `AlreadyClaimed` arm. Applied: this test fails at the `edge` assertion —
+/// `left: 4294967295`, `right: 1`.
 #[test]
 fn a_second_claim_on_a_held_edge_is_refused() {
     let f = Fixture::new();
@@ -310,7 +319,9 @@ fn a_second_claim_on_a_held_edge_is_refused() {
         f.claim("robot", "world").unwrap_err(),
         TFT_ERR_ALREADY_CLAIMED
     );
-    assert_eq!(last_error().code, TFT_ERR_ALREADY_CLAIMED);
+    let e = last_error();
+    assert_eq!(e.code, TFT_ERR_ALREADY_CLAIMED);
+    assert_eq!(e.edge, 1, "the refused edge is named");
 }
 
 /// **Releasing gives the edge back**, and the released handle refuses to
@@ -347,7 +358,12 @@ fn claiming_a_static_edge_is_refused() {
 }
 
 /// **Stamps are non-decreasing per edge**, and a violation is reported with
-/// both the offending stamp and the edge's newest.
+/// both the offending stamp and the edge's newest — and the edge itself (D11;
+/// `world -> robot` is edge 1, see `a_second_claim_on_a_held_edge_is_refused`).
+///
+/// **Mutant:** delete `d.edge = edge.get();` from `map::push`'s
+/// `NonMonotonicStamp` arm. Applied: this test fails at the `edge` assertion —
+/// `left: 4294967295`, `right: 1`.
 #[test]
 fn a_backwards_stamp_is_refused_and_says_by_how_much() {
     let f = Fixture::new();
@@ -361,6 +377,7 @@ fn a_backwards_stamp_is_refused_and_says_by_how_much() {
     let e = last_error();
     assert_eq!(e.requested, 999);
     assert_eq!(e.newest, 1_000);
+    assert_eq!(e.edge, 1, "the refused edge is named");
 }
 
 /// **A left-handed matrix never reaches the arena**, through the shipped entry

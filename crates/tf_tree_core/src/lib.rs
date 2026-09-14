@@ -51,7 +51,10 @@
 //!   Phase 6 fills. [`arena_view`], [`buffer`], [`frame`], [`edge`]'s records,
 //!   [`participant`], [`counters`] and [`topology`] move with it. Depend on them
 //!   and expect to be rebuilt; that is what `tf_tree::unstable` says out loud
-//!   for the two of them the facade used to re-export.
+//!   for the two of them the facade used to re-export. **The exception is
+//!   [`ParticipantError`]**: it is the payload of the stable
+//!   `tf_tree::BuildError::Participant`, so the facade re-exports it at its
+//!   root and it is on the promise with the other error types.
 //!
 //! ## The `#[non_exhaustive]` rule this crate applies
 //!
