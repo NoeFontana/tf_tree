@@ -228,9 +228,17 @@ CASES = [
     (_too_deep, tf_tree.TfTreeError, ()),
     (_too_long_a_walk, tf_tree.TfTreeError, ()),
     (_at_the_seam, tf_tree.TfTreeError, ()),
-    (_non_monotonic_push, tf_tree.TfTreeError, ("world_a", "chassis_b")),
-    (_non_monotonic_push_many, tf_tree.TfTreeError, ("world_a", "chassis_b")),
-    (_non_monotonic_module_push, tf_tree.TfTreeError, ("world_a", "chassis_b")),
+    (_non_monotonic_push, tf_tree.NonMonotonicStampError, ("world_a", "chassis_b")),
+    (
+        _non_monotonic_push_many,
+        tf_tree.NonMonotonicStampError,
+        ("world_a", "chassis_b"),
+    ),
+    (
+        _non_monotonic_module_push,
+        tf_tree.NonMonotonicStampError,
+        ("world_a", "chassis_b"),
+    ),
     (_claim_reversed_pair, tf_tree.TfTreeError, ("world_a", "chassis_b")),
     # All three names: the two the caller typed, and `chassis_b` — the parent
     # the arena actually records, which is the fact they did not have.
@@ -333,6 +341,19 @@ ATTRIBUTES = {
     _derivatives_unavailable: {"edge": ("world_a", "chassis_b")},
     _no_segment: {"edge": ("world_a", "chassis_b")},
     _span_of_a_silent_edge: {"edge": ("chassis_b", "sensor_c")},
+    # `_chain()` publishes 1000 and 2000; `push_many` publishes 9000 and then
+    # refuses 8000, so its `last` is the stamp it just wrote.
+    _non_monotonic_push: {"edge": ("world_a", "chassis_b"), "last": 2_000, "got": 500},
+    _non_monotonic_push_many: {
+        "edge": ("world_a", "chassis_b"),
+        "last": 9_000,
+        "got": 8_000,
+    },
+    _non_monotonic_module_push: {
+        "edge": ("world_a", "chassis_b"),
+        "last": 2_000,
+        "got": 500,
+    },
 }
 
 
@@ -370,6 +391,22 @@ def test_a_raised_exception_carries_exactly_its_classs_attributes(trigger, exc_t
     * build ``ExtrapolationError::new_err((msg, requested))``, still setting
       the attribute => the ``extrapolation`` row fails on ``assert 2 == 1``,
       ``len(e.args)``. ``vars(e)`` alone would have passed it.
+
+    `NonMonotonicStampError` (`0058` step 4), the same way:
+
+    * delete `push_class`'s ``NonMonotonicStamp`` arm => all three
+      ``non_monotonic_*`` rows fail here, in the message table above (the base
+      ``tf_tree.TfTreeError`` escapes ``pytest.raises``) and in the pickle
+      table, and so does the long-name test below: ``10 failed``.
+    * set the attributes in `push_err` only, with `push_class` raising the
+      class bare => only the ``non_monotonic_push_many`` row fails, on
+      ``('_non_monotonic_push_many', {})``, plus the stub test on the same
+      instance; the two scalar rows pass, because `push_many` builds its
+      exception through `push_class` and never calls `push_err`. (A first
+      spelling of this mutant added the `push_err` copy but left `push_class`'s
+      in place, and passed: it was not the mutant.)
+    * swap ``last`` and ``got`` => the three rows fail, the first on
+      ``'last': 500, 'got': 2000``.
     """
     e = _raised(trigger)
     assert type(e) is exc_type
@@ -420,6 +457,36 @@ def test_a_caller_constructed_exception_carries_no_attributes():
     assert not hasattr(built, "requested")
     assert vars(built) == {}
     assert _stub_annotations("ExtrapolationError")["requested"] == "int"
+
+
+#: A child name past the 48 bytes a frame record stores (`0058` measurement 5):
+#: the arena keeps a truncated copy, so the stored pair and the typed pair differ.
+LONG_CHILD = "sensor_" + "x" * 60
+
+
+def test_a_push_error_names_the_stored_edge_not_the_typed_one():
+    """`NonMonotonicStampError.edge` is resolved from the variant's `EdgeId`.
+
+    `0058` §2 chose the arena's stored pair over the names the caller typed, so
+    `e.edge` is a member of `Tree.edges()`. The two spellings differ only for a
+    name over 48 bytes, which is the only case this row can tell them apart in;
+    `_chain()`'s short names cannot. **This row depends on `0027`**: if
+    `intern` comes to refuse names over 48 bytes the spellings never differ,
+    this row cannot be built, and the change that lands `0027` deletes it.
+
+    Mutant: the module-level ``push`` overwrites ``.edge`` with the caller's
+    ``(parent, child)`` => this test alone fails, ``At index 1 diff:
+    'sensor_xxx…' (67 bytes) != 'sensor_xxx…' (48 bytes)``. The three
+    ``non_monotonic_*`` rows pass under it, as they must: their names are short.
+    """
+    t = tf_tree.build([("world_a", LONG_CHILD)])
+    tf_tree.push(t, LONG_CHILD, "world_a", 1_000, POSE)
+    with pytest.raises(tf_tree.NonMonotonicStampError) as excinfo:
+        tf_tree.push(t, LONG_CHILD, "world_a", 500, POSE)
+    e = excinfo.value
+    assert e.edge == t.edges()[0]
+    assert e.edge != ("world_a", LONG_CHILD)
+    assert len(e.edge[1].encode()) == 48
 
 
 def _assert_prose(msg, names):
@@ -721,7 +788,7 @@ def test_a_batch_push_keeps_the_scalar_sentence_and_only_prefixes_it():
 #: Every exception class the package exports. Counted, not just collected: a
 #: set built from `vars(tf_tree)` that came back empty would make the class
 #: test below pass on nothing.
-EXPECTED_EXCEPTION_COUNT = 11
+EXPECTED_EXCEPTION_COUNT = 12
 
 
 def _exception_classes():

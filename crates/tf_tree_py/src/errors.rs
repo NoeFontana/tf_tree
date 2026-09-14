@@ -156,6 +156,14 @@ create_exception!(
 );
 create_exception!(
     tf_tree,
+    NonMonotonicStampError,
+    TfTreeError,
+    "A pushed stamp is older than the newest one already published on its edge.\n\n\
+     Attributes: edge, last (the newest published stamp), got (the refused one). \
+     They exist only on instances the library raises."
+);
+create_exception!(
+    tf_tree,
     ChildProcessDetachedError,
     TfTreeError,
     "This handle was inherited across a fork(); the child has no mapping and \
@@ -190,6 +198,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "TimeDomainMismatchError",
         py.get_type::<TimeDomainMismatchError>(),
+    )?;
+    m.add(
+        "NonMonotonicStampError",
+        py.get_type::<NonMonotonicStampError>(),
     )?;
     Ok(())
 }
@@ -1169,32 +1181,54 @@ fn stored_interp(interp: u8) -> String {
 
 /// Map a failed `push` onto Python, naming the edge the caller claimed.
 ///
-/// `edge` is a label from [`edge_label_of`], not an id: a [`PushError`] is
-/// raised through a `Publisher`, and a publisher was created from the two frame
-/// *names* the caller typed. Resolving an id back into those names through the
-/// arena would be a slower way to reach a worse answer — the caller's own
-/// spelling is what they will search their source for.
+/// **The message's `edge` is a label from [`edge_label_of`], not an id**: a
+/// [`PushError`] is raised through a `Publisher`, and a publisher was created
+/// from the two frame *names* the caller typed, which is the spelling they will
+/// search their source for. The `.edge` *attribute* is the other spelling, the
+/// arena's stored pair resolved from the variant's `EdgeId`
+/// (`docs/decisions/0058` §2), which is what `Tree.edges()` returns; the two
+/// differ only for a name longer than the 48 bytes a frame record stores.
 ///
-/// Every arm but one raises the base `TfTreeError` — which is what the
-/// `format! ("{e:?}")` this replaces raised. The one is `ChildDetached`, which
-/// raises [`ChildProcessDetachedError`] exactly as [`detached_err`] does: a
-/// forked child's first call on an inherited `Publisher` is `push`, and §8.1
-/// does not have a per-method exception. The class and the sentence are
-/// therefore chosen apart — [`push_class`] and [`push_msg`] — because
-/// `push_many` prefixes the sample index to the sentence and must not re-word
-/// it, and must not re-*type* it either.
-pub(crate) fn push_err(edge: &str, e: PushError) -> PyErr {
-    push_class(e)(push_msg(edge, e))
+/// Two arms raise a class of their own and the rest the base `TfTreeError`.
+/// `ChildDetached` raises [`ChildProcessDetachedError`] exactly as
+/// [`detached_err`] does: a forked child's first call on an inherited
+/// `Publisher` is `push`, and §8.1 does not have a per-method exception.
+/// `NonMonotonicStamp` raises [`NonMonotonicStampError`] with `.edge`, `.last`
+/// and `.got` (`0058` §4). The class and the sentence are chosen apart —
+/// [`push_class`] and [`push_msg`] — because `push_many` prefixes the sample
+/// index to the sentence and must not re-word it, and must not re-*type* it or
+/// lose its attributes either.
+///
+/// `tree` is `None` only where the publisher's tree is already gone, which a
+/// held claim prevents; `.edge` is then `None`.
+pub(crate) fn push_err(py: Python<'_>, tree: Option<&Tree>, edge: &str, e: PushError) -> PyErr {
+    push_class(py, tree, e)(push_msg(edge, e))
 }
 
-/// The exception class for a failed push, apart from its sentence.
+/// The exception for a failed push, apart from its sentence: its class and its
+/// attributes.
 ///
 /// A constructor rather than a `PyErr`, so `push_many` can hand it a message
-/// with the sample index already in front.
-pub(crate) fn push_class(e: PushError) -> fn(String) -> PyErr {
-    match e {
-        PushError::ChildDetached => ChildProcessDetachedError::new_err,
-        _ => TfTreeError::new_err,
+/// with the sample index already in front — and **the attributes are set
+/// here**, not in [`push_err`], because `push_many` never calls that.
+pub(crate) fn push_class<'a>(
+    py: Python<'a>,
+    tree: Option<&'a Tree>,
+    e: PushError,
+) -> impl FnOnce(String) -> PyErr + 'a {
+    move |msg| match e {
+        PushError::ChildDetached => ChildProcessDetachedError::new_err(msg),
+        PushError::NonMonotonicStamp { edge, last, got } => {
+            with_attrs(py, NonMonotonicStampError::new_err(msg), |x| {
+                x.setattr(
+                    "edge",
+                    tree.and_then(|t| named_edge_in(&t.arena_view(), edge)),
+                )?;
+                x.setattr("last", last)?;
+                x.setattr("got", got)
+            })
+        }
+        _ => TfTreeError::new_err(msg),
     }
 }
 

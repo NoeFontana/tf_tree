@@ -2124,7 +2124,7 @@ impl PyPublisher {
 
     /// Publish `[qw, qx, qy, qz, tx, ty, tz]` at `stamp_ns`.
     #[pyo3(signature = (stamp_ns, quat7, /))]
-    fn push(&self, stamp_ns: &Bound<'_, PyAny>, quat7: Vec<f64>) -> PyResult<()> {
+    fn push(&self, py: Python<'_>, stamp_ns: &Bound<'_, PyAny>, quat7: Vec<f64>) -> PyResult<()> {
         // The stamp first, as `at_into` checks it first: §3's refusal is the
         // one that carries a measurement, and `Tree.lookup` says why this is
         // `&PyAny`. The `signature` above is what keeps `METH_FASTCALL`, and
@@ -2133,7 +2133,8 @@ impl PyPublisher {
         let iso = iso_from_quat7(&quat7)?;
         let g = self.lock()?;
         let p = g.as_ref().ok_or_else(released)?;
-        p.push(stamp_ns, &iso).map_err(|e| push_err(&self.edge, e))
+        p.push(stamp_ns, &iso)
+            .map_err(|e| push_err(py, self.tree.upgrade().as_deref(), &self.edge, e))
     }
 
     /// Publish a whole batch: `(N,)` stamps and `(N, 7)` poses.
@@ -2177,6 +2178,7 @@ impl PyPublisher {
         if st.is_empty() && self.tree.upgrade().is_some_and(|t| t.detached()) {
             return Err(detached_err());
         }
+        let py = stamps.py();
         for (i, stamp) in st.iter().enumerate() {
             let iso = iso_from_quat7(&po[i * 7..(i + 1) * 7])?;
             p.push(*stamp, &iso).map_err(|e| {
@@ -2187,7 +2189,7 @@ impl PyPublisher {
                 // scalar `push` produces for the same failure — and not
                 // re-typed, so a fork child meets `ChildProcessDetachedError`
                 // here as it does from `push` (`docs/PHASE3.md` §8.1).
-                push_class(e)(format!(
+                push_class(py, self.tree.upgrade().as_deref(), e)(format!(
                     "sample {i} (stamp {stamp}): {}",
                     push_msg(&self.edge, e)
                 ))
@@ -2626,7 +2628,7 @@ pub fn push(
         .map_err(|e| claim_err(&tree.inner, parent, child, e))?;
     publisher
         .push(stamp_ns, &iso)
-        .map_err(|e| push_err(&edge_label_of(parent, child), e))
+        .map_err(|e| push_err(py, Some(&tree.inner), &edge_label_of(parent, child), e))
 }
 
 /// Attach to a running arena (`docs/PHASE3.md` §4.1).

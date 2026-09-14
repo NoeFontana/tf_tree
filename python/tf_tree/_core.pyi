@@ -99,6 +99,22 @@ class TimeDomainMismatchError(TfTreeError):
     expected: int
     got: int
 
+class NonMonotonicStampError(TfTreeError):
+    """A pushed stamp is older than the newest one already published on its edge.
+
+    Raised by `Publisher.push`, `Publisher.push_many` and `tf_tree.push`. Equal
+    stamps are accepted, so this means strictly older. The attributes exist
+    only on instances the library raises: `last` is the newest published stamp
+    and `got` the refused one, both integer nanoseconds, and `edge` is the
+    arena's stored `(parent, child)` pair, which for a name longer than 48
+    bytes is the truncated one `Tree.edges()` lists. `push_many` publishes the
+    samples before the refused one; its message names the index.
+    """
+
+    edge: tuple[str, str] | None
+    last: int
+    got: int
+
 class ChildProcessDetachedError(TfTreeError):
     """This handle was inherited across a `fork()` and cannot be used.
 

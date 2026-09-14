@@ -75,6 +75,14 @@ existing `except` clause catches exactly what it caught before.
   domain=)` per query. **Migration:** `except tf_tree.TfTreeError` still
   catches it; a check of `type(e) is tf_tree.TfTreeError` around either call no
   longer matches, and should become `except tf_tree.TimeDomainMismatchError`.
+- **`NonMonotonicStampError(TfTreeError)` is new**, with `.edge`, `.last` (the
+  newest published stamp) and `.got` (the refused one). `Publisher.push`,
+  `Publisher.push_many` and `tf_tree.push` raise it for a stamp older than the
+  newest on its edge. `.edge` is the arena's stored pair, resolved from the
+  error's edge id, so for a frame name over 48 bytes it is the truncated pair
+  `Tree.edges()` lists and not the one you typed; the message keeps your
+  spelling. **Migration:** `except tf_tree.TfTreeError` still catches it; a
+  `type(e) is tf_tree.TfTreeError` check around a push no longer matches.
 - `just py-test` and `just py-test-freethreaded` now run `cargo build -p tf_tree
   --features shm --bin tf_tree_rendezvous_child` first: `TopologyChangedError`'s
   two attributes are held by a test that spawns that helper's `join-reparent`.
