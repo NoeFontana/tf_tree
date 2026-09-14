@@ -541,7 +541,7 @@ Stamps live in a **separate** array of `AtomicI64`, so binary search touches 8 s
 
 ### 6.2 Publish protocol (single writer)
 
-> **Two lines of the listing below were corrected in place** — it had drifted
+> **The listing below was corrected in place, four times** — it had drifted
 > from the shipped `SampleRing::push`, and this section is normative, so the
 > listing is now the amended version rather than the original with a note
 > attached. What changed, and why, so a reader comparing this against an older

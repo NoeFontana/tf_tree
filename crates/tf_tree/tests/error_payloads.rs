@@ -3,9 +3,12 @@
 //! has a `Display` is printed with it rather than dumped with `Debug`, and the
 //! two writer-path refusals name the edge they are about (D11).
 //!
-//! This target carries no `#[cfg(feature = ...)]`, so it compiles in the
-//! facade's default feature set. `IpcError`'s re-export is `shm`-gated and is
-//! exercised where the rendezvous tests match on it, by its facade path.
+//! This target carries no crate-level `#[cfg(feature = ...)]`, so it compiles in
+//! the facade's default feature set. The one `shm`-gated item in it,
+//! [`every_ipc_error_payload_is_nameable_through_the_facade`], pins `IpcError`
+//! and the eight types its variants carry; `just shm-check`'s
+//! `cargo clippy -p tf_tree --features shm --all-targets` line is what compiles
+//! it, and a compile is the whole of what it asserts.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
@@ -32,6 +35,55 @@ fn every_public_error_payload_is_nameable_through_the_facade() {
     let _: fn(FrameError) -> BuildError = BuildError::Frame;
     let _: fn(TopologyError) -> ReparentError = ReparentError::Topology;
     let _: fn(FrameError) -> AwaitError = AwaitError::Frame;
+}
+
+/// The same pin for `OpenError::Rendezvous`'s payload, under the feature that
+/// exports it. `IpcError` itself by constructor coercion, and each of the eight
+/// types its variants carry by a typed binding on the field that holds it, so a
+/// name missing from the facade's `pub use tf_tree_ipc::{..}` list is `E0432`
+/// and a same-named stand-in is `E0308`. Nothing else named these eight through
+/// `tf_tree::` — `tests/rendezvous.rs` matches only two field-less `IpcError`
+/// variants — so before this item any of them could be dropped from the list
+/// with every gate green.
+///
+/// **Mutant:** drop `LockRole` from the facade's `pub use tf_tree_ipc::{..}`
+/// list. Applied: `cargo clippy -p tf_tree --features shm --all-targets` fails
+/// on this target and no other — `error[E0432]: unresolved import
+/// `tf_tree::LockRole``, while the library itself still compiles.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+#[test]
+fn every_ipc_error_payload_is_nameable_through_the_facade() {
+    use tf_tree::{
+        EnvVar, HelloStatus, IpcError, LockRole, NameProblem, OpenError, ProcError, ProcParseError,
+        RuntimeDirSource, WireError,
+    };
+
+    let _: fn(IpcError) -> OpenError = OpenError::Rendezvous;
+    let _: fn(WireError) -> IpcError = IpcError::HandshakeMalformed;
+    let _: fn(ProcError) -> IpcError = IpcError::Proc;
+
+    fn fields(e: IpcError) {
+        match e {
+            IpcError::RuntimeDirNotADirectory { source } => {
+                let _: RuntimeDirSource = source;
+            }
+            IpcError::NameInvalid { var, problem } => {
+                let _: EnvVar = var;
+                let _: NameProblem = problem;
+            }
+            IpcError::LockFailed { role, .. } => {
+                let _: LockRole = role;
+            }
+            IpcError::RejectionCarriedFd { status } => {
+                let _: HelloStatus = status;
+            }
+            IpcError::Proc(ProcError::Parse { cause, .. }) => {
+                let _: ProcParseError = cause;
+            }
+            _ => {}
+        }
+    }
+    fields(IpcError::ArenaAbsent);
 }
 
 /// A wrapper prints its payload's prose, not the payload's struct literal.

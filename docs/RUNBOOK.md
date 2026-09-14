@@ -134,10 +134,17 @@ occupancy.
 Two nodes are configured to publish the same edge. This is a **genuine
 configuration error**, and `tf_tree` reports it rather than silently averaging
 the two streams into garbage the way a multi-publisher `/tf` topic does.
-The error names the edge and the owning **participant slot**, not a pid — the
-facade's `ClaimApiError::AlreadyClaimed { edge, cause }` and C's
-`tft_error.edge` / `frame_a` carry both — and `doctor`'s `multi-writer` check
-turns the slot into a PID.
+The error names the edge and the owning **participant slot**, not a pid: the
+facade's `ClaimApiError::AlreadyClaimed { edge, cause }` carries both, and so
+does C's `tft_error` from `tft_tree_claim` (and the C++ wrapper over it) —
+`edge`, and the slot in `frame_a`. **`tft_bridge_create` is the exception**: it
+fills `edge` but overwrites `frame_a`/`frame_b` with the refused link's parent and
+child `FrameId`s, so on a bridge `frame_a` is a frame, not a slot. To turn the
+slot into a process, `tf_tree participants` prints one line per slot with its
+pid, and `tf_tree tree`'s writer column shows the holder's pid for each claimed
+edge. `doctor`'s `multi-writer` check (`TFT001`) is **not** the tool here: it
+counts writer pids in a recorded push history, and a refused claim never
+publishes, so it cannot see this collision.
 
 Decide which node owns the edge and stop the other. If you are bridging from
 ROS, the ingest bridge's conflict policy (`FirstWriterWins` by default) is where

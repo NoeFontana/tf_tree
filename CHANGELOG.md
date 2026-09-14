@@ -64,7 +64,10 @@ trait impl is gone; migration is mechanical:
   `TFT_INVALID_ID`), and for a `TFT_ERR_TIME_DOMAIN` raised because a path's
   dynamic edges disagree among themselves. The field already existed and the
   header already allowed either value. `frame_a` still carries the owner slot on
-  `TFT_ERR_ALREADY_CLAIMED`. `tft_plan_create` gains an *Errors* section saying
+  `TFT_ERR_ALREADY_CLAIMED` from `tft_tree_claim` — but not from
+  `tft_bridge_create`, which overwrites `frame_a`/`frame_b` with the refused
+  link's parent and child frame ids, as it did before. `tft_plan_create` gains
+  an *Errors* section saying
   what `TFT_ERR_UNKNOWN_FRAME`, `TFT_ERR_NO_DATA` and `TFT_ERR_TIME_DOMAIN` mean
   when compilation raises them — a topology read that found no consistent
   snapshot or a corrupt parent index, a parent link with no edge, and a path

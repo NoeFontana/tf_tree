@@ -329,13 +329,15 @@ pub use open::Inheritance;
 pub use open::CRASH_SITES;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::{open, CreatePolicy, Open, OpenError};
-/// The payload of [`OpenError::Rendezvous`], and every type one of its variants
-/// carries, so a caller can dispatch on the rendezvous refusal — `IpcError` is
-/// deliberately not `#[non_exhaustive]` for that reason — without adding
-/// `tf_tree_ipc` as a second direct dependency. `CreatePolicy` above is the
-/// precedent, on the same argument. The one type deliberately left out is
-/// `rustix::io::Errno` inside `IpcError::LockFailed`, as `ShmError` and
-/// `FrozenError` already leave theirs out.
+// The payload of `OpenError::Rendezvous`, and every type one of its variants
+// carries, so a caller can dispatch on the rendezvous refusal — `IpcError` is
+// deliberately not `#[non_exhaustive]` for that reason — without adding
+// `tf_tree_ipc` as a second direct dependency. `CreatePolicy` above is the
+// precedent, on the same argument. The one type deliberately left out is
+// `rustix::io::Errno` inside `IpcError::LockFailed`, as `ShmError` and
+// `FrozenError` already leave theirs out. A `//` comment, not `///`: rustdoc
+// inlines a cross-crate re-export and prepends a `///` here to every one of the
+// nine items' own docs, so each would have opened with this paragraph.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use tf_tree_ipc::{
     EnvVar, HelloStatus, IpcError, LockRole, NameProblem, ProcError, ProcParseError,

@@ -112,7 +112,7 @@ pub enum ProcParseError {
     /// [`crate::parse_start_time`] for why the *last* one is the only safe
     /// anchor.
     NoClosingParen,
-    /// Fewer than 22 fields after `comm`.
+    /// The line ends before field 22 (`starttime`), counting `comm` as field 2.
     TooFewFields,
     /// Field 22 is not a decimal integer.
     NotAnInteger,
@@ -686,7 +686,9 @@ impl fmt::Display for ProcError {
                 write!(f, "/proc/{pid}/stat did not parse: ")?;
                 match cause {
                     ProcParseError::NoClosingParen => f.write_str("no ')' delimits comm"),
-                    ProcParseError::TooFewFields => f.write_str("fewer than 22 fields after comm"),
+                    ProcParseError::TooFewFields => {
+                        f.write_str("the line ends before field 22 (starttime)")
+                    }
                     ProcParseError::NotAnInteger => {
                         f.write_str("field 22 is not a decimal integer")
                     }
