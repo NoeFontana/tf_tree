@@ -589,7 +589,16 @@ its defence in depth.
   `lock_file` carries the claim leases *and* A2's topology byte, byte 1
   ([`0029`](./0029-the-topology-lock-is-a-kernel-lock.md); `Tree::lock_file`'s
   field doc). Close only the first, and the dead owner's edges stay held for the
-  dump, and so does byte 1 if it died inside `reparent`. Close the second too,
+  dump, and so does byte 1 if it died inside `reparent` — **and the participant
+  byte goes with byte 0**, so a read-write survivor's `Tree::reap_participants`,
+  or the heir's slot assigner, may reclaim the dying owner's record and grant its
+  slot index while the owner's other threads still act under it: two live
+  processes on one slot index, the uniqueness A3's claims and A2's topology lock
+  rest on ([`0028`](./0028-the-slot-a-killed-participant-keeps.md)'s review found
+  the same state by another route). A handler that must not do that releases
+  byte 0 **alone** — `F_OFD_SETLK` with `F_UNLCK` on the session's description,
+  which is what `Session::release_ownership` already does and which `fcntl`'s
+  async-signal-safety permits — rather than closing the description. Close the second too,
   and both become takeable while other threads of the dying process may still be
   running. A claim can then be reaped beside a thread still inside `push`, which
   is the zombie writer §6.1 makes impossible by construction; A4's epoch check,
@@ -635,7 +644,9 @@ costs and what is left to an operator.
 
 1. **Correctness outranks latency, and the handler's two halves fail it
    differently.**
-   - *(a) Byte 0.* Releasing it from a handler while the serving thread keeps
+   - *(a) Byte 0.* Releasing it from a handler — by `F_UNLCK` on byte 0 alone;
+     closing the session's description would take the participant byte with it,
+     which is corrupting, above — while the serving thread keeps
      running breaks §3.5 requirement 5, which is NORMATIVE, and no crash-matrix
      walk exists for it. Closing the listener and the accepted sockets first
      narrows the window and does not close it, and the project does not accept
@@ -676,6 +687,17 @@ costs and what is left to an operator.
 **What would reopen it:** field evidence from a deployment that needs both the
 core and recovery shorter than its dump, accompanied by the §3.5 requirement 5
 walk and the measured chaining that the hazard list above demands.
+
+**And the shape a reopening should take is not the one rejected here.** Reason 2
+rules out a *library-installed* handler whatever reason 1's walk concludes, so
+the candidate is an opt-in, async-signal-safe release call that an application
+invokes from the crash handler it already owns — a Crashpad or Breakpad callback,
+or its own `sigaction` — and that does only the non-corrupting half: close the
+rendezvous listener and accepted sockets, then `F_UNLCK` byte 0, leaving the
+participant byte and the tree's `lock_file` untouched. Disposition ownership stays
+with the application, and what the call still owes is requirement 5's walk,
+`0030`'s registry rules for the descriptor numbers it reads, and the failing test
+*Open questions* 1 describes.
 *Open questions* 1 keeps the full list of what a reopening would have to
 bring.
 
