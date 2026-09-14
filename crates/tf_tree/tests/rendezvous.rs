@@ -4625,6 +4625,74 @@ fn two_survivors_race_and_exactly_one_inherits() {
 /// the middle one fails on `still being told the owner is gone`. That asymmetry
 /// is the point: the old code was right about the state anybody tested and wrong
 /// about the one a deployment sits in.
+///
+/// # One of the two pins of §3.5's NORMATIVE sentence
+///
+/// `docs/PHASE2.md` §3.5: *"`owner_lost()` answers `true` once the survivor's
+/// attach connection has hung up and the last open file description holding
+/// byte 0 has closed … tf_tree adds no delay, heartbeat or timeout to that
+/// event (D17)."*
+/// [`0057`](../../../docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)
+/// Decision 5 names this test and
+/// `a_read_only_survivor_reports_that_it_cannot_inherit` as its pin.
+/// `Kid::kill` is `SIGKILL` and then `waitpid`, and the kernel closes a dying
+/// process's files — the socket's final release, which raises the peer's
+/// `POLLHUP`, and `locks_remove_file`, which frees byte 0 — before
+/// `exit_notify()` makes it reapable. That ordering is read from kernel source,
+/// and `0057`'s probe agrees with it in 120 of 120 trials. So by the time `kill`
+/// returns the event has happened, and the **first** `owner_lost()` after it
+/// may not answer `false`.
+///
+/// **What this pins is the event, not a duration**: no `false` after the close.
+/// It has no timing threshold, so it cannot see a call that blocks and then
+/// answers `true` (slow, not wrong), and it does not bound the core-dump window
+/// or the address-space teardown that come before the close — those are the
+/// host's, and `0057`'s paragraph after its *Implementation plan* steps says why
+/// neither is tested here.
+///
+/// **Its one legitimate failure is a third party.** Another task holding a
+/// transient reference to the dead owner's socket or lock-file description — a
+/// `/proc/<pid>/fd` reader such as `lsof`, `ss -p` or a monitoring agent,
+/// `pidfd_getfd`, a descriptor in flight in `SCM_RIGHTS` — moves the final
+/// `fput` into that task, possibly after the reap. tf_tree sends only the
+/// segment over `SCM_RIGHTS`, so that is a scanner on the host, and the
+/// assertion's message says so. The other preconditions `0057` lists — no fork
+/// child of the owner, no `open()` inside §3.4 steps 2–4, no other survivor
+/// inheriting first — this test meets by construction.
+///
+/// Here it is asserted twice: the heir's first poke after the owner's reap, and
+/// the other survivor's first poke after the *heir's* reap — the migration case,
+/// where that survivor's socket hung up long ago and byte 0 alone decides.
+/// Survivors are poked one at a time, so no other survivor inherits between a
+/// reap and the call.
+///
+/// **Mutant, run (2026-09-14), a two-observation latch:** in `Tree::owner_lost`,
+/// after the `peer_hung_up` early return, a
+/// `static SEEN: AtomicU32` and `if SEEN.fetch_add(1, Relaxed) < 1 { return false; }`.
+/// Both pins fail. Here the first poke read `false Inherited 1`: the poke's own
+/// `owner_lost()` was the first observation and answered `false`, and
+/// `inherit_ownership`'s internal call was the second, so the role was taken by
+/// a process that had just been told the owner was alive — the failure is on
+/// `the first survivor should have inherited`.
+///
+/// **Mutant, run (2026-09-14), a grace period:** the same site, a
+/// `static FIRST: OnceLock<Instant>` and `false` until 100 ms after the first
+/// hangup seen. Both pins fail. Here the first poke read `false OwnerAlive 1`:
+/// both calls fell inside the grace period, nothing was attempted, and a vacant
+/// role was reported as held.
+///
+/// Neither of those reaches the migration assertion: both fail at the heir's
+/// first poke. **Mutant, run (2026-09-14), a latch on the migration path
+/// only:** in `Tree::owner_lost`, replacing
+/// `!session.ownership_held().unwrap_or(true)` with a
+/// `static SEEN_HELD: AtomicBool` set whenever byte 0 reads held after a
+/// hangup, and a `static FIRED: AtomicBool` that answers `false` on the first
+/// byte-0-free reading taken after `SEEN_HELD`. The heir's first poke stays
+/// green (it never saw byte 0 held), and so does the read-only pin (its only
+/// post-hangup reading is free). This test fails on the migration assertion,
+/// `the second owner died and the survivor did not notice: false Inherited 2`:
+/// the survivor was told the role was held after the last description holding
+/// it had closed, and `inherit_ownership`'s own call then took it.
 #[test]
 fn a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone() {
     let dir = Scratch::new("inherit-loser");
@@ -4649,7 +4717,13 @@ fn a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone() {
     let taken = heir.line();
     assert!(
         taken.starts_with("true Inherited "),
-        "the first survivor should have inherited from the dead owner: {taken}"
+        "the first survivor should have inherited from the dead owner: {taken}. \
+         The owner was SIGKILLed and reaped, so its files were closed: a leading \
+         `false` is owner_lost() answering false after the close, which \
+         PHASE2 §3.5's NORMATIVE sentence forbids (0057 Decision 5). Its one \
+         legitimate cause is another task holding a transient reference to the \
+         dead owner's socket or lock-file description — a /proc/<pid>/fd reader \
+         (lsof, ss -p, a monitoring agent) — on this host"
     );
 
     // **The defect.** The other survivor's socket is hung up and always will be.
@@ -4682,7 +4756,13 @@ fn a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone() {
     let third = other.line();
     assert!(
         third.starts_with("true "),
-        "the second owner died and the survivor did not notice: {third}"
+        "the second owner died and the survivor did not notice: {third}. \
+         The heir was SIGKILLed and reaped, so the last description holding \
+         byte 0 was closed, and PHASE2 §3.5's NORMATIVE sentence forbids a \
+         false after that (0057 Decision 5). Its one legitimate cause is \
+         another task holding a transient reference to the dead heir's \
+         lock-file description — a /proc/<pid>/fd reader (lsof, ss -p, a \
+         monitoring agent) — on this host"
     );
     assert_eq!(
         outcome(&third),
@@ -4710,6 +4790,59 @@ fn a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone() {
 /// the read-only tree reports `Inherited` instead of `ReadOnly` — it takes the
 /// ownership byte it cannot serve behind, which is the state that makes an arena
 /// unjoinable and the exact failure the guard exists to prevent.
+///
+/// # One of the two pins of §3.5's NORMATIVE sentence
+///
+/// `docs/PHASE2.md` §3.5: *"`owner_lost()` answers `true` once the survivor's
+/// attach connection has hung up and the last open file description holding
+/// byte 0 has closed … tf_tree adds no delay, heartbeat or timeout to that
+/// event (D17)."*
+/// [`0057`](../../../docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)
+/// Decision 5 names this test and
+/// `a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone` as its pin.
+/// `Kid::kill` is `SIGKILL` and then `waitpid`, and the kernel closes a dying
+/// process's files — the socket's final release, which raises the peer's
+/// `POLLHUP`, and `locks_remove_file`, which frees byte 0 — before
+/// `exit_notify()` makes it reapable. That ordering is read from kernel source,
+/// and `0057`'s probe agrees with it in 120 of 120 trials. So by the time `kill`
+/// returns the event has happened, and the **first** `owner_lost()` after it
+/// may not answer `false`.
+///
+/// **What this pins is the event, not a duration**: no `false` after the close.
+/// It has no timing threshold, so it cannot see a call that blocks and then
+/// answers `true` (slow, not wrong), and it does not bound the core-dump window
+/// or the address-space teardown that come before the close — those are the
+/// host's, and `0057`'s paragraph after its *Implementation plan* steps says why
+/// neither is tested here.
+///
+/// **Its one legitimate failure is a third party.** Another task holding a
+/// transient reference to the dead owner's socket or lock-file description — a
+/// `/proc/<pid>/fd` reader such as `lsof`, `ss -p` or a monitoring agent,
+/// `pidfd_getfd`, a descriptor in flight in `SCM_RIGHTS` — moves the final
+/// `fput` into that task, possibly after the reap. tf_tree sends only the
+/// segment over `SCM_RIGHTS`, so that is a scanner on the host, and the
+/// assertion's message says so. The other preconditions `0057` lists — no fork
+/// child of the owner, no `open()` inside §3.4 steps 2–4, no other survivor
+/// inheriting first — this test meets by construction.
+///
+/// Here it is the `assert!(ro.owner_lost(), …)` straight after `owner.kill()`,
+/// in this process, with no joiner and no other survivor. `owner_lost` does not
+/// read the mapping's protection, so a read-only survivor asks the same
+/// question a read-write one does.
+///
+/// **Mutant, run (2026-09-14), a two-observation latch:** in `Tree::owner_lost`,
+/// after the `peer_hung_up` early return, a
+/// `static SEEN: AtomicU32` and `if SEEN.fetch_add(1, Relaxed) < 1 { return false; }`.
+/// Both pins fail; this one on `a read-only attachment missed the hangup`.
+///
+/// **Mutant, run (2026-09-14), a grace period:** the same site, a
+/// `static FIRST: OnceLock<Instant>` and `false` until 100 ms after the first
+/// hangup seen. Both pins fail; this one on the same assertion.
+///
+/// The migration-only latch recorded on
+/// `a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone` passes
+/// here, as it must: this survivor never reads byte 0 held after a hangup, so
+/// that half of the pin is the other test's alone.
 #[test]
 fn a_read_only_survivor_reports_that_it_cannot_inherit() {
     use tf_tree::{AttachMode, Inheritance};
@@ -4736,7 +4869,16 @@ fn a_read_only_survivor_reports_that_it_cannot_inherit() {
 
     // The owner's death is visible to a read-only consumer too — the socket is
     // the liveness signal regardless of the mapping's protection (D17).
-    assert!(ro.owner_lost(), "a read-only attachment missed the hangup");
+    assert!(
+        ro.owner_lost(),
+        "a read-only attachment missed the hangup. The owner was SIGKILLed and \
+         reaped, so its socket and byte 0 were closed, and PHASE2 §3.5's \
+         NORMATIVE sentence forbids owner_lost() answering false after that \
+         (0057 Decision 5). Its one legitimate cause is another task holding a \
+         transient reference to the dead owner's socket or lock-file \
+         description — a /proc/<pid>/fd reader (lsof, ss -p, a monitoring \
+         agent) — on this host"
+    );
     assert_eq!(
         ro.inherit_ownership().unwrap(),
         Inheritance::ReadOnly,

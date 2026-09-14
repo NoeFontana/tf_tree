@@ -41,6 +41,63 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — a dying owner is seen at the end of its exit, and the shipped docs said microseconds
+
+[`0057`](docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)
+step 3: the release-visible half of what step 2 corrected in the specs. **No
+behaviour changes**; the docs a Rust, C and Python integrator reads now say
+what the code has always done.
+
+- **`Tree::owner_lost` read *"`POLLHUP` in microseconds, exactly"*.** It answers
+  `true` once the attach connection has hung up and the last open file
+  description holding byte 0 has closed — `PHASE2.md` §3.5's new NORMATIVE
+  sentence — and for a dying owner that is the end of its exit: after any core
+  dump and after its address space is torn down. On one host a small `abort()`
+  dumping through a piped `core_pattern` was not visible, inheritable or
+  joinable for about 1.1 s, and a 1 GiB `SIGKILL`ed owner for about 100 ms. The
+  rustdoc, the C `tft_tree_owner_lost` doc and the Python `owner_lost` docstring
+  and stub now say so, the C and Python texts as *"about a second"* with a
+  pointer to `0057`. Only the rustdoc gives these figures and points at
+  `RUNBOOK.md`'s per-process trade (a core limit of 1 byte suppresses the dump;
+  nothing removes the teardown).
+- **`tf_tree_ipc`'s crate doc and its crates.io page** said a `SIGKILL`ed
+  participant's lock is released *"by the kernel, immediately"*; it is
+  immediately **at the end of the holder's exit**, and the sentence now names
+  any dead participant, `SIGKILL`ed or crashed, because only a crashing one
+  dumps core and holds its lock through the dump. `client.rs`'s module doc,
+  `peer_hung_up`, `server.rs`'s quote of D17, and the two NFS-refusal docs
+  (`IpcError::NetworkFilesystem`, `reject_network_filesystem`) follow §3.3's
+  corrected row. The NFS contrast they draw still holds.
+- **A held byte 0 after a hangup is not always an heir, and one
+  `Inheritance::OwnerAlive` or `Contended` is not final.** A fresh `open()`
+  passing through §3.4 steps 2–4 takes byte 0, meets the survivors' participant
+  bytes and gives it back. `0057` saw a first-call `Contended` or `OwnerAlive`
+  in 21 of 120 trials with a joiner running, and `Inherited` on the next call in
+  every one. `Inheritance::{OwnerAlive, Contended}`, `TFT_OWNER_ALIVE` and
+  `TFT_CONTENDED` (and the unstable C header), `inherit_ownership`'s example
+  (*"Contended is fine: somebody won"*), the Python snippet (*"somebody else
+  won"*), `Session::take_over_ownership`'s *"somebody else is mid-bind"* and
+  `LockFile::try_take_ownership`'s *"will be serving shortly"* now name that
+  case. **A caller that treats one such answer as final can leave the arena
+  ownerless**; the documented loop, which keeps no latch, retries by itself.
+  `take_over_ownership` says what to retry on: a hung-up socket **and**
+  `Session::ownership_held` reading byte 0 free, the pair `Tree::owner_lost`
+  checks. A hangup alone is not vacancy, and retrying on it is the spin `0043`
+  removed.
+- **§3.5's NORMATIVE sentence has a pin, and it is two existing tests.**
+  `a_read_only_survivor_reports_that_it_cannot_inherit` and
+  `a_survivor_that_did_not_inherit_stops_being_told_the_owner_is_gone` already
+  required the first `owner_lost()` after a `SIGKILL`ed owner's reap to answer
+  `true`, with no timing threshold. Both now cite the sentence, and both fail
+  against the two mutants `0057` names, run and recorded in their doc comments:
+  a two-observation latch and a 100 ms grace period in `owner_lost`. Both of
+  those fail at the heir's first poke, so a third mutant, a latch that withholds
+  `true` only after byte 0 has been seen held following a hangup, was run
+  against the migration assertion and fails it alone. They pin the
+  event, not a duration, and each failure message names the one legitimate
+  cause: another task, such as a `/proc/<pid>/fd` reader, holding a transient
+  reference to the dead owner's socket or lock-file description.
+
 ### Changed — the two writer refusals name their edge (D11), and error payloads print as prose and can be named
 
 **Breaking, on the `0.0.x` line.** Two variant shapes changed and one public
@@ -514,8 +571,8 @@ Additive and message-only:
 - **The fix is a `kill.in_progress` marker**, written before the signal and
   removed after the post-reap census, which a child checks immediately before
   leaving and stays instead. **Its cost is stated rather than implied**: §11.4's
-  attach/detach churn pauses for the width of one reap — tens of microseconds
-  normally, tens of milliseconds under ballast — against a detach arm that fires
+  attach/detach churn pauses for the width of one reap — sub-millisecond
+  normally (the 0.3 ms median above), tens of milliseconds under ballast — against a detach arm that fires
   about every fiftieth operation. It suppresses a *detach*, never a kill, an
   inheritance or a violation, and the run prints how many it suppressed, so a run
   leaning on it says so. The operation cap is the detach arm's quieter twin and

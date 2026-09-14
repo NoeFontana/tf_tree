@@ -13,9 +13,18 @@
 //! them. D17 answers it: *"Participants hold their Unix socket open for the
 //! lifetime of the attachment. Process death of any kind closes it, and the
 //! owner sees `EPOLLHUP` in microseconds — exact, immediate, with no timeout to
-//! tune."* That is the reap trigger, so the server keeps every accepted fd in
-//! its `epoll` set and reports a hangup with the slot it granted. Holding the
-//! fds without watching them would keep the cost and throw away the signal.
+//! tune."* *Exact* and *no timeout* stand; *in microseconds* does not, and D17
+//! now carries an amendment saying so
+//! ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)):
+//! the hangup arrives when the kernel closes the dying participant's files, at
+//! the end of its exit, so a participant that dumps core keeps its connection
+//! for the length of its dump and a large one for its address-space teardown,
+//! and this loop's reap of it waits that long — inferred from the hangup being
+//! symmetric, since `0057` timed the survivor's end and not this `epoll` path.
+//! That delay is reaping latency, not a correctness gap. The hangup is the reap trigger, so the server keeps
+//! every accepted fd in its `epoll` set and reports a hangup with the slot it
+//! granted. Holding the fds without watching them would keep the cost and throw
+//! away the signal.
 //!
 //! # Policy is the caller's
 //!

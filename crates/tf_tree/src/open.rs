@@ -476,9 +476,26 @@ pub const CRASH_SITES: &[&str] = &[
 pub enum Inheritance {
     /// This process is now the owner and is serving the rendezvous.
     Inherited,
-    /// The owner is alive. Nothing was attempted.
+    /// [`Tree::owner_lost`] answered `false`, so nothing was attempted.
+    ///
+    /// Usually the owner is alive, or another survivor already inherited. **It
+    /// is not final while `owner_lost` keeps answering `true`**: byte 0 can also
+    /// be held by a fresh `open()` passing through `docs/PHASE2.md` §3.4 steps
+    /// 2–4, which takes it, meets the survivors' participant bytes and gives it
+    /// back
+    /// ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)
+    /// Decision 3). A survivor that treats one `OwnerAlive` as the end of
+    /// recovery can leave the arena ownerless; call again on the next pass.
     OwnerAlive,
-    /// Another survivor won the ownership byte and is binding.
+    /// The ownership byte was taken when this process tried for it: another
+    /// survivor won it and is binding, **or a fresh `open()` holds it in passing**
+    /// through §3.4 steps 2–4 and will hand it back.
+    ///
+    /// **Not final either way** while [`Tree::owner_lost`] keeps answering
+    /// `true`: `0057` measured a first-call `Contended` or `OwnerAlive` in 21 of
+    /// 120 trials with a joiner running, and `Inherited` on the next call every
+    /// time. The loop §3.5 recommends (see [`Tree::inherit_ownership`]'s
+    /// example) retries by itself, because it keeps no latch.
     ///
     /// Not an error, and **this process kept its slot** — which is the property
     /// the deleted takeover arm could not provide, because it went looking for a
@@ -547,7 +564,9 @@ impl Tree {
     ///
     /// ```ignore
     /// if tree.owner_lost() {
-    ///     let _ = tree.inherit_ownership()?;   // Contended is fine: somebody won
+    ///     // Contended or OwnerAlive: another survivor won, or a fresh open()
+    ///     // held byte 0 in passing. Neither is final; the next pass asks again.
+    ///     let _ = tree.inherit_ownership()?;
     /// }
     /// ```
     ///

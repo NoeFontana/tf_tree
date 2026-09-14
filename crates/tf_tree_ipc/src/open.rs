@@ -637,11 +637,21 @@ impl<A> Session<A> {
     /// receives `Ok(false)` and remains a plain participant **with its slot
     /// intact** — which falls out of taking the lock on the existing
     /// description, and is exactly what the deleted arm could not do.
-    /// `Ok(false)` is not an error: it means somebody else is mid-bind.
+    /// `Ok(false)` is not an error: somebody else holds byte 0 — another
+    /// survivor mid-bind, **or a fresh `open()` passing through §3.4 steps 2–4**,
+    /// which takes the byte, meets this session's participant byte and hands it
+    /// back ([`0057`] Decision 3). So `Ok(false)` is not final: while the
+    /// attach socket has hung up **and** [`Self::ownership_held`] still reads
+    /// byte 0 free — the pair `tf_tree::Tree::owner_lost` checks — try again on
+    /// the next pass. A hangup alone is not vacancy: after any migration the
+    /// socket stays hung up for the life of the process, and retrying on it
+    /// alone is the every-cycle spin [`0043`] removed.
     ///
     /// Calling this while already the owner is a no-op returning `Ok(true)`.
     ///
     /// [`0037`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0037-a-takeover-is-not-a-second-open.md
+    /// [`0043`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md
+    /// [`0057`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md
     ///
     /// # Errors
     ///

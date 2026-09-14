@@ -557,8 +557,20 @@ class Tree:
         **Nothing calls it for you** — no background thread, no daemon — so an
         arena whose survivors never ask stays ownerless and wedges new joiners.
 
+        **A dying owner is seen at the end of its exit, not at its signal**
+        (`PHASE2` §3.5, NORMATIVE): once the attach connection has hung up and
+        the last open file description holding the ownership byte has closed.
+        The kernel writes any core dump and tears down the address space first,
+        so an owner dumping core through a piped `core_pattern` can take about
+        a second to be seen, and nothing a survivor can take shortens it
+        (`docs/decisions/0057`).
+
             if tree.owner_lost():
-                tree.inherit_ownership()   # "Contended" is fine: somebody won
+                # "Contended" or "OwnerAlive": another survivor won, or a fresh
+                # open held the ownership byte in passing and will hand it back.
+                # Neither is final while owner_lost() says True; the next pass
+                # asks again.
+                tree.inherit_ownership()
         """
 
     def inherit_ownership(self) -> str:
@@ -568,7 +580,10 @@ class Tree:
         `"NotApplicable"`. **Anything but `"Inherited"` means this process is
         not the owner, and none of them is a reason to stop reading** — lookups
         are unaffected by ownership in every one of these states, and during a
-        takeover as well.
+        takeover as well. **`"OwnerAlive"` and `"Contended"` are not final**
+        while `owner_lost()` keeps answering `True`: a fresh open holds the
+        ownership byte briefly on its way through and gives it back, so call
+        again on the next pass.
 
         `"ReadOnly"` is the one to watch on a consumer fleet: an owner writes
         the participant table on every grant and a read-only mapping cannot, so

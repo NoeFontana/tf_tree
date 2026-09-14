@@ -4,12 +4,13 @@
 **Owner:** @NoeFontana
 **Implementation:** step 1 (the `PHASE2.md` §3.7 step 9 correction, the index
 row and the evidence register's probe row) landed beside this record as a
-`draft` (#333); step 2 (#337) landed the specs and the runbook; step 4 (this
-change) runs `shm_torture`'s recipes, and the bounded rendezvous reaps in
+`draft` (#333); step 2 (#337) landed the specs and the runbook; step 3 (this
+change) landed the release-visible prose and ran the pin's mutants; step 4
+(#341) runs `shm_torture`'s recipes, and the bounded rendezvous reaps in
 `just shm-check`, `just shm-rendezvous` and `just no-network`, under
 `RLIMIT_CORE=1`, with its runner-side verification (the `AN` arm on the runner
-and the first crash-points nightly after landing) still owed; steps 3 and 5
-have not.
+and the first crash-points nightly after landing) still owed; step 5
+has not.
 
 ## Context
 

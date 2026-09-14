@@ -183,8 +183,8 @@ pub enum IpcError {
     /// NORMATIVE refusal (`docs/PHASE2.md` §3.1): file locks over network
     /// filesystems have subtly different semantics — lease-based, recoverable,
     /// and not guaranteed to be released promptly on client death — and every
-    /// property this design relies on ("released by the kernel, immediately")
-    /// stops being true.
+    /// property this design relies on ("released by the kernel, immediately at
+    /// the end of the holder's exit") stops being true.
     NetworkFilesystem {
         /// Which candidate produced the directory.
         source: RuntimeDirSource,

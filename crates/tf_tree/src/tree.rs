@@ -3098,8 +3098,9 @@ impl Tree {
     /// A participant holds its attach socket for the lifetime of the attachment
     /// and the owner reads that socket's closure as death (D17). This is the
     /// same fact from the other end — the owner's death closes it too, and the
-    /// kernel reports `POLLHUP` in microseconds, exactly and with no timeout to
-    /// tune.
+    /// kernel reports `POLLHUP` exactly and with no timeout to tune — at the end
+    /// of the owner's exit, not at its signal, which the last section below
+    /// says in full.
     ///
     /// **Nothing watched this before**, which is why §3.5 never ran even while a
     /// takeover path existed: `docs/PHASE2.md` §0.0 records that the trigger
@@ -3134,7 +3135,18 @@ impl Tree {
     /// |---|---|---|---|
     /// | owner alive | up | held | `false` — **one syscall**, no probe |
     /// | owner dead, role vacant | hung up | free | `true` — inherit |
-    /// | owner dead, somebody took over or is mid-bind | hung up | held | `false` |
+    /// | owner dead, somebody took over or is mid-bind — or a fresh `open()` holds byte 0 in passing | hung up | held | `false` |
+    ///
+    /// **The third row is not always an heir, and a `false` there is not
+    /// final.** A fresh `open()` that finds nobody serving passes through
+    /// §3.4 steps 2–4: it takes byte 0, meets this survivor's participant byte
+    /// and gives byte 0 back. Caught in passing, the byte reads held, and the
+    /// next call may answer `true` again. For the same reason, while this keeps
+    /// answering `true`, no single [`crate::Inheritance::OwnerAlive`] or
+    /// [`crate::Inheritance::Contended`] from [`Tree::inherit_ownership`] is final:
+    /// `0057` saw one on the first call in 21 of 120 trials with a joiner
+    /// running, and `Inherited` on the next call every time. Keep calling both
+    /// from the loop.
     ///
     /// **And the loser stays eligible.** If the new owner dies too, the kernel
     /// releases byte 0 with no cooperation, and the next call answers `true`
@@ -3146,6 +3158,25 @@ impl Tree {
     ///
     /// Lookups are unaffected either way — `Plan::at` touches the mapping and
     /// nothing else, and this is entirely control plane.
+    ///
+    /// # When a dying owner is seen: at the end of its exit, not its signal
+    ///
+    /// `docs/PHASE2.md` §3.5, NORMATIVE: this answers `true` once this
+    /// survivor's attach connection has hung up **and** the last open file
+    /// description holding byte 0 has closed. For a dying owner that is the
+    /// **end of its exit** — the kernel writes any core dump and tears down the
+    /// address space first, and closes the process's files after — and a `fork`
+    /// child sharing those descriptions holds them until it exits. tf_tree adds
+    /// no delay, heartbeat or timeout to that event (D17), and nothing a
+    /// survivor can take shortens it: until then byte 0 is held, and nobody can
+    /// inherit or join. On one host
+    /// ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md))
+    /// a small `SIGKILL`ed owner was seen in about a quarter of a millisecond, a
+    /// 1 GiB one in about 100 ms, and a small `abort()` whose core went to the
+    /// host's piped `core_pattern` in about 1.1 s. The duration is the host's —
+    /// its crash helper, its page size, the owner's resident memory — and no
+    /// figure here is a bound; `docs/RUNBOOK.md`'s *An owner is not dead until
+    /// its exit ends* has the per-process trade.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[must_use]
     pub fn owner_lost(&self) -> bool {
