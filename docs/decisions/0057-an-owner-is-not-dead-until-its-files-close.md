@@ -4,8 +4,9 @@
 **Owner:** @NoeFontana
 **Implementation:** step 1 (the `PHASE2.md` §3.7 step 9 correction, the index
 row and the evidence register's probe row) landed beside this record as a
-`draft` (#333); step 2 (this change) landed the specs and the runbook;
-steps 3–5 have not.
+`draft` (#333); step 2 (#337) landed the specs and the runbook; step 4 (this
+change) runs `shm_torture`'s recipes and the bounded rendezvous reaps under
+`RLIMIT_CORE=1`; steps 3 and 5 have not.
 
 ## Context
 

@@ -1025,8 +1025,11 @@ mod imp {
     /// **This marker is the fix, and it is a suppression of the harness's own
     /// churn rather than of anything the engine does.** A child about to detach
     /// checks it immediately before leaving and stays instead. The cost is that
-    /// §11.4's attach/detach churn pauses for the width of one reap — tens of
-    /// microseconds normally, tens of milliseconds under ballast — against a
+    /// §11.4's attach/detach churn pauses for the width of one reap —
+    /// sub-millisecond normally (`docs/PHASE2.md` §0.0 measures a plain child's
+    /// reap at 0.3 ms median; this read *"tens of microseconds"* until
+    /// 2026-09-14, `docs/decisions/0057`), tens of milliseconds under ballast —
+    /// against a
     /// detach arm that fires about every fifty operations. It does not suppress
     /// a *kill*, a violation, or an inheritance; the population it holds still
     /// has to answer §3.5, and an engine that refuses it still fails the run.
@@ -1516,37 +1519,98 @@ mod imp {
     /// because it decides whether the kernel waits for a pipe helper to exit.
     /// A soft limit of 0 does not stop a pipe dump; only a limit of 1 does.
     ///
-    /// Bound: one line per run.
-    fn host_diag() -> String {
+    /// **The mechanism is explained since 2026-09-14** (`docs/decisions/0057`),
+    /// and the recipes that run this binary set `prlimit --core=1:1`, so under
+    /// them this line reads `core_rlimit soft=1 hard=1`. `hard=1` is what only
+    /// that prefix produces: the ASan build already prints `soft=1` without it.
+    /// A run without it is reported by [`core_dump_warning`].
+    ///
+    /// Bound: one line per run, plus at most one warning line.
+    fn host_diag(crash_points: bool) -> (String, Option<String>) {
         let read = |p: &str| {
             std::fs::read_to_string(p)
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|e| format!("<unreadable: {e}>"))
         };
-        let core_rlimit = std::fs::read_to_string("/proc/self/limits")
+        let limits = std::fs::read_to_string("/proc/self/limits")
             .ok()
             .and_then(|t| {
                 t.lines()
                     .find_map(|l| l.strip_prefix("Max core file size"))
                     .map(|rest| {
                         let f: Vec<&str> = rest.split_whitespace().collect();
-                        format!(
-                            "soft={} hard={}",
-                            f.first().copied().unwrap_or("?"),
-                            f.get(1).copied().unwrap_or("?")
+                        (
+                            f.first().copied().unwrap_or("?").to_string(),
+                            f.get(1).copied().unwrap_or("?").to_string(),
                         )
                     })
-            })
-            .unwrap_or_else(|| "<unreadable>".to_string());
-        format!(
+            });
+        let core_rlimit = match &limits {
+            Some((soft, hard)) => format!("soft={soft} hard={hard}"),
+            None => "<unreadable>".to_string(),
+        };
+        let core_pattern = read("/proc/sys/kernel/core_pattern");
+        let warning = core_dump_warning(
+            crash_points,
+            &core_pattern,
+            limits.as_ref().map(|(soft, _)| soft.as_str()),
+        );
+        let line = format!(
             "{DIAG} host: core_pattern=`{}` core_pipe_limit={} core_rlimit {} osrelease={} \
              stamp={}",
-            read("/proc/sys/kernel/core_pattern"),
+            core_pattern,
             read("/proc/sys/kernel/core_pipe_limit"),
             core_rlimit,
             read("/proc/sys/kernel/osrelease"),
             wall_stamp()
-        )
+        );
+        (line, warning)
+    }
+
+    /// **`docs/decisions/0057` Decision 6's warning: armed crash points on a
+    /// host whose crash helper runs inside every armed child's exit.**
+    ///
+    /// An armed child dies of `SIGABRT`, whose default action is *core*. With a
+    /// pipe `core_pattern` the kernel runs the host's helper **before** the
+    /// child's files close, so its rendezvous socket and byte 0 stay held for
+    /// the helper's whole run, and an armed owner or heir holds the role that
+    /// long. The soft `RLIMIT_CORE` is the limit the kernel reads, and on a pipe
+    /// only a limit of exactly **1** refuses the dump: 0, the usual shell
+    /// default, does not (the record's `AN` arm). So a `--crash-points` run
+    /// whose recovery must not depend on the host's helper needs that limit,
+    /// which the recipes set with `prlimit --core=1:1 --`; the bare binary
+    /// inherits the shell's, and that is the dumping configuration on purpose.
+    ///
+    /// **Reported, never a verdict.** Nothing here changes an exit status: the
+    /// run still has to answer §3.5, and a host that pipes its dumps is a fact
+    /// about the host. Only a `|` pattern is recognised, because that is the
+    /// configuration whose suppression the record measured. An unreadable
+    /// limit warns, since it cannot be shown to be 1.
+    ///
+    /// **Mutants, run 2026-09-14** against
+    /// `the_core_dump_warning_names_only_a_dumping_pipe`, each reverted: the
+    /// pipe test `!core_pattern.starts_with('|')` replaced with `!true` fails
+    /// the file-pattern assertion (`left: Some("… warning …")`, `right: None`);
+    /// `soft == Some("1")` replaced with `soft.is_some()` fails the `soft=0`
+    /// assertion (*"soft=0 on a pipe dumps, so it must warn: None"*); and the
+    /// `!crash_points ||` term deleted fails the not-armed assertion.
+    fn core_dump_warning(
+        crash_points: bool,
+        core_pattern: &str,
+        soft: Option<&str>,
+    ) -> Option<String> {
+        if !crash_points || !core_pattern.starts_with('|') || soft == Some("1") {
+            return None;
+        }
+        Some(format!(
+            "{DIAG} warning: --crash-points with a pipe core_pattern and a core soft limit of \
+             {}: an armed child's abort runs the host's crash helper before its socket and \
+             byte 0 are released, so this run's recovery depends on that helper. A soft limit \
+             of 0 does not stop a pipe dump; only 1 does, which `just \
+             shm-torture-crash-points` sets with `prlimit --core=1:1 --` \
+             (docs/decisions/0057 Decision 6). Reported, not a verdict.",
+            soft.unwrap_or("<unreadable>")
+        ))
     }
 
     /// One participant slot as [`census_with`] read it: the same pass whose
@@ -2463,8 +2527,13 @@ mod imp {
             a.seed,
             dir.display()
         );
-        // [diag] Instrument 1. See `host_diag`. Bound: one line.
-        driver_diag(&host_diag());
+        // [diag] Instrument 1. See `host_diag` and `core_dump_warning`. Bound:
+        // one line, and one more when the warning applies.
+        let (host, core_warning) = host_diag(a.crash_points);
+        driver_diag(&host);
+        if let Some(w) = &core_warning {
+            driver_diag(w);
+        }
         if a.inject {
             println!(
                 "  --inject-violation: one child publishes a corrupt transform on purpose. \
@@ -5836,5 +5905,44 @@ mod imp {
         let mut bits = iso.to_bits();
         bits[4] = f64::NAN.to_bits(); // translation x
         Iso3::from_bits(&bits)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::core_dump_warning;
+
+        /// **`docs/decisions/0057` Decision 6's warning fires on exactly one
+        /// configuration**: armed crash points, a `|` `core_pattern`, and a
+        /// soft `RLIMIT_CORE` that is not 1. The recipes' own configuration
+        /// (`prlimit --core=1:1`) and the plain soak must stay silent, or the
+        /// line stops meaning anything; the dev host's and the runner's shell
+        /// default (`soft=0` on a pipe) must not, because 0 does not stop a
+        /// pipe dump. The mutants are recorded on [`core_dump_warning`].
+        #[test]
+        fn the_core_dump_warning_names_only_a_dumping_pipe() {
+            let apport = "|/usr/share/apport/apport -p%p -s%s -c%c -d%d -P%P -u%u -g%g -F%F -- %E";
+            let coredumpd = "|/usr/lib/systemd/systemd-coredump %P %u %g %s %t \
+                             9223372036854775808 %h %d";
+
+            // The bare binary on either measured host: warns, naming the limit.
+            let bare = core_dump_warning(true, apport, Some("0"));
+            assert!(
+                bare.as_deref()
+                    .is_some_and(|w| w.contains("core soft limit of 0")),
+                "soft=0 on a pipe dumps, so it must warn: {bare:?}"
+            );
+            assert!(core_dump_warning(true, coredumpd, Some("unlimited")).is_some());
+            assert!(
+                core_dump_warning(true, coredumpd, None).is_some(),
+                "an unreadable limit cannot be shown to be 1"
+            );
+
+            // The recipes' configuration: silent.
+            assert_eq!(core_dump_warning(true, coredumpd, Some("1")), None);
+            // Not armed: an abort is not what this run does, so silent.
+            assert_eq!(core_dump_warning(false, apport, Some("0")), None);
+            // A file pattern writes a file, not a helper's run: silent.
+            assert_eq!(core_dump_warning(true, "core", Some("0")), None);
+        }
     }
 }
