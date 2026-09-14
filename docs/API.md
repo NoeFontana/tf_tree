@@ -1271,7 +1271,7 @@ For `Plan::at`, `Plan::at_many_into`, `Plan::at_with_derivatives` and
 
 | Does not | Why, and what checks it |
 |---|---|
-| **Allocate** | The plan is a fixed `[Step; MAX_DEPTH]` by value and every batch form has an `_into` writing into caller memory (R2). Checked: `crates/tf_tree_bench/tests/zero_alloc.rs` counts allocations through a wrapping global allocator across a lookup loop, and again over a 1537-frame tree across ring wraparound |
+| **Allocate** | The plan is a fixed `[Step; MAX_DEPTH]` by value and every batch form has an `_into` writing into caller memory (R2). Checked: `crates/tf_tree_bench/tests/zero_alloc.rs` counts allocations through a wrapping global allocator across `Plan::at` loops (a 24-frame tree, and a 1537-frame tree across ring wraparound), across `at_many`, `at_many_into` in `Mat4`, `Quat` and `QuatTwist`, and `at_many_into_f32` in `Affine32` over monotone and non-monotone batches, `at_with_derivatives`, and `at_extrapolating` under all three `ExtrapPolicy` values, and across a stale plan's `TopologyChanged` refusal. Every window asserts it reached both an answer and a refusal. **Not** reached: `SampleRing::read_slot`'s seqlock retry, which needs a concurrent writer that file does not run |
 | **Take a lock** | Reads are seqlock reads. A reader never blocks a writer and a writer never waits for a reader; there is no mutex on the path at any depth |
 | **Read a clock** | `tf_tree_core` is `no_std` and has no clock to read. The query's stamp is the caller's, always (R3) |
 | **Resolve a name** | Frames are interned to integer ids at compile time (R1, D3). No hashing, no string comparison, no arena name-store access |
