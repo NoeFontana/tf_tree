@@ -1,11 +1,9 @@
 # 0059: the arena errors that cannot describe themselves
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** step 0 (re-reading #339's merged code) was done on
-2026-09-14, in the change that moved this record to `ready`, and found nothing
-that moves the plan; step 1 is in progress (this change), all four parts in one
-PR; step 2 follows its merge, and names its PR number.
+**Implementation:** #345 (step 1, all four parts). Step 0, re-reading #339's
+merged code, was done in the change that moved this record to `ready` (#343).
 
 ## Context
 
