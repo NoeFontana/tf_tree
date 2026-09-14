@@ -394,16 +394,30 @@ impl<'a> ArenaView<'a> {
         let block_off =
             self.header.topo_block_off as usize + index * self.header.topo_block_stride as usize;
         // The two u32 arrays come first so both stay 4-byte aligned for any `mf`.
-        // SAFETY: module invariant — each block reserves `align64(mf * 10)` bytes
-        // at `topo_block_off + index * stride`, block start is 64-aligned; parent
-        // is `mf` u32 at offset 0, edge_of_child is `mf` u32 at `+ mf*4`, depth is
-        // `mf` u16 at `+ mf*8` — all in-bounds and correctly aligned.
+        // Module invariant: the topology region holds `TOPO_BLOCKS` blocks of
+        // `topo_block_stride == align64(mf * 12)` bytes each (parent u32 +
+        // edge_of_child u32 + depth u16 + 2 bytes of padding, `topology.rs`),
+        // starting 64-aligned at `topo_block_off`. `heap.rs` writes that stride
+        // from `ArenaLayout`, and `check.rs` refuses a mapped header whose
+        // stride or offset disagrees with the layout it implies. `index <
+        // TOPO_BLOCKS` because the only caller is `topology()`'s `from_fn` over
+        // `[Block; TOPO_BLOCKS]`, so `block_off` names a whole reservation.
+        //
+        // SAFETY: `parent` is `mf` u32 at offset 0 of the block — bytes
+        // `0..mf*4`, inside the `mf * 12` reserved — and 4-aligned because the
+        // block start is 64-aligned; every `AtomicU32` bit pattern is valid.
         let parent = unsafe {
             core::slice::from_raw_parts(self.base.add(block_off).cast::<AtomicU32>(), mf)
         };
+        // SAFETY: `edge_of_child` is `mf` u32 at `+ mf*4` — bytes `mf*4..mf*8`,
+        // inside the `mf * 12` reserved — and `mf*4` is a multiple of 4, so it
+        // stays 4-aligned.
         let edge_of_child = unsafe {
             core::slice::from_raw_parts(self.base.add(block_off + mf * 4).cast::<AtomicU32>(), mf)
         };
+        // SAFETY: `depth` is `mf` u16 at `+ mf*8` — bytes `mf*8..mf*10`, inside
+        // the `mf * 12` reserved (the last `mf * 2` are padding) — and `mf*8` is
+        // a multiple of 2.
         let depth = unsafe {
             core::slice::from_raw_parts(self.base.add(block_off + mf * 8).cast::<AtomicU16>(), mf)
         };
@@ -565,6 +579,14 @@ impl<'a> ArenaView<'a> {
         // assumed of `ArenaBuilder::declare_edge`, which only asserts the
         // invariant — it writes the caller's record unvalidated.
         let stamps = unsafe { stamp_slots(self.base, stamp_byte_off, cap) };
+        // SAFETY: `pose_slots`' three conditions. Bounds: the pose half of the
+        // same proof — `ring_bytes` checked `pose_off + cap <= pose_slots`, and
+        // `pose_byte_off` is `pose_arena_off + pose_off * 64`, so `cap` 64-byte
+        // slots from it end inside the pose arena `validate_arena_header`
+        // bounded. Alignment: the layout places `pose_arena_off` on a 64-byte
+        // boundary and `pose_off * 64` keeps it there. Typing: the pose arena is
+        // a region reserved for `PoseSlot`s, and `pose_slots` is the only typed
+        // view this module forms over it.
         let poses = unsafe { pose_slots(self.base, pose_byte_off, cap) };
 
         Some(SampleRing {

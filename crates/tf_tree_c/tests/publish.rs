@@ -48,8 +48,8 @@ impl Fixture {
         let t = std::ffi::CString::new(target).unwrap();
         let s = std::ffi::CString::new(source).unwrap();
         let mut p: *mut tft_plan = ptr::null_mut();
-        // SAFETY: live handle, NUL-terminated names, `p` a live local.
         assert_eq!(
+            // SAFETY: live handle, NUL-terminated names, `p` a live local.
             unsafe { tft_plan_create(self.0, t.as_ptr(), s.as_ptr(), &mut p) },
             TFT_OK
         );
@@ -205,8 +205,8 @@ fn all_four_readable_layouts_publish_identically() {
         // Read it back in the canonical layout and compare across layouts.
         let plan = f.plan("world", "robot");
         let mut out = [0u8; 56];
-        // SAFETY: live plan; `out` is exactly the QVEC7 payload.
         assert_eq!(
+            // SAFETY: live plan; `out` is exactly the QVEC7 payload.
             unsafe { tft_plan_at(plan, 0, TFT_LAYOUT_QVEC7_WXYZ, out.as_mut_ptr().cast()) },
             TFT_OK
         );
@@ -279,8 +279,8 @@ fn push_many_honours_a_stride() {
     let plan = f.plan("world", "robot");
     for (i, &t) in stamps.iter().enumerate() {
         let mut out = [0u8; 56];
-        // SAFETY: live plan, correctly sized buffer.
         assert_eq!(
+            // SAFETY: live plan, correctly sized buffer.
             unsafe { tft_plan_at(plan, t, TFT_LAYOUT_QVEC7_WXYZ, out.as_mut_ptr().cast()) },
             TFT_OK
         );
@@ -457,8 +457,8 @@ fn a_batch_reports_the_index_that_failed() {
     // an accident: they are release-stores that already happened.
     let plan = f.plan("world", "robot");
     let mut out = [0u8; 56];
-    // SAFETY: live plan, correctly sized buffer.
     assert_eq!(
+        // SAFETY: live plan, correctly sized buffer.
         unsafe {
             tft_plan_at(
                 plan,
@@ -492,8 +492,8 @@ fn a_tree_is_not_a_publisher() {
     // SAFETY: freeing a non-publisher is a no-op — the magic word is what makes
     // it one, and this asserts the tree survives it.
     unsafe { tft_publisher_free(f.0.cast::<tft_publisher>()) };
-    // SAFETY: `f.0` is a live tree handle.
     assert_eq!(
+        // SAFETY: `f.0` is a live tree handle.
         unsafe { tft_tree_frame_count(f.0) },
         3,
         "the tree must be untouched"
@@ -644,8 +644,8 @@ fn a_frame_id_in_the_headroom_is_refused_not_read() {
     let mut buf: [c_char; 64] = [0; 64];
     // The real frames answer.
     for id in 1..=count {
-        // SAFETY: live handle; 64 writable bytes.
         assert_eq!(
+            // SAFETY: live handle; 64 writable bytes.
             unsafe { tft_tree_frame_name(f.0, id, buf.as_mut_ptr(), buf.len()) },
             TFT_OK,
             "frame {id} is real and must have a name"
@@ -680,8 +680,8 @@ fn a_frame_id_in_the_headroom_is_refused_not_read() {
                                               // SAFETY: `f.0` is a live handle.
     let after = unsafe { tft_tree_frame_count(f.0) };
     assert_eq!(after, count + 1, "the claim must have interned the name");
-    // SAFETY: live handle; 64 writable bytes.
     assert_eq!(
+        // SAFETY: live handle; 64 writable bytes.
         unsafe { tft_tree_frame_name(f.0, after, buf.as_mut_ptr(), buf.len()) },
         TFT_OK
     );

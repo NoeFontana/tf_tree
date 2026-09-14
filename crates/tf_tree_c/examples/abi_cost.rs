@@ -384,8 +384,8 @@ fn main() {
     let a = std::ffi::CString::new("map").unwrap();
     let b = std::ffi::CString::new("sensor").unwrap();
     let mut plan: *mut tft_plan = ptr::null_mut();
-    // SAFETY: live handle and NUL-terminated names.
     assert_eq!(
+        // SAFETY: live handle and NUL-terminated names.
         unsafe { tft_plan_create(tree, a.as_ptr(), b.as_ptr(), &mut plan) },
         TFT_OK
     );
@@ -804,16 +804,16 @@ fn main() {
     // making — so the difference is the boundary, the layout read, and the
     // affinity check, and nothing else.
     let mut ptree: *mut tft_tree = ptr::null_mut();
-    // SAFETY: `ptree` is a live local.
     assert_eq!(
+        // SAFETY: `ptree` is a live local.
         unsafe { tft_test_publishable_tree_create(&mut ptree) },
         TFT_OK
     );
     let child = std::ffi::CString::new("robot").unwrap();
     let par = std::ffi::CString::new("world").unwrap();
     let mut pubh: *mut tft_publisher = ptr::null_mut();
-    // SAFETY: live handle, NUL-terminated names.
     assert_eq!(
+        // SAFETY: live handle, NUL-terminated names.
         unsafe { tft_tree_claim(ptree, child.as_ptr(), par.as_ptr(), &mut pubh) },
         TFT_OK
     );

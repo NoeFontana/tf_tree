@@ -433,9 +433,12 @@ pub unsafe extern "C" fn tft_publisher_push_many(
             Ok(w) => w,
             Err(rc) => return rc,
         };
-        // SAFETY: the caller contracts `n` readable `i64` at `stamps` and
-        // `span` readable bytes at `src`.
+        // SAFETY: `stamps` was checked non-NULL above, and the caller contracts
+        // `n` readable, aligned `i64` there; `n > 0` past the early return.
         let ts = unsafe { core::slice::from_raw_parts(stamps, n) };
+        // SAFETY: `src` was checked non-NULL above, and the caller contracts
+        // `span` readable bytes there — `(n - 1) * stride + payload`, the
+        // overflow-checked extent computed above; `u8` has no alignment.
         let bytes = unsafe { core::slice::from_raw_parts(src.cast::<u8>(), span) };
 
         for (i, &t) in ts.iter().enumerate() {

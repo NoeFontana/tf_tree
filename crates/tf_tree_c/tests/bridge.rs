@@ -430,8 +430,8 @@ fn a_bad_pose_is_refused_before_the_publisher_can_take_the_edge() {
     let ekf = [0x22u8; 16];
     for (g, n) in [(&rogue, "/rogue"), (&ekf, "/ekf")] {
         let name = CString::new(n).unwrap();
-        // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
         assert_eq!(
+            // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
             unsafe { tft_bridge_attribute(b.0, g.as_ptr(), name.as_ptr()) },
             TFT_OK
         );
@@ -501,8 +501,8 @@ fn an_authority_conflict_names_both_publishers_and_the_edge() {
     let (ekf, odom_node) = ([0x33u8; 16], [0x44u8; 16]);
     for (g, n) in [(&ekf, "/ekf"), (&odom_node, "/odom_node")] {
         let name = CString::new(n).unwrap();
-        // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
         assert_eq!(
+            // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
             unsafe { tft_bridge_attribute(b.0, g.as_ptr(), name.as_ptr()) },
             TFT_OK
         );
@@ -571,8 +571,8 @@ fn a_publisher_renamed_by_a_later_graph_walk_keeps_its_edge() {
 
     // The graph's first answer: an endpoint it can see but cannot yet name.
     let placeholder = CString::new("/_NODE_NAMESPACE_UNKNOWN_/_NODE_NAME_UNKNOWN_").unwrap();
-    // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
     assert_eq!(
+        // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
         unsafe { tft_bridge_attribute(b.0, gid.as_ptr(), placeholder.as_ptr()) },
         TFT_OK
     );
@@ -591,8 +591,9 @@ fn a_publisher_renamed_by_a_later_graph_walk_keeps_its_edge() {
 
     // The graph's second answer, for the same endpoint.
     let real = CString::new("/tf_bench_publisher").unwrap();
-    // SAFETY: as above.
     assert_eq!(
+        // SAFETY: live handle, the same 16 readable bytes of `gid`, NUL-terminated
+        // name.
         unsafe { tft_bridge_attribute(b.0, gid.as_ptr(), real.as_ptr()) },
         TFT_OK
     );
@@ -785,8 +786,8 @@ fn a_halted_bridge_refuses_every_later_offer() {
     let (a, z) = ([0x55u8; 16], [0x66u8; 16]);
     for (g, n) in [(&a, "/a"), (&z, "/b")] {
         let name = CString::new(n).unwrap();
-        // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
         assert_eq!(
+            // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
             unsafe { tft_bridge_attribute(b.0, g.as_ptr(), name.as_ptr()) },
             TFT_OK
         );
@@ -1157,8 +1158,8 @@ capacity = 256
     let (amcl, wheels) = ([0x77u8; 16], [0x88u8; 16]);
     for (g, n) in [(&amcl, "/amcl"), (&wheels, "/wheel_driver")] {
         let name = CString::new(n).unwrap();
-        // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
         assert_eq!(
+            // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
             unsafe { tft_bridge_attribute(b.0, g.as_ptr(), name.as_ptr()) },
             TFT_OK
         );
@@ -2400,8 +2401,8 @@ fn last_writer_wins_hands_the_edge_to_the_newcomer() {
     let (first, second) = ([0x77u8; 16], [0x88u8; 16]);
     for (g, n) in [(&first, "/a"), (&second, "/b")] {
         let name = CString::new(n).unwrap();
-        // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
         assert_eq!(
+            // SAFETY: live handle, 16 readable bytes, NUL-terminated name.
             unsafe { tft_bridge_attribute(b.0, g.as_ptr(), name.as_ptr()) },
             TFT_OK
         );

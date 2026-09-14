@@ -137,8 +137,16 @@ home stays in the entry, or moves to the document that should own it.
 - [ ] The `CHANGELOG.md` entry links its argument rather than repeating it.
 - [ ] Public Rust items have doc comments (`missing_docs` is a warn lint, and CI
       builds docs with `-D warnings`).
-- [ ] Every `unsafe` block has a `// SAFETY:` comment; `unsafe` stays within its
-      budgeted crates/modules.
+- [ ] Every `unsafe` block has its own `// SAFETY:` comment naming the invariant
+      it relies on; `unsafe` stays within its budgeted crates/modules.
+      `clippy::undocumented_unsafe_blocks` fails a block with no comment, but
+      only in a configuration some clippy line compiles: `just lint` for the
+      default features, `just shm-check` for anything behind `shm` (all of
+      `tf_tree_arena`'s mapped and frozen files), `just py-compile` for
+      `tf_tree_py`, the container-only `just tf2-check` for
+      `tf_tree_tf2_sys` — `scripts/unsafe-budget.sh`'s *What it does NOT
+      prove* lists the rest. It never fails a comment that names nothing; that
+      half is yours.
 - [ ] If the change is architectural, it cites the `docs/PHASE1.md` /
       `docs/PHASE2.md` section it implements, or a linked decision that is
       `ready` or `implemented`.

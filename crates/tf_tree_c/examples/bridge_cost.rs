@@ -106,8 +106,8 @@ fn main() {
 
     let gid = [0x5Au8; 16];
     let node = CString::new("/ekf").unwrap();
-    // SAFETY: live handle on this thread, 16 readable bytes, NUL-terminated.
     assert_eq!(
+        // SAFETY: live handle on this thread, 16 readable bytes, NUL-terminated.
         unsafe { tft_bridge_attribute(b, gid.as_ptr(), node.as_ptr()) },
         TFT_OK
     );
