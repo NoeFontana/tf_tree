@@ -641,11 +641,12 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
 /// entry point a program calls first, and it reaches every arm of that mapper
 /// through one `From` impl.
 ///
-/// # The one arm with a class of its own
+/// # The two arms with a class of their own
 ///
-/// `ArenaHeldButUnreachable` raises [`ArenaHeldButUnreachableError`], still with
-/// `IpcError`'s sentence, and carries `.holder_slots` (the mask decoded,
-/// ascending) and `.ownership_held` — the two facts that separate the remedies,
+/// Both keep `IpcError`'s sentence. `ArenaAbsent` raises [`ArenaAbsentError`],
+/// a leaf with no attributes. `ArenaHeldButUnreachable` raises
+/// [`ArenaHeldButUnreachableError`], which carries `.holder_slots` (the mask
+/// decoded, ascending) and `.ownership_held` — the two facts that separate the remedies,
 /// which that `Display` spends the same way (`docs/decisions/0058` §4). **Not
 /// `first_pid`**: a recorded pid is namespace-local (`0033`), `0` when no
 /// identity record was written, and `os.kill(0, sig)` signals the caller's own

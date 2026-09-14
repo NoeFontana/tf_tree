@@ -45,8 +45,9 @@ is a bug.
 
 [`0058`](docs/decisions/0058-the-fields-a-python-exception-only-printed.md),
 which `docs/PHASE3.md` §4.4 had promised since Phase 3 and no exception had ever
-kept. **Message text does not change, and every class keeps its base**, so an
-existing `except` clause catches exactly what it caught before.
+kept. **Every new class subclasses `TfTreeError`**, so an existing `except`
+clause catches exactly what it caught before, and message text is unchanged
+except where an already-claimed edge's holder is still mid-claim.
 
 - **Seven classes carry attributes on the instances the library raises**, set in
   the instance's `__dict__` with `args` left `(message,)`, so a pickled
