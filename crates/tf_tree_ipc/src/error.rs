@@ -12,7 +12,7 @@
 //! because the symptom an operator sees ("it will not start") is identical for
 //! all of them.
 
-use crate::HelloStatus;
+use crate::{HelloStatus, WireError};
 use core::fmt;
 
 use rustix::io::Errno;
@@ -434,8 +434,22 @@ impl fmt::Display for IpcError {
                 "the arena owner accepted this attach and then closed the connection without \
                  replying, so it went away mid-handshake; retrying is the right response",
             ),
+            // Matched inline rather than through a `Display` on `WireError`,
+            // as `NameProblem` and `LockRole` are below: a trait impl on a
+            // published type is a commitment, and this sentence is not one.
             IpcError::HandshakeMalformed(e) => {
-                write!(f, "attach handshake reply was not well-formed: {e:?}")
+                f.write_str("attach handshake reply was not well-formed: ")?;
+                match e {
+                    WireError::BadLength { got, expected } => write!(
+                        f,
+                        "{got} bytes where the message is {expected}"
+                    ),
+                    WireError::BadMagic => f.write_str("the magic bytes are not tf_tree's"),
+                    WireError::BadMode { got } => write!(
+                        f,
+                        "mode byte {got} names neither read-only nor read-write"
+                    ),
+                }
             }
             IpcError::HandshakeRejected {
                 status,
@@ -669,7 +683,14 @@ impl fmt::Display for ProcError {
                 write!(f, "/proc/{pid}/stat is unreadable (errno {raw_os_error})")
             }
             ProcError::Parse { pid, cause } => {
-                write!(f, "/proc/{pid}/stat did not parse: {cause:?}")
+                write!(f, "/proc/{pid}/stat did not parse: ")?;
+                match cause {
+                    ProcParseError::NoClosingParen => f.write_str("no ')' delimits comm"),
+                    ProcParseError::TooFewFields => f.write_str("fewer than 22 fields after comm"),
+                    ProcParseError::NotAnInteger => {
+                        f.write_str("field 22 is not a decimal integer")
+                    }
+                }
             }
             ProcError::BootId => f.write_str("/proc/sys/kernel/random/boot_id is not a UUID"),
         }
@@ -678,3 +699,62 @@ impl fmt::Display for ProcError {
 
 impl std::error::Error for IpcError {}
 impl std::error::Error for ProcError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{IpcError, ProcError, ProcParseError};
+    use crate::WireError;
+
+    /// The two payloads `IpcError`'s sentence used to splice in with `Debug`
+    /// read as prose, and keep the numbers they carry.
+    ///
+    /// Every variant of both is listed, so a variant whose arm printed nothing
+    /// useful would be caught here as well as by the exhaustive `match`.
+    ///
+    /// **Mutants, applied one at a time** (each an early `return` of the old
+    /// `Debug` spelling, ahead of the now-unreachable `match`):
+    /// `HandshakeMalformed`'s arm restored to
+    /// `write!(f, "attach handshake reply was not well-formed: {e:?}")` — this
+    /// test fails, `"attach handshake reply was not well-formed: BadLength { got:
+    /// 3, expected: 56 }" is a Debug dump`; `ProcError::Parse`'s arm restored to
+    /// `{cause:?}` — it fails, `"/proc/7/stat did not parse: NoClosingParen" is a
+    /// Debug dump`.
+    #[test]
+    fn wire_and_proc_parse_causes_render_as_prose() {
+        let wire = [
+            (
+                WireError::BadLength {
+                    got: 3,
+                    expected: 56,
+                },
+                "BadLength",
+            ),
+            (WireError::BadMagic, "BadMagic"),
+            (WireError::BadMode { got: 9 }, "BadMode"),
+        ];
+        for (e, name) in wire {
+            let shown = IpcError::HandshakeMalformed(e).to_string();
+            assert!(
+                !shown.contains(name) && !shown.contains('{'),
+                "{shown:?} is a Debug dump"
+            );
+        }
+        let shown = IpcError::HandshakeMalformed(WireError::BadLength {
+            got: 3,
+            expected: 56,
+        })
+        .to_string();
+        assert!(shown.contains('3') && shown.contains("56"), "{shown:?}");
+
+        let causes = [
+            (ProcParseError::NoClosingParen, "NoClosingParen"),
+            (ProcParseError::TooFewFields, "TooFewFields"),
+            (ProcParseError::NotAnInteger, "NotAnInteger"),
+        ];
+        for (cause, name) in causes {
+            let shown = ProcError::Parse { pid: 7, cause }.to_string();
+            assert!(!shown.contains(name), "{shown:?} is a Debug dump");
+            assert!(shown.starts_with("/proc/7/stat"), "{shown:?}");
+        }
+    }
+}

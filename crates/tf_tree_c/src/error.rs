@@ -43,16 +43,25 @@ pub const TFT_ERR_BAD_ENUM: tft_status = -4;
 /// The caller's output buffer is too small for the request.
 pub const TFT_ERR_BUFFER_TOO_SMALL: tft_status = -5;
 /// A frame name that this tree never interned.
+///
+/// From plan compilation it can also mean something else; see
+/// [`tft_plan_create`](crate::tft_plan_create)'s *Errors*.
 pub const TFT_ERR_UNKNOWN_FRAME: tft_status = -10;
 /// Target and source are in different connected components.
 pub const TFT_ERR_DISCONNECTED: tft_status = -11;
 /// The edge has no published samples yet.
+///
+/// From plan compilation it can also mean something else; see
+/// [`tft_plan_create`](crate::tft_plan_create)'s *Errors*.
 pub const TFT_ERR_NO_DATA: tft_status = -12;
 /// The requested stamp lies outside the edge's retained history.
 pub const TFT_ERR_EXTRAPOLATION: tft_status = -13;
 /// The topology changed since the plan was compiled; re-plan.
 pub const TFT_ERR_TOPOLOGY_CHANGED: tft_status = -14;
 /// The query's time domain does not match the plan's.
+///
+/// From plan compilation it can also mean something else; see
+/// [`tft_plan_create`](crate::tft_plan_create)'s *Errors*.
 pub const TFT_ERR_TIME_DOMAIN: tft_status = -15;
 /// The ring lapped the reader mid-read. Retryable.
 pub const TFT_ERR_SLOT_RECYCLED: tft_status = -16;
@@ -421,8 +430,22 @@ pub(crate) fn record_lookup(err: LookupError) -> tft_status {
             );
             TFT_ERR_TOPOLOGY_CHANGED
         }
-        L::TimeDomainMismatch { .. } | L::MixedTimeDomains { .. } => {
+        // Split, because only one of the two knows an edge. A query against a
+        // plan compiled for another domain names two integers and nothing
+        // else; a *path* whose dynamic edges disagree names the edge that
+        // disagreed (D11), and dropping it left a C caller with a refusal and
+        // no way to find the edge to reconfigure. The message stays static:
+        // this runs on the `tft_plan_at` path, which does not allocate.
+        L::TimeDomainMismatch { .. } => {
             set_error(TFT_ERR_TIME_DOMAIN, "time domain mismatch", |_| {});
+            TFT_ERR_TIME_DOMAIN
+        }
+        L::MixedTimeDomains { edge, .. } => {
+            set_error(
+                TFT_ERR_TIME_DOMAIN,
+                "the path's dynamic edges publish in different time domains",
+                |e| e.edge = edge.get(),
+            );
             TFT_ERR_TIME_DOMAIN
         }
         L::SlotRecycled { edge } => {
@@ -564,5 +587,50 @@ pub(crate) fn guard(body: impl FnOnce() -> tft_status) -> tft_status {
             set_error(TFT_ERR_INTERNAL, text, |_| {});
             TFT_ERR_INTERNAL
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{record_lookup, tft_error, LAST_ERROR, TFT_ERR_TIME_DOMAIN, TFT_INVALID_ID};
+    use tf_tree::{EdgeId, LookupError};
+
+    fn last() -> tft_error {
+        LAST_ERROR.with(|slot| *slot.borrow())
+    }
+
+    /// **A path whose dynamic edges disagree names the edge that disagreed**,
+    /// and a query in the wrong domain — which has no edge to name — still
+    /// reports `TFT_INVALID_ID` rather than inheriting one.
+    ///
+    /// Called on the mapper directly: no `test-hooks` fixture builds a
+    /// mixed-domain tree, and the facade's own `behavior.rs` already proves
+    /// `Tree::plan` returns `MixedTimeDomains` with that edge.
+    ///
+    /// **Mutant:** delete `|e| e.edge = edge.get()` from the `MixedTimeDomains`
+    /// arm (replace it with `|_| {}`). Applied: this test fails —
+    /// `left: 4294967295`, `right: 7`.
+    ///
+    /// **Mutant:** in the `TimeDomainMismatch` arm, `set_error(..)` →
+    /// `amend_error(|e| e.code = TFT_ERR_TIME_DOMAIN)`, i.e. a refusal that
+    /// layers onto the previous error instead of replacing it. Applied: the last
+    /// assertion fails — `left: 7`, `right: 4294967295`.
+    #[test]
+    fn mixed_time_domains_names_its_edge() {
+        let rc = record_lookup(LookupError::MixedTimeDomains {
+            edge: EdgeId(7),
+            expected: 1,
+            got: 0,
+        });
+        assert_eq!(rc, TFT_ERR_TIME_DOMAIN);
+        let e = last();
+        assert_eq!(e.code, TFT_ERR_TIME_DOMAIN);
+        assert_eq!(e.edge, 7);
+
+        record_lookup(LookupError::TimeDomainMismatch {
+            expected: 1,
+            got: 0,
+        });
+        assert_eq!(last().edge, TFT_INVALID_ID);
     }
 }

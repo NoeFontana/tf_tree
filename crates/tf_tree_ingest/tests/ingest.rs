@@ -3290,3 +3290,23 @@ fn an_edge_whose_every_sample_was_dropped_is_declared_and_flagged() {
         out.report.summary()
     );
 }
+
+/// A rejected push prints the engine's sentence, which names the edge — not
+/// `NonMonotonicStamp { last: 2, got: 1 }`.
+///
+/// **Mutant:** `#[error("push rejected: {0}")]` → `{0:?}` on `IngestError::Push`.
+/// Applied: this test fails — `left: "push rejected: NonMonotonicStamp { edge:
+/// EdgeId(4), last: 2, got: 1 }"`, `right: "push rejected: edge 4: stamp 1 ns is
+/// not newer than the last published 2 ns"`.
+#[test]
+fn a_rejected_push_renders_the_engines_prose() {
+    let push = tf_tree::PushError::NonMonotonicStamp {
+        edge: tf_tree::EdgeId(4),
+        last: 2,
+        got: 1,
+    };
+    assert_eq!(
+        IngestError::Push(push).to_string(),
+        format!("push rejected: {push}")
+    );
+}

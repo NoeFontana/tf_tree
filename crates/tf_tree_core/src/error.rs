@@ -106,7 +106,14 @@ impl EdgeId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LookupError {
-    /// A frame name that was never interned into this tree.
+    /// A frame name that does not resolve to a frame of this tree.
+    ///
+    /// Usually a name that was never interned. `tf_tree::Tree::lookup` also
+    /// reports two rarer outcomes of the resolver under this variant — a
+    /// different name holding the hash slot ([`FrameError::FrameHashCollision`],
+    /// permanent) and an interner still mid-publish
+    /// ([`FrameError::InternContended`], transient) — and its `# Errors` section
+    /// says how to tell the three apart without writing.
     UnknownFrame {
         /// The 64-bit BLAKE3 prefix hash of the requested name.
         hash: u64,
@@ -290,6 +297,9 @@ pub enum PushError {
     /// are non-decreasing per edge (invariant 6); equal stamps are accepted and
     /// the newer value wins.
     NonMonotonicStamp {
+        /// The edge whose newest stamp the push predates (D11: an error names
+        /// the edge it is about).
+        edge: EdgeId,
         /// The edge's current newest stamp.
         last: i64,
         /// The (rejected) stamp that was pushed.
@@ -518,9 +528,10 @@ impl fmt::Display for LookupError {
 impl fmt::Display for PushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            PushError::NonMonotonicStamp { last, got } => write!(
+            PushError::NonMonotonicStamp { edge, last, got } => write!(
                 f,
-                "stamp {got} ns is not newer than the last published {last} ns",
+                "edge {}: stamp {got} ns is not newer than the last published {last} ns",
+                edge.0,
             ),
             PushError::ClaimRevoked { edge } => write!(
                 f,

@@ -119,7 +119,7 @@ pub enum AwaitError {
     /// property of the two names involved, and [`FrameError::InternContended`]
     /// names a claimant no caller can judge — waiting on either is waiting on
     /// something that will not change on its own.
-    #[error("{0:?}")]
+    #[error("{0}")]
     Frame(FrameError),
     /// This tree belongs to a process that no longer exists — it was opened
     /// before a `fork()` and this is the child. See [`Tree::detached`].
@@ -2346,7 +2346,8 @@ impl Tree {
         // authoritative" is not implementable — two files, no atomic
         // cross-update, and a `HeapArena` has no lock file at all — so exactly
         // one of them is the linearization point, and it is this CAS.
-        let (epoch, owner) = claim(claim_rec, self.participant)?;
+        let (epoch, owner) = claim(claim_rec, self.participant)
+            .map_err(|cause| ClaimApiError::AlreadyClaimed { edge: eid, cause })?;
 
         // The CAS has landed and the lease has not been taken: the one place a
         // reaper can be placed inside `take_claim_lease`'s window on purpose.
@@ -2696,8 +2697,27 @@ impl Tree {
     ///
     /// # Errors
     ///
-    /// [`LookupError::UnknownFrame`] if a name was never declared, or any
-    /// compilation / evaluation error.
+    /// [`LookupError::UnknownFrame`] if a name does not resolve to a frame, or
+    /// any compilation / evaluation error. **`UnknownFrame` covers three
+    /// outcomes that want different remedies**, because the resolver maps both
+    /// of [`FrameError`]'s read-side refusals onto it:
+    ///
+    /// * the name was never declared — spell it right, or wait for its
+    ///   publisher;
+    /// * a *different* name already holds the name's 64-bit hash slot
+    ///   ([`FrameError::FrameHashCollision`]) — permanent: rename one frame;
+    /// * an anonymous claimant is interning the name right now and has not
+    ///   finished within the retry budget ([`FrameError::InternContended`]) —
+    ///   transient: retry.
+    ///
+    /// The error carries only the hash, so it cannot say which. To tell them
+    /// apart, ask a resolver that **never writes**: on a read-only or frozen
+    /// tree [`Tree::frame`] is a pure read and returns `ReadOnly`,
+    /// `FrameHashCollision` or `InternContended` respectively. **On a writable
+    /// tree do not use `Tree::frame` as the probe** — it interns a name it does
+    /// not find, permanently spending a frame slot (ids are never recycled, D10)
+    /// or failing `CapacityExceeded` at zero headroom. The write-free probe there
+    /// is `Tree::arena_view().find_frame(name)`, behind the `unstable` feature.
     pub fn lookup<D: Domain>(
         &self,
         target: &str,
@@ -3591,8 +3611,10 @@ impl Tree {
 // `Send + Sync`, `Mutex` is `Send + Sync`, and the remaining field is a plain
 // `Copy` scalar. No manual `unsafe impl` is needed (and none is allowed here).
 
-/// Look up a frame by name for the read path, mapping "not found" and hash
-/// collisions to [`LookupError::UnknownFrame`].
+/// Look up a frame by name for the read path, mapping "not found", hash
+/// collisions and intern contention to [`LookupError::UnknownFrame`] — see
+/// [`Tree::lookup`]'s `# Errors` for why that is three remedies behind one
+/// variant.
 fn find(view: &ArenaView, name: &str) -> Result<FrameId, LookupError> {
     match view.find_frame(name) {
         Ok(Some(id)) => Ok(id),
@@ -4321,9 +4343,14 @@ impl fmt::Display for Described<'_> {
                         write!(
                             f,
                             ". If the name is spelled right, its publisher has \
-                             not declared it yet: wait with Tree::await_frames, \
-                             or declare it on the TreeBuilder that creates the \
-                             arena"
+                             most likely not declared it yet: wait with \
+                             Tree::await_frames, or declare it on the \
+                             TreeBuilder that creates the arena. Two rarer \
+                             causes read the same: the name's hash collides \
+                             with a frame already interned (rename one), or \
+                             another participant is interning it right now \
+                             (retry) — Tree::frame on a read-only tree says \
+                             which"
                         )
                     }
                     // `Tree::frames` fails only for `ChildDetached`, and that is
@@ -4484,10 +4511,10 @@ pub enum BuildError {
     #[error("arena layout error: {0:?}")]
     Layout(LayoutError),
     /// A frame name could not be interned (table full or 64-bit hash collision).
-    #[error("frame error: {0:?}")]
+    #[error("frame error: {0}")]
     Frame(FrameError),
     /// Wiring an edge into the topology failed (cycle or out-of-range frame).
-    #[error("topology error: {0:?}")]
+    #[error("topology error: {0}")]
     Topology(TopologyError),
     /// The shared-memory segment could not be created, sized, mapped or sealed.
     #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -4522,7 +4549,7 @@ pub enum ReparentError {
         child: FrameId,
     },
     /// The topology mutation failed (cycle or out-of-range frame).
-    #[error("topology error: {0:?}")]
+    #[error("topology error: {0}")]
     Topology(TopologyError),
     /// The arena is mapped read-only; it cannot be mutated.
     #[error("arena is mapped read-only")]
@@ -4620,13 +4647,13 @@ pub enum ClaimApiError {
     /// Reachable only through a reaper bug or `CreatePolicy::Always` byte
     /// aliasing (`docs/decisions/0005` §5). The CAS is backed out before this
     /// returns, so retrying is safe.
-    #[error("edge {edge:?}: the claim record was free but its lease is held")]
+    #[error("edge {}: the claim record was free but its lease is held", edge.get())]
     LeaseContended {
         /// The edge.
         edge: EdgeId,
     },
     /// The lock file could not be asked about the edge's lease.
-    #[error("edge {edge:?}: the claim lease could not be taken")]
+    #[error("edge {}: the claim lease could not be taken", edge.get())]
     LeaseUnavailable {
         /// The edge.
         edge: EdgeId,
@@ -4635,7 +4662,7 @@ pub enum ClaimApiError {
     ///
     /// Everything is given back before this returns, so the correct response is
     /// simply to claim again.
-    #[error("edge {edge:?}: reaped while being claimed; retry")]
+    #[error("edge {}: reaped while being claimed; retry", edge.get())]
     ReapedDuringClaim {
         /// The edge.
         edge: EdgeId,
@@ -4676,30 +4703,22 @@ pub enum ClaimApiError {
     /// The message names the owning **participant slot**, not a pid: A3 made the
     /// claim word an indirection into the participant table, and resolving it
     /// needs the arena. `tf_tree doctor` prints both.
-    #[error("edge already claimed by participant slot {}", .0.owner_slot())]
-    AlreadyClaimed(tf_tree_core::ClaimError),
+    ///
+    /// **Names the edge (D11).** This was a tuple variant around the core
+    /// [`ClaimError`](tf_tree_core::ClaimError) alone, reached through a `From`
+    /// impl on the `?` in [`Tree::claim`] — the one point that knew the edge,
+    /// and the point that dropped it. The core error cannot carry it:
+    /// `edge::claim` is handed a claim record, which holds no edge id.
+    #[error("edge {}: {cause}", edge.get())]
+    AlreadyClaimed {
+        /// The edge whose claim was refused.
+        edge: EdgeId,
+        /// The engine's refusal, which names the owning participant slot.
+        cause: tf_tree_core::ClaimError,
+    },
     /// The arena is mapped read-only, so no edge can be claimed for writing.
     #[error("arena is mapped read-only")]
     ReadOnly,
-}
-
-impl From<tf_tree_core::ClaimError> for ClaimApiError {
-    fn from(e: tf_tree_core::ClaimError) -> ClaimApiError {
-        ClaimApiError::AlreadyClaimed(e)
-    }
-}
-
-// Small accessor so the `#[error]` attribute above can read the owning slot.
-trait ClaimErrorExt {
-    fn owner_slot(&self) -> u32;
-}
-impl ClaimErrorExt for tf_tree_core::ClaimError {
-    fn owner_slot(&self) -> u32 {
-        match self {
-            tf_tree_core::ClaimError::EdgeAlreadyClaimed { owner_slot } => *owner_slot,
-            _ => 0,
-        }
-    }
 }
 
 /// Revoke every claim whose holder the kernel says is gone.

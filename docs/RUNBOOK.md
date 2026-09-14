@@ -129,18 +129,21 @@ occupancy.
 
 ## Writers are failing
 
-### `EdgeAlreadyClaimed { owner_pid }`
+### `EdgeAlreadyClaimed { owner_slot }`
 
 Two nodes are configured to publish the same edge. This is a **genuine
 configuration error**, and `tf_tree` reports it rather than silently averaging
 the two streams into garbage the way a multi-publisher `/tf` topic does.
-`doctor`'s `multi-writer` check names both PIDs.
+The error names the edge and the owning **participant slot**, not a pid — the
+facade's `ClaimApiError::AlreadyClaimed { edge, cause }` and C's
+`tft_error.edge` / `frame_a` carry both — and `doctor`'s `multi-writer` check
+turns the slot into a PID.
 
 Decide which node owns the edge and stop the other. If you are bridging from
 ROS, the ingest bridge's conflict policy (`FirstWriterWins` by default) is where
 this surfaces first.
 
-### `NonMonotonicStamp { last, got }`
+### `NonMonotonicStamp { edge, last, got }`
 
 A push arrived with a stamp older than the edge's newest. Equal stamps are
 accepted — that is required for idempotent replay — but going backwards is not.

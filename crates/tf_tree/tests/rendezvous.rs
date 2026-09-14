@@ -482,7 +482,7 @@ fn a_read_only_attach_refuses_to_create() {
     assert!(
         matches!(
             err,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaAbsent)
         ),
         "the refused open left an arena behind: {err:?}"
     );
@@ -544,7 +544,7 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
     assert!(
         matches!(
             err,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. })
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable { .. })
         ),
         "expected ArenaHeldButUnreachable, got {err:?}"
     );
@@ -650,7 +650,7 @@ fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
     assert!(
         matches!(
             forced,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0b1,
                 first_slot: Some(0),
                 ownership_held: false,
@@ -686,7 +686,7 @@ fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
     assert!(
         matches!(
             crowded,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0b101,
                 first_slot: Some(0),
                 ..
@@ -796,7 +796,7 @@ fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
     assert!(
         matches!(
             err,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable {
                 first_slot: Some(1),
                 ownership_held: true,
                 ..
@@ -1052,7 +1052,7 @@ fn defect_201_a_forced_creators_record_reads_dead_while_it_is_publishing() {
     assert!(
         matches!(
             err,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable {
                 first_slot: Some(0),
                 ..
             })
@@ -1270,7 +1270,7 @@ fn defect_201_release_ownership_strands_a_live_non_owner_on_byte_0() {
     assert!(
         matches!(
             err,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable {
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable {
                 first_slot: Some(0),
                 ..
             })
@@ -1503,10 +1503,8 @@ fn a_wait_for_an_arena_that_never_starts_gives_up() {
     assert!(
         matches!(
             err,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
-                | tf_tree::OpenError::Rendezvous(
-                    tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. }
-                )
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaAbsent)
+                | tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable { .. })
         ),
         "expected the last retryable rendezvous error, got {err:?}"
     );
@@ -1563,10 +1561,8 @@ fn a_whole_second_wait_is_not_refused_by_the_socket_timeout() {
     assert!(
         matches!(
             err,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaAbsent)
-                | tf_tree::OpenError::Rendezvous(
-                    tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. }
-                )
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaAbsent)
+                | tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable { .. })
         ),
         "a whole-second budget must end in the last retryable rendezvous error, \
          not in a local socket failure: {err:?}"
@@ -4293,7 +4289,7 @@ fn a_survivor_inherits_ownership_and_the_arena_becomes_joinable_again() {
     assert!(
         matches!(
             err,
-            tf_tree::OpenError::Rendezvous(tf_tree_ipc::IpcError::ArenaHeldButUnreachable { .. })
+            tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable { .. })
         ),
         "expected the pre-§3.5 wedge, got {err:?}"
     );

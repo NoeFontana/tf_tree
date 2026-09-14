@@ -567,6 +567,11 @@ Stamps live in a **separate** array of `AtomicI64`, so binary search touches 8 s
 >   whose relationship to it nothing enforced — and a ring built with the two
 >   disagreeing returns a silently wrong pose rather than an error. The mask is
 >   derived from `poses.len()` now; the arithmetic is identical.
+> - **`edge: self.edge`** in the `NonMonotonicStamp` refusal, which this
+>   listing and the shipped code both omitted (2026-09-14). D11 says an error
+>   names the edge it is about; the ring always held its `EdgeId` and its own
+>   doc said so, and the variant was the one `PushError` without it. The field
+>   is loaded only on the refusal branch.
 >
 > The ordering annotations remain NORMATIVE as written; none of these
 > corrections weakens one.
@@ -577,7 +582,7 @@ fn push(&mut self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
     let h = self.rec.head.load(Ordering::Relaxed);   // single writer: Relaxed is correct
     if h > 0 {
         let last = self.stamps[((h - 1) & self.mask()) as usize].load(Ordering::Relaxed);
-        if stamp < last { return Err(PushError::NonMonotonicStamp { last, got: stamp }); }
+        if stamp < last { return Err(PushError::NonMonotonicStamp { edge: self.edge, last, got: stamp }); }
     }
     let idx = (h & self.mask()) as usize;
     let slot = &self.poses[idx];

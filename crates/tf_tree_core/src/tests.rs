@@ -190,13 +190,31 @@ fn extrapolation_before_and_after() {
     assert_eq!(held.to_bits(), pose(2).to_bits());
 }
 
+/// The refusal names the ring's own edge (D11). The ring is given a non-zero
+/// edge id on purpose: `HeapRing::ring` uses `EdgeId(0)`, which a producer that
+/// hard-coded a zero would also satisfy.
+///
+/// **Mutant:** in `SampleRing::push`, `edge: self.edge` → `edge: EdgeId(0)`.
+/// Applied: this test fails — `left: NonMonotonicStamp { edge: EdgeId(0), last:
+/// 100, got: 50 }`, `right: NonMonotonicStamp { edge: EdgeId(5), last: 100, got:
+/// 50 }`.
 #[test]
 fn non_monotonic_push_rejected() {
     let hr = HeapRing::new(4);
-    let ring = hr.ring();
+    let ring = SampleRing {
+        edge: EdgeId(5),
+        ..hr.ring()
+    };
     ring.push(100, &pose(1)).unwrap();
     let err = ring.push(50, &pose(2)).unwrap_err();
-    assert_eq!(err, PushError::NonMonotonicStamp { last: 100, got: 50 });
+    assert_eq!(
+        err,
+        PushError::NonMonotonicStamp {
+            edge: EdgeId(5),
+            last: 100,
+            got: 50
+        }
+    );
     // Equal stamps are accepted (idempotent replay); the newer value wins.
     ring.push(100, &pose(9)).unwrap();
     let got = ring.sample::<LerpSlerp>(100, ExtrapPolicy::Error).unwrap();
@@ -3476,13 +3494,30 @@ fn every_error_variant_renders_as_prose_naming_what_it_carries() {
     assert!(format!("{}", LookupError::BufferTooSmall { need: 48, got: 16 }).contains("48"));
 
     for e in [
-        PushError::NonMonotonicStamp { last: 9, got: 4 },
+        PushError::NonMonotonicStamp {
+            edge,
+            last: 9,
+            got: 4,
+        },
         PushError::ClaimRevoked { edge },
         PushError::ChildDetached,
     ] {
         assert!(!format!("{e}").is_empty());
         assert_ne!(format!("{e}"), format!("{e:?}"));
     }
+    // D11 in the prose layer too: a stamp regression names its edge.
+    // Mutant: drop `edge {}: ` (and its argument) from `PushError`'s Display.
+    // Applied: this assertion fails — `assertion failed: format!("{}",
+    // PushError::NonMonotonicStamp ...`.
+    assert!(format!(
+        "{}",
+        PushError::NonMonotonicStamp {
+            edge,
+            last: 9,
+            got: 4
+        }
+    )
+    .starts_with("edge 3:"));
     for e in [
         FrameError::FrameHashCollision { hash: 1 },
         FrameError::CapacityExceeded,

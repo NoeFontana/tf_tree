@@ -329,6 +329,18 @@ pub use open::Inheritance;
 pub use open::CRASH_SITES;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::{open, CreatePolicy, Open, OpenError};
+/// The payload of [`OpenError::Rendezvous`], and every type one of its variants
+/// carries, so a caller can dispatch on the rendezvous refusal — `IpcError` is
+/// deliberately not `#[non_exhaustive]` for that reason — without adding
+/// `tf_tree_ipc` as a second direct dependency. `CreatePolicy` above is the
+/// precedent, on the same argument. The one type deliberately left out is
+/// `rustix::io::Errno` inside `IpcError::LockFailed`, as `ShmError` and
+/// `FrozenError` already leave theirs out.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+pub use tf_tree_ipc::{
+    EnvVar, HelloStatus, IpcError, LockRole, NameProblem, ProcError, ProcParseError,
+    RuntimeDirSource, WireError,
+};
 
 /// Test scaffolding for `docs/decisions/0028` plan step 2's reclamation
 /// predicate, which is private. Its two production callers are the owner's slot
@@ -364,8 +376,20 @@ pub use tf_tree_core::plan::{
 // `Extrapolated` above is what stops a held pose passing for a fresh one.
 pub use tf_tree_core::sample::ExtrapPolicy;
 pub use tf_tree_core::{
-    ClaimError, EdgeId, FrameError, FrameId, LookupError, PushError, MAX_DEPTH, MAX_PATH_EDGES,
+    ClaimError, EdgeId, FrameError, FrameId, LookupError, ParticipantError, PushError,
+    TopologyError, MAX_DEPTH, MAX_PATH_EDGES,
 };
+// **The payload of every public error variant is nameable from here.**
+// `BuildError::Topology`, `BuildError::Layout`, `BuildError::Participant` and
+// `ReparentError::Topology` are stable-tier variants, and until these three
+// names were added a caller who depended only on `tf_tree` could match the
+// variant but not the value inside it — while `FrameError` and `ShmError`, the
+// siblings in the same `BuildError`, were exported. On the stable tier and not
+// behind `unstable` (`docs/API.md` §2.6): a stable variant already hands the
+// type out, so the door is open whether or not it is named; both are
+// `#[non_exhaustive]`, so naming them promises no variant set; and `ShmError` /
+// `FrozenError` are the precedent for an arena-crate error at this root.
+pub use tf_tree_arena::LayoutError;
 
 // **The math surface, including both interpolation kernels.** `slerp` is here
 // for the reason the rest of this block exists: a consumer who reaches
