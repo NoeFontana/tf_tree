@@ -548,7 +548,11 @@ is still in exactly that state.
 if tree.owner_lost() {
     match tree.inherit_ownership()? {
         tf_tree::Inheritance::Inherited => { /* this process is now serving */ }
-        tf_tree::Inheritance::Contended => { /* another survivor won; keep going */ }
+        tf_tree::Inheritance::Contended => {
+            /* another survivor won -- or a fresh open() held the ownership byte
+               in passing and will hand it back. Not final either way (nor is
+               OwnerAlive): while owner_lost() says true, the next pass retries. */
+        }
         _ => {}
     }
 }
@@ -626,6 +630,67 @@ every attached participant** and start again. It is written out under
   Its full consequences are under `ArenaHeldButUnreachable` below; read them
   before reaching for it, and reach for inheritance first.
 
+#### An owner is not dead until its exit ends
+
+**When a survivor learns of it.** `owner_lost()` answers `true` once the
+survivor's attach connection has hung up and the last open file description
+holding byte 0 has closed — [`PHASE2.md`](./PHASE2.md) §3.5's NORMATIVE sentence,
+in its words. For a dying owner that is the **end of its exit**: the kernel
+writes any core dump and tears down the address space *first*, and releases the
+socket and byte 0 after. An owner whose `fork` child outlives it keeps both until
+that child exits (*The tree works in the parent and everything fails in a forked
+child*, above). tf_tree adds no delay to that event, and nothing it lets a
+survivor do shortens it ([`0057`](./decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
+
+**What the window does.** Lookups and existing publishers carry on. Nobody
+inherits, and no fresh join can complete: an `open()` blocks for the window, and
+one whose timeout ends inside it is refused with `ArenaHeldButUnreachable` naming
+the dying owner (`ownership_held: true`) — it is still holding the byte. Edges the
+dying owner had claimed stay refused past the window, until a survivor calls
+`reap_dead`.
+
+**The trade, and it is yours to make per process: a crash dump, or recovery
+bounded by the process's teardown.** Make it for **every process that may hold
+the role**, not only today's owner: ownership migrates, so the next heir is the
+next owner ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)),
+and suppressing dumps on the current owner alone protects one handover.
+
+- **The dump window is the crash helper's run, which can grow with the size of
+  the dump.** No figure is given here, because it belongs to your host:
+  `cat /proc/sys/kernel/core_pattern`, where a leading `|` means dumps are piped
+  to a helper (apport, systemd-coredump). To time it on your host, run the
+  program in `0057`'s *Reproduction* — somewhere a crash report left behind is
+  acceptable.
+- **To suppress dumps for chosen processes only**, give them a core limit of
+  **1 byte**, which the kernel treats as *no dump* for a piped `core_pattern`:
+  - `prlimit --core=1:1 -- <cmd>` — **measured**, on one 6.8 kernel piping to
+    apport (`0057`'s `AN` arm);
+  - `LimitCORE=1` in the process's systemd unit;
+  - the same limit, `setrlimit(RLIMIT_CORE, {1, 1})`, in a launch wrapper before
+    it `exec`s the process.
+
+  Only the first was measured; the other two set the same limit, so confirm it
+  on the running process: `grep 'core file' /proc/<pid>/limits` should read `1`
+  and `1` bytes. **`ulimit -c 0` is not it when the host pipes its dumps**: a soft
+  limit of 0 is the ordinary shell default, and on both hosts `0057` looked at,
+  aborts under it still dumped through the pipe.
+- **systemd-coredump's `Storage=` and `ProcessSizeMax=`** (`coredump.conf`) are
+  the host-wide knobs. Whether `Storage=none` or `ProcessSizeMax=0` shortens the
+  window without per-process limits has **not been measured**; do not rely on
+  either without timing it.
+- **The teardown is not a setting.** Even with no dump, a process's socket and
+  byte 0 are released only after its address space is torn down: about
+  **100 ms per GiB of dirty 4 KiB anonymous memory** on the host `0057` measured,
+  whether the process was killed or aborted. Under
+  `transparent_hugepage=always` the same resident size tears down far faster. A
+  large perception or planning process that holds the role pays it on every
+  death.
+- **A supervisor's `SIGKILL` of a dumping owner ends the window and forfeits the
+  core.** That is stated so you know the effect of a stop timeout, **not
+  recommended as a procedure**: it is inferred rather than measured on an owner,
+  and nothing can tell a dump worth interrupting from an exit that is nearly
+  over.
+
 ### `ArenaHeldButUnreachable`
 
 Somebody holds a live arena and nothing is serving it, so
@@ -634,7 +699,9 @@ one. A stopped or wedged participant is one cause. **The ordinary cause is not a
 fault at all**: the owner exited and a perfectly healthy survivor still has the
 arena mapped, so every process that tries to open the rendezvous meets the check
 and times out for as long as any survivor lives. See *The arena's owner died*
-above.
+above. **If the owner has just died, the refusals last at least until its exit ends** —
+any core dump and its address-space teardown come first; see *An owner is not
+dead until its exit ends*, above.
 
 ```bash
 tf_tree participants   # the holders, by slot and pid — reads the lock file, never maps the arena
