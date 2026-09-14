@@ -10,6 +10,7 @@ never built it at all.
 """
 
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -375,6 +376,79 @@ def test_a_forked_child_identifies_the_arena_as_gone_not_as_in_process(runtime_d
         f"signal {os.WTERMSIG(wstatus) if os.WIFSIGNALED(wstatus) else '?'}"
     )
     assert os.WEXITSTATUS(wstatus) == 0
+
+
+def _rendezvous_child() -> pathlib.Path:
+    """The Rust test helper `tf_tree_rendezvous_child`, which the pytest recipes build.
+
+    Under the cargo target directory — `$CARGO_TARGET_DIR`, else the workspace's
+    `target/` — in `debug/`. **Missing is a failure, not a skip**: a skip would
+    let a recipe that stopped building the binary stay green while the test it
+    exists for ran nowhere.
+    """
+    root = pathlib.Path(__file__).resolve().parents[2]
+    target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or root / "target")
+    exe = target / "debug" / "tf_tree_rendezvous_child"
+    assert exe.is_file(), (
+        f"{exe} is missing; `just py-test` builds it, or run `cargo build -p "
+        "tf_tree --features shm --bin tf_tree_rendezvous_child`"
+    )
+    return exe
+
+
+@shm
+def test_a_peer_reparent_raises_topology_changed_with_both_generations(runtime_dir):
+    """`TopologyChangedError.plan_generation` and `.current_generation` (`0058`).
+
+    The one error a correct program attached to a shared arena routinely meets,
+    and no single-process call raises it: none of the Python, CLI or C surfaces
+    can re-parent. The Rust helper can — `join-reparent` joins read-write and,
+    on a line of stdin, moves `cam` from `base` to `map` — so this process
+    serves an arena with the helper's own `layout()` pairs, compiles a plan,
+    lets the helper re-parent, and asks the plan again.
+
+    `Plan::at_tagged` checks the generation before the domain or any data, so
+    no sample is needed. The strict `<` is what holds the two attributes apart:
+    swapped they read greater, and both taken from one field they read equal.
+
+    Mutants, each applied alone, rebuilt and run with ``just py-test``:
+
+    * swap the two ``setattr``s => fails on ``{'plan_generation': 3,
+      'current_generation': 2}``, ``assert 3 < 2``.
+    * set ``current_generation`` from the variant's ``plan`` too => fails on
+      ``{'plan_generation': 2, 'current_generation': 2}``, ``assert 2 < 2``.
+
+    Nothing else in `tests/python` moves under either: no other test raises this
+    class.
+    """
+    tree = tf_tree.open(mode="rw", create=EDGES)
+    plan = tree.plan("map", "cam")
+    child = subprocess.Popen(
+        [str(_rendezvous_child()), "join-reparent"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "TF_TREE_RUNTIME_DIR": runtime_dir},
+    )
+    try:
+        assert child.stdout.readline().strip() == "joined", "the helper did not join"
+        child.stdin.write("go\n")
+        child.stdin.flush()
+        line = child.stdout.readline().strip()
+        assert line == "reparented", f"the helper did not re-parent: {line!r}"
+
+        with pytest.raises(tf_tree.TopologyChangedError) as excinfo:
+            plan.at(1_000)
+        e = excinfo.value
+        assert type(e) is tf_tree.TopologyChangedError
+        assert e.plan_generation < e.current_generation, vars(e)
+
+        from test_stubs import _stub_annotations
+
+        assert set(vars(e)) == set(_stub_annotations("TopologyChangedError"))
+    finally:
+        child.kill()
+        child.wait(timeout=30)
 
 
 @shm

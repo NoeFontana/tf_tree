@@ -19,11 +19,72 @@ import numpy as np
 from numpy.typing import NDArray
 
 class TfTreeError(Exception): ...
-class ExtrapolationError(TfTreeError): ...
-class DisconnectedError(TfTreeError): ...
-class NoDataError(TfTreeError): ...
-class TopologyChangedError(TfTreeError): ...
-class FrameNotDeclaredError(TfTreeError): ...
+
+# **Attributes exist only on instances the library raises**
+# (`docs/decisions/0058`). Each class below annotates its attributes precisely,
+# with no `| None` a raised instance never takes, and sets no class-level
+# default: an instance a caller constructs, such as a test double's
+# `side_effect`, has none of them and raises `AttributeError` on a read. An id
+# is never an integer: an edge is its stored `(parent, child)` frame names,
+# the shape `Tree.edges()` returns, and a frame its stored name, each `None`
+# where the arena holds no usable record at that id.
+
+class ExtrapolationError(TfTreeError):
+    """The requested stamp lies outside an edge's retained history.
+
+    The attributes exist only on instances the library raises. `requested`,
+    `oldest` and `newest` are integer nanoseconds on the clock `domain` names,
+    which is the query's time-domain tag (`tf_tree.SYSTEM_DOMAIN` and its
+    siblings, or a declared integer).
+    """
+
+    edge: tuple[str, str] | None
+    requested: int
+    oldest: int
+    newest: int
+    domain: int
+
+class DisconnectedError(TfTreeError):
+    """No path joins the two frames.
+
+    The attributes exist only on instances the library raises: the frame the
+    plan was compiled toward, the one it was compiled from, and the frame the
+    chain stopped at.
+    """
+
+    target: str | None
+    source: str | None
+    cut_at: str | None
+
+class NoDataError(TfTreeError):
+    """An edge on the path has no samples yet.
+
+    `edge` exists only on instances the library raises.
+    """
+
+    edge: tuple[str, str] | None
+
+class TopologyChangedError(TfTreeError):
+    """The tree was re-parented after this plan was compiled; call `plan` again.
+
+    The one error a correct program attached to a shared arena routinely meets:
+    a peer re-parented a frame. The attributes exist only on instances the
+    library raises.
+    """
+
+    plan_generation: int
+    current_generation: int
+
+class FrameNotDeclaredError(TfTreeError):
+    """No such frame in this arena.
+
+    `name` exists only on instances the library raises. It is the name the
+    caller passed, and `None` only when the engine reported a hash with no name
+    left to recover.
+    """
+
+    name: str | None
+
 class BufferError(TfTreeError): ...
 
 class ChildProcessDetachedError(TfTreeError):
@@ -51,7 +112,11 @@ class DerivativesUnavailableError(TfTreeError):
 
     A property of the *edge*, so it fires at element 0 of a batch and does not
     go away on its own. Its sibling `NoSegmentError` is the opposite.
+
+    `edge` exists only on instances the library raises.
     """
+
+    edge: tuple[str, str] | None
 
 class NoSegmentError(TfTreeError):
     """A pose exists at this stamp, but no segment to differentiate.
@@ -66,7 +131,11 @@ class NoSegmentError(TfTreeError):
     transform is perfectly well defined and only the derivative is not, so being
     told "no data" would send you to the wrong problem. A property of the
     *stamp*, so it can fire partway through a batch.
+
+    `edge` exists only on instances the library raises.
     """
+
+    edge: tuple[str, str] | None
 
 F32Layout = Literal["affine32"]
 """The one layout that writes `float32`."""

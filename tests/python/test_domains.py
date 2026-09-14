@@ -267,6 +267,32 @@ def test_a_tag_one_arena_answers_a_tag_one_query(tag1):
     assert "domain" in str(e.value).lower()
 
 
+def test_an_extrapolation_error_carries_the_querys_domain(tag1):
+    """`0058` §3: a stamp that leaves in a pickled exception keeps its clock.
+
+    `ExtrapolationError.domain` is the tag the query was made in, from the plan
+    handle or `Tree.lookup`'s `domain=`. **Only a non-zero-domain arena can hold
+    it**: on every arena Python builds the right answer is `0`, so a tag
+    hard-coded to `0` passes `test_errors.py`'s table. `0058` step 2 named a
+    `SIM_DOMAIN` row; no Python-reachable arena extrapolates in that domain,
+    because the domain check runs before the window check and this fixture is
+    the only non-zero arena the package can open, so the row is `SENSOR_DOMAIN`.
+
+    Mutant: ``e.setattr("domain", 0u8)`` in `lookup_err` => fails on ``assert
+    0 == 1``, and **nothing in `test_errors.py` moves**, which is why the row is
+    here.
+    """
+    plan = tag1.plan("odom", "map", domain=tf_tree.SENSOR_DOMAIN)
+    with pytest.raises(tf_tree.ExtrapolationError) as through_plan:
+        plan.at(10**12)
+    with pytest.raises(tf_tree.ExtrapolationError) as through_lookup:
+        tag1.lookup("odom", "map", 10**12, domain=tf_tree.SENSOR_DOMAIN)
+    for e in (through_plan.value, through_lookup.value):
+        assert e.domain == tf_tree.SENSOR_DOMAIN
+        assert e.edge == ("map", "odom")
+        assert (e.requested, e.oldest, e.newest) == (10**12, 0, 150_000_000)
+
+
 def test_every_query_shape_carries_the_tag_on_a_tag_one_arena(tag1):
     """All five shapes, against an arena that can tell the difference.
 

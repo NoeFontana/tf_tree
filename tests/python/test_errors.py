@@ -105,8 +105,12 @@ def _unknown_frame_through_span():
 
 
 def _disconnected():
+    # Toward `chassis_b`, not toward the root `world_a`: the walk then stops at
+    # `world_a`, so `target`, `source` and `cut_at` are three different frames
+    # and the attribute table below cannot pass on a swapped pair. Toward the
+    # root, `cut_at` *is* the target.
     t = tf_tree.build([("world_a", "chassis_b"), ("orphan_d", "sensor_c")])
-    t.plan("world_a", "sensor_c")
+    t.plan("chassis_b", "sensor_c")
 
 
 def _too_deep():
@@ -220,7 +224,7 @@ CASES = [
     (_unknown_frame_through_lookup, tf_tree.FrameNotDeclaredError, ("ghost_frame",)),
     (_unknown_frame_through_plan, tf_tree.FrameNotDeclaredError, ("ghost_frame",)),
     (_unknown_frame_through_span, tf_tree.FrameNotDeclaredError, ("ghost_frame",)),
-    (_disconnected, tf_tree.DisconnectedError, ("world_a", "sensor_c")),
+    (_disconnected, tf_tree.DisconnectedError, ("chassis_b", "sensor_c", "world_a")),
     (_too_deep, tf_tree.TfTreeError, ()),
     (_too_long_a_walk, tf_tree.TfTreeError, ()),
     (_at_the_seam, tf_tree.TfTreeError, ()),
@@ -299,6 +303,123 @@ def test_a_message_carries_frame_names_and_no_rust_internals(trigger, exc_type, 
     with pytest.raises(exc_type) as excinfo:
         trigger()
     _assert_prose(str(excinfo.value), names)
+
+
+# ---------------------------------------------------------------------------
+# The fields a handler branches on (`docs/decisions/0058`)
+# ---------------------------------------------------------------------------
+
+#: What each raising row's instance carries, **exactly**: `vars(e)` is compared
+#: whole, so an attribute on a class that should have none fails as surely as a
+#: missing one. A row absent from this table must carry nothing.
+#:
+#: The fixture values are pairwise distinct — `requested` is none of `oldest`
+#: and `newest`, and `_disconnected`'s three frames are three different names —
+#: so a swapped pair cannot pass. `domain` here is `0`, the only tag an arena
+#: Python builds can carry; `test_domains.py` holds a non-zero one.
+ATTRIBUTES = {
+    _extrapolation: {
+        "edge": ("world_a", "chassis_b"),
+        "requested": 9_000_000,
+        "oldest": 1_000,
+        "newest": 2_000,
+        "domain": 0,
+    },
+    _no_data: {"edge": ("chassis_b", "sensor_c")},
+    _unknown_frame_through_lookup: {"name": "ghost_frame"},
+    _unknown_frame_through_plan: {"name": "ghost_frame"},
+    _unknown_frame_through_span: {"name": "ghost_frame"},
+    _disconnected: {"target": "chassis_b", "source": "sensor_c", "cut_at": "world_a"},
+    _derivatives_unavailable: {"edge": ("world_a", "chassis_b")},
+    _no_segment: {"edge": ("world_a", "chassis_b")},
+    _span_of_a_silent_edge: {"edge": ("chassis_b", "sensor_c")},
+}
+
+
+def _raised(trigger):
+    try:
+        trigger()
+    except tf_tree.TfTreeError as e:
+        return e
+    raise AssertionError(f"{trigger.__name__} did not raise")
+
+
+@pytest.mark.parametrize(
+    "trigger,exc_type",
+    [(c[0], c[1]) for c in CASES],
+    ids=[c[0].__name__.lstrip("_") for c in CASES],
+)
+def test_a_raised_exception_carries_exactly_its_classs_attributes(trigger, exc_type):
+    """`0058` §1: each attribute is on every raised instance of its class and on
+    no instance of any other, with its **value** asserted, not its presence.
+
+    ``args`` stays ``(message,)`` on every row, which is `0058` §5's shape and
+    what `docs/PHASE3.md` §4.4 tells a caller they can rely on: fields in
+    ``args`` would turn ``str(e)`` into a tuple repr.
+
+    Mutants, each applied alone, rebuilt and run with ``just py-test``:
+
+    * swap ``oldest`` and ``newest`` in `lookup_err`'s ``setattr`` => the
+      ``extrapolation`` row fails on ``'oldest': 2000, 'newest': 1000``, and
+      `test_domains.py`'s domain test on ``(10**12, 150000000, 0)``.
+    * resolve `no_data_err`'s ``.edge`` as ``(child, parent)`` => the
+      ``no_data`` and ``span_of_a_silent_edge`` rows fail on ``('sensor_c',
+      'chassis_b')``, and so does the stale-id test below.
+    * swap ``DisconnectedError.target`` and ``.source`` => the ``disconnected``
+      row fails on ``{'source': 'chassis_b'} != {'source': 'sensor_c'}``.
+    * build ``ExtrapolationError::new_err((msg, requested))``, still setting
+      the attribute => the ``extrapolation`` row fails on ``assert 2 == 1``,
+      ``len(e.args)``. ``vars(e)`` alone would have passed it.
+    """
+    e = _raised(trigger)
+    assert type(e) is exc_type
+    assert vars(e) == ATTRIBUTES.get(trigger, {}), (trigger.__name__, vars(e))
+    assert len(e.args) == 1, e.args
+    assert str(e) == e.args[0]
+
+
+def test_every_class_a_row_raises_annotates_exactly_what_the_instance_carries():
+    """The stub against the mapper, on raised instances (`0058` step 2).
+
+    `_core.pyi` annotates each exception attribute in its class body, and
+    `test_stubs.py`'s existence checks see only module-level names — so without
+    this, an attribute renamed in Rust would leave the stub promising the old
+    one to every type checker. Compared per row rather than per class, so a
+    class raised by two rows is held on both.
+
+    Mutant: drop ``oldest: int`` from `_core.pyi` => fails on
+    ``('_extrapolation', {'domain', 'edge', 'newest', 'requested'}, ...)``,
+    ``Extra items in the right set: 'oldest'``. Nothing in `test_stubs.py`
+    moves: its checks are about module-level names and methods.
+    """
+    from test_stubs import _stub_annotations
+
+    for trigger, _, _ in CASES:
+        e = _raised(trigger)
+        annotated = set(_stub_annotations(type(e).__name__))
+        assert annotated == set(vars(e)), (trigger.__name__, annotated, vars(e))
+
+
+def test_a_caller_constructed_exception_carries_no_attributes():
+    """`0058` question 6: the stub stays precise and nothing defaults to ``None``.
+
+    An instance a caller builds — a test double's ``side_effect`` — has no
+    attributes, and the stub still annotates ``requested: int`` rather than
+    ``int | None``, because the consumer of the attribute is a handler of
+    *raised* errors. Both halves are pinned: a class-level ``None`` default would
+    make the first fail, and widening the annotation the second.
+
+    Mutant: ``py.get_type::<ExtrapolationError>().setattr("requested",
+    py.None())`` in `register()` => fails on ``assert not True``, ``where True
+    = hasattr(ExtrapolationError('m'), 'requested')``, and nothing else moves:
+    a raised instance's ``__dict__`` still wins over the class attribute.
+    """
+    from test_stubs import _stub_annotations
+
+    built = tf_tree.ExtrapolationError("m")
+    assert not hasattr(built, "requested")
+    assert vars(built) == {}
+    assert _stub_annotations("ExtrapolationError")["requested"] == "int"
 
 
 def _assert_prose(msg, names):
@@ -519,6 +640,10 @@ def test_a_stale_id_degrades_to_an_index_and_a_reason_not_to_a_debug_dump():
     assert "name unavailable" not in msg, msg
     assert "edge #" not in msg, msg
     assert "frame #" not in msg, msg
+    # And the attribute resolved too (`0058` §2): the stored pair, a member of
+    # the listing, not the `None` a failed resolution gives.
+    assert excinfo.value.edge == ("chassis_b", "sensor_c")
+    assert excinfo.value.edge in t.edges()
 
 
 @shm
@@ -677,3 +802,7 @@ def test_a_raised_exception_survives_a_pickle_round_trip(trigger, exc_type):
     back = pickle.loads(pickle.dumps(excinfo.value))
     assert type(back) is type(excinfo.value)
     assert back.args == excinfo.value.args
+    # `0058` §5: the attributes live in `__dict__`, which
+    # `BaseException.__reduce__` carries, so a worker's exception reaches its
+    # parent with them.
+    assert vars(back) == vars(excinfo.value)

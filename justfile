@@ -3355,12 +3355,19 @@ py-setup:
 # Build the extension into the GIL venv and run the suite.
 py-test:
     VIRTUAL_ENV=.venv .venv/bin/maturin develop --uv -q
+    # `tests/python/test_shared.py` drives this Rust helper's `join-reparent`
+    # to raise `TopologyChangedError` across processes (`docs/decisions/0058`
+    # step 2), and fails rather than skips when it is missing. Measured on the
+    # dev host: 4.9 s on a cold workspace `target/`, 0.07 s warm.
+    cargo build -p tf_tree --features shm --bin tf_tree_rendezvous_child
     .venv/bin/python -m pytest tests/python -q
 
 # The same on the free-threaded interpreter — §7.3's requirement, and the only
 # place the concurrency claims are actually exercised.
 py-test-freethreaded:
     VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
+    # `py-test`'s line, for the same test: both recipes run all of `tests/python`.
+    cargo build -p tf_tree --features shm --bin tf_tree_rendezvous_child
     .venv-t/bin/python -m pytest tests/python -q
 
 # **`docs/PHASE3.md` §12.2 criterion 4, and §7.3's scaling test.** The criterion

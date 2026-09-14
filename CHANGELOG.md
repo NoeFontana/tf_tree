@@ -41,6 +41,38 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — Python exceptions carry the fields a handler branches on
+
+[`0058`](docs/decisions/0058-the-fields-a-python-exception-only-printed.md),
+which `docs/PHASE3.md` §4.4 had promised since Phase 3 and no exception had ever
+kept. **Message text does not change, and every class keeps its base**, so an
+existing `except` clause catches exactly what it caught before.
+
+- **Seven classes carry attributes on the instances the library raises**, set in
+  the instance's `__dict__` with `args` left `(message,)`, so a pickled
+  exception from a `multiprocessing` worker keeps them:
+  `ExtrapolationError.edge`, `.requested`, `.oldest`, `.newest` and `.domain`;
+  `DisconnectedError.target`, `.source` and `.cut_at`; `NoDataError.edge`;
+  `TopologyChangedError.plan_generation` and `.current_generation`;
+  `FrameNotDeclaredError.name`; `DerivativesUnavailableError.edge`; and
+  `NoSegmentError.edge`. An edge is the arena's stored `(parent, child)` frame
+  names, the shape `Tree.edges()` returns, and a frame its stored name; either
+  is `None` where the arena holds no usable record. No attribute is an integer
+  id. `.domain` is the query's time-domain tag, and the stamps are nanoseconds
+  on that clock.
+- **Migration:** nothing to change for a handler that reads only the class or
+  `str(e)`. Code that asserted `vars(e) == {}`, or compared a raised instance's
+  `__dict__`, now sees the attributes. **An instance you construct yourself
+  carries none** — `tf_tree.ExtrapolationError("boom")`, a mock's
+  `side_effect`, or one unpickled from an older build — and `_core.pyi`
+  annotates the attributes precisely (`requested: int`, not `int | None`), so a
+  handler that reads `e.requested` from such a double raises `AttributeError`
+  and a type checker does not warn. Build test doubles by raising through the
+  library, or set the attributes on them.
+- `just py-test` and `just py-test-freethreaded` now run `cargo build -p tf_tree
+  --features shm --bin tf_tree_rendezvous_child` first: `TopologyChangedError`'s
+  two attributes are held by a test that spawns that helper's `join-reparent`.
+
 ### Changed — the arena errors describe themselves, and five wrappers stop printing struct literals
 
 [`0059`](docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md),

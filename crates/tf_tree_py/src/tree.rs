@@ -421,16 +421,17 @@ impl PyTree {
     /// "I already checked" fast path.
     #[pyo3(signature = (target, source, /, *, domain = 0))]
     fn plan(slf: &Bound<'_, PyTree>, target: &str, source: &str, domain: u8) -> PyResult<PyPlan> {
+        let py = slf.py();
         let this = slf.get();
         // [`resolve_frame`], not `Tree::frame`: compiling a plan is a read, and
         // `Tree::frame` interns. A typo here used to declare the typo — see that
         // function for what that costs on an arena with headroom.
-        let t = resolve_frame(&this.inner, target)?;
-        let s = resolve_frame(&this.inner, source)?;
+        let t = resolve_frame(py, &this.inner, target)?;
+        let s = resolve_frame(py, &this.inner, source)?;
         let plan = this
             .inner
             .plan(t, s)
-            .map_err(|e| lookup_err(&this.inner, e))?;
+            .map_err(|e| lookup_err(py, &this.inner, Some(domain), e))?;
         // The one place a domain disagreement is cheap to report *and* nameable:
         // `target` and `source` are still strings here. Guarded on
         // [`samples_anything`] so this fires exactly where the core's own
@@ -455,6 +456,7 @@ impl PyTree {
     /// Use it as a context manager; the claim is released on exit.
     #[pyo3(signature = (child, parent, /))]
     fn publisher(slf: &Bound<'_, PyTree>, child: &str, parent: &str) -> PyResult<PyPublisher> {
+        let py = slf.py();
         let this = slf.get();
         // **This tree stops being the recording the moment it can be written
         // to.** Cleared here rather than on the first `push` because the
@@ -468,8 +470,8 @@ impl PyTree {
         // three: topology is builder-time (decision `0004`), so a name with no
         // record has no edge either and interning it could not produce one — it
         // would spend a frame slot to reach the same refusal one call later.
-        let c = resolve_frame(&this.inner, child)?;
-        let p = resolve_frame(&this.inner, parent)?;
+        let c = resolve_frame(py, &this.inner, child)?;
+        let p = resolve_frame(py, &this.inner, parent)?;
         // `claim_owned`, not `claim`: this crate no longer extends a lifetime
         // itself. `docs/decisions/0017` step 6 — the writer that comes back owns
         // its `Arc<Tree>`, so the arena outlives it by construction and the
@@ -572,8 +574,8 @@ impl PyTree {
     /// died for 30 s in the middle of a 100 Hz edge moves neither end, so a span
     /// can be almost entirely gap and still look healthy.
     #[pyo3(signature = (target, source, /))]
-    fn span(&self, target: &str, source: &str) -> PyResult<Option<(i64, i64)>> {
-        crate::offline::span_impl(&self.inner, target, source)
+    fn span(&self, py: Python<'_>, target: &str, source: &str) -> PyResult<Option<(i64, i64)>> {
+        crate::offline::span_impl(py, &self.inner, target, source)
     }
 
     /// The frame names on this tree, in declaration order (§4.4).
@@ -879,9 +881,9 @@ impl PyTree {
             // whole account.
             .map_err(|e| match e {
                 tf_tree::LookupError::UnknownFrame { .. } => {
-                    unknown_frame_err(&self.inner, [target, source], e)
+                    unknown_frame_err(py, &self.inner, [target, source], e)
                 }
-                other => lookup_err(&self.inner, other),
+                other => lookup_err(py, &self.inner, Some(domain), other),
             })?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated here; no other reference exists.
@@ -1100,7 +1102,7 @@ impl PyPlan {
         let iso = self
             .plan
             .at_tagged(&g, stamp, self.domain)
-            .map_err(|e| lookup_err(self.tree(), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated by us, so nothing else holds a reference and
         // the slice is exactly 16 contiguous f64.
@@ -1279,7 +1281,7 @@ impl PyPlan {
         let iso = self
             .plan
             .at_tagged(&g, stamp, self.domain)
-            .map_err(|e| lookup_err(self.tree(), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
         // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
         // slice is exactly 16 writable f64. Aliasing remains the caller's
         // to avoid, as it was before — `as_slice_mut` documents that, and
@@ -1386,7 +1388,7 @@ impl PyPlan {
         let x = self
             .plan
             .at_extrapolating_tagged(&g, stamp, self.domain, policy)
-            .map_err(|e| lookup_err(self.tree(), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
         // `mat4` keeps `at`'s `(4, 4)` shape; every other layout is the flat
         // `(elems,)` row `at(.., layout=..)` already returns, so the two methods
         // agree on shape for the same `layout` argument.
@@ -1549,7 +1551,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(|err| lookup_err(self.tree(), err))
+        res.map_err(|err| lookup_err(py, self.tree(), Some(self.domain), err))
     }
 
     /// The most recent transform on this path.
@@ -1558,7 +1560,7 @@ impl PyPlan {
         let iso = self
             .plan
             .latest(&g)
-            .map_err(|e| lookup_err(self.tree(), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated here; no other reference exists.
         let slice = unsafe { out.as_slice_mut()? };
@@ -1620,7 +1622,7 @@ impl PyPlan {
                 tol,
                 &mut scratch,
             )
-            .map_err(|e| lookup_err(self.tree(), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
 
         let k = stamps.len();
         let out_s = PyArray1::<i64>::zeros(py, [k], false);
@@ -1731,7 +1733,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(|e| lookup_err(tree, e))
+        res.map_err(|e| lookup_err(py, tree, Some(domain), e))
     }
 
     /// [`PyPlan::at_extrapolating`]'s array half: `(N, 4, 4)` poses and `(N,)`
@@ -1812,7 +1814,7 @@ impl PyPlan {
             } else {
                 run()
             };
-            res.map_err(|e| lookup_err(tree, e))?;
+            res.map_err(|e| lookup_err(py, tree, Some(domain), e))?;
         }
         Ok((poses.into_any(), dist.into_any()))
     }
@@ -2000,7 +2002,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(|e| lookup_err(tree, e))
+        res.map_err(|e| lookup_err(py, tree, Some(domain), e))
     }
 
     /// [`Self::eval_f64`] for the one `f32` layout.
@@ -2023,7 +2025,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(|e| lookup_err(tree, e))
+        res.map_err(|e| lookup_err(py, tree, Some(domain), e))
     }
 }
 
@@ -2590,6 +2592,7 @@ fn config_build_err(e: tf_tree::BuildError) -> PyErr {
 #[pyfunction]
 #[pyo3(signature = (tree, child, parent, stamp_ns, quat7, /))]
 pub fn push(
+    py: Python<'_>,
     tree: &PyTree,
     child: &str,
     parent: &str,
@@ -2606,8 +2609,8 @@ pub fn push(
     }
     // See `Tree.publisher`: builder-time topology means interning a name that
     // has no record cannot produce an edge to publish on.
-    let c = resolve_frame(&tree.inner, child)?;
-    let p = resolve_frame(&tree.inner, parent)?;
+    let c = resolve_frame(py, &tree.inner, child)?;
+    let p = resolve_frame(py, &tree.inner, parent)?;
     let iso = tf_tree::Iso3::new(
         tf_tree::Quat {
             w: quat7[0],

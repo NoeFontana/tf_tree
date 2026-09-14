@@ -1,18 +1,32 @@
 //! The exception hierarchy (`docs/PHASE3.md` §4.4).
 //!
 //! Rust's errors are `Copy` and carry structured fields; **Python's carry a
-//! message and a class, and nothing else.** No exception here has an attribute:
-//! every mapper below builds its exception from a formatted string, and has
-//! since this module's first commit. This paragraph said the opposite — "the
-//! fields are attached to the exception rather than only formatted into it" —
-//! for as long as the module existed, and `PHASE3.md` §4.4's dated amendment is
-//! the account of what ships instead. The gap it described is real: a caller
-//! who has to parse a string to find out *which edge* extrapolated cannot
-//! program against it. Closing it means choosing how an id-shaped attribute
-//! reaches a language that is never handed an id (next section), and that is
-//! a decision record, not an edit here.
+//! class, a message, and the fields a handler branches on as attributes**
+//! (`docs/decisions/0058`). Until that record, no exception here had an
+//! attribute, and this paragraph had claimed for the module's whole life that
+//! the fields were attached. A caller who has to parse a string to find out
+//! *which stamp* extrapolated cannot program against it, and `docs/API.md` R5
+//! says the string is not a promise.
 //!
-//! **What a caller can program against today is the class.** That is why
+//! # How an attribute is attached ([`with_attrs`])
+//!
+//! **Set on the raised instance after construction, into its `__dict__`, with
+//! `args` left `(message,)`.** `BaseException.__reduce__` carries `__dict__`,
+//! so pickle, `copy` and `multiprocessing` keep the attributes with no
+//! `__reduce__` of ours, and `str(e)` is unchanged. Fields in `args` would turn
+//! `str(e)` into a tuple repr; a keyword constructor fails `pickle.loads`.
+//! Values are plain data (`int`, `str`, `bool`, `None`, tuples of those), never
+//! a handle. **An id is never an integer**: an edge is its stored `(parent,
+//! child)` names, the shape `Tree.edges()` returns, and a frame its stored name,
+//! each `None` where the arena holds no usable record (next section).
+//!
+//! **Every mapper that attaches one takes `py: Python<'_>`, and that is what
+//! keeps the work off a detached thread.** `Python<'py>` is not `Ungil`, so
+//! the compiler refuses a mapper call inside a `py.detach` closure; every call
+//! site maps after `detach` returns. The attribute is computed in the `Err`
+//! arm from the error value, so a successful call runs none of this.
+//!
+//! **The class is still what a caller programs against first.** That is why
 //! [`ChildProcessDetachedError`] exists (`PHASE3.md` §8.1, NORMATIVE) and why
 //! every class is declared under the module path `tf_tree`: the macro's first
 //! argument becomes `__module__`, and `_core` — what it said until 2026-09-14 —
@@ -43,7 +57,10 @@
 //! same thing again.
 
 use pyo3::prelude::*;
-use pyo3::{create_exception, exceptions::PyException};
+use pyo3::{
+    create_exception,
+    exceptions::{PyBaseException, PyException},
+};
 
 use tf_tree::unstable::ArenaView;
 use tf_tree::{
@@ -72,31 +89,39 @@ create_exception!(
     tf_tree,
     ExtrapolationError,
     TfTreeError,
-    "The requested stamp lies outside an edge's retained history."
+    "The requested stamp lies outside an edge's retained history.\n\n\
+     Attributes: edge, requested, oldest, newest, domain. They exist only on \
+     instances the library raises."
 );
 create_exception!(
     tf_tree,
     DisconnectedError,
     TfTreeError,
-    "No path joins the two frames."
+    "No path joins the two frames.\n\n\
+     Attributes: target, source, cut_at. They exist only on instances the \
+     library raises."
 );
 create_exception!(
     tf_tree,
     NoDataError,
     TfTreeError,
-    "An edge on the path has no samples yet."
+    "An edge on the path has no samples yet.\n\n\
+     Attribute: edge. It exists only on instances the library raises."
 );
 create_exception!(
     tf_tree,
     TopologyChangedError,
     TfTreeError,
-    "The tree was re-parented after this plan was compiled; re-plan."
+    "The tree was re-parented after this plan was compiled; re-plan.\n\n\
+     Attributes: plan_generation, current_generation. They exist only on \
+     instances the library raises."
 );
 create_exception!(
     tf_tree,
     FrameNotDeclaredError,
     TfTreeError,
-    "No such frame in this arena."
+    "No such frame in this arena.\n\n\
+     Attribute: name. It exists only on instances the library raises."
 );
 create_exception!(
     tf_tree,
@@ -109,14 +134,16 @@ create_exception!(
     DerivativesUnavailableError,
     TfTreeError,
     "This edge's interpolator has no exact derivative; layout='quat_twist' \
-     cannot be served over it."
+     cannot be served over it.\n\n\
+     Attribute: edge. It exists only on instances the library raises."
 );
 create_exception!(
     tf_tree,
     NoSegmentError,
     TfTreeError,
     "A pose exists at this stamp but there is no segment to differentiate; \
-     layout='quat_twist' needs two samples spanning a non-zero interval."
+     layout='quat_twist' needs two samples spanning a non-zero interval.\n\n\
+     Attribute: edge. It exists only on instances the library raises."
 );
 create_exception!(
     tf_tree,
@@ -152,6 +179,25 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<ChildProcessDetachedError>(),
     )?;
     Ok(())
+}
+
+/// Set attributes on `err`'s instance and hand the exception back.
+///
+/// **The one place an attribute is attached** (`docs/decisions/0058` §5): into
+/// the instance's `__dict__`, after construction, so `args` stays
+/// `(message,)` and a pickle round trip keeps both. A `setattr` on an exception
+/// instance can fail only by running out of memory, and then that failure is
+/// what the caller sees rather than an exception missing an attribute its class
+/// promises on every raise.
+fn with_attrs<'py>(
+    py: Python<'py>,
+    err: PyErr,
+    attrs: impl FnOnce(&Bound<'py, PyBaseException>) -> PyResult<()>,
+) -> PyErr {
+    match attrs(err.value(py)) {
+        Ok(()) => err,
+        Err(failed) => failed,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,12 +301,16 @@ fn frame_phrase_in(tree: &Tree, view: &ArenaView<'_>, frame: FrameId) -> String 
 ///
 /// The remedy is here rather than in the `docs/PHASE3.md` §4.4 class docstring
 /// because a Python traceback shows the message and not the class docstring.
-fn frame_not_declared(name: &str) -> PyErr {
-    FrameNotDeclaredError::new_err(format!(
+///
+/// `.name` is the name the caller typed: the one fact the class exists to
+/// report (`docs/decisions/0058` §1).
+fn frame_not_declared(py: Python<'_>, name: &str) -> PyErr {
+    let err = FrameNotDeclaredError::new_err(format!(
         "no frame named {name:?} in this arena; if the name is spelled right, \
          its publisher has not declared it yet — wait for one, or declare it \
          on the builder that creates the arena"
-    ))
+    ));
+    with_attrs(py, err, |e| e.setattr("name", name))
 }
 
 /// Resolve a frame name for an entry point that holds one, **without interning**.
@@ -288,14 +338,14 @@ fn frame_not_declared(name: &str) -> PyErr {
 /// [`FrameNotDeclaredError`] for a name this arena has never interned, and the
 /// base `TfTreeError` for the two failures that are *not* an absent name —
 /// see [`unknown_frame_err`], which spells them.
-pub(crate) fn resolve_frame(tree: &Tree, name: &str) -> PyResult<FrameId> {
+pub(crate) fn resolve_frame(py: Python<'_>, tree: &Tree, name: &str) -> PyResult<FrameId> {
     if tree.detached() {
         return Err(detached_err());
     }
     match tree.arena_view().find_frame(name) {
         Ok(Some(id)) => Ok(id),
-        Ok(None) => Err(frame_not_declared(name)),
-        Err(e) => Err(unresolvable_name(name, e)),
+        Ok(None) => Err(frame_not_declared(py, name)),
+        Err(e) => Err(unresolvable_name(py, name, e)),
     }
 }
 
@@ -329,16 +379,24 @@ pub(crate) fn resolve_frame(tree: &Tree, name: &str) -> PyResult<FrameId> {
 /// the caller lost by a microsecond: a peer interned the name between the engine's
 /// probe and this one. There is nothing to blame, so [`lookup_err`] reports the
 /// hash it was given.
-pub(crate) fn unknown_frame_err(tree: &Tree, names: [&str; 2], e: LookupError) -> PyErr {
+///
+/// That fall-through passes no time-domain tag, and needs none: it is handed
+/// `UnknownFrame` and nothing else, which is not the variant a tag describes.
+pub(crate) fn unknown_frame_err(
+    py: Python<'_>,
+    tree: &Tree,
+    names: [&str; 2],
+    e: LookupError,
+) -> PyErr {
     let view = tree.arena_view();
     for name in names {
         match view.find_frame(name) {
             Ok(Some(_)) => continue,
-            Ok(None) => return frame_not_declared(name),
-            Err(err) => return unresolvable_name(name, err),
+            Ok(None) => return frame_not_declared(py, name),
+            Err(err) => return unresolvable_name(py, name, err),
         }
     }
-    lookup_err(tree, e)
+    lookup_err(py, tree, None, e)
 }
 
 /// The two ways a name fails to resolve that are *not* "it was never declared".
@@ -348,7 +406,7 @@ pub(crate) fn unknown_frame_err(tree: &Tree, names: [&str; 2], e: LookupError) -
 /// contract, and a caller catching `FrameNotDeclaredError` around a lookup is
 /// catching "this name is absent". Neither of these is that — one says the name
 /// cannot exist here, the other says it is on its way.
-fn unresolvable_name(name: &str, e: FrameError) -> PyErr {
+fn unresolvable_name(py: Python<'_>, name: &str, e: FrameError) -> PyErr {
     match e {
         FrameError::FrameHashCollision { hash } => TfTreeError::new_err(format!(
             "{name:?} cannot be resolved in this arena: another frame name \
@@ -370,7 +428,7 @@ fn unresolvable_name(name: &str, e: FrameError) -> PyErr {
         // name is absent and this participant may not declare it — its own doc
         // comment insists on that reading), and `CapacityExceeded` means it can
         // never be declared here either.
-        FrameError::ReadOnly | FrameError::CapacityExceeded => frame_not_declared(name),
+        FrameError::ReadOnly | FrameError::CapacityExceeded => frame_not_declared(py, name),
         FrameError::ChildDetached => detached_err(),
         other => TfTreeError::new_err(format!(
             "{name:?} could not be resolved, and this binding has no message \
@@ -661,12 +719,24 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
      (tf_tree.open(...)), or use multiprocessing's 'spawn' or 'forkserver' \
      start method";
 
-/// Map a `LookupError` to its Python exception: a class and a sentence.
+/// Map a `LookupError` to its Python exception: a class, a sentence, and the
+/// attributes `docs/decisions/0058` §1 gives that class.
 ///
-/// The structured detail the Rust error carries is formatted into the sentence
-/// and not attached — this line used to say "keeping the structured detail",
-/// which was the module doc's false claim again (`docs/PHASE3.md` §4.4's
-/// 2026-09-14 amendment).
+/// Until that record the detail was formatted into the sentence and not
+/// attached, while this line said "keeping the structured detail".
+///
+/// # `domain`, and why three call sites pass `None`
+///
+/// `ExtrapolationError.domain` is the **query's** tag (`0058` §3): a stamp that
+/// crosses a process boundary inside a pickled exception has left behind the
+/// plan that said which clock it is on. Every call site whose Rust call can
+/// return `Extrapolation` holds that tag — `PyPlan`'s `domain` field, and
+/// `Tree.lookup`'s and `Tree.plan`'s `domain=` — and passes it. The three that
+/// hold none pass `None`: `span_impl`'s two, over `Tree::plan` and `Plan::span`,
+/// and [`unknown_frame_err`]'s, which is handed `UnknownFrame`. None of those
+/// Rust calls produces `Extrapolation` (only `tf_tree_core::sample` does, and
+/// neither `compile` nor `Guard::window` reaches it), so the `None` arm of that
+/// variant is this binding's bug and says so rather than inventing a tag.
 ///
 /// `TopologyChanged` is the one a *correct* program routinely hits — a peer
 /// re-parented the tree — so its message says what to do rather than only what
@@ -720,7 +790,13 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
 /// it were a sentence; the Debug is still there because it is the only
 /// information a build in this state has, but it is now labelled as the
 /// binding's bug rather than presented as the answer.
-pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
+// **`#[cold]` and never inlined, because every hot entry point names it in a
+// `map_err` closure.** `0058` step 2's interleaved, pinned A/B (release, n = 30)
+// read scalar `plan.at` +2.6% slower than the base with this function inlinable
+// and +1.0% with these two attributes, on a success path that runs none of it.
+#[cold]
+#[inline(never)]
+pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: LookupError) -> PyErr {
     let view = tree.arena_view();
     match e {
         LookupError::Extrapolation {
@@ -728,39 +804,73 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
             requested,
             oldest,
             newest,
-        } => ExtrapolationError::new_err(format!(
-            "{}: stamp {requested} ns is outside the retained history \
-             [{oldest}, {newest}] ns",
-            edge_label_in(tree, &view, edge)
-        )),
+        } => {
+            let msg = format!(
+                "{}: stamp {requested} ns is outside the retained history \
+                 [{oldest}, {newest}] ns",
+                edge_label_in(tree, &view, edge)
+            );
+            let Some(domain) = domain else {
+                return TfTreeError::new_err(format!(
+                    "{msg}. This call site holds no time-domain tag to attach, \
+                     which is a bug in tf_tree_py's error layer, not in your \
+                     program; please report it with this line"
+                ));
+            };
+            with_attrs(py, ExtrapolationError::new_err(msg), |e| {
+                e.setattr("edge", named_edge_in(&view, edge))?;
+                e.setattr("requested", requested)?;
+                e.setattr("oldest", oldest)?;
+                e.setattr("newest", newest)?;
+                e.setattr("domain", domain)
+            })
+        }
         LookupError::Disconnected {
             target,
             source,
             cut_at,
-        } => DisconnectedError::new_err(format!(
-            "no path from {} to {}; the chain stops at {}",
-            frame_label_in(tree, &view, source),
-            frame_label_in(tree, &view, target),
-            frame_label_in(tree, &view, cut_at),
-        )),
-        LookupError::NoData { edge } => NoDataError::new_err(format!(
-            "{} has no samples yet",
-            edge_label_in(tree, &view, edge)
-        )),
-        LookupError::TopologyChanged { plan, current } => TopologyChangedError::new_err(format!(
-            "this plan was compiled at topology generation {plan}, the tree is \
-             now at {current}; call tree.plan(...) again"
-        )),
+        } => {
+            let err = DisconnectedError::new_err(format!(
+                "no path from {} to {}; the chain stops at {}",
+                frame_label_in(tree, &view, source),
+                frame_label_in(tree, &view, target),
+                frame_label_in(tree, &view, cut_at),
+            ));
+            with_attrs(py, err, |e| {
+                e.setattr("target", named_frame_in(&view, target))?;
+                e.setattr("source", named_frame_in(&view, source))?;
+                e.setattr("cut_at", named_frame_in(&view, cut_at))
+            })
+        }
+        LookupError::NoData { edge } => no_data_err(
+            py,
+            &view,
+            edge,
+            format!("{} has no samples yet", edge_label_in(tree, &view, edge)),
+        ),
+        LookupError::TopologyChanged { plan, current } => {
+            let err = TopologyChangedError::new_err(format!(
+                "this plan was compiled at topology generation {plan}, the tree \
+                 is now at {current}; call tree.plan(...) again"
+            ));
+            with_attrs(py, err, |e| {
+                e.setattr("plan_generation", plan)?;
+                e.setattr("current_generation", current)
+            })
+        }
         // **The last resort, and the entry points that can do better do.**
         // `UnknownFrame` carries a BLAKE3 prefix and BLAKE3 does not invert, so
         // there is no name to recover *here*; `PyTree::lookup` — the one caller
         // that still has both names as strings — attributes the failure itself
         // and reaches this only when neither name is the missing one, which
         // means a peer interned it between the two reads.
+        //
+        // `.name` is `None` here, and only here: no name survives a hash.
         LookupError::UnknownFrame { hash } => {
-            FrameNotDeclaredError::new_err(format!(
+            let err = FrameNotDeclaredError::new_err(format!(
                 "no frame with hash {hash:#x} in this arena; if the name is spelled right, its publisher has not declared it yet — wait for one, or declare it on the builder that creates the arena"
-            ))
+            ));
+            with_attrs(py, err, |e| e.setattr("name", py.None()))
         }
         LookupError::BufferTooSmall { need, got } => BufferError::new_err(format!(
             "output buffer holds {got} elements; this batch needs {need}"
@@ -777,12 +887,13 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
         // the fix is a re-declaration or a pose layout — permanent for the life
         // of the arena.
         LookupError::DerivativesUnavailable { edge, interp } => {
-            DerivativesUnavailableError::new_err(format!(
+            let err = DerivativesUnavailableError::new_err(format!(
                 "{} declares {}, which has no exact derivative; use \
                  layout='quat' or declare the edge interp='sclerp'",
                 edge_label_in(tree, &view, edge),
                 stored_interp(interp),
-            ))
+            ));
+            with_attrs(py, err, |e| e.setattr("edge", named_edge_in(&view, edge)))
         }
         // `NoSegment` is a property of a **stamp**, and is transient: the ring
         // retains one sample, or the two bracketing `t` carry equal stamps —
@@ -793,12 +904,15 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
         // documents the consequence for a batch: the arm above always fires at
         // element 0 and leaves `out` untouched, this one can fire after `k` rows
         // are written.
-        LookupError::NoSegment { edge } => NoSegmentError::new_err(format!(
-            "{} has a pose at this stamp but no segment to differentiate: it \
-             retains one sample, or the two bracketing samples carry equal \
-             stamps. Publish another sample, or use layout='quat'",
-            edge_label_in(tree, &view, edge)
-        )),
+        LookupError::NoSegment { edge } => {
+            let err = NoSegmentError::new_err(format!(
+                "{} has a pose at this stamp but no segment to differentiate: it \
+                 retains one sample, or the two bracketing samples carry equal \
+                 stamps. Publish another sample, or use layout='quat'",
+                edge_label_in(tree, &view, edge)
+            ));
+            with_attrs(py, err, |e| e.setattr("edge", named_edge_in(&view, edge)))
+        }
         // Routed through the shared spelling so a fork victim gets the same
         // sentence whether it arrived through `lookup` or through `frames`.
         LookupError::ChildDetached => detached_err(),
@@ -835,8 +949,8 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
         // edge dynamic (`crates/tf_tree_py/src/tree.rs`), so "make the fixed
         // links static so they fold" — which the Rust facade's own prose does
         // say, and may — names something a Python caller cannot reach.
-        LookupError::TreeTooDeep { depth } => TfTreeError::new_err(
-            if usize::from(depth) > tf_tree::MAX_PATH_EDGES {
+        LookupError::TreeTooDeep { depth } => {
+            TfTreeError::new_err(if usize::from(depth) > tf_tree::MAX_PATH_EDGES {
                 format!(
                     "the path between these frames is longer than the {} edges a \
                      lookup walks — re-parent so the two frames share a nearer \
@@ -849,8 +963,8 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
                      re-parent so the two frames share a nearer ancestor",
                     tf_tree::MAX_DEPTH
                 )
-            },
-        ),
+            })
+        }
         // Recycled and Contended are both "the ring beat the reader", and both
         // are retryable, but they are *not* the same advice: a lap means the
         // history the reader wanted is gone and a retry re-reads a newer
@@ -902,8 +1016,8 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
         // names no usable edge in this arena`, which is one fact said three
         // times. The two causes want different sentences anyway, and only one
         // of them can be named.
-        LookupError::UnknownEdge { edge } => TfTreeError::new_err(
-            match named_edge_in(&view, edge) {
+        LookupError::UnknownEdge { edge } => {
+            TfTreeError::new_err(match named_edge_in(&view, edge) {
                 // `Plan::sampler` answers `None` for an edge whose capacity is
                 // zero as well as for one past the table, so a *named* edge
                 // here is a dynamic step over a static or tombstoned record —
@@ -922,8 +1036,8 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
                      the plan naming it was compiled against a different arena",
                     edge.get()
                 ),
-            },
-        ),
+            })
+        }
         // The one id deliberately *not* sent through `frame_label`: this error
         // means the id is out of range for the frame table, so resolving it can
         // only ever produce the fallback, and `frame #99 (name unavailable:
@@ -955,6 +1069,23 @@ pub(crate) fn lookup_err(tree: &Tree, e: LookupError) -> PyErr {
              program; please report it with this line: {other:?}"
         )),
     }
+}
+
+/// A [`NoDataError`] with its `.edge`, around a sentence the caller chose.
+///
+/// Two sentences raise this class — [`lookup_err`]'s and `span`'s, which adds
+/// where on the path the silent edge sits — and both must carry the attribute,
+/// because an attribute on some raises of a class and not others is not an
+/// attribute of the class (`docs/decisions/0058` §1).
+pub(crate) fn no_data_err(
+    py: Python<'_>,
+    view: &ArenaView<'_>,
+    edge: EdgeId,
+    msg: String,
+) -> PyErr {
+    with_attrs(py, NoDataError::new_err(msg), |e| {
+        e.setattr("edge", named_edge_in(view, edge))
+    })
 }
 
 /// The plan-time domain refusal (`docs/decisions/0038` §2's "checked *there*").

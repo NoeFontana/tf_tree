@@ -298,12 +298,15 @@ class ArenaAbsentError(TfTreeError): ...
 > `BufferError`, `DerivativesUnavailableError`, `NoSegmentError` and
 > `ChildProcessDetachedError`.
 >
-> - **No class carries an attribute.** An instance holds `args == (message,)`
->   and nothing else, so a caller programs against the *class*.
->   `crates/tf_tree_py/src/errors.rs`'s module doc said "the fields are attached
->   to the exception rather than only formatted into it" from its first commit
->   until this date; it was never true, and §11.1's "attributes asserted" had
->   nothing to assert.
+> - ~~**No class carries an attribute.**~~ *Corrected by `0058` step 2:* seven
+>   of the ten classes above, all but `TfTreeError`, `BufferError` and
+>   `ChildProcessDetachedError`, carry the attributes the block at the head of
+>   this section lists for them, set on raised instances only; `args` is still
+>   `(message,)`. Until that step an instance held `args` and nothing else, and
+>   `crates/tf_tree_py/src/errors.rs`'s module doc had said "the fields are
+>   attached to the exception rather than only formatted into it" from its first
+>   commit; it was never true, and §11.1's "attributes asserted" had nothing to
+>   assert.
 > - **`FrameNotDeclaredError` has no `KeyError` base.** Adding one is not
 >   additive: `KeyError.__str__` quotes the message, and every `except
 >   KeyError` and `except LookupError` around a tf_tree call would start

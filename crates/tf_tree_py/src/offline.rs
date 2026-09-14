@@ -41,7 +41,7 @@ use tf_tree::unstable::ArenaView;
 use tf_tree::{EdgeId, FrameId, LookupError, Plan, Step, Tree};
 
 use crate::errors::{
-    detached_err, edge_label, lookup_err, resolve_frame, NoDataError, TfTreeError,
+    detached_err, edge_label, lookup_err, no_data_err, resolve_frame, TfTreeError,
 };
 use crate::tree::PyTree;
 
@@ -105,19 +105,32 @@ pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
 /// printed `EdgeId(2)`. It no longer does — every arm of it goes through
 /// [`edge_label`] now — so what is left here is only the path phrasing, and
 /// falling through would lose that and nothing else.
-pub(crate) fn span_impl(tree: &Tree, target: &str, source: &str) -> PyResult<Option<(i64, i64)>> {
+///
+/// Both mapper calls pass no time-domain tag: neither `Tree::plan` nor
+/// `Plan::span` can return `Extrapolation`, the one variant that carries it.
+pub(crate) fn span_impl(
+    py: Python<'_>,
+    tree: &Tree,
+    target: &str,
+    source: &str,
+) -> PyResult<Option<(i64, i64)>> {
     // [`resolve_frame`] rather than `Tree::frame`, which interns: `span` is a
     // question about an arena and must not add a frame to it.
-    let t = resolve_frame(tree, target)?;
-    let s = resolve_frame(tree, source)?;
-    let plan = tree.plan(t, s).map_err(|e| lookup_err(tree, e))?;
+    let t = resolve_frame(py, tree, target)?;
+    let s = resolve_frame(py, tree, source)?;
+    let plan = tree.plan(t, s).map_err(|e| lookup_err(py, tree, None, e))?;
     plan.span(&tree.guard()).map_err(|e| match e {
-        LookupError::NoData { edge } => NoDataError::new_err(format!(
-            "{} on the path from {source:?} to {target:?} has no samples, so \
-             the path is not answerable at any stamp",
-            edge_label(tree, edge)
-        )),
-        other => lookup_err(tree, other),
+        LookupError::NoData { edge } => no_data_err(
+            py,
+            &tree.arena_view(),
+            edge,
+            format!(
+                "{} on the path from {source:?} to {target:?} has no samples, \
+                 so the path is not answerable at any stamp",
+                edge_label(tree, edge)
+            ),
+        ),
+        other => lookup_err(py, tree, None, other),
     })
 }
 

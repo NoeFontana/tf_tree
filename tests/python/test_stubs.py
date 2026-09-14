@@ -68,12 +68,43 @@ def _stub_names() -> set[str]:
     return {n for n in names if not n.startswith("_")}
 
 
-def _stub_members(cls: str) -> set[str]:
+def _stub_class(cls: str) -> ast.ClassDef | None:
     tree = ast.parse(STUB.read_text())
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == cls:
-            return {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
-    return set()
+            return node
+    return None
+
+
+def _stub_members(cls: str) -> set[str]:
+    """A class body's methods **and its annotated attributes**.
+
+    Methods alone until `docs/decisions/0058`: an exception attribute is a
+    bare `requested: int` in the class body, an `ast.AnnAssign` rather than a
+    `FunctionDef`, so a stub attribute with no runtime counterpart (or the
+    reverse) was invisible to every test here — `_stub_names`' blind spot, one
+    level down.
+    """
+    return {n.name for n in _stub_methods(cls)} | set(_stub_annotations(cls))
+
+
+def _stub_methods(cls: str) -> list[ast.FunctionDef]:
+    node = _stub_class(cls)
+    if node is None:
+        return []
+    return [n for n in node.body if isinstance(n, ast.FunctionDef)]
+
+
+def _stub_annotations(cls: str) -> dict[str, str]:
+    """``{attribute: annotation source}`` for one class body in the stub."""
+    node = _stub_class(cls)
+    if node is None:
+        return {}
+    return {
+        n.target.id: ast.unparse(n.annotation)
+        for n in node.body
+        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
+    }
 
 
 def _public(obj: object) -> set[str]:

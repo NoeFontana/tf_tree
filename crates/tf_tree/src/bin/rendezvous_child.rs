@@ -1,5 +1,11 @@
 //! Helper process for `tests/rendezvous.rs`.
 //!
+//! **It has a second reader**: `tests/python/test_shared.py` drives
+//! `join-reparent` to raise `TopologyChangedError` in Python
+//! (`docs/decisions/0058` step 2), and reads its `joined` and `reparented`
+//! lines, so those two lines are a protocol that test depends on too.
+//! `just py-test` and `just py-test-freethreaded` build this binary for it.
+//!
 //! The rendezvous is a claim about what happens **between processes**, so the
 //! test needs real ones: a thread cannot be `SIGKILL`ed out from under its
 //! locks, and an inherited descriptor would share the parent's open file
