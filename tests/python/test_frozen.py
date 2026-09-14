@@ -295,6 +295,77 @@ def test_open_file_of_a_file_that_is_not_a_tft_says_so(tmp_path):
     assert ".tft" in str(e.value)
 
 
+@pytest.mark.parametrize(
+    ("field", "offset", "variant"),
+    [("layout_hash", 12, "LayoutMismatch"), ("format_version", 8, "VersionMismatch")],
+)
+def test_a_damaged_arena_header_reports_the_engines_reason_as_prose(
+    live, tmp_path, field, offset, variant
+):
+    """One flipped bit in a field of the *arena* header inside a ``.tft``.
+
+    The container header still validates, so the failure is
+    ``FrozenError::Arena(ShmError::<variant>)``, and the binding forwards the
+    engine's reason. Before ``docs/decisions/0059`` that reason was
+    ``ShmError``'s ``Debug``, labelled ``raw:`` —
+    ``raw: LayoutMismatch { found: 1024475540, expected: 1024475541 }``.
+
+    Two cases because ``offline.rs`` has two arms that forward it:
+    ``LayoutMismatch``, which adds §2.4's re-freeze statement, and every other
+    ``ShmError``, which does not. ``VersionMismatch`` is the other case because
+    it carries fields, so its ``Debug`` has braces to catch.
+
+    Structure only, because message text is not a compatibility promise
+    (``docs/API.md`` R5): no brace, no ``raw``, and the variant name, which is
+    the search key ``docs/RUNBOOK.md`` is headed by, still present. For the
+    ``layout_hash`` case, also a statement that the file must be re-frozen,
+    which ``PHASE5.md`` §2.4 is NORMATIVE about for a ``layout_hash`` mismatch.
+
+    The magic-byte flip is deliberately not a case: ``BadMagic`` has no
+    braces, and its ``Debug`` is a substring of its ``Display``, so no assertion
+    on this message could tell ``{inner}`` from ``{inner:?}`` there.
+    ``frozen::tests::every_frozen_error_variant_renders_by_0059s_rules`` in
+    ``tf_tree_arena`` holds that case.
+
+    Mutants, each applied alone:
+
+    - (M8) restore ``raw: {inner:?}`` in ``offline.rs``'s general
+      ``FrozenError::Arena`` arm. Applied: the ``format_version`` case fails
+      on its brace assertion, the message ending ``The engine's reason, raw:
+      VersionMismatch { found: 2,
+      expected: 3 }``; the ``layout_hash`` case still passes.
+    - (M8, on the ``LayoutMismatch`` arm) the same change there. Applied: the
+      ``layout_hash`` case fails on its brace assertion, the message ending
+      ``The engine's reason, raw: LayoutMismatch { found:
+      1024475540, expected: 1024475541 }``; the ``format_version`` case still
+      passes.
+    - (added in review) guard the ``LayoutMismatch`` arm with ``if false``, so
+      the general arm answers. Applied: the ``layout_hash`` case fails on its
+      re-freeze assertion, the message ending ``The engine's reason: arena
+      layout hash 0x3D104194 is not this build's 0x3D104195 (LayoutMismatch)``
+      and saying nothing about re-freezing.
+    """
+    path = tmp_path / f"bad_{field}.tft"
+    live.freeze(str(path), source="synthetic")
+    data = bytearray(path.read_bytes())
+    # `FrozenHeader` (PHASE5.md §2.3): `arena_off` is the u64 at offset 32.
+    # `ArenaHeader`: an 8-byte magic, then `format_version` as the u32 at
+    # offset 8 and `layout_hash` as the u32 at offset 12.
+    arena_off = int.from_bytes(data[32:40], "little")
+    data[arena_off + offset] ^= 1
+    path.write_bytes(bytes(data))
+
+    with pytest.raises(tf_tree.TfTreeError) as e:
+        tf_tree.open_file(str(path))
+    msg = str(e.value)
+    assert str(path) in msg, msg
+    assert "{" not in msg and "}" not in msg, msg
+    assert "raw" not in msg, msg
+    assert variant in msg, msg
+    if field == "layout_hash":
+        assert "re-freez" in msg.lower(), msg
+
+
 def test_freeze_replaces_the_path_atomically_and_leaves_no_litter(live, tmp_path):
     """The temporary is a *sibling* and is renamed over the target (§2.3).
 

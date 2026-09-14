@@ -4,11 +4,14 @@
 //! two writer-path refusals name the edge they are about (D11).
 //!
 //! This target carries no crate-level `#[cfg(feature = ...)]`, so it compiles in
-//! the facade's default feature set. The one `shm`-gated item in it,
-//! [`every_ipc_error_payload_is_nameable_through_the_facade`], pins `IpcError`
-//! and the eight types its variants carry; `just shm-check`'s
-//! `cargo clippy -p tf_tree --features shm --all-targets` line is what compiles
-//! it, and a compile is the whole of what it asserts.
+//! the facade's default feature set, and `just test` runs it there. Two items in
+//! it are `shm`-gated: [`every_ipc_error_payload_is_nameable_through_the_facade`],
+//! whose compile is the whole of what it asserts, and
+//! [`shared_memory_wrappers_print_their_display`], which asserts at run time.
+//! `just shm-check` runs this target under `shm` for the second one
+//! (`cargo nextest run -p tf_tree --features shm --test error_payloads`); before
+//! `docs/decisions/0059` that recipe only clippied it, which compiles a runtime
+//! assertion and never executes it.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
@@ -88,10 +91,10 @@ fn every_ipc_error_payload_is_nameable_through_the_facade() {
 
 /// A wrapper prints its payload's prose, not the payload's struct literal.
 ///
-/// `ends_with(inner)` is what separates `{0}` from `{0:?}`: the core payloads'
-/// `Display` and `Debug` never coincide (`tf_tree_core`'s own rendering test
-/// asserts that), so a wrapper that fell back to `Debug` ends with the variant
-/// name instead.
+/// `ends_with(inner)` is what separates `{0}` from `{0:?}`: a payload's
+/// `Display` and `Debug` never coincide (the rendering tests in `tf_tree_core`
+/// and `tf_tree_arena` assert that for every variant), so a wrapper that fell
+/// back to `Debug` ends with the variant name, or a closing brace, instead.
 fn prints_its_payload(outer: &dyn std::fmt::Display, inner: &dyn std::fmt::Display) {
     let shown = outer.to_string();
     let inner = inner.to_string();
@@ -125,7 +128,8 @@ fn a_cycle_in_the_builder_renders_as_prose() {
     prints_its_payload(&err, &inner);
 }
 
-/// The three other wrappers that dumped a payload which already had prose.
+/// The wrappers that dumped a payload which already had prose, or which gained
+/// it in `docs/decisions/0059`.
 ///
 /// Each is constructed rather than provoked: `AwaitError::Frame` needs a 64-bit
 /// hash collision or an anonymous claimant stalled mid-intern, and the other two
@@ -138,6 +142,9 @@ fn a_cycle_in_the_builder_renders_as_prose() {
 /// hash: 7 }" does not end with ...`); `ReparentError::Topology`'s `{0}` →
 /// `{0:?}` (`"topology error: WouldCreateCycle { child: FrameId(3) }" does not
 /// end with ...`).
+///
+/// `BuildError::Layout` and `BuildError::Participant` joined in `0059`, when
+/// `LayoutError` and `ParticipantError` gained a `Display`.
 #[test]
 fn wrapped_payloads_print_their_display() {
     let contended = FrameError::InternContended;
@@ -150,6 +157,69 @@ fn wrapped_payloads_print_their_display() {
         child: FrameId::new(3).unwrap(),
     };
     prints_its_payload(&ReparentError::Topology(cycle), &cycle);
+
+    let too_large = tf_tree::LayoutError::ArenaTooLarge {
+        total_size: 5_000_000_000,
+    };
+    prints_its_payload(&BuildError::Layout(too_large), &too_large);
+
+    let full = tf_tree::ParticipantError::TableFull;
+    prints_its_payload(&BuildError::Participant(full), &full);
+}
+
+/// `docs/decisions/0059` part (c) under `shm`: the three wrappers whose payloads
+/// only exist with shared memory print that payload's `Display`, and a
+/// `ShmError` returned bare by `Tree::attach_shared` leaves a function through
+/// `?` into `Box<dyn Error>`, which before `0059` was `E0277`.
+///
+/// Every payload here is struct-shaped or a unit variant, and either shape
+/// fails `prints_its_payload` under `{0:?}`: a struct dump carries a brace, and
+/// a bare variant name does not end with the prose it is the last word of.
+///
+/// **Mutant (M7):** `OpenError::Map`'s `#[error("{0}")]` → `{0:?}`. Applied:
+/// `just shm-check`'s `--test error_payloads` line fails at this test —
+/// `"LayoutMismatch { found: 1, expected: 2 }" does not end with its payload's
+/// Display "arena layout hash 0x00000001 is not this build's 0x00000002
+/// (LayoutMismatch)"` — while the same target in default features, which is
+/// all `just test` runs, stays green.
+#[cfg(all(feature = "shm", target_os = "linux"))]
+#[test]
+fn shared_memory_wrappers_print_their_display() {
+    use std::os::fd::OwnedFd;
+
+    use tf_tree::{AttachMode, FrozenError, FrozenFileError, OpenError, ShmError, Tree};
+
+    let mismatch = ShmError::LayoutMismatch {
+        found: 1,
+        expected: 2,
+    };
+    prints_its_payload(&OpenError::Map(mismatch), &mismatch);
+
+    let size = ShmError::SizeMismatch {
+        actual: 4096,
+        expected: 8192,
+    };
+    prints_its_payload(&BuildError::Shm(size), &size);
+
+    let arena = FrozenError::Arena(ShmError::BadMagic);
+    prints_its_payload(&FrozenFileError::Frozen(arena), &arena);
+    let hash = FrozenError::LayoutMismatch {
+        found: 1,
+        expected: 2,
+    };
+    prints_its_payload(&FrozenFileError::Frozen(hash), &hash);
+
+    // A descriptor that is not a memfd: `F_GET_SEALS` refuses it, so the
+    // attach fails on its first syscall with an error nobody constructed.
+    fn attach(fd: OwnedFd) -> Result<Tree, Box<dyn std::error::Error>> {
+        Ok(Tree::attach_shared(fd, AttachMode::ReadOnly)?)
+    }
+    let not_a_memfd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    let err = attach(not_a_memfd).map(drop).unwrap_err();
+    let shown = err.to_string();
+    assert!(shown.ends_with("(SealQuery)"), "{shown:?}");
+    assert!(shown.contains("errno "), "{shown:?}");
+    assert!(!shown.contains('{'), "{shown:?} is a struct dump");
 }
 
 /// Two dynamic edges, so the edge under test is not the first one declared and

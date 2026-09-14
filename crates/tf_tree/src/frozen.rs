@@ -41,7 +41,7 @@ pub enum FrozenFileError {
     },
     /// The file was opened, but is not a `.tft` this build can read — or could
     /// not be written.
-    #[error("{0:?}")]
+    #[error("{0}")]
     Frozen(FrozenError),
 }
 

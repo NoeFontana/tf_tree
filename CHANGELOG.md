@@ -41,6 +41,50 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — the arena errors describe themselves, and five wrappers stop printing struct literals
+
+[`0059`](docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md),
+extending [`0040`](docs/decisions/0040-the-error-that-cannot-be-returned.md) to
+the four error types it did not reach. **Additive at the type level; message
+text changes**, and message text is not a compatibility promise
+(`docs/API.md` R5).
+
+- **`ShmError`, `FrozenError`, `LayoutError` and `ParticipantError` implement
+  `Display` and `core::error::Error`**, by hand, in `tf_tree_arena` and
+  `tf_tree_core`, which stay `no_std` and gain no dependency. So `?` now works
+  from `Tree::attach_shared`, `MappedArena::attach`, `FrozenArena::open`,
+  `write_frozen` and `ArenaLayout::new` into `Box<dyn Error>` and
+  `anyhow::Error`; `Tree::attach_shared`'s was `E0277`. `source()` is `None` on
+  all four, and that is not promised either.
+- **The text is ASCII and names the variant**, such as `LayoutMismatch`, the
+  key `docs/RUNBOOK.md` is headed by. Layout hashes print in hex, the spelling
+  `IpcError`'s `Display` and `tf_tree doctor --explain-version` already use,
+  not in decimal, and an errno as `errno N` rather than the `Os { code, kind,
+  message }` dump, so an operator no longer sees the strerror text the dump
+  happened to carry. `FrozenError::LayoutMismatch` states that the `.tft` must
+  be re-frozen, because `PHASE5.md` §2.4 requires that of a layout-hash
+  mismatch and the Rust facade had never said it on its own.
+  `FrozenError::Arena` states it too, for every arena-header failure inside a
+  `.tft`.
+- **`ShmError::ParticipantTableFull` no longer claims a full table**, in its
+  text or its rustdoc: on `Open`'s joiner path it is what a taken or
+  out-of-range granted slot is reported as.
+- **`BuildError::Layout`, `BuildError::Shm`, `BuildError::Participant`,
+  `OpenError::Map` and `FrozenFileError::Frozen` print their payload's
+  `Display`** instead of `{0:?}`. `BuildError::Participant` loses its
+  `participant table full:` prefix, which its payload now says; `OpenError::Map`
+  and `FrozenFileError::Frozen` print the payload bare. The CLI's `open_frozen`,
+  `freeze_to` and `--attach` errors improve with no change of their own, and so
+  do the C ABI's `tft_tree_open_named` and bridge messages; **no status code,
+  header or ABI changes**.
+- **Python:** `open_file`, `build` and `open` no longer end a message with
+  `The engine's reason, raw: ` and a `Debug` dump; they forward the engine's
+  sentence. `open_file` on a `.tft` whose *arena* header's layout hash does not
+  match now says to re-freeze, as the container header's mismatch already did
+  (`PHASE5.md` §2.4).
+- `just shm-check` now *runs* `tf_tree`'s `tests/error_payloads.rs` under
+  `shm`; it had only clippied that target.
+
 ### Fixed — a dying owner is seen at the end of its exit, and the shipped docs said microseconds
 
 [`0057`](docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)
