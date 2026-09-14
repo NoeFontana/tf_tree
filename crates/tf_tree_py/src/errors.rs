@@ -147,6 +147,15 @@ create_exception!(
 );
 create_exception!(
     tf_tree,
+    TimeDomainMismatchError,
+    TfTreeError,
+    "A stamp's time domain is not the path's: the plan was compiled, or the \
+     query made, in another clock's domain.\n\n\
+     Attributes: expected (the path's or plan's tag), got (the caller's). They \
+     exist only on instances the library raises."
+);
+create_exception!(
+    tf_tree,
     ChildProcessDetachedError,
     TfTreeError,
     "This handle was inherited across a fork(); the child has no mapping and \
@@ -177,6 +186,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "ChildProcessDetachedError",
         py.get_type::<ChildProcessDetachedError>(),
+    )?;
+    m.add(
+        "TimeDomainMismatchError",
+        py.get_type::<TimeDomainMismatchError>(),
     )?;
     Ok(())
 }
@@ -919,15 +932,16 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: Loo
 
         // --- Below here: the arms the deleted `other =>` used to swallow. ---
         //
-        // **They all raise the base `TfTreeError`, and that is a preservation
-        // rather than a judgement.** `docs/API.md` R5 makes the exception
-        // *type* the contract and the prose explicitly not; every one of these
-        // reached Python as a bare `TfTreeError` for the whole of Phases 3–5,
-        // so giving one a leaf class here would be an API change smuggled into
-        // a message fix. Two of them have an obvious home —
-        // `FrameOutOfRange`/`MissingEdge` are arguably `FrameNotDeclaredError`,
-        // and `MixedTimeDomains` is arguably a `Disconnected`-shaped refusal —
-        // and both are noted as decision-record material rather than taken here.
+        // **They raise the base `TfTreeError`, and that is a preservation
+        // rather than a judgement**, with one exception a decision record made.
+        // `docs/API.md` R5 makes the exception *type* the contract and the prose
+        // explicitly not; every one of these reached Python as a bare
+        // `TfTreeError` for the whole of Phases 3–5, so giving one a leaf class
+        // in a message fix would have been an API change smuggled in.
+        // `TimeDomainMismatch` is the exception: `docs/decisions/0058` gave it
+        // `TimeDomainMismatchError`, a subclass. The same record deferred the
+        // rest, each on the condition it fails: `FrameOutOfRange`/`MissingEdge`
+        // have no Python trigger, and `MixedTimeDomains` has no handler branch.
 
         // **"depth {depth} exceeds the maximum of {MAX_DEPTH}" used to be
         // false**, and it is what the obvious phrasing produces. Until `0034`
@@ -994,12 +1008,15 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: Loo
         // fired on every call for the life of the process and there was no
         // argument a caller could pass to stop it. Naming the keyword is what
         // turns it back into a mistake somebody can fix.
-        LookupError::TimeDomainMismatch { expected, got } => TfTreeError::new_err(format!(
-            "this plan was compiled for time domain {expected}; the query \
-             supplied a stamp in domain {got}. A stamp from one clock cannot \
-             address an edge sampled on another — compile the plan in the \
-             arena's domain with tree.plan(target, source, domain={expected})"
-        )),
+        LookupError::TimeDomainMismatch { expected, got } => {
+            let err = TimeDomainMismatchError::new_err(format!(
+                "this plan was compiled for time domain {expected}; the query \
+                 supplied a stamp in domain {got}. A stamp from one clock cannot \
+                 address an edge sampled on another — compile the plan in the \
+                 arena's domain with tree.plan(target, source, domain={expected})"
+            ));
+            domain_mismatch_attrs(py, err, expected, got)
+        }
         LookupError::MixedTimeDomains {
             edge,
             expected,
@@ -1091,21 +1108,40 @@ pub(crate) fn no_data_err(
 /// The plan-time domain refusal (`docs/decisions/0038` §2's "checked *there*").
 ///
 /// **The same exception type the per-query arm raises**, which `docs/API.md` R5
-/// makes the contract: a caller catching `TfTreeError` for a domain mistake must
-/// not have to catch a second class depending on *when* the engine noticed. Only
-/// the prose differs, and it differs because it can — this is the one moment
-/// both frame names are still strings, so the message names the route that
+/// makes the contract: a caller catching [`TimeDomainMismatchError`] for a
+/// domain mistake must not have to catch a second class depending on *when* the
+/// engine noticed (`docs/decisions/0058` §4 keeps one type for both). Only the
+/// prose differs, and it differs because it can — this is the one moment both
+/// frame names are still strings, so the message names the route that
 /// disagreed instead of only the two integers that did. That is `0038`'s third
 /// reason for putting the tag on the handle rather than on the call.
-pub(crate) fn plan_domain_err(target: &str, source: &str, expected: u8, got: u8) -> PyErr {
-    TfTreeError::new_err(format!(
+pub(crate) fn plan_domain_err(
+    py: Python<'_>,
+    target: &str,
+    source: &str,
+    expected: u8,
+    got: u8,
+) -> PyErr {
+    let err = TimeDomainMismatchError::new_err(format!(
         "the path {source:?} -> {target:?} is sampled in time domain {expected}, \
          and this plan was asked for domain {got}. A stamp from one clock \
          cannot address an edge sampled on another; pass \
          domain={expected} to tree.plan(). The four built-in tags are \
          tf_tree.SYSTEM_DOMAIN, SENSOR_DOMAIN, SIM_DOMAIN and STEADY_DOMAIN, \
          and a domain declared beyond them is the integer its declarer chose"
-    ))
+    ));
+    domain_mismatch_attrs(py, err, expected, got)
+}
+
+/// `TimeDomainMismatchError`'s two attributes, for both of its raise sites.
+///
+/// `expected` is the path's or the plan's tag and `got` the one the caller
+/// supplied, at plan time and per query alike.
+fn domain_mismatch_attrs(py: Python<'_>, err: PyErr, expected: u8, got: u8) -> PyErr {
+    with_attrs(py, err, |e| {
+        e.setattr("expected", expected)?;
+        e.setattr("got", got)
+    })
 }
 
 /// Name a stored [`InterpPolicy`] discriminant the way `interp=` spells it.

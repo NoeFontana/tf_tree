@@ -69,6 +69,12 @@ existing `except` clause catches exactly what it caught before.
   handler that reads `e.requested` from such a double raises `AttributeError`
   and a type checker does not warn. Build test doubles by raising through the
   library, or set the attributes on them.
+- **`TimeDomainMismatchError(TfTreeError)` is new**, with `.expected` (the
+  path's or the plan's tag) and `.got` (the caller's). Both domain refusals
+  raise it: `Tree.plan(..., domain=)` at plan time and `Tree.lookup(...,
+  domain=)` per query. **Migration:** `except tf_tree.TfTreeError` still
+  catches it; a check of `type(e) is tf_tree.TfTreeError` around either call no
+  longer matches, and should become `except tf_tree.TimeDomainMismatchError`.
 - `just py-test` and `just py-test-freethreaded` now run `cargo build -p tf_tree
   --features shm --bin tf_tree_rendezvous_child` first: `TopologyChangedError`'s
   two attributes are held by a test that spawns that helper's `join-reparent`.

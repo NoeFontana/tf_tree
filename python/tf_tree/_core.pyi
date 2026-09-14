@@ -87,6 +87,18 @@ class FrameNotDeclaredError(TfTreeError):
 
 class BufferError(TfTreeError): ...
 
+class TimeDomainMismatchError(TfTreeError):
+    """A stamp's time domain is not the path's.
+
+    Raised at plan time by `Tree.plan(..., domain=)` and per query by
+    `Tree.lookup(..., domain=)`: one class for both. The attributes exist only
+    on instances the library raises. `expected` is the path's or the plan's
+    tag, and `got` is the one the caller supplied.
+    """
+
+    expected: int
+    got: int
+
 class ChildProcessDetachedError(TfTreeError):
     """This handle was inherited across a `fork()` and cannot be used.
 
@@ -442,7 +454,8 @@ class Tree:
         declared for its own clock. A tree under `use_sim_time` is read with
         `domain=tf_tree.SIM_DOMAIN`.
 
-        A disagreement with the path's own domain raises `TfTreeError` **here**,
+        A disagreement with the path's own domain raises
+        `TimeDomainMismatchError` **here**,
         naming both frames, rather than on every `at()` — a domain is a property
         of a route, not of an instant, so it cannot legitimately vary between
         two queries on one plan.

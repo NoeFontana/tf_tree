@@ -5,8 +5,8 @@
 **Implementation:** in progress, after
 [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
 implementation (#345), as the plan orders. Step 1, the specs, and step 2, the
-attributes on the seven existing classes, are in this change; step 2 did not
-take its fallback.
+attributes on the seven existing classes, and step 3, `TimeDomainMismatchError`,
+are in this change; step 2 did not take its fallback.
 
 ## Context
 

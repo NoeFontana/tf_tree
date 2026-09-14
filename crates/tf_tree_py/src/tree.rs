@@ -437,7 +437,7 @@ impl PyTree {
         // [`samples_anything`] so this fires exactly where the core's own
         // `check_domain_tag` fires and not one call earlier.
         if samples_anything(&plan) && plan.domain() != domain {
-            return Err(plan_domain_err(target, source, plan.domain(), domain));
+            return Err(plan_domain_err(py, target, source, plan.domain(), domain));
         }
         Ok(PyPlan {
             plan: Box::new(plan),

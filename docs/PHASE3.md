@@ -316,7 +316,9 @@ class ArenaAbsentError(TfTreeError): ...
 > - **Four classes were never built:** `TimeDomainMismatchError`,
 >   `EdgeAlreadyClaimedError`, `ClaimRevokedError` and
 >   `ArenaHeldButUnreachableError`. Those failures reach Python as the base
->   `TfTreeError` with a message. **`ChildProcessDetachedError` was a fifth and
+>   `TfTreeError` with a message. *Corrected by `0058` step 3:*
+>   `TimeDomainMismatchError` ships, a direct subclass of `TfTreeError`, raised
+>   by both domain refusals, so the package exports **eleven** classes. **`ChildProcessDetachedError` was a fifth and
 >   ships as of this date**, because §8.1 is NORMATIVE and names it; it replaced
 >   a base `TfTreeError` from every fork-child refusal, including `Publisher.push`
 >   and `push_many`. §8.1's amendment of the same date lists the two calls that
