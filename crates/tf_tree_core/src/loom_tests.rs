@@ -249,9 +249,9 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
 /// `writer_wraps_...` passes under the same deletion.
 ///
 /// **The seed is the test.** Under that same deletion, seeding the cursor at `1`
-/// or `2` instead **passes** (in 0.01 s: such a reader loads no atomic the writer
-/// stores except `head`, so there is almost nothing to interleave) — a hint
-/// inside the surviving window never steers the search into the recycled slot. So this model checks the
+/// or `2` instead **passes** (in 0.01 s): a hint inside the surviving window
+/// gallops straight to `(1, 2)` and never reads the recycled slot as a bracket
+/// member. So this model checks the
 /// revalidation *against a stale caller-held cursor*, not in general; the
 /// interior-bracket race without a stale hint is `sample_from`'s share of
 /// `sample.rs`'s hazard 1, which nothing here claims to close.
@@ -262,11 +262,10 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
 /// values the reader already holds, loom adds nothing to arithmetic, and the
 /// sequential cursor sweeps in `tests.rs` are what kill that mutant.
 ///
-/// Not reached: `sample_from`'s `Hold` and exact-newest short-circuit arms,
-/// which read the *newest* slot. A lap reaches that slot only after `capacity`
-/// further pushes, so a model for them needs capacity 2: one arm per model
-/// measured 31.7 s (`Hold`) and 34.2 s (exact-newest) against this one's 12.2 s,
-/// and both arms behind one reader 234.6 s.
+/// Not reached here: `sample_from`'s `Hold` and exact-newest short-circuit
+/// arms, which read the *newest* slot. Those are
+/// [`sample_from_hold_revalidates_across_a_lap`] and
+/// [`sample_from_exact_newest_revalidates_across_a_lap`].
 #[test]
 fn sample_from_with_a_stale_cursor_across_a_lap() {
     model(|| {
@@ -296,6 +295,132 @@ fn sample_from_with_a_stale_cursor_across_a_lap() {
                     iso.to_bits(),
                     expect,
                     "sample_from followed a stale cursor into a recycled slot"
+                ),
+                Err(
+                    LookupError::Extrapolation { .. }
+                    | LookupError::SlotRecycled { .. }
+                    | LookupError::SlotContended { .. },
+                ) => {}
+                Err(other) => panic!("undocumented error: {other:?}"),
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
+/// `sample_from`'s **`Hold` arm** revalidates the newest slot against a lap.
+///
+/// # Why it needs its own model
+///
+/// The `Hold` arm and the exact-newest arm (the next model) never reach the
+/// bracket search: they read **the newest slot** and return it. Both belong to
+/// the six-site fix `CHANGELOG.md` records under *"An exact query returns the
+/// pose of the stamp it named, or refuses"*, and `sample_from`'s two sites had
+/// no executor. **Measured, not reported:** removing either site's `revalidated`
+/// call (the two mutants below) passes `cargo nextest run -p tf_tree_core -p
+/// tf_tree` — 195 run, 195 passed — and passes
+/// [`sample_from_with_a_stale_cursor_across_a_lap`], which never takes either
+/// arm.
+///
+/// # Shape
+///
+/// The newest slot of a ring is overwritten only after `capacity` further
+/// pushes, so this is **capacity 2**, the one size a lap reaches it in two
+/// pushes. [`writer_wraps_reader_gets_valid_or_recycled`]'s objection to
+/// capacity 2 — a one-sample window cannot interpolate — does not apply to an
+/// arm that never interpolates. `10` is published before the threads start; the
+/// writer lands `20` (slot 1) and `30` (slot 0, overwriting `10`).
+///
+/// The reader holds a cursor and calls `sample_from(15, Hold)` once. Only at
+/// `head == 1` is `15` past the newest stamp; at 2 or 3 the window's oldest
+/// stamp is above 15 and the call is `Extrapolation`. So the only legal `Ok` is
+/// `pose(1)`, bit for bit. One call per model, one arm per model: this model
+/// runs 30.2 s alone, and both arms behind one reader measured 234.6 s.
+///
+/// **Mutant M279, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): remove
+/// `.and_then(|p| self.revalidated(newest, retained, p))` from `sample_from`'s
+/// `Hold` arm (`sample.rs`). **FAILS** on the assertion below, in 0.00 s — the
+/// reader loads `head == 1` and stamp 10, both pushes land, and slot 0 holds
+/// `pose(3)`. Under it the exact-newest model and the stale-cursor model both
+/// pass, so each model's control is its own arm.
+#[test]
+fn sample_from_hold_revalidates_across_a_lap() {
+    model(|| {
+        let hr = Arc::new(HeapRing::new(2));
+        hr.ring().push(10, &pose(1)).unwrap();
+        let held = pose(1).to_bits();
+
+        let w = Arc::clone(&hr);
+        let writer = thread::spawn(move || {
+            let ring = w.ring();
+            ring.push(20, &pose(2)).unwrap();
+            ring.push(30, &pose(3)).unwrap();
+        });
+
+        let r = Arc::clone(&hr);
+        let reader = thread::spawn(move || {
+            let ring = r.ring();
+            let mut cursor = 0u64;
+            match ring.sample_from::<LerpSlerp>(15, ExtrapPolicy::Hold, &mut cursor) {
+                Ok(iso) => assert_eq!(
+                    iso.to_bits(),
+                    held,
+                    "sample_from's Hold arm returned a lapped slot"
+                ),
+                Err(
+                    LookupError::Extrapolation { .. }
+                    | LookupError::SlotRecycled { .. }
+                    | LookupError::SlotContended { .. },
+                ) => {}
+                Err(other) => panic!("undocumented error: {other:?}"),
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
+/// `sample_from`'s **exact-newest arm** (`t == t_new`) revalidates the newest
+/// slot against a lap.
+///
+/// Same ring, same writer and the same reasoning as
+/// [`sample_from_hold_revalidates_across_a_lap`]; the reader calls
+/// `sample_from(10, Error)` once. Only at `head == 1` is `10` the newest stamp;
+/// at 2 the call brackets `(10, 20)` and returns through the trailing check,
+/// which the stale-cursor model covers, and at 3 the window starts at 20 and the
+/// call is `Extrapolation`. The only legal `Ok` is `pose(1)`, bit for bit.
+///
+/// **Mutant M288, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): replace
+/// the `t == t_new` arm's `return self.revalidated(newest, retained, p);` with
+/// `return Ok(p);` (`sample.rs`, inside `sample_from` only). **FAILS** on the
+/// assertion below, in 0.00 s; the `Hold` model (30.2 s) and the stale-cursor
+/// model pass under it. This model runs 30.5 s alone.
+#[test]
+fn sample_from_exact_newest_revalidates_across_a_lap() {
+    model(|| {
+        let hr = Arc::new(HeapRing::new(2));
+        hr.ring().push(10, &pose(1)).unwrap();
+        let held = pose(1).to_bits();
+
+        let w = Arc::clone(&hr);
+        let writer = thread::spawn(move || {
+            let ring = w.ring();
+            ring.push(20, &pose(2)).unwrap();
+            ring.push(30, &pose(3)).unwrap();
+        });
+
+        let r = Arc::clone(&hr);
+        let reader = thread::spawn(move || {
+            let ring = r.ring();
+            let mut cursor = 0u64;
+            match ring.sample_from::<LerpSlerp>(10, ExtrapPolicy::Error, &mut cursor) {
+                Ok(iso) => assert_eq!(
+                    iso.to_bits(),
+                    held,
+                    "sample_from's exact-newest arm returned a lapped slot"
                 ),
                 Err(
                     LookupError::Extrapolation { .. }

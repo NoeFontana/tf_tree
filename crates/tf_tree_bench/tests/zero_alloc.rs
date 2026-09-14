@@ -41,8 +41,8 @@ thread_local! {
     /// Allocating calls (`alloc` + `realloc`) made **by this thread**.
     ///
     /// Thread-local, and that is load-bearing rather than tidy. `cargo test`
-    /// runs this file's two tests on separate threads by default, and the other
-    /// test's construction phase legitimately allocates several thousand times.
+    /// runs this file's tests on separate threads by default, and the other
+    /// tests' construction phases legitimately allocate several thousand times.
     /// Against a *process-global* counter those allocations land inside this
     /// test's measured window, so the gate failed by ~4000 on every commit
     /// anyone ran it against — a false failure, which is why it reported `FAIL`
@@ -667,7 +667,7 @@ fn extrapolating_allocates_nothing_under_every_policy() {
 /// holds", and a plan compiled before a reparent is one such evaluation: the
 /// caller is handed `LookupError::TopologyChanged` and re-plans. That refusal
 /// is the one a control loop meets on every topology change, and no allocation
-/// window here ever contained it — both windows above evaluate a current plan.
+/// window here ever contained it — every window above evaluates a current plan.
 ///
 /// # The ordering is the test
 ///
