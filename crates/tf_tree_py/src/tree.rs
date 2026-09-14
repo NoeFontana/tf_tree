@@ -1453,8 +1453,15 @@ impl PyPlan {
             None => [stamp_from_any(stamps)?],
         };
         let src: &[i64] = match &src_arr {
-            // SAFETY: checked C-contiguous above; the borrow is held across the
-            // fold below for §6.2's reason.
+            // SAFETY: `as_slice` refuses a non-contiguous or misaligned array
+            // with an `Err` itself; its unsafe precondition is that no other
+            // alias writes the array while `src` lives. `by_ns` is refused
+            // below if it overlaps; every other writer — the caller's own
+            // views, or another Python thread, which can run during the
+            // fold's `detach` and at any time on a free-threaded build — is
+            // the caller's to rule out. Nothing here enforces that: raw
+            // `as_slice` exports no `Py_buffer` and registers no numpy
+            // borrow, so §6.2 rule 2's resize refusal is not what keeps it.
             Some(a) => unsafe { a.as_slice()? },
             None => &src_owned,
         };
@@ -1676,11 +1683,15 @@ impl PyPlan {
             ));
         }
 
-        // SAFETY: both arrays were just checked C-contiguous, `out` is writable,
-        // and aliasing is the caller's to avoid exactly as `as_slice_mut`
-        // documents. Taken *before* `allow_threads` and held across it: NumPy
-        // refuses to resize an array while a buffer is exported, which is what
-        // keeps these pointers valid (§6.2).
+        // SAFETY: both slices' unsafe precondition is that no other alias
+        // writes the array while the slice lives — across the `detach` below
+        // included — and, for `out`, that nothing else reads it either. That is
+        // the caller's to uphold (`stamps` and `out` differ in dtype, but a
+        // dtype view can still share memory), exactly as `as_slice` and
+        // `as_slice_mut` document; `out` was checked writable above. Nothing
+        // here enforces it: raw `as_slice*` exports no `Py_buffer` and
+        // registers no numpy borrow, so §6.2 rule 2's resize refusal is not
+        // what keeps these pointers valid.
         let (src, dst) = unsafe { (stamps.as_slice()?, out.as_slice_mut()?) };
 
         let plan = *self.plan;
@@ -1747,11 +1758,14 @@ impl PyPlan {
         let dist = PyArray1::<i64>::zeros(py, [n], false);
         {
             let flat = poses.cast::<numpy::PyArrayDyn<f64>>()?;
-            // SAFETY: `stamps` was checked C-contiguous above; `poses` and
-            // `dist` were just allocated here, so nothing else holds a
-            // reference to either and both are contiguous by construction. The
-            // borrows are held across the `detach` below for §6.2's reason —
-            // NumPy refuses to resize an array while a buffer is exported.
+            // SAFETY: `poses` and `dist` were just allocated here, so nothing
+            // else holds a reference to either while these slices live. The
+            // unsafe precondition on `stamps` — no other alias writes it while
+            // `src` lives, across the `detach` below included — is the
+            // caller's to uphold, and nothing here enforces it: raw
+            // `as_slice` exports no `Py_buffer` and registers no numpy borrow,
+            // so §6.2 rule 2's resize refusal is not what keeps it. Contiguity
+            // and alignment are `as_slice`'s own `Err`, not a precondition.
             let (src, pd, dd) = unsafe {
                 (
                     stamps.as_slice()?,
@@ -1856,9 +1870,13 @@ impl PyPlan {
             ));
         }
         let n = stamps.len();
-        // SAFETY: checked C-contiguous above; the borrow is held across the
-        // `detach` inside `eval_*` for the reason §6.2 gives — NumPy refuses to
-        // resize an array while a buffer is exported.
+        // SAFETY: `as_slice`'s unsafe precondition is that no other alias
+        // writes `stamps` while `src` lives, across the `detach` inside
+        // `eval_*` included; the output below is freshly allocated, so it is
+        // not such an alias. Any other writer is the caller's to rule out, and
+        // nothing here enforces it: raw `as_slice` exports no `Py_buffer` and
+        // registers no numpy borrow, so §6.2 rule 2's resize refusal is not
+        // what keeps it. Contiguity and alignment are `as_slice`'s own `Err`.
         let src = unsafe { stamps.as_slice()? };
         if layout.is_f32() {
             let out = PyArray2::<f32>::zeros(py, [n, e], false);
@@ -1918,8 +1936,13 @@ impl PyPlan {
             None => [stamp_from_any(stamps)?],
         };
         let src: &[i64] = match &src_arr {
-            // SAFETY: checked C-contiguous above; held across `eval_*`'s `detach`
-            // per §6.2.
+            // SAFETY: `as_slice` refuses a non-contiguous or misaligned array
+            // with an `Err` itself; its unsafe precondition is that no other
+            // alias writes the array while `src` lives, across `eval_*`'s
+            // `detach` included. That is the caller's to uphold — its own
+            // views, `out`, another Python thread — and nothing here enforces
+            // it: raw `as_slice` exports no `Py_buffer` and registers no numpy
+            // borrow, so §6.2 rule 2's resize refusal is not what keeps it.
             Some(a) => unsafe { a.as_slice()? },
             None => &src_owned,
         };

@@ -113,10 +113,12 @@ redundant_clone = "warn"
 # `// SAFETY:` comment. Until this line only review held that. The lint checks
 # that a comment is *there* — directly above the block, or above the statement
 # or `let` that holds it — and **nothing about what it says**: whether it names
-# the invariant relied on is still a review rule. A comment above an
-# `assert_eq!(` that wraps the block does not count; it goes inside the macro,
-# directly above `unsafe`. `tf_tree_py` and `tf_tree_tf2_sys` are outside the
-# workspace and repeat this line in their own `[lints.clippy]`.
+# the invariant relied on is still a review rule. Two placements that look
+# covered are not: a comment above a multi-line `assert_eq!(` that wraps the
+# block (the form rustfmt produces; it goes inside the macro, directly above
+# `unsafe`), and a comment above a `match` — or a `let` of one — whose arm holds
+# the block (it goes on the arm). `tf_tree_py` and `tf_tree_tf2_sys` are
+# outside the workspace and repeat this line in their own `[lints.clippy]`.
 undocumented_unsafe_blocks = "deny"
 
 [workspace.lints.rust]
