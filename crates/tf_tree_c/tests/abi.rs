@@ -112,8 +112,8 @@ fn handle_type_confusion_is_rejected() {
     let a = std::ffi::CString::new("map").unwrap();
     let b = std::ffi::CString::new("base").unwrap();
     let mut plan: *mut tft_plan = ptr::null_mut();
-    // SAFETY: live handle, NUL-terminated names.
     assert_eq!(
+        // SAFETY: live handle, NUL-terminated names.
         unsafe { tft_plan_create(tree, a.as_ptr(), b.as_ptr(), &mut plan) },
         TFT_OK
     );
@@ -426,14 +426,15 @@ fn the_stamp_converter_refuses_what_rust_refuses() {
 #[test]
 fn a_negative_tv_nsec_is_an_interval_not_an_instant() {
     let mut out: i64 = 0;
-    // SAFETY: `out` is a live local, here and below.
     assert_eq!(
+        // SAFETY: `out` is a live local `i64`, writable for the call.
         unsafe { tft_stamp_from_timespec(1_700_000_000, 123_456_789, &mut out) },
         TFT_OK
     );
     assert_eq!(out, 1_700_000_000_123_456_789);
     for bad in [-1i64, -999_999_999, i64::MIN, 1_000_000_000] {
         assert_eq!(
+            // SAFETY: `out` is the same live local `i64`, writable for the call.
             unsafe { tft_stamp_from_timespec(0, bad, &mut out) },
             TFT_ERR_BAD_STAMP,
             "tv_nsec = {bad}"
@@ -467,8 +468,8 @@ fn a_stamp_converter_rejects_a_null_out() {
 #[test]
 fn a_refused_stamp_names_the_pair_that_was_refused() {
     let mut out: i64 = 0;
-    // SAFETY: `out` is a live local.
     assert_eq!(
+        // SAFETY: `out` is a live local.
         unsafe { tft_stamp_from_parts(42, 1_500_000_000, &mut out) },
         TFT_ERR_BAD_STAMP
     );

@@ -388,8 +388,9 @@ fn unresolvable_name(name: &str, e: FrameError) -> PyErr {
 ///
 /// # The two entry points every program calls first shipped five Debug dumps
 ///
-/// `BuildError`'s `thiserror` attributes are `#[error("topology error: {0:?}")]`
-/// and four more like it, forwarded here as `format!("{e}")` — so
+/// `BuildError`'s `thiserror` attributes were `#[error("topology error: {0:?}")]`
+/// and four more like it (two of the five print their payload's `Display`
+/// now), forwarded here as `format!("{e}")` — so
 /// `tf_tree.build([("a","b"),("b","a")])`, which is a *typo-grade* mistake,
 /// raised `topology error: WouldCreateCycle { child: FrameId(1) }`. That is both
 /// things this module exists to keep out of a Python message at once, on the
@@ -1050,7 +1051,7 @@ pub(crate) fn push_msg(edge: &str, e: PushError) -> String {
         // mistake as printing `EdgeId(3)`, in the other direction: an id nobody
         // can use, replaced by prose nobody can look up. The braces stay off,
         // because it is the heading that has to be findable, not the struct.
-        PushError::NonMonotonicStamp { last, got } => format!(
+        PushError::NonMonotonicStamp { last, got, .. } => format!(
             "{edge}: stamp {got} ns is older than the newest published stamp \
              {last} ns. Stamps are non-decreasing per edge; equal stamps are \
              accepted and the newer value wins. A burst of these on a \
@@ -1153,11 +1154,11 @@ pub(crate) fn claim_err(tree: &Tree, parent: &str, child: &str, e: ClaimApiError
                 None => "the root (no parent)".to_owned(),
             }
         )),
-        ClaimApiError::AlreadyClaimed(inner) => TfTreeError::new_err(format!(
+        ClaimApiError::AlreadyClaimed { cause, .. } => TfTreeError::new_err(format!(
             "{edge}: already claimed by participant slot {}. One writer per \
              edge (invariant 4): the other publisher must release it, or be \
              reaped, first",
-            claimed_by(inner)
+            claimed_by(cause)
         )),
         ClaimApiError::ReadOnly => TfTreeError::new_err(format!(
             "{edge}: this arena is mapped read-only, so no edge can be claimed \

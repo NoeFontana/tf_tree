@@ -57,7 +57,17 @@
 #   is the same hole `just shm-check`'s own comments already name, and mirroring
 #   the justfile is how it stays exactly that hole and no larger.
 # * **Nothing about `// SAFETY:` comments or module blocks** — 0007 rules 3 and
-#   4. Those are review rules and this script does not read them.
+#   4 — and this script does not read them. **Per-block presence is not a review
+#   rule any more, but this script is not what holds it:** clippy's
+#   `undocumented_unsafe_blocks` is `deny` in the root `[workspace.lints.clippy]`
+#   and in `tf_tree_py`'s and `tf_tree_tf2_sys`' own `[lints.clippy]`, so every
+#   `clippy -D warnings` pass that compiles a block fails if the block has no
+#   comment of its own. That lint checks where a comment sits, not what it says:
+#   whether it names the invariant, and the module-level blocks, are still
+#   review. It reaches exactly what some clippy line compiles — `just
+#   py-compile` for `tf_tree_py`, the container-only `just tf2-check` for
+#   `tf_tree_tf2_sys` — so a `cfg` no clippy line builds (`--cfg loom`, a
+#   non-Linux target) is unlinted.
 #
 # ## The empty-subject question
 #

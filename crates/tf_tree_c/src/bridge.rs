@@ -1557,10 +1557,16 @@ pub unsafe extern "C" fn tft_bridge_offer(
         // fields a caller could misread would trade a rule stated in one line
         // for a rule with an exception list. The cost is a couple of
         // nanoseconds against a call measured in the hundreds.
-        //
-        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
-        // invariants, so a bitwise write is a complete initialisation.
         let mut o = tft_bridge_outcome::blank();
+        // SAFETY: `out` is non-null, and the caller contracts (`# Safety`) that
+        // it points to a writable `tft_bridge_outcome` — a C object of that
+        // type, so aligned for it and the whole struct, not just `struct_size`.
+        // The `read_unaligned` above assumes less; this write assumes the
+        // contract's alignment, and a misaligned `out` breaks the contract. The
+        // `struct_size` match proves no storage; it rules out a caller built
+        // against a different layout. `ptr::write` neither reads nor drops the
+        // possibly-uninitialised old value, and `tft_bridge_outcome` is `Copy`
+        // with no padding invariants, so the bitwise write initialises it fully.
         unsafe { core::ptr::write(out, o) };
 
         // SAFETY: the caller contracts a live handle.
@@ -2500,10 +2506,16 @@ pub unsafe extern "C" fn tft_bridge_note_time_jump(
         }
         // A blank outcome before the handle is validated, for the same reason
         // and with the same promise as `tft_bridge_offer`'s.
-        //
-        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
-        // invariants, so a bitwise write is a complete initialisation.
         let mut o = tft_bridge_outcome::blank();
+        // SAFETY: `out` is non-null, and the caller contracts (`# Safety`) that
+        // it points to a writable `tft_bridge_outcome` — a C object of that
+        // type, so aligned for it and the whole struct, not just `struct_size`.
+        // The `read_unaligned` above assumes less; this write assumes the
+        // contract's alignment, and a misaligned `out` breaks the contract. The
+        // `struct_size` match proves no storage; it rules out a caller built
+        // against a different layout. `ptr::write` neither reads nor drops the
+        // possibly-uninitialised old value, and `tft_bridge_outcome` is `Copy`
+        // with no padding invariants, so the bitwise write initialises it fully.
         unsafe { core::ptr::write(out, o) };
 
         let kind = match kind {
@@ -2654,10 +2666,16 @@ pub unsafe extern "C" fn tft_bridge_close_startup_window(
         }
         // A blank outcome before the handle is validated, for the same reason
         // and with the same promise as `tft_bridge_offer`'s.
-        //
-        // SAFETY: as above; `tft_bridge_outcome` is `Copy` with no padding
-        // invariants, so a bitwise write is a complete initialisation.
         let mut o = tft_bridge_outcome::blank();
+        // SAFETY: `out` is non-null, and the caller contracts (`# Safety`) that
+        // it points to a writable `tft_bridge_outcome` — a C object of that
+        // type, so aligned for it and the whole struct, not just `struct_size`.
+        // The `read_unaligned` above assumes less; this write assumes the
+        // contract's alignment, and a misaligned `out` breaks the contract. The
+        // `struct_size` match proves no storage; it rules out a caller built
+        // against a different layout. `ptr::write` neither reads nor drops the
+        // possibly-uninitialised old value, and `tft_bridge_outcome` is `Copy`
+        // with no padding invariants, so the bitwise write initialises it fully.
         unsafe { core::ptr::write(out, o) };
 
         // SAFETY: the caller contracts a live handle.

@@ -199,10 +199,28 @@ fi
 # runtime directory and a lock file and are only isolated by that; run
 # concurrently in one process, six of them fail for reasons that have nothing to
 # do with sockets. One thread restores the property they were written against.
+#
+# **`prlimit --core=1:1 --` in front of `strace`, `docs/decisions/0057` step 4,
+# and this is the third runner of a test that step names.** The `rendezvous`
+# binary traced here carries
+# `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`, whose
+# `serve-then-die` child calls `abort()` and is reaped through
+# `wait_within(20 s)`. On a host with a pipe `core_pattern` the crash helper
+# runs inside that wait, before the child's files close, so a helper slower than
+# 20 s would REFUSE this run for a reason that is a property of the host and not
+# of §5.1. Here nothing else bounds it either: these binaries run outside
+# nextest, so its 180 s terminate-after does not apply. A soft limit of 0, the
+# usual shell default, does not stop a pipe dump; a limit of 1 does (measured on
+# kernel 6.8 with apport; pending on the runner, per `0057` step 4). `strace -f`
+# and every child it follows inherit the limit, and `prlimit` issues no
+# `socket(2)` and is not traced. This script is Linux-only already (`strace`),
+# and `prlimit` is util-linux. `just shm-check` and `just shm-rendezvous` carry
+# the same prefix for the same test.
 status=0
 for b in "${BINARIES[@]}"; do
     n=$(basename "$b")
-    if ! strace -f -e trace=socket -o "$OUT/$n.strace" "$b" --test-threads 1 \
+    if ! prlimit --core=1:1 -- \
+            strace -f -e trace=socket -o "$OUT/$n.strace" "$b" --test-threads 1 \
             >"$OUT/$n.log" 2>&1; then
         echo "no-network: $n exited non-zero — its output is in $OUT/$n.log" >&2
         status=1

@@ -406,11 +406,10 @@ pub enum IngestError {
     Claim(tf_tree::ClaimApiError),
     /// A sample was rejected by the engine.
     ///
-    /// `{0:?}` and not `{0}`: `PushError` is a `tf_tree_core` type and the core
-    /// is `no_std` with no `Display` impls — `tf_tree::Described` is what
-    /// renders those, and it needs a `Tree`, which a failing push does not have
-    /// to hand.
-    #[error("push rejected: {0:?}")]
+    /// `{0}`: `PushError` has had its own `Display` since `docs/decisions/0040`,
+    /// and it names the edge. This attribute used to be `{0:?}` under a comment
+    /// saying the core had no `Display` impls, which stopped being true then.
+    #[error("push rejected: {0}")]
     Push(tf_tree::PushError),
     /// A surveyed frame was not present in the built tree. Structurally
     /// impossible — every surveyed name is declared on the builder — and kept

@@ -433,9 +433,12 @@ pub unsafe extern "C" fn tft_publisher_push_many(
             Ok(w) => w,
             Err(rc) => return rc,
         };
-        // SAFETY: the caller contracts `n` readable `i64` at `stamps` and
-        // `span` readable bytes at `src`.
+        // SAFETY: `stamps` was checked non-NULL above, and the caller contracts
+        // `n` readable, aligned `i64` there; `n > 0` past the early return.
         let ts = unsafe { core::slice::from_raw_parts(stamps, n) };
+        // SAFETY: `src` was checked non-NULL above, and the caller contracts
+        // `span` readable bytes there — `(n - 1) * stride + payload`, the
+        // overflow-checked extent computed above; `u8` has no alignment.
         let bytes = unsafe { core::slice::from_raw_parts(src.cast::<u8>(), span) };
 
         for (i, &t) in ts.iter().enumerate() {
@@ -605,11 +608,15 @@ pub(crate) mod map {
                 );
                 TFT_ERR_CHILD_DETACHED
             }
-            C::AlreadyClaimed(inner) => {
+            C::AlreadyClaimed { edge, cause } => {
                 set_error(
                     TFT_ERR_ALREADY_CLAIMED,
                     "another participant already holds this edge (one writer per edge)",
                     |d| {
+                        // D11: the refused edge. `ClaimApiError` has carried it
+                        // since the facade stopped dropping it on `?`; the
+                        // field existed all along and read `TFT_INVALID_ID`.
+                        d.edge = edge.get();
                         // The owner is a participant *slot*, not a pid — A3 made
                         // the claim word an indirection into the participant
                         // table. `tf_tree doctor` resolves it to a process.
@@ -618,7 +625,7 @@ pub(crate) mod map {
                         // `match` and not a `let`: a variant added upstream must
                         // leave the slot at its sentinel rather than fail to
                         // compile a boundary crate.
-                        if let ClaimError::EdgeAlreadyClaimed { owner_slot } = inner {
+                        if let ClaimError::EdgeAlreadyClaimed { owner_slot } = cause {
                             d.frame_a = *owner_slot;
                         }
                     },
@@ -705,11 +712,12 @@ pub(crate) mod map {
 
     pub(crate) fn push(e: &PushError) -> tft_status {
         match e {
-            PushError::NonMonotonicStamp { last, got } => {
+            PushError::NonMonotonicStamp { edge, last, got } => {
                 set_error(
                     TFT_ERR_NON_MONOTONIC,
                     "stamp predates this edge's newest sample; stamps are non-decreasing",
                     |d| {
+                        d.edge = edge.get();
                         d.requested = *got;
                         d.newest = *last;
                     },

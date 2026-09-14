@@ -56,6 +56,12 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+# `docs/decisions/0007` rule 3, mirrored from the root `Cargo.toml`'s
+# `[workspace.lints.clippy]`, which this crate cannot inherit; see the comment
+# there for what the lint does and does not check. This crate builds only in
+# the ROS 2 container, so the container-only `just tf2-check` is the one pass
+# that runs it: no host recipe, and not `just lint`, can see a block here.
+undocumented_unsafe_blocks = "deny"
 
 [lints.rust]
 missing_docs = "warn"

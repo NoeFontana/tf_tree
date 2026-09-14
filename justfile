@@ -54,6 +54,18 @@ test-rust:
     # assert the child died of `SIGABRT` at that site and that the state it left
     # is repairable — so they are the only thing standing between a mis-placed
     # `crash_point!` and a fault-injection harness that proves nothing.
+    #
+    # **No `prlimit --core=1:1 --` here, unlike the rendezvous lines in
+    # `shm-check` and `shm-rendezvous` (`docs/decisions/0057` step 4).** Those
+    # children dump core on a host with a pipe `core_pattern`, and there the
+    # dump decides nothing: `run_child` waits with an `output()` bounded only by
+    # nextest's 180 s terminate-after (`.config/nextest.toml`), so a crash
+    # helper would have to run for minutes to fail these tests — far outside the
+    # ~1.1 s dump `0057` measured on the dev host. And `just test` is the one
+    # recipe step 4 weighs that is expected to work off Linux (a contributor's
+    # macOS host), where there is no `prlimit`, so a prefix would break it
+    # there. The cost, stated rather than implied: on CI these aborts dump into
+    # systemd-coredump's journal on every push.
     cargo nextest run -p tf_tree_core --features crash-points
 
 test-doc:
@@ -2682,7 +2694,30 @@ shm-check:
     # compiles at least one of the three out, so this line is the only one that
     # runs it, which is the same argument the `--test frozen` line above makes
     # about `unstable`.
-    cargo nextest run -p tf_tree --features shm,unstable,crash-points --test rendezvous
+    #
+    # **`prlimit --core=1:1 --`, because three of this line's tests reap an
+    # aborted child through a bounded wait** (`docs/decisions/0057` step 4).
+    # `a_killed_sweeper_leaves_the_record_for_the_next_one` and
+    # `a_killed_owner_in_its_hangup_callback_leaves_the_role_inheritable` arm
+    # `TF_TREE_CRASH_AT`, and
+    # `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`'s
+    # `serve-then-die` child calls `abort()` itself; all three reap through
+    # `wait_within(20 s)`. On a host with a pipe `core_pattern` the crash helper
+    # runs inside that wait, before the child's files close, so a helper slower
+    # than 20 s would decide them — a property of the host, not of §3.5. A soft
+    # limit of 0, the usual shell default, does not stop a pipe dump (measured
+    # on the dev host and on the runner); a limit of 1 does (measured on kernel
+    # 6.8 with apport, pending on the runner, per `0057` step 4). The other
+    # three abort sites reap with a `wait()` bounded only by nextest's 180 s
+    # terminate-after (`.config/nextest.toml`), so a helper would have to run
+    # for minutes to fail them — far outside the ~1.1 s dump `0057` measured on
+    # the dev host. The same test runs a third time, outside nextest, under
+    # `just no-network`, and `scripts/no-network.sh` carries the same prefix.
+    # `prlimit` is util-linux, `Essential: yes` on the Ubuntu images CI runs,
+    # and this recipe is Linux-only already (`shm`). Setting `1:1` only lowers
+    # the hard limit, so it needs no privilege; a host whose hard limit is
+    # already 0 refuses it, loudly, rather than running unsuppressed.
+    prlimit --core=1:1 -- cargo nextest run -p tf_tree --features shm,unstable,crash-points --test rendezvous
     cargo clippy -p tf_tree --features shm,unstable,crash-points --all-targets -- -D warnings
     # **`docs/decisions/0017` steps 2 and 3 — and this line is the rule three
     # paragraphs above being obeyed rather than restated.** Half of
@@ -2760,9 +2795,38 @@ shm-check:
 # feature did not exist is what sends somebody to build it a second time.
 #
 # §11.4's "under ASan" half is `just shm-torture-asan`.
+#
+# **`prlimit --core=1:1 --`, on this recipe and on `shm-torture-crash-points`
+# and `shm-torture-asan` below** (`docs/decisions/0057` Decision 6, step 4). A
+# process that dies of a signal whose default action is *core* — every armed
+# crash point is an `abort()` — runs the host's crash helper **before** its
+# files close, so for the whole of that run its rendezvous socket and byte 0
+# stay held: an owner or heir dumping core holds the role, nothing can inherit,
+# and joins are refused. The harness gates §12.3 gate 3 and §3.5 recovery, and
+# neither verdict may depend on the host's `core_pattern`. On a pipe pattern —
+# apport on the dev host, systemd-coredump on the runner — a soft `RLIMIT_CORE`
+# of 0, the shell default in both places, does **not** stop the dump (measured
+# in both places); a limit of exactly 1 does, **measured on kernel 6.8 with
+# apport and pending on the runner** (kernel 6.17, systemd-coredump): `0057`
+# step 4 asks the first crash-points nightly after landing to show
+# `core_dumped=false` on every reaped armed abort. The limit is set here rather
+# than in the binary so no `unsafe` is added and every child inherits it, and
+# CI, which invokes these recipes, gets it with them. The binary's
+# `[diag] host:` line reads `core_rlimit soft=1 hard=1` under the prefix, and
+# `hard=1` is what only the prefix produces. A `--crash-points` run without the limit on
+# a pipe host prints a `[diag] warning:` line and is **not** failed for it.
+#
+# What this gives up, stated: these recipes no longer exercise recovery across
+# a core dump. That is `0057`'s measurement's job, and the bare binary,
+# invoked outside a recipe, inherits the shell's limit and still runs the
+# dumping configuration. `prlimit` is util-linux (`Essential: yes` on the
+# Ubuntu images CI uses) and all three recipes are Linux-only already, since
+# the binary refuses to run without `shm` on Linux. `1:1` only lowers the hard
+# limit and needs no privilege; a host whose hard limit is already 0 refuses
+# it with `Operation not permitted` rather than running unsuppressed.
 shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
     cargo build --release --features shm -p tf_tree_bench --bin shm_torture
-    ./target/release/shm_torture {{ARGS}}
+    prlimit --core=1:1 -- ./target/release/shm_torture {{ARGS}}
 
 # **§11.4's "a random crash point armed in 10% of children" — `docs/PHASE2.md`
 # §11.3 and §11.4 meeting for the first time.**
@@ -2827,23 +2891,54 @@ shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
 # it serves — see `shm_torture.rs`. **This comment said that worker "no longer
 # abdicates voluntarily", which is false.** The extension is bounded by
 # `MAX_OWNER_CAP_EXTENSIONS` (10). After that the worker leaves through the cap,
-# and takes the role with it, with no census and no
-# `kill.in_progress` marker. Measured 2026-09-13 with
-# `--children 6 --kill-hz 6 --owner-kill-every 60s`: three such departures in
-# one 90 s run, at 23.285–23.405 s of tenure. The 2026-09-13 nightly's log is
-# consistent with its wedge being such an exit, two deferred owner kills having
-# kept one heir past the bound, but nothing in that log recorded the exit, so
-# that is a hypothesis. The binary's `[diag] role-holder-cap-exit` line names
-# each exit and exists to confirm or refute it. **This comment said the
-# diagnosis "places its wedge at that exit"**, which stated the hypothesis as a
-# finding, and quoted 23.3–23.5 s, a range that mixed two runs. **This recipe
-# reaches the state probabilistically rather than reliably**, which is why it
-# took three nights: an armed abort at
+# and takes the role with it, with no census and no `kill.in_progress` marker.
+# Measured 2026-09-13 with `--children 6 --kill-hz 6 --owner-kill-every 60s`:
+# three such departures in one 90 s run, at 23.285–23.405 s of tenure. The
+# 2026-09-13 nightly's wedge was **not this job's**: per job, run 34747459144's
+# `shm_torture (30 min)` — `just shm-torture`, which arms no crash points —
+# failed, and this job was green that night. Its log is consistent with that
+# wedge being such an exit, two deferred owner kills having kept one heir past
+# the bound, but nothing in that log recorded the exit, so that is a hypothesis.
+# (This paragraph read it as this recipe's wedge until 2026-09-14.) The binary's
+# `[diag] role-holder-cap-exit` line names each exit and exists to confirm or
+# refute it. **This comment said the diagnosis "places its wedge at that
+# exit"**, which stated the hypothesis as a finding, and quoted 23.3–23.5 s, a
+# range that mixed two runs. **This recipe reaches the state probabilistically
+# rather than reliably**, which is why it took three nights: an armed abort at
 # `takeover.after_ownership_lock_before_bind` destroys an attached heir at the
 # one instant the role is vacant, and that has to coincide with a thin pool.
+#
+# **`prlimit --core=1:1 --` since 2026-09-14, for the reason `shm-torture`'s
+# comment gives, and this is the recipe it matters most to**: every armed child
+# that reaches its site aborts, and before the prefix every one of those aborts
+# ran the runner's systemd-coredump (all 50 reaped aborts in two 2026-09-13 runs
+# read `core_dumped=true`, `docs/decisions/0057`). It also removes one source of
+# `docs/PHASE2.md` §0.0's *"`aborted` is a floor rather than a count"*: a child
+# the driver `SIGKILL`ed mid-dump, which reaps as signal 9.
+#
+# **What a green run after the prefix is NOT evidence about: the 2026-09-12
+# wedge.** It is consistent with a dumping heir and was never shown to be one; a
+# recurrence of that shape under `RLIMIT_CORE=1` would refute the dump
+# explanation for it. The 2026-09-13 wedge is not this job's (the paragraph on
+# `MAX_OWNER_CAP_EXTENSIONS` above), and it cannot have been a dumping armed
+# child, because the job it happened in arms no crash points.
+#
+# **The pre-change rate, per job and not per run, so a later rate has something
+# to be compared against.** Read on 2026-09-14 with
+# `gh api repos/{owner}/{repo}/actions/runs/<id>/jobs` over every
+# `nightly.yml` run since the job was wired: **10 executions of this job
+# (2026-09-07 through 2026-09-13, seven scheduled and three
+# `workflow_dispatch`), 2 red** — 2026-09-09 (run 34327721803) and 2026-09-12
+# (run 34682020027). The 09-12 log reads the population wedge, *"zero
+# read-write participants were attached, so there was no heir to wait for"*,
+# at round 22. The 09-09 log is no longer retrievable (HTTP 410), so its
+# classification is the earlier paragraph's, made while it was. **The two are
+# not a rate for one configuration of the harness**: 09-09 ran at `0fa78ae`,
+# before #310 and #323 changed it, and 09-12 ran at `74088f0`, which carries
+# both. Of the seven executions at or after #310, one was red.
 shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
     cargo build --release --features shm,crash-points -p tf_tree_bench --bin shm_torture
-    ./target/release/shm_torture --crash-points {{ARGS}}
+    prlimit --core=1:1 -- ./target/release/shm_torture --crash-points {{ARGS}}
 
 # **`docs/PHASE2.md` §12.2's two ownership-migration rows, and §12.3 gate 4b** —
 # the normative criterion that had no artifact until 2026-08-29. §3.5's migration
@@ -2971,8 +3066,15 @@ no-network:
 # the FIRST owner kill, which is what
 # `tests/torture.rs::a_kill_window_wide_enough_to_drain_the_pool_does_not_wedge_the_arena`
 # uses.
+#
+# **`prlimit --core=1:1 --`, for the reason `shm-torture`'s comment gives.**
+# The ASan job's `[diag] host:` line already read `soft=1` without it — inferred
+# to be the sanitizer runtime's own doing, and never shown to reach every child
+# — so `hard=1` is the reading that says the prefix is in force. It wraps
+# `cargo run`, and `cargo` execs the binary as its child, which inherits it.
 shm-torture-asan *ARGS="--duration 120s --children 4 --kill-hz 4":
     RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS=detect_leaks=0 \
+    prlimit --core=1:1 -- \
     cargo +nightly run -Zbuild-std --target "$(rustc -vV | sed -n 's/^host: //p')" \
         --release --features shm -p tf_tree_bench --bin shm_torture -- {{ARGS}}
 
@@ -3071,7 +3173,15 @@ shm-rendezvous:
     # paragraph above it records — a number corrected while the list beside it
     # was not. The twelfth is now in the list at the top of this comment, so the
     # arithmetic and the list agree.
-    cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
+    #
+    # **`prlimit --core=1:1 --` for the reason `just shm-check`'s rendezvous
+    # line gives** (`docs/decisions/0057` step 4). This feature set has no
+    # `crash-points`, so one bounded reap of an aborted child runs here:
+    # `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves`, whose
+    # `serve-then-die` child calls `abort()` and is reaped through
+    # `wait_within(20 s)`, which a pipe `core_pattern`'s helper would otherwise
+    # run inside.
+    prlimit --core=1:1 -- cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.
 tf2-shell:

@@ -631,6 +631,30 @@ pub unsafe extern "C" fn tft_tree_free(tree: *mut tft_tree) {
 /// such a plan compiled and then failed every single evaluate call, with no
 /// argument a C caller could pass to say otherwise.
 ///
+/// # Errors
+///
+/// `*out` is not written on any failure. Three codes mean something here that
+/// their one-line definitions do not say, because compilation reads the
+/// topology and can meet a state those definitions were not written for:
+///
+/// * [`TFT_ERR_UNKNOWN_FRAME`] — before compilation: a name is not UTF-8, or
+///   does not resolve. On a read-only attachment that is usually a name nobody
+///   declared, and rarely a name whose hash slot a different name holds
+///   (permanent) or a name another participant is interning right now
+///   (transient — retry); on a writable tree, which declares a name it does not
+///   find, it is a full frame table or a name that cannot be interned. **From
+///   compilation**, with `frame_a` set, it is not a misspelt name: the topology
+///   read found no consistent snapshot within its retry limit while another
+///   participant re-parented (transient — retry), or the arena records a parent
+///   index outside its frame table (a corrupt or foreign-written arena).
+/// * [`TFT_ERR_NO_DATA`] — the topology records a parent for `frame_a` but no
+///   edge for the link, which a builder-made arena never contains (a corrupt or
+///   foreign-written arena). An edge with no samples yet compiles, and is
+///   reported by the evaluate call instead.
+/// * [`TFT_ERR_TIME_DOMAIN`] — either the route's dynamic edges publish in a
+///   tag other than `domain` (`0` here), or they disagree **among
+///   themselves**, in which case `edge` is the edge that disagreed.
+///
 /// # Safety
 ///
 /// `tree` must be a live handle. `target` and `source` must be NUL-terminated
