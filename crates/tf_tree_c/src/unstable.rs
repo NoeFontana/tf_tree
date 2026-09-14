@@ -379,10 +379,17 @@ pub type tft_inheritance = u8;
 
 /// This process is now the owner and is serving the rendezvous.
 pub const TFT_INHERITED: tft_inheritance = 0;
-/// The owner is alive. Nothing was attempted.
+/// `tft_tree_owner_lost` would have answered `false`, so nothing was attempted:
+/// usually the owner is alive or another survivor already inherited. **Not
+/// final** while `tft_tree_owner_lost` keeps answering `true` — a fresh open
+/// passing through §3.4 steps 2–4 holds the ownership byte briefly and gives it
+/// back (`0057` Decision 3). Call again on the next pass.
 pub const TFT_OWNER_ALIVE: tft_inheritance = 1;
-/// Another survivor won the ownership byte and is binding. This process kept
-/// its slot and keeps reading; it will be told again if that survivor dies too.
+/// The ownership byte was taken when this process tried for it: another
+/// survivor won it and is binding, or a fresh open holds it in passing and will
+/// hand it back. This process kept its slot and keeps reading. **Not final**
+/// while `tft_tree_owner_lost` keeps answering `true`: call again on the next
+/// pass, and it is told again if a winning survivor dies too.
 pub const TFT_CONTENDED: tft_inheritance = 2;
 /// A read-only attachment cannot serve, so it cannot be the heir (D18).
 pub const TFT_READ_ONLY: tft_inheritance = 3;
@@ -489,6 +496,15 @@ pub unsafe extern "C" fn tft_tree_open_named(
 /// inherit stops being told to try
 /// ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
 /// `false` for anything that is not a joined rendezvous attachment.
+///
+/// **A dying owner is seen at the end of its exit, not at its signal**
+/// (`docs/PHASE2.md` §3.5, NORMATIVE): once the attach connection has hung up
+/// and the last open file description holding the ownership byte has closed.
+/// The kernel writes any core dump and tears down the address space first, so
+/// an owner dumping core through a piped `core_pattern` can take about a second
+/// to be seen, and nothing a survivor can take shortens it. tf_tree adds no
+/// delay, heartbeat or timeout to that event
+/// ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
 ///
 /// Pair it with [`tft_tree_inherit_ownership`] in your own loop — there is no
 /// background thread and no daemon, per `0019`, so **nothing calls this for

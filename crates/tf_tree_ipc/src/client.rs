@@ -8,8 +8,16 @@
 //! `docs/PHASE2.md` §3.7 step 9 and `docs/PROJECT.md` §5 D17 both say it: a
 //! participant holds its connection for the lifetime of the attachment, because
 //! that is how it learns the *owner* died — process death of any kind closes
-//! the fd and the peer sees it immediately, with no timeout to tune and no
-//! heartbeat to misinterpret. Closing after the handshake would throw away the
+//! the fd and the peer sees the hangup, with no timeout to tune and no
+//! heartbeat to misinterpret. **It sees it when the kernel closes the dying
+//! process's files, at the end of its exit**: after any core dump and after its
+//! address space is torn down, and not before a `fork` child sharing the
+//! description exits
+//! ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md);
+//! §3.5's NORMATIVE sentence). That is exact, and it is not necessarily prompt:
+//! one host measured about a quarter of a millisecond for a small `SIGKILL`ed
+//! process and about 1.1 s for a small one dumping core through a piped
+//! `core_pattern`. Closing after the handshake would throw away the
 //! liveness signal the whole design rests on, so [`Attached`] owns the socket
 //! and the caller must keep it alive.
 //!
@@ -49,7 +57,11 @@ pub struct Attached {
 /// Whether the peer of `socket` has closed it — the owner's death signal (D17).
 ///
 /// A participant holds its attach socket for the lifetime of the attachment, so
-/// the owner sees `EPOLLHUP` in microseconds when the participant dies. This is
+/// the owner sees `EPOLLHUP` when the participant dies — exactly, but only once
+/// the kernel closes the dying process's files at the end of its exit, which
+/// comes after any core dump and the teardown of its address space
+/// ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md);
+/// `docs/PROJECT.md` D17 carries the amendment). This is
 /// the same fact read from the other end: the *participant* learns that the
 /// owner is gone, which is §3.5's trigger and the thing that has never existed —
 /// `docs/PHASE2.md` §0.0 records that nothing watches the client socket, so no

@@ -123,8 +123,11 @@ impl LockFile {
     /// Try to take byte 0 — become the owner.
     ///
     /// Returns [`LockAttempt::Contended`] when someone else holds it. That is
-    /// not an error: in the §3.4 loop it means another process is mid-bind and
-    /// will be serving shortly.
+    /// not an error: in the §3.4 loop it means another process holds byte 0 —
+    /// an owner mid-bind, which will be serving shortly, or another `open()`
+    /// passing through steps 2–4, which will hand it back
+    /// ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
+    /// Either way the loop backs off and asks again.
     ///
     /// # Errors
     ///

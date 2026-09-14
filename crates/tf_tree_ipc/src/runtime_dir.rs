@@ -169,8 +169,9 @@ fn finish(path: PathBuf, source: RuntimeDirSource, uid: u32) -> Result<RuntimeDi
 /// Not caution for its own sake. On NFS, locks are leases: they are recovered
 /// after a server restart, they can be *lost* while the client believes it holds
 /// them, and release on client death happens when the lease expires rather than
-/// immediately. Every claim in §3.3's table — "holder dies without unlocking →
-/// released by the kernel, immediately" — stops being true, and the split-brain
+/// at the end of the holder's exit. Every claim in §3.3's table — "holder dies
+/// without unlocking → released by the kernel, immediately at the end of the
+/// holder's exit" — stops being true, and the split-brain
 /// check in §3.4 silently degrades into a timing heuristic. Refusing to start is
 /// vastly better than that.
 fn reject_network_filesystem(path: &Path, source: RuntimeDirSource) -> Result<(), IpcError> {
