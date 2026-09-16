@@ -258,7 +258,7 @@ The distinction is worth stating in the docstring rather than only here: the lay
 
 ### 4.4 Errors
 
-Rust's typed errors map to an exception hierarchy carrying **structured attributes**, not just messages, so users can program against them. **This block is [`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md)'s** (2026-09-14), which replaced the one written for this phase, and **it is what ships**, except `ClaimRevokedError`, which waits (last bullet). The amendment below it is historical: the account of what shipped before that record's steps, each of which corrected the bullet it made false.
+Rust's typed errors map to an exception hierarchy carrying **structured attributes**, not just messages, so users can program against them. **This block is [`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md)'s** (2026-09-14), which replaced the one written for this phase, and **it is what ships** — the fifteen classes below are the shipped set. `ClaimRevokedError` is not one of them and is deliberately absent rather than omitted: it waits for a Python-reachable trigger (last bullet). The amendment below it is historical: the account of what shipped before that record's steps, each of which corrected the bullet it made false.
 
 ```python
 class TfTreeError(Exception): ...
@@ -287,7 +287,7 @@ class ArenaAbsentError(TfTreeError): ...
 - **`FrameNotDeclaredError.name`** is the name the caller typed, `str | None`, `None` only where no name survives (a hash reported by the engine).
 - **`ClaimRevokedError` waits for a Python-reachable trigger.** No Python caller is known to be able to make `PushError::ClaimRevoked` raise, so the failure reaches Python as the base `TfTreeError`. Draft [`0031`](./decisions/0031-the-participant-record-with-no-byte.md) is what could create a trigger, since an answer to it could change which publishers are reaped.
 
-`str(e)` names ids as the arena's names, resolved by the binding against the arena the caller holds (`edge_label` / `frame_label` in `crates/tf_tree_py/src/errors.rs`), and its text is not a compatibility promise (`docs/API.md` R5). `TopologyChangedError` must document that the correct response is to re-`plan`, since it is the one error a correct program routinely hits.
+`str(e)` names ids as the arena's names, resolved by the binding against the arena the caller holds (`edge_label_in` / `frame_label` in `crates/tf_tree_py/src/errors.rs`), and its text is not a compatibility promise (`docs/API.md` R5). `TopologyChangedError` must document that the correct response is to re-`plan`, since it is the one error a correct program routinely hits.
 
 > **Amendment (2026-09-14) — historical since `0058`'s steps landed; the block
 > above is what ships.** It was titled *"what ships, which is not the block
@@ -821,9 +821,10 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 Implemented and gated locally (`just py-test`, `py-test-freethreaded`,
 `py-lint`, `tsan`): `open()`/`build()`, `Plan.at` scalar and batch, `at_into`
 with DLPack device classification, `adaptive`, `Publisher` with `push` and
-`push_many`, the exception hierarchy — §4.4's block, fifteen classes with their
-attributes on raised instances, less `ClaimRevokedError`, and with §11.1's four
-unreachable arms recorded there — hand-written
+`push_many`, the exception hierarchy — §4.4's block, the fifteen classes that ship, with
+their attributes on raised instances; `ClaimRevokedError` is not among them and
+waits for a Python-reachable trigger, and §11.1's four unreachable arms are
+recorded there — hand-written
 stubs with a bidirectional
 drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
 path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and
