@@ -44,7 +44,7 @@
 //! looks like it means something.
 //!
 //! Every id that reaches a Python message therefore goes through
-//! [`edge_label`] / [`frame_label`], which resolve against the arena the caller
+//! [`edge_label_in`] / [`frame_label`], which resolve against the arena the caller
 //! is holding. That capability was already in the binding —
 //! [`crate::offline::named_edge_in`] has resolved edge ids for `Tree.edges` and
 //! for `span`'s no-data path since `docs/PHASE5.md` §4.2 — and the routing is
@@ -282,7 +282,7 @@ pub(crate) fn edge_label_of(parent: &str, child: &str) -> String {
     format!("edge {parent:?} -> {child:?}")
 }
 
-/// [`edge_label_of`] for an id, resolved against the arena the caller holds.
+/// [`edge_label_of`] for an id, resolved against a view the caller already holds.
 ///
 /// # The fallback says *why*, and that is the whole point of having one
 ///
@@ -296,24 +296,43 @@ pub(crate) fn edge_label_of(parent: &str, child: &str) -> String {
 /// is not: `Tree::view` substitutes a zeroed poison arena in the child, so every
 /// name would read absent and "no record" would be a lie.
 ///
-/// # `_in`, and why every caller here should prefer it
+/// # `_in`, and why there is no `&Tree` spelling of it
 ///
 /// [`ArenaView`] is what actually resolves a name, and `Tree::view` rebuilds one
 /// per call — `detached()`, `as_participant`, `with_liveness`, `is_writable`.
 /// One message can name three frames ([`LookupError::Disconnected`]), so
-/// [`lookup_err`] takes a single view for the whole message and these two
-/// convenience wrappers exist for the callers that hold a `&Tree` and nothing
-/// else.
-pub(crate) fn edge_label(tree: &Tree, edge: EdgeId) -> String {
-    edge_label_in(tree, &tree.arena_view(), edge)
+/// [`lookup_err`] takes a single view for the whole message and passes it here.
+///
+/// The `&Tree` wrapper that used to sit beside this had one caller left —
+/// [`crate::offline::span_impl`]'s `NoData` arm, which built one view for the
+/// label and a second for the attribute, for one message about one edge — and
+/// it is gone with that caller. [`frame_label`] keeps its wrapper because
+/// `claim_err` holds a `&Tree` and one `FrameId`.
+pub(crate) fn edge_label_in(tree: &Tree, view: &ArenaView<'_>, edge: EdgeId) -> String {
+    resolved_edge(tree, view, edge).0
 }
 
-/// [`edge_label`] against a view the caller already holds.
-fn edge_label_in(tree: &Tree, view: &ArenaView<'_>, edge: EdgeId) -> String {
-    match named_edge_in(view, edge) {
-        Some((parent, child)) => edge_label_of(&parent, &child),
+/// An edge resolved **once**, as the two spellings a raise needs: the label the
+/// sentence reads and the stored pair `.edge` carries (`docs/decisions/0058`
+/// §1).
+///
+/// Four arms want both, and each called [`edge_label_in`] and then
+/// [`named_edge_in`] — one edge record and two frame records read twice, to
+/// answer one question about one edge. `0058` step 2 measured +638 ns for a
+/// caught `ExtrapolationError` and named that second resolution as one of the
+/// two components; it is the component that was ours to remove, PyO3's
+/// per-attribute object construction being the other.
+pub(crate) fn resolved_edge(
+    tree: &Tree,
+    view: &ArenaView<'_>,
+    edge: EdgeId,
+) -> (String, Option<(String, String)>) {
+    let named = named_edge_in(view, edge);
+    let label = match &named {
+        Some((parent, child)) => edge_label_of(parent, child),
         None => format!("edge #{} ({})", edge.get(), nameless(tree)),
-    }
+    };
+    (label, named)
 }
 
 /// A frame id as the caller's own name, quoted, with the same fallback.
@@ -323,6 +342,10 @@ fn edge_label_in(tree: &Tree, view: &ArenaView<'_>, edge: EdgeId) -> String {
 /// [`frame_phrase_in`], which is not the same string with a prefix: the fallback
 /// already begins `frame #7`, and prefixing that produced `frame frame #7 (name
 /// unavailable: ...)`.
+///
+/// This wrapper builds a view of its own, for the one caller that holds a
+/// `&Tree` and a single `FrameId` — see [`edge_label_in`] on why a message that
+/// names more than one takes a view instead.
 pub(crate) fn frame_label(tree: &Tree, frame: FrameId) -> String {
     frame_label_in(tree, &tree.arena_view(), frame)
 }
@@ -459,7 +482,7 @@ pub(crate) fn unknown_frame_err(
             Err(err) => return unresolvable_name(py, name, err),
         }
     }
-    lookup_err(py, tree, None, e)
+    lookup_err_untagged(py, tree, e)
 }
 
 /// The two ways a name fails to resolve that are *not* "it was never declared".
@@ -830,18 +853,22 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
 /// Until that record the detail was formatted into the sentence and not
 /// attached, while this line said "keeping the structured detail".
 ///
-/// # `domain`, and why three call sites pass `None`
+/// # `domain` is a `u8`, and the call sites that hold none have their own entry
 ///
 /// `ExtrapolationError.domain` is the **query's** tag (`0058` §3): a stamp that
 /// crosses a process boundary inside a pickled exception has left behind the
 /// plan that said which clock it is on. Every call site whose Rust call can
 /// return `Extrapolation` holds that tag — `PyPlan`'s `domain` field, and
-/// `Tree.lookup`'s and `Tree.plan`'s `domain=` — and passes it. The three that
-/// hold none pass `None`: `span_impl`'s two, over `Tree::plan` and `Plan::span`,
-/// and [`unknown_frame_err`]'s, which is handed `UnknownFrame`. None of those
-/// Rust calls produces `Extrapolation` (only `tf_tree_core::sample` does, and
-/// neither `compile` nor `Guard::window` reaches it), so the `None` arm of that
-/// variant is this binding's bug and says so rather than inventing a tag.
+/// `Tree.lookup`'s and `Tree.plan`'s `domain=` — and passes it here. The three
+/// that hold none call [`lookup_err_untagged`] instead.
+///
+/// **That split is structural, and the parameter type is what makes it so.**
+/// This took an `Option<u8>` until then, and its `None` fallback raised the base
+/// `TfTreeError` for an `Extrapolation` — a *class* change, which `docs/API.md`
+/// R5 makes the contract, decided by a runtime branch no test could reach. With
+/// a plain `u8` the arm below always builds an `ExtrapolationError`, and the
+/// only place that answer can be anything else is the wrapper, where it is the
+/// whole point of the function.
 ///
 /// `TopologyChanged` is the one a *correct* program routinely hits — a peer
 /// re-parented the tree — so its message says what to do rather than only what
@@ -849,7 +876,7 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
 ///
 /// # Why it takes the tree
 ///
-/// Because [`edge_label`] and [`frame_label`] do: nine of these arms carry an
+/// Because [`edge_label_in`] and [`frame_label_in`] do: nine of these arms carry an
 /// `EdgeId` or a `FrameId`, and there is no other object in the process that
 /// can turn one into the name the caller typed. Every call site in this crate
 /// already had a `&Tree` in scope — `PyPlan` holds a `Py<PyTree>` for exactly
@@ -895,13 +922,21 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
 /// it were a sentence; the Debug is still there because it is the only
 /// information a build in this state has, but it is now labelled as the
 /// binding's bug rather than presented as the answer.
-// **`#[cold]` and never inlined, because every hot entry point names it in a
-// `map_err` closure.** `0058` step 2's interleaved, pinned A/B (release, n = 30)
-// read scalar `plan.at` +2.6% slower than the base with this function inlinable
-// and +1.0% with these two attributes, on a success path that runs none of it.
+// **`#[cold]` and never inlined, and scalar `plan.at` is the entry point that
+// measured it.** `0058` step 2's interleaved, pinned A/B (release, n = 30 paired
+// rounds) read it 2.6% slower than the base with this function inlinable and
+// 1.0% slower with these two attributes — on a success path that runs none of
+// it — so the attributes stayed, and that residual 1.0% is **unattributed**.
+//
+// **They are not on [`push_err`], [`claim_err`], [`plan_domain_err`] or
+// [`open_err`], and that is the measurement rather than an oversight.** The hot
+// entry point those four sit on is `Publisher.push`, and the same A/B read it
+// 0.5% *faster* than the base, head faster in 20 of 30 rounds — no regression to
+// answer. A mapper earns the attributes when a run shows its entry point paying
+// for their absence.
 #[cold]
 #[inline(never)]
-pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: LookupError) -> PyErr {
+pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError) -> PyErr {
     let view = tree.arena_view();
     match e {
         LookupError::Extrapolation {
@@ -910,20 +945,13 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: Loo
             oldest,
             newest,
         } => {
+            let (label, named) = resolved_edge(tree, &view, edge);
             let msg = format!(
-                "{}: stamp {requested} ns is outside the retained history \
-                 [{oldest}, {newest}] ns",
-                edge_label_in(tree, &view, edge)
+                "{label}: stamp {requested} ns is outside the retained history \
+                 [{oldest}, {newest}] ns"
             );
-            let Some(domain) = domain else {
-                return TfTreeError::new_err(format!(
-                    "{msg}. This call site holds no time-domain tag to attach, \
-                     which is a bug in tf_tree_py's error layer, not in your \
-                     program; please report it with this line"
-                ));
-            };
             with_attrs(py, ExtrapolationError::new_err(msg), |e| {
-                e.setattr("edge", named_edge_in(&view, edge))?;
+                e.setattr("edge", named)?;
                 e.setattr("requested", requested)?;
                 e.setattr("oldest", oldest)?;
                 e.setattr("newest", newest)?;
@@ -947,12 +975,10 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: Loo
                 e.setattr("cut_at", named_frame_in(&view, cut_at))
             })
         }
-        LookupError::NoData { edge } => no_data_err(
-            py,
-            &view,
-            edge,
-            format!("{} has no samples yet", edge_label_in(tree, &view, edge)),
-        ),
+        LookupError::NoData { edge } => {
+            let (label, named) = resolved_edge(tree, &view, edge);
+            no_data_err(py, named, format!("{label} has no samples yet"))
+        }
         LookupError::TopologyChanged { plan, current } => {
             let err = TopologyChangedError::new_err(format!(
                 "this plan was compiled at topology generation {plan}, the tree \
@@ -992,13 +1018,13 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: Loo
         // the fix is a re-declaration or a pose layout — permanent for the life
         // of the arena.
         LookupError::DerivativesUnavailable { edge, interp } => {
+            let (label, named) = resolved_edge(tree, &view, edge);
             let err = DerivativesUnavailableError::new_err(format!(
-                "{} declares {}, which has no exact derivative; use \
+                "{label} declares {}, which has no exact derivative; use \
                  layout='quat' or declare the edge interp='sclerp'",
-                edge_label_in(tree, &view, edge),
                 stored_interp(interp),
             ));
-            with_attrs(py, err, |e| e.setattr("edge", named_edge_in(&view, edge)))
+            with_attrs(py, err, |e| e.setattr("edge", named))
         }
         // `NoSegment` is a property of a **stamp**, and is transient: the ring
         // retains one sample, or the two bracketing `t` carry equal stamps —
@@ -1010,13 +1036,14 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: Loo
         // element 0 and leaves `out` untouched, this one can fire after `k` rows
         // are written.
         LookupError::NoSegment { edge } => {
+            let (label, named) = resolved_edge(tree, &view, edge);
             let err = NoSegmentError::new_err(format!(
-                "{} has a pose at this stamp but no segment to differentiate: it \
-                 retains one sample, or the two bracketing samples carry equal \
-                 stamps. Publish another sample, or use layout='quat'",
-                edge_label_in(tree, &view, edge)
+                "{label} has a pose at this stamp but no segment to \
+                 differentiate: it retains one sample, or the two bracketing \
+                 samples carry equal stamps. Publish another sample, or use \
+                 layout='quat'"
             ));
-            with_attrs(py, err, |e| e.setattr("edge", named_edge_in(&view, edge)))
+            with_attrs(py, err, |e| e.setattr("edge", named))
         }
         // Routed through the shared spelling so a fork victim gets the same
         // sentence whether it arrived through `lookup` or through `frames`.
@@ -1180,21 +1207,57 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: Option<u8>, e: Loo
     }
 }
 
+/// The tag [`lookup_err_untagged`] hands on. Nothing can read it: the one
+/// variant that takes a tag is answered by the wrapper itself.
+const UNTAGGED_TAG: u8 = 0;
+
+/// [`lookup_err`] for the three call sites that hold no time-domain tag:
+/// `span_impl`'s two, over `Tree::plan` and `Plan::span`, and
+/// [`unknown_frame_err`]'s, which is handed an `UnknownFrame`.
+///
+/// **The `Extrapolation` arm is a bug report, and having it here is what keeps
+/// it one.** None of those three Rust calls can produce that variant — only
+/// `tf_tree_core::sample` does, and neither `compile` nor `Guard::window`
+/// reaches it — so the arm is unreachable, and the thing that must not happen
+/// is a *reachable* raise quietly getting the base class instead of
+/// [`ExtrapolationError`], which `docs/API.md` R5 makes the contract. While
+/// [`lookup_err`] took an `Option<u8>`, that outcome sat one `None` away from
+/// every call site in the binding. Now the only caller that can reach it is one
+/// whose name says it holds no tag, and there is no argument a tagged caller can
+/// pass to get here.
+pub(crate) fn lookup_err_untagged(py: Python<'_>, tree: &Tree, e: LookupError) -> PyErr {
+    match e {
+        LookupError::Extrapolation {
+            edge,
+            requested,
+            oldest,
+            newest,
+        } => {
+            let view = tree.arena_view();
+            TfTreeError::new_err(format!(
+                "{}: stamp {requested} ns is outside the retained history \
+                 [{oldest}, {newest}] ns. This call site holds no time-domain \
+                 tag to attach, which is a bug in tf_tree_py's error layer, not \
+                 in your program; please report it with this line",
+                edge_label_in(tree, &view, edge)
+            ))
+        }
+        other => lookup_err(py, tree, UNTAGGED_TAG, other),
+    }
+}
+
 /// A [`NoDataError`] with its `.edge`, around a sentence the caller chose.
 ///
 /// Two sentences raise this class — [`lookup_err`]'s and `span`'s, which adds
 /// where on the path the silent edge sits — and both must carry the attribute,
 /// because an attribute on some raises of a class and not others is not an
 /// attribute of the class (`docs/decisions/0058` §1).
-pub(crate) fn no_data_err(
-    py: Python<'_>,
-    view: &ArenaView<'_>,
-    edge: EdgeId,
-    msg: String,
-) -> PyErr {
-    with_attrs(py, NoDataError::new_err(msg), |e| {
-        e.setattr("edge", named_edge_in(view, edge))
-    })
+///
+/// **It takes the resolved pair rather than an id and a view**, because both
+/// callers build their sentence out of the same resolution: [`resolved_edge`]
+/// is called once and its two halves go to the message and to here.
+pub(crate) fn no_data_err(py: Python<'_>, edge: Option<(String, String)>, msg: String) -> PyErr {
+    with_attrs(py, NoDataError::new_err(msg), |e| e.setattr("edge", edge))
 }
 
 /// The plan-time domain refusal (`docs/decisions/0038` §2's "checked *there*").

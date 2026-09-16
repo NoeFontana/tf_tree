@@ -38,7 +38,7 @@ import pathlib
 import numpy as np
 import pytest
 import tf_tree
-from test_stubs import _stub_annotations
+from conftest import _stub_annotations
 
 #: The committed tag-1 arena, the only non-zero-domain tree this package can
 #: reach. Resolved from this file and not from `tf_tree.__file__`: the suite is

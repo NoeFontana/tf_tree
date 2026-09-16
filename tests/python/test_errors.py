@@ -38,6 +38,7 @@ import tempfile
 import numpy as np
 import pytest
 import tf_tree
+from conftest import LONG_CHILD, _stub_annotations
 
 # One predicate for the two Linux-only paths this file touches, because it *is*
 # one predicate: `has_shared_memory()` is `cfg!(target_os = "linux")`, and the
@@ -370,7 +371,7 @@ def _raised(trigger):
     [(c[0], c[1]) for c in CASES],
     ids=[c[0].__name__.lstrip("_") for c in CASES],
 )
-def test_a_raised_exception_carries_exactly_its_classs_attributes(trigger, exc_type):
+def test_a_raised_exception_carries_exactly_its_class_attributes(trigger, exc_type):
     """`0058` §1: each attribute is on every raised instance of its class and on
     no instance of any other, with its **value** asserted, not its presence.
 
@@ -429,8 +430,6 @@ def test_every_class_a_row_raises_annotates_exactly_what_the_instance_carries():
     ``Extra items in the right set: 'oldest'``. Nothing in `test_stubs.py`
     moves: its checks are about module-level names and methods.
     """
-    from test_stubs import _stub_annotations
-
     for trigger, _, _ in CASES:
         e = _raised(trigger)
         annotated = set(_stub_annotations(type(e).__name__))
@@ -451,17 +450,10 @@ def test_a_caller_constructed_exception_carries_no_attributes():
     = hasattr(ExtrapolationError('m'), 'requested')``, and nothing else moves:
     a raised instance's ``__dict__`` still wins over the class attribute.
     """
-    from test_stubs import _stub_annotations
-
     built = tf_tree.ExtrapolationError("m")
     assert not hasattr(built, "requested")
     assert vars(built) == {}
     assert _stub_annotations("ExtrapolationError")["requested"] == "int"
-
-
-#: A child name past the 48 bytes a frame record stores (`0058` measurement 5):
-#: the arena keeps a truncated copy, so the stored pair and the typed pair differ.
-LONG_CHILD = "sensor_" + "x" * 60
 
 
 def test_a_push_error_names_the_stored_edge_not_the_typed_one():

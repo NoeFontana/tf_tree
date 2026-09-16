@@ -3353,6 +3353,14 @@ py-setup:
     VIRTUAL_ENV=.venv-t uv pip install -q maturin numpy pytest
 
 # Build the extension into the GIL venv and run the suite.
+#
+# **5.0 s of the ~5.7 s is one test**, and both this recipe and
+# `py-test-freethreaded` pay it:
+# `test_shared.py::test_a_python_consumer_recovers_an_arena_whose_owner_died`
+# waits out `DEFAULT_OPEN_TIMEOUT` (5 s, and Python cannot shorten it) in an
+# `open` that is *meant* to fail, which is `ArenaHeldButUnreachableError`'s only
+# trigger. Not a defect and not shortened — recorded here because this is where
+# somebody timing the suite looks first.
 py-test:
     VIRTUAL_ENV=.venv .venv/bin/maturin develop --uv -q
     # `tests/python/test_shared.py` drives this Rust helper's `join-reparent`

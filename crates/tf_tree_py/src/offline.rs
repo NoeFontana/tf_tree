@@ -41,7 +41,7 @@ use tf_tree::unstable::ArenaView;
 use tf_tree::{EdgeId, FrameId, LookupError, Plan, Step, Tree};
 
 use crate::errors::{
-    detached_err, edge_label, lookup_err, no_data_err, resolve_frame, TfTreeError,
+    detached_err, lookup_err_untagged, no_data_err, resolve_frame, resolved_edge, TfTreeError,
 };
 use crate::tree::PyTree;
 
@@ -103,11 +103,17 @@ pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
 ///
 /// This arm used to exist to resolve the *names* as well, because `lookup_err`
 /// printed `EdgeId(2)`. It no longer does — every arm of it goes through
-/// [`edge_label`] now — so what is left here is only the path phrasing, and
-/// falling through would lose that and nothing else.
+/// [`crate::errors::edge_label_in`] now — so what is left here is only the path
+/// phrasing, and falling through would lose that and nothing else.
 ///
-/// Both mapper calls pass no time-domain tag: neither `Tree::plan` nor
-/// `Plan::span` can return `Extrapolation`, the one variant that carries it.
+/// Both mapper calls go through [`crate::errors::lookup_err_untagged`], which is
+/// the entry point for a caller that holds no time-domain tag: neither
+/// `Tree::plan` nor `Plan::span` can return `Extrapolation`, the one variant
+/// that carries one.
+///
+/// **One [`ArenaView`] for the whole message**, for the reason
+/// [`crate::errors::edge_label_in`] gives: the label and the `.edge` attribute
+/// are one resolution of one edge, and this arm built a view for each.
 pub(crate) fn span_impl(
     py: Python<'_>,
     tree: &Tree,
@@ -118,19 +124,23 @@ pub(crate) fn span_impl(
     // question about an arena and must not add a frame to it.
     let t = resolve_frame(py, tree, target)?;
     let s = resolve_frame(py, tree, source)?;
-    let plan = tree.plan(t, s).map_err(|e| lookup_err(py, tree, None, e))?;
+    let plan = tree
+        .plan(t, s)
+        .map_err(|e| lookup_err_untagged(py, tree, e))?;
     plan.span(&tree.guard()).map_err(|e| match e {
-        LookupError::NoData { edge } => no_data_err(
-            py,
-            &tree.arena_view(),
-            edge,
-            format!(
-                "{} on the path from {source:?} to {target:?} has no samples, \
-                 so the path is not answerable at any stamp",
-                edge_label(tree, edge)
-            ),
-        ),
-        other => lookup_err(py, tree, None, other),
+        LookupError::NoData { edge } => {
+            let view = tree.arena_view();
+            let (label, named) = resolved_edge(tree, &view, edge);
+            no_data_err(
+                py,
+                named,
+                format!(
+                    "{label} on the path from {source:?} to {target:?} has no \
+                     samples, so the path is not answerable at any stamp"
+                ),
+            )
+        }
+        other => lookup_err_untagged(py, tree, other),
     })
 }
 
@@ -148,7 +158,7 @@ pub(crate) fn span_impl(
 /// `Tree::view` re-runs `detached()`, `as_participant`, `with_liveness` and
 /// `is_writable` on every call. The two `&Tree` wrappers that used to sit here
 /// had exactly one caller left between them once the error layer took a view of
-/// its own, and it was `edge_label`.
+/// its own, and it was `edge_label`, which is gone with its last caller.
 pub(crate) fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(String, String)> {
     // One observation of the record: re-reading `view.edge(edge)` for the child
     // could name a parent and a child that never belonged to the same edge.
@@ -173,7 +183,7 @@ pub(crate) fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(Strin
 /// said why, while this function — the one the error layer reaches through —
 /// let it past. A `Disconnected` naming a headroom id would then read *no path
 /// from "" to "sensor_c"; the chain stops at ""*, and
-/// [`crate::errors::edge_label`]'s fallback — the sentence that says *why* a
+/// [`crate::errors::edge_label_in`]'s fallback — the sentence that says *why* a
 /// name is missing — would never fire, because a name was produced.
 ///
 /// **No id reaching here today comes from outside `1..=frame_count`**: every one

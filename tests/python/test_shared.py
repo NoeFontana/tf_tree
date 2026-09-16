@@ -19,6 +19,7 @@ import tempfile
 import numpy as np
 import pytest
 import tf_tree
+from conftest import LONG_CHILD, _stub_annotations
 
 #: The topology these tests create. `0004` sizes an arena from its declared
 #: edges, so creating one means saying what is in it.
@@ -379,11 +380,6 @@ def test_a_forked_child_identifies_the_arena_as_gone_not_as_in_process(runtime_d
     assert os.WEXITSTATUS(wstatus) == 0
 
 
-#: A child name past the 48 bytes a frame record stores, so the arena's pair and
-#: the typed pair differ (`docs/decisions/0058` measurement 5).
-LONG_CHILD = "sensor_" + "x" * 60
-
-
 @shm
 def test_a_refused_claim_raises_edge_already_claimed_with_the_holders_slot(
     runtime_dir,
@@ -451,8 +447,6 @@ def test_a_refused_claim_raises_edge_already_claimed_with_the_holders_slot(
             with pytest.raises(tf_tree.EdgeAlreadyClaimedError) as long:
                 tf_tree.push(other, LONG_CHILD, "base", 1_000, [1.0, 0, 0, 0, 0, 0, 0])
 
-        from test_stubs import _stub_annotations
-
         for e in (short.value, long.value):
             assert type(e) is tf_tree.EdgeAlreadyClaimedError
             assert e.owner_slot == 1, vars(e)
@@ -485,8 +479,6 @@ def test_opening_a_name_nothing_serves_raises_arena_absent(runtime_dir):
         tf_tree.open(name="tf_tree_test_nothing_serves_this")
     e = excinfo.value
     assert type(e) is tf_tree.ArenaAbsentError
-
-    from test_stubs import _stub_annotations
 
     assert set(vars(e)) == set(_stub_annotations("ArenaAbsentError")) == set()
 
@@ -556,8 +548,6 @@ def test_a_peer_reparent_raises_topology_changed_with_both_generations(runtime_d
         assert type(e) is tf_tree.TopologyChangedError
         assert e.plan_generation < e.current_generation, vars(e)
 
-        from test_stubs import _stub_annotations
-
         assert set(vars(e)) == set(_stub_annotations("TopologyChangedError"))
     finally:
         child.kill()
@@ -586,7 +576,13 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
     `tf_tree.open(mode="rw")` refuses after its 5 s open timeout, which Python
     cannot shorten. A second, read-only participant is attached first so that
     two slots are held — with one, `holder_slots` would be ascending and
-    descending at once — and released before the inheritance assertion.
+    descending at once — and released before the inheritance assertion, which
+    is tidiness rather than a precondition (measured; the comment on the `del`
+    says so).
+
+    **This row costs 5.0 s of the suite's 5.7 s**, in the
+    `tf_tree.open(mode="rw")` that is meant to fail, and `just py-test` and
+    `just py-test-freethreaded` each pay it once.
 
     Mutants, each applied alone, rebuilt and run with ``just py-test``; each
     fails this test and nothing else:
@@ -638,10 +634,17 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
         assert held.holder_slots == tuple(sorted(held.holder_slots))
         assert not hasattr(held, "first_pid")
 
-        from test_stubs import _stub_annotations
-
         annotated = set(_stub_annotations("ArenaHeldButUnreachableError"))
         assert set(vars(held)) == annotated
+        # **Not a precondition, and that is measured rather than assumed**:
+        # with these two lines removed the inheritance below still answers
+        # `Inherited`. A read-only participant never holds byte 0, so it cannot
+        # contend for the vacant role — only its *participant* byte is held, and
+        # that is what `holder_slots` above is for. They are here so that what
+        # inherits is the single surviving read-write participant the docstring
+        # describes. `del` rather than a rebind is a preference and not a
+        # mechanism — either clears the name from a frame that `excinfo`'s
+        # traceback holds alive — and `gc.collect()` is the belt to its braces.
         del second
         gc.collect()
         assert tree.inherit_ownership() == "Inherited", (

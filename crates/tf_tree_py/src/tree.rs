@@ -431,7 +431,7 @@ impl PyTree {
         let plan = this
             .inner
             .plan(t, s)
-            .map_err(|e| lookup_err(py, &this.inner, Some(domain), e))?;
+            .map_err(|e| lookup_err(py, &this.inner, domain, e))?;
         // The one place a domain disagreement is cheap to report *and* nameable:
         // `target` and `source` are still strings here. Guarded on
         // [`samples_anything`] so this fires exactly where the core's own
@@ -883,7 +883,7 @@ impl PyTree {
                 tf_tree::LookupError::UnknownFrame { .. } => {
                     unknown_frame_err(py, &self.inner, [target, source], e)
                 }
-                other => lookup_err(py, &self.inner, Some(domain), other),
+                other => lookup_err(py, &self.inner, domain, other),
             })?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated here; no other reference exists.
@@ -1102,7 +1102,7 @@ impl PyPlan {
         let iso = self
             .plan
             .at_tagged(&g, stamp, self.domain)
-            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), self.domain, e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated by us, so nothing else holds a reference and
         // the slice is exactly 16 contiguous f64.
@@ -1281,7 +1281,7 @@ impl PyPlan {
         let iso = self
             .plan
             .at_tagged(&g, stamp, self.domain)
-            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), self.domain, e))?;
         // SAFETY: checked C-contiguous, (4, 4) and writable above, so this
         // slice is exactly 16 writable f64. Aliasing remains the caller's
         // to avoid, as it was before — `as_slice_mut` documents that, and
@@ -1388,7 +1388,7 @@ impl PyPlan {
         let x = self
             .plan
             .at_extrapolating_tagged(&g, stamp, self.domain, policy)
-            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), self.domain, e))?;
         // `mat4` keeps `at`'s `(4, 4)` shape; every other layout is the flat
         // `(elems,)` row `at(.., layout=..)` already returns, so the two methods
         // agree on shape for the same `layout` argument.
@@ -1551,7 +1551,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(|err| lookup_err(py, self.tree(), Some(self.domain), err))
+        res.map_err(|err| lookup_err(py, self.tree(), self.domain, err))
     }
 
     /// The most recent transform on this path.
@@ -1560,7 +1560,7 @@ impl PyPlan {
         let iso = self
             .plan
             .latest(&g)
-            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), self.domain, e))?;
         let out = PyArray2::<f64>::zeros(py, [4, 4], false);
         // SAFETY: freshly allocated here; no other reference exists.
         let slice = unsafe { out.as_slice_mut()? };
@@ -1622,7 +1622,7 @@ impl PyPlan {
                 tol,
                 &mut scratch,
             )
-            .map_err(|e| lookup_err(py, self.tree(), Some(self.domain), e))?;
+            .map_err(|e| lookup_err(py, self.tree(), self.domain, e))?;
 
         let k = stamps.len();
         let out_s = PyArray1::<i64>::zeros(py, [k], false);
@@ -1733,7 +1733,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(|e| lookup_err(py, tree, Some(domain), e))
+        res.map_err(|e| lookup_err(py, tree, domain, e))
     }
 
     /// [`PyPlan::at_extrapolating`]'s array half: `(N, 4, 4)` poses and `(N,)`
@@ -1814,7 +1814,7 @@ impl PyPlan {
             } else {
                 run()
             };
-            res.map_err(|e| lookup_err(py, tree, Some(domain), e))?;
+            res.map_err(|e| lookup_err(py, tree, domain, e))?;
         }
         Ok((poses.into_any(), dist.into_any()))
     }
@@ -2002,7 +2002,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(|e| lookup_err(py, tree, Some(domain), e))
+        res.map_err(|e| lookup_err(py, tree, domain, e))
     }
 
     /// [`Self::eval_f64`] for the one `f32` layout.
@@ -2025,7 +2025,7 @@ impl PyPlan {
         } else {
             run()
         };
-        res.map_err(|e| lookup_err(py, tree, Some(domain), e))
+        res.map_err(|e| lookup_err(py, tree, domain, e))
     }
 }
 
