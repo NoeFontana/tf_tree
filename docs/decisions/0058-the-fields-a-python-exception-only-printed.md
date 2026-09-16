@@ -2,9 +2,12 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** none yet. No step lands before
+**Implementation:** steps 1–8, all in the change that carries them, after
 [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
-implementation (*Implementation plan*).
+implementation (#345), as the plan orders. Step 2 did not take its fallback.
+**Status stays `ready` until that change merges**, and moving it to
+`implemented` names its PR number, as `0059` step 2 did: an implemented record
+is frozen, and a line reading "this change" would then point at nothing.
 
 ## Context
 

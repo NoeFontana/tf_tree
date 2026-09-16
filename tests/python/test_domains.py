@@ -38,6 +38,7 @@ import pathlib
 import numpy as np
 import pytest
 import tf_tree
+from conftest import _stub_annotations
 
 #: The committed tag-1 arena, the only non-zero-domain tree this package can
 #: reach. Resolved from this file and not from `tf_tree.__file__`: the suite is
@@ -93,9 +94,25 @@ def test_a_plan_in_the_wrong_domain_is_refused_at_plan_time(tree):
     two integers did.
 
     Before `0038` this call was a `TypeError`: there was no keyword.
+
+    **One class for both refusals** (`0058` §4): this one and the per-query one
+    below both raise exactly `TimeDomainMismatchError`, with `expected` the
+    path's tag and `got` the caller's, two distinct tags so a swap cannot pass.
+
+    Mutants, each applied alone, rebuilt and run with ``just py-test``, and
+    each direction of the one-type claim killed by its own test:
+
+    * `plan_domain_err` builds ``TfTreeError::new_err`` => this test alone
+      fails, the ``tf_tree.TfTreeError: the path "base" -> "map" is sampled in
+      time domain 0, ...`` escaping ``pytest.raises``.
+    * swap ``expected`` and ``got`` in ``domain_mismatch_attrs`` => this test
+      and the per-query one below fail, here on ``assert (2, 0) == (0, 2)``.
     """
-    with pytest.raises(tf_tree.TfTreeError) as e:
+    with pytest.raises(tf_tree.TimeDomainMismatchError) as e:
         tree.plan("map", "base", domain=tf_tree.SIM_DOMAIN)
+    assert type(e.value) is tf_tree.TimeDomainMismatchError
+    assert (e.value.expected, e.value.got) == (0, tf_tree.SIM_DOMAIN)
+    assert set(vars(e.value)) == set(_stub_annotations("TimeDomainMismatchError"))
     msg = str(e.value)
     assert '"base" -> "map"' in msg, msg
     assert "domain 0" in msg and "domain 2" in msg, msg
@@ -123,13 +140,21 @@ def test_lookup_takes_the_domain_the_same_way(tree):
     It is a per-call check here rather than a plan-time one — the plan is cached
     rather than returned, so there is no handle to hang it on — which is why the
     sentence names two tags rather than a route.
+
+    Mutant: `lookup_err`'s ``TimeDomainMismatch`` arm builds
+    ``TfTreeError::new_err`` => this test alone fails, ``tf_tree.TfTreeError:
+    this plan was compiled for time domain 0; the query supplied a stamp in
+    domain 1. ...`` escaping ``pytest.raises``.
     """
     assert np.array_equal(
         tree.lookup("map", "base", 1_500),
         tree.lookup("map", "base", 1_500, domain=tf_tree.SYSTEM_DOMAIN),
     )
-    with pytest.raises(tf_tree.TfTreeError) as e:
+    with pytest.raises(tf_tree.TimeDomainMismatchError) as e:
         tree.lookup("map", "base", 1_500, domain=tf_tree.SENSOR_DOMAIN)
+    assert type(e.value) is tf_tree.TimeDomainMismatchError
+    assert (e.value.expected, e.value.got) == (0, tf_tree.SENSOR_DOMAIN)
+    assert set(vars(e.value)) == set(_stub_annotations("TimeDomainMismatchError"))
     msg = str(e.value)
     assert "time domain 0" in msg and "domain 1" in msg, msg
     # `0038` §3 again: the prose gains the remedy. Before the keyword existed
@@ -151,7 +176,8 @@ def test_a_path_with_nothing_to_sample_accepts_any_tag(tree):
 
     Mutant (applied, run): drop `samples_anything(&plan) &&` from
     `PyTree::plan` => `TfTreeError: the path "map" -> "map" is sampled in time
-    domain 0, and this plan was asked for domain 2`. It takes the smoke test
+    domain 0, and this plan was asked for domain 2` (the class before `0058`
+    gave the refusal `TimeDomainMismatchError`). It takes the smoke test
     below with it, which plans the same empty path in `SENSOR_DOMAIN`.
     """
     p = tree.plan("map", "map", domain=tf_tree.SIM_DOMAIN)
@@ -265,6 +291,32 @@ def test_a_tag_one_arena_answers_a_tag_one_query(tag1):
     with pytest.raises(Exception) as e:
         tag1.plan("odom", "map", domain=tf_tree.SYSTEM_DOMAIN)
     assert "domain" in str(e.value).lower()
+
+
+def test_an_extrapolation_error_carries_the_querys_domain(tag1):
+    """`0058` §3: a stamp that leaves in a pickled exception keeps its clock.
+
+    `ExtrapolationError.domain` is the tag the query was made in, from the plan
+    handle or `Tree.lookup`'s `domain=`. **Only a non-zero-domain arena can hold
+    it**: on every arena Python builds the right answer is `0`, so a tag
+    hard-coded to `0` passes `test_errors.py`'s table. `0058` step 2 named a
+    `SIM_DOMAIN` row; no Python-reachable arena extrapolates in that domain,
+    because the domain check runs before the window check and this fixture is
+    the only non-zero arena the package can open, so the row is `SENSOR_DOMAIN`.
+
+    Mutant: ``e.setattr("domain", 0u8)`` in `lookup_err` => fails on ``assert
+    0 == 1``, and **nothing in `test_errors.py` moves**, which is why the row is
+    here.
+    """
+    plan = tag1.plan("odom", "map", domain=tf_tree.SENSOR_DOMAIN)
+    with pytest.raises(tf_tree.ExtrapolationError) as through_plan:
+        plan.at(10**12)
+    with pytest.raises(tf_tree.ExtrapolationError) as through_lookup:
+        tag1.lookup("odom", "map", 10**12, domain=tf_tree.SENSOR_DOMAIN)
+    for e in (through_plan.value, through_lookup.value):
+        assert e.domain == tf_tree.SENSOR_DOMAIN
+        assert e.edge == ("map", "odom")
+        assert (e.requested, e.oldest, e.newest) == (10**12, 0, 150_000_000)
 
 
 def test_every_query_shape_carries_the_tag_on_a_tag_one_arena(tag1):

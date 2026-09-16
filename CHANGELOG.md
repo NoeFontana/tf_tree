@@ -41,6 +41,77 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — Python exceptions carry the fields a handler branches on
+
+[`0058`](docs/decisions/0058-the-fields-a-python-exception-only-printed.md),
+which `docs/PHASE3.md` §4.4 had promised since Phase 3 and no exception had ever
+kept. **Every new class subclasses `TfTreeError`**, so an existing `except`
+clause catches exactly what it caught before, and message text is unchanged
+except where an already-claimed edge's holder is still mid-claim.
+
+- **Seven classes carry attributes on the instances the library raises**, set in
+  the instance's `__dict__` with `args` left `(message,)`, so a pickled
+  exception from a `multiprocessing` worker keeps them:
+  `ExtrapolationError.edge`, `.requested`, `.oldest`, `.newest` and `.domain`;
+  `DisconnectedError.target`, `.source` and `.cut_at`; `NoDataError.edge`;
+  `TopologyChangedError.plan_generation` and `.current_generation`;
+  `FrameNotDeclaredError.name`; `DerivativesUnavailableError.edge`; and
+  `NoSegmentError.edge`. An edge is the arena's stored `(parent, child)` frame
+  names, the shape `Tree.edges()` returns, and a frame its stored name; either
+  is `None` where the arena holds no usable record. No attribute is an integer
+  id. `.domain` is the query's time-domain tag, and the stamps are nanoseconds
+  on that clock.
+- **Migration:** nothing to change for a handler that reads only the class or
+  `str(e)`. Code that asserted `vars(e) == {}`, or compared a raised instance's
+  `__dict__`, now sees the attributes. **An instance you construct yourself
+  carries none** — `tf_tree.ExtrapolationError("boom")`, a mock's
+  `side_effect`, or one unpickled from an older build — and `_core.pyi`
+  annotates the attributes precisely (`requested: int`, not `int | None`), so a
+  handler that reads `e.requested` from such a double raises `AttributeError`
+  and a type checker does not warn. Build test doubles by raising through the
+  library, or set the attributes on them.
+- **`TimeDomainMismatchError(TfTreeError)` is new**, with `.expected` (the
+  path's or the plan's tag) and `.got` (the caller's). Both domain refusals
+  raise it: `Tree.plan(..., domain=)` at plan time and `Tree.lookup(...,
+  domain=)` per query. **Migration:** `except tf_tree.TfTreeError` still
+  catches it; a check of `type(e) is tf_tree.TfTreeError` around either call no
+  longer matches, and should become `except tf_tree.TimeDomainMismatchError`.
+- **`NonMonotonicStampError(TfTreeError)` is new**, with `.edge`, `.last` (the
+  newest published stamp) and `.got` (the refused one). `Publisher.push`,
+  `Publisher.push_many` and `tf_tree.push` raise it for a stamp older than the
+  newest on its edge. `.edge` is the arena's stored pair, resolved from the
+  error's edge id, so for a frame name over 48 bytes it is the truncated pair
+  `Tree.edges()` lists and not the one you typed; the message keeps your
+  spelling. **Migration:** `except tf_tree.TfTreeError` still catches it; a
+  `type(e) is tf_tree.TfTreeError` check around a push no longer matches.
+- **`EdgeAlreadyClaimedError(TfTreeError)` is new**, with `.edge` and
+  `.owner_slot`. `Tree.publisher` and `tf_tree.push` raise it when another
+  participant holds the edge. `.owner_slot` is the holder's participant
+  **slot**, never a pid, and is `None` while the holder's claim is still being
+  taken (the message says so instead of printing slot `4294967295`, as it did).
+  **Migration:** `except tf_tree.TfTreeError` still catches it; a
+  `type(e) is tf_tree.TfTreeError` check around a claim no longer matches, and
+  a handler reading `owner_slot` must allow `None`.
+- **`ArenaHeldButUnreachableError(TfTreeError)` is new**, with
+  `.holder_slots` (the held participant slots, ascending, as a tuple) and
+  `.ownership_held`. `tf_tree.open` raises it when participants still hold an
+  arena's lock bytes and nothing serves it — typically after an owner died and
+  before a survivor calls `inherit_ownership`. It carries no pid: a recorded pid
+  can name an unrelated process in another pid namespace, and `0` would make
+  `os.kill` signal your own process group. The message is unchanged and still
+  prints one. The class is registered on every platform. **Migration:** a
+  `type(e) is tf_tree.TfTreeError` check around `open` no longer matches.
+- **`ArenaAbsentError(TfTreeError)` is new**, a leaf with no attributes.
+  `tf_tree.open` without `create=` raises it at once when nothing serves the
+  name. A loop waiting for a robot to start catches `(tf_tree.ArenaAbsentError,
+  tf_tree.ArenaHeldButUnreachableError)`; the two have no shared parent. The
+  class is registered on every platform. **Migration:** a
+  `type(e) is tf_tree.TfTreeError` check, or a match on the message "no arena is
+  serving", around `open` should become `except tf_tree.ArenaAbsentError`.
+- `just py-test` and `just py-test-freethreaded` now run `cargo build -p tf_tree
+  --features shm --bin tf_tree_rendezvous_child` first: `TopologyChangedError`'s
+  two attributes are held by a test that spawns that helper's `join-reparent`.
+
 ### Changed — the arena errors describe themselves, and five wrappers stop printing struct literals
 
 [`0059`](docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md),

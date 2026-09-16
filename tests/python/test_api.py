@@ -1339,7 +1339,8 @@ def test_open_validates_interp_even_with_nothing_to_create():
     Mutant: move ``let policy = interp_from_str(interp)?;`` back inside the ``if
     let Some(edges) = &create`` block => the typo is accepted, the call proceeds
     to the attach, and what comes back is ``TfTreeError: no arena is serving and
-    CreatePolicy::Never forbids creating one`` — a complaint about the arena
+    CreatePolicy::Never forbids creating one`` — ``ArenaAbsentError`` since
+    `docs/decisions/0058` step 7, a subclass — a complaint about the arena
     instead of about the keyword, and not a ``ValueError``, so ``raises`` fails.
     That *is* the bug: the misspelling reached the transport untouched.
     """

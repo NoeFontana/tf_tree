@@ -258,38 +258,57 @@ The distinction is worth stating in the docstring rather than only here: the lay
 
 ### 4.4 Errors
 
-Rust's typed errors map to an exception hierarchy carrying **structured attributes**, not just messages, so users can program against them:
+Rust's typed errors map to an exception hierarchy carrying **structured attributes**, not just messages, so users can program against them. **This block is [`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md)'s** (2026-09-14), which replaced the one written for this phase, and **it is what ships** — the fifteen classes below are the shipped set. `ClaimRevokedError` is not one of them and is deliberately absent rather than omitted: it waits for a Python-reachable trigger (last bullet). The amendment below it is historical: the account of what shipped before that record's steps, each of which corrected the bullet it made false.
 
 ```python
 class TfTreeError(Exception): ...
-class ExtrapolationError(TfTreeError):      # .edge, .requested, .oldest, .newest
+class ExtrapolationError(TfTreeError):      # .edge, .requested, .oldest, .newest, .domain
 class DisconnectedError(TfTreeError):       # .target, .source, .cut_at
 class NoDataError(TfTreeError):             # .edge
 class TopologyChangedError(TfTreeError):    # .plan_generation, .current_generation
+class FrameNotDeclaredError(TfTreeError):   # .name
+class DerivativesUnavailableError(TfTreeError):   # .edge
+class NoSegmentError(TfTreeError):          # .edge
+class BufferError(TfTreeError): ...
+class ChildProcessDetachedError(TfTreeError):     # §8.1
 class TimeDomainMismatchError(TfTreeError): # .expected, .got
-class EdgeAlreadyClaimedError(TfTreeError): # .edge, .owner_pid
-class ClaimRevokedError(TfTreeError):       # .edge
-class ArenaHeldButUnreachableError(TfTreeError):   # .holders  -> [(pid, name), ...]
-class ChildProcessDetachedError(TfTreeError):      # §8.1
-class FrameNotDeclaredError(TfTreeError, KeyError)
+class EdgeAlreadyClaimedError(TfTreeError): # .edge, .owner_slot
+class NonMonotonicStampError(TfTreeError):  # .edge, .last, .got
+class ArenaHeldButUnreachableError(TfTreeError):  # .holder_slots, .ownership_held
+class ArenaAbsentError(TfTreeError): ...
 ```
 
-`str(e)` uses the Rust `Described` wrapper so frame and edge IDs appear as names. `TopologyChangedError` must document that the correct response is to re-`plan`, since it is the one error a correct program routinely hits.
+- **Every class is a direct subclass of `TfTreeError`.** There is no `KeyError` base on `FrameNotDeclaredError` (`0058` §6): it would widen every `except KeyError` and `except LookupError` around a tf_tree call, and the surface has no mapping protocol whose idiom it would serve. `ArenaAbsentError` and `ArenaHeldButUnreachableError` have no shared parent; a caller waiting for either writes `except (ArenaAbsentError, ArenaHeldButUnreachableError)`. Every class is registered on every platform, including the two only a Linux `open` can raise.
+- **An attribute is set on every instance of its class the library raises, and on no instance a caller constructs.** It lives in the instance's `__dict__`, `args` stays `(message,)`, and so pickle, `copy` and `multiprocessing` keep it. Values are plain data: `int`, `str`, `bool`, `None` and tuples of those. The stub annotates the precise type (`requested: int`), and every class docstring says the attributes exist only on raised instances.
+- **An id reaches Python as the arena's stored names, or as `None`.** An `.edge` is the stored `(parent, child)` pair, a plain `tuple[str, str]`, the shape `Tree.edges()` returns; a frame (`.target`, `.source`, `.cut_at`) is its stored name, `str`. Each is `None` when the arena holds no usable record at that id. No attribute is an integer id.
+- **Stamps are integer nanoseconds and carry their domain**: `ExtrapolationError.domain` is the query's time-domain tag, an `int`. `TimeDomainMismatchError` covers both refusals, at plan time and per query; `.expected` is the path's or the plan's tag and `.got` the one the caller supplied.
+- **`EdgeAlreadyClaimedError.owner_slot` is a participant slot, `int | None`**, and `None` exactly when the claim word was mid-claim (the `CLAIMING` sentinel). It is not a pid: since amendment A3 a claim records a slot, and a field spelled `pid` would point an operator at an unrelated process.
+- **`ArenaHeldButUnreachableError.holder_slots`** is the held participant slots, ascending, as a `tuple[int, ...]`, and `.ownership_held` is a `bool`. No pid is carried: a recorded pid is namespace-local (`0033`), and `tf_tree doctor` is the tool that turns a slot into a process.
+- **`FrameNotDeclaredError.name`** is the name the caller typed, `str | None`, `None` only where no name survives (a hash reported by the engine).
+- **`ClaimRevokedError` waits for a Python-reachable trigger.** No Python caller is known to be able to make `PushError::ClaimRevoked` raise, so the failure reaches Python as the base `TfTreeError`. Draft [`0031`](./decisions/0031-the-participant-record-with-no-byte.md) is what could create a trigger, since an answer to it could change which publishers are reaped.
 
-> **Amendment (2026-09-14) — what ships, which is not the block above.** This
-> section is not marked NORMATIVE and was never implemented as written. The
+`str(e)` names ids as the arena's names, resolved by the binding against the arena the caller holds (`edge_label_in` / `frame_label` in `crates/tf_tree_py/src/errors.rs`), and its text is not a compatibility promise (`docs/API.md` R5). `TopologyChangedError` must document that the correct response is to re-`plan`, since it is the one error a correct program routinely hits.
+
+> **Amendment (2026-09-14) — historical since `0058`'s steps landed; the block
+> above is what ships.** It was titled *"what ships, which is not the block
+> above"*, and the corrections inside it are dated by step. This
+> section is not marked NORMATIVE, and the block it first carried was never
+> implemented as written. The
 > package exports **ten** exception classes: `TfTreeError` (an `Exception`) and
 > nine direct subclasses of it — `ExtrapolationError`, `DisconnectedError`,
 > `NoDataError`, `TopologyChangedError`, `FrameNotDeclaredError`,
 > `BufferError`, `DerivativesUnavailableError`, `NoSegmentError` and
 > `ChildProcessDetachedError`.
 >
-> - **No class carries an attribute.** An instance holds `args == (message,)`
->   and nothing else, so a caller programs against the *class*.
->   `crates/tf_tree_py/src/errors.rs`'s module doc said "the fields are attached
->   to the exception rather than only formatted into it" from its first commit
->   until this date; it was never true, and §11.1's "attributes asserted" had
->   nothing to assert.
+> - ~~**No class carries an attribute.**~~ *Corrected by `0058` step 2:* seven
+>   of the ten classes above, all but `TfTreeError`, `BufferError` and
+>   `ChildProcessDetachedError`, carry the attributes the block at the head of
+>   this section lists for them, set on raised instances only; `args` is still
+>   `(message,)`. Until that step an instance held `args` and nothing else, and
+>   `crates/tf_tree_py/src/errors.rs`'s module doc had said "the fields are
+>   attached to the exception rather than only formatted into it" from its first
+>   commit; it was never true, and §11.1's "attributes asserted" had nothing to
+>   assert.
 > - **`FrameNotDeclaredError` has no `KeyError` base.** Adding one is not
 >   additive: `KeyError.__str__` quotes the message, and every `except
 >   KeyError` and `except LookupError` around a tf_tree call would start
@@ -299,17 +318,27 @@ class FrameNotDeclaredError(TfTreeError, KeyError)
 > - **Four classes were never built:** `TimeDomainMismatchError`,
 >   `EdgeAlreadyClaimedError`, `ClaimRevokedError` and
 >   `ArenaHeldButUnreachableError`. Those failures reach Python as the base
->   `TfTreeError` with a message. **`ChildProcessDetachedError` was a fifth and
+>   `TfTreeError` with a message. *Corrected by `0058` step 3:*
+>   `TimeDomainMismatchError` ships, a direct subclass of `TfTreeError`, raised
+>   by both domain refusals. *And by step 4:* `NonMonotonicStampError`, which
+>   this list never named, ships for `PushError::NonMonotonicStamp` from
+>   `Publisher.push`, `push_many` and `tf_tree.push`. *And by step 5:*
+>   `EdgeAlreadyClaimedError` ships, with `.owner_slot` in place of the first
+>   block's `.owner_pid`. *And by step 6:* `ArenaHeldButUnreachableError`
+>   ships, with `.holder_slots` and `.ownership_held` in place of the first
+>   block's `.holders`, and no pid. *And by step 7:* `ArenaAbsentError`, which
+>   this list never named, ships as a leaf with no attributes. The package
+>   exports **fifteen** classes. **`ChildProcessDetachedError` was a fifth and
 >   ships as of this date**, because §8.1 is NORMATIVE and names it; it replaced
 >   a base `TfTreeError` from every fork-child refusal, including `Publisher.push`
 >   and `push_many`. §8.1's amendment of the same date lists the two calls that
 >   did not refuse at all and the ones that still answer.
-> - **Two listed attributes no longer match the Rust errors.** `.owner_pid`:
+> - **Two attributes the first block listed no longer match the Rust errors.** `.owner_pid`:
 >   since amendment A3 a claim records a participant *slot*, not a pid, and an
 >   attribute spelled `pid` would point an operator at an unrelated process.
 >   `.holders -> [(pid, name)]`: `IpcError::ArenaHeldButUnreachable` carries
 >   `holder_slots`, `first_slot`, `first_pid` and `ownership_held`.
-> - **`BufferError` is not in the block above and ships.** It is public as
+> - **`BufferError` was not in the first block and ships.** It is public as
 >   `tf_tree.BufferError` and deliberately absent from `__all__`, so `from
 >   tf_tree import *` does not shadow the builtin `BufferError`, an unrelated
 >   class. `tf_tree.open` is kept out of `__all__` for the same reason.
@@ -318,12 +347,13 @@ class FrameNotDeclaredError(TfTreeError, KeyError)
 >   date they were declared under `_core`, which is not importable, and none
 >   could.
 >
-> **Still open, and a decision record's rather than this section's:** the
+> **Decided by a record since the same date, and shipped by its steps:** the
 > attributes — including how an id-shaped one (`.edge`, `.target`, `.cut_at`)
-> reaches a language that is never handed an id, when `docs/API.md` R5 says
-> name resolution is a display wrapper and not a field — the `KeyError` base,
-> and the four unbuilt classes. Until one is `ready`, the list above is what a
-> caller can rely on.
+> reaches a language that is never handed an id — the `KeyError` base, and the
+> unbuilt classes, which [`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md)
+> answers and the block above states. This sentence read *"Until one is
+> `ready`, the list above is what a caller can rely on"*, and then that the
+> list stayed what ships until the record's steps landed; they have.
 
 ---
 
@@ -549,7 +579,7 @@ This is what makes §1.2's declaration honest.
 
 ### 7.2 No global mutable state — NORMATIVE
 
-No `static mut`, no `once_cell` singletons holding Python objects, no process-global caches. Everything lives in module state or in the `Tree`. This is required for free-threading and it is also what makes PEP 734 sub-interpreters possible later; support for those is best-effort in this phase but the constraint costs nothing to honour now and is expensive to retrofit.
+No `static mut`, no `once_cell` singletons holding Python objects, no process-global caches. Everything lives in module state or in the `Tree`. **Type objects are not the singletons this forbids**: every `#[pyclass]` and every `create_exception!` class keeps its type object in a process-global static, and §7.1 requires three `#[pyclass]`es, so the rule is about instances and caches ([`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md) *Context*). This is required for free-threading and it is also what makes PEP 734 sub-interpreters possible later; support for those is best-effort in this phase but the constraint costs nothing to honour now and is expensive to retrofit.
 
 The per-thread plan cache behind `tree.lookup` must be genuinely per-thread (`thread_local!`), not a shared map behind a lock — a shared cache would turn the convenience API into a contention point on exactly the workload free-threading exists to serve.
 
@@ -687,7 +717,13 @@ Two upgrades in this set change *default* behaviour, and both intersect somethin
 
 - Hypothesis property tests mirroring the Rust proptests where the boundary can break them: `at(t)` scalar equals `at([t])[0]` **bit-exactly**; every `layout` yields the same transform; `at_into` equals `at`; endpoint stamps return stored poses exactly.
 - Differential test against the Rust CLI over a recorded MCAP session (Phase 2 §10), asserting bit-identical `f64`.
-- Every error type raised at least once with its attributes asserted.
+- Every error type raised at least once with its attributes asserted. **Met for every class `tests/python` can make raise, and four things cannot meet it** ([`0058`](./decisions/0058-the-fields-a-python-exception-only-printed.md), stated above its plan's steps):
+  - the `None` arm of every resolved-id attribute (`.edge`, `.target`, `.source`, `.cut_at`), which has no known Python trigger: a fork child refuses before any id is resolved;
+  - `FrameNotDeclaredError.name`'s `None` arm, from `lookup_err`'s `UnknownFrame { hash }` fallback, which `Tree.lookup` reaches only when a peer's intern lands between two reads;
+  - `EdgeAlreadyClaimedError.owner_slot`'s `None` arm, which only a claim word held in `CLAIMING` produces — a window of a few instructions with no §11.3 crash site inside it;
+  - `ClaimRevokedError`, which is not built until a Python caller can make `PushError::ClaimRevoked` raise.
+
+  `TopologyChangedError`'s two generations are **not** in that list: `tests/python/test_shared.py` raises the class through `tf_tree_rendezvous_child join-reparent`, which `just py-test` and `just py-test-freethreaded` build first.
 
 ### 11.2 Buffer safety
 
@@ -785,8 +821,10 @@ Criteria 4–6 are the ones that make this a 2026 binding rather than a 2019 one
 Implemented and gated locally (`just py-test`, `py-test-freethreaded`,
 `py-lint`, `tsan`): `open()`/`build()`, `Plan.at` scalar and batch, `at_into`
 with DLPack device classification, `adaptive`, `Publisher` with `push` and
-`push_many`, the exception hierarchy — as §4.4's 2026-09-14 amendment lists it,
-which is classes and messages, not the attributes §4.4 specifies — hand-written
+`push_many`, the exception hierarchy — §4.4's block, the fifteen classes that ship, with
+their attributes on raised instances; `ClaimRevokedError` is not among them and
+waits for a Python-reachable trigger, and §11.1's four unreachable arms are
+recorded there — hand-written
 stubs with a bidirectional
 drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
 path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and

@@ -19,12 +19,147 @@ import numpy as np
 from numpy.typing import NDArray
 
 class TfTreeError(Exception): ...
-class ExtrapolationError(TfTreeError): ...
-class DisconnectedError(TfTreeError): ...
-class NoDataError(TfTreeError): ...
-class TopologyChangedError(TfTreeError): ...
-class FrameNotDeclaredError(TfTreeError): ...
+
+# **Attributes exist only on instances the library raises**
+# (`docs/decisions/0058`). Each class below annotates its attributes precisely,
+# with no `| None` a raised instance never takes, and sets no class-level
+# default: an instance a caller constructs, such as a test double's
+# `side_effect`, has none of them and raises `AttributeError` on a read. An id
+# is never an integer: an edge is its stored `(parent, child)` frame names,
+# the shape `Tree.edges()` returns, and a frame its stored name, each `None`
+# where the arena holds no usable record at that id.
+
+class ExtrapolationError(TfTreeError):
+    """The requested stamp lies outside an edge's retained history.
+
+    The attributes exist only on instances the library raises. `requested`,
+    `oldest` and `newest` are integer nanoseconds on the clock `domain` names,
+    which is the query's time-domain tag (`tf_tree.SYSTEM_DOMAIN` and its
+    siblings, or a declared integer).
+    """
+
+    edge: tuple[str, str] | None
+    requested: int
+    oldest: int
+    newest: int
+    domain: int
+
+class DisconnectedError(TfTreeError):
+    """No path joins the two frames.
+
+    The attributes exist only on instances the library raises: the frame the
+    plan was compiled toward, the one it was compiled from, and the frame the
+    chain stopped at.
+    """
+
+    target: str | None
+    source: str | None
+    cut_at: str | None
+
+class NoDataError(TfTreeError):
+    """An edge on the path has no samples yet.
+
+    `edge` exists only on instances the library raises.
+    """
+
+    edge: tuple[str, str] | None
+
+class TopologyChangedError(TfTreeError):
+    """The tree was re-parented after this plan was compiled; call `plan` again.
+
+    The one error a correct program attached to a shared arena routinely meets:
+    a peer re-parented a frame. The attributes exist only on instances the
+    library raises.
+    """
+
+    plan_generation: int
+    current_generation: int
+
+class FrameNotDeclaredError(TfTreeError):
+    """No such frame in this arena.
+
+    `name` exists only on instances the library raises. It is the name the
+    caller passed, and `None` only when the engine reported a hash with no name
+    left to recover.
+    """
+
+    name: str | None
+
 class BufferError(TfTreeError): ...
+
+class TimeDomainMismatchError(TfTreeError):
+    """A stamp's time domain is not the path's.
+
+    Raised at plan time by `Tree.plan(..., domain=)` and per query by
+    `Tree.lookup(..., domain=)`: one class for both. The attributes exist only
+    on instances the library raises. `expected` is the path's or the plan's
+    tag, and `got` is the one the caller supplied.
+    """
+
+    expected: int
+    got: int
+
+class NonMonotonicStampError(TfTreeError):
+    """A pushed stamp is older than the newest one already published on its edge.
+
+    Raised by `Publisher.push`, `Publisher.push_many` and `tf_tree.push`. Equal
+    stamps are accepted, so this means strictly older. The attributes exist
+    only on instances the library raises: `last` is the newest published stamp
+    and `got` the refused one, both integer nanoseconds, and `edge` is the
+    arena's stored `(parent, child)` pair, which for a name longer than 48
+    bytes is the truncated one `Tree.edges()` lists. `push_many` publishes the
+    samples before the refused one; its message names the index.
+    """
+
+    edge: tuple[str, str] | None
+    last: int
+    got: int
+
+class EdgeAlreadyClaimedError(TfTreeError):
+    """Another publisher holds this edge's claim: one writer per edge.
+
+    Raised by `Tree.publisher` and `tf_tree.push`. The holder must release the
+    edge, or be reaped, first. The attributes exist only on instances the
+    library raises: `edge` is the arena's stored `(parent, child)` pair, and
+    `owner_slot` is the holder's participant **slot**, not a pid — `tf_tree
+    participants` lists the held slots and `tf_tree doctor` names the process
+    behind one. `owner_slot` is `None` while the holder's claim is still being
+    taken, or was abandoned mid-claim, which records no slot yet.
+    """
+
+    edge: tuple[str, str] | None
+    owner_slot: int | None
+
+class ArenaHeldButUnreachableError(TfTreeError):
+    """Participants still hold an arena's lock bytes, but nothing serves it.
+
+    Raised by `tf_tree.open` after its open timeout, typically when an owner
+    died and no survivor has called `Tree.inherit_ownership` yet. Retrying is
+    the first response; `except (ArenaAbsentError,
+    ArenaHeldButUnreachableError)` is the retry loop's clause. Registered on
+    every platform; only a Linux `open` raises it.
+
+    The attributes exist only on instances the library raises:
+    `holder_slots` is the held participant slots, ascending, and
+    `ownership_held` whether the ownership byte was held when the timeout
+    expired. No pid is carried — a recorded pid can name an unrelated process
+    from another pid namespace. `tf_tree participants` lists the held slots,
+    and `tf_tree doctor` names the process behind one.
+    """
+
+    holder_slots: tuple[int, ...]
+    ownership_held: bool
+
+class ArenaAbsentError(TfTreeError):
+    """No arena is serving under this name, and `open` was not asked to create.
+
+    Raised at once by `tf_tree.open` without `create=` when nothing serves the
+    name: there is no timeout to wait out, because none could change the answer.
+    A supervisor waiting for its robot to start retries on it, and on its
+    sibling: `except (ArenaAbsentError, ArenaHeldButUnreachableError)`. It
+    carries no attributes. Registered on every platform; only a Linux `open`
+    raises it.
+    """
 
 class ChildProcessDetachedError(TfTreeError):
     """This handle was inherited across a `fork()` and cannot be used.
@@ -51,7 +186,11 @@ class DerivativesUnavailableError(TfTreeError):
 
     A property of the *edge*, so it fires at element 0 of a batch and does not
     go away on its own. Its sibling `NoSegmentError` is the opposite.
+
+    `edge` exists only on instances the library raises.
     """
+
+    edge: tuple[str, str] | None
 
 class NoSegmentError(TfTreeError):
     """A pose exists at this stamp, but no segment to differentiate.
@@ -66,7 +205,11 @@ class NoSegmentError(TfTreeError):
     transform is perfectly well defined and only the derivative is not, so being
     told "no data" would send you to the wrong problem. A property of the
     *stamp*, so it can fire partway through a batch.
+
+    `edge` exists only on instances the library raises.
     """
+
+    edge: tuple[str, str] | None
 
 F32Layout = Literal["affine32"]
 """The one layout that writes `float32`."""
@@ -373,7 +516,8 @@ class Tree:
         declared for its own clock. A tree under `use_sim_time` is read with
         `domain=tf_tree.SIM_DOMAIN`.
 
-        A disagreement with the path's own domain raises `TfTreeError` **here**,
+        A disagreement with the path's own domain raises
+        `TimeDomainMismatchError` **here**,
         naming both frames, rather than on every `at()` — a domain is a property
         of a route, not of an instant, so it cannot legitimately vary between
         two queries on one plan.

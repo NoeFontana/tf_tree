@@ -9,7 +9,9 @@ either — `crates/tf_tree_py` is excluded from the workspace, so `just test`
 never built it at all.
 """
 
+import gc
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,7 @@ import tempfile
 import numpy as np
 import pytest
 import tf_tree
+from conftest import LONG_CHILD, _stub_annotations
 
 #: The topology these tests create. `0004` sizes an arena from its declared
 #: edges, so creating one means saying what is in it.
@@ -378,6 +381,180 @@ def test_a_forked_child_identifies_the_arena_as_gone_not_as_in_process(runtime_d
 
 
 @shm
+def test_a_refused_claim_raises_edge_already_claimed_with_the_holders_slot(
+    runtime_dir,
+):
+    """`EdgeAlreadyClaimedError.owner_slot` and `.edge` (`0058` step 5).
+
+    A subprocess creates the arena and claims nothing, so it holds slot 0
+    (`CREATOR_SLOT`); this process joins read-write as the first joiner, slot
+    1, and claims two edges; a second read-write handle, a different participant,
+    is refused both. **`owner_slot == 1` is what holds the slot**: a claim held
+    by the creator would read `0`, which a hard-coded `0` could not be told
+    apart from.
+
+    The second edge's child is 67 bytes, so `.edge` — the stored pair, a member
+    of `Tree.edges()` — differs from the pair the caller typed there and nowhere
+    else. **That half depends on `0027`**: if `intern` comes to refuse names
+    over 48 bytes it cannot be built, and the change that lands `0027` deletes
+    it.
+
+    `owner_slot`'s `None` arm, the `CLAIMING` sentinel, is not reached: no test
+    can hold a claim word in that window.
+
+    Mutants, each applied alone, rebuilt and run with ``just py-test``; each
+    fails this test and nothing else:
+
+    * ``owner_slot`` set to ``Some(0)`` => ``{'edge': ('map', 'base'),
+      'owner_slot': 0}``, ``assert 0 == 1``.
+    * `claimed_by` answering ``None`` for every slot => ``assert None == 1``.
+    * the ``EdgeAlreadyClaimed`` arm guarded ``if false``, so the cause reaches
+      the bug-report arm => ``tf_tree.TfTreeError: edge "map" -> "base": tf_tree
+      reported a claim failure this binding has no message for ...`` escapes
+      ``pytest.raises``.
+    * ``.edge`` set from the typed ``(parent, child)`` => the long-name half
+      fails, ``At index 1 diff``: the 67-byte typed child against the 48-byte
+      stored one. The short edge passes under it, as it must.
+
+    **Not a mutant: `claimed_by` hard-coded to ``Some``**, which would hand a
+    handler ``4294967295``. No test can put a claim word in ``CLAIMING``, so
+    nothing could kill it; the arm is held by its type and its review.
+    """
+    edges = [("map", "base"), ("base", LONG_CHILD)]
+    creator = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import tf_tree, time;"
+            f"t = tf_tree.open(mode='rw', create={edges!r});"
+            "print('owning', flush=True);"
+            "time.sleep(3600)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "TF_TREE_RUNTIME_DIR": runtime_dir},
+    )
+    try:
+        assert creator.stdout.readline().strip() == "owning", "no creator"
+        holder = tf_tree.open(mode="rw")
+        other = tf_tree.open(mode="rw")
+        with (
+            holder.publisher("base", "map"),
+            holder.publisher(LONG_CHILD, "base"),
+        ):
+            with pytest.raises(tf_tree.EdgeAlreadyClaimedError) as short:
+                other.publisher("base", "map")
+            with pytest.raises(tf_tree.EdgeAlreadyClaimedError) as long:
+                tf_tree.push(other, LONG_CHILD, "base", 1_000, [1.0, 0, 0, 0, 0, 0, 0])
+
+        for e in (short.value, long.value):
+            assert type(e) is tf_tree.EdgeAlreadyClaimedError
+            assert e.owner_slot == 1, vars(e)
+            assert set(vars(e)) == set(_stub_annotations("EdgeAlreadyClaimedError"))
+        assert short.value.edge == ("map", "base")
+        assert long.value.edge == holder.edges()[1]
+        assert long.value.edge != ("base", LONG_CHILD)
+    finally:
+        creator.kill()
+        creator.wait(timeout=30)
+
+
+@shm
+def test_opening_a_name_nothing_serves_raises_arena_absent(runtime_dir):
+    """`ArenaAbsentError` (`0058` step 7), the retry a supervisor writes.
+
+    `tf_tree.open` without `create=` is `CreatePolicy::Never`, and with no
+    participant byte held the rendezvous refuses at once rather than waiting out
+    a timeout that could not change the answer — `test_api.py`'s
+    `test_open_validates_interp_even_with_nothing_to_create` names this as the
+    call past its `interp` check. The class carries nothing, and the stub
+    annotates nothing: the Rust variant is a unit.
+
+    Mutant: `open_err`'s ``IpcError::ArenaAbsent`` arm deleted, so the error
+    reaches the forwarding arm => this test alone fails, ``tf_tree.TfTreeError:
+    no arena is serving and CreatePolicy::Never forbids creating one`` escaping
+    ``pytest.raises``.
+    """
+    with pytest.raises(tf_tree.ArenaAbsentError) as excinfo:
+        tf_tree.open(name="tf_tree_test_nothing_serves_this")
+    e = excinfo.value
+    assert type(e) is tf_tree.ArenaAbsentError
+
+    assert set(vars(e)) == set(_stub_annotations("ArenaAbsentError")) == set()
+
+
+def _rendezvous_child() -> pathlib.Path:
+    """The Rust test helper `tf_tree_rendezvous_child`, which the pytest recipes build.
+
+    Under the cargo target directory — `$CARGO_TARGET_DIR`, else the workspace's
+    `target/` — in `debug/`. **Missing is a failure, not a skip**: a skip would
+    let a recipe that stopped building the binary stay green while the test it
+    exists for ran nowhere.
+    """
+    root = pathlib.Path(__file__).resolve().parents[2]
+    target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or root / "target")
+    exe = target / "debug" / "tf_tree_rendezvous_child"
+    assert exe.is_file(), (
+        f"{exe} is missing; `just py-test` builds it, or run `cargo build -p "
+        "tf_tree --features shm --bin tf_tree_rendezvous_child`"
+    )
+    return exe
+
+
+@shm
+def test_a_peer_reparent_raises_topology_changed_with_both_generations(runtime_dir):
+    """`TopologyChangedError.plan_generation` and `.current_generation` (`0058`).
+
+    The one error a correct program attached to a shared arena routinely meets,
+    and no single-process call raises it: none of the Python, CLI or C surfaces
+    can re-parent. The Rust helper can — `join-reparent` joins read-write and,
+    on a line of stdin, moves `cam` from `base` to `map` — so this process
+    serves an arena with the helper's own `layout()` pairs, compiles a plan,
+    lets the helper re-parent, and asks the plan again.
+
+    `Plan::at_tagged` checks the generation before the domain or any data, so
+    no sample is needed. The strict `<` is what holds the two attributes apart:
+    swapped they read greater, and both taken from one field they read equal.
+
+    Mutants, each applied alone, rebuilt and run with ``just py-test``:
+
+    * swap the two ``setattr``s => fails on ``{'plan_generation': 3,
+      'current_generation': 2}``, ``assert 3 < 2``.
+    * set ``current_generation`` from the variant's ``plan`` too => fails on
+      ``{'plan_generation': 2, 'current_generation': 2}``, ``assert 2 < 2``.
+
+    Nothing else in `tests/python` moves under either: no other test raises this
+    class.
+    """
+    tree = tf_tree.open(mode="rw", create=EDGES)
+    plan = tree.plan("map", "cam")
+    child = subprocess.Popen(
+        [str(_rendezvous_child()), "join-reparent"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "TF_TREE_RUNTIME_DIR": runtime_dir},
+    )
+    try:
+        assert child.stdout.readline().strip() == "joined", "the helper did not join"
+        child.stdin.write("go\n")
+        child.stdin.flush()
+        line = child.stdout.readline().strip()
+        assert line == "reparented", f"the helper did not re-parent: {line!r}"
+
+        with pytest.raises(tf_tree.TopologyChangedError) as excinfo:
+            plan.at(1_000)
+        e = excinfo.value
+        assert type(e) is tf_tree.TopologyChangedError
+        assert e.plan_generation < e.current_generation, vars(e)
+
+        assert set(vars(e)) == set(_stub_annotations("TopologyChangedError"))
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+
+
+@shm
 def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
     """**Recovery from Python — `docs/decisions/0044`.**
 
@@ -392,6 +569,29 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
     away without its cooperation, which is the whole state under test. It is
     started with `subprocess`, not `multiprocessing`, because a fork of this
     (multi-threaded) process is the *other* failure this file tests.
+
+    **The window between the owner's death and `inherit_ownership` is also
+    `ArenaHeldButUnreachableError`'s trigger** (`docs/decisions/0058` step 6):
+    the survivors hold their bytes and nothing serves, so a fresh
+    `tf_tree.open(mode="rw")` refuses after its 5 s open timeout, which Python
+    cannot shorten. A second, read-only participant is attached first so that
+    two slots are held — with one, `holder_slots` would be ascending and
+    descending at once — and released before the inheritance assertion, which
+    is tidiness rather than a precondition (measured; the comment on the `del`
+    says so).
+
+    **This row costs 5.0 s of the suite's 5.7 s**, in the
+    `tf_tree.open(mode="rw")` that is meant to fail, and `just py-test` and
+    `just py-test-freethreaded` each pay it once.
+
+    Mutants, each applied alone, rebuilt and run with ``just py-test``; each
+    fails this test and nothing else:
+
+    * ``ownership_held`` set ``true`` => ``assert True is False``.
+    * ``holder_slots`` decoded from bit 63 down => ``assert (2, 1) == (1, 2)``.
+    * `open_err`'s ``ArenaHeldButUnreachable`` arm deleted, so the forwarding
+      arm raises the base class => ``tf_tree.TfTreeError: an arena is alive but
+      unreachable: participant slots 0x6 ...`` escapes ``pytest.raises``.
     """
     owner = subprocess.Popen(
         [
@@ -410,6 +610,8 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
         assert owner.stdout.readline().strip() == "owning", "the owner did not come up"
 
         tree = tf_tree.open(mode="rw")
+        # A read-only attach takes a lock-file participant byte too.
+        second = tf_tree.open(mode="ro")
 
         # The owner is alive: the loop is cheap and does nothing.
         assert not tree.owner_lost()
@@ -422,6 +624,29 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
         owner.wait(timeout=30)
 
         assert tree.owner_lost(), "the owner is gone and its socket hung up"
+
+        with pytest.raises(tf_tree.ArenaHeldButUnreachableError) as excinfo:
+            tf_tree.open(mode="rw")
+        held = excinfo.value
+        assert type(held) is tf_tree.ArenaHeldButUnreachableError
+        assert held.ownership_held is False
+        assert len(held.holder_slots) >= 2, held.holder_slots
+        assert held.holder_slots == tuple(sorted(held.holder_slots))
+        assert not hasattr(held, "first_pid")
+
+        annotated = set(_stub_annotations("ArenaHeldButUnreachableError"))
+        assert set(vars(held)) == annotated
+        # **Not a precondition, and that is measured rather than assumed**:
+        # with these two lines removed the inheritance below still answers
+        # `Inherited`. A read-only participant never holds byte 0, so it cannot
+        # contend for the vacant role — only its *participant* byte is held, and
+        # that is what `holder_slots` above is for. They are here so that what
+        # inherits is the single surviving read-write participant the docstring
+        # describes. `del` rather than a rebind is a preference and not a
+        # mechanism — either clears the name from a frame that `excinfo`'s
+        # traceback holds alive — and `gc.collect()` is the belt to its braces.
+        del second
+        gc.collect()
         assert tree.inherit_ownership() == "Inherited", (
             "the sole read-write survivor should have taken the vacant role"
         )
