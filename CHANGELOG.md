@@ -52,10 +52,11 @@ nothing timed, and no library surface changes** — it is a harness in
 `tf_tree_bench`, which does not publish.
 
 - **On the tree's one real recording, four of five dynamic edges never move**
-  (202 of 202 intervals bit-identical: a `robot_state_publisher` republishing
-  fixed mount frames at 10 Hz), and the fifth is **99.2% series per bracket**.
-  Its 13.7% large-arc under a 100 Hz sweep is **two publication gaps**, the
-  longest 5.30 s, not fast motion.
+  (202 of 202 intervals bit-identical) — four wheel-link frames published as
+  *dynamic* `/tf` at 10 Hz that never change. The fifth is **99.2% series per
+  bracket**; its 13.7% large-arc under a 100 Hz sweep is **two publication
+  gaps**, 1.20 s and 5.30 s, carrying 650 of the sweep's 4 730 queries, and not
+  fast motion.
 - **Both interpolation policies share one series bound**, and it is an identity
   rather than a fit: `SIN_HALF_THETA_SMALL_SQ` is defined as
   `sin(THETA_SLERP_SMALL)²`, so both reduce to `θ ≤ 0.15 rad` between

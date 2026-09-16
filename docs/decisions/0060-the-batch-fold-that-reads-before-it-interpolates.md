@@ -524,7 +524,7 @@ instrument — unlike every arm above, this one can be re-run.
 
 ```sh
 cargo run --release -p tf_tree_bench --example bracket_mix
-cargo run --release -p tf_tree_bench --example bracket_mix -- <stream.tfstream> [sweep_hz]
+cargo run --release -p tf_tree_bench --example bracket_mix -- <stream> [sweep_hz]
 ```
 
 It classifies every bracket an `at_many` sweep would read into the five arms of
@@ -539,7 +539,19 @@ re-derives it from the sample list; every swept stamp then goes through
 **bit-identically** — a decline against an `Err`, a knot against the recorded
 pose, a bracket against `I::eval(a, b, s)`. The `checked` column is that count,
 printed beside every row so a check that stopped running is visible. It equals
-`n` in every row below.
+`n` in every row below, because nothing in the recording declines.
+
+**A bracket whose `s` rounds to `1.0` counts as an exact hit**, which is what
+the kernel's predicate does with it. Mathematically `s` is in `(0, 1)` — the
+bracket is `t_i < t < t_j` — but the division rounds up once one nanosecond
+falls below half an ulp of the interval: measured, a 2e16 ns span (232 days)
+queried one nanosecond short of its end gives exactly `1.0`, where 2^53 ns
+(104 days) still gives `0.9999999999999999`. **The other endpoint is
+unreachable** — rounding `s` down to `0.0` would need a ratio below ~5e-324, and
+no pair of `i64` nanosecond stamps produces one. Nothing in this recording is
+anywhere near either (its longest interval is 5.30 s), so this changes no figure
+in §9; it is in the classifier so the figures stay right on a stream where it
+would.
 
 #### The recording
 
@@ -563,8 +575,9 @@ so one table serves both and §9.3 says why that is luck rather than law.
 Not "move slowly" — **202 of each edge's 202 intervals have bit-identical
 rotations**, and the pose is one distinct value across all 203 samples. These
 are `left_front_link`, `left_wheel_link`, `right_front_link` and
-`right_wheel_link`: wheel and caster mount frames a `robot_state_publisher`
-republishes at 10 Hz whether or not anything changed. That is the regime §5
+`right_wheel_link`: four wheel-link frames, published as *dynamic* `/tf` at
+10 Hz and never changing — the shape a joint-state publisher produces for a
+joint that does not turn. That is the regime §5
 measured the prototype **losing 80% (LerpSlerp) and 115% (ScLerp)** to the
 restructure on, and it is 4 of 5 edges of the only real recording in the tree.
 
@@ -572,9 +585,15 @@ restructure on, and it is 4 of 5 edges of the only real recording in the tree.
 
 `odom_combined→base_footprint` publishes at **19.8 Hz** by median interval (the
 file header's "5.4 Hz" is samples ÷ duration, which the gaps drag down) and has
-**two** large-arc intervals out of 253. The longest is **5.30 s**. A 100 Hz
-sweep asks 648 questions inside those two gaps, which is the whole of the
-13.7%: duration weighting, not fast motion.
+**two** large-arc intervals out of 253: 1.20 s carrying 0.190 rad and
+**5.30 s** carrying 0.479 rad. A 100 Hz sweep asks **650 of its 4 730**
+questions inside those two, which is the whole of the 13.7%: duration
+weighting, not fast motion. **And they are not the fastest motion either.**
+Rates below are in the *quaternion* angle θ, which is half the body rotation, so
+that they compare directly against the 0.15 bound: the two gaps run at 0.16 and
+0.09 rad/s, while the recording's quickest interval runs at **0.19 rad/s** (a
+body rotation of 0.37 rad/s, ~21°/s) across 45 ms and stays comfortably inside
+the series region. The gaps are large-arc because they are *long*.
 
 **Both policies share one series bound, and it is a statement about angle.**
 `LerpSlerp` is in its series arm while `θ² ≤ THETA_SLERP_SMALL²`; `ScLerp` while
@@ -590,9 +609,12 @@ region:
 | `odom_combined→base_footprint` | 19.8 Hz | 0.010 / 1.135 / 1.192 / **1.226 Hz** |
 
 **Had the publisher not stopped, every interval of this edge would be series at
-any rate above 1.23 Hz.** That is an extrapolation and its model is `ScLerp`'s
-own — it assumes the body turns at a constant rate across the interval, which is
-exactly what the interpolant assumes when it answers a query inside it. It is
+any rate above 1.23 Hz** — and that maximum is set by the robot's quickest turn,
+not by either gap, which need only 0.60 and 1.06 Hz.
+
+That is an extrapolation and its model is `ScLerp`'s own — it assumes the body
+turns at a constant rate across the interval, which is exactly what the
+interpolant assumes when it answers a query inside it. It is
 taken because one recording's raw fraction says nothing about a corpus with
 different rates, and publish rate is the variable the fraction is most sensitive
 to.
@@ -606,17 +628,27 @@ the interpolant's side.
 §5 measured `conj(q)·q` as exactly `(1.0000000000000002, 0, 0, 0)` for its
 stationary cell's rotation and read the property as belonging to *a generic
 constant rotation*. It belongs to the quaternion's **zero pattern**, not to
-constancy. `conj(q) ⊗ q`'s `y` component is `(w·y + x·z) − w·y − z·x`, where the
-first sum has already rounded:
+constancy.
 
-- the recording's wheel quaternion has `w = z = 0`, so every vector component is
-  a difference of *identical* products and `sin²(θ/2)` is exactly `0` — below
-  `SCREW_DEGENERATE_SQ`, degenerate arm;
-- a quaternion with four non-zero components leaves a residue of ~1e-18, so
-  `sin²(θ/2) ≈ 5e-36` — **4.7e254 times** `SCREW_DEGENERATE_SQ` (1e-290). A
-  motionless edge lands in `ScLerp`'s **series region**, at an angle of ~4e-18
-  rad that is pure rounding. Measured for four fixture seeds: 2.7e-36 to
-  1.1e-35.
+`conj(q) ⊗ q` is the identity in exact arithmetic, and its three vector
+components cancel by three different routes in `f64`:
+
+- **`x` always cancels exactly.** It is `((w·x − x·w) − y·z) + z·y`, and both
+  pairs are the *same* product subtracted from itself.
+- **`y` and `z` need not.** `y` is `(w·y + x·z) − w·y − z·x`, where the leading
+  sum has already rounded before `w·y` is taken back out, so what survives is
+  that rounding. `z` is `((w·z − x·y) + y·x) − z·w` and has the same shape.
+- **A quaternion with a zero in the right place makes every term vanish before
+  it can round.** The recording's wheel quaternion has `w = z = 0`, so every
+  product above is zero or a self-cancelling pair, and `sin²(θ/2)` is exactly
+  `0` — below `SCREW_DEGENERATE_SQ`, degenerate arm.
+- **A quaternion with four non-zero components does not.** Over six fixture
+  poses, `x` is exactly `0` in all six — as the algebra above says it must be —
+  `y` is non-zero in all six (1.6e-19 to 2.6e-18) and `z` in one of them
+  (3.5e-18). So `sin²(θ/2) ≈ 5e-36`, which is **4.7e254 times**
+  `SCREW_DEGENERATE_SQ` (1e-290): a motionless edge lands in `ScLerp`'s
+  **series region**, at an angle of ~4e-18 rad that is pure rounding. Four
+  seeds swept end to end give 2.7e-36 to 1.1e-35.
 
 That is not a defect. `dualquat`'s threshold was deliberately lowered ~280
 orders of magnitude because the regrouped algebra stays conditioned there, and
@@ -632,7 +664,7 @@ against the reference. It matters here for two reasons, both about the *mix*:
    `ScLerp::eval` by construction. §5's all-fallback loss is a `LerpSlerp`
    regime; under `ScLerp` it is a coincidence of this recording's frames.
 
-#### 9.4 The chunk-level fraction is near-bimodal, so a bail-out has no threshold to tune
+#### 9.4 The chunk fraction is near-bimodal: a bail-out has no threshold to tune
 
 The per-chunk series fraction is what a chunk-level bail-out sees. Under the
 100 Hz sweep: the wheel edges give **66 of 66** chunks at 0.00, and
@@ -653,7 +685,10 @@ the reason `copy` and `v2` exist as separate arms in step 0b.
 #### 9.6 The controls
 
 `0060`'s plan required two; there are four, because two of them found things.
-Every class is reached by at least one arm, so no column is decoration.
+Between them and the recording, **every one of the five classes is reached**:
+`series`, `stationary` and `LERP fallback` by a control, `large arc` by
+`odom_combined→base_footprint`'s two gaps, and `exact hit` by the `ongrid`
+sweep. No column below can only ever be zero.
 
 | control | what it is | `LerpSlerp` | `ScLerp` |
 |---|---|---|---|

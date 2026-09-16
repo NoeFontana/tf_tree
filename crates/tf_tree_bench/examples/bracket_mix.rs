@@ -3,7 +3,7 @@
 //!
 //! ```sh
 //! cargo run --release -p tf_tree_bench --example bracket_mix
-//! cargo run --release -p tf_tree_bench --example bracket_mix -- <stream.tfstream> [sweep_hz]
+//! cargo run --release -p tf_tree_bench --example bracket_mix -- <stream> [sweep_hz]
 //! ```
 //!
 //! # Why this exists
@@ -317,8 +317,7 @@ fn header(what: &str) -> String {
         .map(|c| format!("{:>8}", c.label()))
         .collect();
     format!(
-        "  {what:<34} {:<10} {:>6} {} {:>5} {:>4} {:>7}",
-        "policy",
+        "  {what:<34} {:>6} {} {:>5} {:>4} {:>7}",
         "n",
         cells.join(" "),
         "decl",
@@ -369,7 +368,7 @@ enum Sweep {
 impl Sweep {
     fn label(self) -> String {
         match self {
-            Sweep::Rate(hz) => format!("rate {hz:.0} Hz"),
+            Sweep::Rate(hz) => format!("rate {hz} Hz"),
             Sweep::Interval => "interval midpoints".to_owned(),
             Sweep::OnGrid => "on-grid (every knot)".to_owned(),
         }
@@ -450,6 +449,19 @@ fn sweep_edge(
                 Class::ExactHit
             }
             Read::Bracket(a, b, s) => {
+                // Guard the case the recording does not exercise. `s` is
+                // mathematically in `(0, 1)` — `t_i < t < t_j` — but the
+                // division can round **up** to `1.0` once one nanosecond falls
+                // below half an ulp of the interval: measured, a 2e16 ns span
+                // (232 days) queried one nanosecond short of its end yields
+                // exactly `1.0`, while 2^53 ns (104 days) still yields
+                // `0.9999999999999999`. It cannot round down to `0.0` — that
+                // would need a ratio below ~5e-324, which no pair of `i64`
+                // nanosecond stamps can produce — so only the upper endpoint is
+                // reachable, and the `s == 0.0` arm below is there for symmetry
+                // with the kernel's predicate rather than because anything hits
+                // it. The kernel answers both by selecting an endpoint, exactly
+                // as it does for a knot, so they belong in the same bucket.
                 let got = got.map_err(|e| anyhow!("engine declined a bracket at {t}: {e}"))?;
                 let want = match policy {
                     InterpPolicy::LerpSlerp => LerpSlerp::eval(&a, &b, s),
@@ -459,11 +471,15 @@ fn sweep_edge(
                     bail!("bracket at {t} on {parent}->{child}: engine != eval(a, b, {s})");
                 }
                 counts.checked += 1;
-                let (class, near) = classify(policy, &a, &b);
-                if near < BOUNDARY_BAND {
-                    counts.near_boundary += 1;
+                if s == 0.0 || s == 1.0 {
+                    Class::ExactHit
+                } else {
+                    let (class, near) = classify(policy, &a, &b);
+                    if near < BOUNDARY_BAND {
+                        counts.near_boundary += 1;
+                    }
+                    class
                 }
-                class
             }
         };
         *counts.per_class.entry(class).or_insert(0) += 1;
@@ -613,7 +629,7 @@ fn report_stream(name: &str, stream: &TfStream, sweeps: &[Sweep]) -> Result<()> 
                     continue;
                 }
                 let (counts, chunks) = sweep_edge(&tree, p, c, &by_edge[i], policy, sweep)?;
-                println!("  {:<34} {:<10} {}", format!("{p}->{c}"), "", counts.row());
+                println!("  {:<34} {}", format!("{p}->{c}"), counts.row());
                 println!("  {:<34} {}", "", chunks.summarise());
                 println!(
                     "  {:<34} {}",
@@ -628,7 +644,7 @@ fn report_stream(name: &str, stream: &TfStream, sweeps: &[Sweep]) -> Result<()> 
                 total.near_boundary += counts.near_boundary;
                 total.checked += counts.checked;
             }
-            println!("  {:<34} {:<10} {}", "ALL EDGES", "", total.row());
+            println!("  {:<34} {}", "ALL EDGES", total.row());
         }
     }
     Ok(())
@@ -637,13 +653,16 @@ fn report_stream(name: &str, stream: &TfStream, sweeps: &[Sweep]) -> Result<()> 
 /// Control 1: the synthetic fixture, whose 50–1000 Hz edges must read ~100%
 /// series.
 fn control_fixture(sweeps: &[Sweep]) -> Result<()> {
-    let stream = fixture_stream()?;
-    report_stream("CONTROL fixture (expect ~100% series)", &stream, sweeps)
+    report_stream(
+        "CONTROL fixture (expect ~100% series)",
+        &fixture_stream(),
+        sweeps,
+    )
 }
 
 /// The fixture's dynamic history, as a [`TfStream`] so it goes through exactly
 /// the same path as the recording.
-fn fixture_stream() -> Result<TfStream> {
+fn fixture_stream() -> TfStream {
     let mut stream = TfStream::default();
     for (i, (p, c, rate)) in fixture::DYNAMIC_EDGES.iter().enumerate() {
         stream
@@ -662,7 +681,7 @@ fn fixture_stream() -> Result<TfStream> {
         }
     }
     stream.samples.sort_by_key(|s| s.stamp_ns);
-    Ok(stream)
+    stream
 }
 
 /// Control 2: one dynamic edge pushed the **same pose** every time, in two
@@ -675,16 +694,19 @@ fn fixture_stream() -> Result<TfStream> {
 ///
 /// `ScLerp` does not, and **only one of the two shapes below reads as
 /// degenerate.** Its predicate is `sin²(θ/2)` of `inv_mul`'s rotation part, i.e.
-/// of `conj(q) ⊗ q`, whose vector components are differences that cancel
-/// exactly only when the operands line up:
+/// of `conj(q) ⊗ q`, whose three vector components cancel by three different
+/// routes. `x` is `((w·x − x·w) − y·z) + z·y`, two self-cancelling pairs, and is
+/// exact for every input. `y` is `(w·y + x·z) − w·y − z·x` and `z` is
+/// `((w·z − x·y) + y·x) − z·w`, where the leading sum has already rounded before
+/// the term it contains is taken back out — so those two keep the rounding:
 ///
-/// - `axis`, the recorded wheel edges' shape (`w = z = 0`), gives every vector
-///   component as a difference of *identical* products, so `sin²(θ/2)` is
-///   exactly `0` and the bracket is degenerate;
-/// - `generic`, all four components non-zero, computes `y` as
-///   `(w·y + x·z) − w·y − z·x`, where the first sum has already rounded. The
-///   residue is ~1e-18, so `sin²(θ/2) ≈ 5e-36` — which is **4.7e254 times**
-///   `SCREW_DEGENERATE_SQ` (1e-290). A motionless edge lands in `ScLerp`'s
+/// - `axis`, the recorded wheel edges' shape (`w = z = 0`), zeroes every product
+///   above before it can round, so `sin²(θ/2)` is exactly `0` and the bracket is
+///   degenerate;
+/// - `generic`, all four components non-zero, keeps it. Over six fixture poses
+///   `x` is exactly `0` in all six, `y` is non-zero in all six (1.6e-19 to
+///   2.6e-18) and `z` in one. So `sin²(θ/2) ≈ 5e-36` — **4.7e254 times**
+///   `SCREW_DEGENERATE_SQ` (1e-290) — and a motionless edge lands in `ScLerp`'s
 ///   **series region**, at an angle of ~4e-18 rad that is pure rounding.
 ///
 /// That is not a defect: `dualquat`'s threshold was deliberately lowered by
