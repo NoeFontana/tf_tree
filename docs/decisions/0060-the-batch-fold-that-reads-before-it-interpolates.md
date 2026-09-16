@@ -2,11 +2,12 @@
 
 **Status:** draft
 **Owner:** @NoeFontana
-**Implementation:** none. The prototype this record measures was built in a
-detached worktree at `681e601`, was never committed and is not coming in as it
-stands. *Implementation plan* steps 0 and 1 are measurements, and none of their
-code is committed: a classifier harness over a recorded stream (step 0a), and
-arms built on that uncommitted prototype (steps 0b and 1).
+**Implementation:** none of the engine. The prototype this record measures was
+built in a detached worktree at `681e601`, was never committed and is not coming
+in as it stands; the arms of steps 0b and 1 are built on it and are not
+committed either. **Step 0a is done and its harness *is* committed** —
+`crates/tf_tree_bench/examples/bracket_mix.rs`, which contains no engine code and
+nothing timed. Its result is §9 and it answers open question 1.
 
 ## Context
 
@@ -101,8 +102,10 @@ bit-identical (`to_bits`) to `Plan::at` for the same stamp.**
 - **Pinning:** everything ran under `taskset -c 2`. The SMT sibling, cpu3, was
   not isolated. There are no hardware counters (`perf_event_paranoid=4`, no
   `perf`, no `valgrind`), so **no mechanism claim below rests on a counter.**
-- **Date:** all campaigns ran on 2026-09-14, against `681e601` plus the
-  prototype.
+- **Date:** the timed campaigns (§1–§8) all ran on 2026-09-14, against
+  `681e601` plus the prototype. **§9 is not one of them**: it ran on 2026-09-16
+  against `main`, it times nothing, and no line of this *Host and method*
+  section applies to it.
 - **Interleaving:** arms alternate within each cell, and the arm order rotates
   every rep. Deltas are paired per rep.
 - **Cell names:** `1dyn` is `odom → map`, one 50 Hz dynamic step. `3dyn` is
@@ -300,6 +303,17 @@ vector part that is exactly zero for the benchmarked generic rotation, so
 (`conj(q)*q = (1.0000000000000002, 0, 0, 0)`, and `sclerp_safe = false` at
 s = 0.25, 0.5 and 0.9). The prototype bench's own comment had predicted the
 series arm for a generic constant rotation, and it was wrong.
+
+***Erratum, 2026-09-16 (§9.3).** The measurement above stands for the rotation
+that cell used. The word **"generic"** does not: whether `conj(q)·q`'s vector
+part cancels exactly is a property of the quaternion's **zero pattern**, not of
+the rotation being constant. A quaternion with four non-zero components leaves
+`sh2 ≈ 5e-36` — 4.7e254 times `SCREW_DEGENERATE_SQ` — and a motionless edge then
+lands in `ScLerp`'s **series** region. So the +115% rows below are what this
+cell's quaternion does, and an all-fallback `ScLerp` regime is not what a
+motionless edge generally produces. The prototype bench's comment was right for
+most rotations and wrong for the one it was measured on, which is the opposite of
+what this paragraph concluded.*
 
 | cell | base | scal | v1 | v2 | v2 vs base | v2 vs scal |
 |---|---|---|---|---|---|---|
@@ -501,6 +515,246 @@ no log of them was kept:
 - **Dropping ScLerp's `sh2` upper bound is caught,** by the isolated-stamp
   shapes.
 
+### 9. Step 0a: what the recorded mix is
+
+**This is the section the kernel's sign was waiting on**, and it is a
+measurement of *data*, not of speed: no engine code, no prototype, nothing
+timed. `crates/tf_tree_bench/examples/bracket_mix.rs` is committed and is the
+instrument — unlike every arm above, this one can be re-run.
+
+```sh
+cargo run --release -p tf_tree_bench --example bracket_mix
+cargo run --release -p tf_tree_bench --example bracket_mix -- <stream> [sweep_hz]
+```
+
+It classifies every bracket an `at_many` sweep would read into the five arms of
+`slerp` and of `screw_parts` / `ScrewParts::pow`, per edge, per policy and per
+64-stamp chunk, under three sweeps: a 100 Hz off-grid grid (`rate`), one query
+per sample interval (`interval`), and one query at every knot (`ongrid`).
+
+**The bracket search is a mirror of `SampleRing::sample_from`, and it is checked
+rather than trusted.** The bracket is not a public return, so the example
+re-derives it from the sample list; every swept stamp then goes through
+`Plan::at` on the same one-edge plan and the two are required to agree
+**bit-identically** — a decline against an `Err`, a knot against the recorded
+pose, a bracket against `I::eval(a, b, s)`. The `checked` column is that count,
+printed beside every row so a check that stopped running is visible. It equals
+`n` in every row below, because nothing in the recording declines.
+
+**A bracket whose `s` rounds to `1.0` counts as an exact hit**, which is what
+the kernel's predicate does with it. Mathematically `s` is in `(0, 1)` — the
+bracket is `t_i < t < t_j` — but the division rounds up once one nanosecond
+falls below half an ulp of the interval: measured, a 2e16 ns span (232 days)
+queried one nanosecond short of its end gives exactly `1.0`, where 2^53 ns
+(104 days) still gives `0.9999999999999999`. **The other endpoint is
+unreachable** — rounding `s` down to `0.0` would need a ratio below ~5e-324, and
+no pair of `i64` nanosecond stamps produces one. Nothing in this recording is
+anywhere near either (its longest interval is 5.30 s), so this changes no figure
+in §9; it is in the classifier so the figures stay right on a stream where it
+would.
+
+#### The recording
+
+`testdata/tfstream/indoor_atelier.tfstream` — 5 dynamic edges, 1 066 samples,
+47.3 s, CC BY 4.0 (`testdata/tfstream/ATTRIBUTION.md`). Percentages are of the
+brackets read; `LerpSlerp` and `ScLerp` agree on every cell of this recording,
+so one table serves both and §9.3 says why that is luck rather than law.
+
+| sweep | edge | n | series | stationary | lerp fb | large arc | exact hit |
+|---|---|---|---|---|---|---|---|
+| `rate` 100 Hz | the four `base_link` wheel edges (each) | 4 220 | 0.0% | **100.0%** | 0.0% | 0.0% | 0.0% |
+| `rate` 100 Hz | `odom_combined→base_footprint` | 4 730 | **86.3%** | 0.0% | 0.0% | 13.7% | 0.0% |
+| `rate` 100 Hz | all edges | 21 610 | 18.9% | 78.1% | 0.0% | 3.0% | 0.0% |
+| `interval` | the four wheel edges (each) | 202 | 0.0% | **100.0%** | 0.0% | 0.0% | 0.0% |
+| `interval` | `odom_combined→base_footprint` | 253 | **99.2%** | 0.0% | 0.0% | 0.8% | 0.0% |
+| `interval` | all edges | 1 061 | 23.7% | 76.2% | 0.0% | 0.2% | 0.0% |
+| `ongrid` | every edge | 1 066 | 0.0% | 0.0% | 0.0% | 0.0% | **100.0%** |
+
+#### 9.1 Four of the five edges never move
+
+Not "move slowly" — **202 of each edge's 202 intervals have bit-identical
+rotations**, and the pose is one distinct value across all 203 samples. These
+are `left_front_link`, `left_wheel_link`, `right_front_link` and
+`right_wheel_link`: four wheel-link frames, published as *dynamic* `/tf` at
+10 Hz and never changing — the shape a joint-state publisher produces for a
+joint that does not turn. That is the regime §5
+measured the prototype **losing 80% (LerpSlerp) and 115% (ScLerp)** to the
+restructure on, and it is 4 of 5 edges of the only real recording in the tree.
+
+#### 9.2 The one moving edge is 99.2% series, and its 13.7% is gaps, not motion
+
+`odom_combined→base_footprint` publishes at **19.8 Hz** by median interval (the
+file header's "5.4 Hz" is samples ÷ duration, which the gaps drag down) and has
+**two** large-arc intervals out of 253: 1.20 s carrying 0.190 rad and
+**5.30 s** carrying 0.479 rad. A 100 Hz sweep asks **650 of its 4 730**
+questions inside those two, which is the whole of the 13.7%: duration
+weighting, not fast motion. **And they are not the fastest motion either.**
+Rates below are in the *quaternion* angle θ, which is half the body rotation, so
+that they compare directly against the 0.15 bound: the two gaps run at 0.16 and
+0.09 rad/s, while the recording's quickest interval runs at **0.19 rad/s** (a
+body rotation of 0.37 rad/s, ~21°/s) across 45 ms and stays comfortably inside
+the series region. The gaps are large-arc because they are *long*.
+
+**Both policies share one series bound, and it is a statement about angle.**
+`LerpSlerp` is in its series arm while `θ² ≤ THETA_SLERP_SMALL²`; `ScLerp` while
+`sin²(θ) ≤ SIN_HALF_THETA_SMALL_SQ`, and that constant *is* `sin(0.15)²`. Both
+reduce to `θ ≤ 0.15 rad` between consecutive samples — a body rotation of
+0.30 rad, 17.2°. So the mix is a function of publish rate against angular rate,
+and the example reports the rate at which each interval would enter the series
+region:
+
+| edge | published (median interval) | series above, p50 / p90 / p99 / max |
+|---|---|---|
+| the four wheel edges | 10.0 Hz | — (no rotating interval) |
+| `odom_combined→base_footprint` | 19.8 Hz | 0.010 / 1.135 / 1.192 / **1.226 Hz** |
+
+**Had the publisher not stopped, every interval of this edge would be series at
+any rate above 1.23 Hz** — and that maximum is set by the robot's quickest turn,
+not by either gap, which need only 0.60 and 1.06 Hz.
+
+That is an extrapolation and its model is `ScLerp`'s own — it assumes the body
+turns at a constant rate across the interval, which is exactly what the
+interpolant assumes when it answers a query inside it. It is
+taken because one recording's raw fraction says nothing about a corpus with
+different rates, and publish rate is the variable the fraction is most sensitive
+to.
+
+The gaps are also what `TFT009` is about (`PHASE5.md`): a publisher that
+stopped. Nothing here is a second detector, but it is the same fact seen from
+the interpolant's side.
+
+#### 9.3 `ScLerp` reads a motionless edge as degenerate only by luck
+
+§5 measured `conj(q)·q` as exactly `(1.0000000000000002, 0, 0, 0)` for its
+stationary cell's rotation and read the property as belonging to *a generic
+constant rotation*. It belongs to the quaternion's **zero pattern**, not to
+constancy.
+
+`conj(q) ⊗ q` is the identity in exact arithmetic, and its three vector
+components cancel by three different routes in `f64`:
+
+- **`x` always cancels exactly.** It is `((w·x − x·w) − y·z) + z·y`, and both
+  pairs are the *same* product subtracted from itself.
+- **`y` and `z` need not.** `y` is `(w·y + x·z) − w·y − z·x`, where the leading
+  sum has already rounded before `w·y` is taken back out, so what survives is
+  that rounding. `z` is `((w·z − x·y) + y·x) − z·w` and has the same shape.
+- **A quaternion with a zero in the right place makes every term vanish before
+  it can round.** The recording's wheel quaternion has `w = z = 0`, so every
+  product above is zero or a self-cancelling pair, and `sin²(θ/2)` is exactly
+  `0` — below `SCREW_DEGENERATE_SQ`, degenerate arm.
+- **A quaternion with four non-zero components does not.** Over six fixture
+  poses, `x` is exactly `0` in all six — as the algebra above says it must be —
+  `y` is non-zero in all six (1.6e-19 to 2.6e-18) and `z` in one of them
+  (3.5e-18). So `sin²(θ/2) ≈ 5e-36`, which is **4.7e254 times**
+  `SCREW_DEGENERATE_SQ` (1e-290): a motionless edge lands in `ScLerp`'s
+  **series region**, at an angle of ~4e-18 rad that is pure rounding. Four
+  seeds swept end to end give 2.7e-36 to 1.1e-35.
+
+That is not a defect. `dualquat`'s threshold was deliberately lowered ~280
+orders of magnitude because the regrouped algebra stays conditioned there, and
+`screw_pow_is_accurate_down_to_the_degenerate_threshold` sweeps θ to 1e-160
+against the reference. It matters here for two reasons, both about the *mix*:
+
+1. **"the robot is not moving" and "the interpolant takes its fallback arm" are
+   the same statement under `LerpSlerp` and are not under `ScLerp`.** The four
+   wheel edges read `stationary` under `ScLerp` above only because their
+   quaternion has the cancelling shape.
+2. **A `ScLerp` kernel would therefore fire on motionless edges of most other
+   shapes** — in the series region, on rounding noise, bit-identically to
+   `ScLerp::eval` by construction. §5's all-fallback loss is a `LerpSlerp`
+   regime; under `ScLerp` it is a coincidence of this recording's frames.
+
+#### 9.4 The chunk fraction is near-bimodal: a bail-out has no threshold to tune
+
+The per-chunk series fraction is what a chunk-level bail-out sees. Under the
+100 Hz sweep: the wheel edges give **66 of 66** chunks at 0.00, and
+`odom_combined→base_footprint` gives **61 of 74** at 1.00 and **9** at 0.00 —
+70 of 74 all-in or all-out, 4 straddling a gap boundary (p10 0.00, p50 1.00,
+p90 1.00). Any bail-out threshold strictly between 0 and 1 makes the same
+decision on this data. **What a bail-out separates here is edges, not chunks.**
+
+#### 9.5 An on-grid consumer is 100% exact hits
+
+The `ongrid` sweep is 100% `exact_hit` by construction, and it is not a
+contrivance: a ROS consumer looks a transform up *at the stamp of the message it
+is processing*, and a publisher driven by the same sensor puts a knot there.
+That is the regime §6 is about — `v1` sends a whole chunk through a `#[cold]`
+fix-up on one knot — so a consumer of this shape is the worst case for `v1` and
+the reason `copy` and `v2` exist as separate arms in step 0b.
+
+#### 9.6 The controls
+
+`0060`'s plan required two; there are four, because two of them found things.
+Between them and the recording, **every one of the five classes is reached**:
+`series`, `stationary` and `LERP fallback` by a control, `large arc` by
+`odom_combined→base_footprint`'s two gaps, and `exact hit` by the `ongrid`
+sweep. No column below can only ever be zero.
+
+| control | what it is | `LerpSlerp` | `ScLerp` |
+|---|---|---|---|
+| `fixture` | the synthetic 50–1000 Hz fixture the matrix bench uses | **100.0% series** (3 368 brackets) | **100.0% series** |
+| `repeat/axis` | one pose repeated, the wheel edges' quaternion shape | **100.0% stationary** | **100.0% stationary** |
+| `repeat/generic` | one pose repeated, four non-zero components | **100.0% stationary** | **100.0% series** (§9.3) |
+| `jitter` | ~1e-7 rad a sample | **100.0% LERP fallback** | **100.0% series** |
+
+The plan's requirement was *"the matrix fixture must read ~100% series, and the
+stationary fixture 100% fallback. Without both, a classifier reading everything
+as series passes."* The first two rows are that. `repeat/generic` was added
+because the first spelling of the stationary control **failed** — it read 100%
+series under `ScLerp` — and the failure was the classifier's expectation, not
+the classifier; §9.3 is that finding. `jitter` was added because without it the
+`lerp_fb` column reads 0.0% in every row of this section, in both other controls
+and in the recording, and a column that can only ever be zero is decoration.
+
+**Nothing in the recording or any control sits near a class boundary.** The
+`near` column counts brackets within 1e-9 relative of one and is **0** in every
+row. That matters because the example reaches `θ²` by `2·asin(√(h/2))` rather
+than by `tf_tree_math`'s eight-term `theta_sq_from_chord` — deliberately, so a
+classifier does not inherit whatever the series gets wrong — and the two agree
+to ~1e-16. With no bracket near a boundary, the choice of route cannot have
+moved a single bucket.
+
+#### 9.7 What step 0a does and does not settle
+
+**Settled.** The mix is measured, on the terms the plan set, with its controls.
+Open question 1 is answered below. The bail-out's threshold is not a tuning
+problem (§9.4).
+
+**Not settled, and the record must not be read as if it were.** This is **one
+47-second indoor run of one wheeled robot**, whose fastest `/tf` edge publishes
+at 19.8 Hz and whose fastest rotation needs 1.23 Hz to stay in the series
+region. It carries **no high-rate edge at all**, and the series region is
+exactly the high-rate regime — so the corpus is biased in the direction that
+*shrinks* B's regime, while `fixture`'s 50–1000 Hz edges are 100% series. Two
+things follow:
+
+- **B's stop rule is applied to this stream because the plan says so, and the
+  verdict it produces is a verdict about this stream.** A recording with a
+  200 Hz odom would put nearly every bracket in the kernel's regime.
+- **What generalises is §9.2's bound, not §9's percentages.** `θ ≤ 0.15 rad`
+  between samples, both policies. A reader with their own corpus can answer this
+  question for it by running the example, and should.
+
+**What 0a implies for B, arithmetically, and why it is not the stop rule.**
+INFERRED, and stated here because a reader will do the arithmetic anyway. Across
+all five edges at the 100 Hz sweep, **81.1% of brackets fall back**, against the
+~27% break-even §5's linear interpolation estimates for `v2` over `scal` under
+ScLerp. **Without a bail-out B loses on this stream, and not narrowly.** With one
+it wins on at most `odom_combined→base_footprint`'s 61 all-series chunks out of
+the recording's 338, and pays classification on the rest. That is a prediction
+from two numbers taken on unlike data by a rule the record itself says *"must not
+be used as a threshold"*, so **B's stop rule is still step 0b's interleaved
+timings** and nothing here closes it. It does mean the bail-out stopped being
+optional: §5's cells are what B does on 4 of these 5 edges without one.
+
+**And §9.3 cuts the other way for a different corpus.** Those four edges reach
+`ScLerp`'s fallback only because their quaternions cancel exactly. A motionless
+edge with a generic rotation classifies as *series*, the kernel runs on it, and
+it is bit-identical by construction — so the all-fallback regime B fears is
+`LerpSlerp`'s everywhere and `ScLerp`'s only on frames shaped like these. B
+proposes no LerpSlerp kernel, which is the half of that this record has already
+decided.
+
 ### MEASURED and INFERRED
 
 | claim | standing |
@@ -513,7 +767,10 @@ no log of them was kept:
 | batch output is bit-identical to `Plan::at` in `base`, `v1`, `v2` and `scal` | MEASURED (three levels, mutants); §8 states which arm and profile each log covers |
 | **why** the restructure is faster (per-chunk sampler and policy resolution hoisted, the out-of-line `fold_at_cursors` call gone, loop layout) | INFERRED: hypotheses, none isolated |
 | why `scal` is weak on `into_mat4` | **UNEXPLAINED**: the census does not tell `scal` from `v1`/`v2` (§7 item 2) |
-| the real `/tf` mix of series, stationary, large-arc and knot segments | **UNMEASURED**, and it decides the kernel's sign |
+| the real `/tf` mix of series, stationary, large-arc and knot segments | **MEASURED** on one recording (§9), by a committed harness whose every swept stamp is checked against `Plan::at` by `to_bits`. 4 of 5 edges never move; the fifth is 99.2% series per bracket. **One 47 s indoor run with no high-rate edge — §9.7 states the bias and what does not generalise** |
+| the series bound is `θ ≤ 0.15 rad` between samples, **for both policies** | MEASURED as an identity, not a fit: `SIN_HALF_THETA_SMALL_SQ` is defined as `sin(THETA_SLERP_SMALL)²` (§9.2) |
+| a motionless `ScLerp` edge takes the degenerate arm | **FALSE in general**, MEASURED (§9.3): it does so only when the quaternion's zero pattern makes `conj(q)·q` cancel exactly. Otherwise `sh2 ≈ 5e-36` and it is **series**. §5's "generic" is an erratum |
+| the chunk-level series fraction a bail-out would see | MEASURED (§9.4): near-bimodal, 70 of 74 chunks all-in or all-out, so no threshold to tune on this data |
 | a rough break-even for `v2` over `scal`: ~27% of elements falling back under ScLerp, ~24% under LerpSlerp | INFERRED, see below |
 | the 16 kB frame's per-call cost (zeroing 14.8 kB) at small N | UNMEASURED; N < 64 was not benchmarked (step 1 measures it) |
 | aarch64/NEON, `[profile.embedder]` (`lto = false`, `codegen-units = 16`), AVX hosts | UNMEASURED |
@@ -546,7 +803,8 @@ accept an argument in place of a model. The three `loom_tests.rs` lap models
 
 **Verdict: PROCEED to the measurements in *Implementation plan* step 0, not to an
 implementation and not to the prototype as built.** **This is a draft and
-authorises nothing.** What steps 0 and 1 feed is two separable decisions, taken
+authorises nothing.** **Step 0a is done** — §9, and it answers open question 1.
+Step 0b, which is timing on the uncommitted prototype, is not. What steps 0 and 1 feed is two separable decisions, taken
 in order. The two campaigns agree on the verdict. Where their attributions
 differ, the conservative reading above is the one carried forward.
 
@@ -568,9 +826,15 @@ differ, the conservative reading above is the one carried forward.
 2. **Decision B — an SoA kernel for ScLerp, on top of A, only if step 0 says the
    data wants it.** It applies only to chunks the classifier admits, with a
    chunk-level bail-out: classify first, and skip the kernel when the chunk is
-   mostly fallback. Its knot handling is whichever of `v2`'s selects and a
-   post-kernel copy of phase 1's exact hits clears the 1.3× bar and is faster on
-   the recorded mix. Step 0b builds and times both.
+   mostly fallback. **Step 0a has since measured what that bail-out sees, and it
+   is near-bimodal** (§9.4): on the recorded stream 70 of 74 chunks are all-in or
+   all-out, and what the bail-out separates is *edges* — one moving, four
+   motionless — rather than chunks within an edge. So its threshold is not a
+   tuning parameter, and the question step 0b still has to answer is whether
+   paying the classification at all beats not having the kernel. Its knot
+   handling is whichever of `v2`'s selects and a post-kernel copy of phase 1's
+   exact hits clears the 1.3× bar and is faster on the recorded mix. Step 0b
+   builds and times both.
 
    **B proposes no LerpSlerp kernel.** `v2`'s LerpSlerp kernel is 1.268× in the
    probe, under the 1.3× bar fixed before any engine number (§2), so a
@@ -718,8 +982,8 @@ differ, the conservative reading above is the one carried forward.
 ## Implementation plan
 
 0. **Measure the recorded `/tf` mix, then time the arms on it.**
-   - **0a. Classification. No engine code.** For each dynamic edge of a
-     recorded stream (the soak's `recorded` workload over
+   - **0a. Classification. No engine code. DONE, 2026-09-16 — §9.** For each
+     dynamic edge of a recorded stream (the soak's `recorded` workload over
      `testdata/tfstream/indoor_atelier.tfstream`, or a bag through PHASE5 §3's
      MCAP ingest), classify every bracket an `at_many` sweep would read into
      five classes: series region, stationary / `h == 0` / degenerate, LERP
@@ -735,6 +999,17 @@ differ, the conservative reading above is the one carried forward.
        Without both, a classifier reading everything as series passes.
      - **Verified by** the fraction table and the two controls, recorded in
        this record.
+     - **As landed:** `crates/tf_tree_bench/examples/bracket_mix.rs`, committed
+       and registered in `docs/benchmarks/EVIDENCE.md`. It went past the plan in
+       three places, each because the plan's own shape demanded it. **Four
+       controls, not two** — the stationary control as specified *failed*, and
+       §9.3 is that finding; a fourth exists because the LERP-fallback column is
+       otherwise unreachable and would be decoration. **Every swept stamp is
+       checked against `Plan::at` by `to_bits`**, because the bracket is not a
+       public return and a mirror that drifted would classify pairs the engine
+       never reads. **Three sweeps, not one**, because the exact-hit fraction is
+       a property of the *consumer's* clock (§9.5) and the large-arc fraction
+       changes 17× between duration-weighted and per-bracket counting (§9.2).
    - **0b. Timing, on the uncommitted prototype.** Two arms that were never
      built are built on the prototype worktree:
      - `copy`: `v1`'s kernel, which has no select, with `v2`'s monomorphic
@@ -852,13 +1127,31 @@ differ, the conservative reading above is the one carried forward.
 
 ## Open questions
 
-1. **Which recorded stream is the mix?** The soak's `recorded` workload
-   (`testdata/tfstream/indoor_atelier.tfstream`, a real recording: irregular
-   periods, duplicate stamps, late frames), a bag through PHASE5 §3's MCAP
-   ingest, or both. Not the soak's `robot` workload, which is the synthetic
-   fixture the matrix bench already used and serves only as step 0a's
-   ~100%-series positive control. Step 0 cannot start without an answer, and
-   both stop rules are applied to it (steps 0b and 1).
+1. ~~**Which recorded stream is the mix?**~~ **ANSWERED, 2026-09-16**
+   (principal ruling on the owner's delegation), and measured: §9.
+
+   **`testdata/tfstream/indoor_atelier.tfstream`, alone.** It is the only real
+   `/tf` recording in the tree, it is permissively licensed (CC BY 4.0), and it
+   replays with no network. **A bag through PHASE5 §3's MCAP ingest was not
+   added**, because it would add no *mix*: the only bag in the tree is this
+   recording's own source, and the only MCAP is a 12 KB zstd conformance
+   fixture. Ingesting the same transforms through a second reader measures the
+   reader, not the data. The soak's `robot` workload is the synthetic fixture and
+   serves only as the ~100%-series positive control, which §9.6 is.
+
+   **What the stop rules are applied to is not one number.** §9 reports the mix
+   per edge, per policy and per 64-stamp chunk, and §9.2 states the bound the
+   fractions come from — `θ ≤ 0.15 rad` between consecutive samples, the same for
+   both policies. That bound is what generalises; §9's percentages are one
+   recording's.
+
+   **Reopen criterion.** This recording carries no edge publishing above 19.8 Hz
+   and no rotation needing more than 1.23 Hz to stay in the series region
+   (§9.2), so it is biased in the direction that *shrinks* the kernel's regime.
+   **If a second permissively-licensed recording with a genuinely high-rate
+   moving edge is added to `testdata/tfstream/`, step 0a is re-run on it and B's
+   stop rule is re-applied before B closes or lands.** Adding one is a change to
+   this repository's test corpus and is not gated on this record.
 2. **Chunk size and stack.** 64 lanes cost ~16 kB of frame. At 16 lanes the five
    buffers would be 3 712 B, so the frame would be about 4.8–5.0 kB if nothing
    else in it changed (derived from §3's frame sizes, which carry 1 096–1 320 B
@@ -893,7 +1186,17 @@ differ, the conservative reading above is the one carried forward.
 
 ## Reproduction
 
-**Nothing below is added to the repository as a file.** The prototype diff,
+**Step 0a's harness is the one exception, and it is committed:**
+`crates/tf_tree_bench/examples/bracket_mix.rs`, run as
+
+```sh
+cargo run --release -p tf_tree_bench --example bracket_mix
+```
+
+with an optional stream path and sweep rate as its two arguments. §9's tables are
+that command's output on `main` at the date §9 gives.
+
+**Nothing else below is added to the repository as a file.** The prototype diff,
 test, logs and binaries stayed in the session's scratch directory (see the
 bullet list below). What a reader can rerun is the code and commands below,
 applied to `681e601`.
@@ -1144,7 +1447,13 @@ on the as-built binary and on the `-C no-vectorize-loops` binary. The claim
 holds only if the packed arithmetic in the kernel symbols collapses in the
 second.
 
-The scratch locations at the time of writing, which are not durable:
+The scratch locations at the time of writing, which are not durable — **and
+which are now gone.** The development host rebooted on 2026-09-16 and cleared
+`/tmp`, taking all three with it. Every number §1–§8 report is inlined above and
+the prototype's code is inlined below, which is why they survive; nothing else
+does, and a reader who wants to re-run an arm has to rebuild it from this
+record. **That is the argument for §9's harness being committed** rather than
+being a fourth entry on this list.
 
 - the first campaign's logs, summaries, disassembly census, full prototype diff
   and every binary are under the session scratchpad's `soa-results/`;
