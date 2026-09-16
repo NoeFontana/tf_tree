@@ -41,6 +41,49 @@ is a bug.
 
 ## [Unreleased]
 
+### Added — `bracket_mix`: which interpolation region a real `/tf` stream lands in
+
+[`0060`](docs/decisions/0060-the-batch-fold-that-reads-before-it-interpolates.md)
+step 0a, the measurement that decides whether its SIMD kernel is worth having.
+`cargo run --release -p tf_tree_bench --example bracket_mix` classifies the
+brackets an `at_many` sweep reads into the five arms of `slerp` and
+`screw_parts`, per edge, per policy and per 64-stamp chunk. **No engine code,
+nothing timed, and no library surface changes** — it is a harness in
+`tf_tree_bench`, which does not publish.
+
+- **On the tree's one real recording, four of five dynamic edges never move**
+  (202 of 202 intervals bit-identical: a `robot_state_publisher` republishing
+  fixed mount frames at 10 Hz), and the fifth is **99.2% series per bracket**.
+  Its 13.7% large-arc under a 100 Hz sweep is **two publication gaps**, the
+  longest 5.30 s, not fast motion.
+- **Both interpolation policies share one series bound**, and it is an identity
+  rather than a fit: `SIN_HALF_THETA_SMALL_SQ` is defined as
+  `sin(THETA_SLERP_SMALL)²`, so both reduce to `θ ≤ 0.15 rad` between
+  consecutive samples. The mix is therefore a function of publish rate, and that
+  bound — not one recording's percentages — is what carries to another corpus.
+- **A motionless `ScLerp` edge does not generally take its degenerate arm.**
+  Whether `conj(q)·q`'s vector part cancels exactly is a property of the
+  quaternion's zero pattern; with four non-zero components the residue leaves
+  `sin²(θ/2) ≈ 5e-36`, which is 4.7e254 times `SCREW_DEGENERATE_SQ`, and the
+  edge sits in the **series** region on rounding noise. `0060` §5 said otherwise
+  and now carries the erratum. Nothing computes a different answer — the
+  threshold was lowered ~280 orders of magnitude on purpose — but the *mix* does.
+- **Every swept stamp is checked against `Plan::at` bit-identically**, because
+  the bracket is not a public return and the harness mirrors `sample_from`
+  rather than calling it. Four controls, one per class, and the stationary
+  control as originally specified **failed**, which is how the `ScLerp` finding
+  above was found.
+
+- **`tf_tree_math`'s `SCREW_DEGENERATE_SQ` is now pinned** by a `const _: () =
+  assert!(…)`, the way `interp.rs` already pins `SLERP_LERP_FALLBACK` and
+  `THETA_SLERP_SMALL`. The harness above restates it, the constant is private,
+  and the two crates cannot be checked against each other — so without the pin a
+  change here would silently move a published classification. Verified by
+  mutating it: the build fails at the assertion. No behaviour changes.
+
+Registered in `docs/benchmarks/EVIDENCE.md`. `0060` remains a `draft` and this
+authorises no engine change.
+
 ### Changed — Python exceptions carry the fields a handler branches on
 
 [`0058`](docs/decisions/0058-the-fields-a-python-exception-only-printed.md),

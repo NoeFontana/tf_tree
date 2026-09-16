@@ -72,6 +72,18 @@ const SIN_HALF_THETA_SMALL_SQ: f64 = 0.022_331_755_437_196_99;
 /// sweeps θ from 3 rad down past 1e-160 against the reference.
 const SCREW_DEGENERATE_SQ: f64 = 1e-290;
 
+// **Pinned, the way `interp.rs` pins `SLERP_LERP_FALLBACK` and
+// `THETA_SLERP_SMALL`, and for the same reason.** This value is restated outside
+// this crate: `crates/tf_tree_bench/examples/bracket_mix.rs` carries a copy, so
+// that `docs/decisions/0060` step 0a can classify a bracket without this module
+// exporting its thresholds. That copy cannot be checked by the compiler — the
+// constant is private and the example is in another crate — so the pin is what
+// makes a change here break a build rather than silently move a published
+// classification. Its sibling `SIN_HALF_THETA_SMALL_SQ` needs no line of its own:
+// `sin_half_theta_small_sq_matches_the_shared_threshold` already ties it to
+// `THETA_SLERP_SMALL`, which `interp.rs` pins.
+const _: () = assert!(SCREW_DEGENERATE_SQ == 1e-290);
+
 /// The screw decomposition of a transform, in the grouped form that stays finite
 /// as `θ → 0`.
 ///
