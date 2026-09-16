@@ -1,13 +1,15 @@
 # 0058: the fields a Python exception only printed
 
-**Status:** ready
+**Status:** implemented (2026-09-16)
 **Owner:** @NoeFontana
-**Implementation:** steps 1–8, all in the change that carries them, after
+**Implementation:** steps 1–8 in #346, after
 [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
-implementation (#345), as the plan orders. Step 2 did not take its fallback.
-**Status stays `ready` until that change merges**, and moving it to
-`implemented` names its PR number, as `0059` step 2 did: an implemented record
-is frozen, and a line reading "this change" would then point at nothing.
+implementation (#345), as the plan orders. Step 2 did not take its fallback: the
+reparent test drives `tf_tree_rendezvous_child join-reparent`, so
+`TopologyChangedError`'s two generations are asserted rather than deferred.
+#346's review round then made the tagless mappers their own entry point
+(`lookup_err_untagged`), so an `Extrapolation` with no domain tag cannot reach
+the class-changing fallback step 2 had left behind it.
 
 ## Context
 
