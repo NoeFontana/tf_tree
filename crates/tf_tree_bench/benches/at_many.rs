@@ -1,7 +1,16 @@
 // Batch sampling: `at_many` with 1024 monotone stamps (`docs/PHASE1.md` §11.2
 // *Measurements* — reported as ns/sample). Monotone input lets each dynamic edge
 // gallop from a resumable cursor, so this is the O(1)-amortized path.
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    missing_docs,
+    // `at_many_recorded` prints one line on the path where it produces no rows.
+    // A group that skips silently reads exactly like one whose rows were never
+    // added, and these are the rows `docs/decisions/0060` §10.5 applies
+    // Decision A's stop rule to.
+    clippy::print_stderr
+)]
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
@@ -219,10 +228,20 @@ fn at_many_small(c: &mut Criterion) {
 ///   consumer gets rather than the one a fixture arranges.
 fn at_many_recorded(c: &mut Criterion) {
     let path = std::path::Path::new("testdata/tfstream/indoor_atelier.tfstream");
-    let Ok(stream) = TfStream::load(path) else {
-        // The bench runs from the workspace root; a caller who runs it from
-        // elsewhere gets the other groups rather than a panic.
-        return;
+    let stream = match TfStream::load(path) {
+        Ok(s) => s,
+        Err(e) => {
+            // The bench runs from the workspace root; a caller who runs the
+            // binary from elsewhere gets the other groups rather than a panic.
+            // **Said out loud**, because a group that silently produces no rows
+            // reads exactly like one whose rows were never added, and these are
+            // the rows `0060` §10.5 applies Decision A's stop rule to.
+            eprintln!(
+                "at_many_recorded: SKIPPED — {} unreadable: {e}",
+                path.display()
+            );
+            return;
+        }
     };
     let tree = stream
         .build_tree(InterpPolicy::ScLerp)

@@ -780,10 +780,10 @@ in; **these arms are an independent reimplementation from this record's own
 *Reproduction* section**, which is a difference worth holding onto when a number
 here disagrees with one there.
 
-Every arm passes the whole suite — 202 `tf_tree_core` tests and 113 `tf_tree`
-tests — including `tests/batch.rs`, which asserts `at_many` against `Plan::at` by
-`to_bits` over 700 stamps. An arm that computed something else would be
-measuring nothing.
+Every arm passes the whole suite — **89 `tf_tree_core` tests and 113 `tf_tree`
+tests, 202 together** — including `tests/batch.rs`, which asserts `at_many`
+against `Plan::at` by `to_bits` over 700 stamps. An arm that computed something
+else would be measuring nothing.
 
 **The arms:**
 
