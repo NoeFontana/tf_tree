@@ -4,10 +4,13 @@
 **Owner:** @NoeFontana
 **Implementation:** none of the engine. The prototype this record measures was
 built in a detached worktree at `681e601`, was never committed and is not coming
-in as it stands; the arms of steps 0b and 1 are built on it and are not
-committed either. **Step 0a is done and its harness *is* committed** —
-`crates/tf_tree_bench/examples/bracket_mix.rs`, which contains no engine code and
-nothing timed. Its result is §9 and it answers open question 1.
+in as it stands. **Steps 0a and 1 are done.** Step 0a's harness is committed —
+`crates/tf_tree_bench/examples/bracket_mix.rs`, no engine code and nothing timed
+— and its result is §9, which answers open question 1. Step 1's *arms* are not
+committed, but its **bench rows are** (`at_many_small/*` and
+`at_many_recorded/*`, which no campaign had run); its result is §10, which
+answers open question 2, attributes A's win and amends Decision A in three
+places. **Step 0b, which needs the vanished prototype's kernels, has not run.**
 
 ## Context
 
@@ -755,6 +758,180 @@ it is bit-identical by construction — so the all-fallback regime B fears is
 proposes no LerpSlerp kernel, which is the half of that this record has already
 decided.
 
+### 10. Step 1: what A's win actually is, and what it costs at small N
+
+**Three of this step's answers change the plan rather than confirm it**, and one
+of them is a cost no campaign had measured.
+
+#### Host and method
+
+Same machine and discipline as §1–§8 (AMD EPYC-Milan, `taskset -c 2`,
+`[profile.bench]`, no `-C target-cpu`, `CARGO_TARGET_DIR` unset), on **2026-09-17
+against `main` at `ac5d4d3`**, not against `681e601`. That substitution is
+checked rather than assumed: `git diff 681e601..main` over `plan.rs`,
+`sample.rs` and `interp.rs` is **empty**, and the only change to `dualquat.rs` in
+those eight commits is a `const _: () = assert!(…)` pin, which emits nothing. So
+the fold these arms modify is byte-identical to the one §1–§8 measured.
+
+Arms alternate inside each cell, the arm order rotates every rep, and deltas are
+paired per rep. Figures are paired medians over 4–5 reps with the paired range
+beside them. The prototype of §1–§8 is gone with the scratch directory it lived
+in; **these arms are an independent reimplementation from this record's own
+*Reproduction* section**, which is a difference worth holding onto when a number
+here disagrees with one there.
+
+Every arm passes the whole suite — 202 `tf_tree_core` tests and 113 `tf_tree`
+tests — including `tests/batch.rs`, which asserts `at_many` against `Plan::at` by
+`to_bits` over 700 stamps. An arm that computed something else would be
+measuring nothing.
+
+**The arms:**
+
+| arm | what it is |
+|---|---|
+| `base` | `main`, unmodified |
+| `hoist` | each dynamic step's `(interp, ring)` resolved **once per batch** instead of once per stamp per step. No chunking, no buffering, same loop order, same scalar `eval`, same cursor |
+| `accbuf` | steps outer / stamps inner over a 64-stamp chunk with **only the accumulator** buffered; sampling and `eval` stay fused per stamp |
+| `scal` | the full two-phase chunked fold, 64 lanes, phase 2 calling scalar `Interp::eval` |
+| `scal16` | `scal` at 16 lanes |
+
+#### 10.1 The win is the phase buffering, and nothing else comes close
+
+`at_many/monotone_1024` and `at_many/into_mat4_1024`, the flagship and the entry
+point §7 called the one to watch, with the untouched
+`at_many/into_quat_twist_1024` beside them as the control:
+
+| arm | `monotone_1024` | `into_mat4_1024` | `into_quat_twist_1024` |
+|---|---|---|---|
+| `hoist` | **+0.71%** | −1.59% | −0.12% |
+| `accbuf` | **−3.43%** [−4.49, −3.17] | **−1.29%** [−2.13, −0.33] | −1.07% |
+| `scal` | −25.10% [−25.83, −23.81] | −22.67% [−23.51, −22.35] | +0.52% |
+| `scal16` | −24.29% [−25.18, −23.38] | −22.95% [−24.31, −21.90] | — |
+
+**§7's three hypotheses, decided.** This record listed the restructure's
+mechanism as INFERRED — *"per-chunk sampler and policy resolution hoisted, the
+out-of-line `fold_at_cursors` call gone, loop layout"* — with *"none isolated"*.
+They are isolated now:
+
+- **The sampler and policy hoist buys nothing.** `Guard::sample_from` does
+  `edge(id)? + claim(id)? + ring_of(..)?` on every call, which at 1024 stamps ×
+  3 dynamic steps is **3 072 arena lookups where 3 would do**. Removing 3 069 of
+  them is **+0.71%** on the flagship — the wrong sign — and −1.59% on
+  `into_mat4`. Both inside the floor.
+- **The loop order and the out-of-line call are worth −1.3% to −3.4%**, also
+  inside the floor. `accbuf` makes the same loop-order change `scal` does, drops
+  the `fold_at_cursors` call the same way, and buffers the accumulator; what it
+  does *not* do is defer the `eval`.
+- **Deferring the `eval` carries the whole 23–25%.** `scal` minus `accbuf` is
+  the phase buffering and it is essentially all of it.
+
+**So step 1's escape hatch does not open.** Its stop point reads *"if one
+sub-change carries A's saving without phase buffering, land that and not A"*.
+None does. The buffering is the lever, which means the frame is not incidental
+to A — it is what A is, and §10.3 is therefore about A's shape rather than about
+a detail of it.
+
+The control behaves: `into_quat_twist_1024` reaches `fold_batch_with_twist`,
+which no arm touches, and reads −1.07% to +0.52% across every run.
+
+#### 10.2 A is uniform across entry points, so it does not need to bind per one
+
+| cell | `scal` vs `base` |
+|---|---|
+| `at_many/monotone_1024` | −24.50% [−25.31, −18.94] |
+| `at_many/into_mat4_1024` | −23.81% [−25.76, −6.68] |
+| `at_many/into_quat_1024` | −25.37% [−25.87, −22.42] |
+| `at_many/into_quat_twist_1024` (control) | −1.00% [−5.49, +0.05] |
+
+**§7's `into_mat4` weakness does not reproduce.** This record measured −6.2%
+there (−6.9% in §4), called it *"barely past the rule"*, and built Decision A's
+per-entry-point stop rule around it: *"`into_mat4` is the entry point to
+watch"*, with a second fold body accepted as the price of not abandoning a large
+win for one path's uniformity. Measured here across three independent runs,
+`into_mat4` is −22.7%, −23.2% and −23.8% — indistinguishable from the flagship's
+−24.5%, −24.7% and −25.1%.
+
+That retires the *MEASURED and INFERRED* table's **UNEXPLAINED** row, *"why
+`scal` is weak on `into_mat4`"*, by finding that it is not. Two campaigns saw
+that weakness and a third does not; what separates them is the prototype, since
+the fold is byte-identical. **The conservative reading is that the per-entry-point
+split is unnecessary, not that it is wrong** — see the Decision below.
+
+#### 10.3 Sixteen lanes, and the record's derivation of the frame was optimistic
+
+| N | `scal` (64 lanes) | `scal16` (16 lanes) |
+|---|---|---|
+| 1 | **+208.85%** | **+82.45%** |
+| 2 | — | **+14.82%** |
+| 3 | — | −11.10% |
+| 4 | — | −11.72% |
+| 8 | −12.96% | −21.60% |
+| 16 | −19.57% | −22.77% |
+| 63 | −23.82% | −23.87% |
+| 1024 | −24.72% | −24.29% |
+
+**Sixteen lanes is not a compromise: it is better everywhere it differs.** Equal
+at 1024 and 63, and strictly ahead below that — −21.6% against −13.0% at N = 8 —
+because it initialises a quarter as much.
+
+Stack reservation, summed over each prologue's `sub …,%rsp` including the page
+probes (`objdump -d -C`, the method of §3):
+
+| arm | `at_many` | `at_many_into_tagged` | `at_many_into_f32_tagged` |
+|---|---|---|---|
+| `base` | 1 256 B | 888 B | 344 B |
+| `scal` (64) | 17 720 B | 17 784 B | 17 656 B |
+| `scal16` (16) | **6 600 B** | **6 664 B** | **6 504 B** |
+
+*Consequences* predicted **4.8–5.0 kB** for 16 lanes, *"derived from §3's frame
+sizes… not built"*. Built, it is **6.5–6.7 kB** — the derivation is optimistic by
+about 35%, because more than the five buffers changed. The 64-lane figure lands
+where that section put it (~16 kB; 17.7 kB measured).
+
+#### 10.4 The cost nobody had measured: a batch smaller than a chunk
+
+**Both chunk sizes fail step 1's stop point as written**, which is *"no chunk
+size goes to step 2 whose N < 64 rows lose to `base` by more than noise"*. At one
+stamp the chunked fold is **3.1× slower at 64 lanes and 1.8× slower at 16**.
+
+The cause is not subtle and is visible in the source: `la`, `lb`, `ls` and `lp`
+are `[Iso3::IDENTITY; CHUNK]`, initialised on every call whatever the batch
+holds, so a caller asking for one stamp pays for sixteen. *Consequences* names
+the zeroing and reaches for `MaybeUninit` to remove it, then rules that out
+correctly as `unsafe` of no kind `0007` rule 1 permits.
+
+**A bypass costs nothing and needs no `unsafe`.** The crossover is measured, not
+interpolated: N = 2 is +14.82% and N = 3 is −11.10%, so a batch of fewer than
+**three** stamps takes the per-stamp fold and everything else takes the chunked
+one. Both sides of that threshold are measured rows, and the rows are committed
+(`at_many_small/*`), so the threshold can be re-derived on another host rather
+than trusted.
+
+#### 10.5 On the recorded stream, which is what A's stop rule is applied to
+
+§9's two plans over `indoor_atelier.tfstream`, 1024 monotone off-grid stamps,
+`scal16` against `base`:
+
+| plan | `at_many` | `at_many_into(Mat4)` |
+|---|---|---|
+| `laser → odom_combined` — one static step and the one **moving** dynamic edge | **−26.16%** [−26.27, −25.94] | **−23.44%** [−24.44, −23.21] |
+| `left_wheel_link → odom_combined` — adds a dynamic step that is motionless all recording (§9.1) | **−35.72%** [−37.76, −35.41] | **−19.69%** [−19.97, −19.04] |
+
+**A clears its ~5% floor by four to seven times at every entry point on real
+data, and wins more there than on the fixture.** The largest margin is on the
+plan that crosses a motionless edge — §9.1's regime, which is the mix a consumer
+of this recording actually gets rather than the one the fixture arranges.
+
+#### 10.6 What step 1 still owes
+
+**§1's baseline inversion is not explained.** That the non-monotone path is
+9.5–14.3 ns/stamp *faster* than the monotone one, when the cursor exists to make
+the monotone path the fast one, is still a recorded-and-not-investigated fact.
+Step 1 asked for it and this section does not deliver it: the non-monotone rows
+live in the uncommitted matrix bench, and the committed rows added here are all
+monotone. It is not decision-affecting for A — every arm above rides the same
+cursor as `base` — so it is carried rather than blocking.
+
 ### MEASURED and INFERRED
 
 | claim | standing |
@@ -765,14 +942,17 @@ decided.
 | `v2`'s LerpSlerp kernel fails the 1.3× probe bar; its ScLerp kernel clears it | MEASURED (1.268× and 1.796×, §2) |
 | the kernel loses 80–115% to the restructure on all-fallback data | MEASURED |
 | batch output is bit-identical to `Plan::at` in `base`, `v1`, `v2` and `scal` | MEASURED (three levels, mutants); §8 states which arm and profile each log covers |
-| **why** the restructure is faster (per-chunk sampler and policy resolution hoisted, the out-of-line `fold_at_cursors` call gone, loop layout) | INFERRED: hypotheses, none isolated |
-| why `scal` is weak on `into_mat4` | **UNEXPLAINED**: the census does not tell `scal` from `v1`/`v2` (§7 item 2) |
+| **why** the restructure is faster | **MEASURED and decided (§10.1)**: it is the **phase buffering**. Hoisting the sampler and policy is +0.71% / −1.59%; the loop order and the dropped `fold_at_cursors` call are −1.3% to −3.4%; deferring the `eval` carries the whole 23–25%. The three hypotheses this row listed are isolated, and two of them are not it |
+| why `scal` is weak on `into_mat4` | ~~**UNEXPLAINED**~~ — **it is not weak there.** §10.2 measures −22.7% / −23.2% / −23.8% across three independent runs, against the flagship's −24.5% / −24.7% / −25.1%. Two campaigns saw a weakness a third does not, on a byte-identical fold; what differs is the prototype |
+| A's win is uniform across batch entry points | MEASURED (§10.2), on an independent reimplementation. It is why Decision A no longer needs to bind per entry point |
+| the chunk size, and the frame it costs | **MEASURED (§10.3)**: 16 lanes equals 64 at N ≥ 63 and beats it below, at **6 600 B** of frame against 17 720 B. *Consequences* derived 4.8–5.0 kB for 16 lanes and marked it "not built"; built, it is 35% larger |
+| the 16 kB frame's per-call cost at small N | **MEASURED (§10.4)**, and it is the cost that was missing: **+82% at N = 1** even at 16 lanes, crossing over between N = 2 and N = 3. A bypass below 3 answers it with no `unsafe` |
+| A on the recorded stream, per entry point | MEASURED (§10.5): −19.7% to −35.7% across two plans and both entry points, clearing the ~5% floor by 4–7× and beating the fixture |
 | the real `/tf` mix of series, stationary, large-arc and knot segments | **MEASURED** on one recording (§9), by a committed harness whose every swept stamp is checked against `Plan::at` by `to_bits`. 4 of 5 edges never move; the fifth is 99.2% series per bracket. **One 47 s indoor run with no high-rate edge — §9.7 states the bias and what does not generalise** |
 | the series bound is `θ ≤ 0.15 rad` between samples, **for both policies** | MEASURED as an identity, not a fit: `SIN_HALF_THETA_SMALL_SQ` is defined as `sin(THETA_SLERP_SMALL)²` (§9.2) |
 | a motionless `ScLerp` edge takes the degenerate arm | **FALSE in general**, MEASURED (§9.3): it does so only when the quaternion's zero pattern makes `conj(q)·q` cancel exactly. Otherwise `sh2 ≈ 5e-36` and it is **series**. §5's "generic" is an erratum |
 | the chunk-level series fraction a bail-out would see | MEASURED (§9.4): near-bimodal, 70 of 74 chunks all-in or all-out, so no threshold to tune on this data |
 | a rough break-even for `v2` over `scal`: ~27% of elements falling back under ScLerp, ~24% under LerpSlerp | INFERRED, see below |
-| the 16 kB frame's per-call cost (zeroing 14.8 kB) at small N | UNMEASURED; N < 64 was not benchmarked (step 1 measures it) |
 | aarch64/NEON, `[profile.embedder]` (`lto = false`, `codegen-units = 16`), AVX hosts | UNMEASURED |
 | `read_bracket_from`'s earlier lap check is as sound as `sample_from`'s | ARGUED (below) and audited by the re-measurement; **no loom model** |
 
@@ -817,6 +997,22 @@ differ, the conservative reading above is the one carried forward.
      `into_mat4`'s −6.2% (§7; −6.9% in §4) is barely past the rule;
    - it needs no second body of any arithmetic;
    - it is the prerequisite for Decision B whatever B becomes.
+
+   **Three amendments from step 1's measurements (§10), 2026-09-17.**
+   - **Sixteen lanes, not sixty-four** (§10.3). They are equal at N ≥ 63 and 16
+     is ahead below it, at **6 600 B** of frame against 17 720 B. Open question
+     2 is answered from those rows.
+   - **A batch of fewer than three stamps takes the per-stamp fold** (§10.4).
+     The chunked path initialises its lanes whatever the batch holds, so it is
+     **+82% at N = 1** and +14.8% at N = 2 even at 16 lanes, and −11.1% at
+     N = 3. Without the bypass A fails its own step-1 stop point at every chunk
+     size; with it A wins at every batch size. It needs no `unsafe`, which is
+     what *Consequences* reached for and correctly refused.
+   - **One fold body, not one per entry point** (§10.2). `into_mat4`'s weakness
+     does not reproduce: it is −22.7% to −23.8% against the flagship's −24.5% to
+     −25.1%. The stop rule below still binds per entry point — a rule is not
+     repealed by a run that happens to pass it everywhere — but the *second fold
+     body* it was willing to buy is not needed, and A lands as one.
 
    Before it lands, step 1 measures its mechanism, its chunk size (a 16-lane arm
    beside 64) and batches under 64 stamps, and applies its stop rule. Open
@@ -929,7 +1125,9 @@ differ, the conservative reading above is the one carried forward.
   change a result. The error returned and the rows written are exactly the
   per-stamp fold's.
 - **The stack frame of every batch entry grows** from 344–1 256 B to ~16 kB at a
-  64-stamp chunk. That matters to `no_std` and small-stack embedders, and to
+  64-stamp chunk — **measured 17 720 B, and 6 600 B at the 16 lanes Decision A
+  now takes (§10.3)**; the rest of this bullet is written against 64 and its
+  arithmetic scales by a quarter. That matters to `no_std` and small-stack embedders, and to
   `API.md` §8.3's page-fault residual, since a first call can touch up to ~4
   more stack pages (inferred from the frame size, not measured). Two costs are
   in that, and they do not go away the same way:
@@ -1040,8 +1238,17 @@ differ, the conservative reading above is the one carried forward.
        - **The LerpSlerp kernel stays out of B** unless `copy`'s clears 1.3×
          in the probe and ~5% against `scal` on 0a's LerpSlerp edges. `v2`'s
          is not a candidate: it already failed the bar (§2).
-1. **Attribute A's mechanism, size its chunk, and apply A's stop rule.** Build
-   arms on the prototype that separately:
+1. **Attribute A's mechanism, size its chunk, and apply A's stop rule. DONE,
+   2026-09-17 — §10.** Measured on `main` rather than on `681e601`, which is
+   checked and not assumed: the fold is byte-identical across those eight
+   commits. The arms are an independent reimplementation from *Reproduction*,
+   because the prototype went with the scratch directory that held it.
+
+   **Outcome:** the phase buffering is the lever and nothing else is close
+   (§10.1); A is uniform across entry points (§10.2); 16 lanes beats 64 (§10.3);
+   a batch under three stamps must bypass the chunked path (§10.4); and on the
+   recorded stream A clears its floor by 4–7× at every entry point (§10.5). The
+   arms below were built and measured as follows:
    - hoist `view.sampler(edge)` and the policy dispatch per chunk into
      `681e601`'s fused loop;
    - inline, or remove the call to, `fold_at_cursors`;
@@ -1057,19 +1264,28 @@ differ, the conservative reading above is the one carried forward.
    - **Verified by** each arm's interleaved delta against `base` and against
      `scal`, with the flat `into_quat_twist_1024` control, and each arm's stack
      reservation read from its prologue as in §3, all recorded in this record.
-   - **Stop points:**
+   - **Stop points, and how each came out:**
      - **A's stop rule, per entry point.** Each batch entry point whose arm wins
        under ~5% against `base` on 0a's recorded stream keeps the per-stamp fold;
        A is abandoned here only if no entry point clears ~5%. `into_mat4` is the
-       entry point to watch (−6.2%, §7).
+       entry point to watch (−6.2%, §7). **PASSED at every entry point** —
+       −19.7% to −35.7% (§10.5) — and `into_mat4` is not the weak one (§10.2).
      - If one sub-change carries A's saving without phase buffering, land that
-       and not A.
+       and not A. **DID NOT FIRE.** `hoist` is +0.71% / −1.59% and `accbuf` is
+       −1.3% to −3.4%; the buffering carries the whole 23–25% (§10.1).
      - No chunk size goes to step 2 whose N < 64 rows lose to `base` by more
        than noise. Open question 2 is answered from these rows, in this record,
-       before step 2 starts.
-2. **Land A.**
+       before step 2 starts. **FAILED as written, at both chunk sizes** —
+       +208.9% at N = 1 for 64 lanes and +82.5% for 16 — and that is what the
+       small-N bypass in Decision A is for. With the bypass, no row loses.
+2. **Land A**, as amended by §10: **16 lanes, one fold body, and the per-stamp
+   fold for a batch under three stamps.**
    - **One read body.** `sample_from` expressed through the bracket read, so the
      scalar path runs the same lap check in the same position.
+   - **The bypass is a tested boundary, not a constant in a comment.** N = 2 and
+     N = 3 are committed bench rows either side of it (`at_many_small/*`), and
+     the threshold has to be re-derivable on another host rather than trusted
+     from this one.
    - **A loom model** for that read, mirroring the three `sample_from_*` lap
      models. It must carry a disabled-check control that fails, and run at
      `LOOM_MAX_PREEMPTIONS >= 3`.
@@ -1152,14 +1368,22 @@ differ, the conservative reading above is the one carried forward.
    moving edge is added to `testdata/tfstream/`, step 0a is re-run on it and B's
    stop rule is re-applied before B closes or lands.** Adding one is a change to
    this repository's test corpus and is not gated on this record.
-2. **Chunk size and stack.** 64 lanes cost ~16 kB of frame. At 16 lanes the five
-   buffers would be 3 712 B, so the frame would be about 4.8–5.0 kB if nothing
-   else in it changed (derived from §3's frame sizes, which carry 1 096–1 320 B
-   outside the buffers; not built). 16 lanes also give the loop vectoriser a
-   shorter trip count. Nobody has measured the trade, or N < 64 at all; step 1
-   does, and this question is answered from its rows. Is a batch-entry frame of
-   that size acceptable for `no_std` and small-stack embedders, and for the
-   real-time envelope `API.md` §8 states?
+2. ~~**Chunk size and stack.**~~ **ANSWERED, 2026-09-17 — §10.3 and §10.4.**
+   **Sixteen lanes**, with a per-stamp bypass below three stamps.
+
+   16 lanes measures **6 600 B** of frame (`at_many`; 6 664 B and 6 504 B for the
+   two `_into` entries) against 64 lanes' 17 720 B, and it is not a compromise:
+   equal at N = 1024 and N = 63, ahead everywhere below (−21.6% against −13.0% at
+   N = 8), because it initialises a quarter as much. **The 4.8–5.0 kB derived
+   above was optimistic by about 35%** — more than the five buffers changed —
+   which is what "not built" was hedging.
+
+   The question's last sentence is the part that outlives the number, and it is
+   **still open**: 6.6 kB is a batch-entry frame five times `base`'s 1 256 B, and
+   whether that is acceptable for `no_std` and small-stack embedders, and for
+   `API.md` §8's real-time envelope, is not something these rows can answer. What
+   they do say is that the price is 6.6 kB rather than 16 kB, and that the caller
+   who cannot pay it — the one asking for one or two stamps — no longer does.
 3. **One read body: is the lap check's move acceptable on the scalar path?**
    Decision A requires `sample_from` to become "read the bracket, then `eval`",
    which moves `Plan::at`'s lap check before `eval` too. The argument is above
