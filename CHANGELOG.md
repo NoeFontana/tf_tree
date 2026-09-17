@@ -41,6 +41,36 @@ is a bug.
 
 ## [Unreleased]
 
+### Added — the two `at_many` bench groups `0060` step 1 needed and nobody had run
+
+`at_many_small` (N = 1, 2, 3, 4, 8, 16, 63 at both pose entry points) and
+`at_many_recorded` (two plans over `indoor_atelier.tfstream`). Benchmarks only;
+no shipped crate changes. `cargo bench -p tf_tree_bench --bench at_many`.
+
+Every existing row in that file is 1024 stamps on the synthetic fixture, which
+measures the steady state on data step 0a showed is not the shape real `/tf`
+takes. What these two groups then measured (`0060` §10) amends its Decision A in
+three places:
+
+- **The two-phase fold's win is the phase buffering, and nothing else is close.**
+  Hoisting each step's `(interp, ring)` out of the per-stamp loop — 3 072 arena
+  lookups per batch where 3 would do — is **+0.71%** on the flagship. The loop
+  order and the dropped out-of-line call are −1.3% to −3.4%. Deferring the
+  `eval` carries the whole 23–25%. `0060` had all three as INFERRED hypotheses
+  with *"none isolated"*.
+- **Sixteen lanes beat sixty-four**: equal at N ≥ 63, ahead below it, at
+  **6 600 B** of stack frame against 17 720 B. The record derived 4.8–5.0 kB for
+  16 lanes and marked it *"not built"*; built, it is ~35% larger.
+- **A batch smaller than a chunk is where it hurts**: **+82% at N = 1** even at
+  16 lanes, crossing over between N = 2 and N = 3, because the lane buffers are
+  initialised whatever the batch holds. Both sides of that threshold are now
+  committed rows, so a small-N bypass has a measured boundary rather than a
+  guessed one.
+
+On the recorded stream the fold is −19.7% to −35.7% across two plans and both
+entry points — better than on the fixture, and best on the plan that crosses a
+motionless edge.
+
 ### Fixed — `shm_torture` could print `PASS` over an owner-kill arm that never fired
 
 The harness's floor for *"the §3.5 arm is on and never fired"* tested

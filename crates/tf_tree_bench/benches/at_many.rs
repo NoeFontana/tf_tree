@@ -1,12 +1,21 @@
 // Batch sampling: `at_many` with 1024 monotone stamps (`docs/PHASE1.md` §11.2
 // *Measurements* — reported as ns/sample). Monotone input lets each dynamic edge
 // gallop from a resumable cursor, so this is the O(1)-amortized path.
-#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    missing_docs,
+    // `at_many_recorded` prints one line on the path where it produces no rows.
+    // A group that skips silently reads exactly like one whose rows were never
+    // added, and these are the rows `docs/decisions/0060` §10.5 applies
+    // Decision A's stop rule to.
+    clippy::print_stderr
+)]
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use tf_tree::{Iso3, Layout, Stamp, SystemDomain};
-use tf_tree_bench::fixture;
+use tf_tree::{InterpPolicy, Iso3, Layout, Stamp, SystemDomain};
+use tf_tree_bench::{fixture, replay::TfStream};
 
 const N: usize = 1024;
 
@@ -143,5 +152,144 @@ fn at_many(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, at_many);
+/// Batches **smaller than one chunk**, which no campaign had ever run.
+///
+/// `docs/decisions/0060` Decision A folds a batch in chunks, so every row above
+/// — all of them 1024 stamps — measures the steady state and none of them
+/// measures the prologue. A chunked fold reserves and zeroes its lane buffers
+/// whether the batch fills them or not, so the cost a caller asking for **one**
+/// stamp pays is exactly the cost these rows exist to expose. Step 1's stop
+/// point is written against them: no chunk size goes to step 2 whose `N < 64`
+/// rows lose to the per-stamp fold by more than noise.
+///
+/// The plan and the stamps are the flagship's, so the only variable is `N`.
+fn at_many_small(c: &mut Criterion) {
+    let tree = fixture::build_tree().expect("build fixture");
+    let (_writers, _samples) = fixture::spin_up(&tree).expect("populate history");
+
+    let t = tree.frame("imu_link").expect("target");
+    let s = tree.frame("map").expect("source");
+    let plan = tree.plan(t, s).expect("plan");
+    let guard = tree.guard();
+
+    let now = fixture::NOW_NS;
+    let lo = now - 100_000_000;
+
+    let mut group = c.benchmark_group("at_many_small");
+    // Not `Throughput::Elements`: at N = 1 the per-batch cost *is* the answer,
+    // and dividing it by one element would hide that these rows are about the
+    // prologue rather than about the per-stamp rate.
+    for n in [1usize, 2, 3, 4, 8, 16, 63] {
+        let stamps: Vec<Stamp> = (0..n)
+            .map(|i| Stamp::from_nanos(lo + (now - lo) * i as i64 / n as i64))
+            .collect();
+        let nanos: Vec<i64> = stamps.iter().map(|s| s.nanos()).collect();
+        let mut out = vec![Iso3::IDENTITY; n];
+        let mut mat = vec![0.0f64; n * Layout::Mat4.elems()];
+
+        group.bench_function(format!("at_many_{n}"), |b| {
+            b.iter(|| {
+                plan.at_many(&guard, black_box(&stamps), &mut out)
+                    .expect("at_many");
+                black_box(&out);
+            });
+        });
+        group.bench_function(format!("into_mat4_{n}"), |b| {
+            b.iter(|| {
+                plan.at_many_into::<SystemDomain>(
+                    &guard,
+                    black_box(&nanos),
+                    Layout::Mat4,
+                    &mut mat,
+                )
+                .expect("at_many_into");
+                black_box(&mat);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The same two entry points over a **recorded** `/tf` stream.
+///
+/// Every other row in this file runs on the synthetic fixture, whose four
+/// dynamic edges publish at 50–1000 Hz on a smooth analytic screw. Step 0a
+/// measured what that costs in realism (`docs/decisions/0060` §9): on the one
+/// real recording in the tree, **four of five dynamic edges never move at all**
+/// and the fifth is 99.2% series per bracket. Decision A's stop rule is applied
+/// to *this* data, not to the fixture's, so the rows have to exist.
+///
+/// Two plans, chosen for what they cross rather than for their depth:
+///
+/// - `laser → odom_combined` is one static step and the one **moving** dynamic
+///   edge;
+/// - `left_wheel_link → odom_combined` adds a second dynamic step that is
+///   motionless for the whole recording — §9.1's regime, and the mix a real
+///   consumer gets rather than the one a fixture arranges.
+fn at_many_recorded(c: &mut Criterion) {
+    let path = std::path::Path::new("testdata/tfstream/indoor_atelier.tfstream");
+    let stream = match TfStream::load(path) {
+        Ok(s) => s,
+        Err(e) => {
+            // The bench runs from the workspace root; a caller who runs the
+            // binary from elsewhere gets the other groups rather than a panic.
+            // **Said out loud**, because a group that silently produces no rows
+            // reads exactly like one whose rows were never added, and these are
+            // the rows `0060` §10.5 applies Decision A's stop rule to.
+            eprintln!(
+                "at_many_recorded: SKIPPED — {} unreadable: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let tree = stream
+        .build_tree(InterpPolicy::ScLerp)
+        .expect("replay tree");
+    let (lo, hi) = stream.common_window().expect("common window");
+
+    // 1024 monotone stamps across the window, offset 1 ns so none lands on a
+    // knot — §9's `rate` sweep, which is the consumer shape.
+    let stamps: Vec<Stamp> = (0..N)
+        .map(|i| Stamp::from_nanos(lo + 1 + (hi - lo - 2) * i as i64 / N as i64))
+        .collect();
+    let nanos: Vec<i64> = stamps.iter().map(|s| s.nanos()).collect();
+    let guard = tree.guard();
+
+    let mut group = c.benchmark_group("at_many_recorded");
+    group.throughput(Throughput::Elements(N as u64));
+    for (name, target, source) in [
+        ("moving", "laser", "odom_combined"),
+        ("mixed", "left_wheel_link", "odom_combined"),
+    ] {
+        let t = tree.frame(target).expect("target");
+        let s = tree.frame(source).expect("source");
+        let plan = tree.plan(t, s).expect("plan");
+        let mut out = vec![Iso3::IDENTITY; N];
+        let mut mat = vec![0.0f64; N * Layout::Mat4.elems()];
+
+        group.bench_function(format!("{name}_at_many_1024"), |b| {
+            b.iter(|| {
+                plan.at_many(&guard, black_box(&stamps), &mut out)
+                    .expect("at_many");
+                black_box(&out);
+            });
+        });
+        group.bench_function(format!("{name}_into_mat4_1024"), |b| {
+            b.iter(|| {
+                plan.at_many_into::<SystemDomain>(
+                    &guard,
+                    black_box(&nanos),
+                    Layout::Mat4,
+                    &mut mat,
+                )
+                .expect("at_many_into");
+                black_box(&mat);
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, at_many, at_many_small, at_many_recorded);
 criterion_main!(benches);
