@@ -463,8 +463,26 @@ fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "a run in which no survivor ever called `owner_lost` passed. The owner was killed \
-         and the arena is ownerless, so this run proved nothing about §3.5.\n{stdout}\n{stderr}"
+        "a run in which no survivor ever called `owner_lost` passed, so this run proved \
+         nothing about §3.5.\n{stdout}\n{stderr}"
+    );
+    // **The message must not assert a kill that may not have happened.** This
+    // assertion read *"The owner was killed and the arena is ownerless"* until
+    // 2026-09-17, and on the 2026-09-16 nightly it printed that over a run whose
+    // own output said `§3.5: 0 owner kill(s)`: every attempt had been deferred
+    // because the fleet's replacements were still paging their binaries in, and
+    // the harness's floor could not see a single-attempt run. Both halves are
+    // fixed — the floor counts attempts now, and the arm retries in
+    // milliseconds rather than at the next tenure — so a deferred-out run
+    // reaches here as a *failure* rather than a pass. It is still not this
+    // test's subject, so it is named separately instead of being reported as a
+    // migration that did not recover.
+    assert!(
+        !stderr.contains("produced 0 migration(s)"),
+        "the owner-kill arm never fired on this host, so `--no-inherit` tested nothing: every \
+         attempt was deferred for want of a second eligible heir. That is a statement about \
+         this fleet's population, not about §3.5 — raise --children or lower \
+         --kill-hz.\n{stdout}\n{stderr}"
     );
     assert!(
         stderr.contains("ownership migration did not happen"),
@@ -478,6 +496,202 @@ fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
         stdout.contains("NO fresh process joined"),
         "the failure must say that no fresh process could join, which is the property \
          §3.5 restores and the one an internal flag cannot observe.\n{stdout}"
+    );
+}
+
+/// **A run whose owner-kill arm fired and never landed FAILS, however short it
+/// is.**
+///
+/// The floor for "the arm is on but never fires" counted the schedule's
+/// *second* attempt (`duration >= OWNER_KILL_FIRST + every`, 12 s at the
+/// defaults), so a shorter run got one attempt in its whole life and, if that
+/// attempt deferred, printed `PASS` over `§3.5: 0 owner kill(s)`. Measured
+/// 2026-09-16 by mutating the deferral test to defer everything: `--duration
+/// 6s` exited **0**, `--duration 13s` exited 1.
+///
+/// That is what the 2026-09-16 nightly hit — three children still in `D` state
+/// paging their own binaries in, a census of 1, one deferral, a vacuous pass —
+/// and what made `a_run_that_never_inherits_the_owner_role_fails_naming_it`
+/// report a kill that had not happened.
+///
+/// `--defer-owner-kills` is the positive control for the path. It is a flag
+/// because nothing else reaches it: `--children` is refused below the pool
+/// floor, and on an unloaded host a replacement's handshake is over in about a
+/// millisecond, so `--kill-hz 40` and six busy loops pinned to one core both
+/// leave every kill landing.
+///
+/// Mutant (applied, confirmed fatal): restore the condition to
+/// `a.duration >= OWNER_KILL_FIRST + every` — this run exits 0 and the first
+/// assertion fails.
+#[test]
+fn a_short_run_whose_owner_kills_all_defer_fails_instead_of_passing() {
+    let out = torture(&[
+        "--duration",
+        "6s",
+        "--children",
+        "4",
+        "--kill-hz",
+        "4",
+        "--seed",
+        "999",
+        // Far more than the run can attempt, so every one of them defers.
+        "--defer-owner-kills",
+        "999",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a run whose every owner kill deferred printed PASS. It killed no owner, so it \
+         covers none of §3.5 and must not be quoted as if it did.\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("produced 0 migration(s)"),
+        "the failure must say the arm produced no migration, and from how many attempts — \
+         a run that failed on the read floor instead would satisfy the assertion above while \
+         saying nothing about the owner.\n{stdout}\n{stderr}"
+    );
+    // The run's own tally has to agree with the verdict, or the verdict is
+    // reading something other than what happened.
+    assert!(
+        stdout.contains("shm_torture: §3.5: 0 owner kill(s)"),
+        "the run reported a migration it was not supposed to be able to make.\n{stdout}"
+    );
+}
+
+/// **A deferral that clears costs the run nothing.**
+///
+/// The other half of the same change, and the one that keeps the fix from being
+/// a harness that fails on its own scheduling. A deferral used to re-arm the
+/// kill a whole `--owner-kill-every` later, so two of them pushed the first kill
+/// from 4 s to 20 s — past the end of any short run. Retrying at
+/// `OWNER_KILL_DEFERRAL_RETRY` instead means the fleet gets another chance as
+/// soon as a replacement has finished its handshake, which is what a deferral is
+/// waiting for.
+///
+/// Two forced deferrals, then the arm is left alone: the run must migrate and
+/// pass. Under the old cadence this configuration had zero migrations by its
+/// deadline and would now fail the floor above.
+///
+/// Mutant (applied, confirmed fatal): re-arm with `every` on the deferred
+/// branch — the run reaches its deadline with no migration and fails.
+#[test]
+fn a_deferral_that_clears_still_leaves_time_for_the_kill() {
+    let out = torture(&[
+        "--duration",
+        "8s",
+        "--children",
+        "4",
+        "--kill-hz",
+        "4",
+        "--seed",
+        "7",
+        "--defer-owner-kills",
+        "2",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "two deferrals that cleared cost the run its owner kill.\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("deferred for want of a second eligible heir: 2"),
+        "the control did not defer the two kills it was asked to, so this run does not \
+         exercise the retry at all.\n{stdout}"
+    );
+    assert!(
+        stdout.contains("shm_torture: §3.5: 1 owner kill(s)"),
+        "the arm never recovered from the deferrals; the retry is what this pins.\n{stdout}"
+    );
+}
+
+/// **The deferral budget has a floor, because it is derived from a caller's
+/// number.**
+///
+/// The budget is `3 × --owner-kill-every`, which is 24 s at the defaults and
+/// **zero** at `--owner-kill-every 0s` — an accepted input meaning "kill the
+/// owner every round". A zero budget makes the *first* deferral fatal, which is
+/// stricter than the three this harness has always allowed and for a reason
+/// about the caller's schedule rather than about the fleet.
+///
+/// Measured: with the floor the run reports a `1.0s budget` and tolerates six
+/// deferrals; without it, one.
+///
+/// Mutant (applied, confirmed fatal): drop the `.max(MIN_OWNER_KILL_DEFERRAL_
+/// BUDGET)` — the run wedges at `Deferrals so far: 1` and the last assertion
+/// fails.
+#[test]
+fn the_deferral_budget_does_not_collapse_on_a_zero_interval() {
+    let out = torture(&[
+        "--duration",
+        "6s",
+        "--children",
+        "4",
+        "--kill-hz",
+        "4",
+        "--seed",
+        "5",
+        "--owner-kill-every",
+        "0s",
+        "--defer-owner-kills",
+        "999",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // It still fails — every kill was forced to defer — but on the budget, not
+    // on the first attempt.
+    assert!(
+        !out.status.success(),
+        "a run whose every owner kill deferred printed PASS.\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("of 1.0s budget"),
+        "the budget did not take its floor, so a zero interval derived a zero \
+         budget.\n{stdout}"
+    );
+    // The floor's whole purpose: a single deferral must not be fatal.
+    let deferrals: usize = stderr
+        .split("Deferrals so far: ")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|d| d.parse().ok())
+        })
+        .unwrap_or(0);
+    assert!(
+        deferrals >= 3,
+        "the run wedged after {deferrals} deferral(s); the budget exists so that ordinary \
+         churn — a replacement finishing its handshake — clears, and three has been the \
+         tolerated number since the bound was a count.\n{stdout}\n{stderr}"
+    );
+}
+
+/// **`--defer-owner-kills` is refused when there is no arm to defer.**
+///
+/// The rule `--crash-points` already follows for a flag whose sites are
+/// compiled out: a control that silently does nothing is worse than one that
+/// says it cannot.
+#[test]
+fn deferring_owner_kills_without_the_arm_is_refused() {
+    let out = torture(&[
+        "--duration",
+        "5s",
+        "--children",
+        "4",
+        "--no-kill-owner",
+        "--defer-owner-kills",
+        "2",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the run accepted a control over an arm it had turned off.\n{stderr}"
+    );
+    assert!(
+        stderr.contains("there is no owner-kill arm to defer"),
+        "the refusal must name what is missing.\n{stderr}"
     );
 }
 

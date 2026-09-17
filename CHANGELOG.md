@@ -41,6 +41,54 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — `shm_torture` could print `PASS` over an owner-kill arm that never fired
+
+The harness's floor for *"the §3.5 arm is on and never fired"* tested
+`duration >= OWNER_KILL_FIRST + every` — the schedule's **second** attempt, 12 s
+at the defaults. A shorter run therefore got **one** attempt in its whole life,
+and if that attempt deferred for want of a second eligible heir, the run printed
+`PASS` beside its own `§3.5: 0 owner kill(s)`. That is the exact outcome the
+guard's own comment says must land in the guard instead.
+
+Test-harness only; no shipped crate changes.
+
+- **Demonstrated, not argued.** Mutating the deferral test so every owner kill
+  defers: `--duration 6s` exited **0** and printed `PASS`, `--duration 13s`
+  exited 1. The 2026-09-16 scheduled nightly hit it for real — three children
+  still in `D` state paging their own binaries in
+  (`folio_wait_bit_common`), a census of 1, one deferral — and the
+  `--no-inherit` self-test then failed asserting *"The owner was killed and the
+  arena is ownerless"* over a run that had killed no owner.
+- **The floor counts attempts now**, which is what the duration arithmetic was
+  standing in for and cannot be off by a scheduling round. The message reports
+  migrations *and* attempts.
+- **A deferral re-arms in milliseconds, not at the next tenure.**
+  `OWNER_KILL_DEFERRAL_RETRY` is 250 ms, clamped to `--owner-kill-every`. What a
+  deferral waits for is a replacement's handshake — about a millisecond on an
+  idle host, 106–173 ms on that runner by its own `[diag] slow-join` lines — so
+  re-arming 8 s later made one transient thinness fatal to any run shorter than
+  the schedule. A 6 s run now gets eight attempts instead of one.
+- **The 24 s failure semantics are unchanged**, re-expressed as a budget
+  (`3 × --owner-kill-every`) over one unbroken run of deferrals rather than as
+  three consecutive schedule-paced attempts. Verified: a forced 40 s run wedges
+  at 24.1 s of its 24.0 s budget.
+- **The budget has a floor**, because it is derived from a caller's number:
+  `--owner-kill-every 0s` is accepted and means "every round", which would
+  derive a **zero** budget and make the *first* deferral fatal — stricter than
+  the three this harness has always allowed. One second, four attempts at the
+  retry cadence. Measured: with the floor the run reports a `1.0s budget` and
+  tolerates six deferrals; without it, one.
+- **`--defer-owner-kills N` is the positive control for the deferral path**, in
+  the same family as `--stop-owner-ms`. Nothing else reaches it: `--children` is
+  refused below the pool floor, and on an unloaded host a replacement's
+  handshake is over in about a millisecond, so `--kill-hz 40` and six busy loops
+  pinned to one core both leave every kill landing. Refused with
+  `--no-kill-owner` rather than silently doing nothing.
+- **The `--no-inherit` self-test no longer asserts a kill that may not have
+  happened**, and names the population instead when the arm never fired.
+- Three new self-tests, each run against a deliberate mutant and observed to
+  fail.
+
 ### Added — `bracket_mix`: which interpolation region a real `/tf` stream lands in
 
 [`0060`](docs/decisions/0060-the-batch-fold-that-reads-before-it-interpolates.md)
