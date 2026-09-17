@@ -367,18 +367,59 @@ mod imp {
     /// the kill rate would be a gate quietly doing less than it claims.
     const MIN_ATTACHED_FOR_ORDINARY_KILL: u64 = 3;
 
-    /// How many owner kills in a row may be deferred for want of a second
-    /// eligible heir before the run calls it a wedge.
+    /// How long one scheduled owner kill may stay deferred for want of a
+    /// second eligible heir before the run calls it a wedge, expressed in
+    /// `--owner-kill-every` intervals.
     ///
-    /// Three, not one: a single interval can legitimately catch the fleet mid
+    /// Three, not one: a single attempt can legitimately catch the fleet mid
     /// churn — a replacement is `fork`ed at the top of a round and still has a
     /// handshake to finish — and failing on that would be a harness that fails
-    /// on its own scheduling. Three consecutive intervals is `3 × --owner-kill-
-    /// every` (24 s at the default) with no second participant ever attached,
-    /// which is not churn. It is deliberately a small number: the cost of being
-    /// wrong in this direction is one red run naming the population, and the
-    /// cost of being wrong in the other is a green run over a dead arena.
-    const MAX_CONSECUTIVE_DEFERRALS: usize = 3;
+    /// on its own scheduling. `3 × --owner-kill-every` (24 s at the default)
+    /// with no second participant ever attached is not churn. It is
+    /// deliberately a small number: the cost of being wrong in this direction
+    /// is one red run naming the population, and the cost of being wrong in the
+    /// other is a green run over a dead arena.
+    ///
+    /// **This used to be a count of consecutive deferrals, and the difference
+    /// is the 2026-09-16 nightly.** A deferral re-armed the kill a full
+    /// `--owner-kill-every` later, so "three in a row" and "24 s" were the same
+    /// statement — and a run shorter than `OWNER_KILL_FIRST + every` got
+    /// **one** attempt in its whole life. On a runner whose children were still
+    /// paging their own binaries in (`D` state, `folio_wait_bit_common`), that
+    /// one attempt saw a census of 1, deferred, and the run ended having killed
+    /// no owner at all. Separating the budget from the retry cadence
+    /// ([`OWNER_KILL_DEFERRAL_RETRY`]) keeps the 24 s failure semantics exactly
+    /// and gives a 6 s run eight attempts instead of one.
+    const OWNER_KILL_DEFERRAL_BUDGET_INTERVALS: u32 = 3;
+
+    /// How soon a deferred owner kill is retried.
+    ///
+    /// **A deferral is a kill that did not happen, so it must not cost a whole
+    /// inter-kill period.** What it waits for is a replacement finishing its
+    /// handshake, which is milliseconds locally and ~150 ms on a cold CI runner
+    /// (measured: `[diag] slow-join` lines report 106–173 ms, nearly all of it
+    /// before `open` is called). Re-arming at `--owner-kill-every` waited 8 s
+    /// for a 150 ms event and, on a short run, never retried at all.
+    ///
+    /// Clamped to `--owner-kill-every` at the call site so a caller who asks for
+    /// a faster schedule than this gets their schedule, not this floor.
+    const OWNER_KILL_DEFERRAL_RETRY: Duration = Duration::from_millis(250);
+
+    /// The shortest a deferral budget may be, whatever `--owner-kill-every` is.
+    ///
+    /// The budget is `OWNER_KILL_DEFERRAL_BUDGET_INTERVALS × --owner-kill-every`,
+    /// and that interval is a caller's number: `--owner-kill-every 0s` is
+    /// accepted today and means "kill the owner every round", which would derive
+    /// a **zero** budget and make the *first* deferral fatal — stricter than the
+    /// three this harness has always allowed, and for a reason that is about the
+    /// caller's schedule rather than the fleet.
+    ///
+    /// One second is sized against what a deferral actually waits for: a
+    /// replacement finishing its handshake, about a millisecond on an idle host
+    /// and 106–173 ms on the CI runner that produced the 2026-09-16 nightly. At
+    /// the 250 ms retry it is four attempts, so the floor never tolerates fewer
+    /// deferrals than the three the interval-derived budget was written for.
+    const MIN_OWNER_KILL_DEFERRAL_BUDGET: Duration = Duration::from_secs(1);
 
     /// How often the observer reads while a migration is in flight.
     ///
@@ -515,6 +556,25 @@ mod imp {
         /// The negative control for §3.5: children never call
         /// `Tree::owner_lost`, so nothing inherits and the run must fail.
         no_inherit: bool,
+        /// `--defer-owner-kills N`: force the first `N` owner-kill attempts to
+        /// defer, whatever the population actually is.
+        ///
+        /// **The positive control for the deferral path**, in the same family
+        /// as `--victim-ballast-mb` and `--stop-owner-ms`: a path CI reaches
+        /// and no test could produce. A real deferral needs the attached pool
+        /// to be below its floor at the instant the arm fires, and the CLI
+        /// cannot arrange that — `--children` is refused below the floor, and
+        /// on an unloaded host a replacement's handshake is over in about a
+        /// millisecond, so raising `--kill-hz` to 40 still leaves every kill
+        /// landing (measured 2026-09-16, and under six busy loops pinned to one
+        /// core as well). The runner's deferral came from page-cache I/O, which
+        /// no flag reproduces.
+        ///
+        /// It defers *after* the pre-kill census, so `heirs_before` and the
+        /// `starved` classification stay truthful — a forced deferral on a
+        /// healthy fleet exercises the non-starved branch, which is the one the
+        /// nightly hit.
+        defer_owner_kills: usize,
         /// `--crash-site NAME`: arm **this** §11.3 site in every child instead
         /// of drawing one at random in a tenth of them.
         ///
@@ -595,6 +655,7 @@ mod imp {
             // came to be unmet for the life of the harness in the first place.
             owner_kill_every: Some(Duration::from_secs(8)),
             no_inherit: false,
+            defer_owner_kills: 0,
             crash_site: None,
             victim_ballast_mb: 0,
             stop_owner_ms: 0,
@@ -645,6 +706,14 @@ mod imp {
                 // and asserts on the message, because "the run failed" is also
                 // what a harness that fails unconditionally produces.
                 "--no-inherit" => a.no_inherit = true,
+                // **The positive control for the deferral path.** See
+                // [`Args::defer_owner_kills`] for why a flag is the only way to
+                // reach it. Refused without the arm it controls, rather than
+                // silently doing nothing: `--no-kill-owner --defer-owner-kills 2`
+                // asks to defer kills that are not scheduled.
+                "--defer-owner-kills" => {
+                    a.defer_owner_kills = value("--defer-owner-kills")?.parse()?;
+                }
                 // **The positive control for the kill-window class**, and the
                 // third of this harness's deliberate-failure flags beside
                 // `--inject-violation` and `--no-inherit`. Those two make the
@@ -767,6 +836,18 @@ mod imp {
                 children_floor
             );
         }
+        // **Refused rather than silently doing nothing**, which is the rule
+        // `--crash-points` already follows for a flag whose sites are compiled
+        // out. Deferring kills that are not scheduled is a caller asking for a
+        // control over an arm they have just turned off.
+        if a.defer_owner_kills > 0 && a.owner_kill_every.is_none() {
+            bail!(
+                "--defer-owner-kills {} with --no-kill-owner: there is no owner-kill arm to \
+                 defer. It is the positive control for the deferral path, so it needs the arm \
+                 it controls.",
+                a.defer_owner_kills
+            );
+        }
         if !(0.1..=100.0).contains(&a.kill_hz) {
             bail!(
                 "--kill-hz {} is outside §11.4's 1-10 Hz by more than a \
@@ -799,6 +880,14 @@ mod imp {
                  It is NOT portable: on a host with transparent_hugepage=always the pages \
                  are 2 MiB and the window collapses, which is why the regression test uses \
                  the flag below instead."
+            );
+            println!(
+                "  --defer-owner-kills N is the positive control for the DEFERRAL path: the \
+                 first N owner-kill attempts defer whatever the population is, as if the fleet \
+                 held only the role holder. A real deferral needs the attached pool below its \
+                 floor at the instant the arm fires, which the CLI cannot arrange — --children \
+                 is refused below the floor, and on an unloaded host a replacement's handshake \
+                 is over in about a millisecond. Refused with --no-kill-owner."
             );
             println!(
                 "  --stop-owner-ms is the PORTABLE positive control for the same window: \
@@ -2624,9 +2713,17 @@ mod imp {
         // How many owner kills were deferred for want of a second eligible
         // heir. Reported for the same reason.
         let mut owner_kills_deferred = 0usize;
-        // Deferrals since the last kill that actually happened. A deferral is
-        // meant to be transient; this is what stops it becoming a stall.
-        let mut consecutive_deferrals = 0usize;
+        // When the current unbroken run of deferrals began, and how many
+        // attempts it has cost. A deferral is meant to be transient; the clock
+        // is what stops it becoming a stall, and it is a clock rather than a
+        // count because the retry cadence is no longer the schedule's
+        // ([`OWNER_KILL_DEFERRAL_RETRY`]).
+        let mut deferring_since: Option<Instant> = None;
+        let mut deferrals_in_a_row = 0usize;
+        // Every time the arm fired, deferred or not. What the §3.5 floor reads
+        // to tell "the schedule never came due" from "it came due and nothing
+        // came of it" — the two the duration arithmetic could not separate.
+        let mut owner_kill_attempts = 0usize;
         // Ordinary draws skipped because the attached pool was at its floor.
         let mut thin_pool_draws_skipped = 0usize;
         // **A wedge is not a `violations` entry, and putting it there was a
@@ -2718,6 +2815,7 @@ mod imp {
             // under test rather than a quiet moment arranged for it.
             if let (Some(every), Some(at)) = (a.owner_kill_every, next_owner_kill) {
                 if Instant::now() >= at {
+                    owner_kill_attempts += 1;
                     let m = kill_the_owner(
                         &dir,
                         &observer,
@@ -2729,17 +2827,37 @@ mod imp {
                         migrations.len() + 1,
                         last_round_reads > 0,
                         a.stop_owner_ms,
+                        owner_kill_attempts <= a.defer_owner_kills,
                     );
                     reads.add(m.reads);
                     rounds += m.rounds;
                     println!("{}", m.line());
-                    next_owner_kill = Some(Instant::now() + every);
+                    // **A deferral re-arms in milliseconds; a kill re-arms on
+                    // the schedule.** What a deferral waits for is a
+                    // replacement's handshake, not the next scheduled tenure —
+                    // see [`OWNER_KILL_DEFERRAL_RETRY`] for the nightly that
+                    // made the difference matter. Clamped so a caller asking for
+                    // a schedule faster than the retry gets their schedule.
+                    next_owner_kill = Some(
+                        Instant::now()
+                            + if m.deferred {
+                                OWNER_KILL_DEFERRAL_RETRY.min(every)
+                            } else {
+                                every
+                            },
+                    );
                     // A deferral is a kill that never happened, so it is not one
                     // of this run's migrations and must not enter the ledger the
                     // verdict counts. It is reported through its own tally.
                     if m.deferred {
                         owner_kills_deferred += 1;
-                        consecutive_deferrals += 1;
+                        deferrals_in_a_row += 1;
+                        let since = *deferring_since.get_or_insert_with(Instant::now);
+                        // `saturating_mul` because `every` is a caller's
+                        // number and `Duration`'s `Mul` panics on overflow.
+                        let budget = every
+                            .saturating_mul(OWNER_KILL_DEFERRAL_BUDGET_INTERVALS)
+                            .max(MIN_OWNER_KILL_DEFERRAL_BUDGET);
                         // **A deferral has to clear, or it is the wedge wearing
                         // a politer name.** Two ways it never clears, and both
                         // end the run here rather than at the duration:
@@ -2759,12 +2877,23 @@ mod imp {
                         let starved = m.heirs_before == Some(0);
                         // [diag] Instrument 2, at every deferral. The starved
                         // stop is a deferral too, so it is covered here. See
-                        // `population_diag`. Bound: one line per deferral.
+                        // `population_diag`. Bound: one line per deferral, so
+                        // one per [`OWNER_KILL_DEFERRAL_RETRY`] while a
+                        // deferral is unbroken — about 96 for a full 24 s
+                        // budget, where the old schedule-paced retry gave 3.
+                        // Measured on a forced 40 s run: 67 lines to the wedge.
+                        // Kept at that volume on purpose: what diagnoses a
+                        // wedge is the census *trajectory*, and three samples
+                        // eight seconds apart cannot show a pool recovering and
+                        // relapsing between them.
                         driver_diag(&population_diag(
                             &format!(
-                                "at deferral of owner kill {} (consecutive {}/{}, \
-                                 starved={starved})",
-                                m.n, consecutive_deferrals, MAX_CONSECUTIVE_DEFERRALS
+                                "at deferral of owner kill {} (attempt {} in a row, \
+                                 {:.1}s of {:.1}s budget, starved={starved})",
+                                m.n,
+                                deferrals_in_a_row,
+                                since.elapsed().as_secs_f64(),
+                                budget.as_secs_f64()
                             ),
                             "pre-kill census",
                             &dir,
@@ -2773,7 +2902,7 @@ mod imp {
                             &kids,
                             &m.before_seen,
                         ));
-                        if starved || consecutive_deferrals >= MAX_CONSECUTIVE_DEFERRALS {
+                        if starved || since.elapsed() >= budget {
                             wedge = Some(format!(
                                 "owner kill {} could not be attempted and the deferral did not \
                                  clear: {}. §3.5's trigger outcomes at this instant: {}. \
@@ -2790,7 +2919,7 @@ mod imp {
                                 } else {
                                     "the fleet held only the role holder for every attempt in a \
                                      row, so replacements are not completing their handshake \
-                                     between intervals"
+                                     between retries"
                                 },
                                 trigger_tally_line(&dir),
                                 migrations
@@ -2804,7 +2933,8 @@ mod imp {
                             ));
                         }
                     } else {
-                        consecutive_deferrals = 0;
+                        deferring_since = None;
+                        deferrals_in_a_row = 0;
                         // **Stop at the first unrecoverable wedge.**
                         //
                         // `recovered.is_none()` with `heirs_at_kill == 0` is
@@ -3493,20 +3623,38 @@ mod imp {
         // its own schedule. Silence here was the whole defect: §12.3 gate 3 read
         // "partly met" for the life of this harness because the arm did not
         // exist, and an arm that is on but never fires looks identical.
+        //
+        // **`owner_kill_attempts`, not arithmetic on the duration.** This
+        // condition read `a.duration >= OWNER_KILL_FIRST + every` until
+        // 2026-09-17, which is the schedule's *second* attempt — so a run
+        // shorter than 12 s at the default could defer its only attempt and
+        // print PASS over an arm that never fired, which is the exact outcome
+        // the paragraph above says must land here. Demonstrated by mutating the
+        // deferral test to defer everything: `--duration 6s` exited 0 and
+        // printed PASS over `§3.5: 0 owner kill(s)`, while `--duration 13s`
+        // failed correctly. It is what the 2026-09-16 nightly hit, and the
+        // self-test then reported a kill that had not happened.
+        //
+        // The attempt counter says the thing the duration was standing in for
+        // and cannot be off by a scheduling round: the arm fired, and nothing
+        // came of it. The duration arm is kept beside it for the case the
+        // counter cannot see — an arm that was due and never fired at all.
         if let Some(every) = a.owner_kill_every {
-            if migrations.is_empty() && a.duration >= OWNER_KILL_FIRST + every {
+            let attempted = owner_kill_attempts > 0;
+            if migrations.is_empty() && (attempted || a.duration >= OWNER_KILL_FIRST + every) {
                 bail!(
-                    "the owner-kill arm is on and ran {} time(s) in {:?}, which is fewer than \
-                     the schedule (first at {:?}, then every {:?}) requires. This run covers \
-                     none of docs/PHASE2.md §3.5 and must not be quoted as if it did. \
+                    "the owner-kill arm is on and produced {} migration(s) from {} attempt(s) \
+                     in {:?} (first due at {:?}, then every {:?}). This run covers none of \
+                     docs/PHASE2.md §3.5 and must not be quoted as if it did. \
                      {} owner kill(s) were DEFERRED for want of a second eligible heir — \
                      deferrals are deliberately not counted as migrations, precisely so that a \
                      run which deferred every one of them lands here instead of printing PASS \
                      over an arm that never fired. A nonzero deferral count with zero migrations \
-                     means the fleet never held two read-write participants at once: raise \
-                     `--children`, or lower `--kill-hz` so a replacement finishes its handshake \
-                     before the next draw.",
+                     means the fleet never held two read-write participants at any attempt: \
+                     raise `--children`, or lower `--kill-hz` so a replacement finishes its \
+                     handshake before the next draw.",
                     migrations.len(),
+                    owner_kill_attempts,
                     a.duration,
                     OWNER_KILL_FIRST,
                     every,
@@ -3921,6 +4069,10 @@ mod imp {
         n: usize,
         read_before: bool,
         stop_owner_ms: u64,
+        // `--defer-owner-kills`: defer this attempt whatever the census says.
+        // Applied *after* the census so `heirs_before` and `starved` stay
+        // truthful — see `Args::defer_owner_kills`.
+        force_defer: bool,
     ) -> Migration {
         let mut m = Migration {
             n,
@@ -3971,7 +4123,7 @@ mod imp {
         let mut before_kill = RoundHealth::default();
         census_with(observer, &mut before_kill, Some(&mut m.before_seen));
         m.heirs_before = Some(before_kill.slots_alive);
-        if before_kill.slots_alive < 2 {
+        if force_defer || before_kill.slots_alive < 2 {
             m.deferred = true;
             return m;
         }
