@@ -79,7 +79,9 @@ the original defect of this arm made unexpressible; the runbook section must
 carry a row per refusal status and those rows must contain the remedy words the
 message is forbidden to contain; and a new `HelloStatus` trips a wire-value
 tripwire, because safe Rust cannot enumerate an enum and neither list is derived
-from one.
+from one. The worked example that section quotes is asserted to be `Display`'s
+own output rather than a transcription of it, because a quoted message is the
+shape that drifts.
 
 ### Fixed — a C caller could not read the end of an error message, and `ArenaHeldButUnreachable` was 793 bytes of it (`0055` step 6)
 
