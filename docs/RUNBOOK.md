@@ -778,6 +778,11 @@ If a holder must keep running and its arena is written off, the escape hatch is
 `--force-new`, and it is a policy on the process that creates the arena, not a
 flag on `tf_tree`. There is no such flag; §0.0 records why.
 
+**This next table is about the *hatch*, not about your remedy — the remedy table
+is below it.** It answers one question: given what is held, does a forced create
+pass? Read it if you are considering `CreatePolicy::Always`; read the eight-row
+table further down to decide what to do.
+
 **It is not unconditional, and which holder is stuck decides whether it can help
 at all.** A forced create skips §3.4's participant scan and nothing else, so it
 still takes the ownership byte and still takes participant byte **0** — the
@@ -821,8 +826,16 @@ processes; it cannot. Read your row off the two facts it gives you:
 | lowest slot is 0, others too | held | the ownership byte and slot 0 both have to be free, in either order, and one process may hold both; the hatch then applies to what is left |
 | lowest slot is 1 or above | free | the stranded-participant case §3.4's hatch is for: `CreatePolicy::Always` **abandons** this arena and creates a fresh one, leaving the survivors publishing where nobody can reach them. Reach for inheritance first |
 | lowest slot is 1 or above | held | **two things are held, so stopping one is not enough**: the ownership byte's holder took it and never bound a socket, and the participant bytes are still held too. A forced create cannot pass this either — it must take the ownership byte before the participant bytes it may skip. Stop the ownership holder, then you are on row 5 |
-| `participant bytes 0x0` … `held for the whole open timeout` | held | nobody is attached and ownership was held throughout by a process that never served; nothing was created. Stop that process |
+| `nobody attached` … `held for the whole open timeout` | held | nobody is attached and ownership was held throughout by a process that never served; nothing was created. Stop that process |
 | `no byte was held at the open deadline` | — | the blocker let go while you were timing out. Retry; this is the one state that clears itself |
+
+**Two states are not in this table, and cannot reach you.** The
+`first_slot: None` arm with a non-empty mask prints *"no participant byte held,
+yet ownership could not be taken before the deadline"* for both ownership
+readings, and the rendezvous derives `first_slot` from the mask, so it never
+constructs that pair. The unit gate sweeps it because the variant's fields are
+`pub` and the arm is reachable by construction — not because an operator can
+meet it.
 
 **A forced create needs two more things besides the policy**, and the message
 no longer says so because it says nothing procedural: a layout to build from,

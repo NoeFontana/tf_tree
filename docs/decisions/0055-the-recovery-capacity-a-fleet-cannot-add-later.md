@@ -683,8 +683,8 @@ deliberately unplanned.
    parenthesised form, as `tf_tree_arena`'s `check.rs` and `frozen.rs` already
    spell it; a first version ended `: ArenaHeldButUnreachable`, a second
    spelling of a convention living in two other crates. **Convention (e), at
-   most 120 bytes, is not met and is no longer claimed**: these arms are 115 to
-   152 bytes, because (e) was derived for an arena error nested in two wrappers
+   most 120 bytes, is not met and is no longer claimed**: these arms are 116 to
+   145 bytes at the sample widths and 158 at the widest, because (e) was derived for an arena error nested in two wrappers
    carrying an errno, and this one carries a 64-bit mask and two 32-bit ids.
 
    **Five tests needed rewriting, not the three this step predicted**: the two
@@ -701,11 +701,15 @@ deliberately unplanned.
      `could not open the arena: {e}` into `tft_error::message`, which is
      `TFT_MESSAGE_LEN = 256` and truncated by `set_message` at 255 bytes (pinned), with a
      `?` substituted per non-ASCII **byte**. The `(0b1, true)` remedy as landed
-     is **790 bytes**, 816 with that prefix: a C operator reads as far as
-     `"Stop th"`, the whole remedy is gone, and the em-dashes render `???`. So
-     the reduction is what makes this arm legible to C at all, and
+     is **793 bytes** at a four-digit pid, 819 with that prefix: a C operator
+     reads to `"… can pass this. Stop"`, the whole remedy is gone, and the
+     em-dashes render `???`. (Earlier revisions of this bullet said 790/816 and
+     `"Stop th"` — the same state at a one-digit pid — and 788, a different
+     state. The figure moves with the pid and the mask, which is part of why
+     these numbers now live in one place each.) So the reduction is what makes
+     this arm legible to C at all, and
      [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
-     conventions (e) and (g) — at most 120 bytes, ending with the variant name
+     convention (g) — ending with the variant name
      as the runbook's search key — are the shape to reduce it to, for the reason
      that record already gives. **A test asserting the rendered message fits
      `TFT_MESSAGE_LEN` belongs to this step**; none exists for `IpcError`

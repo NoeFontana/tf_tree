@@ -853,13 +853,16 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
 /// (`Open::held_but_unreachable`). Applied ⇒ measured: the sibling test below
 /// fails, and it fails one assertion *earlier* than the message check — at
 /// `expected ArenaHeldButUnreachable with ownership_held, got …
-/// ownership_held: false`. **Mutant: `(Some(0), _) if false`, i.e. the slot-0
-/// arm folded back into the generic one.** Applied ⇒ measured, this test fails
-/// on the message assertions this test used to carry (deleted by `0055` step 6,
-/// which took the remedy out of the message), and the
-/// message it printed was the stranded-joiner one — "CreatePolicy::Always will
-/// create a fresh arena and abandon this one", recommended for the one state
-/// where it cannot work.
+/// ownership_held: false`. **A second mutant is recorded here as history and
+/// is no longer reproducible.** It folded the slot-0 arm into the generic one
+/// (`(Some(0), _) if false`) and was caught by this test's message assertions,
+/// whose failure showed the stranded-joiner remedy — *"CreatePolicy::Always
+/// will create a fresh arena and abandon this one"* — being recommended in the
+/// one state where it cannot work. `0055` step 6 deleted both the remedy and
+/// the arm it was folded into: there is one `write!` now, with `creator = if
+/// slot == 0`, so neither the mutation nor the assertions it reddened exist.
+/// The equivalent mutation today is dropping `, the creator's`, and that is
+/// caught by the `creator` assertion below and by the unit gate.
 #[test]
 fn a_live_byte_0_refuses_both_policies() {
     use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};

@@ -49,15 +49,15 @@ is a bug.
 substitutes `?` for **each non-ASCII byte**.
 
 `IpcError::ArenaHeldButUnreachable`'s worst state rendered **793 bytes** at a
-four-digit pid — 819 with that prefix. A C operator hitting a wedged arena read
+four-digit pid — 819 with that prefix, and more with a wider one. A C operator hitting a wedged arena read
 to `"… so no forced create can pass this. Stop"` and no further, with every
 em-dash as `???`. The remedy was entirely truncated away. Measured, not
 inferred; the figure moves with the pid and the mask, which is itself part of
 the problem.
 
 **The message now states facts and ends with its own name; the remedy moved to
-`docs/RUNBOOK.md`**, whose reader has every process in hand. The same state is
-**143 bytes** and ASCII, and **152** with the widest ids the fields can carry.
+`docs/RUNBOOK.md`**, whose reader has every process in hand. The same state is **143 bytes** and ASCII; the widest ids those fields can
+carry render **158**.
 The split is the point rather than the size: this type sees which lock bytes are
 held and cannot see who holds them, so it cannot tell one process holding two
 bytes from two holding one each — and a remedy that guesses is wrong in
@@ -68,8 +68,8 @@ than 165 lines into a bullet.
 
 The messages end with `(ArenaHeldButUnreachable)` — `0059` convention (g)'s
 parenthesised form, as `tf_tree_arena`'s `check.rs` and `frozen.rs` already
-spell it. **Convention (e), at most 120 bytes, is not met**: these arms are 115
-to 152 bytes, because (e) was derived for an arena error nested in two wrappers
+spell it. **Convention (e), at most 120 bytes, is not met**: these arms are 116
+to 145 bytes at the sample widths and 158 at the widest, because (e) was derived for an arena error nested in two wrappers
 whose payload is an errno, and this one carries a 64-bit mask and two 32-bit
 ids.
 

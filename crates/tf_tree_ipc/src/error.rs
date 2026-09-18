@@ -562,20 +562,27 @@ impl fmt::Display for IpcError {
             // living in two other crates.
             //
             // **Convention (e) — at most 120 bytes — is NOT met, and that is
-            // stated rather than claimed away.** These arms run 115 to 146
-            // bytes at the sample widths and further with wide ids. (e) was
+            // stated rather than claimed away.** These arms are over it; the
+            // gate measures them and `MESSAGE_BUDGET` is what binds them. (e)
+            // was
             // derived for an arena error nested inside *two* wrappers (35 + 21
             // bytes of prefix) carrying errnos and layout hashes; this variant
             // carries a 64-bit mask and two 32-bit ids, up to 38 bytes of
             // digits on their own. `MESSAGE_BUDGET` below is what binds it,
             // derived from the same C path `0059` measured.
             //
-            // ASCII and length both matter at the C boundary — `tft_tree_open_named` formats this into
-            // a 256-byte `tft_error::message` and substitutes `?` per non-ASCII
-            // byte, so the 788-byte four-branch version reached a C operator as
-            // `"... Stop th"` with its em-dashes as `???`. `MESSAGE_BUDGET` and
-            // `every_ipc_error_message_fits_the_c_abis_buffer` are the gate that
-            // did not exist when that shipped.
+            // ASCII and length both matter at the C boundary:
+            // `tft_tree_open_named` formats this into a 256-byte
+            // `tft_error::message` and substitutes `?` per non-ASCII byte, so
+            // the four-branch version this replaced lost its whole remedy to
+            // truncation and printed its em-dashes as `???`.
+            //
+            // **No byte counts in this comment, on purpose.** Every figure here
+            // was written into a code comment, a changelog entry and a decision
+            // record at once, and four review rounds found a stale copy every
+            // time. `MESSAGE_BUDGET` and
+            // `every_ipc_error_message_fits_the_c_abis_buffer` hold the numbers
+            // where they are executable.
             IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0,
                 ownership_held: true,
@@ -921,8 +928,8 @@ mod tests {
     }
 
     /// **Every message must survive the C ABI, which is a 256-byte array**
-    /// (`0055` step 6; `0059` conventions (e) and (g) are where the shape comes
-    /// from).
+    /// (`0055` step 6; `0059` convention (g) is where the shape comes from — (e)
+    /// is not met here, and the arm's own comment says why).
     ///
     /// `tft_tree_open_named`'s failure arm formats `could not open the arena:
     /// {e}` into `tft_error::message`, a `[c_char; TFT_MESSAGE_LEN]` with
@@ -930,15 +937,20 @@ mod tests {
     /// bytes and substitutes `?` for **each non-ASCII byte**, so an em-dash
     /// renders `???` and a long message loses its tail silently.
     ///
-    /// **This gate did not exist, and that is how a 788-byte remedy shipped.**
-    /// `ArenaHeldButUnreachable`'s four-branch remedy reached a C operator as
-    /// `"... Stop th"` — truncated before the remedy began, em-dashes as `???`.
-    /// Measured on #355 rather than inferred.
+    /// **This gate did not exist, and that is how a remedy three times this
+    /// budget shipped.** `ArenaHeldButUnreachable`'s four-branch remedy reached
+    /// a C operator truncated before the remedy began, em-dashes as `???`.
+    /// Measured on #355 rather than inferred; the figures live in `0055` step 6
+    /// and in `CHANGELOG.md`, once each, rather than a third time here.
     ///
     /// **Why 220.** 255 bytes are usable (the NUL takes one) and the longest
     /// fixed text a C path puts *before* one of these renderings is the bridge's
     /// `shared arena could not be created: `, 35 bytes
-    /// (`tf_tree_c::bridge::generic_failure_message`). 255 − 35 = 220. That path
+    /// (`tf_tree_c::bridge::generic_failure_message`). The three C-side facts
+    /// this rests on — the buffer size, the truncation bound and the `?`
+    /// substitution — are pinned by `tf_tree_c`'s
+    /// `the_message_buffer_is_the_size_this_crates_budget_assumes`, which is
+    /// what keeps the two crates in step in the direction this one cannot see. 255 − 35 = 220. That path
     /// appends `(arena_name {name:?})` afterwards, and the suffix is **not**
     /// subtracted because that function's own doc makes the name the part the
     /// buffer is meant to eat: *"the fixed clause leads, `OpenError`'s unbounded
@@ -1023,7 +1035,7 @@ mod tests {
         // **The budget must be a real constraint, not headroom nobody uses.**
         // Without this the assertions above would pass just as well against a
         // set of one-word messages, and the gate would say nothing about whether
-        // 229 is the right number.
+        // this budget is the right number.
         assert!(
             worst > MESSAGE_BUDGET / 2,
             "the worst message is only {worst} bytes, so this budget is not measuring anything"
@@ -1040,11 +1052,11 @@ mod tests {
             }
             .to_string();
             assert!(text.is_ascii(), "non-ASCII in {status:?}: {text}");
-            assert_eq!(
-                text.len(),
-                pinned,
-                "{status:?} moved from its pinned {pinned} bytes; it is already over the \
-                 {MESSAGE_BUDGET}-byte budget and may only shrink (0055 step 7)"
+            assert!(
+                text.len() <= pinned,
+                "{status:?} grew from {pinned} bytes to {}; these are over budget already \
+                 and may only shrink, which is `0055` step 7's work",
+                text.len()
             );
         }
     }
@@ -1111,18 +1123,23 @@ mod tests {
             //   * **a procedure.** What to stop, and which policy or builder to
             //     use, belong to `RUNBOOK.md`, whose reader can see the
             //     processes.
+            // **Case-folded, because the defect this forbids was capitalised.**
+            // The shipped text read "… Stop the process holding slot 0"; a
+            // lowercase-only `contains` let exactly that wording back in with
+            // all 98 tests green. Measured, not supposed.
+            let lower = message.to_ascii_lowercase();
             for forbidden in [
                 "same process",
                 "second process",
                 "one process",
                 "two processes",
                 "stop",
-                "CreatePolicy",
-                "AttachMode",
+                "createpolicy",
+                "attachmode",
                 "layout_if_creating",
             ] {
                 assert!(
-                    !message.contains(forbidden),
+                    !lower.contains(forbidden),
                     "{state}: {forbidden:?} is a count or a procedure, and this type has \
                      neither to offer: {message}"
                 );

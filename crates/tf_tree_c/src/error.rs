@@ -639,12 +639,19 @@ mod tests {
     /// **The buffer `tf_tree_ipc`'s message budget is derived from** (`0055`
     /// step 6).
     ///
-    /// `tf_tree_ipc::error`'s `MESSAGE_BUDGET` is 229 = 255 usable bytes minus
-    /// the 26-byte `could not open the arena: ` wrapper, and that crate cannot
-    /// see this constant — `tf_tree_c` depends on it, not the reverse. So the
-    /// derivation is repeated there and pinned here: if this buffer shrinks,
-    /// that budget is wrong in the unsafe direction and its gate would keep
-    /// passing.
+    /// `tf_tree_ipc::error`'s `MESSAGE_BUDGET` is 255 usable bytes minus the
+    /// **longest** fixed text a C path puts before one of its renderings, which
+    /// is `bridge::generic_failure_message`'s `shared arena could not be
+    /// created: ` — not the shorter `could not open the arena: ` an earlier
+    /// revision of this comment named. That crate cannot see these constants
+    /// (`tf_tree_c` depends on it, not the reverse), so the derivation is
+    /// repeated there and the three facts it rests on are pinned here: the
+    /// buffer's size, the truncation bound, and the `?` substitution. If any of
+    /// them moves, that budget is wrong in the unsafe direction and its own gate
+    /// would keep passing.
+    ///
+    /// **The number itself is deliberately not repeated here.** It was, and it
+    /// went stale in this file the moment it was corrected in the other one.
     ///
     /// It also pins the substitution, because a message that is merely *short*
     /// is not enough: `set_message` replaces each non-ASCII **byte** with `?`,
@@ -660,7 +667,7 @@ mod tests {
     fn the_message_buffer_is_the_size_this_crates_budget_assumes() {
         assert_eq!(
             TFT_MESSAGE_LEN, 256,
-            "tf_tree_ipc's MESSAGE_BUDGET of 229 is derived from 256; move both together"
+            "tf_tree_ipc's MESSAGE_BUDGET is derived from this; move both together"
         );
 
         // **The truncation bound itself, which is the "255 usable" term in that
