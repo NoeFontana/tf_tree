@@ -70,6 +70,12 @@ wrapper), with an exhaustive `match` so a new variant cannot go unmeasured, and
 the buffer the budget is derived from — the two crates cannot see each other's
 constants. Three further messages were non-ASCII and are now ASCII.
 
+The buffer pin carries an `#[allow(clippy::unnecessary_cast)]`, for the same
+reason `set_message` beside it has carried one since the first `ubuntu-24.04-arm`
+job this repository ran: `c_char` is `i8` on x86-64 and `u8` on aarch64, so
+reading the buffer back casts to the same type on exactly one of them. No
+behaviour differs between the two.
+
 **Disclosed and not fixed:** `IpcError::HandshakeRejected` is **378 bytes** at
 its worst status, and four of its seven statuses truncate. Its length is seven
 per-status remedies concatenated into the message — the same pattern, needing
