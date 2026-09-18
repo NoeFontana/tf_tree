@@ -59,15 +59,24 @@ least afford it. Both arms now name all three parts, in the same terms.
 **The same arm was telling an operator something false in a second way, and
 that is fixed here too.** It matched `(Some(0), _)` — discarding
 `ownership_held`, the one field whose own documentation says *"`Display` spends
-it"* — so in the reachable state where slot 0 holds a participant byte and some
-other process holds the ownership byte without serving (`release_ownership`
-produces it;
-`defect_201_release_ownership_strands_a_live_non_owner_on_byte_0` pins it), the
-message said *"it is the only holder, so an ordinary open will then create"*.
-Stopping that holder is necessary and not sufficient: the next open refuses on
-the ownership byte. The remedy now has four forms — participant mask crossed
-with the ownership byte — and the `(Some(slot), true)` arm is no longer the only
-one that mentions ownership at all.
+it"* — so it printed *"it is the only holder, so an ordinary open will then
+create"* even when the ownership byte was held by somebody else, where stopping
+the slot-0 holder is necessary and not sufficient. The remedy now branches on
+both bits.
+
+**What each branch may claim is now the constraint, because the first repair of
+this got it wrong.** `Display` sees which bytes are held; it cannot see who
+holds them. That matters because the usual holder of both is **one** process: a
+creator takes the ownership byte and then `CREATOR_SLOT` on the same `LockFile`
+and keeps both for as long as it serves, so `holder_slots: 0b1, first_slot:
+Some(0), ownership_held: true` is the steady state of every healthy
+single-owner arena, and any joiner that times out without reaching the socket
+reads that remedy. A first version of this fix told that operator to stop a
+second process as well — after one that need not exist. Each branch now names
+the bytes it knows about and hedges the holder, and
+`a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process` reaches
+that state through the public API — a live, serving owner whose socket was
+removed underneath it — and pins the hedge.
 
 No type changed: errors stay `Copy` identifiers with the prose in the message
 layer (`docs/API.md` R5). What is new is that the prose is now *pinned*.

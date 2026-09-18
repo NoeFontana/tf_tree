@@ -488,6 +488,97 @@ fn a_read_only_attach_refuses_to_create() {
     );
 }
 
+/// **A healthy owner holds both bytes, and that is the state the `(0b1, true)`
+/// remedy is written for** (#353, `0055` question 3).
+///
+/// The `(Some(0), _)` arm of `ArenaHeldButUnreachable` discarded
+/// `ownership_held` until #353, and the first repair replaced it with a remedy
+/// that asserted **two** holders — "stop that one too". That is false here, and
+/// here is not an exotic state: a creator takes the ownership byte and then
+/// `CREATOR_SLOT` on the same `LockFile` and holds both for as long as it
+/// serves, so **every healthy single-owner arena is `holder_slots: 0b1,
+/// first_slot: Some(0), ownership_held: true`**, and any joiner that times out
+/// without reaching the socket reads that remedy. Telling that operator to stop
+/// a second process sends them after one that does not exist.
+///
+/// This is what makes the state reachable through the public API rather than by
+/// constructing the error value: a live, serving owner whose socket has been
+/// removed underneath it (§3.9's removed socket; a wedged accept loop reads the
+/// same way to a joiner). The assertion is the *hedge* — the remedy may name the
+/// byte and may not name a holder it cannot see.
+///
+/// The message text for all four branches is pinned in `tf_tree_ipc`'s own
+/// `every_unreachable_remedy_names_what_the_operator_must_supply`; this test
+/// owes the reachability and the one clause an operator acts on.
+#[test]
+fn a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let scratch = Scratch::new("owner-holds-both");
+    let layout = || {
+        TreeBuilder::new()
+            .default_interp(InterpPolicy::LerpSlerp)
+            .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64)))
+    };
+
+    // A real owner: it creates, binds and serves, and it keeps the ownership
+    // byte and slot 0 for its whole life.
+    let owner = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .layout_if_creating(layout())
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("the owner must create and serve");
+    assert_eq!(
+        owner.participant_slot(),
+        0,
+        "the creator holds CREATOR_SLOT, which is what puts bit 0 in the mask"
+    );
+
+    // Remove the door while the owner is still behind it. Nothing about the
+    // owner changes: it is alive, serving, and holding both bytes.
+    let sock = scratch.0.join("0/default.sock");
+    std::fs::remove_file(&sock).expect("the rendezvous socket must exist to be removed");
+
+    let err = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .layout_if_creating(layout())
+        .timeout(std::time::Duration::from_millis(200))
+        .open()
+        .err()
+        .expect("a joiner that cannot reach the socket must be refused");
+
+    let tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable {
+        holder_slots,
+        first_slot,
+        ownership_held,
+        ..
+    }) = err
+    else {
+        panic!("expected ArenaHeldButUnreachable, got {err:?}");
+    };
+    assert_eq!(
+        (holder_slots, first_slot, ownership_held),
+        (0b1, Some(0), true),
+        "a live owner is one holder of both bytes: this is the state the remedy must fit"
+    );
+
+    let message = err.to_string();
+    assert!(
+        message.contains("usually by that same process"),
+        "the remedy must allow that one process holds both bytes: {message}"
+    );
+    assert!(
+        !message.contains("stop that one too"),
+        "the remedy must not send the operator after a second process that need not exist: \
+         {message}"
+    );
+
+    drop(owner);
+}
+
 /// **`RUNBOOK.md`'s escape hatch out of `ArenaHeldButUnreachable`, run as written.**
 ///
 /// `docs/PHASE2.md` §3.4 asks for it as `--force-new` and no binary ever grew
