@@ -83,13 +83,18 @@ fn receivable() -> Vec<HelloStatus> {
 fn section() -> &'static str {
     const RUNBOOK: &str = include_str!("../../../docs/RUNBOOK.md");
     // `\n### `, not `### `: a `#### ` subheading of the same name would match
-    // the start. The end bound stops at any heading depth — including `# `,
-    // which the first version left out while giving the argument for it — at a
-    // `## ` because a section that becomes the last `###` under its chapter
-    // would otherwise swallow the rest of the file and every `contains` below
-    // would go vacuous with nothing firing, and at a `#### ` because a
-    // subsection added under this one would lend it words the table does not
-    // have.
+    // the start.
+    //
+    // **The end bound is "any heading", not a list of depths.** A list is the
+    // depths somebody thought of, and two rounds of this file added one each
+    // time: `## `, because a section that becomes the last `###` under its
+    // chapter would swallow the rest of the file and every `contains` below
+    // would hold vacuously; then `# `; and then `#####`, found by measurement —
+    // a footnote under this section lent it a remedy word the table did not
+    // have and the required-word half passed on borrowed text. A heading is one
+    // to six `#`s then a space, which a fenced line could imitate; this
+    // section's one fence holds a rendered message and no shell, and that is a
+    // caveat rather than a guarantee.
     let after = RUNBOOK
         .split_once("\n### `HandshakeRejected`")
         .map_or("", |(_, after)| after);
@@ -100,10 +105,14 @@ fn section() -> &'static str {
         "docs/RUNBOOK.md must carry a `HandshakeRejected` section: it holds the remedies \
          that variant's message stopped carrying"
     );
-    let end = ["\n#### ", "\n### ", "\n## ", "\n# "]
-        .iter()
-        .filter_map(|h| after.find(h))
-        .min()
+    let is_heading = |line: &str| {
+        let hashes = line.len() - line.trim_start_matches('#').len();
+        (1..=6).contains(&hashes) && line[hashes..].starts_with(' ')
+    };
+    let end = after
+        .match_indices('\n')
+        .map(|(i, _)| i + 1)
+        .find(|&start| is_heading(after[start..].split('\n').next().unwrap_or("")))
         .unwrap_or(after.len());
     &after[..end]
 }
@@ -162,6 +171,14 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
             panic!("the `HandshakeRejected` table has no `What to do` column: {header}")
         });
 
+    // **`!= Ok` is a second spelling of `tf_tree_ipc`'s `status_is_a_refusal`,
+    // and it cannot be the first.** That predicate is the canonical answer to
+    // *which statuses owe a row*; it is `#[cfg(test)]`, so this crate cannot
+    // call it, and `HelloStatus` is `#[non_exhaustive]`, so this crate cannot
+    // re-derive it with a `match` either. The duplication is structural rather
+    // than lazy — and its failure mode is worth naming: a future status that is
+    // *not* a refusal gets a `false` arm there and would still be demanded a
+    // row here, two gates contradicting each other. Whoever adds one edits both.
     for status in receivable().into_iter().filter(|s| s != &HelloStatus::Ok) {
         // A **row**, not a mention: the section's prose names `VersionMismatch`
         // and `LayoutMismatch` while distinguishing them from the
@@ -219,9 +236,17 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     );
 
     // The rows say something, and the message says none of it.
+    // **Case-folded on both sides.** The forbidden half lowercases the message;
+    // this half compared raw, so capitalising a remedy at the start of a cell —
+    // `Restart them together` — reddened the gate with *"no longer says
+    // restart"*, a diagnostic that contradicts the file in front of the author.
+    // `0055` step 6 shipped a defect through a case-sensitive forbidden list;
+    // this is the same rule with its polarity flipped, and it fails closed
+    // instead of open.
+    let folded = section.to_ascii_lowercase();
     for word in REMEDY_WORDS {
         assert!(
-            section.contains(word),
+            folded.contains(word),
             "docs/RUNBOOK.md's `HandshakeRejected` section no longer says {word:?}, which \
              the message is forbidden to say: the remedy is in neither place"
         );

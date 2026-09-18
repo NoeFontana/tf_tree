@@ -819,9 +819,14 @@ deliberately unplanned.
    is about — a check whose name promises more than it asserts. The runbook's
    remedy words were required *of the section* and not of the row, so blanking a
    remedy cell passed with the row still present; a row's *what to do* cell now
-   has a floor, and blanking or stubbing one fails. (The words stayed
-   section-wide — see above — so a cell can still be replaced by *other* prose
-   of the same length. The floor is what a row owes.) The section's end bound
+   has a floor. **What the floor catches is an emptied cell, and that is all** —
+   *this said "blanking or stubbing one fails", and a stub over the floor does
+   not fail: a 65-byte "see the section below for what to do about this
+   particular status" passes, measured on round 10.* The mutant that justified
+   the sentence was a 17-byte stub, so the claim was true of that stub and not
+   of stubs. The words stayed section-wide for the reason above, so a cell can
+   also be replaced by other prose of the same length. A length is what a row
+   owes; whether it says anything is review's. The section's end bound
    stopped only at `###`, so a `HandshakeRejected` section that ever became the
    last one under its chapter would have swallowed the rest of the runbook and
    every `contains` in that test would have held vacuously. And
@@ -844,6 +849,22 @@ deliberately unplanned.
    addition that *can* reach an operator — a variant wired into the codec — and
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
+
+   **Round 10, and the end bound had been extended twice by guessing.** The
+   section's end was a list of heading depths — `####`, `###`, `##`, then `#`,
+   each added when somebody thought of it — and `#####` was not on it, so a
+   footnote under this section lent the table a remedy word it did not have and
+   the required-word half passed on borrowed text (measured). It matches any
+   heading now. Two more in the same file: the required-word half compared raw
+   while the forbidden half folded case, so capitalising a remedy at the start
+   of a cell reddened the gate with *"no longer says restart"* — a diagnostic
+   contradicting the file in front of its reader, and the same case-sensitivity
+   defect step 6 shipped, with the polarity flipped. And `!= Ok` is a second
+   spelling of `status_is_a_refusal` that cannot be the first — the predicate is
+   `#[cfg(test)]` and `HelloStatus` is `#[non_exhaustive]`, so the downstream
+   crate can neither call it nor rebuild it — which is now written where the
+   duplicate lives, with the contradiction it would produce if a future status
+   were not a refusal.
 
    **Round 8, two escapes, both measured by running them.** The derived
    enumeration probed `0..64`, so a status assigned wire value **64** was
