@@ -506,12 +506,13 @@ fn a_read_only_attach_refuses_to_create() {
 /// reclamation (#184): it abandons the arena and **leaves the byte held**, so
 /// the replacement's table is one slot smaller for as long as the survivor runs.
 ///
-/// **The two refusals in the middle are the message read verbatim** (`0055`
-/// step 2). `CreatePolicy::Always` is two thirds of a create: the arms of
-/// `ArenaHeldButUnreachable` that recommend it say so, and a reader who follows
-/// only the policy gets `NoLayoutToCreate` or `ReadOnlyCannotCreate` instead of
-/// an arena. Asserting both here is what keeps that sentence from decaying into
-/// a recovery path that fails when it is followed.
+/// **The refusal in the middle is the message read verbatim** (`0055` step 2).
+/// Switching the policy is not the whole call: the arms of
+/// `ArenaHeldButUnreachable` that recommend `CreatePolicy::Always` say a create
+/// also needs a layout to build from and a read-write mode to do it in, and a
+/// reader who follows only the policy gets `NoLayoutToCreate` instead of an
+/// arena. Asserting it here is what keeps that sentence from decaying into a
+/// recovery path that fails when it is followed.
 ///
 /// **Mutant: drop `self.create != CreatePolicy::Always &&` from step 4's
 /// condition** ⇒ measured — `Always` yields the ownership byte like every other
@@ -556,15 +557,24 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
         "expected ArenaHeldButUnreachable, got {err:?}"
     );
 
-    // **The message read verbatim, which is the half that drifts.** Every
-    // `ArenaHeldButUnreachable` arm that sends an operator to
+    // **The message read verbatim, in the state that reaches the lock file.**
+    // Every `ArenaHeldButUnreachable` arm that sends an operator to
     // `CreatePolicy::Always` also tells them a forced create needs a layout to
-    // build from and a read-write mode to build it in — `0055` step 2, and the
-    // reason that sentence is in two arms rather than one. These two assertions
-    // are what stops the prose and the code drifting apart again: switching the
-    // policy alone reaches a *second, different* error, exactly as the message
-    // says. Neither attempt creates anything, so the wedge is still the wedge
-    // for the successful call below.
+    // build from and a read-write mode to build it in (`0055` step 2). This
+    // asserts the half that is a property of *this* state: from here the
+    // rendezvous returns `Created`, and the policy alone then reaches a second,
+    // different error exactly as the message says.
+    //
+    // **The read-write half is deliberately not asserted here.** `Open::attempt`
+    // checks the mode before it resolves the runtime directory at all
+    // (`0019` plan step 1), so a read-only forced create never sees the stranded
+    // byte and asserting it beside this one would be a second spelling of
+    // `a_read_only_attach_refuses_to_create`. The message *text* — both halves,
+    // all four branches — is pinned in `tf_tree_ipc`'s own
+    // `every_unreachable_remedy_names_what_the_operator_must_supply`, which is
+    // what makes the prose non-revertible.
+    //
+    // The attempt creates nothing, so the wedge is still the wedge below.
     let no_layout = tf_tree::Open::new()
         .mode(AttachMode::ReadWrite)
         .create(CreatePolicy::Always)
@@ -575,19 +585,6 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
     assert!(
         matches!(no_layout, tf_tree::OpenError::NoLayoutToCreate),
         "the policy alone must not create; expected NoLayoutToCreate, got {no_layout:?}"
-    );
-
-    let read_only = tf_tree::Open::new()
-        .mode(AttachMode::ReadOnly)
-        .create(CreatePolicy::Always)
-        .layout_if_creating(layout())
-        .timeout(std::time::Duration::from_millis(100))
-        .open()
-        .err()
-        .expect("a forced create in read-only mode cannot create");
-    assert!(
-        matches!(read_only, tf_tree::OpenError::ReadOnlyCannotCreate),
-        "the layout alone must not create; expected ReadOnlyCannotCreate, got {read_only:?}"
     );
 
     let tree = creator(CreatePolicy::Always)
@@ -705,8 +702,16 @@ fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
         byte_0_message.contains("no forced create can pass this"),
         "the message must not send an operator to the escape hatch here: {byte_0_message}"
     );
+    // The wording gained "and the ownership byte is free" when that arm stopped
+    // discarding `ownership_held` (#353): the sufficiency of stopping slot 0 is
+    // *conditional* on it, and the message now says which condition it is. What
+    // this asserts is unchanged — in the one state where stopping slot 0 really
+    // is enough, the message says so.
     assert!(
-        byte_0_message.contains("it is the only holder, so an ordinary open will then create"),
+        byte_0_message.contains(
+            "it is the only holder and the ownership byte is free, so an ordinary open will \
+             then create"
+        ),
         "byte 0 alone: stopping it really is sufficient, and the message may say so: \
          {byte_0_message}"
     );

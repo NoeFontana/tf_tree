@@ -835,13 +835,24 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
 
   — *"…slot 0 (pid N) is the arena creator's own slot — CreatePolicy::Always
   takes slot 0 or nothing, so no forced create can pass this. Stop the process
-  holding slot 0: it is the only holder, so an ordinary open will then create"*.
-  When other slots are held too the same message ends *"the other slots in the
-  mask above are still held, so an ordinary open will still refuse — that is when
-  PHASE2 §3.4's CreatePolicy::Always becomes the escape hatch"*, because after
-  byte 0 frees you are in row 1 of the table above. The message branches there
-  rather than giving one remedy that is right in one state and wrong in the
-  other — which is the defect #257 was filed on, one state over.
+  holding slot 0: it is the only holder and the ownership byte is free, so an
+  ordinary open will then create"*.
+
+  **The remedy after the colon has four forms, and which one you get is the whole
+  point of the message.** It branches on the rest of the mask *and* on
+  `ownership_held`, rather than giving one remedy that is right in one state and
+  wrong in the other — which is the defect #257 was filed on, one state over.
+  Paraphrased rather than quoted here, because a verbatim quote of a diagnostic
+  is what went stale twice: the message text is not a compatibility promise, and
+  `every_unreachable_remedy_names_what_the_operator_must_supply`
+  (`crates/tf_tree_ipc/src/error.rs`) is what holds the clauses that matter.
+
+  | mask | ownership byte | what the remedy says |
+  |---|---|---|
+  | slot 0 alone | free | stopping it is sufficient; an ordinary open then creates |
+  | slot 0 alone | held | stopping it is **not** sufficient — stop the ownership holder too |
+  | slot 0 + others | free | after byte 0 frees you are in row 1 of the table above: §3.4's hatch applies, and it needs a layout and a read-write mode besides the policy |
+  | slot 0 + others | held | the ownership holder has to go first, because a forced create takes that byte before the participant bytes it may skip |
 
   **An earlier revision of this paragraph told you to expect
   `OpenError::ParticipantSlotDiverged` here, and grepping your logs for it will

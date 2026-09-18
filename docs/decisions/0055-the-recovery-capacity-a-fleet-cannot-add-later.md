@@ -504,7 +504,9 @@ deliberately unplanned.
    message should lead with the abandoning path at all, when `RUNBOOK.md` says to
    reach for inheritance first — is untouched and stays open. — verified by
    **extending** `the_escape_hatch_creates_over_a_stranded_participant`
-   (`crates/tf_tree/tests/rendezvous.rs:506`), not by a new test: that case
+   (`crates/tf_tree/tests/rendezvous.rs`, by name — the line number this step
+   carried matched neither the doc comment nor the `fn` when it was written, and
+   an edit to the test moves it again), not by a new test: that case
    already reaches the stranded state, already passes
    `.layout_if_creating(layout())` and already asserts `CreatePolicy::Always`
    creates. The only half that is new is the negative one — the *verbatim*

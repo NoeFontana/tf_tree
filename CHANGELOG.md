@@ -56,12 +56,29 @@ through the slot-0 arm and followed it verbatim got a second, different error
 instead of an arena** — `OpenError::NoLayoutToCreate` — at the moment they could
 least afford it. Both arms now name all three parts, in the same terms.
 
+**The same arm was telling an operator something false in a second way, and
+that is fixed here too.** It matched `(Some(0), _)` — discarding
+`ownership_held`, the one field whose own documentation says *"`Display` spends
+it"* — so in the reachable state where slot 0 holds a participant byte and some
+other process holds the ownership byte without serving (`release_ownership`
+produces it;
+`defect_201_release_ownership_strands_a_live_non_owner_on_byte_0` pins it), the
+message said *"it is the only holder, so an ordinary open will then create"*.
+Stopping that holder is necessary and not sufficient: the next open refuses on
+the ownership byte. The remedy now has four forms — participant mask crossed
+with the ownership byte — and the `(Some(slot), true)` arm is no longer the only
+one that mentions ownership at all.
+
 No type changed: errors stay `Copy` identifiers with the prose in the message
-layer (`docs/API.md` R5). What is new is the test of the *verbatim* reading —
-`the_escape_hatch_creates_over_a_stranded_participant` now asserts, in the
-stranded state, that the policy alone returns `NoLayoutToCreate` and the layout
-alone returns `ReadOnlyCannotCreate` — which is what keeps the message and the
-runbook from drifting apart again.
+layer (`docs/API.md` R5). What is new is that the prose is now *pinned*.
+`every_unreachable_remedy_names_what_the_operator_must_supply`
+(`crates/tf_tree_ipc/src/error.rs`) asserts, per branch, the clauses an operator
+cannot act without, with a control on the one remedy that really is sufficient;
+and `the_escape_hatch_creates_over_a_stranded_participant` asserts the verbatim
+reading of the recommendation — in the stranded state, the policy alone returns
+`NoLayoutToCreate`. Before this, every test of this error asserted `open()`'s
+*behaviour*, which was already true, so the whole message could have been
+reverted to a bare policy name with the suite green.
 
 ### Changed — `at_many` and friends read a whole chunk before they interpolate (`0060` Decision A)
 

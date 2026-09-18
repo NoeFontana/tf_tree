@@ -573,23 +573,50 @@ impl fmt::Display for IpcError {
                 // Slot 0 is the creator's slot (`0035`, `CREATOR_SLOT`), so the
                 // escape hatch provably cannot pass this state; pointing an
                 // operator at it would send them down a path that fails.
-                (Some(0), _) => write!(
+                // **`ownership_held` is spent here too, and this arm used to
+                // discard it.** `_` for the second element sent an operator
+                // holding `(0b1, true)` — one participant on byte 0 with the
+                // ownership byte taken by a process that never bound, which
+                // `release_ownership` reaches and
+                // `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`
+                // pins — away with "it is the only holder, so an ordinary open
+                // will then create". Stopping that holder is necessary and not
+                // sufficient: the next open refuses on the ownership byte. The
+                // `(Some(slot), true)` arm below has always said so for
+                // `slot != 0`; this one is no longer the asymmetric one.
+                (Some(0), owned) => write!(
                     f,
                     "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
                      hold their lock bytes, and slot 0 (pid {first_pid}) is the arena creator's \
                      own slot — CreatePolicy::Always takes slot 0 or nothing, so no forced create \
                      can pass this. Stop the process holding slot 0: {next}",
-                    next = if holder_slots == 1 {
-                        "it is the only holder, so an ordinary open will then create"
-                    } else {
-                        "the other slots in the mask above are still held, so an ordinary open \
-                         will still refuse — that is when PHASE2 §3.4's CreatePolicy::Always \
-                         becomes the escape hatch, provided nothing still holds the ownership \
-                         byte, and provided the call carries the other two halves of a create: a \
-                         layout to build from and a read-write mode to build it in. Through the \
-                         tf_tree facade those are Open::layout_if_creating and \
-                         AttachMode::ReadWrite; without them the forced create fails with a \
-                         second, different error rather than creating"
+                    next = match (holder_slots == 1, owned) {
+                        (true, false) => {
+                            "it is the only holder and the ownership byte is free, so an ordinary \
+                             open will then create"
+                        }
+                        (true, true) => {
+                            "it is the only participant byte held, but the ownership byte is held \
+                             as well, by a process that is not serving — stop that one too, or an \
+                             ordinary open will keep refusing after slot 0 is gone"
+                        }
+                        (false, false) => {
+                            "the other slots in the mask above are still held, so an ordinary \
+                             open will still refuse — that is when PHASE2 §3.4's \
+                             CreatePolicy::Always becomes the escape hatch, and switching the \
+                             policy is not the whole call, because a create needs a layout to \
+                             build from and a read-write mode to do it in. Through the tf_tree \
+                             facade that is Open::layout_if_creating and AttachMode::ReadWrite; \
+                             without them the forced create fails with a second, different error \
+                             rather than creating"
+                        }
+                        (false, true) => {
+                            "the other slots in the mask above are still held and so is the \
+                             ownership byte, by a process that is not serving — a forced create \
+                             has to take that byte before the participant bytes it may skip, so \
+                             stop its holder as well; PHASE2 §3.4's escape hatch applies to what \
+                             is left, and needs a layout and a read-write mode besides the policy"
+                        }
                     }
                 ),
                 // §3.4's stranded-participant case: the only one where
@@ -711,6 +738,90 @@ impl std::error::Error for ProcError {}
 mod tests {
     use super::{IpcError, ProcError, ProcParseError};
     use crate::WireError;
+
+    /// **The remedy each `ArenaHeldButUnreachable` state prints, asserted as
+    /// text** — because the remedy *is* the deliverable of this variant and
+    /// nothing else in the workspace reads it.
+    ///
+    /// Every other test of this error asserts `open()`'s **behaviour**, which
+    /// was already true before the prose it prints was written: the whole
+    /// message could be reverted to a bare policy name with 270 tests still
+    /// green (measured on #353). So the two things an operator cannot act
+    /// without — *a create needs a layout and a read-write mode besides the
+    /// policy*, and *a held ownership byte is not fixed by stopping a
+    /// participant* — are pinned here, per branch, by substring.
+    ///
+    /// Substrings and not whole strings: the message text is a diagnostic and
+    /// not a compatibility promise, so this must fail when a clause goes
+    /// missing and not when a comma moves.
+    #[test]
+    fn every_unreachable_remedy_names_what_the_operator_must_supply() {
+        let held = |slots: u64, first: Option<u32>, owned: bool| {
+            IpcError::ArenaHeldButUnreachable {
+                holder_slots: slots,
+                first_slot: first,
+                first_pid: 4242,
+                ownership_held: owned,
+            }
+            .to_string()
+        };
+
+        // §3.4's stranded-participant case: the hatch is the answer, so the
+        // message owes all three parts of a create.
+        let stranded = held(0b1000, Some(3), false);
+        for clause in [
+            "layout to build from",
+            "read-write mode",
+            "layout_if_creating",
+        ] {
+            assert!(
+                stranded.contains(clause),
+                "the stranded-participant remedy must name {clause:?}: {stranded}"
+            );
+        }
+
+        // Slot 0 held with other slots, ownership free: the hatch becomes
+        // available once slot 0 is gone, so the same three parts are owed.
+        let crowded = held(0b101, Some(0), false);
+        for clause in [
+            "layout to build from",
+            "read-write mode",
+            "layout_if_creating",
+        ] {
+            assert!(
+                crowded.contains(clause),
+                "the slot-0 remedy must name {clause:?} once the hatch applies: {crowded}"
+            );
+        }
+
+        // The two states that must NOT promise an ordinary open will work: the
+        // ownership byte is held, so stopping participants is not sufficient.
+        // This is the half the `(Some(0), _)` arm discarded until #353.
+        let only_holder_owned = held(0b1, Some(0), true);
+        assert!(
+            !only_holder_owned.contains("an ordinary open will then create"),
+            "with the ownership byte held, stopping slot 0 is not sufficient: {only_holder_owned}"
+        );
+        assert!(
+            only_holder_owned.contains("stop that one too"),
+            "the remedy must name the ownership holder: {only_holder_owned}"
+        );
+
+        let crowded_owned = held(0b101, Some(0), true);
+        assert!(
+            crowded_owned.contains("so is the ownership byte"),
+            "the remedy must say the ownership byte is held: {crowded_owned}"
+        );
+
+        // The control: the one state where "an ordinary open will then create"
+        // is true must still say it, or the assertions above pass by a message
+        // that promises nothing anywhere.
+        let only_holder_free = held(0b1, Some(0), false);
+        assert!(
+            only_holder_free.contains("an ordinary open will then create"),
+            "the one sufficient remedy must still be stated: {only_holder_free}"
+        );
+    }
 
     /// The two payloads `IpcError`'s sentence used to splice in with `Debug`
     /// read as prose, and keep the numbers they carry.
