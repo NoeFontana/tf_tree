@@ -745,8 +745,10 @@ deliberately unplanned.
    `tft_error::message` at the 26-byte wrapper, and six of seven were over this
    crate's own 220-byte budget. They are now **108 to 124 bytes** (133 at the
    widest owner numbers), ASCII, and every one of them fits: the message states
-   the status, the owner's two numbers — which §3.7 requires a rejection to name
-   — and `(HandshakeRejected)`, and `rejection_advice` is deleted. Its seven
+   the status, the owner's two numbers — a client can get them no other way, and
+   §3.7 asks for *both* sides' values, which this arm does not print; see the
+   round-6 paragraph below — and `(HandshakeRejected)`, and `rejection_advice`
+   is deleted. Its seven
    remedies are `docs/RUNBOOK.md`'s `HandshakeRejected` section, placed beside
    the header-validation checks that share two of their names, because that
    confusion is the one an operator actually makes.
@@ -849,6 +851,29 @@ deliberately unplanned.
    addition that *can* reach an operator — a variant wired into the codec — and
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
+
+   **Round 11 found the false `BootIdMismatch` advice still in the spec, and
+   the retraction missing from the paragraph it retracts.** Correcting a
+   diagnostic means correcting every site that states it, and this step reached
+   the message, `RUNBOOK.md`, `CHANGELOG.md` and this record while leaving
+   `PHASE2.md` §13's failure-mode table — the row an author consults *instead of*
+   the code — saying "arena predates a reboot … recreate the arena". §13's row
+   is about the file-backed case and is right about it; what it lacked is the
+   distinction this step measured, so it now carries it and points at the
+   runbook. §3.7 gained the erratum it was owed on both clauses, in the style
+   this same change used for §0.0's `shm_torture` row and §13's ASan box — an
+   omission that was inconsistent with its own approach. And this record's lead
+   still said the owner's numbers are "what §3.7 requires a rejection to name",
+   fourteen paragraphs above its own retraction of that claim: round 6 fixed
+   three copies of the sentence and missed the one in the document doing the
+   retracting.
+
+   One more, and it is this step's own defect shape: the `ModeNotPermitted` row
+   said "**nothing in this workspace sends it.** Two things can:
+   `OwnerServer::check` … and the `assign` closure". `check` returns three
+   statuses and this is not one, so it cannot — and an operator reading the row
+   goes to read `check`. The row exists *because* the advice it replaced
+   described a policy the implementation does not have.
 
    **Round 10, and the end bound had been extended twice by guessing.** The
    section's end was a list of heading depths — `####`, `###`, `##`, then `#`,
