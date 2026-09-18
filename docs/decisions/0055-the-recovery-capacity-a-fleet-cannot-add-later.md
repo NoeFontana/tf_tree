@@ -740,7 +740,8 @@ deliberately unplanned.
      how a reader gets to it.
 7. **The same reduction for `HandshakeRejected`. DONE, 2026-09-18.** Step 6's
    gate measured what it was not chartered to fix: seven per-status remedies
-   rendering **112 to 378 bytes**, of which **four truncated** in
+   making messages of **112 to 378 bytes** — the remedies themselves were 22 to
+   272, and it is the rendering the buffer sees — of which **four truncated** in
    `tft_error::message` at the 26-byte wrapper, and six of seven were over this
    crate's own 220-byte budget. They are now **108 to 124 bytes** (133 at the
    widest owner numbers), ASCII, and every one of them fits: the message states
@@ -832,7 +833,28 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
-   The other five were figures and scopes: "164 at the widest ids" attributed
+   **Round 4 found the hole that reasoning left, and it was mine.** The
+   conclusion above — that no downstream tripwire can exist — is true of a
+   `match` and false of enumeration. `from_u32` is injective on the values it
+   names and folds the rest onto `Malformed`, so walking `v` upward until a
+   status repeats yields exactly the set the wire can deliver, in a crate that
+   cannot `match` on the enum at all. With the list copied instead of derived,
+   this sequence left every gate green and the table without a row: add a
+   variant, wire it into `from_u32`, add the arm `status_is_a_refusal` demands,
+   extend `ALL_STATUSES`. **Measured, by doing it** — the `tf_tree_ipc` gates go
+   green and the derived `tf_tree_cli` gate is the only thing that fails. The
+   list is derived now, with a floor of seven so a `from_u32` that stopped
+   enumerating cannot make the whole file hold vacuously.
+
+   Two figures went with it. "The arms were 112 to 378 bytes" is five sites
+   quoting *message* lengths as *arm* lengths — the arms were 22 to 272 — and
+   the distinction is load-bearing, because "four of the seven truncate" follows
+   from the rendering and not from the remedy. And `REMEDY_FLOOR`'s comment said
+   the shortest cell was "several times" the floor when it is 1.7×: an
+   un-instrumented superlative beside a constant, which is the shape this
+   repository keeps correcting.
+
+   The other five of round 3 were figures and scopes: "164 at the widest ids" attributed
    the worst case to the wrong state (the widest *ids* render 158; 164 is slot
    0, where `, the creator's` outweighs a wide slot's nine digits), in two
    documents; "nine digits short" for `4242` against a `u32`, which is six;

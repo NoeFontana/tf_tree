@@ -344,7 +344,8 @@ the arena owner refused this attach: LayoutMismatch (owner format_version 3, lay
 ```
 
 **The remedy is this table, and it left the message on 2026-09-18.** Seven
-per-status remedies rendered 112 to 378 bytes; the C ABI's `tft_error::message`
+per-status remedies made messages of 112 to 378 bytes — the buffer sees the
+rendering, not the remedy, and the remedies themselves were 22 to 272; the C ABI's `tft_error::message`
 is 256 bytes and `set_message` truncates at 255, so four of the seven reached a C
 operator cut off mid-sentence, which is worse than a status and a place to look
 ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)

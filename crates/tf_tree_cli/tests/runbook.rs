@@ -1,7 +1,7 @@
 //! **`docs/RUNBOOK.md` holds what an error message gave up** — `0055` step 7.
 //!
 //! `IpcError::HandshakeRejected` used to carry a remedy per `HelloStatus`, and
-//! those seven texts were 112 to 378 bytes against a C buffer of 256. They are
+//! the messages they made were 112 to 378 bytes against a C buffer of 256. They are
 //! now the runbook's `HandshakeRejected` table, and the message ends
 //! `(HandshakeRejected)` so a reader can find it. That split is only as good as
 //! the table, so the table is gated: a row per refusal status, rows that say
@@ -28,31 +28,45 @@
 
 use tf_tree::{HelloStatus, IpcError};
 
-/// Every `HelloStatus`.
+/// Every `HelloStatus` this build can **receive**, derived from the codec
+/// rather than copied.
 ///
-/// **A total `match` here is impossible, and that is deliberate rather than an
-/// oversight.** `HelloStatus` is `#[non_exhaustive]`, because a newer owner may
-/// refuse for a reason this build has no name for and a downstream `match` must
-/// keep compiling when one is added — the same argument that makes
-/// `HelloStatus::from_u32` fold every unknown code onto `Malformed`. So the
-/// compile-time prompt for a new status cannot live in this crate; it is
-/// `status_is_a_refusal` in `tf_tree_ipc`'s `error.rs`, whose doc names this
-/// list among the things its author then owes an entry.
+/// **A hand-copied list here left a hole, and it took three review rounds to
+/// find.** `HelloStatus` is `#[non_exhaustive]`, so a downstream total `match`
+/// is impossible — deliberately, because a newer owner may refuse for a reason
+/// this build has no name for. From that I concluded there could be no
+/// downstream tripwire at all, and that was wrong: a `match` is not the only
+/// way to enumerate. `HelloStatus::from_u32` is injective on the values it
+/// names and folds every other onto `Malformed`, so walking `v` upward until a
+/// status repeats yields exactly the set the wire can deliver — and a status
+/// the wire cannot deliver is one no operator will ever be handed.
 ///
-/// What covers the gap from *here* is on the wire:
-/// `a_status_this_build_cannot_receive_needs_no_row` in that same module. A
-/// variant `from_u32` does not produce cannot arrive in a `HelloResponse`, so a
-/// client never renders it and no operator ever follows a search key to a
-/// missing row.
-const ALL: [HelloStatus; 7] = [
-    HelloStatus::Ok,
-    HelloStatus::VersionMismatch,
-    HelloStatus::LayoutMismatch,
-    HelloStatus::BootIdMismatch,
-    HelloStatus::NoParticipantSlots,
-    HelloStatus::ModeNotPermitted,
-    HelloStatus::Malformed,
-];
+/// With the list copied, adding a variant, wiring it into `from_u32`, fixing
+/// `tf_tree_ipc`'s `status_is_a_refusal` and extending its `ALL_STATUSES` left
+/// every gate green and this table without a row. Derived, the new status
+/// appears here the moment the codec can produce it, and the row is owed.
+fn receivable() -> Vec<HelloStatus> {
+    let mut seen: Vec<HelloStatus> = Vec::new();
+    // 64 is a bound, not an expectation: the walk ends at the fold.
+    for v in 0..64u32 {
+        let status = HelloStatus::from_u32(v);
+        if seen.contains(&status) {
+            break;
+        }
+        seen.push(status);
+    }
+    // **A derivation that collapses is a gate that checks nothing.** Every
+    // assertion below iterates this, so a `from_u32` that folded everything
+    // onto one status would leave them all holding over a single row. Seven
+    // exist today and a wire contract does not shrink.
+    assert!(
+        seen.len() >= 7,
+        "the codec delivers {} distinct statuses, fewer than the seven that exist: this \
+         list is derived from `from_u32`, and it has stopped enumerating",
+        seen.len()
+    );
+    seen
+}
 
 /// `docs/RUNBOOK.md`'s `HandshakeRejected` section.
 fn section() -> &'static str {
@@ -89,11 +103,14 @@ const REMEDY_WORDS: [&str; 5] = ["rebuild", "restart", "read-only", "/proc", "do
 
 /// The shortest a row's *what to do* cell may be.
 ///
-/// **A floor, not a target.** It exists because the remedy-word check below is
-/// over the section and a row can be emptied without touching a word anywhere
-/// else — measured, on review round 2: the `ModeNotPermitted` cell was blanked,
-/// the row stayed, and this file passed. The shortest cell today is several
-/// times this.
+/// **A floor, not a target, and deliberately far below what these cells are.**
+/// Its job is to catch a cell that was emptied, not to police length: the
+/// remedy-word check below is over the section, so a row can be blanked without
+/// touching a word anywhere else — measured, on review round 2, when the
+/// `ModeNotPermitted` cell was emptied, the row stayed, and this file passed.
+/// The assertion prints the offending cell's actual length, which is where a
+/// number belongs; an earlier version of this sentence claimed the shortest
+/// cell was "several times this" and it was 1.7×.
 const REMEDY_FLOOR: usize = 60;
 
 /// Every refusal has a row, the rows say something, and the example is real.
@@ -102,7 +119,7 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     let section = section();
 
     // Every status but the acceptance, which is not a refusal and has no row.
-    for status in ALL.into_iter().filter(|s| *s != HelloStatus::Ok) {
+    for status in receivable().into_iter().filter(|s| s != &HelloStatus::Ok) {
         // A **row**, not a mention: the section's prose names `VersionMismatch`
         // and `LayoutMismatch` while distinguishing them from the
         // header-validation checks that share those names, so a `contains` over
@@ -166,7 +183,7 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
             "docs/RUNBOOK.md's `HandshakeRejected` section no longer says {word:?}, which \
              the message is forbidden to say: the remedy is in neither place"
         );
-        for status in ALL {
+        for status in receivable() {
             let text = IpcError::HandshakeRejected {
                 status,
                 owner_format_version: u32::MAX,

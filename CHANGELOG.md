@@ -43,9 +43,10 @@ is a bug.
 
 ### Fixed — four of the seven attach refusals did not fit the C ABI's message buffer (`0055` step 7)
 
-`IpcError::HandshakeRejected` appended a per-status remedy to every rejection:
-seven texts rendering **112 to 378 bytes**, against a `tft_error::message` of
-256 that `set_message` truncates at 255. **Four of the seven reached a C
+`IpcError::HandshakeRejected` appended a per-status remedy to every rejection,
+making messages of **112 to 378 bytes** against a `tft_error::message` of 256
+that `set_message` truncates at 255. (The remedies themselves were 22 to 272
+bytes; it is the rendering the buffer sees, and every figure here is one.) **Four of the seven reached a C
 operator cut off mid-sentence**, and six were over the 220 bytes this crate's
 own gate allows. They are **108 to 124 bytes** now (133 at the widest owner
 numbers) and every one of them fits.
@@ -84,9 +85,11 @@ for no other purpose, because safe Rust cannot enumerate an enum and
 It lives in `#[cfg(test)]`, so it is `--all-targets` that fails and not a plain
 `cargo check`. A downstream crate cannot have the same prompt — `HelloStatus` is
 `#[non_exhaustive]` so that a newer owner's newer refusal keeps compiling — so
-the other half is on the wire: a status `from_u32` cannot produce never reaches
-a joining client, and the one that *can* be added and delivered is what
-`a_status_this_build_cannot_receive_needs_no_row` catches. The per-status check
+the other half is derived from the wire: `from_u32` is injective on the values
+it names and folds the rest onto `Malformed`, so `tf_tree_cli`'s gate walks it
+to get exactly the statuses the wire can deliver, and a new one owes a row the
+moment the codec can produce it. A status the codec cannot produce never reaches
+a joining client at all. The per-status check
 requires a table **row** rather than a mention, since the section's prose names
 two of the statuses while telling them apart from the header checks that share
 those names, and the worked example that section quotes is asserted to be

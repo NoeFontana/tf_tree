@@ -347,10 +347,12 @@ pub enum IpcError {
     /// The status is right there and it is not `LayoutMismatch`, but the advice
     /// is the longest and last thing on the line, so it reads as the diagnosis
     /// and costs a rebuild before anyone rereads the word in front of it. That
-    /// was repaired with one arm per status — and the arms were 112 to 378
-    /// bytes, while `tft_error::message` is 256 and `set_message` truncates at
-    /// 255, so **four of the seven statuses reached a C operator cut off
-    /// mid-remedy**. A per-status remedy that C cannot finish reading is the
+    /// was repaired with one arm per status — and the *messages* those arms
+    /// produced were 112 to 378 bytes (the arms themselves 22 to 272), while
+    /// `tft_error::message` is 256 and `set_message` truncates at 255, so
+    /// **four of the seven statuses reached a C operator cut off mid-remedy**.
+    /// It is the message length the buffer sees, which is why the figures
+    /// quoted anywhere are renderings and not arms. A per-status remedy that C cannot finish reading is the
     /// same defect one layer down, which is what a runbook row does not have.
     HandshakeRejected {
         /// Why.
