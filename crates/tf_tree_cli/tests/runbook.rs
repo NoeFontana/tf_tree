@@ -19,7 +19,7 @@
 //! failure mode not exist.
 //!
 //! What stays beside the type, in `tf_tree_ipc`'s `error.rs`, is everything
-//! that needs no file: `every_rejection_names_only_the_status_it_carries` (the
+//! that needs no file: `both_rejection_arms_name_only_the_status_they_carry` (the
 //! facts, the search key, the 140-byte budget, and the rule that no rendering
 //! may name a status it did not get) and
 //! `every_ipc_error_message_fits_the_c_abis_buffer`.

@@ -758,7 +758,8 @@ deliberately unplanned.
    sentence appended to every rejection, printed thousands of times over a
    `NoParticipantSlots` refusal — and the per-status repair that followed is
    what put 378 bytes in a 256-byte buffer. Both are refused by
-   `every_rejection_names_only_the_status_it_carries`, which also holds the arm
+   `both_rejection_arms_name_only_the_status_they_carry` (renamed in round 13;
+   see below), which also holds the arm
    to a 140-byte budget of its own: prose returning here fails long before it
    reaches the 220 the C path allows.
 
@@ -851,6 +852,29 @@ deliberately unplanned.
    addition that *can* reach an operator — a variant wired into the codec — and
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
+
+   **Round 14: a rename I made in round 13 and did not propagate, twice.**
+   `every_rejection_names_only_the_status_it_carries` became
+   `both_rejection_arms_name_only_the_status_they_carry`, and the old name
+   survived in this record's own step-7 body and in `runbook.rs`'s module doc —
+   the file whose job is to send a reader to the `tf_tree_ipc` half. Both were
+   the sentence a reader lands on first. This is rounds 11 and 12's defect, from
+   the round that was fixing it.
+
+   **And `wire.rs`'s public doc still carried the refuted `BootIdMismatch`
+   claim.** `HelloResponse`'s rustdoc called the missing owner-boot-id field
+   "benign" because the two peers' ids "agree by construction" — which this step
+   measured to be false three ways, one of which needs no failure at all, the
+   divergent parsers. §3.7 and §13 got errata in this change; **the published
+   crate's rustdoc, which is where a caller dispatching on the status actually
+   reads, did not.** It does now, and it states the consequence the original
+   wording hid: a refused joiner is told the ids differ and cannot be shown the
+   owner's.
+
+   Also: a link-reference definition inserted mid-paragraph in round 13 split
+   the paragraph in rendered docs — confirmed in `target/doc`, where *"It is the
+   message length the buffer sees"* had become its own paragraph with "It"
+   pointing at nothing. Moved below the prose, as its sibling already was.
 
    **Owed, and found in round 13: `IpcError::RejectionCarriedFd` is the third
    arm that carries a `HelloStatus` and is outside everything this step built.**

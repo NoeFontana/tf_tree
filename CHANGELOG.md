@@ -80,7 +80,10 @@ a third value.
 the arena had "outlived a reboot" and should be removed. A serving owner is
 proof it did not, and the segment would not have survived one; the boot id
 detects a stale *lock file*, not a served arena. `PHASE2.md` §13's failure-mode table carried the same false advice and now
-carries the distinction instead; §3.7 gained the erratum it was owed. The new
+carries the distinction instead; §3.7 gained the erratum it was owed; and
+`HelloResponse`'s rustdoc — the published crate's own, where a caller
+dispatching on the status reads — no longer says the two peers' boot ids "agree
+by construction". The new
 row says what that status actually means — the two processes disagree about which boot this is, so
 one of them could not read `/proc/sys/kernel/random/boot_id` — and what to check.
 

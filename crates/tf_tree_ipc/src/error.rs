@@ -355,14 +355,13 @@ pub enum IpcError {
     /// on the bridge's 35-byte one — which [`0059`]'s *Rationale* names as the
     /// longest fixed text a C path puts in front of one of these renderings. A
     /// count of truncations is a statement about a prefix, and this one used to
-    /// name none. *It pointed at a `MESSAGE_BUDGET` "below" until round 13;
-    /// that constant is `#[cfg(test)]`, so a docs.rs reader following it found
-    /// nothing.*
+    /// name none, and it is the message length the buffer sees, which is why
+    /// the figures quoted anywhere are renderings and not arms. *It pointed at
+    /// a `MESSAGE_BUDGET` "below" until round 13; that constant is
+    /// `#[cfg(test)]`, so a docs.rs reader following it found nothing.* A per-status remedy that C cannot finish reading is the
+    /// same defect one layer down, which is what a runbook row does not have.
     ///
     /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
-    /// It is the message length the buffer sees, which is why the figures
-    /// quoted anywhere are renderings and not arms. A per-status remedy that C cannot finish reading is the
-    /// same defect one layer down, which is what a runbook row does not have.
     HandshakeRejected {
         /// Why.
         status: crate::wire::HelloStatus,
