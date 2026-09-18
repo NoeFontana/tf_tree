@@ -355,16 +355,16 @@ step 7).
 against the attach request, made before this process ever saw the segment — which
 is why the message carries one hash and not two, and why `found`/`expected` do
 not appear. The sections under those names below are this process validating a
-header it has already mapped. Either can happen without the other: a read-only
-consumer that never reaches the rendezvous meets only the second.
+header it has already mapped against its own build constant — which also happens
+where there is no owner and no handshake at all, opening a frozen `.tft`.
 
 | `status` | What the owner compared | What to do |
 |---|---|---|
 | `VersionMismatch` | this binary's `FORMAT_VERSION` against the running arena's, **first**, because a version difference makes every later field's meaning uncertain | rebuild every participant from one release and restart them together. There is no partial upgrade path |
 | `LayoutMismatch` | same version, a different record layout | rebuild every participant, as above. The owner's `layout_hash` is in the message; this binary's is a build constant, which `tf_tree doctor` prints |
 | `BootIdMismatch` | the boot id in the attach request against the one in the **arena header** | **not "the arena outlived a reboot"** — a serving owner is proof it did not, and the segment would not have survived one. The two processes disagree about which boot this is, and the kernel has one boot id per host with no per-namespace variant ([`PHASE2.md`](./PHASE2.md) §3.3), so one of them did not read the real value: either the read failed and it substituted all-zeros (both sides do, so it takes exactly one failure), or something presents a different `/proc/sys/kernel/random/boot_id` to it — a sandbox that masks `/proc/sys`, or a `/proc` overlay. Read that file from both processes and compare |
-| `NoParticipantSlots` | the participant table, which is full | the same exhaustion the *`ParticipantTableFull` / `NoParticipantSlots`* section below reaches from the other side; its two commands and the difference between the two tables they read are the triage. **There is no `--participants` flag and never was**: capacity is fixed at construction ([`PROJECT.md`](./PROJECT.md) §5 D4) |
-| `ModeNotPermitted` | the mode byte, against what this arena lets a joiner do | attach read-only, which is the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18). If this process must write, it is the **owner** that decides, so the change belongs there and not in the attach |
+| `NoParticipantSlots` | every slot, against **both** its tables: the owner's assigner walks the arena's participant records *and* the lock bytes, and grants a slot only where both are free | the *`ParticipantTableFull` / `NoParticipantSlots`* section below is the triage, and the reason it is there rather than here is that the two tables need two different commands to read. A read-only consumer holds a byte and writes no record, so neither table alone is the answer. **There is no `--participants` flag and never was**: capacity is fixed at construction ([`PROJECT.md`](./PROJECT.md) §5 D4) |
+| `ModeNotPermitted` | **nothing** — no owner in this workspace sends this status. It exists on the wire because §3.7 lists it, and `OwnerServer::check` compares version, layout and boot id and nothing else | if you meet it, some peer that is not this implementation refused a read-write attach: attach read-only, which is the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18), and report the peer. *The remedy this table replaced described this status as an ordinary refusal to grant write access, with no hint that nothing produces it* |
 | `Malformed` | nothing — it could not decode the request | **or it refused for a reason this build has no name for.** Every unknown status code decodes to `Malformed` (`HelloStatus::from_u32`), deliberately, so a newer owner's newer refusal arrives here. The two are indistinguishable on the wire, so confirm both sides are the same release before reading this as corruption |
 
 `Ok` never appears in this message: it is the acceptance, and no error is built

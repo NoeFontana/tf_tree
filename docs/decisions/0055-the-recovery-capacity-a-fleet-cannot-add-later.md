@@ -789,6 +789,16 @@ deliberately unplanned.
      step 6's, one layer over: prose that describes the *state the author was
      picturing* rather than the one the branch selects.
 
+     **And a second, of the same kind:** `ModeNotPermitted`'s advice told a
+     caller to attach read-only because the owner would not let it write.
+     **Nothing in this workspace sends that status** — `OwnerServer::check`
+     compares version, layout and boot id and nothing else, and the value exists
+     because §3.7 lists it. So the advice described a policy the implementation
+     does not have. Both errors survived every review this arm has had, because
+     a per-status list *looks* like it was derived from the producers and was
+     derived from the status names. The row now says what is true: a peer that
+     is not this implementation refused the attach, and that is worth reporting.
+
 ## Open questions
 
 **All three are answered, in *Decision* parts 2, 3 and 4 (2026-09-18).** They are

@@ -59,12 +59,20 @@ names, because mistaking one for the other is the error an operator actually
 makes: the handshake statuses are the *owner's* comparison against an attach
 request, decided before this process ever saw a segment.
 
-**Writing those rows found one of them false.** The `BootIdMismatch` remedy said
+**Writing those rows found two of them false.** The `BootIdMismatch` remedy said
 the arena had "outlived a reboot" and should be removed. A serving owner is
 proof it did not, and the segment would not have survived one; the boot id
 detects a stale *lock file*, not a served arena. The new row says what that
 status actually means — the two processes disagree about which boot this is, so
 one of them could not read `/proc/sys/kernel/random/boot_id` — and what to check.
+
+`ModeNotPermitted` told a caller to attach read-only because the owner would not
+let it write. **No owner in this workspace sends that status**: the wire carries
+it because §3.7 lists it, and the check compares version, layout and boot id and
+nothing else. The row now says that a peer which sends it is not this
+implementation. Both errors survived every review this arm has had, because a
+per-status list looks like it was derived from the producers and was derived
+from the status names.
 
 Both halves are gated. No rendering may name a status it did not get, which is
 the original defect of this arm made unexpressible; the runbook section must
