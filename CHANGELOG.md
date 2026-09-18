@@ -41,6 +41,54 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — the escape hatch out of `ArenaHeldButUnreachable`, in the arm that did not say it (`0055` step 2)
+
+`IpcError::ArenaHeldButUnreachable` has an arm for the state where the arena
+creator's own slot 0 is still held. When other slots were held too, it sent the
+operator to `docs/PHASE2.md` §3.4's escape hatch — *"that is when
+`CreatePolicy::Always` becomes the escape hatch"* — and stopped there.
+
+`CreatePolicy::Always` is two thirds of a create. A create also needs a layout
+to build from, because decision `0004` sizes an arena from its declared edges,
+and a read-write mode to build it in. The stranded-participant arm has said so
+since 2026-09-10; this one had not, so **an operator who reached the hatch
+through the slot-0 arm and followed it verbatim got a second, different error
+instead of an arena** — `OpenError::NoLayoutToCreate` — at the moment they could
+least afford it. Both arms now name all three parts, in the same terms.
+
+**The same arm was telling an operator something false in a second way, and
+that is fixed here too.** It matched `(Some(0), _)` — discarding
+`ownership_held`, the one field whose own documentation says *"`Display` spends
+it"* — so it printed *"it is the only holder, so an ordinary open will then
+create"* even when the ownership byte was held by somebody else, where stopping
+the slot-0 holder is necessary and not sufficient. The remedy now branches on
+both bits.
+
+**What each branch may claim is now the constraint, because the first repair of
+this got it wrong.** `Display` sees which bytes are held; it cannot see who
+holds them. That matters because the usual holder of both is **one** process: a
+creator takes the ownership byte and then `CREATOR_SLOT` on the same `LockFile`
+and keeps both for as long as it serves, so `holder_slots: 0b1, first_slot:
+Some(0), ownership_held: true` is the steady state of every healthy
+single-owner arena, and any joiner that times out without reaching the socket
+reads that remedy. A first version of this fix told that operator to stop a
+second process as well — after one that need not exist. Each branch now names
+the bytes it knows about and hedges the holder, and
+`a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process` reaches
+that state through the public API — a live, serving owner whose socket was
+removed underneath it — and pins the hedge.
+
+No type changed: errors stay `Copy` identifiers with the prose in the message
+layer (`docs/API.md` R5). What is new is that the prose is now *pinned*.
+`every_unreachable_remedy_names_what_the_operator_must_supply`
+(`crates/tf_tree_ipc/src/error.rs`) asserts, per branch, the clauses an operator
+cannot act without, with a control on the one remedy that really is sufficient;
+and `the_escape_hatch_creates_over_a_stranded_participant` asserts the verbatim
+reading of the recommendation — in the stranded state, the policy alone returns
+`NoLayoutToCreate`. Before this, every test of this error asserted `open()`'s
+*behaviour*, which was already true, so the whole message could have been
+reverted to a bare policy name with the suite green.
+
 ### Changed — `at_many` and friends read a whole chunk before they interpolate (`0060` Decision A)
 
 `Plan::at_many`, `at_many_into` and `at_many_into_f32` no longer fold a batch

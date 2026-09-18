@@ -835,13 +835,34 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
 
   — *"…slot 0 (pid N) is the arena creator's own slot — CreatePolicy::Always
   takes slot 0 or nothing, so no forced create can pass this. Stop the process
-  holding slot 0: it is the only holder, so an ordinary open will then create"*.
-  When other slots are held too the same message ends *"the other slots in the
-  mask above are still held, so an ordinary open will still refuse — that is when
-  PHASE2 §3.4's CreatePolicy::Always becomes the escape hatch"*, because after
-  byte 0 frees you are in row 1 of the table above. The message branches there
-  rather than giving one remedy that is right in one state and wrong in the
-  other — which is the defect #257 was filed on, one state over.
+  holding slot 0: it is the only holder and the ownership byte is free, so an
+  ordinary open will then create"*.
+
+  **The remedy after the colon has four forms, and which one you get is the whole
+  point of the message.** It branches on the rest of the mask *and* on
+  `ownership_held`, rather than giving one remedy that is right in one state and
+  wrong in the other — which is the defect #257 was filed on, one state over.
+  Paraphrased rather than quoted here, because a verbatim quote of a diagnostic
+  is what went stale twice: the message text is not a compatibility promise, and
+  `every_unreachable_remedy_names_what_the_operator_must_supply`
+  (`crates/tf_tree_ipc/src/error.rs`) is what holds the clauses that matter.
+
+  | mask | ownership byte | what the remedy says |
+  |---|---|---|
+  | slot 0 alone | free | stopping it is sufficient; an ordinary open then creates |
+  | slot 0 alone | held | **usually still just that one process** — a creator holds the ownership byte and slot 0 on one file description, so stopping it releases both. Only if the ownership byte is still held afterwards is there a second process to stop |
+  | slot 0 + others | free | after byte 0 frees you are in row 1 of the table above: §3.4's hatch applies |
+  | slot 0 + others | held | a forced create needs the ownership byte **and** slot 0 free, in either order, and one process may hold both; §3.4's hatch then applies to the participants that are left |
+
+  Every one of the four ends with what a create needs besides the policy — a
+  layout and a read-write mode — because three of the four can end in one.
+
+  **Row 2 is the steady state of a healthy arena, not an exotic state.** A live
+  owner holds both bytes for its whole life, so any joiner that times out
+  without reaching the socket reads row 2; the first repair of this message told
+  that operator to stop a second process as well, which need not exist.
+  `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process`
+  (`crates/tf_tree/tests/rendezvous.rs`) is what stops that coming back.
 
   **An earlier revision of this paragraph told you to expect
   `OpenError::ParticipantSlotDiverged` here, and grepping your logs for it will

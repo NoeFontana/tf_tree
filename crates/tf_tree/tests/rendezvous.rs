@@ -488,6 +488,97 @@ fn a_read_only_attach_refuses_to_create() {
     );
 }
 
+/// **A healthy owner holds both bytes, and that is the state the `(0b1, true)`
+/// remedy is written for** (#353, `0055` question 3).
+///
+/// The `(Some(0), _)` arm of `ArenaHeldButUnreachable` discarded
+/// `ownership_held` until #353, and the first repair replaced it with a remedy
+/// that asserted **two** holders — "stop that one too". That is false here, and
+/// here is not an exotic state: a creator takes the ownership byte and then
+/// `CREATOR_SLOT` on the same `LockFile` and holds both for as long as it
+/// serves, so **every healthy single-owner arena is `holder_slots: 0b1,
+/// first_slot: Some(0), ownership_held: true`**, and any joiner that times out
+/// without reaching the socket reads that remedy. Telling that operator to stop
+/// a second process sends them after one that does not exist.
+///
+/// This is what makes the state reachable through the public API rather than by
+/// constructing the error value: a live, serving owner whose socket has been
+/// removed underneath it (§3.9's removed socket; a wedged accept loop reads the
+/// same way to a joiner). The assertion is the *hedge* — the remedy may name the
+/// byte and may not name a holder it cannot see.
+///
+/// The message text for all four branches is pinned in `tf_tree_ipc`'s own
+/// `every_unreachable_remedy_names_what_the_operator_must_supply`; this test
+/// owes the reachability and the one clause an operator acts on.
+#[test]
+fn a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let scratch = Scratch::new("owner-holds-both");
+    let layout = || {
+        TreeBuilder::new()
+            .default_interp(InterpPolicy::LerpSlerp)
+            .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64)))
+    };
+
+    // A real owner: it creates, binds and serves, and it keeps the ownership
+    // byte and slot 0 for its whole life.
+    let owner = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .layout_if_creating(layout())
+        .timeout(std::time::Duration::from_millis(500))
+        .open()
+        .expect("the owner must create and serve");
+    assert_eq!(
+        owner.participant_slot(),
+        0,
+        "the creator holds CREATOR_SLOT, which is what puts bit 0 in the mask"
+    );
+
+    // Remove the door while the owner is still behind it. Nothing about the
+    // owner changes: it is alive, serving, and holding both bytes.
+    let sock = scratch.0.join("0/default.sock");
+    std::fs::remove_file(&sock).expect("the rendezvous socket must exist to be removed");
+
+    let err = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .layout_if_creating(layout())
+        .timeout(std::time::Duration::from_millis(200))
+        .open()
+        .err()
+        .expect("a joiner that cannot reach the socket must be refused");
+
+    let tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable {
+        holder_slots,
+        first_slot,
+        ownership_held,
+        ..
+    }) = err
+    else {
+        panic!("expected ArenaHeldButUnreachable, got {err:?}");
+    };
+    assert_eq!(
+        (holder_slots, first_slot, ownership_held),
+        (0b1, Some(0), true),
+        "a live owner is one holder of both bytes: this is the state the remedy must fit"
+    );
+
+    let message = err.to_string();
+    assert!(
+        message.contains("usually by that same process"),
+        "the remedy must allow that one process holds both bytes: {message}"
+    );
+    assert!(
+        !message.contains("stop that one too"),
+        "the remedy must not send the operator after a second process that need not exist: \
+         {message}"
+    );
+
+    drop(owner);
+}
+
 /// **`RUNBOOK.md`'s escape hatch out of `ArenaHeldButUnreachable`, run as written.**
 ///
 /// `docs/PHASE2.md` §3.4 asks for it as `--force-new` and no binary ever grew
@@ -505,6 +596,14 @@ fn a_read_only_attach_refuses_to_create() {
 /// The last two assertions are what separates the escape hatch from slot
 /// reclamation (#184): it abandons the arena and **leaves the byte held**, so
 /// the replacement's table is one slot smaller for as long as the survivor runs.
+///
+/// **The refusal in the middle is the message read verbatim** (`0055` step 2).
+/// Switching the policy is not the whole call: the arms of
+/// `ArenaHeldButUnreachable` that recommend `CreatePolicy::Always` say a create
+/// also needs a layout to build from and a read-write mode to do it in, and a
+/// reader who follows only the policy gets `NoLayoutToCreate` instead of an
+/// arena. Asserting it here is what keeps that sentence from decaying into a
+/// recovery path that fails when it is followed.
 ///
 /// **Mutant: drop `self.create != CreatePolicy::Always &&` from step 4's
 /// condition** ⇒ measured — `Always` yields the ownership byte like every other
@@ -547,6 +646,36 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
             tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable { .. })
         ),
         "expected ArenaHeldButUnreachable, got {err:?}"
+    );
+
+    // **The message read verbatim, in the state that reaches the lock file.**
+    // Every `ArenaHeldButUnreachable` arm that sends an operator to
+    // `CreatePolicy::Always` also tells them a forced create needs a layout to
+    // build from and a read-write mode to build it in (`0055` step 2). This
+    // asserts the half that is a property of *this* state: from here the
+    // rendezvous returns `Created`, and the policy alone then reaches a second,
+    // different error exactly as the message says.
+    //
+    // **The read-write half is deliberately not asserted here.** `Open::attempt`
+    // checks the mode before it resolves the runtime directory at all
+    // (`0019` plan step 1), so a read-only forced create never sees the stranded
+    // byte and asserting it beside this one would be a second spelling of
+    // `a_read_only_attach_refuses_to_create`. The message *text* — both halves,
+    // all four branches — is pinned in `tf_tree_ipc`'s own
+    // `every_unreachable_remedy_names_what_the_operator_must_supply`, which is
+    // what makes the prose non-revertible.
+    //
+    // The attempt creates nothing, so the wedge is still the wedge below.
+    let no_layout = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Always)
+        .timeout(std::time::Duration::from_millis(100))
+        .open()
+        .err()
+        .expect("a forced create with no layout cannot create");
+    assert!(
+        matches!(no_layout, tf_tree::OpenError::NoLayoutToCreate),
+        "the policy alone must not create; expected NoLayoutToCreate, got {no_layout:?}"
     );
 
     let tree = creator(CreatePolicy::Always)
@@ -664,8 +793,16 @@ fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
         byte_0_message.contains("no forced create can pass this"),
         "the message must not send an operator to the escape hatch here: {byte_0_message}"
     );
+    // The wording gained "and the ownership byte is free" when that arm stopped
+    // discarding `ownership_held` (#353): the sufficiency of stopping slot 0 is
+    // *conditional* on it, and the message now says which condition it is. What
+    // this asserts is unchanged — in the one state where stopping slot 0 really
+    // is enough, the message says so.
     assert!(
-        byte_0_message.contains("it is the only holder, so an ordinary open will then create"),
+        byte_0_message.contains(
+            "it is the only holder and the ownership byte is free, so an ordinary open will \
+             then create"
+        ),
         "byte 0 alone: stopping it really is sufficient, and the message may say so: \
          {byte_0_message}"
     );
