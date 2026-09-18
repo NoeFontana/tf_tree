@@ -50,7 +50,8 @@ bytes; it is the rendering the buffer sees, and every figure here is one.) **Fou
 operator cut off mid-sentence** — four behind `tft_tree_open_named`'s 26-byte
 wrapper, six behind the bridge's 35-byte one, and a count of truncations is a
 statement about a prefix — and six were over the 220 bytes this crate's own gate
-allows. They are **108 to 124 bytes** now (133 at the widest owner
+allows. They are **115 to 124 bytes** now over the statuses this library can
+send (108 for `Ok`, which no code path here constructs; 133 at the widest owner
 numbers) and every one of them fits.
 
 The message states the status and the owner's `format_version` and

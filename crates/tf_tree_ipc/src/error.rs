@@ -1072,7 +1072,14 @@ mod tests {
     /// This is that convention plus the digits. **What it defends, measured
     /// rather than asserted:** the budget is one number checked per status, and
     /// the statuses are not the same length, so the slack runs from **7 bytes**
-    /// (`NoParticipantSlots`) to **23** (`Ok`), with `Malformed` at 16. A
+    /// (`NoParticipantSlots`) to **16** (`Malformed`) over the statuses this
+    /// library can actually send. `Ok` renders 23 bytes of slack and is not one
+    /// of them: `HandshakeRejected` is built at two sites and both are inside a
+    /// `status != Ok` branch, so only a caller constructing the variant by hand
+    /// — the fields are `pub` — can produce it. It stays in `samples()` because
+    /// that rendering exists and must survive the C buffer, and it is kept out
+    /// of this bound because *a number is only as measured as the state that
+    /// produced it*, which is this step's own lesson. A
     /// clause of prose returning to this arm fails here long before it reaches
     /// `MESSAGE_BUDGET`, which has room for a paragraph — but a *short* clause
     /// on a *short* status does not: 16 bytes added to a `Malformed`-only

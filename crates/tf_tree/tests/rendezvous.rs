@@ -2290,16 +2290,14 @@ fn the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live() {
 /// attach 64 of 128 was refused: error ... NoParticipantSlots ...
 /// ```
 ///
-/// **The rendering is elided deliberately.** What this transcript is for is
-/// *which* status the 64th attach met, and a quoted message is the shape that
-/// drifts — this line already went stale once, when `0055` step 7 reduced the
-/// arm, and a copy carrying an elided hash is one nothing can assert against
-/// `Display`. The place a rendering *is* quoted is `docs/RUNBOOK.md`'s
-/// `HandshakeRejected` section, where `tf_tree_cli`'s `tests/runbook.rs` holds
-/// it to `Display`'s own output.
-///
 /// — the 64th and not the 65th, because the owner holds slot 0 and only 63 are
-/// ever available to joiners. So this scenario pins the *property*, and after
+/// ever available to joiners. **The rendering is elided deliberately**: what
+/// this transcript is for is *which* status the 64th attach met, and a quoted
+/// message is the shape that drifts — this line already went stale once, when
+/// `0055` step 7 reduced the arm, and a copy carrying an elided hash is one
+/// nothing can assert against `Display`. Where a rendering *is* quoted is
+/// `docs/RUNBOOK.md`'s `HandshakeRejected` section, which `tf_tree_cli`'s
+/// `tests/runbook.rs` holds to `Display`'s own output. So this scenario pins the *property*, and after
 /// step 3 it holds through two independent mechanisms rather than one; what
 /// pins step 3 itself is
 /// [`the_assigner_reclaims_a_stale_record_no_hangup_will_ever_clear`], which

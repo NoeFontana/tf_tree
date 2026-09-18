@@ -743,7 +743,9 @@ deliberately unplanned.
    making messages of **112 to 378 bytes** — the remedies themselves were 22 to
    272, and it is the rendering the buffer sees — of which **four truncated** in
    `tft_error::message` at the 26-byte wrapper, and six of seven were over this
-   crate's own 220-byte budget. They are now **108 to 124 bytes** (133 at the
+   crate's own 220-byte budget. They are now **115 to 124 bytes** over the
+   statuses this library sends — 108 for `Ok`, which neither producer can
+   construct, both being inside a `status != Ok` branch — (133 at the
    widest owner numbers), ASCII, and every one of them fits: the message states
    the status, the owner's two numbers — a client can get them no other way, and
    §3.7 asks for *both* sides' values, which this arm does not print; see the
@@ -853,6 +855,24 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Round 15: a bound taken from a state this library cannot construct.** The
+   reduction was advertised as "108 to 124 bytes" in four places, and 108 is
+   `Ok` — a status `HandshakeRejected` cannot carry here, because both producers
+   sit inside a `status != Ok` branch. The reachable floor is `Malformed`'s 115,
+   and the slack ceiling `REJECTION_BUDGET`'s doc named as 23 (`Ok`) is really
+   16 (`Malformed`). The argument in that doc survives untouched — it reasons
+   from `Malformed`'s 16 — but *a number is only as measured as the state that
+   produced it* is this step's own lesson, stated in this record, applied to
+   `first_pid` in round 8 and missed here in four documents. `Ok` stays in
+   `samples()`, because the fields are `pub` and that rendering must survive the
+   C buffer; it is out of the quoted bounds.
+
+   Also: the round-14 paragraph in `rendezvous.rs` was inserted *between* the
+   transcript and the sentence continuing it, so *"— the 64th and not the
+   65th"* opened a paragraph whose antecedent was two blocks up. That is round
+   14's own finding — a paragraph split by an insertion — reintroduced by the
+   commit that fixed it.
+
    **Round 14: a rename I made in round 13 and did not propagate, twice.**
    `every_rejection_names_only_the_status_it_carries` became
    `both_rejection_arms_name_only_the_status_they_carry`, and the old name
@@ -908,7 +928,9 @@ deliberately unplanned.
 
    And `REJECTION_BUDGET`'s doc said "the slack it leaves is single digits".
    Measured, at the widest owner numbers: 7 (`NoParticipantSlots`), 9, 10, 11,
-   11, **16** (`Malformed`), **23** (`Ok`). A 16-byte clause on a
+   11, **16** (`Malformed`) — and 23 for `Ok`, which round 15 established this
+   library cannot construct, so the reachable ceiling is `Malformed`'s 16. A
+   16-byte clause on a
    `Malformed`-only branch passes this gate and every other. The doc now states
    the range and names what would actually catch a short clause, which is the
    forbidden-word rule and review — the third un-instrumented superlative beside
