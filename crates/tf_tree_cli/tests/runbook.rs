@@ -124,7 +124,7 @@ fn section() -> &'static str {
 /// write is vacuous, and a row can be checked for existing without being
 /// checked for saying anything.
 ///
-/// **Section-wide, and deliberately not per row.** Per row would be the
+/// **Over the joined table rows, and deliberately not per row.** Per row would be the
 /// stronger rule and it is refused because it would dictate vocabulary:
 /// measured, `Malformed`'s remedy — *confirm both sides are the same release
 /// before reading this as corruption* — carries none of these five, and the
@@ -134,6 +134,13 @@ fn section() -> &'static str {
 /// wording. Two documents described this check as per-row until round 9; they
 /// were corrected rather than the check, because the check is the defensible
 /// one.
+///
+/// **It was section-wide until round 16, and that let the table borrow.** The
+/// prose above it says "rebuilding every participant" and names `tf_tree doctor
+/// --explain-version`, so two of these five were satisfied by sentences no row
+/// owns — rewriting both `rebuild` cells to say "reinstall" would have passed.
+/// The rows are where a search key lands a reader, so the rows are what is
+/// searched.
 const REMEDY_WORDS: [&str; 5] = ["rebuild", "restart", "read-only", "/proc", "doctor"];
 
 /// The shortest a row's *what to do* cell may be.
@@ -236,6 +243,17 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     );
 
     // The rows say something, and the message says none of it.
+    // **Over the table's rows, not the whole section.** Round 10 widened the
+    // section's end bound because a footnote *below* it lent the table a word;
+    // the same borrowing works from the prose *above* the table, which says
+    // "rebuilding every participant" and names `tf_tree doctor
+    // --explain-version` — so two of the five words were satisfied by sentences
+    // no row owns, and rewriting both `rebuild` cells to say "reinstall" would
+    // have passed. Joining the rows keeps the words where an operator who
+    // followed a search key is looking, and still asks nothing of any single
+    // row: that is [`REMEDY_FLOOR`]'s job, and requiring a word per row would
+    // dictate vocabulary — see [`REMEDY_WORDS`].
+    //
     // **Case-folded on both sides.** The forbidden half lowercases the message;
     // this half compared raw, so capitalising a remedy at the start of a cell —
     // `Restart them together` — reddened the gate with *"no longer says
@@ -243,12 +261,19 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     // `0055` step 6 shipped a defect through a case-sensitive forbidden list;
     // this is the same rule with its polarity flipped, and it fails closed
     // instead of open.
-    let folded = section.to_ascii_lowercase();
+    let folded = section
+        .lines()
+        .filter(|l| l.starts_with("| `") && !l.starts_with("| `status` |"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
     for word in REMEDY_WORDS {
         assert!(
             folded.contains(word),
-            "docs/RUNBOOK.md's `HandshakeRejected` section no longer says {word:?}, which \
-             the message is forbidden to say: the remedy is in neither place"
+            "no row in docs/RUNBOOK.md's `HandshakeRejected` table says {word:?}, which \
+             the message is forbidden to say: the remedy is in neither place. Prose \
+             around the table does not count — it is not where a search key lands a \
+             reader"
         );
         for status in receivable() {
             let text = IpcError::HandshakeRejected {

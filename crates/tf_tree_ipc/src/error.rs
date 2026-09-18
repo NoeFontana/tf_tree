@@ -785,10 +785,17 @@ mod tests {
     /// [`RuntimeDirSource`]s, the four [`EnvVar`]s, the four [`NameProblem`]s,
     /// the four [`LockRole`]s, the seven `HelloStatus`es, the three
     /// [`WireError`]s, [`ProcError`]'s arms including all three parse causes,
-    /// and `ArenaHeldButUnreachable`'s seven reachable states.
+    /// and `ArenaHeldButUnreachable`'s **thirteen** states — *this said seven,
+    /// which is the count a first version listed and
+    /// `every_unreachable_state_reports_the_facts_and_prescribes_nothing` calls
+    /// out as wrong; the sweep below it was rewritten twice without the number
+    /// above being read.*
     ///
     /// **And the widths a formatter does not branch on but a budget counts**:
-    /// the ids that carry one are sampled at `u64::MAX` / `Some(u32::MAX)`, and
+    /// the three ids are sampled at `u64::MAX` / `Some(u32::MAX)` /
+    /// `first_pid: u32::MAX` — **the pid included, which is the field round 8
+    /// found pinned at 4242 under a "widest" label**, and which a first version
+    /// of this very sentence left out again — and
     /// `HandshakeRejected`'s two owner numbers at `u32::MAX` beside their
     /// realistic values. A `format_version` of `3` renders one digit where the
     /// type renders ten.
@@ -1086,9 +1093,11 @@ mod tests {
     /// branch pass this and every other gate. What would catch that is the
     /// forbidden-word rule in `tf_tree_cli`'s `runbook.rs`, and review. Saying
     /// so is the point, because *this read "the slack it leaves is single
-    /// digits"* — true of five statuses, false of two, and an un-instrumented
-    /// superlative beside a constant is the shape this step has already
-    /// corrected twice.
+    /// digits"* — true of **two** statuses and false of five, and an
+    /// un-instrumented superlative beside a constant is the shape this step has
+    /// already corrected twice. *The correction itself then said "true of five,
+    /// false of two", which is the same sentence inverted: a count stated
+    /// beside the seven numbers that refute it.*
     ///
     /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
     const REJECTION_BUDGET: usize = 140;

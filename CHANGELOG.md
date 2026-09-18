@@ -105,7 +105,9 @@ floor, and the section must carry the remedy words the message is forbidden to
 carry — section-wide, because requiring them per row would dictate vocabulary;
 `RejectionCarriedFd`, the sibling arm that also carries a `HelloStatus`, is held
 to the same no-foreign-status rule, though its search key and runbook row are
-recorded as owed rather than taken; and a new `HelloStatus` trips a wire-value
+recorded as owed rather than taken; the required words are searched over the
+table's joined rows rather than the section, because the prose around it says
+"rebuilding every participant" and would lend the table two of the five; and a new `HelloStatus` trips a wire-value
 compile error in the test build: `status_is_a_refusal` is a total `match` kept
 for no other purpose, because safe Rust cannot enumerate an enum and
 `HelloStatus::from_u32`'s catch-all arm absorbs a new variant without complaint.
@@ -146,8 +148,10 @@ the problem.
 **143 bytes** and ASCII. The arm's range is **116 to 164**: the widest *ids* —
 a 64-bit mask and two `u32::MAX`s — render 158, and the widest rendering of all
 is 164, at **slot 0**, because `, the creator's` outweighs the nine digits a
-wide slot adds. *This said "158 at the widest", from a sweep that pinned
-`first_pid` at 4242 and measured 152.*
+wide slot adds. *This entry originally said "the widest ids those fields can
+carry render 158" — true of the arm, and backed by nothing: the sweep behind it
+pinned `first_pid` at 4242 and measured 152, and 164 was named nowhere. The
+erratum that replaced it called 158 wrong, which it is not.*
 The split is the point rather than the size: this type sees which lock bytes are
 held and cannot see who holds them, so it cannot tell one process holding two
 bytes from two holding one each — and a remedy that guesses is wrong in

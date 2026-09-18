@@ -855,6 +855,36 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Round 16, six findings, and three are counts stated beside the numbers
+   that refute them.** `REJECTION_BUDGET`'s doc said the old superlative was
+   "true of five statuses, false of two"; the seven slacks are 7, 9, 10, 11, 11,
+   16, 23, so single digits is true of **two**. The correction inverted the
+   sentence it was correcting, in a published rustdoc whose subject is
+   un-instrumented counts. `samples()`' doc still said `ArenaHeldButUnreachable`
+   has "seven reachable states" while the sweep under it lists thirteen and the
+   sibling test's comment calls seven the repudiated count. And the sentence
+   added to record round 8's fix — "the ids that carry one are sampled at
+   `u64::MAX` / `Some(u32::MAX)`" — names the mask and the slot and omits
+   `first_pid`, which *is* the field round 8 was about.
+
+   Two were errata that misdescribe what they retract. The changelog's step-6
+   erratum said the entry had claimed "158 at the widest" and called it wrong;
+   what it claimed was "the widest *ids* render 158", which is **true** — what
+   was wrong is that nothing measured it, the sweep having produced 152. And the
+   record's `ModeNotPermitted` paragraph still offered `OwnerServer::check`
+   alone as the reason nothing sends that status, which is the producer list
+   round 12 corrected in the runbook cell and left standing in the paragraph
+   drawing the same conclusion.
+
+   The sixth is a real gate hole: **the required words were searched over the
+   whole section, and the prose above the table says "rebuilding every
+   participant" and names `tf_tree doctor --explain-version`.** So two of the
+   five were satisfied by sentences no row owns; rewriting both `rebuild` cells
+   to say "reinstall" passed. Round 10 widened the *end bound* because a
+   footnote below lent the table a word, and the same borrowing from above went
+   unexamined. The search is over the joined rows now — where a search key lands
+   a reader — and the reworded-cells mutant is caught.
+
    **Round 15: a bound taken from a state this library cannot construct.** The
    reduction was advertised as "108 to 124 bytes" in four places, and 108 is
    `Ok` — a status `HandshakeRejected` cannot carry here, because both producers
@@ -1123,9 +1153,15 @@ deliberately unplanned.
 
      **And a second, of the same kind:** `ModeNotPermitted`'s advice told a
      caller to attach read-only because the owner would not let it write.
-     **Nothing in this workspace sends that status** — `OwnerServer::check`
-     compares version, layout and boot id and nothing else, and the value exists
-     because §3.7 lists it. So the advice described a policy the implementation
+     **Nothing in this workspace sends that status.** A rejection has three
+     producers and none yields it: `OwnerServer::serve` answers an undecodable
+     datagram with `Malformed`, `OwnerServer::check` compares version, layout
+     and boot id and nothing else, and the `assign` closure a caller hands
+     `serve` may return **any** status — the only route that could send this one
+     — while `tf_tree::open`'s assigner returns only `NoParticipantSlots`. The
+     value exists because §3.7 lists it. *This offered `check` alone as the
+     reason: the producer list round 12 corrected in the runbook cell, left
+     standing in the paragraph stating the same conclusion.* So the advice described a policy the implementation
      does not have. Both errors survived every review this arm has had, because
      a per-status list *looks* like it was derived from the producers and was
      derived from the status names. The row now says what is true: a peer that
