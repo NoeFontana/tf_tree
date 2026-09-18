@@ -78,12 +78,17 @@ Both halves are gated. No rendering may name a status it did not get, which is
 the original defect of this arm made unexpressible; the runbook section must
 carry a row per refusal status and those rows must contain the remedy words the
 message is forbidden to contain; and a new `HelloStatus` trips a wire-value
-tripwire, because safe Rust cannot enumerate an enum and neither list is derived
-from one. The worked example that section quotes is asserted to be `Display`'s
-own output rather than a transcription of it, because a quoted message is the
-shape that drifts, and the per-status check requires a table **row** rather than
-a mention, because the section's prose names two of the statuses while telling
-them apart from the header checks that share those names.
+compile error: `status_is_a_refusal` is a total `match` kept for no other
+purpose, because safe Rust cannot enumerate an enum and `HelloStatus::from_u32`'s
+catch-all arm absorbs a new variant without complaint. The per-status check
+requires a table **row** rather than a mention, since the section's prose names
+two of the statuses while telling them apart from the header checks that share
+those names, and the worked example that section quotes is asserted to be
+`Display`'s own output rather than a transcription of it, because a quoted
+message is the shape that drifts. The runbook-reading half lives in
+`tf_tree_cli`, which is not published: `cargo package` does not put `docs/` into
+a tarball, so that `include_str!` beside the type would ship a crate whose tests
+cannot build.
 
 ### Fixed — a C caller could not read the end of an error message, and `ArenaHeldButUnreachable` was 793 bytes of it (`0055` step 6)
 
@@ -114,8 +119,8 @@ than 165 lines into a bullet.
 
 The messages end with `(ArenaHeldButUnreachable)` — `0059` convention (g)'s
 parenthesised form, as `tf_tree_arena`'s `check.rs` and `frozen.rs` already
-spell it. **Convention (e), at most 120 bytes, is not met**: these arms are 116
-to 145 bytes at the sample widths and 158 at the widest, because (e) was derived for an arena error nested in two wrappers
+spell it. **Convention (e), at most 120 bytes, is not met**: these arms are **116 to
+164** bytes, the upper end being the widest the fields can render, because (e) was derived for an arena error nested in two wrappers
 whose payload is an errno, and this one carries a 64-bit mask and two 32-bit
 ids.
 

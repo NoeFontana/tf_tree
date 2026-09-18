@@ -729,8 +729,47 @@ mod tests {
     /// `HandshakeRejected`'s two owner numbers at `u32::MAX` beside their
     /// realistic values. A `format_version` of `3` renders one digit where the
     /// type renders ten.
-    fn samples() -> Vec<IpcError> {
+    /// Every `HelloStatus`, written out because safe Rust cannot enumerate an
+    /// enum — and [`status_is_a_refusal`] is the compile error that says so
+    /// when one is added.
+    const ALL_STATUSES: [crate::wire::HelloStatus; 7] = {
         use crate::wire::HelloStatus as H;
+        [
+            H::Ok,
+            H::VersionMismatch,
+            H::LayoutMismatch,
+            H::BootIdMismatch,
+            H::NoParticipantSlots,
+            H::ModeNotPermitted,
+            H::Malformed,
+        ]
+    };
+
+    /// Is this status a refusal — that is, does it need a `docs/RUNBOOK.md`
+    /// row?
+    ///
+    /// **Total by construction, and that is its whole job.** `rejection_advice`
+    /// used to be the place a new `HelloStatus` broke the build, and step 7
+    /// deleted it; `HelloStatus::from_u32`'s `_` arm cannot replace it, because
+    /// a variant added without touching the codec compiles clean. So the prompt
+    /// lives here: adding one fails to compile, and the author who fixes this
+    /// match is the author standing in front of [`ALL_STATUSES`], the runbook's
+    /// table and `tf_tree_cli`'s `runbook.rs`.
+    fn status_is_a_refusal(status: crate::wire::HelloStatus) -> bool {
+        use crate::wire::HelloStatus as H;
+        match status {
+            // The acceptance: no error is built from it, so it has no row.
+            H::Ok => false,
+            H::VersionMismatch
+            | H::LayoutMismatch
+            | H::BootIdMismatch
+            | H::NoParticipantSlots
+            | H::ModeNotPermitted
+            | H::Malformed => true,
+        }
+    }
+
+    fn samples() -> Vec<IpcError> {
         use crate::{EnvVar, LockRole, NameProblem, RuntimeDirSource as R};
         let sources = [R::Env, R::XdgRuntimeDir, R::Run, R::Tmp];
         let vars = [
@@ -751,15 +790,7 @@ mod tests {
             LockRole::Participant(63),
             LockRole::Claim(63),
         ];
-        let statuses = [
-            H::Ok,
-            H::VersionMismatch,
-            H::LayoutMismatch,
-            H::BootIdMismatch,
-            H::NoParticipantSlots,
-            H::ModeNotPermitted,
-            H::Malformed,
-        ];
+        let statuses = ALL_STATUSES;
         let mut out = Vec::new();
         for source in sources {
             out.push(IpcError::RuntimeDirUnusable {
@@ -1001,13 +1032,6 @@ mod tests {
         );
     }
 
-    /// Words a remedy is written with. **Forbidden in the message and required
-    /// in the runbook section**, which is the only pairing that keeps either
-    /// half honest: a forbidden list nobody would ever write is vacuous, and a
-    /// runbook row can be checked for existence without being checked for
-    /// saying anything.
-    const REMEDY_WORDS: [&str; 5] = ["rebuild", "restart", "read-only", "/proc", "doctor"];
-
     /// **A rejection is facts, and facts have a width.** [`0059`]'s convention
     /// (e) asks for 120 bytes; these must also name both sides of the
     /// comparison (§3.7), and a `u32` renders ten digits where a plausible
@@ -1018,23 +1042,6 @@ mod tests {
     ///
     /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
     const REJECTION_BUDGET: usize = 140;
-
-    /// `docs/RUNBOOK.md`'s `HandshakeRejected` section, which is where this
-    /// variant's seven remedies went.
-    fn runbook_rejection_section() -> &'static str {
-        const RUNBOOK: &str = include_str!("../../../docs/RUNBOOK.md");
-        let after = RUNBOOK
-            .split_once("### `HandshakeRejected`")
-            .map_or("", |(_, after)| after);
-        // An empty parse is not a pass: every assertion below is a `contains`,
-        // and all of them hold vacuously against nothing.
-        assert!(
-            !after.is_empty(),
-            "docs/RUNBOOK.md must carry a `HandshakeRejected` section: it holds the \
-             remedies this variant's message stopped carrying"
-        );
-        after.split_once("\n### ").map_or(after, |(body, _)| body)
-    }
 
     /// **A rejection reports the status it got and prescribes nothing**
     /// (`0055` step 7) — and, above all, **never names a status it did not
@@ -1052,17 +1059,19 @@ mod tests {
     /// which this variant is no longer excepted from.
     #[test]
     fn every_rejection_names_only_the_status_it_carries() {
-        use crate::wire::HelloStatus as H;
-        let statuses = [
-            H::Ok,
-            H::VersionMismatch,
-            H::LayoutMismatch,
-            H::BootIdMismatch,
-            H::NoParticipantSlots,
-            H::ModeNotPermitted,
-            H::Malformed,
-        ];
-        for status in statuses {
+        // Six of the seven are refusals, and the odd one out is the acceptance.
+        // Cheap, and it is what keeps `status_is_a_refusal` — the compile error
+        // a new `HelloStatus` meets — attached to something that runs.
+        assert_eq!(
+            ALL_STATUSES
+                .into_iter()
+                .filter(|s| status_is_a_refusal(*s))
+                .count(),
+            ALL_STATUSES.len() - 1,
+            "exactly one `HelloStatus` is not a refusal, and it is the acceptance"
+        );
+
+        for status in ALL_STATUSES {
             let text = IpcError::HandshakeRejected {
                 status,
                 owner_format_version: u32::MAX,
@@ -1092,108 +1101,14 @@ mod tests {
             );
 
             // No other status's name, ever.
-            for other in statuses {
+            for other in ALL_STATUSES {
                 assert!(
                     other == status || !text.contains(&format!("{other:?}")),
                     "a {status:?} rejection names {other:?}, which is the defect that \
                      cost a rebuild before anyone reread the word in front of it: {text}"
                 );
             }
-
-            // No remedy: that is the runbook's, in more room than this buffer has.
-            let lower = text.to_ascii_lowercase();
-            for word in REMEDY_WORDS {
-                assert!(
-                    !lower.contains(word),
-                    "{status:?}'s message prescribes ({word:?}); the remedy belongs in \
-                     docs/RUNBOOK.md, which the C ABI's 255 bytes cannot hold: {text}"
-                );
-            }
         }
-    }
-
-    /// **The runbook holds what the message gave up, per status** — and a new
-    /// `HelloStatus` trips over this test on its way in.
-    ///
-    /// Safe Rust cannot enumerate a plain enum, so neither this list nor the
-    /// runbook's table is derived from `HelloStatus`; what is derived is the
-    /// wire codec, and `from_u32` maps every code it has no name for to
-    /// `Malformed`. So the first unused wire value decoding to anything else
-    /// means a status was added, and this test is where that says "the runbook
-    /// needs a row".
-    #[test]
-    fn a_new_status_needs_a_row_in_the_runbook() {
-        use crate::wire::HelloStatus as H;
-        let section = runbook_rejection_section();
-
-        // Every refusal has a row. `Ok` does not: it is the acceptance, and no
-        // error is built from it.
-        for status in [
-            H::VersionMismatch,
-            H::LayoutMismatch,
-            H::BootIdMismatch,
-            H::NoParticipantSlots,
-            H::ModeNotPermitted,
-            H::Malformed,
-        ] {
-            // A **row**, not a mention: the section's prose names
-            // `VersionMismatch` and `LayoutMismatch` while distinguishing them
-            // from the header checks that share those names, so a `contains`
-            // over the section is satisfied for two of the six by paragraphs
-            // that answer nothing.
-            let row = format!("| `{status:?}` |");
-            assert!(
-                section.lines().any(|l| l.starts_with(&row)),
-                "docs/RUNBOOK.md's `HandshakeRejected` section has no table row for \
-                 {status:?}, so the message's search key leads an operator to a table \
-                 that does not answer the status they were given"
-            );
-        }
-
-        // **The section's worked example is the real rendering**, not a
-        // transcription of it. A quoted message is the shape that drifts: this
-        // repository has corrected the same figure in three documents more than
-        // once, and the fix is to state it where it executes.
-        let example = IpcError::HandshakeRejected {
-            status: H::LayoutMismatch,
-            owner_format_version: 3,
-            owner_layout_hash: 0x3D10_4195,
-        }
-        .to_string();
-        assert!(
-            section.contains(&example),
-            "docs/RUNBOOK.md's `HandshakeRejected` section quotes a message this code does \
-             not produce; it must contain, verbatim: {example}"
-        );
-
-        // The rows say something. Without this the check above is satisfied by
-        // seven bare status names.
-        for word in REMEDY_WORDS {
-            assert!(
-                section.contains(word),
-                "docs/RUNBOOK.md's `HandshakeRejected` section no longer says {word:?}, \
-                 which `every_rejection_names_only_the_status_it_carries` forbids the \
-                 message from saying: the remedy is in neither place"
-            );
-        }
-
-        // The tripwire. Seven codes are named — each round-trips to itself, so
-        // none of them is a fallback — and the eighth must still decode to
-        // `Malformed`, which is what makes a new status visible here.
-        for v in 0..=6u32 {
-            assert_eq!(
-                H::from_u32(v).as_u32(),
-                v,
-                "wire value {v} no longer has a status of its own"
-            );
-        }
-        assert_eq!(
-            H::from_u32(7),
-            H::Malformed,
-            "wire value 7 decodes to a status of its own, so `HelloStatus` grew: give it a \
-             row in docs/RUNBOOK.md's `HandshakeRejected` section, a line in this test's \
-             two lists, and a sample in `samples()`"
-        );
     }
 
     /// **The facts each `ArenaHeldButUnreachable` state prints** — the remedy is

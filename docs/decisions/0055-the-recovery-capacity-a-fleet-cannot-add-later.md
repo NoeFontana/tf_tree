@@ -689,8 +689,8 @@ deliberately unplanned.
    parenthesised form, as `tf_tree_arena`'s `check.rs` and `frozen.rs` already
    spell it; a first version ended `: ArenaHeldButUnreachable`, a second
    spelling of a convention living in two other crates. **Convention (e), at
-   most 120 bytes, is not met and is no longer claimed**: these arms are 116 to
-   145 bytes at the sample widths and 158 at the widest, because (e) was derived for an arena error nested in two wrappers
+   most 120 bytes, is not met and is no longer claimed**: these arms are **116 to
+   164** bytes, the upper end being the widest the fields can render, because (e) was derived for an arena error nested in two wrappers
    carrying an errno, and this one carries a 64-bit mask and two 32-bit ids.
 
    **Five tests needed rewriting, not the three this step predicted**: the two
@@ -757,12 +757,33 @@ deliberately unplanned.
    reaches the 220 the C path allows.
 
    **A row a reader cannot reach is the failure this shape invites**, so the
-   runbook is gated too. `a_new_status_needs_a_row_in_the_runbook` reads
-   `docs/RUNBOOK.md` with `include_str!` and requires a row per refusal status,
-   requires those rows to contain the remedy words the message is forbidden to
-   contain — the two halves keep each other honest — and trips when wire value 7
-   stops decoding to `Malformed`, which is the only signal available that a
-   `HelloStatus` was added: safe Rust cannot enumerate one.
+   runbook is gated too — `crates/tf_tree_cli/tests/runbook.rs`, which reads
+   `docs/RUNBOOK.md` with `include_str!` and requires a table **row** per
+   refusal status (a `contains` over the section is satisfied for two of the six
+   by the prose that tells them apart from the header checks sharing their
+   names), requires those rows to carry the remedy words the message is
+   forbidden to carry — the two halves keep each other honest — and requires the
+   section's worked example to be `Display`'s own output rather than a
+   transcription of it.
+
+   **It lives in `tf_tree_cli` and not beside the type, and that is not a
+   preference.** `tf_tree_ipc` is published, and `cargo package` does not put a
+   file from outside the package directory into the tarball
+   (`cargo package --list -p tf_tree_ipc` carries no `docs/`), so an
+   `include_str!("../../../docs/RUNBOOK.md")` there ships a crate whose tests
+   cannot build. `crates/tf_tree_cli/src/lib.rs` writes that rule down for the
+   README and `checks.rs`'s `docs/API.md` gate is the precedent. The first cut
+   of this step put it in `tf_tree_ipc`.
+
+   **And what tells the next author a row is owed is a compile error, not a
+   tripwire.** `rejection_advice` was the total `match` a new `HelloStatus` used
+   to break; deleting it removed that prompt, and `HelloStatus::from_u32`'s
+   catch-all arm absorbs a new variant without complaint — so a first cut of
+   this step asserted that wire value 7 still decodes to `Malformed`, which
+   fires only if the codec is updated too. `status_is_a_refusal` replaces it: a
+   total `match` kept for no other purpose, whose author is standing in front of
+   the list, the table and the test. Measured: adding a variant fails
+   `cargo check -p tf_tree_ipc --all-targets`.
 
    - **Verified by** the step-6 gate with the exception and
      `HANDSHAKE_REJECTED_LENGTHS` both removed, so the variant is measured with
