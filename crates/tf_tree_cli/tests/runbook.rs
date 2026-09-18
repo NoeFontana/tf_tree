@@ -135,21 +135,24 @@ fn section() -> &'static str {
 /// were corrected rather than the check, because the check is the defensible
 /// one.
 ///
-/// **It was section-wide until round 16, and that let the table borrow.** The
-/// prose above it says "rebuilding every participant" and names `tf_tree doctor
-/// --explain-version`, so two of these five were satisfied by sentences no row
-/// owns — rewriting both `rebuild` cells to say "reinstall" would have passed.
-/// The rows are where a search key lands a reader, so the rows are what is
-/// searched.
+/// **It was section-wide until round 16 and whole-row until round 17, and both
+/// let the table borrow.** The prose above it says "rebuilding every
+/// participant" and names `tf_tree doctor --explain-version`, so two of these
+/// five were satisfied by sentences no row owns; and a row has a second content
+/// column, so moving that pointer into *What the owner compared* and rewording
+/// the remedy passed as well. The remedy cell is what an operator acts on, so
+/// the remedy cells are what is searched.
 const REMEDY_WORDS: [&str; 5] = ["rebuild", "restart", "read-only", "/proc", "doctor"];
 
 /// The shortest a row's *what to do* cell may be.
 ///
 /// **A floor, not a target, and deliberately far below what these cells are.**
 /// Its job is to catch a cell that was emptied, not to police length: the
-/// remedy-word check below is over the section, so a row can be blanked without
-/// touching a word anywhere else — measured, on review round 2, when the
-/// `ModeNotPermitted` cell was emptied, the row stayed, and this file passed.
+/// remedy-word check below is over the *union* of the remedy cells, so one can
+/// be blanked without touching a word in any other — measured, on review round
+/// 2, when the `ModeNotPermitted` cell was emptied, the row stayed, and this
+/// file passed. *That sentence said "over the section" until round 17, three
+/// narrowings after it stopped being true.*
 /// The assertion prints the offending cell's actual length, which is where a
 /// number belongs; an earlier version of this sentence claimed the shortest
 /// cell was "several times this" and it was 1.7×.
@@ -242,17 +245,21 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
          produce; it must contain, verbatim: {example}"
     );
 
-    // The rows say something, and the message says none of it.
-    // **Over the table's rows, not the whole section.** Round 10 widened the
-    // section's end bound because a footnote *below* it lent the table a word;
-    // the same borrowing works from the prose *above* the table, which says
-    // "rebuilding every participant" and names `tf_tree doctor
-    // --explain-version` — so two of the five words were satisfied by sentences
-    // no row owns, and rewriting both `rebuild` cells to say "reinstall" would
-    // have passed. Joining the rows keeps the words where an operator who
-    // followed a search key is looking, and still asks nothing of any single
-    // row: that is [`REMEDY_FLOOR`]'s job, and requiring a word per row would
-    // dictate vocabulary — see [`REMEDY_WORDS`].
+    // The remedies say something, and the message says none of it.
+    //
+    // **Over the remedy cells, and this bound has been narrowed three times.**
+    // Round 10 widened the section's *end* because a footnote below it lent the
+    // table a word. Round 16 moved the search from the section to the rows,
+    // because the prose *above* the table says "rebuilding every participant"
+    // and names `tf_tree doctor --explain-version` — two of the five, borrowed.
+    // And a row is two content columns: with whole rows joined, moving
+    // `tf_tree doctor --explain-version` into `LayoutMismatch`'s *What the
+    // owner compared* cell and rewording its remedy left the only pointer to a
+    // reader's own `layout_hash` in no remedy anywhere, and passed (measured).
+    // The remedy column is the one an operator acts on, so it is the one
+    // searched. It still asks nothing of any *single* row — that is
+    // [`REMEDY_FLOOR`]'s job, and a word per row would dictate vocabulary, see
+    // [`REMEDY_WORDS`].
     //
     // **Case-folded on both sides.** The forbidden half lowercases the message;
     // this half compared raw, so capitalising a remedy at the start of a cell —
@@ -264,16 +271,23 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     let folded = section
         .lines()
         .filter(|l| l.starts_with("| `") && !l.starts_with("| `status` |"))
+        .filter_map(|l| {
+            l.trim_matches('|')
+                .split(" | ")
+                .nth(remedy_column)
+                .map(str::trim)
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .to_ascii_lowercase();
     for word in REMEDY_WORDS {
         assert!(
             folded.contains(word),
-            "no row in docs/RUNBOOK.md's `HandshakeRejected` table says {word:?}, which \
-             the message is forbidden to say: the remedy is in neither place. Prose \
-             around the table does not count — it is not where a search key lands a \
-             reader"
+            "no *remedy* in docs/RUNBOOK.md's `HandshakeRejected` table says {word:?}, \
+             which the message is forbidden to say: the remedy is in neither place. \
+             Neither the prose around the table nor the `What the owner compared` \
+             column counts — a search key lands a reader on a row, and the remedy \
+             cell is what they act on"
         );
         for status in receivable() {
             let text = IpcError::HandshakeRejected {

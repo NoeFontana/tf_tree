@@ -771,12 +771,13 @@ deliberately unplanned.
    refusal status (a `contains` over the section is satisfied for two of the six
    by the prose that tells them apart from the header checks sharing their
    names), holds each row's remedy cell to a length floor, requires the
-   *section* to carry the remedy words the message is forbidden to carry — the
-   two halves keep each other honest — and requires the section's worked example
+   **remedy cells** to carry between them the words the message is forbidden to
+   carry — the two halves keep each other honest — and requires the section's worked example
    to be `Display`'s own output rather than a transcription of it.
 
-   **Section-wide and not per row, which two sentences here claimed until round
-   9.** Per row is the stronger rule and it is refused on purpose: measured,
+   **Over the union of the remedy cells, and not per row.** *Section-wide until
+   round 16 and whole-row until round 17, each narrowing forced by a measured
+   escape; and two sentences here claimed per row until round 9.* Per row is the stronger rule and it is refused on purpose: measured,
    `Malformed`'s remedy carries none of the five words, and the only way to pass
    a per-row rule would be to write one into prose that does not want it. A gate
    that edits the text to satisfy itself is worse than one that checks less, and
@@ -829,8 +830,9 @@ deliberately unplanned.
    not fail: a 65-byte "see the section below for what to do about this
    particular status" passes, measured on round 10.* The mutant that justified
    the sentence was a 17-byte stub, so the claim was true of that stub and not
-   of stubs. The words stayed section-wide for the reason above, so a cell can
-   also be replaced by other prose of the same length. A length is what a row
+   of stubs. The words are searched over the union of the remedy
+   cells for the reason above, so one cell can still be replaced by other prose
+   of the same length. A length is what a row
    owes; whether it says anything is review's. The section's end bound
    stopped only at `###`, so a `HandshakeRejected` section that ever became the
    last one under its chapter would have swallowed the rest of the runbook and
@@ -854,6 +856,23 @@ deliberately unplanned.
    addition that *can* reach an operator — a variant wired into the codec — and
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
+
+   **Round 17: the same bound narrowed a third time, and three documents left
+   describing the version before it.** Round 16 moved the remedy-word search
+   from the section to the rows — and a row has two content columns. Measured:
+   move `tf_tree doctor --explain-version` into `LayoutMismatch`'s *What the
+   owner compared* cell, reword its remedy, and the only pointer telling an
+   operator how to read their own build's `layout_hash` appears in no remedy
+   anywhere, with the gate green. It searches the remedy cells now, which is the
+   column an operator acts on.
+
+   The narrowing has gone section → rows → remedy cells, each step forced by a
+   measured escape and each leaving its predecessor's description in place:
+   `REMEDY_FLOOR`'s doc in the same file and same commit as round 16's fix, the
+   changelog stating both rules six lines apart, and this plan describing the
+   check as section-wide in three places — the half an implementer reads as the
+   spec, which is round 11's finding about this record repeated on a different
+   claim.
 
    **Round 16, six findings, and three are counts stated beside the numbers
    that refute them.** `REJECTION_BUDGET`'s doc said the old superlative was
