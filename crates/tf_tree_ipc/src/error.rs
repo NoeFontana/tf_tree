@@ -1121,9 +1121,20 @@ mod tests {
                 text.contains(&format!("{status:?}")),
                 "a rejection that does not name its status: {text}"
             );
+            // **Each number with its label, and not one `contains` for both.**
+            // A conjunction of two bare `contains` is satisfied by two
+            // unlabelled digits: rewriting the arm as `(owner {n}, 0x{h:08X})`
+            // — which leaves an operator holding two numbers with no way to
+            // tell which is which — passed this assertion. That is the same
+            // anti-pattern this file splits apart for the widest
+            // `ArenaHeldButUnreachable` ids, and it was here at the same time.
             assert!(
-                text.contains("4294967295") && text.contains("0x3D104195"),
-                "the owner's side of the comparison is missing: {text}"
+                text.contains("owner format_version 4294967295"),
+                "the owner's format_version is missing or unlabelled: {text}"
+            );
+            assert!(
+                text.contains("layout_hash 0x3D104195"),
+                "the owner's layout_hash is missing or unlabelled: {text}"
             );
             assert!(
                 text.ends_with("(HandshakeRejected)"),

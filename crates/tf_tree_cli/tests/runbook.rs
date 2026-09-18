@@ -82,7 +82,8 @@ fn receivable() -> Vec<HelloStatus> {
 fn section() -> &'static str {
     const RUNBOOK: &str = include_str!("../../../docs/RUNBOOK.md");
     // `\n### `, not `### `: a `#### ` subheading of the same name would match
-    // the start. The end bound stops at any of the three heading depths — at a
+    // the start. The end bound stops at any heading depth — including `# `,
+    // which the first version left out while giving the argument for it — at a
     // `## ` because a section that becomes the last `###` under its chapter
     // would otherwise swallow the rest of the file and every `contains` below
     // would go vacuous with nothing firing, and at a `#### ` because a
@@ -98,7 +99,7 @@ fn section() -> &'static str {
         "docs/RUNBOOK.md must carry a `HandshakeRejected` section: it holds the remedies \
          that variant's message stopped carrying"
     );
-    let end = ["\n#### ", "\n### ", "\n## "]
+    let end = ["\n#### ", "\n### ", "\n## ", "\n# "]
         .iter()
         .filter_map(|h| after.find(h))
         .min()

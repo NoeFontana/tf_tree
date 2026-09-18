@@ -85,7 +85,8 @@ per-status list looks like it was derived from the producers and was derived
 from the status names.
 
 Both halves are gated. No rendering may name a status it did not get, which is
-the original defect of this arm made unexpressible; the runbook section must
+the original defect of this arm made unexpressible; each of the owner's two
+numbers is asserted with the label that says which one it is; the runbook section must
 carry a row per refusal status and those rows must contain the remedy words the
 message is forbidden to contain; and a new `HelloStatus` trips a wire-value
 compile error in the test build: `status_is_a_refusal` is a total `match` kept

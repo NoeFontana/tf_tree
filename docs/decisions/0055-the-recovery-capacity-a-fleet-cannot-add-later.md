@@ -833,6 +833,18 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Round 7, and the finding is this step's own lesson landing on itself.** The
+   rejection gate asserted `contains("4294967295") && contains("0x3D104195")` —
+   a conjunction of two bare `contains`, satisfied by two unlabelled numbers.
+   Measured: rewriting the arm as `(owner {n}, 0x{h:08X})`, which leaves an
+   operator holding two digits with no way to tell which is which, passed it.
+   The same anti-pattern is split apart three hunks below for the widest
+   `ArenaHeldButUnreachable` ids, in this same commit, with the fix written out
+   — and it was sitting here the whole time. Each number is now asserted with
+   its label. *That the regression was caught at all was `tf_tree_cli`'s
+   verbatim-example assertion, which is `shm`-gated: the crate that publishes
+   the type was not gating its own message's labels.*
+
    **Found in round 6 and deliberately not fixed here: `PHASE2.md` §3.7 asks a
    rejection to name *both* sides' values, and this arm prints one.** §3.7 is
    explicit — "Each must name both sides' values", and for `LayoutMismatch`
