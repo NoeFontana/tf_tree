@@ -506,6 +506,13 @@ fn a_read_only_attach_refuses_to_create() {
 /// reclamation (#184): it abandons the arena and **leaves the byte held**, so
 /// the replacement's table is one slot smaller for as long as the survivor runs.
 ///
+/// **The two refusals in the middle are the message read verbatim** (`0055`
+/// step 2). `CreatePolicy::Always` is two thirds of a create: the arms of
+/// `ArenaHeldButUnreachable` that recommend it say so, and a reader who follows
+/// only the policy gets `NoLayoutToCreate` or `ReadOnlyCannotCreate` instead of
+/// an arena. Asserting both here is what keeps that sentence from decaying into
+/// a recovery path that fails when it is followed.
+///
 /// **Mutant: drop `self.create != CreatePolicy::Always &&` from step 4's
 /// condition** ⇒ measured — `Always` yields the ownership byte like every other
 /// policy, and the second half fails with `ArenaHeldButUnreachable`.
@@ -547,6 +554,40 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
             tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable { .. })
         ),
         "expected ArenaHeldButUnreachable, got {err:?}"
+    );
+
+    // **The message read verbatim, which is the half that drifts.** Every
+    // `ArenaHeldButUnreachable` arm that sends an operator to
+    // `CreatePolicy::Always` also tells them a forced create needs a layout to
+    // build from and a read-write mode to build it in — `0055` step 2, and the
+    // reason that sentence is in two arms rather than one. These two assertions
+    // are what stops the prose and the code drifting apart again: switching the
+    // policy alone reaches a *second, different* error, exactly as the message
+    // says. Neither attempt creates anything, so the wedge is still the wedge
+    // for the successful call below.
+    let no_layout = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::Always)
+        .timeout(std::time::Duration::from_millis(100))
+        .open()
+        .err()
+        .expect("a forced create with no layout cannot create");
+    assert!(
+        matches!(no_layout, tf_tree::OpenError::NoLayoutToCreate),
+        "the policy alone must not create; expected NoLayoutToCreate, got {no_layout:?}"
+    );
+
+    let read_only = tf_tree::Open::new()
+        .mode(AttachMode::ReadOnly)
+        .create(CreatePolicy::Always)
+        .layout_if_creating(layout())
+        .timeout(std::time::Duration::from_millis(100))
+        .open()
+        .err()
+        .expect("a forced create in read-only mode cannot create");
+    assert!(
+        matches!(read_only, tf_tree::OpenError::ReadOnlyCannotCreate),
+        "the layout alone must not create; expected ReadOnlyCannotCreate, got {read_only:?}"
     );
 
     let tree = creator(CreatePolicy::Always)

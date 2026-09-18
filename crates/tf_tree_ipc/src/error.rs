@@ -584,7 +584,12 @@ impl fmt::Display for IpcError {
                     } else {
                         "the other slots in the mask above are still held, so an ordinary open \
                          will still refuse — that is when PHASE2 §3.4's CreatePolicy::Always \
-                         becomes the escape hatch, provided nothing still holds the ownership byte"
+                         becomes the escape hatch, provided nothing still holds the ownership \
+                         byte, and provided the call carries the other two halves of a create: a \
+                         layout to build from and a read-write mode to build it in. Through the \
+                         tf_tree facade those are Open::layout_if_creating and \
+                         AttachMode::ReadWrite; without them the forced create fails with a \
+                         second, different error rather than creating"
                     }
                 ),
                 // §3.4's stranded-participant case: the only one where
