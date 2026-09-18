@@ -225,6 +225,31 @@ is a call per step.
    ABI. Today the C ABI is measured against native and the native *embedding*
    path is not measured at all.
 
+> **Amendment (2026-09-18) — item 2's guidance now has a price on it, and a
+> sixth placement is measured and declined.**
+>
+> `docs/decisions/0060` Decision A gave `SampleRing::sample_from` and the batch
+> fold **one** bracket-read body. On this workspace's own profile that is free —
+> every `lookup/*` row is within ±1.4% of the commit before it. At an embedder's
+> default `cargo build --release` (`lto = false`, `codegen-units = 16`) the
+> interpolating rows are **+6% to +11%**, isolated to the read split and not to
+> the batch fold (§11.3 of that record). So item 2 above is no longer only about
+> a boundary an embedder can choose to pay: **a placement that is invisible
+> under LTO can cost 10% without it**, and the same knob is still the mitigation.
+>
+> **A sixth `#[inline]`, measured and not taken.** `#[inline(always)]` on
+> `SampleRing::sample_from` itself is **−27.6% to −38.0%** on every
+> interpolating `lookup/*` row here and **+13.5% to +20.2%** at the embedder
+> profile. It joins `fold_at_cursors` below as a placement whose measurement
+> refused it, for the opposite reason: not that it is slower, but that it is
+> faster only where the profile is already ours.
+>
+> **And neither number came from a recipe.** `just bench-check`'s
+> `lookup_latency` and `embedding_cross_crate` rows are refused on the
+> development host by `bench_report`'s own fitness probe (SMT on, CPU governor
+> unreadable), so item 3's gate could not see either result. That is the gap
+> item 3 exists to close and has not.
+
 > **Amendment — item 1 is done and measured, items 2 and 3 are not, and the
 > paragraph above states the wrong mechanism.**
 >

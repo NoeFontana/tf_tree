@@ -14,7 +14,9 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use tf_tree::{InterpPolicy, Iso3, Layout, Stamp, SystemDomain};
+use tf_tree::{
+    exp_se3, Capacity, EdgeCfg, InterpPolicy, Iso3, Layout, Stamp, SystemDomain, TreeBuilder,
+};
 use tf_tree_bench::{fixture, replay::TfStream};
 
 const N: usize = 1024;
@@ -210,6 +212,120 @@ fn at_many_small(c: &mut Criterion) {
     group.finish();
 }
 
+/// The plan and data shapes `docs/decisions/0060` step 2 owes: **one dynamic
+/// step**, stamps **off the publication grid**, and a **stationary** edge.
+///
+/// Every other group in this file runs the 3-step fixture plan on 1024 stamps
+/// that are neither deliberately on nor deliberately off its 50–1000 Hz grids.
+/// Three things that changes hide:
+///
+/// * **One dynamic step** is the shape the audited plan was first scoped to and
+///   the shape `py_parity`'s batch actually has. It is also the shape with the
+///   least arithmetic per stamp to amortise a chunk's bookkeeping over, so if
+///   the chunked fold has a plan shape it loses on, this is it.
+/// * **On the grid** every bracket is an exact stamp hit and `Interp::eval`
+///   never runs at all; **off it** every bracket interpolates. The two are
+///   different code paths through the same fold, and a change that moved work
+///   between them would be invisible to a row that mixes them.
+/// * **A stationary edge** is §5's all-fallback regime and — since step 0a —
+///   the regime *four of the five* dynamic edges of the one real recording in
+///   this tree are in for its whole duration. `py_parity`'s rows are in it too.
+///
+/// The two policies are kept apart because they disagree here: `LerpSlerp`
+/// reads a motionless edge as `h == 0` and `ScLerp` reads it as a degenerate
+/// screw, and §9.3 measured that the second of those happens by luck rather
+/// than by construction.
+fn at_many_shapes(c: &mut Criterion) {
+    /// Samples per edge, and the stamp spacing.
+    const SAMPLES: usize = 2048;
+    const DT: i64 = 1_000_000;
+
+    let mut group = c.benchmark_group("at_many_shapes");
+    group.throughput(Throughput::Elements(N as u64));
+
+    for (name, interp, moving) in [
+        ("one_dyn_sclerp", InterpPolicy::ScLerp, true),
+        ("one_dyn_lerpslerp", InterpPolicy::LerpSlerp, true),
+        ("stationary_sclerp", InterpPolicy::ScLerp, false),
+        ("stationary_lerpslerp", InterpPolicy::LerpSlerp, false),
+    ] {
+        let tree = TreeBuilder::new()
+            .dynamic_edge(
+                "map",
+                "base",
+                EdgeCfg::new(Capacity::slots(SAMPLES as u32 + 1)).interp(interp),
+            )
+            .build()
+            .expect("build");
+        let map = tree.frame("map").expect("map");
+        let base = tree.frame("base").expect("base");
+        {
+            let w = tree.claim(base, map).expect("claim");
+            for i in 0..SAMPLES as i64 {
+                // Moving: a smooth screw. Stationary: literally one pose,
+                // republished — which is what a `/tf` wheel-link edge does.
+                let f = if moving { i as f64 } else { 1.0 };
+                w.push(
+                    i * DT,
+                    &exp_se3([
+                        0.0003 * f,
+                        -0.0002 * f,
+                        0.0005 * f,
+                        0.01 * f,
+                        0.02 * f,
+                        -0.01 * f,
+                    ]),
+                )
+                .expect("push");
+            }
+        }
+        let plan = tree.plan(base, map).expect("plan");
+        let guard = tree.guard();
+
+        // On the grid: every query is an exact published stamp, so no bracket
+        // interpolates. Off it: every query falls strictly inside a segment.
+        let step = (SAMPLES as i64 - 2) / N as i64;
+        let on: Vec<Stamp> = (0..N)
+            .map(|i| Stamp::from_nanos(i as i64 * step * DT))
+            .collect();
+        let off: Vec<Stamp> = (0..N)
+            .map(|i| Stamp::from_nanos(i as i64 * step * DT + DT / 3))
+            .collect();
+
+        let mut out = vec![Iso3::IDENTITY; N];
+        let mut mat = vec![0.0f64; N * Layout::Mat4.elems()];
+
+        group.bench_function(format!("{name}_on_grid_at_many_1024"), |b| {
+            b.iter(|| {
+                plan.at_many(&guard, black_box(&on), &mut out)
+                    .expect("at_many");
+                black_box(&out);
+            });
+        });
+        group.bench_function(format!("{name}_off_grid_at_many_1024"), |b| {
+            b.iter(|| {
+                plan.at_many(&guard, black_box(&off), &mut out)
+                    .expect("at_many");
+                black_box(&out);
+            });
+        });
+        let nanos: Vec<i64> = off.iter().map(|s| s.nanos()).collect();
+        group.bench_function(format!("{name}_off_grid_into_mat4_1024"), |b| {
+            b.iter(|| {
+                plan.at_many_into::<SystemDomain>(
+                    &guard,
+                    black_box(&nanos),
+                    Layout::Mat4,
+                    &mut mat,
+                )
+                .expect("at_many_into");
+                black_box(&mat);
+            });
+        });
+    }
+    group.finish();
+}
+
 /// The same two entry points over a **recorded** `/tf` stream.
 ///
 /// Every other row in this file runs on the synthetic fixture, whose four
@@ -291,5 +407,11 @@ fn at_many_recorded(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, at_many, at_many_small, at_many_recorded);
+criterion_group!(
+    benches,
+    at_many,
+    at_many_small,
+    at_many_shapes,
+    at_many_recorded
+);
 criterion_main!(benches);

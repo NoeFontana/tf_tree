@@ -21,7 +21,7 @@ use crate::edge::{claim, ClaimRecord};
 use crate::error::{EdgeId, LookupError};
 use crate::frame::{intern_core, InternTable, CLAIM_UNRECORDED};
 use crate::participant::{state_of, ParticipantRecord, ParticipantTable, FREE, LIVE, RESERVED};
-use crate::sample::ExtrapPolicy;
+use crate::sample::{Bracket, ExtrapPolicy};
 use crate::sync::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 fn pose(seed: u64) -> Iso3 {
@@ -221,9 +221,12 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
 /// which production reaches from `Plan::latest` alone. `Plan::at` samples
 /// through `Guard::sample_hinted` -> `sample_from`, and so do
 /// `at_extrapolating`, `latest_common`, the adaptive path and both batch loops.
-/// `sample_from` carries **its own copy** of the trailing `head - i > retained`
-/// revalidation, and no loom model executed that copy: deleting it passes
-/// `writer_wraps_...` (run, 20.9 s green).
+/// `sample_from`'s read carries **its own copy** of the trailing
+/// `head - i > retained` revalidation, separate from `sample`'s, and no loom
+/// model executed that copy: deleting it passes `writer_wraps_...` (run, 20.9 s
+/// green). Since `docs/decisions/0060` step 2 that copy lives in
+/// [`SampleRing::read_from`], which `sample_from` is one `Interp::eval` away
+/// from; the mutant below was re-run against it there.
 ///
 /// # Shape
 ///
@@ -242,10 +245,11 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
 /// trailing check can refuse.
 ///
 /// **Mutant, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`, which the
-/// environment cannot lower): delete `sample_from`'s trailing
+/// environment cannot lower): delete the trailing
 /// `if self.head.load(Ordering::Acquire) - i > retained { return
-/// Err(LookupError::SlotRecycled { .. }); }` (`sample.rs`). **FAILS** on the
-/// assertion below, found in the first milliseconds of the search.
+/// Err(LookupError::SlotRecycled { .. }); }` from `read_from` (`sample.rs`).
+/// **FAILS** on the assertion below, found in the first milliseconds of the
+/// search.
 /// `writer_wraps_...` passes under the same deletion.
 ///
 /// **The seed is the test.** Under that same deletion, seeding the cursor at `1`
@@ -340,8 +344,10 @@ fn sample_from_with_a_stale_cursor_across_a_lap() {
 /// runs 30.2 s alone, and both arms behind one reader measured 234.6 s.
 ///
 /// **Mutant M279, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): remove
-/// `.and_then(|p| self.revalidated(newest, retained, p))` from `sample_from`'s
-/// `Hold` arm (`sample.rs`). **FAILS** on the assertion below, in 0.00 s — the
+/// `.and_then(|p| self.revalidated(newest, retained, p))` from the `Hold` arm
+/// of `read_from`, which is where `sample_from`'s arm has lived since
+/// `docs/decisions/0060` step 2 (`sample.rs`). **FAILS** on the assertion
+/// below, in 0.00 s — the
 /// reader loads `head == 1` and stamp 10, both pushes land, and slot 0 holds
 /// `pose(3)`. Under it the exact-newest model and the stale-cursor model both
 /// pass, so each model's control is its own arm.
@@ -394,8 +400,10 @@ fn sample_from_hold_revalidates_across_a_lap() {
 /// call is `Extrapolation`. The only legal `Ok` is `pose(1)`, bit for bit.
 ///
 /// **Mutant M288, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): replace
-/// the `t == t_new` arm's `return self.revalidated(newest, retained, p);` with
-/// `return Ok(p);` (`sample.rs`, inside `sample_from` only). **FAILS** on the
+/// the `t == t_new` arm's `return self.revalidated(newest, retained, p)
+/// .map(Bracket::Exact);` with `return Ok(Bracket::Exact(p));` (`sample.rs`,
+/// inside `read_from` only — the arm `sample_from` reaches, and not `sample`'s
+/// copy of it). **FAILS** on the
 /// assertion below, in 0.00 s; the `Hold` model (30.2 s) and the stale-cursor
 /// model pass under it. This model runs 30.5 s alone.
 #[test]
@@ -422,6 +430,91 @@ fn sample_from_exact_newest_revalidates_across_a_lap() {
                     held,
                     "sample_from's exact-newest arm returned a lapped slot"
                 ),
+                Err(
+                    LookupError::Extrapolation { .. }
+                    | LookupError::SlotRecycled { .. }
+                    | LookupError::SlotContended { .. },
+                ) => {}
+                Err(other) => panic!("undocumented error: {other:?}"),
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
+/// [`SampleRing::read_from`] validates the bracket **before it hands it back**,
+/// so a caller that interpolates later still interpolates validated endpoints.
+///
+/// # Why it needs its own model, given the three above
+///
+/// Since `docs/decisions/0060` step 2 there is one read body: `sample_from` is
+/// `read_from` plus one `Interp::eval`, and `Plan::fold_batch` is `read_from`
+/// for a whole chunk and then one `Interp::eval` per lane. The three models
+/// above drive that body — but all three drive it through `sample_from`, where
+/// the evaluation is the next instruction. **The batch fold's shape is the one
+/// where it is not**: the returned [`Bracket`] is carried across up to fifteen
+/// further reads before anything is done with it, so what has to hold is that
+/// the *endpoints* were judged, not that the pose was.
+///
+/// That is what this asserts, on the endpoints themselves rather than on a
+/// pose folded from them: an `Ok(Bracket::Between { .. })` must carry `(20, 30)`
+/// bit for bit, whatever the writer did while it was being read.
+///
+/// # Shape
+///
+/// [`sample_from_with_a_stale_cursor_across_a_lap`]'s ring, writer, cursor seed
+/// and query, for that model's reasons — capacity 4, `10, 20, 30` published
+/// before the threads start, the writer landing `40` and `50`, the reader's
+/// cursor seeded at `0` because that is where a batch starts and it is the
+/// index the fifth push recycles.
+///
+/// **Mutant, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): delete
+/// `read_from`'s trailing `if self.head.load(Ordering::Acquire) - i > retained
+/// { return Err(LookupError::SlotRecycled { .. }); }` (`sample.rs`). **FAILS**
+/// on the assertion below. It is the same deletion that fails
+/// [`sample_from_with_a_stale_cursor_across_a_lap`], and necessarily so — there
+/// is one check now, and a control that killed only one of two models would
+/// mean there were still two. What this model adds is not a second check to
+/// break, it is the deferred-evaluation caller.
+#[test]
+fn read_from_validates_the_bracket_it_hands_back() {
+    model(|| {
+        let hr = Arc::new(HeapRing::new(4));
+        {
+            let ring = hr.ring();
+            for i in 1..=3u64 {
+                ring.push(i as i64 * 10, &pose(i)).unwrap();
+            }
+        }
+        let (lo, hi) = (pose(2).to_bits(), pose(3).to_bits());
+
+        let w = Arc::clone(&hr);
+        let writer = thread::spawn(move || {
+            let ring = w.ring();
+            ring.push(40, &pose(4)).unwrap();
+            ring.push(50, &pose(5)).unwrap();
+        });
+
+        let r = Arc::clone(&hr);
+        let reader = thread::spawn(move || {
+            let ring = r.ring();
+            // Held by the caller across the whole chunk, as `Plan::fold_batch`
+            // holds one per step.
+            let mut cursor = 0u64;
+            match ring.read_from::<Bracket>(25, ExtrapPolicy::Error, &mut cursor) {
+                // The only bracket for 25 in this ring is (20, 30) at s = 0.5.
+                Ok(Bracket::Between { a, b, s }) => {
+                    assert_eq!(
+                        (a.to_bits(), b.to_bits(), s),
+                        (lo, hi, 0.5),
+                        "read_from handed back a bracket built from a recycled slot"
+                    );
+                }
+                Ok(Bracket::Exact(_)) => {
+                    panic!("25 is not a published stamp and the policy is Error")
+                }
                 Err(
                     LookupError::Extrapolation { .. }
                     | LookupError::SlotRecycled { .. }

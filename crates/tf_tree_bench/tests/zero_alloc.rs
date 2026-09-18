@@ -495,6 +495,21 @@ fn batch_outcome(r: Result<(), tf_tree::LookupError>) -> Outcome {
 ///   `allocations=6120`. `at_many` has its own loop and the non-monotone windows
 ///   take the other arm, and all five stay green: the windows are specific, not
 ///   merely sensitive.
+///
+///   **That bullet was measured before `docs/decisions/0060` step 2 and its
+///   parenthetical no longer holds**: `at_many` went through `fold_batch` in
+///   that change, so the monotone path is one body for all four entry points
+///   and there is no longer a separate loop for it to miss. Re-run on the
+///   chunked fold — the statement placed in the chunk loop's emit pass, which
+///   is where the per-stamp `write` call went — it **FAILS naming all four
+///   monotone windows**, each `allocations=3328`, and leaves the four
+///   non-monotone ones at `allocations=0`. The mutant is still specific; what
+///   it is specific to is one entry point more. The count drops from 6 120 to
+///   3 328 because the emit pass runs per *written row* where `note` ran per
+///   *evaluation*: 3 328 is the 208 answered rounds times this file's
+///   `BATCH` of 16, and the missing 2 792 are the declined rounds, each of
+///   which refuses at element 0 and now never reaches the emit pass at all.
+///   6 120 = 3 328 + 2 792 is that arithmetic closing.
 /// * `WINDOW_ROUNDS` lowered to 100: FAILS every window with `declined=0 <-
 ///   nothing declined, so the refusal path was never measured` — the
 ///   anti-vacuity assertion is itself failable.

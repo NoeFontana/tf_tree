@@ -461,9 +461,14 @@ fn at_many_into_handles_unsorted_stamps() {
 /// The twist layout's two batch loops must agree, exactly as the pose layouts'
 /// do.
 ///
-/// `Layout::QuatTwist` gained the monotone cursor branch, so it now has the
-/// same shape as `fold_batch`: ascending stamps gallop from a resumable cursor,
-/// anything else restarts each search. Feeding the same stamps forward and
+/// `Layout::QuatTwist` gained the monotone cursor branch, so it has the shape
+/// `fold_batch` had: ascending stamps gallop from a resumable cursor, anything
+/// else restarts each search. **`fold_batch` has since moved on** —
+/// `docs/decisions/0060` step 2 made it a chunked two-phase fold and left
+/// `fold_batch_with_twist` alone, deliberately, as the untouched control the
+/// `into_quat_twist_1024` bench row measures. So this is now the *only* batch
+/// loop of that shape, which makes the agreement below its own property rather
+/// than a restatement of the pose layouts'. Feeding the same stamps forward and
 /// reversed puts one call down each branch, and the rows must come back
 /// element-for-element identical after un-reversing.
 ///
