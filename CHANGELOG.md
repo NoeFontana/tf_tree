@@ -53,14 +53,21 @@ statement about a prefix — and six were over the 220 bytes this crate's own ga
 allows. They are **108 to 124 bytes** now (133 at the widest owner
 numbers) and every one of them fits.
 
-The message states the status, the owner's `format_version` and `layout_hash` —
-which §3.7 requires a rejection to name, and which a client cannot get any other
-way — and ends `(HandshakeRejected)`, the key that finds the runbook. **The
+The message states the status and the owner's `format_version` and
+`layout_hash`, which a client can get no other way — and ends `(HandshakeRejected)`, the key that finds the runbook. **The
 seven remedies are now `docs/RUNBOOK.md`'s `HandshakeRejected` section**, one row
 per status, placed beside the header-validation checks that share two of their
 names, because mistaking one for the other is the error an operator actually
 makes: the handshake statuses are the *owner's* comparison against an attach
 request, decided before this process ever saw a segment.
+
+**`PHASE2.md` §3.7 asks a rejection to name *both* sides' values and this arm
+prints one.** That is older than this change — `tf_tree_ipc` depends on `rustix`
+and `libc`, so it cannot read this build's `layout_hash()` — and it is recorded
+in `0055` step 7 rather than fixed here, because closing it means new fields on a
+published crate's error type. The remedy is unaffected; the runbook now says
+which build to read the second number from, since `tf_tree doctor` prints the
+CLI's own and that is a third value.
 
 **Writing those rows found two of them false.** The `BootIdMismatch` remedy said
 the arena had "outlived a reboot" and should be removed. A serving owner is

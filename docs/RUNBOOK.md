@@ -354,16 +354,27 @@ step 7).
 
 **Two of these statuses share a name with a check below and are not that check.**
 `VersionMismatch` and `LayoutMismatch` here are the **owner's** comparison
-against the attach request, made before this process ever saw the segment — which
-is why the message carries one hash and not two, and why `found`/`expected` do
-not appear. The sections under those names below are this process validating a
+against the attach request, made before this process ever saw the segment, which
+is why `found`/`expected` do not appear.
+
+**The message prints the owner's hash and not this build's, and
+[`PHASE2.md`](./PHASE2.md) §3.7 asks for both.** That divergence is older than
+the reduction and is recorded in
+[`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
+step 7 rather than fixed by it: `tf_tree_ipc` depends on `rustix` and `libc`
+alone, so it cannot read this build's `layout_hash()` to print beside the
+owner's. **It does not change the remedy** — rebuilding every participant from
+one release is the fix whichever pair of numbers you are holding — and where
+this build's own constants *are* printed is `tf_tree doctor --explain-version`,
+**run from the refused binary's build**, not from whichever `tf_tree` is on the
+path. A hash from a different build is a third number, not the missing one. The sections under those names below are this process validating a
 header it has already mapped against its own build constant — which also happens
 where there is no owner and no handshake at all, opening a frozen `.tft`.
 
 | `status` | What the owner compared | What to do |
 |---|---|---|
 | `VersionMismatch` | this binary's `FORMAT_VERSION` against the running arena's, **first**, because a version difference makes every later field's meaning uncertain | rebuild every participant from one release and restart them together. There is no partial upgrade path |
-| `LayoutMismatch` | same version, a different record layout | rebuild every participant, as above. The owner's `layout_hash` is in the message; this binary's is a build constant, which `tf_tree doctor` prints |
+| `LayoutMismatch` | same version, a different record layout | rebuild every participant, as above. The owner's `layout_hash` is in the message; this binary's is a build constant, printed by `tf_tree doctor --explain-version` **built from the same commit as the refused process** — see the note above this table before comparing two numbers |
 | `BootIdMismatch` | the boot id in the attach request against the one in the **arena header** | **not "the arena outlived a reboot"** — a serving owner is proof it did not, and the segment would not have survived one. The two processes disagree about which boot this is, and the kernel has one boot id per host with no per-namespace variant ([`PHASE2.md`](./PHASE2.md) §3.3), so one of them did not read the real value: either the read failed and it substituted all-zeros (both sides do, so it takes exactly one failure), or something presents a different `/proc/sys/kernel/random/boot_id` to it — a sandbox that masks `/proc/sys`, or a `/proc` overlay. **And there is a third way, which needs no failure at all: the two sides parse that file with different code.** The joiner sends `tf_tree_ipc::procstat::boot_id`, which rejects a UUID with trailing junk; the arena header was written by `tf_tree::tree::boot_id`, which ignores it. On a file neither of them should ever see, the strict one substitutes all-zeros and the lenient one does not — so reading the file from both processes can show it identical and the ids still disagree. Check the file first, and if it is well formed and identical, the mismatch is that divergence and is a bug to report |
 | `NoParticipantSlots` | every slot, against **both** its tables: the owner's assigner walks the arena's participant records *and* the lock bytes, and grants a slot only where both are free | the *`ParticipantTableFull` / `NoParticipantSlots`* section below is the triage, and the reason it is there rather than here is that the two tables need two different commands to read. A read-only consumer holds a byte and writes no record, so neither table alone is the answer. **There is no `--participants` flag and never was**: capacity is fixed at construction ([`PROJECT.md`](./PROJECT.md) §5 D4) |
 | `ModeNotPermitted` | **nothing in this workspace sends it.** Two things can: `OwnerServer::check`, which compares version, layout and boot id and nothing else, and the `assign` closure a caller hands `OwnerServer::serve`, which may return any `HelloStatus` — that is how `NoParticipantSlots` is sent. `tf_tree::open`'s assigner returns only `NoParticipantSlots` | attach read-only, which is the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18). **Who refused you decides the rest.** Against an owner built on `tf_tree_ipc` with its own `assign`, this is that policy and its author is who to ask. Against a `tf_tree` owner, no code path produces it, so report it. *The remedy this table replaced described it as an ordinary refusal to grant write access, with no hint that nothing here produces it* |

@@ -833,6 +833,31 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Found in round 6 and deliberately not fixed here: `PHASE2.md` §3.7 asks a
+   rejection to name *both* sides' values, and this arm prints one.** §3.7 is
+   explicit — "Each must name both sides' values", and for `LayoutMismatch`
+   "**The message must say exactly that** and print both hashes". The arm has
+   only ever carried the owner's, so the divergence predates this step; what
+   this step did was assert the opposite in three places, citing §3.7 as the
+   reason the owner's numbers are there.
+
+   **Why it is not step 7's to fix.** `tf_tree_ipc`'s dependencies are `rustix`
+   and `libc`, so it cannot read this build's `FORMAT_VERSION` or
+   `layout_hash()` to print beside the owner's. Closing it needs either two more
+   fields on a public variant of a published crate or a new dependency edge into
+   `tf_tree_arena` — a change to the surface, with `API.md` §7's checklist to
+   walk, not a reduction of a message. Both call sites do have the values in
+   hand (`client.rs` sent the request; `server.rs` is holding it), so the fields
+   route is mechanical if it is taken.
+
+   **What it costs an operator today, measured rather than assumed:** less than
+   it looks. The remedy for both hash-comparing statuses is *rebuild every
+   participant from one release*, which does not depend on knowing the second
+   number. The trap is the advice for getting it: `tf_tree doctor` prints the
+   **CLI binary's** build constant, which is a third value whenever the refused
+   process is a differently-built binary — precisely the case `LayoutMismatch`
+   reports. The runbook now says so and says which build to run it from.
+
    **Round 5 closed two escapes the round-4 fix still left, both measured.** The
    derivation stopped at the first repeated status, which assumes the wire
    numbering is contiguous: a variant wired in at 10, with 7 to 9 still folding

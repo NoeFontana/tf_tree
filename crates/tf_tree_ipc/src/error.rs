@@ -716,10 +716,18 @@ mod tests {
     /// deleted it; `HelloStatus::from_u32`'s `_` arm cannot replace it, because
     /// a variant added without touching the codec compiles clean. So the prompt
     /// lives here: adding one fails to compile, and the author who fixes this
-    /// match owes an entry to [`ALL_STATUSES`], a row to the runbook's table,
-    /// and a line to `tf_tree_cli`'s `tests/runbook.rs` — which cannot have a
-    /// prompt of its own, because `HelloStatus` is `#[non_exhaustive]` and a
-    /// downstream `match` is required to keep compiling when a status is added.
+    /// match owes an entry to [`ALL_STATUSES`] and a row to the runbook's
+    /// table.
+    ///
+    /// **`tf_tree_cli`'s `tests/runbook.rs` needs nothing added and will tell
+    /// you about the row.** It has no status list: it derives the set from
+    /// `HelloStatus::from_u32`, so the new status appears there as soon as the
+    /// codec can deliver it and the missing row fails `just shm-check`. *This
+    /// doc said the opposite — that the downstream crate could not detect an
+    /// addition because `HelloStatus` is `#[non_exhaustive]`. That is true of a
+    /// `match` and false of enumeration, and it was refuted two rounds after it
+    /// was written; a reader who believed it had no reason to expect the row to
+    /// be caught, which is exactly the step they would skip.*
     ///
     /// It is in `#[cfg(test)]`, so `cargo check -p tf_tree_ipc` still passes and
     /// `--all-targets` is what fails. `just build` and `just lint` pass it.
@@ -1044,9 +1052,18 @@ mod tests {
     }
 
     /// **A rejection is facts, and facts have a width.** [`0059`]'s convention
-    /// (e) asks for 120 bytes; these must also name both sides of the
-    /// comparison (§3.7), and a `u32` renders ten digits where a plausible
-    /// `format_version` renders one. This is that convention plus the digits,
+    /// (e) asks for 120 bytes; these carry the owner's `format_version` and
+    /// `layout_hash`, and a `u32` renders ten digits where a plausible
+    /// `format_version` renders one.
+    ///
+    /// **`PHASE2.md` §3.7 asks for *both* sides' values and this arm prints
+    /// one**, which is a divergence older than `0055` step 7 and is recorded
+    /// there rather than fixed here. `tf_tree_ipc` depends on `rustix` and
+    /// `libc` and nothing else, so it cannot read this build's `FORMAT_VERSION`
+    /// or `layout_hash()`: printing both needs two more fields on the variant
+    /// or a dependency edge, and either is a change to a published crate's
+    /// surface rather than a reduction. An earlier revision of this doc cited
+    /// §3.7 as though the arm satisfied it. This is that convention plus the digits,
     /// and the slack it leaves is single digits — so a clause of prose
     /// returning to this arm fails here long before it reaches
     /// `MESSAGE_BUDGET`, which has room for a paragraph.
@@ -1079,7 +1096,15 @@ mod tests {
                 .filter(|s| status_is_a_refusal(*s))
                 .count(),
             ALL_STATUSES.len() - 1,
-            "exactly one `HelloStatus` is not a refusal, and it is the acceptance"
+            "exactly one `HelloStatus` is not a refusal"
+        );
+        // **And it is the acceptance — which the count above does not say.**
+        // Inverting the predicate leaves the count at six and this file green,
+        // and the predicate is what the runbook and this module both name as
+        // the answer to *which statuses need a row*.
+        assert!(
+            !status_is_a_refusal(crate::wire::HelloStatus::Ok),
+            "`Ok` is the acceptance: no error is built from it and it has no runbook row"
         );
 
         for status in ALL_STATUSES {
@@ -1193,9 +1218,11 @@ mod tests {
             H::from_u32(v),
             H::Malformed,
             "the first unused wire value decodes to a status of its own, so `HelloStatus` \
-             grew and the codec can now deliver it: give it a row in docs/RUNBOOK.md's \
-             `HandshakeRejected` section, an entry in ALL_STATUSES here and in \
-             tf_tree_cli's tests/runbook.rs, and an arm in `status_is_a_refusal`"
+             grew and the codec can now deliver it: give it an entry in ALL_STATUSES \
+             here, an arm in `status_is_a_refusal`, and a row in docs/RUNBOOK.md's \
+             `HandshakeRejected` section. tf_tree_cli's tests/runbook.rs needs no \
+             list — it derives one from this codec — and it is what fails until the \
+             row exists"
         );
     }
 
