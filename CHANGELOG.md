@@ -41,6 +41,28 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — the escape hatch out of `ArenaHeldButUnreachable`, in the arm that did not say it (`0055` step 2)
+
+`IpcError::ArenaHeldButUnreachable` has an arm for the state where the arena
+creator's own slot 0 is still held. When other slots were held too, it sent the
+operator to `docs/PHASE2.md` §3.4's escape hatch — *"that is when
+`CreatePolicy::Always` becomes the escape hatch"* — and stopped there.
+
+`CreatePolicy::Always` is two thirds of a create. A create also needs a layout
+to build from, because decision `0004` sizes an arena from its declared edges,
+and a read-write mode to build it in. The stranded-participant arm has said so
+since 2026-09-10; this one had not, so **an operator who reached the hatch
+through the slot-0 arm and followed it verbatim got a second, different error
+instead of an arena** — `OpenError::NoLayoutToCreate` — at the moment they could
+least afford it. Both arms now name all three parts, in the same terms.
+
+No type changed: errors stay `Copy` identifiers with the prose in the message
+layer (`docs/API.md` R5). What is new is the test of the *verbatim* reading —
+`the_escape_hatch_creates_over_a_stranded_participant` now asserts, in the
+stranded state, that the policy alone returns `NoLayoutToCreate` and the layout
+alone returns `ReadOnlyCannotCreate` — which is what keeps the message and the
+runbook from drifting apart again.
+
 ### Changed — `at_many` and friends read a whole chunk before they interpolate (`0060` Decision A)
 
 `Plan::at_many`, `at_many_into` and `at_many_into_f32` no longer fold a batch
