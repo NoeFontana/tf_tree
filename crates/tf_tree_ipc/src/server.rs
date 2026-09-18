@@ -300,7 +300,9 @@ impl OwnerServer {
             // branch before the fix: `SIGSTOP` + `SIGCONT` to an owner takes it
             // from two threads to one, `default.sock` disappears, and a join
             // reports `an arena is alive but unreachable: participant slots 0x1
-            // still hold their lock bytes (slot 0, pid <alive>)`. The only
+            // still hold their lock bytes (slot 0, pid <alive>)` — the wording
+            // of that error at the time; `0055` step 6 reduced it to facts plus
+            // `(ArenaHeldButUnreachable)`, so do not grep for this text. The only
             // remedy was killing a healthy process. Three controls — no signal,
             // three `SIGWINCH`es, and a bare `SIGCONT` to a never-stopped owner
             // — all left the socket up and the join succeeding, so it is the

@@ -101,7 +101,7 @@ pub enum CreatePolicy {
     /// ownership byte and keeps byte 0, so a live non-owner can sit on the
     /// creator's slot with no owner anywhere and this still refuses. Read the
     /// bytes, not the role. Measured both ways by
-    /// `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass` and
+    /// `a_live_byte_0_refuses_both_policies` and
     /// `a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through`
     /// (`crates/tf_tree/tests/rendezvous.rs`); the error's own `Display` now
     /// names which of the three states a caller is in.
@@ -466,7 +466,7 @@ impl Open {
     /// pins that state. The refusal is the same either way, which is the point
     /// of predicating it on the byte rather than on who is meant to hold it.
     /// Measured by
-    /// `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass`
+    /// `a_live_byte_0_refuses_both_policies`
     /// (`crates/tf_tree/tests/rendezvous.rs`): with byte 0 held both policies
     /// return the *same* error; move the held byte to 3 and `Always` creates.
     fn register_creator(

@@ -592,7 +592,9 @@ pub(crate) fn guard(body: impl FnOnce() -> tft_status) -> tft_status {
 
 #[cfg(test)]
 mod tests {
-    use super::{record_lookup, tft_error, LAST_ERROR, TFT_ERR_TIME_DOMAIN, TFT_INVALID_ID};
+    use super::{
+        record_lookup, tft_error, LAST_ERROR, TFT_ERR_TIME_DOMAIN, TFT_INVALID_ID, TFT_MESSAGE_LEN,
+    };
     use tf_tree::{EdgeId, LookupError};
 
     fn last() -> tft_error {
@@ -632,5 +634,71 @@ mod tests {
             got: 0,
         });
         assert_eq!(last().edge, TFT_INVALID_ID);
+    }
+
+    /// **The buffer `tf_tree_ipc`'s message budget is derived from** (`0055`
+    /// step 6).
+    ///
+    /// `tf_tree_ipc::error`'s `MESSAGE_BUDGET` is 255 usable bytes minus the
+    /// **longest** fixed text a C path puts before one of its renderings, which
+    /// is `bridge::generic_failure_message`'s `shared arena could not be
+    /// created: ` — not the shorter `could not open the arena: ` an earlier
+    /// revision of this comment named. That crate cannot see these constants
+    /// (`tf_tree_c` depends on it, not the reverse), so the derivation is
+    /// repeated there and the three facts it rests on are pinned here: the
+    /// buffer's size, the truncation bound, and the `?` substitution. If any of
+    /// them moves, that budget is wrong in the unsafe direction and its own gate
+    /// would keep passing.
+    ///
+    /// **The number itself is deliberately not repeated here.** It was, and it
+    /// went stale in this file the moment it was corrected in the other one.
+    ///
+    /// It also pins the substitution, because a message that is merely *short*
+    /// is not enough: `set_message` replaces each non-ASCII **byte** with `?`,
+    /// so one em-dash becomes `???` and the budget has to be spent on ASCII.
+    // Same reason as `set_message`'s own allow above: `c_char` is `i8` on
+    // x86_64 and `u8` on aarch64, so `c as u8` is a no-op on exactly one of
+    // them and `-D warnings` makes that a build error there. **This test was
+    // written and gated on x86_64 and failed the `ubuntu-24.04-arm` row**,
+    // which is the same defect class the comment above records, one target
+    // over — and the reason that row exists.
+    #[allow(clippy::unnecessary_cast)]
+    #[test]
+    fn the_message_buffer_is_the_size_this_crates_budget_assumes() {
+        assert_eq!(
+            TFT_MESSAGE_LEN, 256,
+            "tf_tree_ipc's MESSAGE_BUDGET is derived from this; move both together"
+        );
+
+        // **The truncation bound itself, which is the "255 usable" term in that
+        // budget and was not pinned.** Mutating `min(TFT_MESSAGE_LEN - 1)` to
+        // `min(TFT_MESSAGE_LEN / 4)` left all 34 tests in this crate green — so
+        // the budget could have gone wrong in the unsafe direction with the gate
+        // passing, which is the exact hazard this test's doc says it prevents.
+        let mut long = last();
+        long.set_message(&"x".repeat(300));
+        let kept = long.message.iter().take_while(|&&c| c != 0).count();
+        assert_eq!(
+            kept,
+            TFT_MESSAGE_LEN - 1,
+            "a 300-byte message must keep exactly {} bytes and then NUL; \
+             tf_tree_ipc's budget subtracts the wrapper from this number",
+            TFT_MESSAGE_LEN - 1
+        );
+
+        let mut e = last();
+        e.set_message("a\u{2014}b");
+        let rendered: Vec<u8> = e
+            .message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&rendered),
+            "a???b",
+            "one em-dash must cost three bytes and render as ???, which is what the \
+             ASCII half of tf_tree_ipc's gate is for"
+        );
     }
 }

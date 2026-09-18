@@ -778,6 +778,11 @@ If a holder must keep running and its arena is written off, the escape hatch is
 `--force-new`, and it is a policy on the process that creates the arena, not a
 flag on `tf_tree`. There is no such flag; §0.0 records why.
 
+**This next table is about the *hatch*, not about your remedy — the remedy table
+is below it.** It answers one question: given what is held, does a forced create
+pass? Read it if you are considering `CreatePolicy::Always`; read the eight-row
+table further down to decide what to do.
+
 **It is not unconditional, and which holder is stuck decides whether it can help
 at all.** A forced create skips §3.4's participant scan and nothing else, so it
 still takes the ownership byte and still takes participant byte **0** — the
@@ -790,14 +795,56 @@ assigned `>= 1`. Three states, and they need different remedies:
 | slot **0** | **refuses**, identically to an ordinary open. Byte 0 is the creator's slot — usually the owner, but `Session::release_ownership` can leave a live non-owner there. Stop that process. If it was the *only* holder, an ordinary open then creates and no force is needed; if slots `>= 1` are still held, you land on row 1 and the forced create is the remedy |
 | the ownership byte, by a process that is not serving | **refuses.** Something took ownership and never bound its socket; stop it, then re-open |
 
-**The error is what tells you which of the three you are in**, and since #257 it
-says so in as many words instead of printing one sentence with a different slot
-number in it. `tf_tree participants` covers the first two rows — it walks the
-participant bytes, so a held slot 0 shows up there as `live` — but it does **not**
-show the ownership byte at all, which is why the third row is a bit
-(`ownership_held`) on `ArenaHeldButUnreachable` rather than something to go and
-look up. In both refusing rows the remedy is the paragraph above: stop the
-process, and the kernel releases the byte.
+**The error tells you which of the three you are in — as facts, not as a
+remedy, since `0055` step 6.** It prints the participant mask, the lowest held
+slot and its pid, and whether the ownership byte is held, and then ends with
+`(ArenaHeldButUnreachable)`. Match those against **the eight-row table below**,
+which is the remedy this section owns. This paragraph used to say the message
+"says so in as many words", i.e. carried the remedy itself; it did, and it was
+wrong three times in a day, because `Display` sees which bytes are held and
+cannot see who holds them.
+
+`tf_tree participants` covers the first two rows of the table above — it walks
+the participant bytes, so a held slot 0 shows up there as `live` — but it does
+**not** show the ownership byte at all, which is why that is a bit
+(`ownership_held`) on the error rather than something to go and look up.
+
+**The message states facts and ends with its own name; the remedy is here, and
+that split is deliberate** ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
+part 4, step 6). The message is printed by a process that is *being refused an
+attachment* — it can see which lock bytes are held and cannot see who holds
+them, so it cannot tell one process holding two bytes from two holding one
+each, and a remedy that guesses is wrong in whichever state it did not guess.
+It guessed wrong three times in a day before the split. You can see the
+processes; it cannot. Read your row off the two facts it gives you:
+
+| participant bytes | ownership byte | what to do |
+|---|---|---|
+| lowest slot is 0, nothing else | free | stop the process on slot 0; an ordinary open then creates. Slot 0 is the creator's, so a forced create cannot pass it either — `CreatePolicy::Always` takes slot 0 or nothing |
+| lowest slot is 0, nothing else | held | **usually the same process holds both** — a creator takes the ownership byte and slot 0 on one file description — so stopping it releases both. Check with `tf_tree participants`; if the ownership byte stays held afterwards, a second process has it and goes too |
+| lowest slot is 0, others too | free | stop slot 0's holder first; the rest are ordinary participants and §3.4's hatch then applies to them |
+| lowest slot is 0, others too | held | the ownership byte and slot 0 both have to be free, in either order, and one process may hold both; the hatch then applies to what is left |
+| lowest slot is 1 or above | free | the stranded-participant case §3.4's hatch is for: `CreatePolicy::Always` **abandons** this arena and creates a fresh one, leaving the survivors publishing where nobody can reach them. Reach for inheritance first |
+| lowest slot is 1 or above | held | **two things are held, so stopping one is not enough**: the ownership byte's holder took it and never bound a socket, and the participant bytes are still held too. A forced create cannot pass this either — it must take the ownership byte before the participant bytes it may skip. Stop the ownership holder, then you are on row 5 |
+| `nobody attached` … `held for the whole open timeout` | held | nobody is attached and ownership was held throughout by a process that never served; nothing was created. Stop that process |
+| `no byte was held at the open deadline` | — | the blocker let go while you were timing out. Retry; this is the one state that clears itself |
+
+**Two states are not in this table, and cannot reach you.** The
+`first_slot: None` arm with a non-empty mask prints *"no participant byte held,
+yet ownership could not be taken before the deadline"* for both ownership
+readings, and the rendezvous derives `first_slot` from the mask, so it never
+constructs that pair. The unit gate sweeps it because the variant's fields are
+`pub` and the arm is reachable by construction — not because an operator can
+meet it.
+
+**A forced create needs two more things besides the policy**, and the message
+no longer says so because it says nothing procedural: a layout to build from,
+since [`0004`](./decisions/0004-builder-time-edge-declaration.md) sizes an
+arena from its declared edges, and a read-write mode. Through the `tf_tree`
+facade those are `Open::layout_if_creating` and `AttachMode::ReadWrite`;
+without them the forced create fails with `NoLayoutToCreate` or
+`ReadOnlyCannotCreate` rather than creating. That was the defect `0055` step 2
+fixed in the message, and it is the reason this paragraph exists here.
 
 ```rust
 // `tf_tree::Open` is behind `features = ["shm"]`, Linux only.
@@ -828,7 +875,6 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
   still holds gets `LeaseContended` on an edge the new arena reports free, and
   retrying cannot clear it while the survivor runs. Expect it on whichever edge
   ids the old topology used first.
-
 - **It does *not* leave the creator's lock byte and arena record disagreeing, and
   an earlier revision of this bullet said it did.** The correction is kept here
   because the wrong version is the intuitive one. Those two indices are the same
@@ -864,36 +910,11 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
   ArenaHeldButUnreachable { holder_slots: 0x1, first_slot: Some(0), first_pid: <the holder>, ownership_held: false }
   ```
 
-  — *"…slot 0 (pid N) is the arena creator's own slot — CreatePolicy::Always
-  takes slot 0 or nothing, so no forced create can pass this. Stop the process
-  holding slot 0: it is the only holder and the ownership byte is free, so an
-  ordinary open will then create"*.
+  — which reads *"arena alive but unreachable: participant bytes 0x1 held,
+  lowest slot 0 (pid N, the creator's), ownership byte free
+  (ArenaHeldButUnreachable)"*. That is row 1 of this section's remedy table
+  above: stop the process on slot 0 and an ordinary open then creates.
 
-  **The remedy after the colon has four forms, and which one you get is the whole
-  point of the message.** It branches on the rest of the mask *and* on
-  `ownership_held`, rather than giving one remedy that is right in one state and
-  wrong in the other — which is the defect #257 was filed on, one state over.
-  Paraphrased rather than quoted here, because a verbatim quote of a diagnostic
-  is what went stale twice: the message text is not a compatibility promise, and
-  `every_unreachable_remedy_names_what_the_operator_must_supply`
-  (`crates/tf_tree_ipc/src/error.rs`) is what holds the clauses that matter.
-
-  | mask | ownership byte | what the remedy says |
-  |---|---|---|
-  | slot 0 alone | free | stopping it is sufficient; an ordinary open then creates |
-  | slot 0 alone | held | **usually still just that one process** — a creator holds the ownership byte and slot 0 on one file description, so stopping it releases both. Only if the ownership byte is still held afterwards is there a second process to stop |
-  | slot 0 + others | free | after byte 0 frees you are in row 1 of the table above: §3.4's hatch applies |
-  | slot 0 + others | held | a forced create needs the ownership byte **and** slot 0 free, in either order, and one process may hold both; §3.4's hatch then applies to the participants that are left |
-
-  Every one of the four ends with what a create needs besides the policy — a
-  layout and a read-write mode — because three of the four can end in one.
-
-  **Row 2 is the steady state of a healthy arena, not an exotic state.** A live
-  owner holds both bytes for its whole life, so any joiner that times out
-  without reaching the socket reads row 2; the first repair of this message told
-  that operator to stop a second process as well, which need not exist.
-  `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process`
-  (`crates/tf_tree/tests/rendezvous.rs`) is what stops that coming back.
 
   **An earlier revision of this paragraph told you to expect
   `OpenError::ParticipantSlotDiverged` here, and grepping your logs for it will
