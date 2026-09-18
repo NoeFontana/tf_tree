@@ -1,8 +1,10 @@
 # 0055: the recovery capacity a fleet cannot add later
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** (none yet)
+**Implementation:** **step 2 has landed** (#353, `0411adb`). Steps 1, 3, 4 and 6
+— the documentation, the eligibility pin, the §0.0 row and the reduction of what
+the message claims — have not. Step 5 is struck.
 
 ## Context
 
@@ -358,10 +360,17 @@ for answering open question 1 rather than deferring it.
 
 ## Decision
 
-**This is a draft and it authorises nothing.** It decides one thing, recommends
-a second, and deliberately leaves the mechanism open — the three questions below
-are the record's substance, and answering them from this document rather than
-from a review is the failure it is trying to avoid.
+**Decided 2026-09-18 by the owner. What changed is the *standing* of the parts
+below, not their content — except part 4, where the evidence moved.** This record
+was drafted to state the property out loud and to refuse to choose a mechanism
+from its own pages; the questions it left are answered here, with their reasons,
+and the answer to both of the expensive ones is **no new surface**. So what this
+record authorises is documentation and a test, not a protocol.
+
+The three questions are answered below as parts 2, 3 and 4. Question 1's table of
+candidates, question 2's costed routes and question 3's measurement stay where
+they are: they are the working, and a reader who wants to reopen one needs them
+rather than this summary.
 
 **1. Decided (documentation of an existing consequence; no code, no new
 surface).** The property is stated where a reader meets it —
@@ -385,16 +394,84 @@ read-only are the ones an integrator will not derive from the existing text —
 and with the statement, in [`RUNBOOK.md`](../RUNBOOK.md), that its own remedy is
 necessary and not sufficient.
 
-**2. Recommended, not decided.** Of the three candidate mechanisms in question 1
-below, the NORMATIVE fleet requirement is the cheapest and the only one with no
-tension against `0019`. It is also the weakest, and this record says so rather
-than selling it.
+**2. Decided (question 1): the NORMATIVE fleet requirement, and no mechanism.**
+Question 1's other two candidates are one candidate wearing two hats. A
+standby-heir helper polls, so it is a thread or a process; an `Open` policy either
+spawns that thread or records an intent nothing acts on. [`PHASE2.md`](../PHASE2.md)
+§3.5 is NORMATIVE that there is "no background thread, no daemon, no watcher a
+user must run", and [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md)
+holds that every process a user is *required* to run is a place adoption dies. An
+*optional* helper escapes the letter of that and not its point: the fleets that
+wedge are exactly the fleets that did not opt in, so an optional helper **names**
+the gap at the price of a permanent surface and closes it for nobody who did not
+already know. The presumption that such a helper would belong inside `tf_tree
+serve` makes the cost larger rather than smaller, because `serve` as specified is
+the arena's *creator* — a standby attaching to somebody else's arena is a scope
+change to an unbuilt capability, and it would be argued on its own or not at all.
 
-**3. Separable, and recommended to land ahead of this record on its own.** The
-`ArenaHeldButUnreachable` message recommends a recovery path that fails when
-followed verbatim. That is a defect in operator-facing prose today, independent
-of how anything above resolves, and coupling it to an undecided record delays a
-fix an operator meets at the worst possible moment. Detail in question 3.
+What the requirement is worth is stated rather than sold: it is advice wearing a
+normative label, and its second half — does anyone *call*? — is unobservable from
+outside the calling process. That is the honest ceiling of what a library with no
+daemon can promise here, and it is the same ceiling §3.5 already lives with.
+
+**What would reopen this:** a measured field incident in which a fleet that had
+read the requirement wedged anyway. Not an argument that a helper would be
+convenient, and not a second reading of the same trade.
+
+**3. Decided (question 2): no, and the refusal is recorded with its reasons so
+the next proposal starts from them.** Question 2's three routes each *supersede* a
+standing decision rather than extending one — a named segment runs at
+[`PROJECT.md`](../PROJECT.md) §6's design-smell list and §3.9's "no stale
+segments, ever", and *that* is the route whose proposal would have to supersede
+the entry rather than amend §3.6's creation sequence; an fd depot is a daemon, so
+`0019` applies in full, and §3.6 has nothing to do with it; an ownership handoff
+through the lock file runs at §3.4's **deleted** step 3 and the five unsound
+states [`0037`](./0037-a-takeover-is-not-a-second-open.md) enumerates — the list
+is `0037`'s, and [`0035`](./0035-the-creators-slot-is-taken-not-found.md) is
+state 1 of it rather than a second enumeration. A proposal may still be made. It
+starts by superseding the decision its own route runs at.
+
+**4. Decided (question 3), and the answer is not the one this record's own
+framing suggested.** Question 3 asked whether the message should recommend the
+abandoning path at all, when [`RUNBOOK.md`](../RUNBOOK.md) says to reach for
+inheritance first, and left it open as "a judgement about operator guidance".
+
+The first answer considered was that the two texts have different *readers* and
+both orderings are therefore right: the process printing
+`ArenaHeldButUnreachable` is a would-be joiner being refused an attachment, and
+inheritance is reachable only by a survivor that is already attached, so telling
+that reader to inherit first would name the one remedy it structurally cannot
+reach. That argument is sound as far as it goes, and **step 2's implementation
+(#353) falsified the conclusion it was used to support** — that the message needs
+no structural change.
+
+What #353 measured is that this arm cannot carry a remedy at all. `Display` sees
+which lock bytes are held and **cannot tell whether one process holds two of
+them** — nor name the ownership byte's holder at all; `first_pid` names the first
+held *participant* slot and nothing else. The remedy wants to say what to *stop*,
+which is a statement about processes. Three successive statements out of that one arm were wrong in
+a reachable state — the missing layout clause, the discarded `ownership_held`, and
+then a repair that asserted two holders and was false in the steady state of every
+healthy single-owner arena. Each was a hedge added to an inference the type cannot
+support.
+
+**So: the message's job is facts plus one pointer, and the remedy belongs in the
+runbook alone.** The bytes held, the first slot, its pid, and where to read what
+to do — `RUNBOOK.md`, whose reader has every process in hand and can therefore be
+given an ordering. This does not reopen [`API.md`](../API.md) R5: the prose stays
+in the message layer and nothing enters the error type. It is a reduction of what
+that prose claims, not a move of it.
+
+**Not done here, deliberately.** As landed, the arm is correct and pinned in two
+crates with mutants, and a third rewrite of the same text inside the branch that
+found the second one is how a repair breeds a defect. It is step 6 below, and it
+is this record's to own because it is the question this record left open.
+
+**5. Separable, and landed ahead of this record on its own (#353).** The
+`ArenaHeldButUnreachable` message recommended a recovery path that failed when
+followed verbatim. That was a defect in operator-facing prose independent of how
+anything above resolves, and coupling it to an undecided record would have delayed
+a fix an operator meets at the worst possible moment. Detail in question 3.
 
 ## Rationale
 
@@ -486,9 +563,18 @@ deliberately unplanned.
    (relative links, table rows) and by reading the three texts against each
    other, so the runbook's remedy and the spec's normative paragraph say the
    same thing in the same terms.
-2. **The message defect**, on its own branch and not gated on this record: the
-   two `ArenaHeldButUnreachable` arms in `crates/tf_tree_ipc/src/error.rs` that
-   name `CreatePolicy::Always` also name the layout the hatch requires.
+2. **The message defect. DONE, 2026-09-18 — #353.** On its own branch and not
+   gated on this record: the two `ArenaHeldButUnreachable` arms in
+   `crates/tf_tree_ipc/src/error.rs` that name `CreatePolicy::Always` also name
+   the layout the hatch requires.
+
+   **It went past this step in two places, and the second is why part 4 exists.**
+   The arm also discarded `ownership_held`, so it promised that stopping slot 0
+   was sufficient when the ownership byte was held elsewhere; and the first repair
+   of *that* asserted two holders, which is false in the steady state of every
+   healthy single-owner arena, where one process holds both bytes. Three wrong
+   statements out of one arm, each a hedge on an inference `Display` cannot
+   support — which is the measurement *Decision* part 4 rests on.
 
    **Of the two arms this step names, one already carried the clause when the
    step was written.** [#310](https://github.com/NoeFontana/tf_tree/pull/310)
@@ -534,20 +620,65 @@ deliberately unplanned.
    (`cargo nextest run -p tf_tree --features shm,unstable,crash-points --test
    rendezvous`).
 4. **[`PHASE2.md`](../PHASE2.md) §0.0's *Ownership migration (§3.5)* row**
-   records the provisioning precondition. — **this step may not land while this
+   records the provisioning precondition. — this step **may not land while this
    record is `draft`**: a §0.0 row resting on a draft is precisely what
    `just artifact-versions`' decision-citation check exists to catch, and three
-   records were cited that way at fourteen sites before it did.
-5. **The mechanism** — whichever of question 1's candidates survives review.
+   records were cited that way at fourteen sites before it did. **That bar is
+   cleared as of 2026-09-18**, and the status half is what the check reads: it
+   parses each record's own `**Status:**` line and fails only on `draft`.
+   **It does not read every citation, so the row has to use a spelling it
+   reads.** `DECISION_SETTLED_VERB` matches a settled *verb* before the link —
+   *declined by*, *superseded by*, *governed by* — and the script's own *What
+   this does NOT prove* section lists the forms it cannot see, bare adjacency
+   (`0055`'s own `(0048; the register is …)` shape) among them. A §0.0 row that
+   merely mentions this record beside the precondition is invisible to it and
+   held by review alone, which is the same standing the three miscited records
+   had. So step 4's row cites in the checked form or it is not gated.
+5. ~~**The mechanism** — whichever of question 1's candidates survives review.
    Deliberately not broken into steps here: planning it would be choosing it,
-   and this record does not have the standing to choose.
+   and this record does not have the standing to choose.~~ **Struck: question 1
+   is answered "no mechanism" (*Decision* part 2), so there is nothing to plan.**
+   The record now has the standing, and used it to decline. What would bring this
+   step back is named with the answer.
+6. **Reduce what the `ArenaHeldButUnreachable` remedy claims** (*Decision* part 4,
+   and this record's own question 3). The arm states the bytes held, the first
+   slot and its pid, and points at [`RUNBOOK.md`](../RUNBOOK.md); the four-form
+   remedy #353 landed moves there, where the reader has every process in hand.
+   - **Not a deletion of the prose, a reduction of what it claims.**
+     [`API.md`](../API.md) R5 keeps the prose in the message layer, and nothing
+     enters the error type: the variant stays `Copy`, its four fields unchanged.
+   - `every_unreachable_remedy_names_what_the_operator_must_supply` and
+     `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process` are
+     rewritten rather than deleted — the first asserts the facts and the pointer,
+     the second keeps the reachability it measured. The negative assertion that no
+     branch names a holder it cannot see is what the reduction makes structural,
+     so it stays and gets easier to hold.
+   - **Verified by** the mutants #353 established, re-run against the reduced
+     text, plus `just lint` (whose `artifact-versions` arm holds the runbook's
+     table rows and links) and the runbook and spec read against each other as
+     step 1 requires.
+   - **Stop point:** if the reduced message leaves an operator with less than
+     [`RUNBOOK.md`](../RUNBOOK.md)'s own `ArenaHeldButUnreachable` section gives
+     them, this step has traded one incomplete text for two and should not land.
+     (That section, and not a "§3.4" of the runbook — the runbook has no numbered
+     sections, and every `§3.4` in it points at [`PHASE2.md`](../PHASE2.md).)
 
 ## Open questions
 
-All three are open. **Two of them can be answered wrongly in a way that costs a
-protocol**, so neither should be answered from this document.
+**All three are answered, in *Decision* parts 2, 3 and 4 (2026-09-18).** They are
+kept here in full rather than collapsed into their answers, because the working is
+what a reopening needs: question 1's candidate table with its costs, question 2's
+three routes with the decision each would have to supersede, and question 3's
+measurement. The headings below say where each answer is.
+
+The warning this preamble carried — **two of them can be answered wrongly in a way
+that costs a protocol**, so neither should be answered from this document — is why
+both expensive answers are *no new surface*, and why question 3's answer changed
+after contact with the code (part 4).
 
 ### 1. Does the library owe a supported way to hold recovery capacity?
+
+**ANSWERED: no — the NORMATIVE fleet requirement, no mechanism. *Decision* part 2.**
 
 Three candidates, with costs rather than a ranking:
 
@@ -576,6 +707,8 @@ is a scope change to an unbuilt capability and needs its own argument — it is
 not a free consequence of this record.
 
 ### 2. Should anything ever let a fresh process adopt an ownerless arena?
+
+**ANSWERED: no, refused with each route's superseding cost named. *Decision* part 3.**
 
 Today the answer is structurally no, and every way to change it is expensive.
 Recorded here so the next person costs them before proposing one.
@@ -615,6 +748,8 @@ Recorded here so the next person costs them before proposing one.
 
 ### 3. Is the operator guidance itself wrong? — yes, in one measurable place
 
+**ANSWERED, and not as this section's closing paragraph expected: the message carries facts and one pointer, and the remedy lives in the runbook alone. *Decision* part 4, step 6.** The clause defect this section measured is fixed (#353); what changed is the larger judgement it left open.
+
 `IpcError::ArenaHeldButUnreachable`'s `Display` has an arm for the state where
 every held byte is a non-owner's and nothing holds ownership — §3.4's
 stranded-participant case — and it ends:
@@ -625,7 +760,9 @@ stranded-participant case — and it ends:
 **Following that verbatim fails.** It was measured in the 2026-09-10
 investigation: an `Open` with `CreatePolicy::Always` and no builder returns
 `OpenError::NoLayoutToCreate` — *"no layout was supplied and the arena had to be
-created"* (`crates/tf_tree/src/open.rs:721`) — because decision `0004` sizes an
+created"* (`crates/tf_tree/src/open.rs`, cited by variant name because the line
+this carried had already drifted — `:721` is inside `OpenError::Map`/`Build`, and
+step 2 stopped citing lines for the same reason) — because decision `0004` sizes an
 arena from its declared edges, so a creator must bring a `TreeBuilder`. The
 operator who follows the printed advice at 3 a.m. meets a second error.
 
