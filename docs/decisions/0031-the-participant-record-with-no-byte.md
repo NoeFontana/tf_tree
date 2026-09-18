@@ -118,8 +118,10 @@ its answer; it was in a rustdoc rather than a record.
 
 **The discriminator is the lock file, not the server** — and a first version of
 this section got that wrong, which is worth stating because the counterexample is
-the library. There are **20** `.build_shared(` call sites in the workspace, and
-one of them, `crates/tf_tree/src/open.rs:1224`, is `Open::open`'s `Created` arm:
+the library. There are **19** `.build_shared(` call sites in the workspace — 20
+`rg` hits, one of which (`crates/tf_tree_c/tests/bridge_shared.rs:324`) is a
+`///` comment describing a mutant and calls nothing — and one of the 19,
+`crates/tf_tree/src/open.rs:1224`, is `Open::open`'s `Created` arm:
 it calls `build_shared` **and** binds an `OwnerServer` at `:1388`. Writing "the
 only composition of `build_shared` with `OwnerServer` is the test" was therefore
 false, and a reader re-running the check gets a different answer than the record
@@ -131,17 +133,20 @@ participant byte and installs claim leases *before* it builds and binds — it i
 composition `tf_tree_c`'s bridge names. What this record is about is the
 composition that omits that half.
 
-**So, stated as the discriminator actually is:** of the 20 call sites, exactly
+**So, stated as the discriminator actually is:** of the 19 call sites, exactly
 one stands up a rendezvous *with* a lock file (`Open::open`'s `Created` arm, the
 supported path); **two** stand one up *without* one — `rendezvous.rs:3881` and
-`byteless_served_arena()` at `:4131`, feeding the three tests that stage this
-record's measurement on purpose; and the remaining seventeen pass the fd directly
-and stand up no rendezvous at all
-(`backing.rs`, `workload.rs`, `cache.rs`, `tree.rs`, `mp_bench`, `attach_bench`,
-`shm_scaling`, `hugepage_grant`, `heap_vs_shared`, `control_loop`,
-`tests/population.rs` ×3, `tests/multiprocess.rs`, `replay_bit_identity.rs` ×2,
-`bridge_shared.rs`). **No shipped path composes the byte-less served shape**, and
-that is the claim this answer rests on.
+`byteless_served_arena()` at `:4139`, feeding the three tests that stage this
+record's measurement on purpose; and the remaining **sixteen** pass the fd
+directly and stand up no rendezvous at all (`backing.rs`, `workload.rs`,
+`cache.rs`, `tree.rs`, `mp_bench`, `attach_bench`, `shm_scaling`,
+`hugepage_grant`, `heap_vs_shared`, `control_loop`, `tests/population.rs` ×3,
+`tests/multiprocess.rs`, `replay_bit_identity.rs` ×2). **No shipped path composes
+the byte-less served shape**, and that is the claim this answer rests on.
+
+*A first version of this paragraph said 20 and seventeen, and listed
+`bridge_shared.rs` among the callers — in the paragraph whose subject is a census
+a reader can re-run.*
 
 **And it reaches neither binding — question 3, answered by checking.**
 `tf_tree_py` exposes exactly one shared path, `open_arena`, which is
@@ -184,9 +189,12 @@ wrong opinion is available the moment the record exists, and the only way to sto
 it is to refuse the call — which is what step 0b did, breaking the API to do it.
 
 `build_shared` creates an arena whose **fd is the capability** and which nothing
-can find by name. Unserved — every composition in this workspace — there is no
-rendezvous, no lock file, and therefore no observer holding a probe: the record
-is byte-less and *unobserved*, which is not a defect but the design. What makes the opinion available is binding a rendezvous over
+can find by name. Unserved — sixteen of the nineteen call sites, and every one
+that ships — there is no rendezvous, no lock file, and therefore no observer
+holding a probe: the record is byte-less and *unobserved*, which is not a defect
+but the design. *This read "every composition in this workspace", which is the
+universal part 1 retracts; the argument needs only that the unserved shape is the
+ordinary one, which it is.* What makes the opinion available is binding a rendezvous over
 it afterwards, and that is a **second call by the same caller**, not a property
 of `build_shared`.
 
@@ -233,7 +241,10 @@ where the warning applies.
    liveness predicates being indexed by **what they authorise**, which is an
    argument *for* option 2's shape rather than against it. This does not decide
    the option — the cost of a `/proc` conjunct is unchanged and question 2 still
-   gates everything — but it removes a reason that was on the page.
+   gates everything — but it removes a reason that was on the page. *(Question 2
+   was answered on 2026-09-18 and gates nothing now; this paragraph is retained
+   draft text, and what it still says correctly is the cost of option 2 should
+   the answer ever be reopened.)*
 
 A third option — refuse `build_shared` on an arena that will be served — is not
 obviously expressible: nothing in `build_shared` knows whether an `OwnerServer`

@@ -3543,9 +3543,12 @@ same shape one layer up. Each has a home; none is a surprise waiting to be found
   unaffected (its creator holds byte 0), and so is the ordinary `build_shared`
   deployment that passes `Tree::shared_fd` to children and stands up no
   rendezvous: no peer there carries a probe. Nothing in this workspace composes
-  it the affected way. **Until `docs/decisions/0031` is answered, do not call
-  `Tree::reap_participants` in a process tree where anything served a
-  `build_shared` arena by hand.**
+  it the affected way. **Do not call `Tree::reap_participants` in a process
+  tree where anything served a `build_shared` arena by hand.** *This read "until
+  `docs/decisions/0031` is answered"; it was answered on 2026-09-18, and the
+  answer is that **serving a `build_shared` arena is out of contract** — so the
+  advisory is permanent rather than expired. Nothing was fixed, because the
+  composition it warns about is one this project does not support.*
 
 - **`Tree::reparent` decides topology-lock liveness from `/proc` even when the
   tree holds an OFD probe** (issue #213) — the same §5.1 shape this release fixed

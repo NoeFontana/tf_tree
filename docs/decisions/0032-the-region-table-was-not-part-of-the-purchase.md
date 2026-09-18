@@ -194,10 +194,13 @@ forking the geometry without forking the hash.
    A named break with a list turns "wait for the next one" from a refusal into a
    schedule. Its first entries, **none of them authorised by this record**, are
    Phase 6's spline region, `0031`'s question, and an `EdgeMeta` provenance byte
-   — *`0031`'s row was removed on 2026-09-18 when that record was answered out
-   of contract, so the ledger seeded three and carries two*
    no record has argued either way — that last is listed so a future request has
    somewhere to be argued, and this record is not that argument.
+
+   *`0031`'s seed was removed from the ledger on 2026-09-18, when that record was
+   answered out of contract and its row had nothing left to hold: the ledger was
+   seeded with three entries and carries two. Step 2 below says the same, because
+   that is the step a reader re-runs.*
 
    **A fabricated citation is removed here rather than repaired.** *This part
    used to attribute to [`0009`](./0009-descoping-phase-6.md) the sentence*
