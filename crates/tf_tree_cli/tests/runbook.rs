@@ -28,6 +28,13 @@
 
 use tf_tree::{HelloStatus, IpcError};
 
+/// How far up the wire numbering the derivation probes.
+///
+/// A status assigned a value past this is invisible to every gate here. The
+/// discriminants are a wire contract assigned in order (`wire.rs`), so the room
+/// is generous rather than tight.
+const PROBE_RANGE: u32 = 64;
+
 /// Every `HelloStatus` this build can **receive**, derived from the codec
 /// rather than copied.
 ///
@@ -47,13 +54,16 @@ use tf_tree::{HelloStatus, IpcError};
 /// appears here the moment the codec can produce it, and the row is owed.
 fn receivable() -> Vec<HelloStatus> {
     let mut seen: Vec<HelloStatus> = Vec::new();
-    // 64 is a bound, not an expectation: the walk ends at the fold.
-    for v in 0..64u32 {
+    // **Every value in the range, not "until the first repeat".** Stopping at
+    // the fold assumes the wire numbering is contiguous, and nothing makes it
+    // so: a status added at 10, with 7 to 9 still folding onto `Malformed`,
+    // would never be enumerated and would owe no row. `PROBE_RANGE` is a bound
+    // on the walk, not a claim about the enum.
+    for v in 0..PROBE_RANGE {
         let status = HelloStatus::from_u32(v);
-        if seen.contains(&status) {
-            break;
+        if !seen.contains(&status) {
+            seen.push(status);
         }
-        seen.push(status);
     }
     // **A derivation that collapses is a gate that checks nothing.** Every
     // assertion below iterates this, so a `from_u32` that folded everything
@@ -72,9 +82,12 @@ fn receivable() -> Vec<HelloStatus> {
 fn section() -> &'static str {
     const RUNBOOK: &str = include_str!("../../../docs/RUNBOOK.md");
     // `\n### `, not `### `: a `#### ` subheading of the same name would match
-    // the start, and the end bound must stop at a `## ` too, or a section that
-    // becomes the last `###` under its chapter swallows the rest of the file
-    // and every `contains` below goes vacuous with nothing firing.
+    // the start. The end bound stops at any of the three heading depths — at a
+    // `## ` because a section that becomes the last `###` under its chapter
+    // would otherwise swallow the rest of the file and every `contains` below
+    // would go vacuous with nothing firing, and at a `#### ` because a
+    // subsection added under this one would lend it words the table does not
+    // have.
     let after = RUNBOOK
         .split_once("\n### `HandshakeRejected`")
         .map_or("", |(_, after)| after);
@@ -85,7 +98,7 @@ fn section() -> &'static str {
         "docs/RUNBOOK.md must carry a `HandshakeRejected` section: it holds the remedies \
          that variant's message stopped carrying"
     );
-    let end = ["\n### ", "\n## "]
+    let end = ["\n#### ", "\n### ", "\n## "]
         .iter()
         .filter_map(|h| after.find(h))
         .min()
@@ -119,6 +132,23 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     let section = section();
 
     // Every status but the acceptance, which is not a refusal and has no row.
+    // **The remedy column is found by its heading, not by counting to three.**
+    // `just artifact-versions` holds every row to the header's cell *count* and
+    // says nothing about its order, so reordering the table would move the
+    // remedy under a floor that went on measuring the column beside it — the
+    // same shape as the section-wide check this floor was added to replace.
+    let header = section
+        .lines()
+        .find(|l| l.starts_with("| `status` |"))
+        .unwrap_or_else(|| panic!("docs/RUNBOOK.md's `HandshakeRejected` table has no header"));
+    let headers: Vec<&str> = header.trim_matches('|').split(" | ").collect();
+    let remedy_column = headers
+        .iter()
+        .position(|h| h.trim() == "What to do")
+        .unwrap_or_else(|| {
+            panic!("the `HandshakeRejected` table has no `What to do` column: {header}")
+        });
+
     for status in receivable().into_iter().filter(|s| s != &HelloStatus::Ok) {
         // A **row**, not a mention: the section's prose names `VersionMismatch`
         // and `LayoutMismatch` while distinguishing them from the
@@ -144,16 +174,15 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
         let cells: Vec<&str> = line.trim_matches('|').split(" | ").collect();
         assert_eq!(
             cells.len(),
-            3,
-            "{status:?}'s row is not three cells; `just artifact-versions` holds the count \
-             and this holds what is in them: {line}"
+            headers.len(),
+            "{status:?}'s row does not match the header's cell count: {line}"
         );
         assert!(
-            cells[2].trim().len() >= REMEDY_FLOOR,
+            cells[remedy_column].trim().len() >= REMEDY_FLOOR,
             "{status:?}'s remedy cell is {} bytes, under the {REMEDY_FLOOR}-byte floor; the \
              message stopped explaining this status on the promise that this cell would: \
              {line}",
-            cells[2].trim().len()
+            cells[remedy_column].trim().len()
         );
     }
 

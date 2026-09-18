@@ -350,7 +350,11 @@ pub enum IpcError {
     /// was repaired with one arm per status — and the *messages* those arms
     /// produced were 112 to 378 bytes (the arms themselves 22 to 272), while
     /// `tft_error::message` is 256 and `set_message` truncates at 255, so
-    /// **four of the seven statuses reached a C operator cut off mid-remedy**.
+    /// **four of the seven statuses reached a C operator cut off mid-remedy** —
+    /// four on `tft_tree_open_named`'s path, whose wrapper is 26 bytes, and six
+    /// on the bridge's 35-byte one, which `MESSAGE_BUDGET`'s doc below records
+    /// as the longest a C path puts in front. A count of truncations is a
+    /// statement about a prefix, and this one used to name none.
     /// It is the message length the buffer sees, which is why the figures
     /// quoted anywhere are renderings and not arms. A per-status remedy that C cannot finish reading is the
     /// same defect one layer down, which is what a runbook row does not have.
@@ -1108,9 +1112,17 @@ mod tests {
             );
 
             // No other status's name, ever.
+            //
+            // **The status's own name is removed first, rather than skipped in
+            // the loop.** A future status whose name extends an existing one —
+            // `LayoutMismatchV2` — makes the longer one's correct rendering
+            // contain the shorter one's name, and a bare `contains` would fail
+            // a message that is right. Cutting the name this rendering is
+            // *supposed* to carry leaves exactly the question being asked.
+            let without_its_own = text.replacen(&format!("{status:?}"), "", 1);
             for other in ALL_STATUSES {
                 assert!(
-                    other == status || !text.contains(&format!("{other:?}")),
+                    other == status || !without_its_own.contains(&format!("{other:?}")),
                     "a {status:?} rejection names {other:?}, which is the defect that \
                      cost a rebuild before anyone reread the word in front of it: {text}"
                 );
@@ -1151,8 +1163,32 @@ mod tests {
             assert_eq!(H::from_u32(v), status, "wire value {v} lost its status");
             v += 1;
         }
-        // `v` is now the first value past the list, which is the one a new
-        // status would take.
+
+        // **And nothing above forces `ALL_STATUSES` to be every status**, which
+        // matters because its length is written out: a variant wired in at a
+        // *gapped* value — 10, with 7 to 9 still folding — leaves the loop
+        // above and the check below both satisfied. So the codec is walked, and
+        // what it can deliver must be exactly this list.
+        let mut delivered: Vec<H> = Vec::new();
+        for probe in 0..64u32 {
+            let status = H::from_u32(probe);
+            if !delivered.contains(&status) {
+                delivered.push(status);
+            }
+        }
+        assert_eq!(
+            delivered.len(),
+            ALL_STATUSES.len(),
+            "the codec delivers {} statuses and ALL_STATUSES names {}: {delivered:?}. A \
+             status was added to `HelloStatus` and `from_u32` without being added here, \
+             so nothing renders it, nothing measures it against the budget, and \
+             docs/RUNBOOK.md owes it a row",
+            delivered.len(),
+            ALL_STATUSES.len()
+        );
+
+        // `v` is the first value past the list, which is the one a new
+        // status would take if the numbering stays contiguous.
         assert_eq!(
             H::from_u32(v),
             H::Malformed,

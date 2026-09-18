@@ -833,6 +833,30 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Round 5 closed two escapes the round-4 fix still left, both measured.** The
+   derivation stopped at the first repeated status, which assumes the wire
+   numbering is contiguous: a variant wired in at 10, with 7 to 9 still folding
+   onto `Malformed`, was enumerated by nothing and owed no row, and the ipc-side
+   guard probes only the first unused value so it passed too. Both sides now
+   walk a range, and `ALL_STATUSES` is asserted to be exactly what the codec can
+   deliver — which is also what forces an entry there, since a compile error
+   demands a `match` arm and not an array element. And `REMEDY_FLOOR` was
+   applied to `cells[2]`, which is the remedy only because the header lists it
+   third; `just artifact-versions` holds a row to the header's cell *count* and
+   says nothing about its order, so reordering the table moved the remedy out
+   from under the floor silently. The column is found by its heading now.
+   Measured both ways: reorder the header and the rows together and the floor
+   follows; blank the remedy in its new column and it fails.
+
+   Two more figures. "Four of the seven truncate" is a statement about a
+   *prefix* and named none — four behind `tft_tree_open_named`'s 26-byte
+   wrapper, two against the bare 255, and six behind the bridge's 35-byte one,
+   which this crate's own `MESSAGE_BUDGET` doc records as the longest. And the
+   erratum this record asked for in `PHASE2.md` §13 had broken italic markers,
+   so the sentence it retracts rendered as live prose immediately above the
+   retraction — the stale claim reading as current, which is the failure the
+   erratum existed to fix.
+
    **Round 4 found the hole that reasoning left, and it was mine.** The
    conclusion above — that no downstream tripwire can exist — is true of a
    `match` and false of enumeration. `from_u32` is injective on the values it

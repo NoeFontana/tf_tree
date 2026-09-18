@@ -47,8 +47,10 @@ is a bug.
 making messages of **112 to 378 bytes** against a `tft_error::message` of 256
 that `set_message` truncates at 255. (The remedies themselves were 22 to 272
 bytes; it is the rendering the buffer sees, and every figure here is one.) **Four of the seven reached a C
-operator cut off mid-sentence**, and six were over the 220 bytes this crate's
-own gate allows. They are **108 to 124 bytes** now (133 at the widest owner
+operator cut off mid-sentence** — four behind `tft_tree_open_named`'s 26-byte
+wrapper, six behind the bridge's 35-byte one, and a count of truncations is a
+statement about a prefix — and six were over the 220 bytes this crate's own gate
+allows. They are **108 to 124 bytes** now (133 at the widest owner
 numbers) and every one of them fits.
 
 The message states the status, the owner's `format_version` and `layout_hash` —
@@ -87,8 +89,9 @@ It lives in `#[cfg(test)]`, so it is `--all-targets` that fails and not a plain
 `#[non_exhaustive]` so that a newer owner's newer refusal keeps compiling — so
 the other half is derived from the wire: `from_u32` is injective on the values
 it names and folds the rest onto `Malformed`, so `tf_tree_cli`'s gate walks it
-to get exactly the statuses the wire can deliver, and a new one owes a row the
-moment the codec can produce it. A status the codec cannot produce never reaches
+to get exactly the statuses the wire can deliver — over a range, not up to the
+first repeat, so a status wired in at a gapped value is enumerated too — and a
+new one owes a row the moment the codec can produce it. A status the codec cannot produce never reaches
 a joining client at all. The per-status check
 requires a table **row** rather than a mention, since the section's prose names
 two of the statuses while telling them apart from the header checks that share
