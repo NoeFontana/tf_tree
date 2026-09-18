@@ -599,7 +599,11 @@ deliberately unplanned.
    reading of the message, `CreatePolicy::Always` with **no** builder, which must
    return `OpenError::NoLayoutToCreate`. That assertion is what stops the two
    operator-facing texts drifting again.
-3. **Pin the eligibility half, and only that half. DONE, 2026-09-18**, and the
+3. **Pin the eligibility half, and only that half. DONE, 2026-09-18**, and it
+   **overran that charter by one test** — the two-holder conjunction below pins a
+   `Display` arm, not eligibility. It landed here because the promotion round
+   found that state unreached while step 3 was the step being written; step 6
+   names it and owes its rewrite, and the
    open choice below was resolved to the **read-write survivor that never polls**
    — the case this record says nothing documents. `scenario_3`'s existing
    `join-sweep` child already *is* that survivor (read-write, `CreatePolicy::Never`,
@@ -662,12 +666,32 @@ deliberately unplanned.
    - **Not a deletion of the prose, a reduction of what it claims.**
      [`API.md`](../API.md) R5 keeps the prose in the message layer, and nothing
      enters the error type: the variant stays `Copy`, its four fields unchanged.
-   - `every_unreachable_remedy_names_what_the_operator_must_supply` and
-     `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process` are
-     rewritten rather than deleted — the first asserts the facts and the pointer,
+   - **Three tests pin the prose this step reduces, not two**, and the third
+     arrived with step 3 rather than being planned here:
+     `every_unreachable_remedy_names_what_the_operator_must_supply`,
+     `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process` and
+     `byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_a_topology`.
+     All three are rewritten rather than deleted — the first asserts the facts and the pointer,
      the second keeps the reachability it measured. The negative assertion that no
      branch names a holder it cannot see is what the reduction makes structural,
      so it stays and gets easier to hold.
+   - **And the measurement this step was missing, which makes it a defect fix
+     rather than a tidying.** `tft_tree_open_named`'s failure arm formats
+     `could not open the arena: {e}` into `tft_error::message`, which is
+     `TFT_MESSAGE_LEN = 256` and truncated by `set_message` at 255 bytes, with a
+     `?` substituted per non-ASCII **byte**. The `(0b1, true)` remedy as landed
+     is **790 bytes**, 816 with that prefix: a C operator reads as far as
+     `"Stop th"`, the whole remedy is gone, and the em-dashes render `???`. So
+     the reduction is what makes this arm legible to C at all, and
+     [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
+     conventions (e) and (g) — at most 120 bytes, ending with the variant name
+     as the runbook's search key — are the shape to reduce it to, for the reason
+     that record already gives. **A test asserting the rendered message fits
+     `TFT_MESSAGE_LEN` belongs to this step**; none exists for `IpcError`
+     today, which is why the overrun shipped. This is also the measured
+     companion to [`0020`](./0020-the-consumer-side-of-the-arena-refusal.md):
+     that record is about C not being told which cause it hit, and this is C
+     being told and unable to read the answer.
    - **Verified by** the mutants #353 established, re-run against the reduced
      text, plus `just lint` (whose `artifact-versions` arm holds the runbook's
      table rows and links) and the runbook and spec read against each other as

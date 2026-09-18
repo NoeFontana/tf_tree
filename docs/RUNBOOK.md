@@ -742,16 +742,21 @@ state, and for it the paragraph below is still the whole recovery.
 
 **And whether you have such a survivor was decided before you got here**
 ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md);
-`PHASE2.md` §3.5 states it NORMATIVE). This state *is* the door being shut: no
-new rendezvous attachment can be made while any participant byte is held, so
-nothing you start now can become the heir. The candidates are whoever was
-attached, read-write **and** polling at the instant the role fell vacant, and
-that set can only shrink. Two consequences for triage: a `tf_tree participants`
-listing tells you who is attached and not who is *looking*, so it cannot
-distinguish "an heir exists and has not got to it yet" from "no heir exists";
-and if the answer is the second one, the paragraph below is the recovery and no
-amount of starting new processes will change that. Provisioning read-write
-pollers is something a fleet does in advance, not during an incident.
+`PHASE2.md` §3.5 states it NORMATIVE). This state *is* the door being shut: while any participant byte is held, no new
+process can *join* this arena, so **nothing you start now can become its heir**.
+The candidates are whoever was attached, read-write **and** polling at the
+instant the role fell vacant, and that set can only shrink.
+
+Two consequences for triage. First, a `tf_tree participants` listing tells you
+who is attached and not who is *looking*, so it cannot distinguish "an heir
+exists and has not got to it yet" from "no heir exists at all" — provisioning
+read-write pollers is something a fleet does in advance, not during an incident.
+Second, **starting a new process is not useless here — it just cannot inherit.**
+`CreatePolicy::Always` is the one thing that still creates in this state (the
+table below is which states it passes), and what it creates is a *fresh* arena
+over the same rendezvous name: it abandons this one, leaving its survivors
+publishing where nobody can reach them. That is a recovery of the *name*, not of
+the arena, which is why the warning above says to reach for inheritance first.
 
 **This section
 used to say the survivor could never promote itself and that stopping everything

@@ -491,9 +491,13 @@ fn a_read_only_attach_refuses_to_create() {
 /// **Byte 0 and the ownership byte held by two *different* holders** — the one
 /// state of that arm nothing reached through the API (`0055` step 3).
 ///
-/// This is the state `(Some(0), true)` was written for, and until this test the
-/// only thing that exercised it built the error value by hand, which proves the
-/// formatting and says nothing about whether the state occurs. It does: two open
+/// **The `(Some(0), true)` branch has two topologies, and this is the second
+/// one.** `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process`
+/// below reaches the first — one live owner holding both bytes, which is the
+/// steady state of a healthy arena. The *two-holder* reading of the same triple
+/// was reached by nothing: until this test the only thing exercising it built the
+/// error value by hand, which proves the formatting and says nothing about
+/// whether the state occurs. It does: two open
 /// file descriptions on one lock file, one holding the creator's participant
 /// byte and the other holding byte 0, is what a live non-owner on slot 0
 /// (`Session::release_ownership`, `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`)
@@ -520,7 +524,12 @@ fn byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_
     let lock_path = scratch.0.join("0/default.lock");
     std::fs::create_dir_all(scratch.0.join("0")).unwrap();
 
-    // Holder A: the creator's participant byte, with no ownership.
+    // Holder A: the creator's participant byte, with no ownership. No
+    // `write_identity`, so the message reads `slot 0 (pid 0)` where a real
+    // `release_ownership` stranding would name a live pid. Nothing here asserts
+    // `first_pid` and no branch selects on it, so the difference is fidelity
+    // rather than coverage — but it is the one way this staging is not the
+    // producer the comment above names.
     let stranded = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
     assert_eq!(
         stranded.try_take_participant(0).unwrap(),
@@ -562,11 +571,15 @@ fn byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_
         "two holders present the same triple a single owner of both bytes does"
     );
 
+    // **Only the guard is asserted here.** `"the ownership byte is held too"` and
+    // `"a second process has it"` are already asserted on this exact triple by
+    // `every_unreachable_remedy_names_what_the_operator_must_supply`
+    // (`crates/tf_tree_ipc/src/error.rs`), and repeating them would be a second
+    // spelling of an existing assertion (`PROJECT.md` §6). What this test owes
+    // that the unit test cannot is the **reachability** above — a state built by
+    // two real holders rather than by a struct literal — plus the one clause
+    // that makes the create promise conditional.
     let message = err.to_string();
-    assert!(
-        message.contains("the ownership byte is held too"),
-        "the remedy must name the held ownership byte: {message}"
-    );
     // **The create promise has to stay guarded, and asserting its *absence* is
     // the wrong shape.** The branch does say "an ordinary open will then
     // create" — inside a conditional, which is the only honest form it can
@@ -578,10 +591,6 @@ fn byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_
     assert!(
         message.contains("if the ownership byte is still held afterwards"),
         "the create promise must be conditional, not flat: {message}"
-    );
-    assert!(
-        message.contains("a second process has it"),
-        "the remedy must offer the second-holder case, which is what this state is: {message}"
     );
 
     drop(owner_byte);
@@ -5977,7 +5986,7 @@ fn scenario_2_attach_detach_churn_does_not_leak_participant_slots() {
 /// **§11.2 scenario 3 — the owner dies mid-run.** Existing participants
 /// continue, a new attach fails cleanly, and reaping still functions.
 ///
-/// All three clauses are one property: the arena outlives the process that
+/// All of it is one property: the arena outlives the process that
 /// created it, and what stops working is *joining*, not *reading*. A reader
 /// that lost its data when the owner died would make every consumer's liveness
 /// depend on the publisher's, which is the coupling shared memory exists to
@@ -6004,10 +6013,12 @@ fn scenario_3_an_owner_dying_leaves_readers_working_and_joins_refused() {
     );
 
     // 2. Reaping still functions — the survivor collects the dead owner's slot,
+    //    and the `survivor.poke()` this paragraph describes is now below step 3,
+    //    because step 3 has to run while the sweeper still holds its byte.
     //    which is the one no hangup can reach because the owner had no socket
     //    of its own to close. The sweeper waits on stdin before sweeping, so
     //    the poke is what orders the sweep *after* the kill.
-    // 2. **The eligibility half, asserted while the survivor is still there**
+    // 3. **The eligibility half, asserted while the survivor is still there**
     //    (`0055` part 1, step 3). `join-sweep` is read-write
     //    (`AttachMode::ReadWrite`, `CreatePolicy::Never`) and never calls
     //    `owner_lost()` or `inherit_ownership()`: it reads, it sweeps once when
