@@ -136,10 +136,15 @@ by the commit that wrote it. The round-4 sweep that says so **left two**, and a
 round-5 edit to a test's doc comment moved both: the announcement of the fix was
 itself incomplete, which is why this note now names that too.*
 
-It is also the wrong question. That arm takes the ownership byte and a
-participant byte and installs claim leases *before* it builds and binds — it is
+It is also the wrong question. That arm holds the ownership byte and participant
+byte 0 **before** it builds — `register_creator` takes `CREATOR_SLOT` during
+`Open::open` — then calls `build_shared`, then installs `use_ofd_liveness` and
+`use_claim_leases` on the tree it got back, and only then binds. It is
 `build_shared` **plus** the OFD-liveness half, which is precisely the supported
-composition `tf_tree_c`'s bridge names. What this record is about is the
+composition `tf_tree_c`'s bridge names. *This said the leases were installed
+before the build; they are installed after it and before the bind, which the
+source says in a comment two lines up. The composition is unchanged; the order
+stated was not the order.* What this record is about is the
 composition that omits that half.
 
 **So, stated as the discriminator actually is:** of the 19 call sites, exactly
@@ -281,7 +286,10 @@ will later be bound over it.
    severity.~~
 
    **The claim goes.** `take_claim_lease` opens with
-   `let Some(lock) = self.claim_lock.as_ref() else { return Ok(None) }`, so a
+   `let Some(lock) = self.lock_file.as_ref() else { return Ok(None) }` — *this
+   record said `self.claim_lock`, a field `0029` renamed; a stale symbol misleads
+   exactly as a stale line number does, and this PR de-numbered the citations
+   without re-reading the quoted code* — so a
    byte-less publisher holds **no lease byte either** — not just no participant
    byte. `Tree::reap_inner`'s guard is
    `if lock.probe_claim(edge).map_or(true, |p| p.held) { continue; }`, which
@@ -534,7 +542,15 @@ measurements can be repeated.
   next round found one more.
 - **Line citations were invalidated by the commit that wrote them.** A rustdoc
   edit in this branch moved `open.rs`'s by six lines; the sweep that de-numbered
-  them left two, which a later edit moved as well. The section cites symbols now.
+  them left two, which a later edit moved as well. The section cites symbols now
+  — **and a symbol goes stale the same way**: the record quoted
+  `self.claim_lock`, a field `0029` renamed to `lock_file`, and the de-numbering
+  passes did not re-read the code they were citing.
+- **An ordering was stated from memory.** The `Created` arm was described as
+  installing claim leases *before* it builds; it installs them after the build
+  and before the bind, which the source says in a comment two lines above the
+  call. The composition the ruling rests on is unchanged; the sequence written
+  down was not the sequence.
 
 The pattern under all five is one thing: **a claim written at the site being
 edited, from what was already believed, rather than from the check re-run at that

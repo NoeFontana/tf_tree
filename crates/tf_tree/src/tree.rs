@@ -3545,8 +3545,10 @@ impl Tree {
     /// The supported way to serve a created arena is `tf_tree::Open`, which
     /// takes the lock byte before it builds.
     ///
-    /// The three names above are deliberately **not** intra-doc links: this
-    /// method is compiled into the default tier and all three are `shm`-gated,
+    /// `Tree::reap_participants`, `tf_tree::Open`, `Tree::participant_alive` and
+    /// `tf_tree_ipc::OwnerServer` above are deliberately **not** intra-doc
+    /// links: this method is compiled into the default tier and all four are
+    /// `shm`-gated,
     /// so linking them breaks `just stable-tier-check`'s rustdoc pass — which is
     /// the tier a published consumer reads.
     #[must_use]

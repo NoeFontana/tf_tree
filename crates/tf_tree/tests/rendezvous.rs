@@ -3856,13 +3856,14 @@ fn a_read_only_tree_reaps_no_participant_records() {
 ///
 /// Every call here is shipped public API: `TreeBuilder::build_shared`,
 /// `Tree::shared_fd`, `tf_tree_ipc::OwnerServer::bind_at`, `Tree::open`,
-/// `Tree::reap_participants`. **No shipped path composes them this way** — this
-/// test and its two siblings are the only places in the workspace that do, on
+/// `Tree::reap_participants`. **No shipped path composes them this way** — the
+/// only `build_shared` calls in the workspace without a lock file are this test
+/// and the `byteless_served_arena()` helper that the other two use, both on
 /// purpose — which is why running the suite never found it: the benches and
 /// examples that call `build_shared` pass the fd directly and stand up no
 /// rendezvous, so no probe-carrying observer exists in them to hold the wrong
 /// opinion. *This read "Nothing in this workspace composes them this way",
-/// written inside one of the two things that do.*
+/// written inside one of the two call sites that do.*
 ///
 /// **Mutant, run rather than asserted.** `Tree::reap_participants` counting the
 /// verdict without calling `ParticipantTable::reclaim`:

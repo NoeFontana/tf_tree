@@ -60,7 +60,8 @@ neither the C nor the Python binding can reach it.
 
 Nothing changes in behaviour. `reclamation_verdict`'s rustdoc said the question
 was "being decided"; it now says what was decided and why nothing here changes
-because of it. The advisory in 0.0.4's entry and in `PHASE2.md` §0.0 is
+because of it, and `Tree::participant_slot`'s says that the peer which could hold
+the wrong opinion only exists in the composition that is out of contract. The advisory in 0.0.4's entry and in `PHASE2.md` §0.0 is
 **permanent, not lifted** — both said "until `0031` is answered", which after an
 answer reads as expired.
 
