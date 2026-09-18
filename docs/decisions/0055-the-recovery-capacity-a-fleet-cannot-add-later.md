@@ -2,7 +2,9 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** (none yet)
+**Implementation:** **step 2 has landed** (#353, `0411adb`). Steps 1, 3, 4 and 6
+— the documentation, the eligibility pin, the §0.0 row and the reduction of what
+the message claims — have not. Step 5 is struck.
 
 ## Context
 
@@ -420,11 +422,14 @@ convenient, and not a second reading of the same trade.
 the next proposal starts from them.** Question 2's three routes each *supersede* a
 standing decision rather than extending one — a named segment runs at
 [`PROJECT.md`](../PROJECT.md) §6's design-smell list and §3.9's "no stale
-segments, ever"; an fd depot is a daemon, so `0019` applies in full; an ownership
-handoff through the lock file runs at §3.4's **deleted** step 3 and the five
-unsound states [`0035`](./0035-the-creators-slot-is-taken-not-found.md) and
-[`0037`](./0037-a-takeover-is-not-a-second-open.md) enumerate. A proposal may
-still be made. It starts by superseding one of those, not by amending §3.6.
+segments, ever", and *that* is the route whose proposal would have to supersede
+the entry rather than amend §3.6's creation sequence; an fd depot is a daemon, so
+`0019` applies in full, and §3.6 has nothing to do with it; an ownership handoff
+through the lock file runs at §3.4's **deleted** step 3 and the five unsound
+states [`0037`](./0037-a-takeover-is-not-a-second-open.md) enumerates — the list
+is `0037`'s, and [`0035`](./0035-the-creators-slot-is-taken-not-found.md) is
+state 1 of it rather than a second enumeration. A proposal may still be made. It
+starts by superseding the decision its own route runs at.
 
 **4. Decided (question 3), and the answer is not the one this record's own
 framing suggested.** Question 3 asked whether the message should recommend the
@@ -441,8 +446,10 @@ reach. That argument is sound as far as it goes, and **step 2's implementation
 no structural change.
 
 What #353 measured is that this arm cannot carry a remedy at all. `Display` sees
-which lock bytes are held and cannot see who holds them, and the remedy wants to
-say what to *stop*. Three successive statements out of that one arm were wrong in
+which lock bytes are held and **cannot tell whether one process holds two of
+them** — nor name the ownership byte's holder at all; `first_pid` names the first
+held *participant* slot and nothing else. The remedy wants to say what to *stop*,
+which is a statement about processes. Three successive statements out of that one arm were wrong in
 a reachable state — the missing layout clause, the discarded `ownership_held`, and
 then a repair that asserted two holders and was false in the steady state of every
 healthy single-owner arena. Each was a hedge added to an inference the type cannot
@@ -617,8 +624,16 @@ deliberately unplanned.
    record is `draft`**: a §0.0 row resting on a draft is precisely what
    `just artifact-versions`' decision-citation check exists to catch, and three
    records were cited that way at fourteen sites before it did. **That bar is
-   cleared as of 2026-09-18** — the record is `ready` — and the check is the thing
-   that proves it rather than this sentence.
+   cleared as of 2026-09-18**, and the status half is what the check reads: it
+   parses each record's own `**Status:**` line and fails only on `draft`.
+   **It does not read every citation, so the row has to use a spelling it
+   reads.** `DECISION_SETTLED_VERB` matches a settled *verb* before the link —
+   *declined by*, *superseded by*, *governed by* — and the script's own *What
+   this does NOT prove* section lists the forms it cannot see, bare adjacency
+   (`0055`'s own `(0048; the register is …)` shape) among them. A §0.0 row that
+   merely mentions this record beside the precondition is invisible to it and
+   held by review alone, which is the same standing the three miscited records
+   had. So step 4's row cites in the checked form or it is not gated.
 5. ~~**The mechanism** — whichever of question 1's candidates survives review.
    Deliberately not broken into steps here: planning it would be choosing it,
    and this record does not have the standing to choose.~~ **Struck: question 1
@@ -642,9 +657,11 @@ deliberately unplanned.
      text, plus `just lint` (whose `artifact-versions` arm holds the runbook's
      table rows and links) and the runbook and spec read against each other as
      step 1 requires.
-   - **Stop point:** if the reduced message leaves an operator with less than the
-     runbook's own §3.4 entry gives them, this step has traded one incomplete text
-     for two and should not land.
+   - **Stop point:** if the reduced message leaves an operator with less than
+     [`RUNBOOK.md`](../RUNBOOK.md)'s own `ArenaHeldButUnreachable` section gives
+     them, this step has traded one incomplete text for two and should not land.
+     (That section, and not a "§3.4" of the runbook — the runbook has no numbered
+     sections, and every `§3.4` in it points at [`PHASE2.md`](../PHASE2.md).)
 
 ## Open questions
 
@@ -743,7 +760,9 @@ stranded-participant case — and it ends:
 **Following that verbatim fails.** It was measured in the 2026-09-10
 investigation: an `Open` with `CreatePolicy::Always` and no builder returns
 `OpenError::NoLayoutToCreate` — *"no layout was supplied and the arena had to be
-created"* (`crates/tf_tree/src/open.rs:721`) — because decision `0004` sizes an
+created"* (`crates/tf_tree/src/open.rs`, cited by variant name because the line
+this carried had already drifted — `:721` is inside `OpenError::Map`/`Build`, and
+step 2 stopped citing lines for the same reason) — because decision `0004` sizes an
 arena from its declared edges, so a creator must bring a `TreeBuilder`. The
 operator who follows the printed advice at 3 a.m. meets a second error.
 
