@@ -98,7 +98,10 @@ the original defect of this arm made unexpressible; each of the owner's two
 numbers is asserted with the label that says which one it is; the runbook section must
 carry a row per refusal status, each row's remedy cell must clear a length
 floor, and the section must carry the remedy words the message is forbidden to
-carry — section-wide, because requiring them per row would dictate vocabulary; and a new `HelloStatus` trips a wire-value
+carry — section-wide, because requiring them per row would dictate vocabulary;
+`RejectionCarriedFd`, the sibling arm that also carries a `HelloStatus`, is held
+to the same no-foreign-status rule, though its search key and runbook row are
+recorded as owed rather than taken; and a new `HelloStatus` trips a wire-value
 compile error in the test build: `status_is_a_refusal` is a total `match` kept
 for no other purpose, because safe Rust cannot enumerate an enum and
 `HelloStatus::from_u32`'s catch-all arm absorbs a new variant without complaint.
