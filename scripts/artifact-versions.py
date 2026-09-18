@@ -1121,7 +1121,8 @@ def check_decision_status_citations() -> str:
     """A `draft` decision record may not be cited as settled.
 
     `docs/decisions/README.md`'s lifecycle says a draft authorises nothing, and
-    `docs/PROJECT.md` §5.1 says it of `0031` in a ledger row. **It was not
+    `docs/PROJECT.md` §5.1 used to say it of `0031` in a ledger row — removed
+    2026-09-18 with that record's answer; the rule is unchanged. **It was not
     held.** `0047`, `0048` and `0049` were cited as settled declines and
     amendments at fourteen sites — spec §0.0 rows marking work "Declined, not
     merely absent", amendment banners, and `CLAUDE.md`'s hard-rules bullet —

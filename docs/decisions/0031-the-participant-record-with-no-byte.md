@@ -2,10 +2,11 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** *Implementation plan* below — one PR. **Decided 2026-09-18,
-on the owner's delegation**: question 2 is answered *out of contract*, which
-selects the small branch this record predicted for that answer, and questions 3
-and 4 are answered with it.
+**Implementation:** steps 3 and 4 landed with the promotion (#358); **steps 1
+and 2 are open** and are one PR. **Decided 2026-09-18, on the owner's
+delegation**: question 2 is answered *out of contract*, which selects the small
+branch this record predicted for that answer, and questions 3 and 4 are answered
+with it.
 
 ## Context
 
@@ -19,7 +20,10 @@ That sentence is false of one call, and the call is `pub`:
 `TreeBuilder::build_shared` registers a `LIVE` participant record
 (`register_participant`, `crates/tf_tree/src/tree.rs:3155`) and takes **no lock
 byte**, because such an arena has no lock file at all — the fd is the capability
-(`docs/PHASE2.md` §3.2). So the arena can contain a `LIVE` record over a
+(`docs/PHASE2.md` §3.1 — *this cited §3.2 until 2026-09-18, which is
+*Identity and defaults*; the phrase "the fd is the capability" appears nowhere in
+`PHASE2.md`, and §3.1 is the section that states the sharing boundary this arena
+sits outside*). So the arena can contain a `LIVE` record over a
 permanently free byte, and every reclaimer `0028` shipped reads that as *dead*.
 
 This is not #201. #201 is a byte and a record with **different indices**;
@@ -112,15 +116,32 @@ is that composition with the OFD-liveness half left out — and every consequenc
 question 1 measured is a consequence of leaving it out. The project already had
 its answer; it was in a rustdoc rather than a record.
 
-**Nothing composes it, measured now rather than quoted from the draft.** `rg`
-over every `build_shared` call in the workspace: `tf_tree_bench`'s `backing.rs`,
-`workload.rs`, `mp_bench`, `attach_bench`, `shm_scaling`, `tests/population.rs`,
-`tests/multiprocess.rs`, and `tf_tree_cli`'s `replay_bit_identity.rs` — all pass
-the fd directly and stand up no rendezvous. The **only** composition of
-`build_shared` with `OwnerServer` in the tree is
-`a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`, the
-test this record's measurement is written from, which stages the shape on
-purpose.
+**The discriminator is the lock file, not the server** — and a first version of
+this section got that wrong, which is worth stating because the counterexample is
+the library. There are **20** `.build_shared(` call sites in the workspace, and
+one of them, `crates/tf_tree/src/open.rs:1224`, is `Open::open`'s `Created` arm:
+it calls `build_shared` **and** binds an `OwnerServer` at `:1388`. Writing "the
+only composition of `build_shared` with `OwnerServer` is the test" was therefore
+false, and a reader re-running the check gets a different answer than the record
+— the failure this project keeps having with enumerations.
+
+It is also the wrong question. That arm takes the ownership byte and a
+participant byte and installs claim leases *before* it builds and binds — it is
+`build_shared` **plus** the OFD-liveness half, which is precisely the supported
+composition `tf_tree_c`'s bridge names. What this record is about is the
+composition that omits that half.
+
+**So, stated as the discriminator actually is:** of the 20 call sites, exactly
+one stands up a rendezvous *with* a lock file (`Open::open`'s `Created` arm, the
+supported path); **two** stand one up *without* one — `rendezvous.rs:3881` and
+`byteless_served_arena()` at `:4131`, feeding the three tests that stage this
+record's measurement on purpose; and the remaining seventeen pass the fd directly
+and stand up no rendezvous at all
+(`backing.rs`, `workload.rs`, `cache.rs`, `tree.rs`, `mp_bench`, `attach_bench`,
+`shm_scaling`, `hugepage_grant`, `heap_vs_shared`, `control_loop`,
+`tests/population.rs` ×3, `tests/multiprocess.rs`, `replay_bit_identity.rs` ×2,
+`bridge_shared.rs`). **No shipped path composes the byte-less served shape**, and
+that is the claim this answer rests on.
 
 **And it reaches neither binding — question 3, answered by checking.**
 `tf_tree_py` exposes exactly one shared path, `open_arena`, which is
@@ -165,8 +186,7 @@ it is to refuse the call — which is what step 0b did, breaking the API to do i
 `build_shared` creates an arena whose **fd is the capability** and which nothing
 can find by name. Unserved — every composition in this workspace — there is no
 rendezvous, no lock file, and therefore no observer holding a probe: the record
-is byte-less and *unobserved*, which is not a defect but the design
-(`PHASE2.md` §3.2). What makes the opinion available is binding a rendezvous over
+is byte-less and *unobserved*, which is not a defect but the design. What makes the opinion available is binding a rendezvous over
 it afterwards, and that is a **second call by the same caller**, not a property
 of `build_shared`.
 
@@ -376,27 +396,63 @@ will later be bound over it.
 
 ## Implementation plan
 
-**One PR.** The answer changes no code path, so what it ships is where the
-boundary is written and what keeps it measured.
+**Steps 1 and 2 are one PR; steps 3 and 4 landed with the promotion (#358),
+because both are consequences of the *status change itself* rather than of the
+boundary being written.** The answer changes no code path, so what the open steps
+ship is where the boundary is written and what keeps it measured.
 
 1. **Say it where the call is.** `TreeBuilder::build_shared`'s rustdoc gains the
    boundary: this creates an arena whose fd is the capability, and **binding a
    rendezvous over it is out of contract**, with the reason (the byte-less record
-   no observer can judge) and a pointer here. `PHASE2.md` §3.2 — where *the fd is
-   the capability* is stated — gains the same sentence, because that is the
-   section a reader consults for this property rather than a rustdoc.
-   - **Verified by** `just doc`, and by `rg 'build_shared' docs/ crates/` finding
-     no other site that describes the shape as supported.
-2. **Keep it executed.** `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
-   says of itself *"It pins the defect, not the fix. When `0031` is answered this
-   test flips, and each `PIN:` message says which way."* This is the answer, so
-   it flips: from a defect pinned pending a decision to a **characterisation of
-   an unsupported composition**, asserting the same observable facts with the
-   `PIN:` messages restated as what the boundary costs. The assertions do not
-   change — the behaviour does not change — only what the test claims about it.
-   - **Verified by** the test still passing unmodified in substance, and by the
-     mutant the test already documents (`reap_participants` counting the verdict
+   no observer can judge) and a pointer here. `PHASE2.md` **§3.1** — *The sharing
+   boundary is the runtime directory*, NORMATIVE — gains the same sentence,
+   because a `build_shared` arena is precisely one that sits outside that
+   boundary, and serving it is reaching back across. *An earlier revision of this
+   step said §3.2; that section is env-var defaults.*
+   - **Three shipped sites describe the shape and must be reconciled, found by
+     review rather than by the plan**, which is why the step names them instead
+     of a `rg` that would have to find them again:
+     - `crates/tf_tree_cli/src/checks.rs` — *"`TreeBuilder::build_shared` called
+       directly still registers without a byte **and is still supported**"*. The
+       sentence is true of the **call** and this answer does not change it; what
+       it must not be read as is support for serving the result. It gains that
+       clause.
+     - `crates/tf_tree_c/src/unstable.rs`, `tft_tree_reap_dead`'s doc — names "a
+       `TreeBuilder::build_shared` participant with no socket" as one of two
+       producers of a stale claim with no hangup, "and this is their only
+       collector". That producer exists **only** in the composition this answer
+       puts out of contract: the creator's claim can go stale to another process
+       only if that process has the arena read-write, which is either
+       `attach_shared(ReadWrite)` — refused by `0028` step 0b — or the
+       rendezvous. The other producer, a dead owner, is in contract and unchanged.
+       So the doc keeps both and says which is which.
+     - `docs/RUNBOOK.md` carries the same pair to operators and gains the same
+       distinction.
+   - **Verified by** `just doc` and `just lint`, and by `rg 'build_shared' docs/
+     crates/` over the result — with the three sites above already known, so the
+     `rg` is a check for a *fourth* rather than the means of finding the first.
+2. **Keep it executed — three tests, not one.**
+   `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes` says
+   of itself *"It pins the defect, not the fix. When `0031` is answered this test
+   flips, and each `PIN:` message says which way."* This is the answer, so it
+   flips: from a defect pinned pending a decision to a **characterisation of an
+   unsupported composition**, asserting the same observable facts with the `PIN:`
+   messages restated as what the boundary costs. The assertions do not change —
+   the behaviour does not change — only what the test claims about it.
+
+   **And so do the other two, which a first version of this step missed.**
+   `a_byteless_publisher_is_evicted_from_the_edge_it_is_publishing_to` carries
+   the same pending-decision framing in its doc comment and an in-test message
+   reading *"If this is now 0, 0031 has been answered — invert it"*, and its
+   control shares `byteless_served_arena()`. Left alone they would tell a reader
+   this record is still open, which is the defect `0055` step 7 spent four review
+   rounds on: a claim corrected everywhere except where somebody reads it.
+   - **Verified by** all three still passing unmodified in substance, and by the
+     mutant the first already documents (`reap_participants` counting the verdict
      without calling `reclaim`) still failing it.
+   - **Not a rename.** The names describe what is executed and stay; what changes
+     is the prose around them. A test named for a defect is the right name for a
+     characterisation of the same behaviour.
 3. **Remove the ledger row.** `PROJECT.md` §5.1 carries *"`0031`'s question |
    `0031` (`draft`) | Queued only if `0031` is answered by giving a byte-less
    participant record something to be judged by"*. It is not, so the row goes —

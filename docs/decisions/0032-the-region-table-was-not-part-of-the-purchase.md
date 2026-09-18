@@ -194,6 +194,8 @@ forking the geometry without forking the hash.
    A named break with a list turns "wait for the next one" from a refusal into a
    schedule. Its first entries, **none of them authorised by this record**, are
    Phase 6's spline region, `0031`'s question, and an `EdgeMeta` provenance byte
+   — *`0031`'s row was removed on 2026-09-18 when that record was answered out
+   of contract, so the ledger seeded three and carries two*
    no record has argued either way — that last is listed so a future request has
    somewhere to be argued, and this record is not that argument.
 
@@ -301,8 +303,13 @@ because this list will outlive the record that opened it.
    `regions reserved` and not `reserved regions` returns a clean sweep over the
    sites that phrase it the other way, which is where the stale claims sit.
 2. **Open the ledger** — `docs/PROJECT.md` §5.1, with the three seed entries,
-   each marked queued and none authorised. Verified by review. `0031` is `draft`
-   and its row says so.
+   each marked queued and none authorised. Verified by review. **Done, and one
+   seed has since gone:** `0031`'s row was queued only if that record were
+   answered by giving a byte-less participant record something to be judged by;
+   it was answered *out of contract* on 2026-09-18, so the row was removed under
+   this section's own rule that removing one is a decision. **Re-running this
+   step must not re-add it** — the ledger has two seeds now, and the third is
+   settled rather than missing.
 3. **Couple the stride array.** One line in
    `crates/tf_tree_arena/src/layout.rs` — `let strides: [u32; N_REGIONS + 1] = [`
    — with the comment naming `R_TOPO` as the `+ 1` and stating what a cardinality
