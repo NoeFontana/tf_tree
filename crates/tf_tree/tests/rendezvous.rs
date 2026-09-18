@@ -3859,14 +3859,19 @@ fn a_read_only_tree_reaps_no_participant_records() {
 /// `Tree::reap_participants`. **No shipped path composes them this way** — the
 /// only `build_shared` calls in the workspace that stand a **rendezvous** up
 /// without a lock file are this test and the `byteless_served_arena()` helper
-/// the other two use, both on purpose. **Everything else that calls
-/// `build_shared` — benches, examples and eight other tests — stands up no
-/// rendezvous at all**, so no probe-carrying observer exists in them to hold the
-/// wrong opinion, which is why the suite went on passing while `PHASE2.md`
-/// §0.0's claim was false. *This read "Nothing in this workspace composes them
-/// this way", written inside one of the two call sites that do; and its
-/// replacement blamed "the benches and examples", when eight of the sixteen
-/// unserved call sites are tests and both staging sites are in this file.*
+/// the other two use, both on purpose. **Every other call site either stands up
+/// no rendezvous at all — sixteen of them, benches, examples and eight tests —
+/// or stands one up holding a lock file, which is `Open::open`'s `Created` arm,
+/// the supported path.** Neither shape gives a probe-carrying observer anything
+/// byte-less to judge, which is why the suite went on passing while `PHASE2.md`
+/// §0.0's claim was false.
+///
+/// *Three spellings of that sentence were wrong before this one: "Nothing in
+/// this workspace composes them this way", written inside one of the two call
+/// sites that do; then "the benches and examples", when eight of the sixteen are
+/// tests; then "everything else … stands up no rendezvous at all", which drops
+/// the `Created` arm — the nineteenth call site, and the one the whole record
+/// turns on.*
 ///
 /// **Mutant, run rather than asserted.** `Tree::reap_participants` counting the
 /// verdict without calling `ParticipantTable::reclaim`:

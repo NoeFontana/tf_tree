@@ -130,7 +130,9 @@ among them.* One of the 19 is **`Open::open`'s `Created` arm** in
 gets a different answer than the record — the failure this project keeps having
 with enumerations.
 
-*No line numbers in this section. The first version had them, and **this PR's own
+*No line numbers in this section except the one naming a `///` comment by
+position — `bridge_shared.rs:324` above, which is a citation of prose rather than
+of code and moves only if that file's comments do. The first version had them, and **this PR's own
 rustdoc edit to `open.rs` moved every one by seven lines** — a citation invalidated
 by the commit that wrote it. The round-4 sweep that says so **left two**, and a
 round-5 edit to a test's doc comment moved both: the announcement of the fix was
@@ -344,9 +346,22 @@ will later be bound over it.
    knows; the fleet does not.
 
    **Nothing does this automatically, and that is the other half of the
-   severity.** `reap_dead` and `reap_participant` are explicit calls with no
-   production caller — `git grep` finds `crates/tf_tree_bench/src/bin/shm_torture.rs`
-   and `crates/tf_tree/src/bin/rendezvous_child.rs`, a bench and a test binary.
+   severity.** `reap_dead` and `reap_participants` are explicit calls: nothing in
+   the library invokes either on its own.
+
+   **The "no production caller" half of this is stale and is corrected rather
+   than deleted.** It read: *"`git grep` finds `shm_torture.rs` and
+   `rendezvous_child.rs`, a bench and a test binary."* That was true when this
+   record was drafted and false since
+   [`0044`](./0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)
+   (2026-08-29), which gave the sweep to both bindings: `tft_tree_reap_dead` in
+   the C ABI and `Tree.reap_dead()` in Python both call
+   `reap_dead() + reap_participants()`. **The direction is against this record's
+   comfort, so it is stated plainly** — the sweeping peer is now an ordinary C or
+   Python consumer rather than a bench, which makes that half of the composition
+   *easier* to reach, not harder. The conclusion is unchanged because the other
+   half, a hand-served `build_shared` arena, is what this record puts out of
+   contract, and neither binding can produce one (question 3).
    The owner's socket-hangup callback reclaims **only the participant record**
    (`table.reclaim`), never a claim. So reaching this needs a hand-served
    `build_shared` arena *and* a peer that sweeps.
@@ -392,7 +407,11 @@ will later be bound over it.
    `0028:1113` calls `build_shared` "a supported shape — it is how an arena gets
    created", but every composition of it in this workspace
    passes the fd directly and stands up no rendezvous — `mp_bench`, `attach_bench`,
-   `backing.rs`, `workload.rs`. If serving one by hand is out of contract, this
+   `backing.rs`, `workload.rs`. *(Retained draft text, and that universal is
+   **refuted** by this record's own Decision part 1: `Open::open`'s `Created` arm
+   composes `build_shared` with a rendezvous, holding a lock file, and is the
+   supported path. The framing is kept because a reopening needs it; the claim in
+   it is not the record's.)* If serving one by hand is out of contract, this
    record's answer is a refusal plus a sentence in the docs, and it is small. If
    it is in contract, it is option 1 or 2 above. **Nothing currently says which**,
    and that ambiguity is the reason this is a record rather than a patch.
@@ -480,9 +499,16 @@ promotion by this record's own partition.
        So the doc keeps both and says which is which.
      - `docs/RUNBOOK.md` carries the same pair to operators and gains the same
        distinction.
-   - **Verified by** `just doc` and `just lint`, and by `rg 'build_shared' docs/
-     crates/` over the result — with the three sites above already known, so the
-     `rg` is a check for a *fourth* rather than the means of finding the first.
+   - **Reconciled with the promotion, not by this step** — `PHASE2.md` §0.0, §5
+     and §6, `PHASE3.md`, `CHANGELOG.md`, `CLAUDE.md`, and the two shipped
+     rustdocs above. Each was falsified by the status flipping rather than by the
+     boundary being written, which is this record's partition; they are listed so
+     an engineer running step 1 knows what is already done.
+   - **Verified by** `just doc` and `just lint`, and by
+     `rg 'build_shared' docs/ crates/ CLAUDE.md` over the result. **The repo root
+     is in that command because it was not**, and `CLAUDE.md`'s Status section
+     carries the exact sentence this step reconciles — a check scoped to two
+     directories could not have found it.
 2. **Keep it executed — three tests, not one. DONE with the promotion (#358).**
    `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes` says
    of itself *"It pins the defect, not the fix. When `0031` is answered this test
@@ -555,6 +581,13 @@ it.
   call. The composition the ruling rests on is unchanged; the sequence written
   down was not the sequence.
 
+- **A claim about the *world* went stale while the record sat in `draft`.**
+  Question 1's severity argument said `reap_dead` has "no production caller — a
+  bench and a test binary". `0044` gave the sweep to both bindings a month
+  before this promotion, and the direction is against the record's comfort: the
+  sweeping peer is now an ordinary C or Python consumer. The conclusion survives
+  because the *other* half of the composition is what is out of contract, but a
+  `draft` promoted to `ready` inherits every fact it stopped checking.
 - **A fix reported as landed had not been written.** Round 4's commit message
   says the nested emphasis in the §3.1 erratum was closed; the script that made
   that edit threw before writing the file, and the nesting survived four more

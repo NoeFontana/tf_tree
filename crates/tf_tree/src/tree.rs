@@ -3540,8 +3540,9 @@ impl Tree {
     /// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
     /// 2026-09-18 that serving a `build_shared` arena through a hand-bound
     /// `tf_tree_ipc::OwnerServer` is **out of contract**. Unserved — the fd
-    /// passed to a child, which is what this constructor is for — no observer
-    /// carries a probe and the paragraph above describes nothing that happens.
+    /// passed to a child, which is what `TreeBuilder::build_shared` is for — no
+    /// observer carries a probe and the paragraph above describes nothing that
+    /// happens.
     /// The supported way to serve a created arena is `tf_tree::Open`, which
     /// takes the lock byte before it builds.
     ///
