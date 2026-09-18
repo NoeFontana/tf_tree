@@ -2,8 +2,8 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** steps 3 and 4 landed with the promotion (#358); **steps 1
-and 2 are open** and are one PR. **Decided 2026-09-18, on the owner's
+**Implementation:** steps 2, 3 and 4 landed with the promotion (#358);
+**step 1 is open** and is one PR. **Decided 2026-09-18, on the owner's
 delegation**: question 2 is answered *out of contract*, which selects the small
 branch this record predicted for that answer, and questions 3 and 4 are answered
 with it.
@@ -210,9 +210,9 @@ call site is served. *Two earlier spellings — "every composition in this
 workspace", then "every one that ships" — were the universal part 1 retracts,
 reintroduced; the fact that replaces them is stronger than either.*
 
- What makes the opinion available is binding a rendezvous over
-it afterwards, and that is a **second call by the same caller**, not a property
-of `build_shared`.
+What makes the wrong opinion available is binding a rendezvous over that arena
+afterwards, and that is a **second call by the same caller**, not a property of
+`build_shared`.
 
 So step 0b refused the calls whose defect is intrinsic, and this answer refuses
 the **composition** whose defect is not in either call. That is also why the
@@ -423,10 +423,17 @@ will later be bound over it.
 
 ## Implementation plan
 
-**Steps 1 and 2 are one PR; steps 3 and 4 landed with the promotion (#358),
-because both are consequences of the *status change itself* rather than of the
-boundary being written.** The answer changes no code path, so what the open steps
-ship is where the boundary is written and what keeps it measured.
+**Step 1 is one PR; steps 2, 3 and 4 landed with the promotion (#358), because
+each is a consequence of the *status change itself* rather than of the boundary
+being written.** The answer changes no code path, so what the open step ships is
+where the boundary is written.
+
+*Step 2 moved across that line during review, and the criterion is what moved
+it.* The three tests carried messages reading "`0031` has been answered — invert
+it"; the answer changes no behaviour, so an engineer following that instruction
+inverts a passing assertion and breaks the suite. That trap is created by the
+status flipping, not by a rustdoc being written, so it belongs with the
+promotion by this record's own partition.
 
 1. **Say it where the call is.** `TreeBuilder::build_shared`'s rustdoc gains the
    boundary: this creates an arena whose fd is the capability, and **binding a
@@ -462,7 +469,7 @@ ship is where the boundary is written and what keeps it measured.
    - **Verified by** `just doc` and `just lint`, and by `rg 'build_shared' docs/
      crates/` over the result — with the three sites above already known, so the
      `rg` is a check for a *fourth* rather than the means of finding the first.
-2. **Keep it executed — three tests, not one.**
+2. **Keep it executed — three tests, not one. DONE with the promotion (#358).**
    `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes` says
    of itself *"It pins the defect, not the fix. When `0031` is answered this test
    flips, and each `PIN:` message says which way."* This is the answer, so it
