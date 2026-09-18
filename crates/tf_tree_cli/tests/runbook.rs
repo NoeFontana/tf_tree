@@ -45,9 +45,18 @@ const PROBE_RANGE: u32 = u16::MAX as u32 + 1;
 /// this build has no name for. From that I concluded there could be no
 /// downstream tripwire at all, and that was wrong: a `match` is not the only
 /// way to enumerate. `HelloStatus::from_u32` is injective on the values it
-/// names and folds every other onto `Malformed`, so walking `v` upward until a
-/// status repeats yields exactly the set the wire can deliver — and a status
-/// the wire cannot deliver is one no operator will ever be handed.
+/// names and folds every other onto `Malformed`, so **walking the whole probe
+/// range** and keeping each distinct status yields exactly the set the wire can
+/// deliver — and a status the wire cannot deliver is one no operator will ever
+/// be handed.
+///
+/// **Not "until a status repeats", which is what this doc said until round 18
+/// and what the body refuses.** Stopping at the first repeat assumes the wire
+/// numbering is contiguous; a status at 10, with 7 to 9 still folding onto
+/// `Malformed`, is then enumerated by nothing and owes no row — measured, round
+/// 5. The full sweep is 65,536 `match` arms and costs microseconds. **If you
+/// are here to make it cheaper, that is the shape that reinstates the hole**,
+/// and this doc licensed it for three rounds.
 ///
 /// With the list copied, adding a variant, wiring it into `from_u32`, fixing
 /// `tf_tree_ipc`'s `status_is_a_refusal` and extending its `ALL_STATUSES` left
@@ -124,7 +133,7 @@ fn section() -> &'static str {
 /// write is vacuous, and a row can be checked for existing without being
 /// checked for saying anything.
 ///
-/// **Over the joined table rows, and deliberately not per row.** Per row would be the
+/// **Over the union of the remedy cells, and deliberately not per row.** Per row would be the
 /// stronger rule and it is refused because it would dictate vocabulary:
 /// measured, `Malformed`'s remedy — *confirm both sides are the same release
 /// before reading this as corruption* — carries none of these five, and the

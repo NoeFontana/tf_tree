@@ -857,6 +857,27 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Round 18, and the loop stops here.** Two findings, both docs in
+   `runbook.rs` contradicting the code beneath them, and both licensing a
+   regression rather than merely reading wrong: `receivable()`'s rustdoc still
+   described the derivation as "walking `v` upward until a status repeats",
+   which is exactly the optimisation its own body refuses and which would
+   reinstate the gapped-value hole; and `REMEDY_WORDS`'s bolded lead still said
+   "over the joined table rows", the scope round 17 measured an escape through.
+   Both fixed.
+
+   **The stopping decision, stated because it is a judgement and not an
+   outcome.** The shipped change — a three-line `Display` arm and a deleted
+   helper — has been correct and untouched since the first commit; eighteen
+   rounds found nothing in it. Rounds 14 to 18 found *only* defects introduced
+   by the previous round's fix, at roughly one new defect per defect closed, all
+   of them in prose describing gates rather than in the gates. That is a loop
+   with a generator — a prose edit made at the site of a finding is itself
+   unreviewed until the next round — and the marginal round has stopped paying.
+   What is **not** resolved is recorded above as owed rather than closed: §3.7's
+   erratum on both clauses, `RejectionCarriedFd`'s search key and runbook row,
+   and the `shm_torture` population decision §13's ASan box now waits on.
+
    **Round 17: the same bound narrowed a third time, and three documents left
    describing the version before it.** Round 16 moved the remedy-word search
    from the section to the rows — and a row has two content columns. Measured:
