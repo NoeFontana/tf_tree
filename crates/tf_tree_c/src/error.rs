@@ -649,6 +649,13 @@ mod tests {
     /// It also pins the substitution, because a message that is merely *short*
     /// is not enough: `set_message` replaces each non-ASCII **byte** with `?`,
     /// so one em-dash becomes `???` and the budget has to be spent on ASCII.
+    // Same reason as `set_message`'s own allow above: `c_char` is `i8` on
+    // x86_64 and `u8` on aarch64, so `c as u8` is a no-op on exactly one of
+    // them and `-D warnings` makes that a build error there. **This test was
+    // written and gated on x86_64 and failed the `ubuntu-24.04-arm` row**,
+    // which is the same defect class the comment above records, one target
+    // over — and the reason that row exists.
+    #[allow(clippy::unnecessary_cast)]
     #[test]
     fn the_message_buffer_is_the_size_this_crates_budget_assumes() {
         assert_eq!(
