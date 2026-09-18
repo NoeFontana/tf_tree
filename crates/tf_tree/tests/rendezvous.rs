@@ -579,18 +579,35 @@ fn byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_
     // that the unit test cannot is the **reachability** above — a state built by
     // two real holders rather than by a struct literal — plus the one clause
     // that makes the create promise conditional.
+    // **This test's contribution is the reachability, and after step 6 that is
+    // all of it.** Two real holders present the same triple a single owner of
+    // both bytes does, and the message now says only what is true of both: the
+    // bytes are held. The clause this used to pin — the conditional create
+    // promise — left the message with the rest of the remedy, which is the
+    // point: a message that cannot tell these two states apart should not try
+    // to prescribe for either. `RUNBOOK.md` prescribes, and its reader can see
+    // the difference.
     let message = err.to_string();
-    // **The create promise has to stay guarded, and asserting its *absence* is
-    // the wrong shape.** The branch does say "an ordinary open will then
-    // create" — inside a conditional, which is the only honest form it can
-    // take when `Display` cannot tell this state from the single-owner one. So
-    // what this pins is the guard: the clause that makes the promise
-    // conditional, and the second-holder case that is what this state actually
-    // is. A first revision asserted the phrase was absent and failed against a
-    // correct message.
     assert!(
-        message.contains("if the ownership byte is still held afterwards"),
-        "the create promise must be conditional, not flat: {message}"
+        message.contains("ownership byte held"),
+        "the held ownership byte is the fact that distinguishes this from a stranded \
+         participant: {message}"
+    );
+    assert!(
+        !message.contains("process") && !message.contains("stop"),
+        "no claim about processes may be made from two bits: {message}"
+    );
+    assert_eq!(
+        message,
+        tf_tree::IpcError::ArenaHeldButUnreachable {
+            holder_slots: 0b1,
+            first_slot: Some(0),
+            first_pid: 0,
+            ownership_held: true,
+        }
+        .to_string(),
+        "two holders and one owner of both bytes are indistinguishable here, and the \
+         message must be identical for both — which is why neither may be prescribed for"
     );
 
     drop(owner_byte);
@@ -674,15 +691,20 @@ fn a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process() {
         "a live owner is one holder of both bytes: this is the state the remedy must fit"
     );
 
+    // **The hedge became structural when the remedy left the message** (`0055`
+    // step 6). There is no longer a sentence about who to stop, so there is
+    // nothing to hedge: the message reports that both bytes are held and says
+    // nothing about how many processes hold them. That is what this asserts,
+    // and the negative is what it used to take three attempts to get right.
     let message = err.to_string();
     assert!(
-        message.contains("usually by that same process"),
-        "the remedy must allow that one process holds both bytes: {message}"
+        message.contains("participant bytes 0x1 held") && message.contains("ownership byte held"),
+        "both held bytes must be reported: {message}"
     );
     assert!(
-        !message.contains("stop that one too"),
-        "the remedy must not send the operator after a second process that need not exist: \
-         {message}"
+        !message.contains("process") && !message.contains("stop"),
+        "the message must make no claim about processes or about what to stop — that is \
+         the runbook's, because Display cannot see who holds a byte: {message}"
     );
 
     drop(owner);
@@ -897,22 +919,30 @@ fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
         ),
         "expected ArenaHeldButUnreachable naming slot 0 with ownership free, got {forced:?}"
     );
+    // The remedy moved to `RUNBOOK.md` (`0055` step 6), so the facts that
+    // *selected* the remedy are what this asserts: slot 0 is the creator's, and
+    // the ownership byte is free. Those two are what the runbook's table is
+    // indexed by.
     let byte_0_message = forced.to_string();
     assert!(
-        byte_0_message.contains("no forced create can pass this"),
-        "the message must not send an operator to the escape hatch here: {byte_0_message}"
+        byte_0_message.contains("the creator's"),
+        "the message must say slot 0 is the creator's own: {byte_0_message}"
     );
-    // The wording gained "and the ownership byte is free" when that arm stopped
-    // discarding `ownership_held` (#353): the sufficiency of stopping slot 0 is
-    // *conditional* on it, and the message now says which condition it is. What
-    // this asserts is unchanged — in the one state where stopping slot 0 really
-    // is enough, the message says so.
     assert!(
-        byte_0_message.contains(
-            "it is the only holder and the ownership byte is free, so an ordinary open will \
-             then create"
-        ),
-        "byte 0 alone: stopping it really is sufficient, and the message may say so: \
+        byte_0_message.contains("ownership byte free"),
+        "the message must report the free ownership byte: {byte_0_message}"
+    );
+    // **This assertion has been rewritten twice and the second time deleted the
+    // sentence rather than the assertion.** It first pinned "it is the only
+    // holder, so an ordinary open will then create"; #353 made that conditional
+    // on `ownership_held`; `0055` step 6 removed the promise from the message
+    // altogether, because a promise about what an open will do next is a remedy
+    // and `Display` cannot see enough to make one. What is left is the fact the
+    // promise rested on, asserted above, and the mask that distinguishes this
+    // state from the crowded one below.
+    assert!(
+        byte_0_message.contains("participant bytes 0x1 held"),
+        "byte 0 alone: the mask is what separates this state from the crowded one: \
          {byte_0_message}"
     );
 
@@ -940,15 +970,19 @@ fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
         ),
         "expected slot 0 plus slot 2 in the mask, got {crowded:?}"
     );
+    // **The mask is what a crowded state says differently, now that neither
+    // state carries a remedy** (`0055` step 6). The two remedies this used to
+    // keep apart both live in `RUNBOOK.md`, indexed by exactly these facts.
     let crowded_message = crowded.to_string();
     assert!(
-        crowded_message.contains("the other slots in the mask above are still held"),
-        "with a joiner still attached the remedy is not 'an ordinary open will create': \
+        crowded_message.contains("participant bytes 0x5 held"),
+        "a crowded mask must be reported as such, not collapsed to its lowest slot: \
          {crowded_message}"
     );
     assert!(
-        !crowded_message.contains("it is the only holder"),
-        "the two remedies must not both appear: {crowded_message}"
+        crowded_message.contains("lowest slot 0"),
+        "the lowest held slot is the one fact the runbook's table is indexed by: \
+         {crowded_message}"
     );
     drop(alongside);
 
@@ -964,8 +998,9 @@ fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
     let still_refused = refusal(CreatePolicy::IfAbsent);
     let stranded_message = still_refused.to_string();
     assert!(
-        stranded_message.contains("escape hatch is for"),
-        "a stranded joiner is the case the hatch is for: {stranded_message}"
+        stranded_message.contains("lowest slot 3"),
+        "a stranded joiner must be named by its own slot, which is the fact the \
+         runbook's table is indexed by: {stranded_message}"
     );
     assert_ne!(
         byte_0_message, stranded_message,
@@ -1050,10 +1085,18 @@ fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
         ),
         "expected ArenaHeldButUnreachable with ownership_held, got {err:?}"
     );
+    // **The message states the facts and the runbook carries the remedy**
+    // (`0055` step 6). It used to say "CreatePolicy::Always will not pass this"
+    // here; the remedy left the message, so what is asserted is the fact the
+    // remedy turned on — the ownership byte is reported held.
     let message = err.to_string();
     assert!(
-        message.contains("CreatePolicy::Always will not pass this"),
-        "the message must not recommend the hatch here: {message}"
+        message.contains("ownership byte held"),
+        "the message must report the held ownership byte: {message}"
+    );
+    assert!(
+        message.ends_with("ArenaHeldButUnreachable"),
+        "the message must end with the runbook's search key: {message}"
     );
 
     // The control: release the ownership byte and change nothing else.

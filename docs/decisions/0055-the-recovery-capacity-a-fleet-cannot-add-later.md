@@ -2,9 +2,10 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** **steps 1, 2, 3 and 4 have landed** (#353 `0411adb`, then
-steps 1/3/4 together). **Step 6 — the reduction of what the message claims — has
-not.** Step 5 is struck.
+**Implementation:** **steps 1, 2, 3, 4 and 6 have landed** (#353 `0411adb`,
+steps 1/3/4 in #355, step 6 after it). Step 5 is struck. **Step 7 — the same
+reduction for `HandshakeRejected`, which step 6 measured and did not fix — is
+open.**
 
 ## Context
 
@@ -659,8 +660,22 @@ deliberately unplanned.
    is answered "no mechanism" (*Decision* part 2), so there is nothing to plan.**
    The record now has the standing, and used it to decline. What would bring this
    step back is named with the answer.
-6. **Reduce what the `ArenaHeldButUnreachable` remedy claims** (*Decision* part 4,
-   and this record's own question 3). The arm states the bytes held, the first
+6. **Reduce what the `ArenaHeldButUnreachable` remedy claims. DONE,
+   2026-09-18** (*Decision* part 4, and this record's own question 3).
+   **788 bytes non-ASCII → 142 bytes ASCII**, and the remedy is
+   `docs/RUNBOOK.md`'s eight-row table, indexed by the two facts the message
+   still prints. The negative rule is what makes the old defect unexpressible
+   rather than merely fixed: no arm may state a count of holders or a procedure,
+   asserted over all seven states by
+   `every_unreachable_state_reports_the_facts_and_prescribes_nothing`. **That
+   rule took two attempts** — a first version forbade the word "process" and
+   failed on the empty-mask arm's "a process that never served", which is a fact
+   (the byte was held throughout and nothing answered), not a count.
+
+   **Four tests needed rewriting, not the three this step predicted**:
+   `a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through` and
+   `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass` also pinned
+   the remedy. All four now assert the facts the runbook's rows are indexed by. The arm states the bytes held, the first
    slot and its pid, and points at [`RUNBOOK.md`](../RUNBOOK.md); the four-form
    remedy #353 landed moves there, where the reader has every process in hand.
    - **Not a deletion of the prose, a reduction of what it claims.**
@@ -701,6 +716,21 @@ deliberately unplanned.
      them, this step has traded one incomplete text for two and should not land.
      (That section, and not a "§3.4" of the runbook — the runbook has no numbered
      sections, and every `§3.4` in it points at [`PHASE2.md`](../PHASE2.md).)
+     **Not triggered:** that section gained the remedy the message gave up, in
+     more detail than the message could carry, and the message's search key is
+     how a reader gets to it.
+7. **The same reduction for `HandshakeRejected`.** Step 6's gate measured what it
+   was not chartered to fix: that variant is **378 bytes at its worst status**,
+   and **four of its seven statuses truncate** in `tft_error::message` (239, 253,
+   320, 378 against a 229-byte budget). The length is `rejection_advice`, seven
+   per-status remedies concatenated into the message — the same pattern part 4
+   ends. The fix is the same shape: facts plus the search key, and a new
+   `docs/RUNBOOK.md` section for the seven statuses, which is why it is a step
+   and not a clause of step 6.
+   - Until it lands, `HANDSHAKE_REJECTED_RATCHET` pins it at 378 so it can only
+     shrink, and the gate's exception names this step. **A ratchet, not an
+     exemption**: if a status's advice grows, the gate fails.
+   - **Verified by** the same gate with the exception removed.
 
 ## Open questions
 

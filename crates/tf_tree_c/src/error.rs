@@ -592,7 +592,9 @@ pub(crate) fn guard(body: impl FnOnce() -> tft_status) -> tft_status {
 
 #[cfg(test)]
 mod tests {
-    use super::{record_lookup, tft_error, LAST_ERROR, TFT_ERR_TIME_DOMAIN, TFT_INVALID_ID};
+    use super::{
+        record_lookup, tft_error, LAST_ERROR, TFT_ERR_TIME_DOMAIN, TFT_INVALID_ID, TFT_MESSAGE_LEN,
+    };
     use tf_tree::{EdgeId, LookupError};
 
     fn last() -> tft_error {
@@ -632,5 +634,41 @@ mod tests {
             got: 0,
         });
         assert_eq!(last().edge, TFT_INVALID_ID);
+    }
+
+    /// **The buffer `tf_tree_ipc`'s message budget is derived from** (`0055`
+    /// step 6).
+    ///
+    /// `tf_tree_ipc::error`'s `MESSAGE_BUDGET` is 229 = 255 usable bytes minus
+    /// the 26-byte `could not open the arena: ` wrapper, and that crate cannot
+    /// see this constant — `tf_tree_c` depends on it, not the reverse. So the
+    /// derivation is repeated there and pinned here: if this buffer shrinks,
+    /// that budget is wrong in the unsafe direction and its gate would keep
+    /// passing.
+    ///
+    /// It also pins the substitution, because a message that is merely *short*
+    /// is not enough: `set_message` replaces each non-ASCII **byte** with `?`,
+    /// so one em-dash becomes `???` and the budget has to be spent on ASCII.
+    #[test]
+    fn the_message_buffer_is_the_size_this_crates_budget_assumes() {
+        assert_eq!(
+            TFT_MESSAGE_LEN, 256,
+            "tf_tree_ipc's MESSAGE_BUDGET of 229 is derived from 256; move both together"
+        );
+
+        let mut e = last();
+        e.set_message("a\u{2014}b");
+        let rendered: Vec<u8> = e
+            .message
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&rendered),
+            "a???b",
+            "one em-dash must cost three bytes and render as ???, which is what the \
+             ASCII half of tf_tree_ipc's gate is for"
+        );
     }
 }

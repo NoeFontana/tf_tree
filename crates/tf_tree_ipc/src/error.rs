@@ -494,8 +494,8 @@ impl fmt::Display for IpcError {
             IpcError::NetworkFilesystem { source, magic } => write!(
                 f,
                 "runtime directory from {} is on a network filesystem (statfs f_type {magic:#x}); \
-                 file-lock semantics there are not exact enough for the rendezvous — \
-                 set TF_TREE_RUNTIME_DIR to a local path",
+                 file-lock semantics there are not exact enough for the rendezvous; set \
+                 TF_TREE_RUNTIME_DIR to a local path",
                 source.as_str()
             ),
             IpcError::DomainNotAnInteger { var } => {
@@ -541,119 +541,64 @@ impl fmt::Display for IpcError {
             IpcError::ArenaAbsent => f.write_str(
                 "no arena is serving and CreatePolicy::Never forbids creating one",
             ),
-            // Empty mask: nobody is attached and the ownership byte was held
-            // for the whole deadline. Saying "slot 64, pid 0" here would point
-            // an operator at a slot that does not exist.
+            // **These arms state facts and end with the variant name; the
+            // remedy lives in `docs/RUNBOOK.md`** (`0055` part 4, step 6).
+            //
+            // They used to carry the remedy itself, in four branches that
+            // crossed the participant mask with `ownership_held`, and it went
+            // wrong three times in one day: a missing requirement, a discarded
+            // `ownership_held`, and a repair that asserted two holders and was
+            // false in the steady state of a healthy arena. The remedy wants to
+            // say which *processes* to stop, and this type sees which *bytes*
+            // are held — an inference it cannot make. The runbook's reader has
+            // every process in hand and can be given an ordering; this one is a
+            // process being refused an attachment.
+            //
+            // The shape is `0059`'s conventions (e) and (g): ASCII, short, and
+            // ending with the variant name as the runbook's search key. Both
+            // matter at the C boundary — `tft_tree_open_named` formats this into
+            // a 256-byte `tft_error::message` and substitutes `?` per non-ASCII
+            // byte, so the 788-byte four-branch version reached a C operator as
+            // `"... Stop th"` with its em-dashes as `???`. `MESSAGE_BUDGET` and
+            // `every_ipc_error_message_fits_the_c_abis_buffer` are the gate that
+            // did not exist when that shipped.
             IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0,
                 ownership_held: true,
                 ..
             } => f.write_str(
-                "the ownership byte was held for the whole open timeout by a process that \
-                 never started serving, and no participant is attached; nothing was created",
+                "nobody attached; the ownership byte was held for the whole open timeout \
+                 by a process that never served; nothing created: ArenaHeldButUnreachable",
             ),
             // Same empty mask, but the ownership probe at the deadline came back
-            // free. The mask and the probe are read one after the other, at two
-            // instants, so a holder that let go between the last acquire attempt
-            // and the probe lands here — the arm above would claim it was held
-            // "for the whole open timeout", which this cannot say.
+            // free: the mask and the probe are read at two instants, so a holder
+            // that let go in between lands here and the arm above would claim it
+            // was held throughout.
             IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0, ..
             } => f.write_str(
-                "nothing held the ownership byte or any participant byte when the open timeout \
-                 expired, so whatever blocked every attempt had let go by then; retrying is the \
-                 right response",
+                "no byte was held at the open deadline, so whatever blocked every attempt \
+                 had let go; retry: ArenaHeldButUnreachable",
             ),
             IpcError::ArenaHeldButUnreachable {
                 holder_slots,
-                first_slot,
+                first_slot: Some(slot),
                 first_pid,
                 ownership_held,
-            } => match (first_slot, ownership_held) {
-                // Slot 0 is the creator's slot (`0035`, `CREATOR_SLOT`), so the
-                // escape hatch provably cannot pass this state; pointing an
-                // operator at it would send them down a path that fails.
-                // **`ownership_held` is spent here, and the arm used to
-                // discard it with `_`.** What it may *not* do is infer a
-                // topology from it: `Display` sees two bits and cannot know
-                // whether one process holds both. Usually one does — a creator
-                // takes the ownership byte and then `CREATOR_SLOT` on the same
-                // `LockFile`, and holds both for as long as it serves — so
-                // `(0b1, true)` is the steady state of a healthy arena, and a
-                // joiner that times out without reaching the socket (§3.9's
-                // removed socket, a wedged accept loop) lands here. A remedy
-                // that says "stop the other one too" would send that operator
-                // after a process that does not exist. So each branch says what
-                // is *known* — which bytes are held — and hedges the holder.
-                //
-                // An earlier revision of this arm asserted the two-holder shape
-                // and was measured false in exactly that steady state, which is
-                // the #257 defect class reintroduced inside the branch added to
-                // prevent it.
-                (Some(0), owned) => write!(
-                    f,
-                    "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
-                     hold their lock bytes, and slot 0 (pid {first_pid}) is the arena creator's \
-                     own slot — CreatePolicy::Always takes slot 0 or nothing, so no forced create \
-                     can pass this. Stop the process holding slot 0: {next}. Whatever creates \
-                     afterwards needs a layout to build from and a read-write mode to do it in — \
-                     through the tf_tree facade, Open::layout_if_creating and \
-                     AttachMode::ReadWrite; without them the create fails with a second, \
-                     different error rather than creating",
-                    next = match (holder_slots == 1, owned) {
-                        (true, false) => {
-                            "it is the only holder and the ownership byte is free, so an ordinary \
-                             open will then create"
-                        }
-                        (true, true) => {
-                            "the ownership byte is held too, and usually by that same process — \
-                             one file description takes both — in which case stopping it releases \
-                             both and an ordinary open will then create; if the ownership byte is \
-                             still held afterwards, a second process has it and has to go as well"
-                        }
-                        (false, false) => {
-                            "the other slots in the mask above are still held, so an ordinary \
-                             open will still refuse — that is when PHASE2 §3.4's \
-                             CreatePolicy::Always becomes the escape hatch"
-                        }
-                        (false, true) => {
-                            "the other slots in the mask above are still held and so is the \
-                             ownership byte. A forced create needs the ownership byte and slot 0 \
-                             both free — in either order, and the same process may hold both — \
-                             and §3.4's escape hatch then applies to the participants that are \
-                             left"
-                        }
-                    }
-                ),
-                // §3.4's stranded-participant case: the only one where
-                // `CreatePolicy::Always` is the answer.
-                (Some(slot), false) => write!(
-                    f,
-                    "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
-                     hold their lock bytes (slot {slot}, pid {first_pid}) and none took over \
-                     ownership before the deadline; refusing to create a second arena. The \
-                     creator's slot 0 and the ownership byte are both free, which is the case \
-                     PHASE2 §3.4's escape hatch is for: CreatePolicy::Always will create a fresh \
-                     arena and abandon this one — and switching the policy is not the whole call, \
-                     because a create needs a layout to build from and a read-write mode to do it \
-                     in. Through the tf_tree facade that is Open::layout_if_creating and \
-                     AttachMode::ReadWrite; without them the retry fails with a second, different \
-                     error rather than creating"
-                ),
-                (Some(slot), true) => write!(
-                    f,
-                    "an arena is alive but unreachable: participant slots {holder_slots:#x} still \
-                     hold their lock bytes (slot {slot}, pid {first_pid}), and the ownership byte \
-                     is held by a process that is not serving. CreatePolicy::Always will not pass \
-                     this — it has to take the ownership byte before the participant bytes it may \
-                     skip. Stop the holders; refusing to create a second arena"
-                ),
-                (None, _) => write!(
-                    f,
-                    "an arena is alive but unreachable: no participant byte is held, yet ownership \
-                     could not be taken before the deadline; refusing to create a second arena"
-                ),
-            },
+            } => write!(
+                f,
+                "arena alive but unreachable: participant bytes {holder_slots:#x} held, \
+                 lowest slot {slot} (pid {first_pid}{creator}), ownership byte {own}: \
+                 ArenaHeldButUnreachable",
+                creator = if slot == 0 { ", the creator's" } else { "" },
+                own = if ownership_held { "held" } else { "free" },
+            ),
+            IpcError::ArenaHeldButUnreachable {
+                first_slot: None, ..
+            } => f.write_str(
+                "arena alive but unreachable: no participant byte held, yet ownership \
+                 could not be taken before the deadline: ArenaHeldButUnreachable",
+            ),
             IpcError::Proc(e) => write!(f, "{e}"),
         }
     }
@@ -690,7 +635,7 @@ fn rejection_advice(status: HelloStatus) -> &'static str {
         }
         HelloStatus::LayoutMismatch => {
             "same version, different record layout: this binary was built against a \
-             different arena layout than the running owner — rebuild both from the same source"
+             different arena layout than the running owner; rebuild both from the same source"
         }
         HelloStatus::BootIdMismatch => {
             "the arena records a different boot id than this host is running, so it \
@@ -699,7 +644,7 @@ fn rejection_advice(status: HelloStatus) -> &'static str {
         HelloStatus::NoParticipantSlots => {
             "every participant slot is taken. If the participants are real, raise the \
              arena's participant limit, which needs an owner restart; if they are not, \
-             the slots are held by records of processes that died — `tf_tree participants` \
+             the slots are held by records of processes that died: `tf_tree participants` \
              prints one line per slot and marks those `stale`"
         }
         HelloStatus::ModeNotPermitted => {
@@ -708,7 +653,7 @@ fn rejection_advice(status: HelloStatus) -> &'static str {
         }
         HelloStatus::Malformed => {
             "the owner could not decode this attach request, or refused it for a reason \
-             this build has no name for — the two are indistinguishable on the wire, so \
+             this build has no name for; the two are indistinguishable on the wire, so \
              check that both sides are the same release before reading it as corruption"
         }
     }
@@ -745,27 +690,318 @@ mod tests {
     use super::{IpcError, ProcError, ProcParseError};
     use crate::WireError;
 
-    /// **The remedy each `ArenaHeldButUnreachable` state prints, asserted as
-    /// text** — because the remedy *is* the deliverable of this variant and
-    /// nothing else in the workspace reads it.
+    /// Every [`IpcError`] variant, **and every value its `Display` branches
+    /// on**, for the length and ASCII gates.
     ///
-    /// Every other test of this error asserts `open()`'s **behaviour**, which
-    /// was already true before the prose it prints was written: the whole
-    /// message could be reverted to a bare policy name with 270 tests still
-    /// green (measured on #353). So the clauses an operator cannot act without
-    /// are pinned here, per branch.
+    /// The exhaustive `match` below keeps the variant list complete: `IpcError`
+    /// is not `#[non_exhaustive]` and this module is inside its own crate, so a
+    /// new variant that is not sampled here fails to compile.
     ///
-    /// Substrings and not whole strings: the message text is a diagnostic and
-    /// not a compatibility promise, so this must fail when a clause goes
-    /// missing and not when a comma moves.
+    /// **One sample per variant is not enough, and four mutants proved it.** A
+    /// first version of this returned exactly that. Three of four deliberate
+    /// defects — a procedure added to an arm, 220 bytes added to an arm, a
+    /// non-ASCII byte added to an arm — **passed**, because every one of them
+    /// was in an `ArenaHeldButUnreachable` branch the single sample did not
+    /// select. A gate over a branching `Display` has to enumerate the branches
+    /// or it measures one of them and reports on all.
     ///
-    /// **What each branch may and may not claim.** `Display` sees which bytes
-    /// are held and *not* who holds them, so a branch may name a byte and may
-    /// not name a second process. The negative assertions below are that rule:
-    /// an earlier revision asserted two holders and was false in the steady
-    /// state of a healthy arena, where one process holds both bytes.
+    /// So each field the formatter switches on is swept: the four
+    /// [`RuntimeDirSource`]s, the four [`EnvVar`]s, the four [`NameProblem`]s,
+    /// the four [`LockRole`]s, the seven `HelloStatus`es, the three
+    /// [`WireError`]s, [`ProcError`]'s arms including all three parse causes,
+    /// and `ArenaHeldButUnreachable`'s seven reachable states.
+    fn samples() -> Vec<IpcError> {
+        use crate::wire::HelloStatus as H;
+        use crate::{EnvVar, LockRole, NameProblem, RuntimeDirSource as R};
+        let sources = [R::Env, R::XdgRuntimeDir, R::Run, R::Tmp];
+        let vars = [
+            EnvVar::RuntimeDir,
+            EnvVar::Domain,
+            EnvVar::RosDomainId,
+            EnvVar::Name,
+        ];
+        let problems = [
+            NameProblem::Empty,
+            NameProblem::TooLong,
+            NameProblem::NotOneComponent,
+            NameProblem::NotUtf8,
+        ];
+        let roles = [
+            LockRole::Ownership,
+            LockRole::Topology,
+            LockRole::Participant(63),
+            LockRole::Claim(63),
+        ];
+        let statuses = [
+            H::Ok,
+            H::VersionMismatch,
+            H::LayoutMismatch,
+            H::BootIdMismatch,
+            H::NoParticipantSlots,
+            H::ModeNotPermitted,
+            H::Malformed,
+        ];
+        let mut out = Vec::new();
+        for source in sources {
+            out.push(IpcError::RuntimeDirUnusable {
+                source,
+                raw_os_error: 13,
+            });
+            out.push(IpcError::RuntimeDirNotADirectory { source });
+            out.push(IpcError::StatFsFailed {
+                source,
+                raw_os_error: 13,
+            });
+            out.push(IpcError::NetworkFilesystem {
+                source,
+                magic: 0x6969,
+            });
+        }
+        for var in vars {
+            out.push(IpcError::DomainNotAnInteger { var });
+            for problem in problems {
+                out.push(IpcError::NameInvalid { var, problem });
+            }
+        }
+        for role in roles {
+            out.push(IpcError::LockFailed {
+                role,
+                errno: rustix::io::Errno::ACCESS,
+            });
+        }
+        for status in statuses {
+            out.push(IpcError::HandshakeRejected {
+                status,
+                owner_format_version: 3,
+                owner_layout_hash: 0x3D10_4195,
+            });
+            out.push(IpcError::RejectionCarriedFd { status });
+        }
+        for wire in [
+            WireError::BadLength {
+                got: 3,
+                expected: 16,
+            },
+            WireError::BadMagic,
+            WireError::BadMode { got: 9 },
+        ] {
+            out.push(IpcError::HandshakeMalformed(wire));
+        }
+        for proc in [
+            ProcError::Unreadable {
+                pid: 4242,
+                raw_os_error: 13,
+            },
+            ProcError::Parse {
+                pid: 4242,
+                cause: ProcParseError::NoClosingParen,
+            },
+            ProcError::Parse {
+                pid: 4242,
+                cause: ProcParseError::TooFewFields,
+            },
+            ProcError::Parse {
+                pid: 4242,
+                cause: ProcParseError::NotAnInteger,
+            },
+            ProcError::BootId,
+        ] {
+            out.push(IpcError::Proc(proc));
+        }
+        // `ArenaHeldButUnreachable`'s own arms: the two empty-mask states, the
+        // `Some(slot)` arm with slot 0 and with a joiner's slot, both ownership
+        // readings, and the `first_slot: None` arm with a non-empty mask, which
+        // no other test constructs.
+        for (holder_slots, first_slot, ownership_held) in [
+            (0u64, None, true),
+            (0, None, false),
+            (0b1, Some(0u32), false),
+            (0b1, Some(0), true),
+            (0b101, Some(0), false),
+            (0b101, Some(0), true),
+            (0b1000, Some(3), false),
+            (0b1000, Some(3), true),
+            (0b1, None, false),
+            (0b1, None, true),
+        ] {
+            out.push(IpcError::ArenaHeldButUnreachable {
+                holder_slots,
+                first_slot,
+                first_pid: 4242,
+                ownership_held,
+            });
+        }
+        out.push(IpcError::LockFileOpen { raw_os_error: 13 });
+        out.push(IpcError::IdentityIo {
+            slot: 7,
+            raw_os_error: 13,
+        });
+        out.push(IpcError::ClaimOutOfRange { edge: 9, limit: 64 });
+        out.push(IpcError::NoParticipantSlots { limit: 64 });
+        out.push(IpcError::ArenaAbsent);
+        out.push(IpcError::SocketPathTooLong {
+            len: 120,
+            limit: 108,
+        });
+        out.push(IpcError::ServerUnreachable { raw_os_error: 111 });
+        out.push(IpcError::ClientSocketSetup { raw_os_error: 13 });
+        out.push(IpcError::HandshakeIo { raw_os_error: 13 });
+        out.push(IpcError::HandshakeClosed);
+        out.push(IpcError::NoFdReceived);
+        // Exhaustiveness: no wildcard arm, so a new variant breaks the build.
+        for s in &out {
+            match s {
+                IpcError::RuntimeDirUnusable { .. }
+                | IpcError::RuntimeDirNotADirectory { .. }
+                | IpcError::RuntimeDirForeignOwner { .. }
+                | IpcError::StatFsFailed { .. }
+                | IpcError::NetworkFilesystem { .. }
+                | IpcError::DomainNotAnInteger { .. }
+                | IpcError::NameInvalid { .. }
+                | IpcError::LockFileOpen { .. }
+                | IpcError::IdentityIo { .. }
+                | IpcError::LockFailed { .. }
+                | IpcError::ClaimOutOfRange { .. }
+                | IpcError::NoParticipantSlots { .. }
+                | IpcError::ArenaAbsent
+                | IpcError::SocketPathTooLong { .. }
+                | IpcError::ServerUnreachable { .. }
+                | IpcError::ClientSocketSetup { .. }
+                | IpcError::HandshakeIo { .. }
+                | IpcError::HandshakeClosed
+                | IpcError::HandshakeMalformed(_)
+                | IpcError::HandshakeRejected { .. }
+                | IpcError::RejectionCarriedFd { .. }
+                | IpcError::NoFdReceived
+                | IpcError::ArenaHeldButUnreachable { .. }
+                | IpcError::Proc(_) => {}
+            }
+        }
+        out.push(IpcError::RuntimeDirForeignOwner {
+            owner_uid: 1000,
+            our_uid: 1001,
+        });
+        out
+    }
+
+    /// **Every message must survive the C ABI, which is a 256-byte array**
+    /// (`0055` step 6; `0059` conventions (e) and (g) are where the shape comes
+    /// from).
+    ///
+    /// `tft_tree_open_named`'s failure arm formats `could not open the arena:
+    /// {e}` into `tft_error::message`, a `[c_char; TFT_MESSAGE_LEN]` with
+    /// `TFT_MESSAGE_LEN = 256`. `tf_tree_c::error::set_message` truncates at 255
+    /// bytes and substitutes `?` for **each non-ASCII byte**, so an em-dash
+    /// renders `???` and a long message loses its tail silently.
+    ///
+    /// **This gate did not exist, and that is how a 788-byte remedy shipped.**
+    /// `ArenaHeldButUnreachable`'s four-branch remedy reached a C operator as
+    /// `"... Stop th"` — truncated before the remedy began, em-dashes as `???`.
+    /// Measured on #355 rather than inferred.
+    ///
+    /// **Why 229 and not 256.** 255 bytes are usable (the NUL takes one), and
+    /// the wrapper this crate's errors are actually formatted into is
+    /// `could not open the arena: `, 26 bytes. 255 − 26 = 229. That is the
+    /// budget, and it is a property of the longest *known* wrapper: a caller
+    /// that wraps more deeply gets less, which is an argument for `0059`'s
+    /// aspirational 120 rather than against this number. The worst message here
+    /// is currently 147 bytes, the `HandshakeRejected` ratchet aside.
+    ///
+    /// `tf_tree_ipc` cannot see `TFT_MESSAGE_LEN` — `tf_tree_c` depends on this
+    /// crate, not the reverse — so the constant is repeated here with its
+    /// derivation, and `tf_tree_c`'s own
+    /// `the_message_buffer_is_the_size_this_crates_budget_assumes` is what keeps
+    /// the two in step.
+    const MESSAGE_BUDGET: usize = 229;
+
+    /// `HandshakeRejected` is over budget and **this step is not chartered to
+    /// fix it** — a ratchet, not an exemption.
+    ///
+    /// Its length is `rejection_advice`, seven per-status remedies concatenated
+    /// into the message. That is exactly the pattern `0055` part 4 ends, and
+    /// applying it here means writing a `docs/RUNBOOK.md` section for the seven
+    /// statuses, which is `0055` step 7 rather than step 6. Four of its seven
+    /// statuses truncate in C today (239, 253, 320 and 378 bytes against 229).
+    ///
+    /// **Pinned at its current worst case so it can only shrink.** If a status's
+    /// advice grows, this test fails; when step 7 lands, this constant and its
+    /// exception go with it.
+    const HANDSHAKE_REJECTED_RATCHET: usize = 378;
+
     #[test]
-    fn every_unreachable_remedy_names_what_the_operator_must_supply() {
+    fn every_ipc_error_message_fits_the_c_abis_buffer() {
+        use crate::wire::HelloStatus as H;
+        let mut worst = 0usize;
+        for e in samples() {
+            let text = e.to_string();
+            assert!(
+                text.is_ascii(),
+                "a non-ASCII byte reaches C as `?` per byte: {text}"
+            );
+            if matches!(e, IpcError::HandshakeRejected { .. }) {
+                continue;
+            }
+            assert!(
+                text.len() <= MESSAGE_BUDGET,
+                "{} bytes over the {MESSAGE_BUDGET}-byte budget, so a C caller reads a \
+                 truncated message: {text}",
+                text.len()
+            );
+            worst = worst.max(text.len());
+        }
+        // **The budget must be a real constraint, not headroom nobody uses.**
+        // Without this the assertions above would pass just as well against a
+        // set of one-word messages, and the gate would say nothing about whether
+        // 229 is the right number.
+        assert!(
+            worst > MESSAGE_BUDGET / 2,
+            "the worst message is only {worst} bytes, so this budget is not measuring anything"
+        );
+
+        // The ratchet: `HandshakeRejected` over every status it can carry.
+        let mut rejected_worst = 0usize;
+        for status in [
+            H::Ok,
+            H::VersionMismatch,
+            H::LayoutMismatch,
+            H::BootIdMismatch,
+            H::NoParticipantSlots,
+            H::ModeNotPermitted,
+            H::Malformed,
+        ] {
+            let text = IpcError::HandshakeRejected {
+                status,
+                owner_format_version: 3,
+                owner_layout_hash: 0x3D10_4195,
+            }
+            .to_string();
+            assert!(text.is_ascii(), "non-ASCII in {status:?}: {text}");
+            rejected_worst = rejected_worst.max(text.len());
+        }
+        assert!(
+            rejected_worst <= HANDSHAKE_REJECTED_RATCHET,
+            "HandshakeRejected grew to {rejected_worst} bytes, past its \
+             {HANDSHAKE_REJECTED_RATCHET}-byte ratchet; it is already over the \
+             {MESSAGE_BUDGET}-byte budget and may only shrink (0055 step 7)"
+        );
+    }
+
+    /// **The facts each `ArenaHeldButUnreachable` state prints** — the remedy is
+    /// `docs/RUNBOOK.md`'s (`0055` part 4, step 6).
+    ///
+    /// This test used to assert the remedy, per branch, because the message
+    /// carried one. It carried three wrong ones in a day, all from the same
+    /// category error: the remedy says which *processes* to stop and this type
+    /// sees which *bytes* are held. So the remedy left, and what is asserted
+    /// here is that each state reports the facts that select the runbook's row —
+    /// the mask, the lowest slot and whether it is the creator's, the ownership
+    /// byte — and that **no state claims anything about processes**, which is
+    /// the rule that makes the old defect unexpressible rather than merely
+    /// fixed.
+    ///
+    /// Length and ASCII are `every_ipc_error_message_fits_the_c_abis_buffer`'s.
+    #[test]
+    fn every_unreachable_state_reports_the_facts_and_prescribes_nothing() {
         let held = |slots: u64, first: Option<u32>, owned: bool| {
             IpcError::ArenaHeldButUnreachable {
                 holder_slots: slots,
@@ -776,11 +1012,7 @@ mod tests {
             .to_string()
         };
 
-        // **The create requirement is owed by every state that can end in a
-        // create, which is all four** — it is stated once, outside the branch,
-        // and this is what holds it there. It is the clause the parent commit
-        // added because a reader who followed the prose got `NoLayoutToCreate`.
-        let all_four = [
+        let states = [
             ("slot 0 alone, ownership free", held(0b1, Some(0), false)),
             ("slot 0 alone, ownership held", held(0b1, Some(0), true)),
             (
@@ -792,54 +1024,74 @@ mod tests {
                 held(0b101, Some(0), true),
             ),
             ("a stranded non-creator", held(0b1000, Some(3), false)),
+            ("nobody attached, ownership held", held(0, None, true)),
+            ("nobody attached, nothing held", held(0, None, false)),
         ];
-        for (state, message) in &all_four {
-            for clause in [
-                "layout to build from",
-                "read-write mode",
+
+        for (state, message) in &states {
+            // **The rule, as a negative, and it took two attempts to state.**
+            // A first version forbade the word "process" outright and failed on
+            // the empty-mask arm's "a process that never served" — which is a
+            // *fact*: the ownership byte was held throughout and nothing
+            // answered the socket. What must be forbidden is narrower and is
+            // exactly what went wrong three times:
+            //
+            //   * **a count of holders.** `Display` sees two bits and cannot
+            //     tell one process holding both bytes from two holding one
+            //     each, so it may not say which it is;
+            //   * **a procedure.** What to stop, and which policy or builder to
+            //     use, belong to `RUNBOOK.md`, whose reader can see the
+            //     processes.
+            for forbidden in [
+                "same process",
+                "second process",
+                "one process",
+                "two processes",
+                "stop",
+                "CreatePolicy",
+                "AttachMode",
                 "layout_if_creating",
-                "AttachMode::ReadWrite",
             ] {
                 assert!(
-                    message.contains(clause),
-                    "{state}: the remedy must name {clause:?}: {message}"
+                    !message.contains(forbidden),
+                    "{state}: {forbidden:?} is a count or a procedure, and this type has \
+                     neither to offer: {message}"
                 );
             }
-        }
-
-        // **No branch may name a second process**, because `Display` cannot see
-        // one. This is the assertion the regression would have failed.
-        for (state, message) in &all_four {
+            // (g): the runbook's search key is how a reader gets from the message
+            // to the remedy, so it is the one thing every arm must end with.
             assert!(
-                !message.contains("by a process that is not serving — stop that one too")
-                    && !message.contains("has to go first"),
-                "{state}: the remedy asserts a topology it cannot know: {message}"
+                message.ends_with("ArenaHeldButUnreachable"),
+                "{state}: must end with the search key: {message}"
             );
         }
 
-        // The ownership byte is named where it is held, and the hedge with it.
-        let only_holder_owned = held(0b1, Some(0), true);
+        // The facts, per state. These are exactly the columns `RUNBOOK.md`'s
+        // table is indexed by, so a message that drops one leaves a reader
+        // unable to find their row.
+        assert!(states[0].1.contains("participant bytes 0x1 held"));
+        assert!(states[0]
+            .1
+            .contains("lowest slot 0 (pid 4242, the creator's)"));
+        assert!(states[0].1.contains("ownership byte free"));
+        assert!(states[1].1.contains("ownership byte held"));
+        assert!(states[2].1.contains("participant bytes 0x5 held"));
+        assert!(states[4].1.contains("lowest slot 3"));
         assert!(
-            only_holder_owned.contains("the ownership byte is held too")
-                && only_holder_owned.contains("usually by that same process")
-                && only_holder_owned.contains("a second process has it"),
-            "with both bytes held the remedy must hedge the holder: {only_holder_owned}"
+            !states[4].1.contains("the creator's"),
+            "slot 3 is not the creator's slot: {}",
+            states[4].1
         );
-        let crowded_owned = held(0b101, Some(0), true);
-        assert!(
-            crowded_owned.contains("so is the ownership byte")
-                && crowded_owned.contains("in either order"),
-            "the crowded remedy must name the byte and claim no ordering: {crowded_owned}"
-        );
+        assert!(states[5].1.contains("nobody attached"));
+        assert!(states[6].1.contains("retry"));
 
-        // The control: the one state where stopping slot 0 is sufficient must
-        // still say so, or every assertion above passes against a message that
-        // promises nothing anywhere.
-        let only_holder_free = held(0b1, Some(0), false);
+        // **The pid is carried, and it is the one identifying fact the message
+        // may state**, because it is read from the identity record rather than
+        // inferred. `0055` part 4's prescription names it explicitly.
         assert!(
-            only_holder_free.contains("it is the only holder and the ownership byte is free")
-                && only_holder_free.contains("an ordinary open will then create"),
-            "the one sufficient remedy must still be stated: {only_holder_free}"
+            states[0].1.contains("4242"),
+            "the first slot's pid is a fact, not an inference: {}",
+            states[0].1
         );
     }
 

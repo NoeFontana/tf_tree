@@ -41,6 +41,41 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — a C caller could not read the end of an error message, and `ArenaHeldButUnreachable` was 788 bytes of it (`0055` step 6)
+
+`tft_tree_open_named` reports a failure by formatting
+`could not open the arena: {e}` into `tft_error::message`, which is
+`TFT_MESSAGE_LEN = 256` bytes. `tf_tree_c`'s `set_message` truncates at 255 and
+substitutes `?` for **each non-ASCII byte**.
+
+`IpcError::ArenaHeldButUnreachable` rendered **790 bytes**, 816 with that
+prefix. A C operator hitting a wedged arena read as far as `"Stop th"` — the
+entire remedy truncated away — with every em-dash as `???`. Measured, not
+inferred.
+
+**The message now states facts and ends with its own name; the remedy moved to
+`docs/RUNBOOK.md`**, whose reader has every process in hand. It is **142 bytes
+and ASCII**. The split is the point rather than the size: this type sees which
+lock bytes are held and cannot see who holds them, so it cannot tell one process
+holding two bytes from two holding one each — and a remedy that guesses is wrong
+in whichever state it did not guess. It guessed wrong three times in a day. The
+runbook's `ArenaHeldButUnreachable` section gained an eight-row table indexed by
+the two facts the message still prints.
+
+**The gate that was missing.**
+`every_ipc_error_message_fits_the_c_abis_buffer` now holds every `IpcError`
+variant to ASCII and to a 229-byte budget (255 usable, less the 26-byte
+wrapper), with an exhaustive `match` so a new variant cannot go unmeasured, and
+`tf_tree_c`'s `the_message_buffer_is_the_size_this_crates_budget_assumes` pins
+the buffer the budget is derived from — the two crates cannot see each other's
+constants. Three further messages were non-ASCII and are now ASCII.
+
+**Disclosed and not fixed:** `IpcError::HandshakeRejected` is **378 bytes** at
+its worst status, and four of its seven statuses truncate. Its length is seven
+per-status remedies concatenated into the message — the same pattern, needing
+its own runbook section. It is `0055` step 7, pinned meanwhile by a ratchet at
+its current size so it can only shrink.
+
 ### Fixed — the escape hatch out of `ArenaHeldButUnreachable`, in the arm that did not say it (`0055` step 2)
 
 `IpcError::ArenaHeldButUnreachable` has an arm for the state where the arena
