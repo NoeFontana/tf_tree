@@ -41,7 +41,7 @@ is a bug.
 
 ## [Unreleased]
 
-### Fixed — four of the seven attach refusals did not fit the C ABI's message buffer (`0055` step 7)
+### Fixed — attach refusals did not fit the C ABI's message buffer (`0055` step 7)
 
 `IpcError::HandshakeRejected` appended a per-status remedy to every rejection,
 making messages of **112 to 378 bytes** against a `tft_error::message` of 256

@@ -30,10 +30,11 @@ use tf_tree::{HelloStatus, IpcError};
 
 /// How far up the wire numbering the derivation probes.
 ///
-/// A status assigned a value past this is invisible to every gate here. The
-/// discriminants are a wire contract assigned in order (`wire.rs`), so the room
-/// is generous rather than tight.
-const PROBE_RANGE: u32 = 64;
+/// A status assigned a value past this is invisible to every gate here, and a
+/// first cut set it to 64 — which a status *at* 64 walked straight through,
+/// measured. The discriminants are a wire contract assigned explicitly
+/// (`wire.rs`), so every `u16` is far past what the protocol contemplates.
+const PROBE_RANGE: u32 = u16::MAX as u32 + 1;
 
 /// Every `HelloStatus` this build can **receive**, derived from the codec
 /// rather than copied.

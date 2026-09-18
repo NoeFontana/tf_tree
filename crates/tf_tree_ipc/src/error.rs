@@ -1108,10 +1108,17 @@ mod tests {
         );
 
         for status in ALL_STATUSES {
+            // **A leading-zero nibble, deliberately.** The live
+            // `layout_hash()` starts `0x3D`, so a sample carrying it cannot
+            // tell `{:08X}` from `{:X}` — measured, with the width spec
+            // dropped and every test green. The zero-padding is load-bearing:
+            // `tf_tree doctor --explain-version` prints `0x{h:08X}`, and the
+            // runbook's `LayoutMismatch` row sends an operator to compare
+            // exactly those two renderings.
             let text = IpcError::HandshakeRejected {
                 status,
                 owner_format_version: u32::MAX,
-                owner_layout_hash: 0x3D10_4195,
+                owner_layout_hash: 0x0D10_4195,
             }
             .to_string();
 
@@ -1133,7 +1140,7 @@ mod tests {
                 "the owner's format_version is missing or unlabelled: {text}"
             );
             assert!(
-                text.contains("layout_hash 0x3D104195"),
+                text.contains("layout_hash 0x0D104195"),
                 "the owner's layout_hash is missing or unlabelled: {text}"
             );
             assert!(
@@ -1205,8 +1212,16 @@ mod tests {
         // *gapped* value — 10, with 7 to 9 still folding — leaves the loop
         // above and the check below both satisfied. So the codec is walked, and
         // what it can deliver must be exactly this list.
+        //
+        // **The probe covers every `u16`, and 64 was not enough.** A first cut
+        // stopped at 64 and its comment argued only the gapped-below-64 case; a
+        // status at 64 itself was delivered by the codec, rendered by `Display`
+        // and enumerated by nothing — measured. A discriminant is a wire
+        // contract assigned explicitly (`wire.rs`), so `u16` is far past
+        // anything the protocol contemplates; a status beyond it would escape,
+        // and that is stated rather than left for the next person to measure.
         let mut delivered: Vec<H> = Vec::new();
-        for probe in 0..64u32 {
+        for probe in 0..=u32::from(u16::MAX) {
             let status = H::from_u32(probe);
             if !delivered.contains(&status) {
                 delivered.push(status);

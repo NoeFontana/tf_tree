@@ -833,6 +833,20 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Round 8, two escapes, both measured by running them.** The derived
+   enumeration probed `0..64`, so a status assigned wire value **64** was
+   delivered by the codec, rendered by `Display`, and enumerated by neither
+   crate — the runbook row it owed went missing with every gate green, which is
+   the exact failure both tests exist to prevent. The round-5 comment argued
+   only the gapped-*below*-64 case. Both probes now cover every `u16`, which is
+   far past what a wire contract assigns, and what lies beyond it is stated
+   rather than left to be found. And the label assertion was insensitive to the
+   `08` width spec, because the live `layout_hash()` starts `0x3D` and a sample
+   carrying it cannot tell `{:08X}` from `{:X}`: dropping the width left every
+   test green. The sample now has a leading-zero nibble. The padding is
+   load-bearing — `tf_tree doctor --explain-version` prints `0x{h:08X}` and this
+   step's own runbook row sends an operator to compare those two renderings.
+
    **Round 7, and the finding is this step's own lesson landing on itself.** The
    rejection gate asserted `contains("4294967295") && contains("0x3D104195")` —
    a conjunction of two bare `contains`, satisfied by two unlabelled numbers.
