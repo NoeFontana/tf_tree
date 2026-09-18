@@ -53,8 +53,10 @@ first, so the victim's next `push` is refused rather than interleaved).
 **`0031` answers that this composition is not a shape the project supports.** The
 supported way to serve a created arena is `tf_tree::Open::open`'s `Created` arm,
 which is `build_shared` **plus** the rendezvous, the lock byte and the claim
-leases. Nothing in the workspace composes the byte-less served shape, and neither
-the C nor the Python binding can reach it.
+leases. **No shipped path composes the byte-less served shape** — the only
+`build_shared` call in shipped library code is that `Created` arm, and the two
+that compose it without a lock file are the tests staging the measurement — and
+neither the C nor the Python binding can reach it.
 
 Nothing changes in behaviour. `reclamation_verdict`'s rustdoc said the question
 was "being decided"; it now says what was decided and why nothing here changes

@@ -123,17 +123,18 @@ the library. There are **19** `.build_shared(` call sites in the workspace —
 (`crates/tf_tree_c/tests/bridge_shared.rs:324`) is a `///` comment describing a
 mutant and calls nothing. *The path matters: run at the repo root the same
 pattern gives 27, the extra seven being prose in `docs/decisions/`, this record
-among them.* One of the 19,
-**`Open::open`'s `Created` arm** in `crates/tf_tree/src/open.rs`: it calls
-`build_shared`, and `spawn_owner_server` in the same file binds an `OwnerServer`
-over the result. Writing "the only composition of `build_shared` with
+among them.* One of the 19 is **`Open::open`'s `Created` arm** in
+`crates/tf_tree/src/open.rs`, which calls `build_shared` and whose
+`spawn_owner_server` then binds an `OwnerServer` over the result. Writing "the only composition of `build_shared` with
 `OwnerServer` is the test" was therefore false, and a reader re-running the check
 gets a different answer than the record — the failure this project keeps having
 with enumerations.
 
-*No line numbers in this section any more. The first version had them, and **this
-PR's own rustdoc edit to `open.rs` moved every one by six lines** — a citation
-invalidated by the commit that wrote it.*
+*No line numbers in this section. The first version had them, and **this PR's own
+rustdoc edit to `open.rs` moved every one by six lines** — a citation invalidated
+by the commit that wrote it. The round-4 sweep that says so **left two**, and a
+round-5 edit to a test's doc comment moved both: the announcement of the fix was
+itself incomplete, which is why this note now names that too.*
 
 It is also the wrong question. That arm takes the ownership byte and a
 participant byte and installs claim leases *before* it builds and binds — it is
@@ -143,9 +144,10 @@ composition that omits that half.
 
 **So, stated as the discriminator actually is:** of the 19 call sites, exactly
 one stands up a rendezvous *with* a lock file (`Open::open`'s `Created` arm, the
-supported path); **two** stand one up *without* one — `rendezvous.rs:3881` and
-`byteless_served_arena()` at `:4139`, feeding the three tests that stage this
-record's measurement on purpose; and the remaining **sixteen** pass the fd
+supported path); **two** stand one up *without* one —
+`a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes` and the
+`byteless_served_arena()` helper, both in `crates/tf_tree/tests/rendezvous.rs`,
+feeding the three tests that stage this record's measurement on purpose; and the remaining **sixteen** pass the fd
 directly and stand up no rendezvous at all (`backing.rs`, `workload.rs`,
 `cache.rs`, `tree.rs`, `mp_bench`, `attach_bench`, `shm_scaling`,
 `hugepage_grant`, `heap_vs_shared`, `control_loop`, `tests/population.rs` ×3,
@@ -447,9 +449,12 @@ promotion by this record's own partition.
      review rather than by the plan**, which is why the step names them instead
      of a `rg` that would have to find them again. *A fourth,
      `crates/tf_tree/src/open.rs`'s `reclamation_verdict` rustdoc, said the
-     question was "being decided"; it was corrected with the promotion, because
-     a status change is what falsified it. Writing "three" as a closed count was
-     the enumeration failure this record spends a paragraph on.*
+     question was "being decided", and a **fifth**, `Tree::participant_slot`'s public
+     rustdoc, described the byte-less record's fate with no mention that the
+     serving composition is out of contract. Both were corrected with the
+     promotion, because a status change is what falsified them. Writing "three"
+     as a closed count was the enumeration failure this record spends a paragraph
+     on — and the correction to "four" repeated it one round later.*
      - `crates/tf_tree_cli/src/checks.rs` — *"`TreeBuilder::build_shared` called
        directly still registers without a byte **and is still supported**"*. The
        sentence is true of the **call** and this answer does not change it; what
@@ -504,6 +509,37 @@ promotion by this record's own partition.
 **Stop point:** if step 1 cannot state the boundary without also describing a
 mechanism that does not exist, the answer is being written as though it were
 enforced, and the wording is wrong rather than the decision.
+
+## What review changed, because the record offers its evidence as re-runnable
+
+Six rounds, and **the ruling never moved while three of the four facts under it
+did**. Recorded because this record's whole claim on a reader is that its
+measurements can be repeated.
+
+- **The discriminator was wrong.** "The only composition of `build_shared` with
+  `OwnerServer` is the test" is false: `Open::open`'s `Created` arm is one, and
+  it is the *supported* composition. What separates the shapes is the **lock
+  file**, not the server — and the corrected fact is stronger than the false one.
+- **The universal came back twice more** after being retracted, as "every
+  composition in this workspace" and "every one that ships". What replaced it is
+  sharper than any of the three: **the only `build_shared` call in shipped
+  library code is that `Created` arm**, and every other call site is a test,
+  bench or example.
+- **The census was 20, then 19.** One `rg` hit is a `///` comment describing a
+  mutant, and the number is reproducible only under `crates/` — at the repo root
+  the same pattern gives 27.
+- **The shipped sites were three, then four, then five.** `checks.rs`,
+  `unstable.rs`, `RUNBOOK.md`, then `reclamation_verdict`'s rustdoc, then
+  `Tree::participant_slot`'s. Each correction restated a closed count and the
+  next round found one more.
+- **Line citations were invalidated by the commit that wrote them.** A rustdoc
+  edit in this branch moved `open.rs`'s by six lines; the sweep that de-numbered
+  them left two, which a later edit moved as well. The section cites symbols now.
+
+The pattern under all five is one thing: **a claim written at the site being
+edited, from what was already believed, rather than from the check re-run at that
+moment.** It is the same failure the record's own subject is an instance of —
+`0028` reasoning about a probe from the observer's side instead of the subject's.
 
 ## Not in this record
 

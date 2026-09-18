@@ -3856,10 +3856,13 @@ fn a_read_only_tree_reaps_no_participant_records() {
 ///
 /// Every call here is shipped public API: `TreeBuilder::build_shared`,
 /// `Tree::shared_fd`, `tf_tree_ipc::OwnerServer::bind_at`, `Tree::open`,
-/// `Tree::reap_participants`. **Nothing in this workspace composes them this
-/// way**, which is why running the suite never found it — the bench binaries
-/// that call `build_shared` pass the fd directly and stand up no rendezvous, so
-/// no probe-carrying observer exists in them to hold the wrong opinion.
+/// `Tree::reap_participants`. **No shipped path composes them this way** — this
+/// test and its two siblings are the only places in the workspace that do, on
+/// purpose — which is why running the suite never found it: the benches and
+/// examples that call `build_shared` pass the fd directly and stand up no
+/// rendezvous, so no probe-carrying observer exists in them to hold the wrong
+/// opinion. *This read "Nothing in this workspace composes them this way",
+/// written inside one of the two things that do.*
 ///
 /// **Mutant, run rather than asserted.** `Tree::reap_participants` counting the
 /// verdict without calling `ParticipantTable::reclaim`:
@@ -4016,12 +4019,13 @@ fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
 ///
 /// **Mutant, run rather than asserted.** `reap_inner` made to decline every
 /// claim — roughly the shape of the option `0031` did **not** take — fails this
-/// test and
-/// leaves the control passing, which is the right pair:
+/// test and leaves the control passing, which is the right pair:
 ///
 /// ```text
-/// assertion `left == right` failed: BOUNDARY: an ordinary peer's sweep
-/// takes the claim of a publisher that is running.
+/// assertion `left == right` failed: BOUNDARY: an ordinary peer's sweep takes
+/// the claim of a publisher that is running. This is what serving a
+/// `build_shared` arena costs, and 0031 answered it out of contract — if this
+/// is now 0, the behaviour changed, so find out why rather than inverting it
 /// ```
 #[test]
 #[cfg(feature = "unstable")]

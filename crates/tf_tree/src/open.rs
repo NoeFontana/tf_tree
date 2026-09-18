@@ -178,7 +178,8 @@ pub(crate) enum Reclamation {
 /// [`AttachMode::ReadWrite`] (`refuse_a_byteless_writer`), so the byte-less
 /// writer they used to produce has no producer left.
 ///
-/// **It does not buy *every participant*, and the difference is a live defect.**
+/// **It does not buy *every participant*, and the difference is a composition
+/// this project does not support.**
 /// `TreeBuilder::build_shared` called directly still registers without a byte.
 /// `0028` concluded that this was harmless because such a tree has "no lock file,
 /// therefore no probe, and never reaches here" — **and that is wrong, because the
@@ -189,7 +190,7 @@ pub(crate) enum Reclamation {
 /// every peer that joined normally, and [`Tree::reap_participants`] frees its
 /// record while it is publishing —
 /// `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
-/// (`crates/tf_tree/tests/rendezvous.rs`) pins it. The predicate is therefore
+/// (`crates/tf_tree/tests/rendezvous.rs`) characterises it. The predicate is therefore
 /// **total only over participants that joined through the rendezvous**, which is
 /// a property of the arena's population and not of this caller.
 /// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided that on

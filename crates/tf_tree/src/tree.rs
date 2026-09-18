@@ -3534,8 +3534,16 @@ impl Tree {
     /// smaller version of the same thing: every reclaimer keys on the byte
     /// (`docs/PHASE2.md` §5.1), so such a record reads *dead* to any peer
     /// carrying a probe, and `Tree::reap_participants` will free it while this
-    /// process is still publishing. See
-    /// `docs/decisions/0031-the-participant-record-with-no-byte.md`.
+    /// process is still publishing.
+    ///
+    /// **A peer can only hold that opinion if the arena is served**, and
+    /// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
+    /// 2026-09-18 that serving a `build_shared` arena through a hand-bound
+    /// `tf_tree_ipc::OwnerServer` is **out of contract**. Unserved — the fd
+    /// passed to a child, which is what this constructor is for — no observer
+    /// carries a probe and the paragraph above describes nothing that happens.
+    /// The supported way to serve a created arena is `tf_tree::Open`, which
+    /// takes the lock byte before it builds.
     ///
     /// The three names above are deliberately **not** intra-doc links: this
     /// method is compiled into the default tier and all three are `shm`-gated,
