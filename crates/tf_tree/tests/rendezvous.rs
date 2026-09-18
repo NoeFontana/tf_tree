@@ -488,6 +488,106 @@ fn a_read_only_attach_refuses_to_create() {
     );
 }
 
+/// **Byte 0 and the ownership byte held by two *different* holders** — the one
+/// state of that arm nothing reached through the API (`0055` step 3).
+///
+/// This is the state `(Some(0), true)` was written for, and until this test the
+/// only thing that exercised it built the error value by hand, which proves the
+/// formatting and says nothing about whether the state occurs. It does: two open
+/// file descriptions on one lock file, one holding the creator's participant
+/// byte and the other holding byte 0, is what a live non-owner on slot 0
+/// (`Session::release_ownership`, `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`)
+/// coexisting with any process that took ownership and has not bound looks like
+/// from a third process's `F_OFD_GETLK`.
+///
+/// Two descriptions rather than two processes, for the reason
+/// `the_escape_hatch_creates_over_a_stranded_participant` gives: OFD locks are
+/// per-description, so a second `LockFile::open` in this process conflicts with
+/// the first exactly as another process would, and a second process would add a
+/// socket, a mapping and a race without changing the input.
+///
+/// **What it asserts is the hedge, not a topology.** Here two holders really do
+/// exist, and the message still may not say so, because `Display` cannot tell
+/// this state from the one where a single owner holds both
+/// (`a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process`). The
+/// two tests are the pair: same message, two topologies, and it has to be true
+/// of each.
+#[test]
+fn byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_a_topology() {
+    use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
+
+    let scratch = Scratch::new("two-holders");
+    let lock_path = scratch.0.join("0/default.lock");
+    std::fs::create_dir_all(scratch.0.join("0")).unwrap();
+
+    // Holder A: the creator's participant byte, with no ownership.
+    let stranded = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        stranded.try_take_participant(0).unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired
+    );
+    // Holder B: the ownership byte, on its own description, serving nothing.
+    let owner_byte = tf_tree_ipc::LockFile::open(&lock_path).unwrap();
+    assert_eq!(
+        owner_byte.try_take_ownership().unwrap(),
+        tf_tree_ipc::LockAttempt::Acquired,
+        "the ownership byte must be free for a second description to take it"
+    );
+
+    let err = tf_tree::Open::new()
+        .mode(AttachMode::ReadWrite)
+        .create(CreatePolicy::IfAbsent)
+        .layout_if_creating(
+            TreeBuilder::new()
+                .default_interp(InterpPolicy::LerpSlerp)
+                .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64))),
+        )
+        .timeout(std::time::Duration::from_millis(200))
+        .open()
+        .err()
+        .expect("both bytes held must refuse");
+
+    let tf_tree::OpenError::Rendezvous(tf_tree::IpcError::ArenaHeldButUnreachable {
+        holder_slots,
+        first_slot,
+        ownership_held,
+        ..
+    }) = err
+    else {
+        panic!("expected ArenaHeldButUnreachable, got {err:?}");
+    };
+    assert_eq!(
+        (holder_slots, first_slot, ownership_held),
+        (0b1, Some(0), true),
+        "two holders present the same triple a single owner of both bytes does"
+    );
+
+    let message = err.to_string();
+    assert!(
+        message.contains("the ownership byte is held too"),
+        "the remedy must name the held ownership byte: {message}"
+    );
+    // **The create promise has to stay guarded, and asserting its *absence* is
+    // the wrong shape.** The branch does say "an ordinary open will then
+    // create" — inside a conditional, which is the only honest form it can
+    // take when `Display` cannot tell this state from the single-owner one. So
+    // what this pins is the guard: the clause that makes the promise
+    // conditional, and the second-holder case that is what this state actually
+    // is. A first revision asserted the phrase was absent and failed against a
+    // correct message.
+    assert!(
+        message.contains("if the ownership byte is still held afterwards"),
+        "the create promise must be conditional, not flat: {message}"
+    );
+    assert!(
+        message.contains("a second process has it"),
+        "the remedy must offer the second-holder case, which is what this state is: {message}"
+    );
+
+    drop(owner_byte);
+    drop(stranded);
+}
+
 /// **A healthy owner holds both bytes, and that is the state the `(0b1, true)`
 /// remedy is written for** (#353, `0055` question 3).
 ///
@@ -5907,6 +6007,37 @@ fn scenario_3_an_owner_dying_leaves_readers_working_and_joins_refused() {
     //    which is the one no hangup can reach because the owner had no socket
     //    of its own to close. The sweeper waits on stdin before sweeping, so
     //    the poke is what orders the sweep *after* the kill.
+    // 2. **The eligibility half, asserted while the survivor is still there**
+    //    (`0055` part 1, step 3). `join-sweep` is read-write
+    //    (`AttachMode::ReadWrite`, `CreatePolicy::Never`) and never calls
+    //    `owner_lost()` or `inherit_ownership()`: it reads, it sweeps once when
+    //    poked, and it exits. So it is condition (b) of the absorbing state —
+    //    attached, holding a byte, read-write, and **not an eligible heir** —
+    //    the case `0055` says nothing documents, and the one an integrator gets
+    //    wrong because "open one process read-write" reads like the whole
+    //    remedy.
+    //
+    //    **The ordering is the assertion.** A first revision ran this after the
+    //    poke and got a `uuid` back: the sweeper had already exited, every byte
+    //    was free, and `open-uuid`'s `CreatePolicy::IfAbsent` created a fresh
+    //    arena.
+    //
+    //    Only the conjunction is asserted. The mechanical sequence — refused,
+    //    refused again, creating once the last holder exits — is
+    //    `a_live_participant_prevents_a_second_arena`
+    //    (`crates/tf_tree_ipc/tests/multiprocess.rs`), 128 iterations with a
+    //    positive control, and repeating it would be a second spelling of an
+    //    existing path (`PROJECT.md` §6).
+    let mut later = Kid::spawn(&scratch.0, &["open-uuid", "400"]);
+    let still_refused =
+        uuid_of(&mut later).expect_err("a read-write survivor that never polls is not an heir");
+    assert!(
+        still_refused.contains("ArenaHeldButUnreachable"),
+        "the refusal must outlive the instant the owner died, not merely follow it: \
+         {still_refused}"
+    );
+    later.kill();
+
     survivor.poke();
     let swept = survivor.line();
     let n: usize = swept
@@ -5929,6 +6060,33 @@ fn scenario_3_an_owner_dying_leaves_readers_working_and_joins_refused() {
     //    was in the first revision of this one.
     let _ = &truth;
 
-    survivor.kill();
+    // **The positive control for the refusal above: same command, one variable.**
+    // `open-uuid 400` was refused while the ineligible survivor held its byte;
+    // once it is gone the identical invocation succeeds. Without this the
+    // refusal would pass equally well against an `Open` that can never create.
+    // The sweeper exits after reporting, so waiting on it is what orders this
+    // after the byte is released.
+    // `wait_within`, not `wait`: the latter is `#[cfg(feature = "crash-points")]`
+    // and its own doc comment says a new caller has to re-read it, which is how
+    // this line first broke `just shm-check`'s `--features shm` row while a
+    // targeted `shm,unstable,crash-points` run passed. The bound is also the
+    // better shape — nextest's timeout is not an assertion.
+    let status = survivor
+        .wait_within(std::time::Duration::from_secs(10))
+        .expect("the sweeper must exit after reporting, so its participant byte is released");
+    assert!(
+        status.success(),
+        "the sweeper must exit cleanly, so its participant byte is released: {status:?}"
+    );
+    let mut after = Kid::spawn(&scratch.0, &["open-uuid", "400"]);
+    let created =
+        uuid_of(&mut after).expect("with every byte released the identical open must succeed");
+    assert_eq!(
+        created.len(),
+        32,
+        "expected an instance uuid, got {created:?}"
+    );
+    after.kill();
+
     newcomer.kill();
 }
