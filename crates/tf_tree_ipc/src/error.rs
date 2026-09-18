@@ -1136,11 +1136,17 @@ mod tests {
             H::ModeNotPermitted,
             H::Malformed,
         ] {
+            // A **row**, not a mention: the section's prose names
+            // `VersionMismatch` and `LayoutMismatch` while distinguishing them
+            // from the header checks that share those names, so a `contains`
+            // over the section is satisfied for two of the six by paragraphs
+            // that answer nothing.
+            let row = format!("| `{status:?}` |");
             assert!(
-                section.contains(&format!("`{status:?}`")),
-                "docs/RUNBOOK.md's `HandshakeRejected` section has no row for {status:?}, \
-                 so the message's search key leads an operator to a table that does not \
-                 answer the status they were given"
+                section.lines().any(|l| l.starts_with(&row)),
+                "docs/RUNBOOK.md's `HandshakeRejected` section has no table row for \
+                 {status:?}, so the message's search key leads an operator to a table \
+                 that does not answer the status they were given"
             );
         }
 

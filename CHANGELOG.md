@@ -81,7 +81,9 @@ message is forbidden to contain; and a new `HelloStatus` trips a wire-value
 tripwire, because safe Rust cannot enumerate an enum and neither list is derived
 from one. The worked example that section quotes is asserted to be `Display`'s
 own output rather than a transcription of it, because a quoted message is the
-shape that drifts.
+shape that drifts, and the per-status check requires a table **row** rather than
+a mention, because the section's prose names two of the statuses while telling
+them apart from the header checks that share those names.
 
 ### Fixed — a C caller could not read the end of an error message, and `ArenaHeldButUnreachable` was 793 bytes of it (`0055` step 6)
 
