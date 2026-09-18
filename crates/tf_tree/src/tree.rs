@@ -3545,12 +3545,18 @@ impl Tree {
     /// The supported way to serve a created arena is `tf_tree::Open`, which
     /// takes the lock byte before it builds.
     ///
-    /// `Tree::reap_participants`, `tf_tree::Open`, `Tree::participant_alive` and
-    /// `tf_tree_ipc::OwnerServer` above are deliberately **not** intra-doc
+    /// `tf_tree::Open`, `Tree::reap_participants`, `TreeBuilder::build_shared`
+    /// and `tf_tree_ipc::OwnerServer` above are deliberately **not** intra-doc
     /// links: this method is compiled into the default tier and all four are
     /// `shm`-gated,
     /// so linking them breaks `just stable-tier-check`'s rustdoc pass — which is
-    /// the tier a published consumer reads.
+    /// the tier a published consumer reads. **[`Self::participant_alive`] is
+    /// linked above and must stay linked**: it carries no `cfg` and is in the
+    /// default tier, so it is the one name here that is safe.
+    ///
+    /// *This list named `Tree::participant_alive` and omitted
+    /// `TreeBuilder::build_shared` for one round — exactly inverted, in a
+    /// sentence whose only job is to say which names are unsafe to link.*
     #[must_use]
     pub fn participant_slot(&self) -> u32 {
         self.participant

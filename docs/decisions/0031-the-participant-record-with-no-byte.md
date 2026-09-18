@@ -520,9 +520,11 @@ enforced, and the wording is wrong rather than the decision.
 
 ## What review changed, because the record offers its evidence as re-runnable
 
-Six rounds, and **the ruling never moved while three of the four facts under it
-did**. Recorded because this record's whole claim on a reader is that its
-measurements can be repeated.
+**The ruling never moved; the facts under it were corrected one after another.**
+Recorded because this record's whole claim on a reader is that its measurements
+can be repeated — and no count of rounds or of the list below is given, because
+those went stale too, in this very section, in the round that added a bullet to
+it.
 
 - **The discriminator was wrong.** "The only composition of `build_shared` with
   `OwnerServer` is the test" is false: `Open::open`'s `Created` arm is one, and
@@ -552,7 +554,16 @@ measurements can be repeated.
   call. The composition the ruling rests on is unchanged; the sequence written
   down was not the sequence.
 
-The pattern under all five is one thing: **a claim written at the site being
+- **And a correction inverted the thing it corrected.** `Tree::participant_slot`'s
+  rustdoc carries a guard naming the symbols that must *not* become intra-doc
+  links, because linking a `shm`-gated name reddens `just stable-tier-check` on
+  the tier a published consumer reads. Rewriting that guard added
+  `participant_alive` — which carries no `cfg` and is *already* a working link
+  four paragraphs above — and dropped `TreeBuilder::build_shared`, which is
+  gated. Exactly inverted, in a sentence whose only job is to say which names are
+  unsafe.
+
+The pattern under all of them is one thing: **a claim written at the site being
 edited, from what was already believed, rather than from the check re-run at that
 moment.** It is the same failure the record's own subject is an instance of —
 `0028` reasoning about a probe from the observer's side instead of the subject's.

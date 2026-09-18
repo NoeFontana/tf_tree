@@ -3566,8 +3566,10 @@ same shape one layer up. Each has a home; none is a surprise waiting to be found
   it joined and took a probe. An arena created through `tf_tree::Open` is
   unaffected (its creator holds byte 0), and so is the ordinary `build_shared`
   deployment that passes `Tree::shared_fd` to children and stands up no
-  rendezvous: no peer there carries a probe. Nothing in this workspace composes
-  it the affected way. **Do not call `Tree::reap_participants` in a process
+  rendezvous: no peer there carries a probe. *This said "Nothing in this
+  workspace composes it the affected way", and it was false when it shipped:
+  three tests in `crates/tf_tree/tests/rendezvous.rs` compose it on purpose and
+  predate this tag. What is true is that **no shipped path** does.* **Do not call `Tree::reap_participants` in a process
   tree where anything served a `build_shared` arena by hand.** *This read "until
   `docs/decisions/0031` is answered"; it was answered on 2026-09-18, and the
   answer is that **serving a `build_shared` arena is out of contract** — so the

@@ -3857,9 +3857,10 @@ fn a_read_only_tree_reaps_no_participant_records() {
 /// Every call here is shipped public API: `TreeBuilder::build_shared`,
 /// `Tree::shared_fd`, `tf_tree_ipc::OwnerServer::bind_at`, `Tree::open`,
 /// `Tree::reap_participants`. **No shipped path composes them this way** — the
-/// only `build_shared` calls in the workspace without a lock file are this test
-/// and the `byteless_served_arena()` helper that the other two use, both on
-/// purpose — which is why running the suite never found it: the benches and
+/// only `build_shared` calls in the workspace that stand a **rendezvous** up
+/// without a lock file are this test and the `byteless_served_arena()` helper
+/// the other two use, both on purpose — which is why running the suite never
+/// found it: the benches and
 /// examples that call `build_shared` pass the fd directly and stand up no
 /// rendezvous, so no probe-carrying observer exists in them to hold the wrong
 /// opinion. *This read "Nothing in this workspace composes them this way",
