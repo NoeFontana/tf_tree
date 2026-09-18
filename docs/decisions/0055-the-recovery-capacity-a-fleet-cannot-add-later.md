@@ -2,9 +2,9 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** **step 2 has landed** (#353, `0411adb`). Steps 1, 3, 4 and 6
-— the documentation, the eligibility pin, the §0.0 row and the reduction of what
-the message claims — have not. Step 5 is struck.
+**Implementation:** **steps 1, 2, 3 and 4 have landed** (#353 `0411adb`, then
+steps 1/3/4 together). **Step 6 — the reduction of what the message claims — has
+not.** Step 5 is struck.
 
 ## Context
 
@@ -553,7 +553,7 @@ argument against it.
 half; step 2 is recommended to land on its own, ahead of this record; step 5 is
 deliberately unplanned.
 
-1. **State the property** in [`PHASE2.md`](../PHASE2.md) §3.5 and in
+1. **State the property. DONE, 2026-09-18.** In [`PHASE2.md`](../PHASE2.md) §3.5 and in
    [`RUNBOOK.md`](../RUNBOOK.md)'s *The arena's owner died* and
    *`ArenaHeldButUnreachable`*, on the **eligibility** axis — the three ways to
    be ineligible, and the instant-versus-census sharpening. The runbook edit is
@@ -599,7 +599,23 @@ deliberately unplanned.
    reading of the message, `CreatePolicy::Always` with **no** builder, which must
    return `OpenError::NoLayoutToCreate`. That assertion is what stops the two
    operator-facing texts drifting again.
-3. **Pin the eligibility half, and only that half.** The mechanical sequence —
+3. **Pin the eligibility half, and only that half. DONE, 2026-09-18**, and it
+   **overran that charter by one test** — the two-holder conjunction below pins a
+   `Display` arm, not eligibility. It landed here because the promotion round
+   found that state unreached while step 3 was the step being written; step 6
+   names it and owes its rewrite, and the
+   open choice below was resolved to the **read-write survivor that never polls**
+   — the case this record says nothing documents. `scenario_3`'s existing
+   `join-sweep` child already *is* that survivor (read-write, `CreatePolicy::Never`,
+   never calls `owner_lost()`), so the conjunction needed no new harness: the same
+   `open-uuid` invocation is refused while it holds its byte and succeeds once it
+   exits, which is the positive control. **The ordering turned out to be the
+   assertion** — a first revision ran the refusal after the sweeper had exited and
+   got a fresh arena back. The two-holder conjunction the promotion round found
+   unpinned is `byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_a_topology`,
+   which stages both holders through `tf_tree_ipc::LockFile` on two descriptions;
+   it asserts the *hedge*, because `Display` cannot tell that state from a single
+   owner holding both bytes and has to be true of each. The mechanical sequence —
    refused, refused again, and creating once the last holder exits — is
    `a_live_participant_prevents_a_second_arena`
    (`crates/tf_tree_ipc/tests/multiprocess.rs:230`) already, 128 iterations and
@@ -620,7 +636,10 @@ deliberately unplanned.
    (`cargo nextest run -p tf_tree --features shm,unstable,crash-points --test
    rendezvous`).
 4. **[`PHASE2.md`](../PHASE2.md) §0.0's *Ownership migration (§3.5)* row**
-   records the provisioning precondition. — this step **may not land while this
+   records the provisioning precondition. **DONE, 2026-09-18**, and it cites
+   *"settled by `0055`"* — the checked spelling, which is what makes it gated
+   rather than merely written: `just artifact-versions`' settled-citation count
+   went 41 → 42 on that row alone. — this step **may not land while this
    record is `draft`**: a §0.0 row resting on a draft is precisely what
    `just artifact-versions`' decision-citation check exists to catch, and three
    records were cited that way at fourteen sites before it did. **That bar is
@@ -647,12 +666,32 @@ deliberately unplanned.
    - **Not a deletion of the prose, a reduction of what it claims.**
      [`API.md`](../API.md) R5 keeps the prose in the message layer, and nothing
      enters the error type: the variant stays `Copy`, its four fields unchanged.
-   - `every_unreachable_remedy_names_what_the_operator_must_supply` and
-     `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process` are
-     rewritten rather than deleted — the first asserts the facts and the pointer,
+   - **Three tests pin the prose this step reduces, not two**, and the third
+     arrived with step 3 rather than being planned here:
+     `every_unreachable_remedy_names_what_the_operator_must_supply`,
+     `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process` and
+     `byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_a_topology`.
+     All three are rewritten rather than deleted — the first asserts the facts and the pointer,
      the second keeps the reachability it measured. The negative assertion that no
      branch names a holder it cannot see is what the reduction makes structural,
      so it stays and gets easier to hold.
+   - **And the measurement this step was missing, which makes it a defect fix
+     rather than a tidying.** `tft_tree_open_named`'s failure arm formats
+     `could not open the arena: {e}` into `tft_error::message`, which is
+     `TFT_MESSAGE_LEN = 256` and truncated by `set_message` at 255 bytes, with a
+     `?` substituted per non-ASCII **byte**. The `(0b1, true)` remedy as landed
+     is **790 bytes**, 816 with that prefix: a C operator reads as far as
+     `"Stop th"`, the whole remedy is gone, and the em-dashes render `???`. So
+     the reduction is what makes this arm legible to C at all, and
+     [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md)'s
+     conventions (e) and (g) — at most 120 bytes, ending with the variant name
+     as the runbook's search key — are the shape to reduce it to, for the reason
+     that record already gives. **A test asserting the rendered message fits
+     `TFT_MESSAGE_LEN` belongs to this step**; none exists for `IpcError`
+     today, which is why the overrun shipped. This is also the measured
+     companion to [`0020`](./0020-the-consumer-side-of-the-arena-refusal.md):
+     that record is about C not being told which cause it hit, and this is C
+     being told and unable to read the answer.
    - **Verified by** the mutants #353 established, re-run against the reduced
      text, plus `just lint` (whose `artifact-versions` arm holds the runbook's
      table rows and links) and the runbook and spec read against each other as

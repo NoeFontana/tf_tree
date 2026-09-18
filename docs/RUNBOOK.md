@@ -599,7 +599,18 @@ check when owner death has wedged a live system:
   If every survivor is a consumer, the recovery below (stop everything) is still
   the only one you have — **and that is a reason to open one process read-write**
   even if it never publishes, since read-write is what makes a survivor eligible
-  rather than what makes it a writer. Pinned by
+  rather than what makes it a writer.
+
+  **That is necessary and not sufficient, and this sentence used to stop here**
+  ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
+  part 1, step 1). A read-write attachment that never calls `owner_lost()` is
+  **not** recovery capacity — the next two bullets say so as facts, and a reader
+  who acted on this bullet alone satisfied the remedy as written and wedged
+  anyway. The process you open read-write has to *poll*, on some cadence of its
+  own, and it has to be attached **before** the owner dies: capacity is whatever
+  was attached and eligible at the instant the role fell vacant, and it can only
+  shrink from there. `PHASE2.md` §3.5 states the property NORMATIVE, with the
+  three ways to be ineligible. Pinned by
   `a_read_only_survivor_reports_that_it_cannot_inherit`
   (`crates/tf_tree/tests/rendezvous.rs`), which also shows the consumer reading
   straight through the owner's death.
@@ -727,7 +738,27 @@ daemon polling on anyone's behalf
 ([`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)), and a
 read-only consumer is told `Inheritance::ReadOnly` and cannot serve (D18). A
 fleet of consumers, or one that predates the call, is in the pre-2026-08-28
-state, and for it the paragraph below is still the whole recovery. **This section
+state, and for it the paragraph below is still the whole recovery.
+
+**And whether you have such a survivor was decided before you got here**
+([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md);
+`PHASE2.md` §3.5 states it NORMATIVE). This state *is* the door being shut: while any participant byte is held, no new
+process can *join* this arena, so **nothing you start now can become its heir**.
+The candidates are whoever was attached, read-write **and** polling at the
+instant the role fell vacant, and that set can only shrink.
+
+Two consequences for triage. First, a `tf_tree participants` listing tells you
+who is attached and not who is *looking*, so it cannot distinguish "an heir
+exists and has not got to it yet" from "no heir exists at all" — provisioning
+read-write pollers is something a fleet does in advance, not during an incident.
+Second, **starting a new process is not useless here — it just cannot inherit.**
+`CreatePolicy::Always` is the one thing that still creates in this state (the
+table below is which states it passes), and what it creates is a *fresh* arena
+over the same rendezvous name: it abandons this one, leaving its survivors
+publishing where nobody can reach them. That is a recovery of the *name*, not of
+the arena, which is why the warning above says to reach for inheritance first.
+
+**This section
 used to say the survivor could never promote itself and that stopping everything
 was the only path**; that was accurate while §3.5's first takeover half was
 deleted (#275,
