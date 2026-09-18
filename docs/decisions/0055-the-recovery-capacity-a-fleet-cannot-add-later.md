@@ -490,17 +490,19 @@ deliberately unplanned.
    two `ArenaHeldButUnreachable` arms in `crates/tf_tree_ipc/src/error.rs` that
    name `CreatePolicy::Always` also name the layout the hatch requires.
 
-   **Half of this step was already done when it was written, and the half that
-   was left was not the one the sentence above describes.** [#310](https://github.com/NoeFontana/tf_tree/pull/310)
-   landed the layout-and-mode clause in the `(Some(slot), false)` arm — §3.4's
-   stranded-participant case, the one arm where the hatch *is* the answer — on
-   2026-09-10, and this record was drafted the same day against a tree that
-   already had it. What remained was the `(Some(0), _)` arm's multi-holder
-   branch, which forwards an operator to `CreatePolicy::Always` as the escape
-   hatch "provided nothing still holds the ownership byte" and stopped there. A
-   reader who reached the hatch through *that* sentence still met a recovery
-   path that fails when followed verbatim. **Both arms now carry the clause, in
-   the same terms**, which is the property this step was for. — verified by
+   **Of the two arms this step names, one already carried the clause when the
+   step was written.** [#310](https://github.com/NoeFontana/tf_tree/pull/310)
+   landed it in the `(Some(slot), false)` arm — §3.4's stranded-participant
+   case, the arm question 3 quotes — on 2026-09-10, and this record was drafted
+   the same day against a tree that already had it. What remained was the second
+   arm question 3 names, the `next` hint on `(Some(0), _)`, which forwards an
+   operator to `CreatePolicy::Always` as the escape hatch "provided nothing still
+   holds the ownership byte" and stopped there; a reader who reached the hatch
+   through *that* sentence still met a recovery path that fails when followed
+   verbatim. **Both arms now carry the clause, in the same terms**, which is the
+   property this step was for. Question 3's genuinely open half — whether the
+   message should lead with the abandoning path at all, when `RUNBOOK.md` says to
+   reach for inheritance first — is untouched and stays open. — verified by
    **extending** `the_escape_hatch_creates_over_a_stranded_participant`
    (`crates/tf_tree/tests/rendezvous.rs:506`), not by a new test: that case
    already reaches the stranded state, already passes
