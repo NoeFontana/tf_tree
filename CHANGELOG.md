@@ -78,9 +78,11 @@ Both halves are gated. No rendering may name a status it did not get, which is
 the original defect of this arm made unexpressible; the runbook section must
 carry a row per refusal status and those rows must contain the remedy words the
 message is forbidden to contain; and a new `HelloStatus` trips a wire-value
-compile error: `status_is_a_refusal` is a total `match` kept for no other
-purpose, because safe Rust cannot enumerate an enum and `HelloStatus::from_u32`'s
-catch-all arm absorbs a new variant without complaint. The per-status check
+compile error in the test build: `status_is_a_refusal` is a total `match` kept
+for no other purpose, because safe Rust cannot enumerate an enum and
+`HelloStatus::from_u32`'s catch-all arm absorbs a new variant without complaint.
+It lives in `#[cfg(test)]`, so it is `--all-targets` that fails and not a plain
+`cargo check`. The per-status check
 requires a table **row** rather than a mention, since the section's prose names
 two of the statuses while telling them apart from the header checks that share
 those names, and the worked example that section quotes is asserted to be

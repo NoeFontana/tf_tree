@@ -783,7 +783,27 @@ deliberately unplanned.
    fires only if the codec is updated too. `status_is_a_refusal` replaces it: a
    total `match` kept for no other purpose, whose author is standing in front of
    the list, the table and the test. Measured: adding a variant fails
-   `cargo check -p tf_tree_ipc --all-targets`.
+   `cargo check -p tf_tree_ipc --all-targets`. **`--all-targets` is not
+   decoration in that sentence** — the prompt is in `#[cfg(test)]`, so a plain
+   `cargo check` still passes, and the two reader-facing copies of this claim
+   said "fails to compile" without the qualifier until review round 2 measured
+   it. `just build` and `just lint` both pass the flag, so the gate holds.
+
+   **Round 2 found three more gates that were narrower than their own labels**,
+   and they are recorded because each is the same shape as the defect this step
+   is about — a check whose name promises more than it asserts. The runbook's
+   remedy words were required *of the section* and not of the row, so blanking a
+   remedy cell passed with the row still present; a row's *what to do* cell now
+   has a floor, and blanking or stubbing one fails. The section's end bound
+   stopped only at `###`, so a `HandshakeRejected` section that ever became the
+   last one under its chapter would have swallowed the rest of the runbook and
+   every `contains` in that test would have held vacuously. And
+   `every_unreachable_state_reports_the_facts_and_prescribes_nothing` still
+   carried the very defect the erratum above repudiates: a state labelled
+   *widest ids* whose `first_pid` was 4242, under an assertion that two
+   `contains` satisfied with one wide field. Each id is now checked on its own,
+   and the widest state — slot 0, whose `, the creator's` outweighs a wide
+   slot's digits — is swept beside it.
 
    - **Verified by** the step-6 gate with the exception and
      `HANDSHAKE_REJECTED_LENGTHS` both removed, so the variant is measured with

@@ -31,8 +31,12 @@ use tf_tree::{HelloStatus, IpcError};
 /// `docs/RUNBOOK.md`'s `HandshakeRejected` section.
 fn section() -> &'static str {
     const RUNBOOK: &str = include_str!("../../../docs/RUNBOOK.md");
+    // `\n### `, not `### `: a `#### ` subheading of the same name would match
+    // the start, and the end bound must stop at a `## ` too, or a section that
+    // becomes the last `###` under its chapter swallows the rest of the file
+    // and every `contains` below goes vacuous with nothing firing.
     let after = RUNBOOK
-        .split_once("### `HandshakeRejected`")
+        .split_once("\n### `HandshakeRejected`")
         .map_or("", |(_, after)| after);
     // An empty parse is not a pass: every assertion below is a `contains`, and
     // all of them hold vacuously against nothing.
@@ -41,7 +45,12 @@ fn section() -> &'static str {
         "docs/RUNBOOK.md must carry a `HandshakeRejected` section: it holds the remedies \
          that variant's message stopped carrying"
     );
-    after.split_once("\n### ").map_or(after, |(body, _)| body)
+    let end = ["\n### ", "\n## "]
+        .iter()
+        .filter_map(|h| after.find(h))
+        .min()
+        .unwrap_or(after.len());
+    &after[..end]
 }
 
 /// Words a remedy is written with.
@@ -51,6 +60,15 @@ fn section() -> &'static str {
 /// write is vacuous, and a row can be checked for existing without being
 /// checked for saying anything.
 const REMEDY_WORDS: [&str; 5] = ["rebuild", "restart", "read-only", "/proc", "doctor"];
+
+/// The shortest a row's *what to do* cell may be.
+///
+/// **A floor, not a target.** It exists because the remedy-word check below is
+/// over the section and a row can be emptied without touching a word anywhere
+/// else — measured, on review round 2: the `ModeNotPermitted` cell was blanked,
+/// the row stayed, and this file passed. The shortest cell today is several
+/// times this.
+const REMEDY_FLOOR: usize = 60;
 
 /// Every refusal has a row, the rows say something, and the example is real.
 #[test]
@@ -71,11 +89,34 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
         // the section is satisfied for two of the six by paragraphs that answer
         // nothing.
         let row = format!("| `{status:?}` |");
+        let line = section
+            .lines()
+            .find(|l| l.starts_with(&row))
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/RUNBOOK.md's `HandshakeRejected` section has no table row for \
+                     {status:?}, so the message's search key leads an operator to a table \
+                     that does not answer the status they were given"
+                )
+            });
+
+        // **The row's own remedy cell, not the section's prose.** A first
+        // version checked the remedy words over the whole section, and blanking
+        // this cell — leaving the row in place — passed: an operator followed
+        // the search key to an empty answer with the gate green.
+        let cells: Vec<&str> = line.trim_matches('|').split(" | ").collect();
+        assert_eq!(
+            cells.len(),
+            3,
+            "{status:?}'s row is not three cells; `just artifact-versions` holds the count \
+             and this holds what is in them: {line}"
+        );
         assert!(
-            section.lines().any(|l| l.starts_with(&row)),
-            "docs/RUNBOOK.md's `HandshakeRejected` section has no table row for {status:?}, \
-             so the message's search key leads an operator to a table that does not answer \
-             the status they were given"
+            cells[2].trim().len() >= REMEDY_FLOOR,
+            "{status:?}'s remedy cell is {} bytes, under the {REMEDY_FLOOR}-byte floor; the \
+             message stopped explaining this status on the promise that this cell would: \
+             {line}",
+            cells[2].trim().len()
         );
     }
 

@@ -686,6 +686,46 @@ mod tests {
     use super::{IpcError, ProcError, ProcParseError};
     use crate::WireError;
 
+    /// Every `HelloStatus`, written out because safe Rust cannot enumerate an
+    /// enum — and [`status_is_a_refusal`] is the compile error that says so
+    /// when one is added.
+    const ALL_STATUSES: [crate::wire::HelloStatus; 7] = {
+        use crate::wire::HelloStatus as H;
+        [
+            H::Ok,
+            H::VersionMismatch,
+            H::LayoutMismatch,
+            H::BootIdMismatch,
+            H::NoParticipantSlots,
+            H::ModeNotPermitted,
+            H::Malformed,
+        ]
+    };
+
+    /// Is this status a refusal — that is, does it need a `docs/RUNBOOK.md`
+    /// row?
+    ///
+    /// **Total by construction, and that is its whole job.** `rejection_advice`
+    /// used to be the place a new `HelloStatus` broke the build, and step 7
+    /// deleted it; `HelloStatus::from_u32`'s `_` arm cannot replace it, because
+    /// a variant added without touching the codec compiles clean. So the prompt
+    /// lives here: adding one fails to compile, and the author who fixes this
+    /// match is the author standing in front of [`ALL_STATUSES`], the runbook's
+    /// table and `tf_tree_cli`'s `runbook.rs`.
+    fn status_is_a_refusal(status: crate::wire::HelloStatus) -> bool {
+        use crate::wire::HelloStatus as H;
+        match status {
+            // The acceptance: no error is built from it, so it has no row.
+            H::Ok => false,
+            H::VersionMismatch
+            | H::LayoutMismatch
+            | H::BootIdMismatch
+            | H::NoParticipantSlots
+            | H::ModeNotPermitted
+            | H::Malformed => true,
+        }
+    }
+
     /// Every [`IpcError`] variant, **and every value its `Display` branches
     /// on**, for the length and ASCII gates.
     ///
@@ -729,46 +769,6 @@ mod tests {
     /// `HandshakeRejected`'s two owner numbers at `u32::MAX` beside their
     /// realistic values. A `format_version` of `3` renders one digit where the
     /// type renders ten.
-    /// Every `HelloStatus`, written out because safe Rust cannot enumerate an
-    /// enum — and [`status_is_a_refusal`] is the compile error that says so
-    /// when one is added.
-    const ALL_STATUSES: [crate::wire::HelloStatus; 7] = {
-        use crate::wire::HelloStatus as H;
-        [
-            H::Ok,
-            H::VersionMismatch,
-            H::LayoutMismatch,
-            H::BootIdMismatch,
-            H::NoParticipantSlots,
-            H::ModeNotPermitted,
-            H::Malformed,
-        ]
-    };
-
-    /// Is this status a refusal — that is, does it need a `docs/RUNBOOK.md`
-    /// row?
-    ///
-    /// **Total by construction, and that is its whole job.** `rejection_advice`
-    /// used to be the place a new `HelloStatus` broke the build, and step 7
-    /// deleted it; `HelloStatus::from_u32`'s `_` arm cannot replace it, because
-    /// a variant added without touching the codec compiles clean. So the prompt
-    /// lives here: adding one fails to compile, and the author who fixes this
-    /// match is the author standing in front of [`ALL_STATUSES`], the runbook's
-    /// table and `tf_tree_cli`'s `runbook.rs`.
-    fn status_is_a_refusal(status: crate::wire::HelloStatus) -> bool {
-        use crate::wire::HelloStatus as H;
-        match status {
-            // The acceptance: no error is built from it, so it has no row.
-            H::Ok => false,
-            H::VersionMismatch
-            | H::LayoutMismatch
-            | H::BootIdMismatch
-            | H::NoParticipantSlots
-            | H::ModeNotPermitted
-            | H::Malformed => true,
-        }
-    }
-
     fn samples() -> Vec<IpcError> {
         use crate::{EnvVar, LockRole, NameProblem, RuntimeDirSource as R};
         let sources = [R::Env, R::XdgRuntimeDir, R::Run, R::Tmp];
@@ -1136,6 +1136,20 @@ mod tests {
             }
             .to_string()
         };
+        // **The widest state needs the pid too, and that is why it is a second
+        // closure.** `samples()` carried the same defect until step 7: it swept
+        // the mask and the slot to their maxima, left `first_pid` at 4242 —
+        // nine digits short — and its label said *widest*. The figure that came
+        // out was 152, and the arm renders 164. A label is not a measurement.
+        let held_wide = |slots: u64, first: Option<u32>, owned: bool| {
+            IpcError::ArenaHeldButUnreachable {
+                holder_slots: slots,
+                first_slot: first,
+                first_pid: u32::MAX,
+                ownership_held: owned,
+            }
+            .to_string()
+        };
 
         // **Every state the four arms can render, not the seven a first version
         // listed.** That list omitted `(0b1000, Some(3), true)` and both
@@ -1156,7 +1170,10 @@ mod tests {
             ("nobody attached, nothing held", held(0, None, false)),
             ("no first slot, mask set, free", held(0b1, None, false)),
             ("no first slot, mask set, held", held(0b1, None, true)),
-            ("widest ids", held(u64::MAX, Some(u32::MAX), true)),
+            ("widest ids", held_wide(u64::MAX, Some(u32::MAX), true)),
+            // Slot 0 is the widest of all: `, the creator's` costs more than
+            // the nine digits a `u32::MAX` slot adds.
+            ("widest of all", held_wide(u64::MAX, Some(0), true)),
         ];
 
         for (state, message) in &states {
@@ -1243,10 +1260,32 @@ mod tests {
         // **The widest ids are what the budget has to survive, and a sample at
         // 0x5 / pid 4242 does not measure them.** A 64-bit mask and two 32-bit
         // ids are up to 38 bytes of digits on their own.
+        //
+        // **Each id is checked on its own**, because the conjunction of two
+        // `contains` over one string is satisfied by *either* field being wide:
+        // `4294967295` was the slot, and the pid stayed at 4242 with this
+        // assertion green — which is how the label outlived the measurement.
         let widest = of("widest ids");
         assert!(
-            widest.contains("0xffffffffffffffff") && widest.contains("4294967295"),
-            "the widest ids must render in full rather than being abbreviated: {widest}"
+            widest.contains("0xffffffffffffffff"),
+            "the mask must render in full: {widest}"
+        );
+        assert!(
+            widest.contains("lowest slot 4294967295"),
+            "the slot must render in full: {widest}"
+        );
+        assert!(
+            widest.contains("pid 4294967295"),
+            "the pid must render in full, and it is the field that was left at 4242 \
+             under this very label: {widest}"
+        );
+        // And the widest of all is the creator's slot, for the reason above it.
+        let widest_of_all = of("widest of all");
+        assert!(
+            widest_of_all.len() > widest.len(),
+            "slot 0's `, the creator's` must cost more than a wide slot's digits, or the \
+             worst case this budget is sized against is the other state: \
+             {widest_of_all}"
         );
     }
 

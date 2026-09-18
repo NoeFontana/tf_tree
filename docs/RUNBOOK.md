@@ -368,10 +368,12 @@ where there is no owner and no handshake at all, opening a frozen `.tft`.
 | `Malformed` | nothing — it could not decode the request | **or it refused for a reason this build has no name for.** Every unknown status code decodes to `Malformed` (`HelloStatus::from_u32`), deliberately, so a newer owner's newer refusal arrives here. The two are indistinguishable on the wire, so confirm both sides are the same release before reading this as corruption |
 
 `Ok` never appears in this message: it is the acceptance, and no error is built
-from it. **Adding a `HelloStatus` fails to compile** — `status_is_a_refusal` in
-`tf_tree_ipc`'s `error.rs` is a total `match` kept for exactly that, since safe
-Rust cannot enumerate an enum and `HelloStatus::from_u32`'s catch-all arm
-absorbs a new variant without complaint. Whoever fixes that match is the person
+from it. **Adding a `HelloStatus` fails to build the tests** — `status_is_a_refusal`
+in `tf_tree_ipc`'s `error.rs` is a total `match` kept for exactly that, since
+safe Rust cannot enumerate an enum and `HelloStatus::from_u32`'s catch-all arm
+absorbs a new variant without complaint. It is in `#[cfg(test)]`, so a plain
+`cargo check -p tf_tree_ipc` still passes and `--all-targets` is what fails;
+`just build` and `just lint` both pass that flag. Whoever fixes that match is the person
 who owes this table a row; that the row *exists* and says something is
 `tf_tree_cli`'s `tests/runbook.rs`, which reads this section.
 
