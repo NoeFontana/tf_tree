@@ -41,6 +41,38 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — four of the seven attach refusals did not fit the C ABI's message buffer (`0055` step 7)
+
+`IpcError::HandshakeRejected` appended a per-status remedy to every rejection:
+seven texts rendering **112 to 378 bytes**, against a `tft_error::message` of
+256 that `set_message` truncates at 255. **Four of the seven reached a C
+operator cut off mid-sentence**, and six were over the 220 bytes this crate's
+own gate allows. They are **108 to 124 bytes** now (133 at the widest owner
+numbers) and every one of them fits.
+
+The message states the status, the owner's `format_version` and `layout_hash` —
+which §3.7 requires a rejection to name, and which a client cannot get any other
+way — and ends `(HandshakeRejected)`, the key that finds the runbook. **The
+seven remedies are now `docs/RUNBOOK.md`'s `HandshakeRejected` section**, one row
+per status, placed beside the header-validation checks that share two of their
+names, because mistaking one for the other is the error an operator actually
+makes: the handshake statuses are the *owner's* comparison against an attach
+request, decided before this process ever saw a segment.
+
+**Writing those rows found one of them false.** The `BootIdMismatch` remedy said
+the arena had "outlived a reboot" and should be removed. A serving owner is
+proof it did not, and the segment would not have survived one; the boot id
+detects a stale *lock file*, not a served arena. The new row says what that
+status actually means — the two processes disagree about which boot this is, so
+one of them could not read `/proc/sys/kernel/random/boot_id` — and what to check.
+
+Both halves are gated. No rendering may name a status it did not get, which is
+the original defect of this arm made unexpressible; the runbook section must
+carry a row per refusal status and those rows must contain the remedy words the
+message is forbidden to contain; and a new `HelloStatus` trips a wire-value
+tripwire, because safe Rust cannot enumerate an enum and neither list is derived
+from one.
+
 ### Fixed — a C caller could not read the end of an error message, and `ArenaHeldButUnreachable` was 793 bytes of it (`0055` step 6)
 
 `tft_tree_open_named` reports a failure by formatting
@@ -56,8 +88,10 @@ inferred; the figure moves with the pid and the mask, which is itself part of
 the problem.
 
 **The message now states facts and ends with its own name; the remedy moved to
-`docs/RUNBOOK.md`**, whose reader has every process in hand. The same state is **143 bytes** and ASCII; the widest ids those fields can
-carry render **158**.
+`docs/RUNBOOK.md`**, whose reader has every process in hand. The same state is
+**143 bytes** and ASCII; the widest ids those fields can carry render **164**
+(this said 158 before the sample set swept `first_pid`, and 158 was a state the
+gate did not construct).
 The split is the point rather than the size: this type sees which lock bytes are
 held and cannot see who holds them, so it cannot tell one process holding two
 bytes from two holding one each — and a remedy that guesses is wrong in

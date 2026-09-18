@@ -1,11 +1,10 @@
 # 0055: the recovery capacity a fleet cannot add later
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** **steps 1, 2, 3, 4 and 6 have landed** (#353 `0411adb`,
-steps 1/3/4 in #355, step 6 after it). Step 5 is struck. **Step 7 — the same
-reduction for `HandshakeRejected`, which step 6 measured and did not fix — is
-open.**
+**Implementation:** **every step has landed** — 2 in #353 (`0411adb`), 1/3/4 in
+#355 (`ea98e56`), 6 in #356 (`d121589`), 7 after it. Step 5 is **struck**: open
+question 1 answered *no mechanism*, so there was nothing to build.
 
 ## Context
 
@@ -662,7 +661,14 @@ deliberately unplanned.
    step back is named with the answer.
 6. **Reduce what the `ArenaHeldButUnreachable` remedy claims. DONE,
    2026-09-18** (*Decision* part 4, and this record's own question 3).
-   **793 bytes non-ASCII → 143 bytes ASCII**, 152 at the widest ids, and the
+   **793 bytes non-ASCII → 143 bytes ASCII**, 164 at the widest ids — *this
+   read 152 until step 7, and 152 was what `samples()` measured rather than what
+   the arm can render: it swept the mask and the slot to their maxima and left
+   `first_pid` at 4242, six digits short, and never combined a wide mask with
+   slot 0, whose `, the creator's` costs more than a wide slot's nine digits.
+   The sweep and the figure are both corrected, and the correction is the
+   step-6 lesson arriving one level up: a number is only as measured as the
+   sample that produced it* — and the
    remedy is `docs/RUNBOOK.md`'s eight-row table, indexed by the facts the
    message still prints — the mask, the lowest slot and its pid, and the
    ownership byte — and placed where the search key lands a reader rather than
@@ -729,19 +735,59 @@ deliberately unplanned.
      **Not triggered:** that section gained the remedy the message gave up, in
      more detail than the message could carry, and the message's search key is
      how a reader gets to it.
-7. **The same reduction for `HandshakeRejected`.** Step 6's gate measured what it
-   was not chartered to fix: that variant is **378 bytes at its worst status**,
-   and **four of its seven statuses truncate** in `tft_error::message` (239, 253,
-   320, 378 against 255 with the 26-byte wrapper, and all but `Ok` over this crate's own 220-byte budget). The length is `rejection_advice`, seven
-   per-status remedies concatenated into the message — the same pattern part 4
-   ends. The fix is the same shape: facts plus the search key, and a new
-   `docs/RUNBOOK.md` section for the seven statuses, which is why it is a step
-   and not a clause of step 6.
-   - Until it lands, `HANDSHAKE_REJECTED_LENGTHS` pins **each status** at its measured length so
-     none of them can grow — a first version pinned only the worst, and growing
-     `Ok` from 112 to 306 bytes passed it, and the gate's exception names this step. **A ratchet, not an
-     exemption**: if a status's advice grows, the gate fails.
-   - **Verified by** the same gate with the exception removed.
+7. **The same reduction for `HandshakeRejected`. DONE, 2026-09-18.** Step 6's
+   gate measured what it was not chartered to fix: seven per-status remedies
+   rendering **112 to 378 bytes**, of which **four truncated** in
+   `tft_error::message` at the 26-byte wrapper, and six of seven were over this
+   crate's own 220-byte budget. They are now **108 to 124 bytes** (133 at the
+   widest owner numbers), ASCII, and every one of them fits: the message states
+   the status, the owner's two numbers — which §3.7 requires a rejection to name
+   — and `(HandshakeRejected)`, and `rejection_advice` is deleted. Its seven
+   remedies are `docs/RUNBOOK.md`'s `HandshakeRejected` section, placed beside
+   the header-validation checks that share two of their names, because that
+   confusion is the one an operator actually makes.
+
+   **The negative rule, as in step 6:** no rendering may name a status it did
+   not get. That is the first defect this arm ever had — one `LayoutMismatch`
+   sentence appended to every rejection, printed thousands of times over a
+   `NoParticipantSlots` refusal — and the per-status repair that followed is
+   what put 378 bytes in a 256-byte buffer. Both are refused by
+   `every_rejection_names_only_the_status_it_carries`, which also holds the arm
+   to a 140-byte budget of its own: prose returning here fails long before it
+   reaches the 220 the C path allows.
+
+   **A row a reader cannot reach is the failure this shape invites**, so the
+   runbook is gated too. `a_new_status_needs_a_row_in_the_runbook` reads
+   `docs/RUNBOOK.md` with `include_str!` and requires a row per refusal status,
+   requires those rows to contain the remedy words the message is forbidden to
+   contain — the two halves keep each other honest — and trips when wire value 7
+   stops decoding to `Malformed`, which is the only signal available that a
+   `HelloStatus` was added: safe Rust cannot enumerate one.
+
+   - **Verified by** the step-6 gate with the exception and
+     `HANDSHAKE_REJECTED_LENGTHS` both removed, so the variant is measured with
+     every other one, plus **nine mutants, nine caught**: advice re-appended,
+     the search key dropped, the owner's numbers dropped, 100 bytes of prose
+     carrying none of the forbidden words, a runbook row deleted, the runbook's
+     remedies emptied, the runbook section renamed away, a status added at wire
+     value 7, and a named status folded onto another.
+   - **Found and not fixed, because it is outside this step:** there are **two
+     `boot_id` parsers** — `tf_tree_ipc::procstat::boot_id`, which rejects a
+     UUID with trailing junk, and `tf_tree::tree::boot_id`, which ignores it —
+     and they disagree on a malformed `/proc/sys/kernel/random/boot_id`, which
+     is one of the ways `BootIdMismatch` becomes reachable. The runbook row says
+     what an operator should check; a second spelling of a parser is a separate
+     record (`PROJECT.md` §6).
+   - **Corrected while writing the row, rather than copied:** the deleted
+     `BootIdMismatch` advice said the arena "outlived a reboot ... nothing in it
+     is alive and it should be removed". **A serving owner is proof it did not**,
+     and the segment would not have survived one;
+     [`wire.rs`](../../crates/tf_tree_ipc/src/wire.rs)'s own doc on
+     `HelloResponse` says the two peers' ids "agree by construction" and that
+     the reboot check belongs to the lock-file path. The advice was true of a
+     different check with the same name. That is the same category error as
+     step 6's, one layer over: prose that describes the *state the author was
+     picturing* rather than the one the branch selects.
 
 ## Open questions
 

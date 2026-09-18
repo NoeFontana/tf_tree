@@ -2288,8 +2288,14 @@ fn the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live() {
 ///
 /// ```text
 /// attach 64 of 128 was refused: error the arena owner refused this attach:
-/// NoParticipantSlots ... every participant slot is taken.
+/// NoParticipantSlots (owner format_version 3, layout_hash 0x...) (HandshakeRejected)
 /// ```
+///
+/// *The tail of that line is the message as it reads since `0055` step 7. The
+/// run quoted here predates the reduction and printed one of the seven
+/// per-status remedies that are now `docs/RUNBOOK.md`'s; the line is updated
+/// rather than left to describe a rendering nothing produces, and the hash it
+/// always elided is still elided.*
 ///
 /// — the 64th and not the 65th, because the owner holds slot 0 and only 63 are
 /// ever available to joiners. So this scenario pins the *property*, and after

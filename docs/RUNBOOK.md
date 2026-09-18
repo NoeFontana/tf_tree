@@ -333,6 +333,47 @@ that the runtime directory still exists and is on a local filesystem
 ([`PHASE2.md`](./PHASE2.md) §3.1 refuses NFS and CIFS for exactly this class of
 reason), and that the process has not exhausted its descriptors.
 
+### `HandshakeRejected`
+
+A **live, serving owner** answered the rendezvous socket and refused this attach.
+The message names the status and the owner's side of the comparison, and stops
+there:
+
+```text
+the arena owner refused this attach: LayoutMismatch (owner format_version 3, layout_hash 0x3D104195) (HandshakeRejected)
+```
+
+**The remedy is this table, and it left the message on 2026-09-18.** Seven
+per-status remedies rendered 112 to 378 bytes; the C ABI's `tft_error::message`
+is 256 bytes and `set_message` truncates at 255, so four of the seven reached a C
+operator cut off mid-sentence, which is worse than a status and a place to look
+([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
+step 7).
+
+**Two of these statuses share a name with a check below and are not that check.**
+`VersionMismatch` and `LayoutMismatch` here are the **owner's** comparison
+against the attach request, made before this process ever saw the segment — which
+is why the message carries one hash and not two, and why `found`/`expected` do
+not appear. The sections under those names below are this process validating a
+header it has already mapped. Either can happen without the other: a read-only
+consumer that never reaches the rendezvous meets only the second.
+
+| `status` | What the owner compared | What to do |
+|---|---|---|
+| `VersionMismatch` | this binary's `FORMAT_VERSION` against the running arena's, **first**, because a version difference makes every later field's meaning uncertain | rebuild every participant from one release and restart them together. There is no partial upgrade path |
+| `LayoutMismatch` | same version, a different record layout | rebuild every participant, as above. The owner's `layout_hash` is in the message; this binary's is a build constant, which `tf_tree doctor` prints |
+| `BootIdMismatch` | the boot id in the attach request against the one in the **arena header** | **not "the arena outlived a reboot"** — a serving owner is proof it did not, and the segment would not have survived one. The two processes disagree about which boot this is, and the kernel has one boot id per host with no per-namespace variant ([`PHASE2.md`](./PHASE2.md) §3.3), so one of them did not read the real value: either the read failed and it substituted all-zeros (both sides do, so it takes exactly one failure), or something presents a different `/proc/sys/kernel/random/boot_id` to it — a sandbox that masks `/proc/sys`, or a `/proc` overlay. Read that file from both processes and compare |
+| `NoParticipantSlots` | the participant table, which is full | the same exhaustion the *`ParticipantTableFull` / `NoParticipantSlots`* section below reaches from the other side; its two commands and the difference between the two tables they read are the triage. **There is no `--participants` flag and never was**: capacity is fixed at construction ([`PROJECT.md`](./PROJECT.md) §5 D4) |
+| `ModeNotPermitted` | the mode byte, against what this arena lets a joiner do | attach read-only, which is the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18). If this process must write, it is the **owner** that decides, so the change belongs there and not in the attach |
+| `Malformed` | nothing — it could not decode the request | **or it refused for a reason this build has no name for.** Every unknown status code decodes to `Malformed` (`HelloStatus::from_u32`), deliberately, so a newer owner's newer refusal arrives here. The two are indistinguishable on the wire, so confirm both sides are the same release before reading this as corruption |
+
+`Ok` never appears in this message: it is the acceptance, and no error is built
+from it. **Nothing derives either this table or the list the gate sweeps from the
+enum** — safe Rust cannot enumerate one — so a new `HelloStatus` needs a row here
+and an entry in `samples()`. That is a review rule, and the tripwire for it is
+`a_new_status_needs_a_row_in_the_runbook`, which fails as soon as wire value 7
+stops decoding to `Malformed`.
+
 ### `LayoutMismatch { found, expected }`
 
 Two binaries were built from different commits and their arena struct layouts
@@ -343,11 +384,19 @@ This is the one operators actually hit, and the raw symptom — attach failing o
 a machine where everything else looks fine — is otherwise a multi-hour debugging
 session. Both hashes are printed for exactly that reason.
 
+**This is the mapped header's check, not the owner's.** A refusal that never got
+as far as a segment prints `LayoutMismatch` with one hash and ends
+`(HandshakeRejected)`; that one is *`HandshakeRejected`* above, and the remedy is
+the same rebuild for a different reason.
+
 ### `VersionMismatch { found, expected }`
 
 The segment was written by a different `FORMAT_VERSION`. Version 1 arenas cannot
 be attached by a version 2 build: the Phase 2 amendments changed the header and
 region table. Recreate the arena.
+
+Also the mapped header's check. The owner's version comparison at the rendezvous
+handshake is *`HandshakeRejected`* above, and it prints only the owner's number.
 
 ### `HeaderInconsistent`
 

@@ -12,7 +12,7 @@
 //! because the symptom an operator sees ("it will not start") is identical for
 //! all of them.
 
-use crate::{HelloStatus, WireError};
+use crate::WireError;
 use core::fmt;
 
 use rustix::io::Errno;
@@ -324,6 +324,34 @@ pub enum IpcError {
     /// went away mid-handshake is [`IpcError::HandshakeClosed`] instead.
     HandshakeMalformed(crate::wire::WireError),
     /// The owner refused this client, and named its own side of the comparison.
+    ///
+    /// **The message states the status and the owner's two numbers, and
+    /// prescribes nothing** (`0055` step 7). What to do about each status is
+    /// [`docs/RUNBOOK.md`](https://github.com/NoeFontana/tf_tree/blob/main/docs/RUNBOOK.md)'s `HandshakeRejected`
+    /// section, one row per status, and `(HandshakeRejected)` at the end of the
+    /// rendering is the search key that reaches it
+    /// ([`0059`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md)
+    /// convention (g)).
+    ///
+    /// **Two measurements put the remedy there rather than here, and the second
+    /// is why the first one's fix was not enough.** The message once appended a
+    /// single sentence about `LayoutMismatch` to *every* rejection, so a torture
+    /// run that exhausted the participant table printed, thousands of times:
+    ///
+    /// ```text
+    /// the arena owner refused this attach: NoParticipantSlots (owner format_version 3,
+    /// layout_hash 0x3D104195). A LayoutMismatch means this binary was built against a
+    /// different record layout than the running arena — rebuild both from the same source
+    /// ```
+    ///
+    /// The status is right there and it is not `LayoutMismatch`, but the advice
+    /// is the longest and last thing on the line, so it reads as the diagnosis
+    /// and costs a rebuild before anyone rereads the word in front of it. That
+    /// was repaired with one arm per status — and the arms were 112 to 378
+    /// bytes, while `tft_error::message` is 256 and `set_message` truncates at
+    /// 255, so **four of the seven statuses reached a C operator cut off
+    /// mid-remedy**. A per-status remedy that C cannot finish reading is the
+    /// same defect one layer down, which is what a runbook row does not have.
     HandshakeRejected {
         /// Why.
         status: crate::wire::HelloStatus,
@@ -451,6 +479,9 @@ impl fmt::Display for IpcError {
                     ),
                 }
             }
+            // Facts only, and the variant name as the runbook's search key: the
+            // seven per-status remedies this arm used to carry are that
+            // section's rows. Why they left is on the variant.
             IpcError::HandshakeRejected {
                 status,
                 owner_format_version,
@@ -459,8 +490,7 @@ impl fmt::Display for IpcError {
                 f,
                 "the arena owner refused this attach: {status:?} \
                  (owner format_version {owner_format_version}, \
-                 layout_hash 0x{owner_layout_hash:08X}). {}",
-                rejection_advice(status)
+                 layout_hash 0x{owner_layout_hash:08X}) (HandshakeRejected)"
             ),
             IpcError::RejectionCarriedFd { status } => write!(
                 f,
@@ -625,61 +655,6 @@ impl fmt::Display for IpcError {
     }
 }
 
-/// What to do about a refused attach, for the status that was actually
-/// returned.
-///
-/// **One arm per status, because the alternative was measured and it misleads.**
-/// This used to be a single sentence appended to every rejection explaining what
-/// a `LayoutMismatch` means. A torture run that exhausted the participant table
-/// therefore printed, thousands of times:
-///
-/// ```text
-/// the arena owner refused this attach: NoParticipantSlots (owner format_version 3,
-/// layout_hash 0x3D104195). A LayoutMismatch means this binary was built against a
-/// different record layout than the running arena — rebuild both from the same source
-/// ```
-///
-/// The status is right there and it is not `LayoutMismatch`, but the advice is
-/// the longest and last thing on the line, so it reads as the diagnosis and
-/// points the operator at their build. Prose that explains a status the caller
-/// did not get is worse than no prose: it costs a rebuild before anyone rereads
-/// the word in front of it.
-fn rejection_advice(status: HelloStatus) -> &'static str {
-    match status {
-        // Reachable only from a rejection, which `Ok` is not — but the match is
-        // total so the compiler tells the next person who adds a status that
-        // this list needs a line.
-        HelloStatus::Ok => "this was not a refusal",
-        HelloStatus::VersionMismatch => {
-            "this binary speaks a different arena FORMAT_VERSION than the running owner; \
-             both sides must be built from the same release"
-        }
-        HelloStatus::LayoutMismatch => {
-            "same version, different record layout: this binary was built against a \
-             different arena layout than the running owner; rebuild both from the same source"
-        }
-        HelloStatus::BootIdMismatch => {
-            "the arena records a different boot id than this host is running, so it \
-             outlived a reboot; nothing in it is alive and it should be removed"
-        }
-        HelloStatus::NoParticipantSlots => {
-            "every participant slot is taken. If the participants are real, raise the \
-             arena's participant limit, which needs an owner restart; if they are not, \
-             the slots are held by records of processes that died: `tf_tree participants` \
-             prints one line per slot and marks those `stale`"
-        }
-        HelloStatus::ModeNotPermitted => {
-            "this attach asked for read-write on an arena the owner will not let it write; \
-             attach read-only, which is the consumer default"
-        }
-        HelloStatus::Malformed => {
-            "the owner could not decode this attach request, or refused it for a reason \
-             this build has no name for; the two are indistinguishable on the wire, so \
-             check that both sides are the same release before reading it as corruption"
-        }
-    }
-}
-
 impl fmt::Display for ProcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
@@ -748,6 +723,12 @@ mod tests {
     /// the four [`LockRole`]s, the seven `HelloStatus`es, the three
     /// [`WireError`]s, [`ProcError`]'s arms including all three parse causes,
     /// and `ArenaHeldButUnreachable`'s seven reachable states.
+    ///
+    /// **And the widths a formatter does not branch on but a budget counts**:
+    /// the ids that carry one are sampled at `u64::MAX` / `Some(u32::MAX)`, and
+    /// `HandshakeRejected`'s two owner numbers at `u32::MAX` beside their
+    /// realistic values. A `format_version` of `3` renders one digit where the
+    /// type renders ten.
     fn samples() -> Vec<IpcError> {
         use crate::wire::HelloStatus as H;
         use crate::{EnvVar, LockRole, NameProblem, RuntimeDirSource as R};
@@ -808,11 +789,19 @@ mod tests {
             });
         }
         for status in statuses {
-            out.push(IpcError::HandshakeRejected {
-                status,
-                owner_format_version: 3,
-                owner_layout_hash: 0x3D10_4195,
-            });
+            // Both the realistic numbers and the widest ones. `Display` does
+            // not branch on either, but the budget is a length, and a
+            // `format_version` of 3 is nine digits short of what a `u32` can
+            // render.
+            for (owner_format_version, owner_layout_hash) in
+                [(3, 0x3D10_4195), (u32::MAX, u32::MAX)]
+            {
+                out.push(IpcError::HandshakeRejected {
+                    status,
+                    owner_format_version,
+                    owner_layout_hash,
+                });
+            }
             out.push(IpcError::RejectionCarriedFd { status });
         }
         for wire in [
@@ -850,27 +839,31 @@ mod tests {
         // `Some(slot)` arm with slot 0 and with a joiner's slot, both ownership
         // readings, and the `first_slot: None` arm with a non-empty mask, which
         // no other test constructs.
-        for (holder_slots, first_slot, ownership_held) in [
-            // The widest ids the fields can carry: a 64-bit mask and two 32-bit
-            // ids are 38 bytes of digits, which a `0x5` / `pid 4242` sample does
-            // not measure and the budget has to survive.
-            (u64::MAX, Some(u32::MAX), true),
-            (u64::MAX, Some(u32::MAX), false),
-            (0u64, None, true),
-            (0, None, false),
-            (0b1, Some(0u32), false),
-            (0b1, Some(0), true),
-            (0b101, Some(0), false),
-            (0b101, Some(0), true),
-            (0b1000, Some(3), false),
-            (0b1000, Some(3), true),
-            (0b1, None, false),
-            (0b1, None, true),
+        for (holder_slots, first_slot, first_pid, ownership_held) in [
+            // The widest the arm can render, and **`first_pid` is part of it**:
+            // a first version of this swept the mask and the slot to their
+            // maxima and left the pid at 4242, six digits short, so the figure
+            // it measured was not the worst case it was quoted as. The widest
+            // of all is slot **0**, whose `, the creator's` costs more than the
+            // nine digits a wide slot adds.
+            (u64::MAX, Some(0u32), u32::MAX, true),
+            (u64::MAX, Some(u32::MAX), u32::MAX, true),
+            (u64::MAX, Some(u32::MAX), u32::MAX, false),
+            (0u64, None, 4242, true),
+            (0, None, 4242, false),
+            (0b1, Some(0), 4242, false),
+            (0b1, Some(0), 4242, true),
+            (0b101, Some(0), 4242, false),
+            (0b101, Some(0), 4242, true),
+            (0b1000, Some(3), 4242, false),
+            (0b1000, Some(3), 4242, true),
+            (0b1, None, 4242, false),
+            (0b1, None, 4242, true),
         ] {
             out.push(IpcError::ArenaHeldButUnreachable {
                 holder_slots,
                 first_slot,
-                first_pid: 4242,
+                first_pid,
                 ownership_held,
             });
         }
@@ -969,37 +962,6 @@ mod tests {
     /// `0059`'s aspirational 120 is a long way below what these texts are.
     const MESSAGE_BUDGET: usize = 220;
 
-    /// `HandshakeRejected` is over budget and **this step is not chartered to
-    /// fix it** — a ratchet, not an exemption.
-    ///
-    /// Its length is `rejection_advice`, seven per-status remedies concatenated
-    /// into the message. That is exactly the pattern `0055` part 4 ends, and
-    /// applying it here means writing a `docs/RUNBOOK.md` section for the seven
-    /// statuses, which is `0055` step 7 rather than step 6.
-    ///
-    /// **Per status, because a max-over-statuses ratchet is not a ratchet.** A
-    /// first version pinned only the worst (378); growing `HelloStatus::Ok`'s
-    /// advice from 112 to 306 bytes — enough to truncate in C — passed it, and
-    /// six of seven statuses carried 58–266 bytes of silent headroom. Each
-    /// status is now pinned at its own measured length, so any of them growing
-    /// fails. When step 7 lands, this table and the exception go with it.
-    ///
-    /// Four of the seven truncate today at the 26-byte wrapper (239, 253, 320,
-    /// 378 against 255), and under this crate's own 220-byte budget all but
-    /// `Ok` are over.
-    const HANDSHAKE_REJECTED_LENGTHS: [(crate::wire::HelloStatus, usize); 7] = {
-        use crate::wire::HelloStatus as H;
-        [
-            (H::Ok, 112),
-            (H::VersionMismatch, 225),
-            (H::LayoutMismatch, 253),
-            (H::BootIdMismatch, 239),
-            (H::NoParticipantSlots, 378),
-            (H::ModeNotPermitted, 229),
-            (H::Malformed, 320),
-        ]
-    };
-
     #[test]
     fn every_ipc_error_message_fits_the_c_abis_buffer() {
         let mut worst = 0usize;
@@ -1009,9 +971,6 @@ mod tests {
                 text.is_ascii(),
                 "a non-ASCII byte reaches C as `?` per byte: {text}"
             );
-            if matches!(e, IpcError::HandshakeRejected { .. }) {
-                continue;
-            }
             assert!(
                 text.len() <= MESSAGE_BUDGET,
                 "{} bytes over the {MESSAGE_BUDGET}-byte budget, so a C caller reads a \
@@ -1040,25 +999,179 @@ mod tests {
             worst > MESSAGE_BUDGET / 2,
             "the worst message is only {worst} bytes, so this budget is not measuring anything"
         );
+    }
 
-        // The ratchet, per status: each is pinned at the length measured on
-        // 2026-09-18, so growth anywhere fails rather than only growth of the
-        // current worst.
-        for (status, pinned) in HANDSHAKE_REJECTED_LENGTHS {
+    /// Words a remedy is written with. **Forbidden in the message and required
+    /// in the runbook section**, which is the only pairing that keeps either
+    /// half honest: a forbidden list nobody would ever write is vacuous, and a
+    /// runbook row can be checked for existence without being checked for
+    /// saying anything.
+    const REMEDY_WORDS: [&str; 5] = ["rebuild", "restart", "read-only", "/proc", "doctor"];
+
+    /// **A rejection is facts, and facts have a width.** [`0059`]'s convention
+    /// (e) asks for 120 bytes; these must also name both sides of the
+    /// comparison (§3.7), and a `u32` renders ten digits where a plausible
+    /// `format_version` renders one. This is that convention plus the digits,
+    /// and the slack it leaves is single digits — so a clause of prose
+    /// returning to this arm fails here long before it reaches
+    /// `MESSAGE_BUDGET`, which has room for a paragraph.
+    ///
+    /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
+    const REJECTION_BUDGET: usize = 140;
+
+    /// `docs/RUNBOOK.md`'s `HandshakeRejected` section, which is where this
+    /// variant's seven remedies went.
+    fn runbook_rejection_section() -> &'static str {
+        const RUNBOOK: &str = include_str!("../../../docs/RUNBOOK.md");
+        let after = RUNBOOK
+            .split_once("### `HandshakeRejected`")
+            .map_or("", |(_, after)| after);
+        // An empty parse is not a pass: every assertion below is a `contains`,
+        // and all of them hold vacuously against nothing.
+        assert!(
+            !after.is_empty(),
+            "docs/RUNBOOK.md must carry a `HandshakeRejected` section: it holds the \
+             remedies this variant's message stopped carrying"
+        );
+        after.split_once("\n### ").map_or(after, |(body, _)| body)
+    }
+
+    /// **A rejection reports the status it got and prescribes nothing**
+    /// (`0055` step 7) — and, above all, **never names a status it did not
+    /// get**.
+    ///
+    /// That last rule is the shipped defect made unexpressible rather than
+    /// fixed. One sentence about `LayoutMismatch` was once appended to every
+    /// rejection, so a torture run that exhausted the participant table printed
+    /// a `NoParticipantSlots` refusal whose longest, last clause explained a
+    /// layout mismatch; the repair was one arm per status, and *those* were 112
+    /// to 378 bytes against a 256-byte C buffer. Both defects are refused here:
+    /// the prose is gone, and no rendering may contain another status's name.
+    ///
+    /// Length and ASCII are `every_ipc_error_message_fits_the_c_abis_buffer`'s,
+    /// which this variant is no longer excepted from.
+    #[test]
+    fn every_rejection_names_only_the_status_it_carries() {
+        use crate::wire::HelloStatus as H;
+        let statuses = [
+            H::Ok,
+            H::VersionMismatch,
+            H::LayoutMismatch,
+            H::BootIdMismatch,
+            H::NoParticipantSlots,
+            H::ModeNotPermitted,
+            H::Malformed,
+        ];
+        for status in statuses {
             let text = IpcError::HandshakeRejected {
                 status,
-                owner_format_version: 3,
+                owner_format_version: u32::MAX,
                 owner_layout_hash: 0x3D10_4195,
             }
             .to_string();
-            assert!(text.is_ascii(), "non-ASCII in {status:?}: {text}");
+
+            // The facts: which status, the owner's two numbers, and the search
+            // key that reaches the runbook (`0059` convention (g)).
             assert!(
-                text.len() <= pinned,
-                "{status:?} grew from {pinned} bytes to {}; these are over budget already \
-                 and may only shrink, which is `0055` step 7's work",
+                text.contains(&format!("{status:?}")),
+                "a rejection that does not name its status: {text}"
+            );
+            assert!(
+                text.contains("4294967295") && text.contains("0x3D104195"),
+                "the owner's side of the comparison is missing: {text}"
+            );
+            assert!(
+                text.ends_with("(HandshakeRejected)"),
+                "no runbook search key: {text}"
+            );
+            assert!(
+                text.len() <= REJECTION_BUDGET,
+                "{status:?} renders {} bytes against a {REJECTION_BUDGET}-byte budget; \
+                 prose has come back to a message a C caller reads 255 bytes of: {text}",
                 text.len()
             );
+
+            // No other status's name, ever.
+            for other in statuses {
+                assert!(
+                    other == status || !text.contains(&format!("{other:?}")),
+                    "a {status:?} rejection names {other:?}, which is the defect that \
+                     cost a rebuild before anyone reread the word in front of it: {text}"
+                );
+            }
+
+            // No remedy: that is the runbook's, in more room than this buffer has.
+            let lower = text.to_ascii_lowercase();
+            for word in REMEDY_WORDS {
+                assert!(
+                    !lower.contains(word),
+                    "{status:?}'s message prescribes ({word:?}); the remedy belongs in \
+                     docs/RUNBOOK.md, which the C ABI's 255 bytes cannot hold: {text}"
+                );
+            }
         }
+    }
+
+    /// **The runbook holds what the message gave up, per status** — and a new
+    /// `HelloStatus` trips over this test on its way in.
+    ///
+    /// Safe Rust cannot enumerate a plain enum, so neither this list nor the
+    /// runbook's table is derived from `HelloStatus`; what is derived is the
+    /// wire codec, and `from_u32` maps every code it has no name for to
+    /// `Malformed`. So the first unused wire value decoding to anything else
+    /// means a status was added, and this test is where that says "the runbook
+    /// needs a row".
+    #[test]
+    fn a_new_status_needs_a_row_in_the_runbook() {
+        use crate::wire::HelloStatus as H;
+        let section = runbook_rejection_section();
+
+        // Every refusal has a row. `Ok` does not: it is the acceptance, and no
+        // error is built from it.
+        for status in [
+            H::VersionMismatch,
+            H::LayoutMismatch,
+            H::BootIdMismatch,
+            H::NoParticipantSlots,
+            H::ModeNotPermitted,
+            H::Malformed,
+        ] {
+            assert!(
+                section.contains(&format!("`{status:?}`")),
+                "docs/RUNBOOK.md's `HandshakeRejected` section has no row for {status:?}, \
+                 so the message's search key leads an operator to a table that does not \
+                 answer the status they were given"
+            );
+        }
+
+        // The rows say something. Without this the check above is satisfied by
+        // seven bare status names.
+        for word in REMEDY_WORDS {
+            assert!(
+                section.contains(word),
+                "docs/RUNBOOK.md's `HandshakeRejected` section no longer says {word:?}, \
+                 which `every_rejection_names_only_the_status_it_carries` forbids the \
+                 message from saying: the remedy is in neither place"
+            );
+        }
+
+        // The tripwire. Seven codes are named — each round-trips to itself, so
+        // none of them is a fallback — and the eighth must still decode to
+        // `Malformed`, which is what makes a new status visible here.
+        for v in 0..=6u32 {
+            assert_eq!(
+                H::from_u32(v).as_u32(),
+                v,
+                "wire value {v} no longer has a status of its own"
+            );
+        }
+        assert_eq!(
+            H::from_u32(7),
+            H::Malformed,
+            "wire value 7 decodes to a status of its own, so `HelloStatus` grew: give it a \
+             row in docs/RUNBOOK.md's `HandshakeRejected` section, a line in this test's \
+             two lists, and a sample in `samples()`"
+        );
     }
 
     /// **The facts each `ArenaHeldButUnreachable` state prints** — the remedy is
