@@ -87,8 +87,9 @@ one of them could not read `/proc/sys/kernel/random/boot_id` — and what to che
 `ModeNotPermitted` told a caller to attach read-only because the owner would not
 let it write. **No owner in this workspace sends that status**: the wire carries
 it because §3.7 lists it, and the check compares version, layout and boot id and
-nothing else. The row now says that a peer which sends it is not this
-implementation. Both errors survived every review this arm has had, because a
+nothing else. The row now names all three places a rejection status can come from —
+`OwnerServer::serve`'s decode failure, `check`, and the caller's `assign`
+closure — and says that a peer which sends this one is not this implementation. Both errors survived every review this arm has had, because a
 per-status list looks like it was derived from the producers and was derived
 from the status names.
 

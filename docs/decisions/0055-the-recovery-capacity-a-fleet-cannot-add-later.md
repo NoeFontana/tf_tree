@@ -852,6 +852,31 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Round 12: a producer list wrong one revision after being corrected, and a
+   budget claim true of five statuses out of seven.** The `ModeNotPermitted`
+   cell said "a rejection has exactly two sources". There are three —
+   `OwnerServer::serve` answers an undecodable datagram with `Malformed`
+   directly, consulting neither `check` nor `assign` — so a reader sent to those
+   two would not find the path producing the status documented in the row below.
+   Round 11 corrected this same cell's producer list; getting it wrong again,
+   one revision later, in the row that exists *because* its predecessor
+   described a policy the implementation does not have, is the clearest evidence
+   in this arc that enumerating producers is where I am unreliable.
+
+   And `REJECTION_BUDGET`'s doc said "the slack it leaves is single digits".
+   Measured, at the widest owner numbers: 7 (`NoParticipantSlots`), 9, 10, 11,
+   11, **16** (`Malformed`), **23** (`Ok`). A 16-byte clause on a
+   `Malformed`-only branch passes this gate and every other. The doc now states
+   the range and names what would actually catch a short clause, which is the
+   forbidden-word rule and review — the third un-instrumented superlative beside
+   a constant this step has had to correct.
+
+   Third: `rendezvous.rs`'s transcript quoted the rendering with the hash
+   elided, so nothing could assert it — **a second, ungated transcription added
+   by the commit that built the gate against transcriptions.** The status is
+   what that transcript is for; the rendering is elided now, and the comment
+   says where a quoted one is held to `Display`.
+
    **Round 11 found the false `BootIdMismatch` advice still in the spec, and
    the retraction missing from the paragraph it retracts.** Correcting a
    diagnostic means correcting every site that states it, and this step reached

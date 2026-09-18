@@ -1063,10 +1063,21 @@ mod tests {
     /// or `layout_hash()`: printing both needs two more fields on the variant
     /// or a dependency edge, and either is a change to a published crate's
     /// surface rather than a reduction. An earlier revision of this doc cited
-    /// §3.7 as though the arm satisfied it. This is that convention plus the digits,
-    /// and the slack it leaves is single digits — so a clause of prose
-    /// returning to this arm fails here long before it reaches
-    /// `MESSAGE_BUDGET`, which has room for a paragraph.
+    /// §3.7 as though the arm satisfied it.
+    ///
+    /// This is that convention plus the digits. **What it defends, measured
+    /// rather than asserted:** the budget is one number checked per status, and
+    /// the statuses are not the same length, so the slack runs from **7 bytes**
+    /// (`NoParticipantSlots`) to **23** (`Ok`), with `Malformed` at 16. A
+    /// clause of prose returning to this arm fails here long before it reaches
+    /// `MESSAGE_BUDGET`, which has room for a paragraph — but a *short* clause
+    /// on a *short* status does not: 16 bytes added to a `Malformed`-only
+    /// branch pass this and every other gate. What would catch that is the
+    /// forbidden-word rule in `tf_tree_cli`'s `runbook.rs`, and review. Saying
+    /// so is the point, because *this read "the slack it leaves is single
+    /// digits"* — true of five statuses, false of two, and an un-instrumented
+    /// superlative beside a constant is the shape this step has already
+    /// corrected twice.
     ///
     /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
     const REJECTION_BUDGET: usize = 140;

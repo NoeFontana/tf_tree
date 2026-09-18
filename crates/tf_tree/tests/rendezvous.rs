@@ -2287,15 +2287,16 @@ fn the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live() {
 /// callback and re-running gives
 ///
 /// ```text
-/// attach 64 of 128 was refused: error the arena owner refused this attach:
-/// NoParticipantSlots (owner format_version 3, layout_hash 0x...) (HandshakeRejected)
+/// attach 64 of 128 was refused: error ... NoParticipantSlots ...
 /// ```
 ///
-/// *The tail of that line is the message as it reads since `0055` step 7. The
-/// run quoted here predates the reduction and printed one of the seven
-/// per-status remedies that are now `docs/RUNBOOK.md`'s; the line is updated
-/// rather than left to describe a rendering nothing produces, and the hash it
-/// always elided is still elided.*
+/// **The rendering is elided deliberately.** What this transcript is for is
+/// *which* status the 64th attach met, and a quoted message is the shape that
+/// drifts — this line already went stale once, when `0055` step 7 reduced the
+/// arm, and a copy carrying an elided hash is one nothing can assert against
+/// `Display`. The place a rendering *is* quoted is `docs/RUNBOOK.md`'s
+/// `HandshakeRejected` section, where `tf_tree_cli`'s `tests/runbook.rs` holds
+/// it to `Display`'s own output.
 ///
 /// — the 64th and not the 65th, because the owner holds slot 0 and only 63 are
 /// ever available to joiners. So this scenario pins the *property*, and after
