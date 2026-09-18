@@ -225,13 +225,28 @@ impl HelloRequest {
 ///
 /// **[`HelloStatus::BootIdMismatch`] cannot**, because §3.7's response layout
 /// has no field for the owner's boot id. That is a gap in the spec rather than
-/// in this code, and it is a benign one: both peers reached each other through
-/// the same runtime directory on the same running kernel, so their boot ids
-/// agree by construction. The boot id exists to detect a **lock file** that
-/// outlived a reboot (§5.1) — a file persists across a reboot where a live
-/// server cannot — so the check belongs to the lock-file path, which does have
-/// both values. The status is carried here because §3.7 lists it and the wire
-/// must be able to express what a peer might send.
+/// in this code. The boot id exists to detect a **lock file** that outlived a
+/// reboot (§5.1) — a file persists across a reboot where a live server cannot —
+/// so that check belongs to the lock-file path, which does have both values.
+/// The status is carried here because §3.7 lists it and the wire must be able
+/// to express what a peer might send.
+///
+/// **This paragraph called the gap "benign", on the grounds that "both peers
+/// reached each other through the same runtime directory on the same running
+/// kernel, so their boot ids agree by construction". That is refuted**
+/// (2026-09-18, [`0055`] step 7). Two live peers on one kernel can disagree in
+/// three ways: either side's read of `/proc/sys/kernel/random/boot_id` can fail
+/// and substitute all-zeros; a sandbox or `/proc` overlay can present a
+/// different value; and — needing no failure at all — **the two sides parse
+/// that file with different code**. A joiner sends
+/// `tf_tree_ipc::procstat::boot_id`, which rejects a UUID with trailing junk,
+/// while the arena header was written by `tf_tree::tree::boot_id`, which
+/// ignores it. So the missing field is the operator's problem and not only the
+/// spec's: a refused joiner is told the ids differ and cannot be shown the
+/// owner's. `docs/RUNBOOK.md`'s `HandshakeRejected` row is the triage, and the
+/// parser divergence is a bug to report.
+///
+/// [`0055`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HelloResponse {
     /// Accepted, or why not.

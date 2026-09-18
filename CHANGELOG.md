@@ -41,6 +41,95 @@ is a bug.
 
 ## [Unreleased]
 
+### Fixed — attach refusals did not fit the C ABI's message buffer (`0055` step 7)
+
+`IpcError::HandshakeRejected` appended a per-status remedy to every rejection,
+making messages of **112 to 378 bytes** against a `tft_error::message` of 256
+that `set_message` truncates at 255. (The remedies themselves were 22 to 272
+bytes; it is the rendering the buffer sees, and every figure here is one.) **Four of the seven reached a C
+operator cut off mid-sentence** — four behind `tft_tree_open_named`'s 26-byte
+wrapper, six behind the bridge's 35-byte one, and a count of truncations is a
+statement about a prefix — and six were over the 220 bytes this crate's own gate
+allows. They are **115 to 124 bytes** now over the statuses this library can
+send (108 for `Ok`, which no code path here constructs; 133 at the widest owner
+numbers) and every one of them fits.
+
+The message states the status and the owner's `format_version` and
+`layout_hash`, which a client can get no other way — and ends `(HandshakeRejected)`, the key that finds the runbook. **The
+seven remedies are now `docs/RUNBOOK.md`'s `HandshakeRejected` section**, one row
+per status, placed beside the header-validation checks that share two of their
+names, because mistaking one for the other is the error an operator actually
+makes: the handshake statuses are the *owner's* comparison against an attach
+request, decided before this process ever saw a segment.
+
+**`PHASE2.md` §3.7 asks a rejection to name *both* sides' values and this arm
+prints one.** The hash half is older than this change — `tf_tree_ipc` depends on
+`rustix` and `libc`, so it cannot read this build's `layout_hash()` to print
+beside the owner's — and closing it means new fields on a published crate's
+error type, so it is recorded in `0055` step 7 rather than fixed here. §3.7's
+other clause for `LayoutMismatch`, that the message "must say exactly that",
+*was* satisfied and moved to the runbook row in this change — which is the shape
+`0059` settled for the sibling `ShmError::LayoutMismatch`, and that record
+already calls this same §3.7 sentence stale for it. §3.7 has an erratum owed on
+both clauses.
+
+The remedy is unaffected either way; the runbook now says which build to read
+the second number from, since `tf_tree doctor` prints the CLI's own and that is
+a third value.
+
+**Writing those rows found two of them false.** The `BootIdMismatch` remedy said
+the arena had "outlived a reboot" and should be removed. A serving owner is
+proof it did not, and the segment would not have survived one; the boot id
+detects a stale *lock file*, not a served arena. `PHASE2.md` §13's failure-mode table carried the same false advice and now
+carries the distinction instead; §3.7 gained the erratum it was owed; and
+`HelloResponse`'s rustdoc — the published crate's own, where a caller
+dispatching on the status reads — no longer says the two peers' boot ids "agree
+by construction". The new
+row says what that status actually means — the two processes disagree about which boot this is, so
+one of them could not read `/proc/sys/kernel/random/boot_id` — and what to check.
+
+`ModeNotPermitted` told a caller to attach read-only because the owner would not
+let it write. **No owner in this workspace sends that status**: the wire carries
+it because §3.7 lists it, and the check compares version, layout and boot id and
+nothing else. The row now names all three places a rejection status can come from —
+`OwnerServer::serve`'s decode failure, `check`, and the caller's `assign`
+closure — and says that a peer which sends this one is not this implementation. Both errors survived every review this arm has had, because a
+per-status list looks like it was derived from the producers and was derived
+from the status names.
+
+Both halves are gated. No rendering may name a status it did not get, which is
+the original defect of this arm made unexpressible; each of the owner's two
+numbers is asserted with the label that says which one it is; the runbook section must
+carry a row per refusal status, each row's remedy cell must clear a length
+floor, and the **remedy cells** must between them carry the words the message is
+forbidden to carry — their union rather than each one, because requiring a word
+per row would dictate vocabulary, and the remedy cells rather than the section
+because the prose around the table says "rebuilding every participant" and the
+`What the owner compared` column can hold a pointer the remedy then lacks;
+`RejectionCarriedFd`, the sibling arm that also carries a `HelloStatus`, is held
+to the same no-foreign-status rule, though its search key and runbook row are
+recorded as owed rather than taken; and a new `HelloStatus` trips a wire-value
+compile error in the test build: `status_is_a_refusal` is a total `match` kept
+for no other purpose, because safe Rust cannot enumerate an enum and
+`HelloStatus::from_u32`'s catch-all arm absorbs a new variant without complaint.
+It lives in `#[cfg(test)]`, so it is `--all-targets` that fails and not a plain
+`cargo check`. A downstream crate cannot have the same prompt — `HelloStatus` is
+`#[non_exhaustive]` so that a newer owner's newer refusal keeps compiling — so
+the other half is derived from the wire: `from_u32` is injective on the values
+it names and folds the rest onto `Malformed`, so `tf_tree_cli`'s gate walks it
+to get exactly the statuses the wire can deliver — over a range, not up to the
+first repeat, so a status wired in at a gapped value is enumerated too — and a
+new one owes a row the moment the codec can produce it. A status the codec cannot produce never reaches
+a joining client at all. The per-status check
+requires a table **row** rather than a mention, since the section's prose names
+two of the statuses while telling them apart from the header checks that share
+those names, and the worked example that section quotes is asserted to be
+`Display`'s own output rather than a transcription of it, because a quoted
+message is the shape that drifts. The runbook-reading half lives in
+`tf_tree_cli`, which is not published: `cargo package` does not put `docs/` into
+a tarball, so that `include_str!` beside the type would ship a crate whose tests
+cannot build.
+
 ### Fixed — a C caller could not read the end of an error message, and `ArenaHeldButUnreachable` was 793 bytes of it (`0055` step 6)
 
 `tft_tree_open_named` reports a failure by formatting
@@ -56,8 +145,14 @@ inferred; the figure moves with the pid and the mask, which is itself part of
 the problem.
 
 **The message now states facts and ends with its own name; the remedy moved to
-`docs/RUNBOOK.md`**, whose reader has every process in hand. The same state is **143 bytes** and ASCII; the widest ids those fields can
-carry render **158**.
+`docs/RUNBOOK.md`**, whose reader has every process in hand. The same state is
+**143 bytes** and ASCII. The arm's range is **116 to 164**: the widest *ids* —
+a 64-bit mask and two `u32::MAX`s — render 158, and the widest rendering of all
+is 164, at **slot 0**, because `, the creator's` outweighs the nine digits a
+wide slot adds. *This entry originally said "the widest ids those fields can
+carry render 158" — true of the arm, and backed by nothing: the sweep behind it
+pinned `first_pid` at 4242 and measured 152, and 164 was named nowhere. The
+erratum that replaced it called 158 wrong, which it is not.*
 The split is the point rather than the size: this type sees which lock bytes are
 held and cannot see who holds them, so it cannot tell one process holding two
 bytes from two holding one each — and a remedy that guesses is wrong in
@@ -68,8 +163,8 @@ than 165 lines into a bullet.
 
 The messages end with `(ArenaHeldButUnreachable)` — `0059` convention (g)'s
 parenthesised form, as `tf_tree_arena`'s `check.rs` and `frozen.rs` already
-spell it. **Convention (e), at most 120 bytes, is not met**: these arms are 116
-to 145 bytes at the sample widths and 158 at the widest, because (e) was derived for an arena error nested in two wrappers
+spell it. **Convention (e), at most 120 bytes, is not met**: these arms are **116 to
+164** bytes, the upper end being the widest the fields can render, because (e) was derived for an arena error nested in two wrappers
 whose payload is an errno, and this one carries a 64-bit mask and two 32-bit
 ids.
 

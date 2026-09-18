@@ -1,11 +1,10 @@
 # 0055: the recovery capacity a fleet cannot add later
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** **steps 1, 2, 3, 4 and 6 have landed** (#353 `0411adb`,
-steps 1/3/4 in #355, step 6 after it). Step 5 is struck. **Step 7 — the same
-reduction for `HandshakeRejected`, which step 6 measured and did not fix — is
-open.**
+**Implementation:** **every step has landed** — 2 in #353 (`0411adb`), 1/3/4 in
+#355 (`ea98e56`), 6 in #356 (`d121589`), 7 after it. Step 5 is **struck**: open
+question 1 answered *no mechanism*, so there was nothing to build.
 
 ## Context
 
@@ -662,7 +661,17 @@ deliberately unplanned.
    step back is named with the answer.
 6. **Reduce what the `ArenaHeldButUnreachable` remedy claims. DONE,
    2026-09-18** (*Decision* part 4, and this record's own question 3).
-   **793 bytes non-ASCII → 143 bytes ASCII**, 152 at the widest ids, and the
+   **793 bytes non-ASCII → 143 bytes ASCII**, and 164 at the widest — which is
+   **slot 0**, not the widest ids: `, the creator's` outweighs the nine digits a
+   `u32::MAX` slot adds, and the widest ids render 158. *This read "152 at the
+   widest ids" until step 7, and 152 was what `samples()` measured rather than
+   what the arm can render: the sweep took the mask and the slot to their maxima
+   and left `first_pid` at 4242, six digits short, and never combined a wide
+   mask with slot 0. The sweep and the figure are both corrected, and the
+   correction is the step-6 lesson arriving one level up: a number is only as
+   measured as the sample that produced it — and "at the widest ids" survived
+   two rounds of correcting the number itself, which is the same sentence
+   describing a state nobody constructed.* And the
    remedy is `docs/RUNBOOK.md`'s eight-row table, indexed by the facts the
    message still prints — the mask, the lowest slot and its pid, and the
    ownership byte — and placed where the search key lands a reader rather than
@@ -683,8 +692,8 @@ deliberately unplanned.
    parenthesised form, as `tf_tree_arena`'s `check.rs` and `frozen.rs` already
    spell it; a first version ended `: ArenaHeldButUnreachable`, a second
    spelling of a convention living in two other crates. **Convention (e), at
-   most 120 bytes, is not met and is no longer claimed**: these arms are 116 to
-   145 bytes at the sample widths and 158 at the widest, because (e) was derived for an arena error nested in two wrappers
+   most 120 bytes, is not met and is no longer claimed**: these arms are **116 to
+   164** bytes, the upper end being the widest the fields can render, because (e) was derived for an arena error nested in two wrappers
    carrying an errno, and this one carries a 64-bit mask and two 32-bit ids.
 
    **Five tests needed rewriting, not the three this step predicted**: the two
@@ -729,19 +738,474 @@ deliberately unplanned.
      **Not triggered:** that section gained the remedy the message gave up, in
      more detail than the message could carry, and the message's search key is
      how a reader gets to it.
-7. **The same reduction for `HandshakeRejected`.** Step 6's gate measured what it
-   was not chartered to fix: that variant is **378 bytes at its worst status**,
-   and **four of its seven statuses truncate** in `tft_error::message` (239, 253,
-   320, 378 against 255 with the 26-byte wrapper, and all but `Ok` over this crate's own 220-byte budget). The length is `rejection_advice`, seven
-   per-status remedies concatenated into the message — the same pattern part 4
-   ends. The fix is the same shape: facts plus the search key, and a new
-   `docs/RUNBOOK.md` section for the seven statuses, which is why it is a step
-   and not a clause of step 6.
-   - Until it lands, `HANDSHAKE_REJECTED_LENGTHS` pins **each status** at its measured length so
-     none of them can grow — a first version pinned only the worst, and growing
-     `Ok` from 112 to 306 bytes passed it, and the gate's exception names this step. **A ratchet, not an
-     exemption**: if a status's advice grows, the gate fails.
-   - **Verified by** the same gate with the exception removed.
+7. **The same reduction for `HandshakeRejected`. DONE, 2026-09-18.** Step 6's
+   gate measured what it was not chartered to fix: seven per-status remedies
+   making messages of **112 to 378 bytes** — the remedies themselves were 22 to
+   272, and it is the rendering the buffer sees — of which **four truncated** in
+   `tft_error::message` at the 26-byte wrapper, and six of seven were over this
+   crate's own 220-byte budget. They are now **115 to 124 bytes** over the
+   statuses this library sends — 108 for `Ok`, which neither producer can
+   construct, both being inside a `status != Ok` branch — (133 at the
+   widest owner numbers), ASCII, and every one of them fits: the message states
+   the status, the owner's two numbers — a client can get them no other way, and
+   §3.7 asks for *both* sides' values, which this arm does not print; see the
+   round-6 paragraph below — and `(HandshakeRejected)`, and `rejection_advice`
+   is deleted. Its seven
+   remedies are `docs/RUNBOOK.md`'s `HandshakeRejected` section, placed beside
+   the header-validation checks that share two of their names, because that
+   confusion is the one an operator actually makes.
+
+   **The negative rule, as in step 6:** no rendering may name a status it did
+   not get. That is the first defect this arm ever had — one `LayoutMismatch`
+   sentence appended to every rejection, printed thousands of times over a
+   `NoParticipantSlots` refusal — and the per-status repair that followed is
+   what put 378 bytes in a 256-byte buffer. Both are refused by
+   `both_rejection_arms_name_only_the_status_they_carry` (renamed in round 13;
+   see below), which also holds the arm
+   to a 140-byte budget of its own: prose returning here fails long before it
+   reaches the 220 the C path allows.
+
+   **A row a reader cannot reach is the failure this shape invites**, so the
+   runbook is gated too — `crates/tf_tree_cli/tests/runbook.rs`, which reads
+   `docs/RUNBOOK.md` with `include_str!` and requires a table **row** per
+   refusal status (a `contains` over the section is satisfied for two of the six
+   by the prose that tells them apart from the header checks sharing their
+   names), holds each row's remedy cell to a length floor, requires the
+   **remedy cells** to carry between them the words the message is forbidden to
+   carry — the two halves keep each other honest — and requires the section's worked example
+   to be `Display`'s own output rather than a transcription of it.
+
+   **Over the union of the remedy cells, and not per row.** *Section-wide until
+   round 16 and whole-row until round 17, each narrowing forced by a measured
+   escape; and two sentences here claimed per row until round 9.* Per row is the stronger rule and it is refused on purpose: measured,
+   `Malformed`'s remedy carries none of the five words, and the only way to pass
+   a per-row rule would be to write one into prose that does not want it. A gate
+   that edits the text to satisfy itself is worse than one that checks less, and
+   the length floor is what holds a single row to account. *The review that
+   raised this proposed the per-row move on the grounds that "every current row
+   carries at least one"; that is false of `Malformed`, which is why the
+   documents moved and the check did not.*
+
+   **It lives in `tf_tree_cli` and not beside the type, and that is not a
+   preference.** `tf_tree_ipc` is published, and `cargo package` does not put a
+   file from outside the package directory into the tarball
+   (`cargo package --list -p tf_tree_ipc` carries no `docs/`), so an
+   `include_str!("../../../docs/RUNBOOK.md")` there ships a crate whose tests
+   cannot build. `crates/tf_tree_cli/src/lib.rs` writes that rule down for the
+   README and `checks.rs`'s `docs/API.md` gate is the precedent. The first cut
+   of this step put it in `tf_tree_ipc`.
+
+   **And what tells the next author a row is owed is a compile error, not a
+   tripwire.** `rejection_advice` was the total `match` a new `HelloStatus` used
+   to break; deleting it removed that prompt, and `HelloStatus::from_u32`'s
+   catch-all arm absorbs a new variant without complaint — so a first cut of
+   this step asserted that wire value 7 still decodes to `Malformed`, which
+   fires only if the codec is updated too. `status_is_a_refusal` replaces it: a
+   total `match` kept for no other purpose, whose author is standing in front of
+   the list, the table and the test. Measured: adding a variant fails
+   `cargo check -p tf_tree_ipc --all-targets`. **`--all-targets` is not
+   decoration in that sentence** — the prompt is in `#[cfg(test)]`, so a plain
+   `cargo check` still passes, and the two reader-facing copies of this claim
+   said "fails to compile" without the qualifier until review round 2 measured
+   it. `just build` and `just lint` both pass the flag, so the gate holds.
+
+   **What the answer leaves open elsewhere, named so it is not lost.**
+   `PHASE2.md` §0.0's `shm_torture` row and §13's ASan box were both conditioned
+   on this record being answered — "ticking this box again waits on `0055`, not
+   on a re-run" — and the answer does not tick it. It says the red is not a
+   defect in the library, which leaves the harness: a torture run whose
+   population can reach zero heirs is measuring the fleet this record describes
+   rather than the code. Whether `shm_torture` should guarantee an heir at every
+   kill, so that a `POPULATION` classification becomes a real failure again, is
+   a harness decision nobody has taken. Both sites now say that instead of
+   pointing here.
+
+   **Round 2 found three more gates that were narrower than their own labels**,
+   and they are recorded because each is the same shape as the defect this step
+   is about — a check whose name promises more than it asserts. The runbook's
+   remedy words were required *of the section* and not of the row, so blanking a
+   remedy cell passed with the row still present; a row's *what to do* cell now
+   has a floor. **What the floor catches is an emptied cell, and that is all** —
+   *this said "blanking or stubbing one fails", and a stub over the floor does
+   not fail: a 65-byte "see the section below for what to do about this
+   particular status" passes, measured on round 10.* The mutant that justified
+   the sentence was a 17-byte stub, so the claim was true of that stub and not
+   of stubs. The words are searched over the union of the remedy
+   cells for the reason above, so one cell can still be replaced by other prose
+   of the same length. A length is what a row
+   owes; whether it says anything is review's. The section's end bound
+   stopped only at `###`, so a `HandshakeRejected` section that ever became the
+   last one under its chapter would have swallowed the rest of the runbook and
+   every `contains` in that test would have held vacuously. And
+   `every_unreachable_state_reports_the_facts_and_prescribes_nothing` still
+   carried the very defect the erratum above repudiates: a state labelled
+   *widest ids* whose `first_pid` was 4242, under an assertion that two
+   `contains` satisfied with one wide field. Each id is now checked on its own,
+   and the widest state — slot 0, whose `, the creator's` outweighs a wide
+   slot's digits — is swept beside it.
+
+   **Round 3 found six more, and one of them refuted its own suggested fix.**
+   The review asked that `tf_tree_cli`'s list be derived from a total `match`
+   over `HelloStatus` so the second crate breaks too; it cannot be, because
+   `HelloStatus` is `#[non_exhaustive]` — a downstream `match` is *required* to
+   keep compiling when a status is added, which is the same argument that makes
+   `from_u32` fold unknown codes onto `Malformed`. So the gap is closed from the
+   other side: a status the codec cannot produce cannot reach a joining client,
+   whose status always comes through `from_u32`, so a missing row is
+   unreachable. `a_status_this_build_cannot_receive_needs_no_row` guards the one
+   addition that *can* reach an operator — a variant wired into the codec — and
+   the compile-time match guards the rest. Neither is the tripwire alone; a
+   first cut of this step shipped the wire half and called it one.
+
+   **Round 18, and the loop stops here.** Two findings, both docs in
+   `runbook.rs` contradicting the code beneath them, and both licensing a
+   regression rather than merely reading wrong: `receivable()`'s rustdoc still
+   described the derivation as "walking `v` upward until a status repeats",
+   which is exactly the optimisation its own body refuses and which would
+   reinstate the gapped-value hole; and `REMEDY_WORDS`'s bolded lead still said
+   "over the joined table rows", the scope round 17 measured an escape through.
+   Both fixed.
+
+   **The stopping decision, stated because it is a judgement and not an
+   outcome.** The shipped change — a three-line `Display` arm and a deleted
+   helper — has been correct and untouched since the first commit; eighteen
+   rounds found nothing in it. Rounds 14 to 18 found *only* defects introduced
+   by the previous round's fix, at roughly one new defect per defect closed, all
+   of them in prose describing gates rather than in the gates. That is a loop
+   with a generator — a prose edit made at the site of a finding is itself
+   unreviewed until the next round — and the marginal round has stopped paying.
+   What is **not** resolved is recorded above as owed rather than closed: §3.7's
+   erratum on both clauses, `RejectionCarriedFd`'s search key and runbook row,
+   and the `shm_torture` population decision §13's ASan box now waits on.
+
+   **Round 17: the same bound narrowed a third time, and three documents left
+   describing the version before it.** Round 16 moved the remedy-word search
+   from the section to the rows — and a row has two content columns. Measured:
+   move `tf_tree doctor --explain-version` into `LayoutMismatch`'s *What the
+   owner compared* cell, reword its remedy, and the only pointer telling an
+   operator how to read their own build's `layout_hash` appears in no remedy
+   anywhere, with the gate green. It searches the remedy cells now, which is the
+   column an operator acts on.
+
+   The narrowing has gone section → rows → remedy cells, each step forced by a
+   measured escape and each leaving its predecessor's description in place:
+   `REMEDY_FLOOR`'s doc in the same file and same commit as round 16's fix, the
+   changelog stating both rules six lines apart, and this plan describing the
+   check as section-wide in three places — the half an implementer reads as the
+   spec, which is round 11's finding about this record repeated on a different
+   claim.
+
+   **Round 16, six findings, and three are counts stated beside the numbers
+   that refute them.** `REJECTION_BUDGET`'s doc said the old superlative was
+   "true of five statuses, false of two"; the seven slacks are 7, 9, 10, 11, 11,
+   16, 23, so single digits is true of **two**. The correction inverted the
+   sentence it was correcting, in a published rustdoc whose subject is
+   un-instrumented counts. `samples()`' doc still said `ArenaHeldButUnreachable`
+   has "seven reachable states" while the sweep under it lists thirteen and the
+   sibling test's comment calls seven the repudiated count. And the sentence
+   added to record round 8's fix — "the ids that carry one are sampled at
+   `u64::MAX` / `Some(u32::MAX)`" — names the mask and the slot and omits
+   `first_pid`, which *is* the field round 8 was about.
+
+   Two were errata that misdescribe what they retract. The changelog's step-6
+   erratum said the entry had claimed "158 at the widest" and called it wrong;
+   what it claimed was "the widest *ids* render 158", which is **true** — what
+   was wrong is that nothing measured it, the sweep having produced 152. And the
+   record's `ModeNotPermitted` paragraph still offered `OwnerServer::check`
+   alone as the reason nothing sends that status, which is the producer list
+   round 12 corrected in the runbook cell and left standing in the paragraph
+   drawing the same conclusion.
+
+   The sixth is a real gate hole: **the required words were searched over the
+   whole section, and the prose above the table says "rebuilding every
+   participant" and names `tf_tree doctor --explain-version`.** So two of the
+   five were satisfied by sentences no row owns; rewriting both `rebuild` cells
+   to say "reinstall" passed. Round 10 widened the *end bound* because a
+   footnote below lent the table a word, and the same borrowing from above went
+   unexamined. The search is over the joined rows now — where a search key lands
+   a reader — and the reworded-cells mutant is caught.
+
+   **Round 15: a bound taken from a state this library cannot construct.** The
+   reduction was advertised as "108 to 124 bytes" in four places, and 108 is
+   `Ok` — a status `HandshakeRejected` cannot carry here, because both producers
+   sit inside a `status != Ok` branch. The reachable floor is `Malformed`'s 115,
+   and the slack ceiling `REJECTION_BUDGET`'s doc named as 23 (`Ok`) is really
+   16 (`Malformed`). The argument in that doc survives untouched — it reasons
+   from `Malformed`'s 16 — but *a number is only as measured as the state that
+   produced it* is this step's own lesson, stated in this record, applied to
+   `first_pid` in round 8 and missed here in four documents. `Ok` stays in
+   `samples()`, because the fields are `pub` and that rendering must survive the
+   C buffer; it is out of the quoted bounds.
+
+   Also: the round-14 paragraph in `rendezvous.rs` was inserted *between* the
+   transcript and the sentence continuing it, so *"— the 64th and not the
+   65th"* opened a paragraph whose antecedent was two blocks up. That is round
+   14's own finding — a paragraph split by an insertion — reintroduced by the
+   commit that fixed it.
+
+   **Round 14: a rename I made in round 13 and did not propagate, twice.**
+   `every_rejection_names_only_the_status_it_carries` became
+   `both_rejection_arms_name_only_the_status_they_carry`, and the old name
+   survived in this record's own step-7 body and in `runbook.rs`'s module doc —
+   the file whose job is to send a reader to the `tf_tree_ipc` half. Both were
+   the sentence a reader lands on first. This is rounds 11 and 12's defect, from
+   the round that was fixing it.
+
+   **And `wire.rs`'s public doc still carried the refuted `BootIdMismatch`
+   claim.** `HelloResponse`'s rustdoc called the missing owner-boot-id field
+   "benign" because the two peers' ids "agree by construction" — which this step
+   measured to be false three ways, one of which needs no failure at all, the
+   divergent parsers. §3.7 and §13 got errata in this change; **the published
+   crate's rustdoc, which is where a caller dispatching on the status actually
+   reads, did not.** It does now, and it states the consequence the original
+   wording hid: a refused joiner is told the ids differ and cannot be shown the
+   owner's.
+
+   Also: a link-reference definition inserted mid-paragraph in round 13 split
+   the paragraph in rendered docs — confirmed in `target/doc`, where *"It is the
+   message length the buffer sees"* had become its own paragraph with "It"
+   pointing at nothing. Moved below the prose, as its sibling already was.
+
+   **Owed, and found in round 13: `IpcError::RejectionCarriedFd` is the third
+   arm that carries a `HelloStatus` and is outside everything this step built.**
+   It is the sibling one line below in the same `match` — an owner that refuses
+   an attach and sends a segment fd anyway, which is an owner bug and therefore
+   exactly when an operator reaches for a runbook. Its rendering has no
+   `(RejectionCarriedFd)` search key and `docs/RUNBOOK.md` has no section for
+   it, so there is nothing to grep and nothing to land on. The substance is
+   currently fine — it names no foreign status — and **the gate now holds it
+   there**, renamed `both_rejection_arms_name_only_the_status_they_carry`
+   because the old name promised every rejection and covered one. The search key
+   and the row are a third variant's worth of this step's work and are not taken
+   here; they are the natural next slice if `IpcError` is brought fully under
+   `0059` convention (g).
+
+   Also round 13: the **public** doc on `HandshakeRejected` pointed at
+   `MESSAGE_BUDGET` "below" for the 35-byte bridge prefix. That constant is
+   `#[cfg(test)]`, so a docs.rs reader of a published crate followed it to
+   nothing; it cites `0059`'s *Rationale*, which is where the figure comes from.
+
+   **Round 12: a producer list wrong one revision after being corrected, and a
+   budget claim true of five statuses out of seven.** The `ModeNotPermitted`
+   cell said "a rejection has exactly two sources". There are three —
+   `OwnerServer::serve` answers an undecodable datagram with `Malformed`
+   directly, consulting neither `check` nor `assign` — so a reader sent to those
+   two would not find the path producing the status documented in the row below.
+   Round 11 corrected this same cell's producer list; getting it wrong again,
+   one revision later, in the row that exists *because* its predecessor
+   described a policy the implementation does not have, is the clearest evidence
+   in this arc that enumerating producers is where I am unreliable.
+
+   And `REJECTION_BUDGET`'s doc said "the slack it leaves is single digits".
+   Measured, at the widest owner numbers: 7 (`NoParticipantSlots`), 9, 10, 11,
+   11, **16** (`Malformed`) — and 23 for `Ok`, which round 15 established this
+   library cannot construct, so the reachable ceiling is `Malformed`'s 16. A
+   16-byte clause on a
+   `Malformed`-only branch passes this gate and every other. The doc now states
+   the range and names what would actually catch a short clause, which is the
+   forbidden-word rule and review — the third un-instrumented superlative beside
+   a constant this step has had to correct.
+
+   Third: `rendezvous.rs`'s transcript quoted the rendering with the hash
+   elided, so nothing could assert it — **a second, ungated transcription added
+   by the commit that built the gate against transcriptions.** The status is
+   what that transcript is for; the rendering is elided now, and the comment
+   says where a quoted one is held to `Display`.
+
+   **Round 11 found the false `BootIdMismatch` advice still in the spec, and
+   the retraction missing from the paragraph it retracts.** Correcting a
+   diagnostic means correcting every site that states it, and this step reached
+   the message, `RUNBOOK.md`, `CHANGELOG.md` and this record while leaving
+   `PHASE2.md` §13's failure-mode table — the row an author consults *instead of*
+   the code — saying "arena predates a reboot … recreate the arena". §13's row
+   is about the file-backed case and is right about it; what it lacked is the
+   distinction this step measured, so it now carries it and points at the
+   runbook. §3.7 gained the erratum it was owed on both clauses, in the style
+   this same change used for §0.0's `shm_torture` row and §13's ASan box — an
+   omission that was inconsistent with its own approach. And this record's lead
+   still said the owner's numbers are "what §3.7 requires a rejection to name",
+   fourteen paragraphs above its own retraction of that claim: round 6 fixed
+   three copies of the sentence and missed the one in the document doing the
+   retracting.
+
+   One more, and it is this step's own defect shape: the `ModeNotPermitted` row
+   said "**nothing in this workspace sends it.** Two things can:
+   `OwnerServer::check` … and the `assign` closure". `check` returns three
+   statuses and this is not one, so it cannot — and an operator reading the row
+   goes to read `check`. The row exists *because* the advice it replaced
+   described a policy the implementation does not have.
+
+   **Round 10, and the end bound had been extended twice by guessing.** The
+   section's end was a list of heading depths — `####`, `###`, `##`, then `#`,
+   each added when somebody thought of it — and `#####` was not on it, so a
+   footnote under this section lent the table a remedy word it did not have and
+   the required-word half passed on borrowed text (measured). It matches any
+   heading now. Two more in the same file: the required-word half compared raw
+   while the forbidden half folded case, so capitalising a remedy at the start
+   of a cell reddened the gate with *"no longer says restart"* — a diagnostic
+   contradicting the file in front of its reader, and the same case-sensitivity
+   defect step 6 shipped, with the polarity flipped. And `!= Ok` is a second
+   spelling of `status_is_a_refusal` that cannot be the first — the predicate is
+   `#[cfg(test)]` and `HelloStatus` is `#[non_exhaustive]`, so the downstream
+   crate can neither call it nor rebuild it — which is now written where the
+   duplicate lives, with the contradiction it would produce if a future status
+   were not a refusal.
+
+   **Round 8, two escapes, both measured by running them.** The derived
+   enumeration probed `0..64`, so a status assigned wire value **64** was
+   delivered by the codec, rendered by `Display`, and enumerated by neither
+   crate — the runbook row it owed went missing with every gate green, which is
+   the exact failure both tests exist to prevent. The round-5 comment argued
+   only the gapped-*below*-64 case. Both probes now cover every `u16`, which is
+   far past what a wire contract assigns, and what lies beyond it is stated
+   rather than left to be found. And the label assertion was insensitive to the
+   `08` width spec, because the live `layout_hash()` starts `0x3D` and a sample
+   carrying it cannot tell `{:08X}` from `{:X}`: dropping the width left every
+   test green. The sample now has a leading-zero nibble. The padding is
+   load-bearing — `tf_tree doctor --explain-version` prints `0x{h:08X}` and this
+   step's own runbook row sends an operator to compare those two renderings.
+
+   **Round 7, and the finding is this step's own lesson landing on itself.** The
+   rejection gate asserted `contains("4294967295") && contains("0x3D104195")` —
+   a conjunction of two bare `contains`, satisfied by two unlabelled numbers.
+   Measured: rewriting the arm as `(owner {n}, 0x{h:08X})`, which leaves an
+   operator holding two digits with no way to tell which is which, passed it.
+   The same anti-pattern is split apart three hunks below for the widest
+   `ArenaHeldButUnreachable` ids, in this same commit, with the fix written out
+   — and it was sitting here the whole time. Each number is now asserted with
+   its label. *That the regression was caught at all was `tf_tree_cli`'s
+   verbatim-example assertion, which is `shm`-gated: the crate that publishes
+   the type was not gating its own message's labels.*
+
+   **Found in round 6 and deliberately not fixed here: `PHASE2.md` §3.7 asks a
+   rejection to name *both* sides' values, and this arm prints one.** §3.7 is
+   explicit — "Each must name both sides' values", and for `LayoutMismatch`
+   "**The message must say exactly that** and print both hashes". The arm has
+   only ever carried the owner's, so **the hash half of the divergence predates
+   this step** — and the sentence quoted above has two clauses, which an earlier
+   revision of this bullet ran together. *"The message must say exactly that"*
+   was satisfied until this step: `rejection_advice(LayoutMismatch)` said "same
+   version, different record layout: this binary was built against a different
+   arena layout than the running owner". **This step deleted that clause's
+   satisfaction and moved it to the runbook row**, which is the shape `0059`
+   settled for the sibling `ShmError::LayoutMismatch` — and `0059` already flags
+   this same §3.7 sentence as stale for that variant (its *Decision* 4 note). So
+   the behaviour is consistent with an `implemented` convention and §3.7 has an
+   erratum owed on both clauses, not one. What this step also did was assert the
+   opposite in three places, citing §3.7 as the reason the owner's numbers are
+   there.
+
+   **Why it is not step 7's to fix.** `tf_tree_ipc`'s dependencies are `rustix`
+   and `libc`, so it cannot read this build's `FORMAT_VERSION` or
+   `layout_hash()` to print beside the owner's. Closing it needs either two more
+   fields on a public variant of a published crate or a new dependency edge into
+   `tf_tree_arena` — a change to the surface, with `API.md` §7's checklist to
+   walk, not a reduction of a message. Both call sites do have the values in
+   hand (`client.rs` sent the request; `server.rs` is holding it), so the fields
+   route is mechanical if it is taken.
+
+   **What it costs an operator today, measured rather than assumed:** less than
+   it looks. The remedy for both hash-comparing statuses is *rebuild every
+   participant from one release*, which does not depend on knowing the second
+   number. The trap is the advice for getting it: `tf_tree doctor` prints the
+   **CLI binary's** build constant, which is a third value whenever the refused
+   process is a differently-built binary — precisely the case `LayoutMismatch`
+   reports. The runbook now says so and says which build to run it from.
+
+   **Round 5 closed two escapes the round-4 fix still left, both measured.** The
+   derivation stopped at the first repeated status, which assumes the wire
+   numbering is contiguous: a variant wired in at 10, with 7 to 9 still folding
+   onto `Malformed`, was enumerated by nothing and owed no row, and the ipc-side
+   guard probes only the first unused value so it passed too. Both sides now
+   walk a range, and `ALL_STATUSES` is asserted to be exactly what the codec can
+   deliver — which is also what forces an entry there, since a compile error
+   demands a `match` arm and not an array element. And `REMEDY_FLOOR` was
+   applied to `cells[2]`, which is the remedy only because the header lists it
+   third; `just artifact-versions` holds a row to the header's cell *count* and
+   says nothing about its order, so reordering the table moved the remedy out
+   from under the floor silently. The column is found by its heading now.
+   Measured both ways: reorder the header and the rows together and the floor
+   follows; blank the remedy in its new column and it fails.
+
+   Two more figures. "Four of the seven truncate" is a statement about a
+   *prefix* and named none — four behind `tft_tree_open_named`'s 26-byte
+   wrapper, two against the bare 255, and six behind the bridge's 35-byte one,
+   which this crate's own `MESSAGE_BUDGET` doc records as the longest. And the
+   erratum this record asked for in `PHASE2.md` §13 had broken italic markers,
+   so the sentence it retracts rendered as live prose immediately above the
+   retraction — the stale claim reading as current, which is the failure the
+   erratum existed to fix.
+
+   **Round 4 found the hole that reasoning left, and it was mine.** The
+   conclusion above — that no downstream tripwire can exist — is true of a
+   `match` and false of enumeration. `from_u32` is injective on the values it
+   names and folds the rest onto `Malformed`, so walking `v` upward until a
+   status repeats yields exactly the set the wire can deliver, in a crate that
+   cannot `match` on the enum at all. With the list copied instead of derived,
+   this sequence left every gate green and the table without a row: add a
+   variant, wire it into `from_u32`, add the arm `status_is_a_refusal` demands,
+   extend `ALL_STATUSES`. **Measured, by doing it** — the `tf_tree_ipc` gates go
+   green and the derived `tf_tree_cli` gate is the only thing that fails. The
+   list is derived now, with a floor of seven so a `from_u32` that stopped
+   enumerating cannot make the whole file hold vacuously.
+
+   Two figures went with it. "The arms were 112 to 378 bytes" is five sites
+   quoting *message* lengths as *arm* lengths — the arms were 22 to 272 — and
+   the distinction is load-bearing, because "four of the seven truncate" follows
+   from the rendering and not from the remedy. And `REMEDY_FLOOR`'s comment said
+   the shortest cell was "several times" the floor when it is 1.7×: an
+   un-instrumented superlative beside a constant, which is the shape this
+   repository keeps correcting.
+
+   The other five of round 3 were figures and scopes: "164 at the widest ids" attributed
+   the worst case to the wrong state (the widest *ids* render 158; 164 is slot
+   0, where `, the creator's` outweighs a wide slot's nine digits), in two
+   documents; "nine digits short" for `4242` against a `u32`, which is six;
+   the runbook's worked example had its *values* transcribed on both sides, so
+   the format break `0032` owes would have left it quoting numbers no build
+   produces with the gate green — they come from `FORMAT_VERSION` and
+   `layout_hash()` now; and `PHASE2.md` restated this record's status.
+
+   - **Verified by** the step-6 gate with the exception and
+     `HANDSHAKE_REJECTED_LENGTHS` both removed, so the variant is measured with
+     every other one, plus **nine mutants, nine caught**: advice re-appended,
+     the search key dropped, the owner's numbers dropped, 100 bytes of prose
+     carrying none of the forbidden words, a runbook row deleted, the runbook's
+     remedies emptied, the runbook section renamed away, a status added at wire
+     value 7, and a named status folded onto another.
+   - **Found and not fixed, because it is outside this step:** there are **two
+     `boot_id` parsers** — `tf_tree_ipc::procstat::boot_id`, which rejects a
+     UUID with trailing junk, and `tf_tree::tree::boot_id`, which ignores it —
+     and they disagree on a malformed `/proc/sys/kernel/random/boot_id`, which
+     is one of the ways `BootIdMismatch` becomes reachable. The runbook row says
+     what an operator should check; a second spelling of a parser is a separate
+     record (`PROJECT.md` §6).
+   - **Corrected while writing the row, rather than copied:** the deleted
+     `BootIdMismatch` advice said the arena "outlived a reboot ... nothing in it
+     is alive and it should be removed". **A serving owner is proof it did not**,
+     and the segment would not have survived one;
+     [`wire.rs`](../../crates/tf_tree_ipc/src/wire.rs)'s own doc on
+     `HelloResponse` says the two peers' ids "agree by construction" and that
+     the reboot check belongs to the lock-file path. The advice was true of a
+     different check with the same name. That is the same category error as
+     step 6's, one layer over: prose that describes the *state the author was
+     picturing* rather than the one the branch selects.
+
+     **And a second, of the same kind:** `ModeNotPermitted`'s advice told a
+     caller to attach read-only because the owner would not let it write.
+     **Nothing in this workspace sends that status.** A rejection has three
+     producers and none yields it: `OwnerServer::serve` answers an undecodable
+     datagram with `Malformed`, `OwnerServer::check` compares version, layout
+     and boot id and nothing else, and the `assign` closure a caller hands
+     `serve` may return **any** status — the only route that could send this one
+     — while `tf_tree::open`'s assigner returns only `NoParticipantSlots`. The
+     value exists because §3.7 lists it. *This offered `check` alone as the
+     reason: the producer list round 12 corrected in the runbook cell, left
+     standing in the paragraph stating the same conclusion.* So the advice described a policy the implementation
+     does not have. Both errors survived every review this arm has had, because
+     a per-status list *looks* like it was derived from the producers and was
+     derived from the status names. The row now says what is true: a peer that
+     is not this implementation refused the attach, and that is worth reporting.
 
 ## Open questions
 

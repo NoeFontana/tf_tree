@@ -2646,6 +2646,14 @@ shm-check:
     # heap arena and a mapped one, bit-identical `f64`. `shm`-only by nature:
     # without it there is no mapped arena to be the second half of the pair.
     cargo nextest run -p tf_tree_cli --features shm --test replay_bit_identity
+    # **`docs/RUNBOOK.md`'s `HandshakeRejected` table** — the seven remedies
+    # `0055` step 7 took out of `IpcError`'s message. It is `shm`-gated because
+    # the types it reads, `HelloStatus` and `IpcError`, are re-exported from
+    # `tf_tree` only under that feature; it lives in this crate, and not beside
+    # the type, because `tf_tree_ipc` is **published** and `cargo package` does
+    # not put `docs/RUNBOOK.md` into the tarball. The file's own header states
+    # both halves.
+    cargo nextest run -p tf_tree_cli --features shm --test runbook
     # **The frozen `.tft` arena (`docs/PHASE5.md` §2), which needs a real
     # mapping and therefore `--features shm`.** Without these two lines the
     # branch that introduced it had its centrepiece — §2.1's bit-for-bit proof

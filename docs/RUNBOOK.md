@@ -333,6 +333,63 @@ that the runtime directory still exists and is on a local filesystem
 ([`PHASE2.md`](./PHASE2.md) §3.1 refuses NFS and CIFS for exactly this class of
 reason), and that the process has not exhausted its descriptors.
 
+### `HandshakeRejected`
+
+A **live, serving owner** answered the rendezvous socket and refused this attach.
+The message names the status and the owner's side of the comparison, and stops
+there:
+
+```text
+the arena owner refused this attach: LayoutMismatch (owner format_version 3, layout_hash 0x3D104195) (HandshakeRejected)
+```
+
+**The remedy is this table, and it left the message on 2026-09-18.** Seven
+per-status remedies made messages of 112 to 378 bytes — the buffer sees the
+rendering, not the remedy, and the remedies themselves were 22 to 272; the C ABI's `tft_error::message`
+is 256 bytes and `set_message` truncates at 255, so four of the seven reached a C
+operator cut off mid-sentence — four behind `tft_tree_open_named`'s 26-byte
+wrapper, and six behind the bridge's 35-byte one — which is worse than a status and a place to look
+([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
+step 7).
+
+**Two of these statuses share a name with a check below and are not that check.**
+`VersionMismatch` and `LayoutMismatch` here are the **owner's** comparison
+against the attach request, made before this process ever saw the segment, which
+is why `found`/`expected` do not appear.
+
+**The message prints the owner's hash and not this build's, and
+[`PHASE2.md`](./PHASE2.md) §3.7 asks for both.** That divergence is older than
+the reduction and is recorded in
+[`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
+step 7 rather than fixed by it: `tf_tree_ipc` depends on `rustix` and `libc`
+alone, so it cannot read this build's `layout_hash()` to print beside the
+owner's. **It does not change the remedy** — rebuilding every participant from
+one release is the fix whichever pair of numbers you are holding — and where
+this build's own constants *are* printed is `tf_tree doctor --explain-version`,
+**run from the refused binary's build**, not from whichever `tf_tree` is on the
+path. A hash from a different build is a third number, not the missing one. The sections under those names below are this process validating a
+header it has already mapped against its own build constant — which also happens
+where there is no owner and no handshake at all, opening a frozen `.tft`.
+
+| `status` | What the owner compared | What to do |
+|---|---|---|
+| `VersionMismatch` | this binary's `FORMAT_VERSION` against the running arena's, **first**, because a version difference makes every later field's meaning uncertain | rebuild every participant from one release and restart them together. There is no partial upgrade path |
+| `LayoutMismatch` | same version, a different record layout | rebuild every participant, as above. The owner's `layout_hash` is in the message; this binary's is a build constant, printed by `tf_tree doctor --explain-version` **built from the same commit as the refused process** — see the note above this table before comparing two numbers |
+| `BootIdMismatch` | the boot id in the attach request against the one in the **arena header** | **not "the arena outlived a reboot"** — a serving owner is proof it did not, and the segment would not have survived one. The two processes disagree about which boot this is, and the kernel has one boot id per host with no per-namespace variant ([`PHASE2.md`](./PHASE2.md) §3.3), so one of them did not read the real value: either the read failed and it substituted all-zeros (both sides do, so it takes exactly one failure), or something presents a different `/proc/sys/kernel/random/boot_id` to it — a sandbox that masks `/proc/sys`, or a `/proc` overlay. **And there is a third way, which needs no failure at all: the two sides parse that file with different code.** The joiner sends `tf_tree_ipc::procstat::boot_id`, which rejects a UUID with trailing junk; the arena header was written by `tf_tree::tree::boot_id`, which ignores it. On a file neither of them should ever see, the strict one substitutes all-zeros and the lenient one does not — so reading the file from both processes can show it identical and the ids still disagree. Check the file first, and if it is well formed and identical, the mismatch is that divergence and is a bug to report |
+| `NoParticipantSlots` | every slot, against **both** its tables: the owner's assigner walks the arena's participant records *and* the lock bytes, and grants a slot only where both are free | the *`ParticipantTableFull` / `NoParticipantSlots`* section below is the triage, and the reason it is there rather than here is that the two tables need two different commands to read. A read-only consumer holds a byte and writes no record, so neither table alone is the answer. **There is no `--participants` flag and never was**: capacity is fixed at construction ([`PROJECT.md`](./PROJECT.md) §5 D4) |
+| `ModeNotPermitted` | **nothing in this workspace sends it.** A rejection has three sources and none of them produces this one. `OwnerServer::serve` answers a datagram it cannot decode with `Malformed` and nothing else — that is the row below. `OwnerServer::check` returns `VersionMismatch`, `LayoutMismatch` or `BootIdMismatch` and nothing else. The `assign` closure a caller hands `serve` may return **any** `HelloStatus` — that is how `NoParticipantSlots` is sent — but `tf_tree::open`'s assigner returns only `NoParticipantSlots`. So the only route is somebody else's `assign`. *An earlier revision of this cell said two sources and named the decode path as one of the other two; a list of producers is the thing this row exists to get right* | attach read-only, which is the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18). **Who refused you decides the rest.** Against an owner built on `tf_tree_ipc` with its own `assign`, this is that policy and its author is who to ask. Against a `tf_tree` owner, no code path produces it, so report it. *The remedy this table replaced described it as an ordinary refusal to grant write access, with no hint that nothing here produces it* |
+| `Malformed` | nothing — it could not decode the request | **or it refused for a reason this build has no name for.** Every unknown status code decodes to `Malformed` (`HelloStatus::from_u32`), deliberately, so a newer owner's newer refusal arrives here. The two are indistinguishable on the wire, so confirm both sides are the same release before reading this as corruption |
+
+`Ok` never appears in this message: it is the acceptance, and no error is built
+from it. **Adding a `HelloStatus` fails to build the tests** — `status_is_a_refusal`
+in `tf_tree_ipc`'s `error.rs` is a total `match` kept for exactly that, since
+safe Rust cannot enumerate an enum and `HelloStatus::from_u32`'s catch-all arm
+absorbs a new variant without complaint. It is in `#[cfg(test)]`, so a plain
+`cargo check -p tf_tree_ipc` still passes and `--all-targets` is what fails;
+`just build` and `just lint` both pass that flag. Whoever fixes that match is the person
+who owes this table a row; that the row *exists* and says something is
+`tf_tree_cli`'s `tests/runbook.rs`, which reads this section.
+
 ### `LayoutMismatch { found, expected }`
 
 Two binaries were built from different commits and their arena struct layouts
@@ -343,11 +400,19 @@ This is the one operators actually hit, and the raw symptom — attach failing o
 a machine where everything else looks fine — is otherwise a multi-hour debugging
 session. Both hashes are printed for exactly that reason.
 
+**This is the mapped header's check, not the owner's.** A refusal that never got
+as far as a segment prints `LayoutMismatch` with one hash and ends
+`(HandshakeRejected)`; that one is *`HandshakeRejected`* above, and the remedy is
+the same rebuild for a different reason.
+
 ### `VersionMismatch { found, expected }`
 
 The segment was written by a different `FORMAT_VERSION`. Version 1 arenas cannot
 be attached by a version 2 build: the Phase 2 amendments changed the header and
 region table. Recreate the arena.
+
+Also the mapped header's check. The owner's version comparison at the rendezvous
+handshake is *`HandshakeRejected`* above, and it prints only the owner's number.
 
 ### `HeaderInconsistent`
 
