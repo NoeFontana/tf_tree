@@ -18,7 +18,7 @@ that can hold a slot holds a byte."*
 
 That sentence is false of one call, and the call is `pub`:
 `TreeBuilder::build_shared` registers a `LIVE` participant record
-(`register_participant`, `crates/tf_tree/src/tree.rs:3155`) and takes **no lock
+(`register_participant`, `crates/tf_tree/src/tree.rs`) and takes **no lock
 byte**, because such an arena has no lock file at all — the fd is the capability
 (`docs/PHASE2.md` §3.1 — *this cited §3.2 until 2026-09-18, which is
 *Identity and defaults*; the phrase "the fd is the capability" appears nowhere in
@@ -66,7 +66,7 @@ right: 0* — so the post-sweep word carries the claim, not the count beside it.
 
 ## Why every reclaimer inherits it
 
-`reclamation_verdict` (`crates/tf_tree/src/open.rs:299`) reads the state word,
+`reclamation_verdict` (`crates/tf_tree/src/open.rs`) reads the state word,
 then asks `probe.is_held(slot)`, and **never reads the record's own pid**. A free
 byte gives `Some(false)`, which is `Reclaimable`. All three of `0028`'s
 collectors share that one predicate, so all three inherit it: the owner's slot
@@ -124,11 +124,16 @@ the library. There are **19** `.build_shared(` call sites in the workspace —
 mutant and calls nothing. *The path matters: run at the repo root the same
 pattern gives 27, the extra seven being prose in `docs/decisions/`, this record
 among them.* One of the 19,
-`crates/tf_tree/src/open.rs:1224`, is `Open::open`'s `Created` arm:
-it calls `build_shared` **and** binds an `OwnerServer` at `:1388`. Writing "the
-only composition of `build_shared` with `OwnerServer` is the test" was therefore
-false, and a reader re-running the check gets a different answer than the record
-— the failure this project keeps having with enumerations.
+**`Open::open`'s `Created` arm** in `crates/tf_tree/src/open.rs`: it calls
+`build_shared`, and `spawn_owner_server` in the same file binds an `OwnerServer`
+over the result. Writing "the only composition of `build_shared` with
+`OwnerServer` is the test" was therefore false, and a reader re-running the check
+gets a different answer than the record — the failure this project keeps having
+with enumerations.
+
+*No line numbers in this section any more. The first version had them, and **this
+PR's own rustdoc edit to `open.rs` moved every one by six lines** — a citation
+invalidated by the commit that wrote it.*
 
 It is also the wrong question. That arm takes the ownership byte and a
 participant byte and installs claim leases *before* it builds and binds — it is
@@ -192,12 +197,20 @@ wrong opinion is available the moment the record exists, and the only way to sto
 it is to refuse the call — which is what step 0b did, breaking the API to do it.
 
 `build_shared` creates an arena whose **fd is the capability** and which nothing
-can find by name. Unserved — sixteen of the nineteen call sites, and every one
-that ships — there is no rendezvous, no lock file, and therefore no observer
-holding a probe: the record is byte-less and *unobserved*, which is not a defect
-but the design. *This read "every composition in this workspace", which is the
-universal part 1 retracts; the argument needs only that the unserved shape is the
-ordinary one, which it is.* What makes the opinion available is binding a rendezvous over
+can find by name. Unserved — sixteen of the nineteen call sites — there is no
+rendezvous, no lock file, and therefore no observer holding a probe: the record
+is byte-less and *unobserved*, which is not a defect but the design.
+
+**The shipped picture is sharper than "sixteen".** All sixteen unserved sites are
+tests, benches or examples — including `cache.rs` and `tree.rs`, both inside
+`#[cfg(test)] mod tests`. **The only `build_shared` call in shipped library code
+is `Open::open`'s `Created` arm**, which is the served, lock-file-holding,
+supported composition. So no shipping call site is unserved, and the one shipping
+call site is served. *Two earlier spellings — "every composition in this
+workspace", then "every one that ships" — were the universal part 1 retracts,
+reintroduced; the fact that replaces them is stronger than either.*
+
+ What makes the opinion available is binding a rendezvous over
 it afterwards, and that is a **second call by the same caller**, not a property
 of `build_shared`.
 
