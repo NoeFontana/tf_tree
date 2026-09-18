@@ -29,7 +29,7 @@ use crate::arena_view::ArenaView;
 use crate::edge::EdgeKind;
 use crate::error::{EdgeId, FrameId, LookupError};
 use crate::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
-use crate::sample::ExtrapPolicy;
+use crate::sample::{Bracket, ExtrapPolicy};
 use crate::sync::spin;
 use crate::topology::TopologyView;
 use crate::{MAX_DEPTH, MAX_PATH_EDGES};
@@ -39,6 +39,64 @@ pub const MAX_KNOTS: usize = 4096;
 
 /// Maximum bisection recursion depth in [`Plan::at_adaptive`].
 pub const MAX_ADAPTIVE_DEPTH: u32 = 16;
+
+/// How many stamps one pass of the batch fold holds in flight.
+///
+/// **Sixteen, measured, not chosen for roundness.** `docs/decisions/0060` §10.3
+/// timed a 16-lane arm beside the prototype's 64 on the same host in the same
+/// interleaved run: the two are equal from N = 63 upwards and 16 is ahead below
+/// it, at **6 600 B** of stack frame against 17 720 B. A batch entry point's
+/// frame is `docs/API.md` §8.3's page-fault residual and a `no_std` embedder's
+/// stack budget, so the lane count that ties on speed and costs a quarter of
+/// the frame is the one that lands. Open question 2 of that record is answered
+/// from those rows.
+const FOLD_LANES: usize = 16;
+
+/// The batch size below which the fold stays per-stamp.
+///
+/// **Three, and the boundary is measured on both sides.** The chunked pass sets
+/// up its lanes whatever the batch holds, so at a batch of one it is doing a
+/// chunk's bookkeeping for a single stamp: `docs/decisions/0060` §10.4 measured
+/// **+82.5% at N = 1** and +14.8% at N = 2 even at 16 lanes, against −11.1% at
+/// N = 3. Without this bypass the restructure fails its own step-1 stop point at
+/// every chunk size; with it, no batch size loses.
+///
+/// `at_many_small/at_many_2` and `at_many_small/at_many_3` are committed bench
+/// rows either side of this constant, so the threshold is re-derivable on
+/// another host rather than trusted from the one that set it.
+const FOLD_MIN_BATCH: usize = 3;
+
+// **Pinned, the way `interp.rs` pins `SLERP_LERP_FALLBACK`, and for the same
+// reason.** Both values are restated outside this crate:
+// `crates/tf_tree/tests/batch_phases.rs` carries a copy of each, because the
+// lane shapes it builds — a stamp in lane 0, in lane 1 and in the last lane of
+// a chunk, and batches either side of the bypass — are only those shapes for
+// these two numbers. That copy cannot be checked by the compiler, since both
+// constants are private and the test is in another crate, so the pin is what
+// makes a change here break a build rather than silently retarget the test.
+const _: () = assert!(FOLD_LANES == 16 && FOLD_MIN_BATCH == 3);
+
+/// Phase 2 of the batch fold: interpolate a chunk's brackets and compose each
+/// into its accumulator.
+///
+/// The `inverted` test is lifted out of the loop, so neither arm has a branch
+/// between one lane and the next; `I` is a type parameter for the same reason
+/// the scalar path has one, and `Bracket::eval` is the *only* arithmetic here.
+/// Nothing in this function loads an atomic or searches a ring — that is what
+/// phase 1 already did, and what makes this loop the one `docs/decisions/0060`
+/// §10.1 measured the win on.
+#[inline]
+fn fold_lanes<I: Interp>(acc: &mut [Iso3], brackets: &[Bracket], inverted: bool) {
+    if inverted {
+        for (a, b) in acc.iter_mut().zip(brackets) {
+            *a = a.mul_inv(&b.eval::<I>());
+        }
+    } else {
+        for (a, b) in acc.iter_mut().zip(brackets) {
+            *a = *a * b.eval::<I>();
+        }
+    }
+}
 
 /// A time domain: a compile-time marker carrying a runtime [`Domain::TAG`] byte.
 ///
@@ -791,8 +849,13 @@ impl Plan {
     /// **Deliberately not `#[inline]`, and that is a measurement.** It was
     /// marked alongside [`Self::fold_at`] for symmetry and the probe behind
     /// [`Self::at`]'s table never executed it — the measured path is
-    /// `at → fold_at`, while this one is reached only from `at_many`,
-    /// `at_many_into`, `at_many_into_f32` and [`Self::fold_batch`]. Extending
+    /// `at → fold_at`, while this one is reached only from [`Self::fold_batch`],
+    /// and since `docs/decisions/0060` step 2 only from its **sub-chunk
+    /// bypass**: a batch of one or two stamps, where a chunk's setup costs more
+    /// than it saves. Every larger batch folds step by step and never calls
+    /// this. (Before that change it was also reached directly from `at_many`,
+    /// `at_many_into` and `at_many_into_f32`, which now share one body.)
+    /// Extending
     /// that probe with an `#[inline(never)]` caller doing
     /// `at_many_into(.., Layout::Mat4, ..)` over 1024 monotone stamps at depth
     /// 3, best of five, x86-64, isolating this one attribute:
@@ -1714,20 +1777,19 @@ impl Plan {
         self.check_generation(g)?;
         self.check_domain_tag(D::TAG)?;
 
-        // Hoisted: loop-invariant (see [`Self::note`]; it is O(1) since `d546462`).
-        let edge = self.first_dynamic_edge();
-        let monotone = stamps.windows(2).all(|w| w[0].nanos() <= w[1].nanos());
-        if monotone {
-            let mut cursors = [0u64; MAX_DEPTH];
-            for (s, o) in stamps.iter().zip(out.iter_mut()) {
-                *o = self.note(g, edge, self.fold_at_cursors(g, s.nanos(), &mut cursors))?;
-            }
-        } else {
-            for (s, o) in stamps.iter().zip(out.iter_mut()) {
-                *o = self.note(g, edge, self.fold_at(g, s.nanos()))?;
-            }
-        }
-        Ok(())
+        // **Through [`Self::fold_batch`], not beside it.** This entry point kept
+        // its own copy of the cursor loop until `docs/decisions/0060` step 2,
+        // which is why step 1 first measured the restructure as flat here: the
+        // arm had patched the shared loop and this one still folded per stamp.
+        // One `Iso3` per stamp is `elems == 1`, and the emitter is a move.
+        self.fold_batch(
+            g,
+            stamps,
+            |s: Stamp<D>| s.nanos(),
+            |iso, dst| dst[0] = *iso,
+            1,
+            out,
+        )
     }
 
     /// Evaluate a batch **directly into a caller's buffer**, in `layout`.
@@ -1828,8 +1890,8 @@ impl Plan {
         // add an unpredictable branch between every element and the next, in
         // the one API whose whole purpose is a per-element cost of nanoseconds.
         match layout {
-            Layout::Mat4 => self.fold_batch(g, stamps, write_mat4, n, out),
-            Layout::Quat => self.fold_batch(g, stamps, write_quat, n, out),
+            Layout::Mat4 => self.fold_batch(g, stamps, |s| s, write_mat4, n, out),
+            Layout::Quat => self.fold_batch(g, stamps, |s| s, write_quat, n, out),
             // The one arm that does not go through `fold_batch`: it needs the
             // twist, so it folds through `fold_at_with_derivatives` instead.
             // See [`Self::fold_batch_with_twist`] for why that is a sibling and
@@ -1892,27 +1954,78 @@ impl Plan {
         self.check_domain_tag(domain)?;
 
         let n = layout.elems();
-        self.fold_batch(g, stamps, write_affine32, n, out)
+        self.fold_batch(g, stamps, |s| s, write_affine32, n, out)
     }
 
-    /// The shared batch loop: monotone stamps ride resumable cursors, and each
-    /// result is emitted straight into its slot.
+    /// The shared batch loop: a chunk's brackets are read first, then folded.
     ///
     /// Generic over the element type so the `f64` and `f32` paths share one
-    /// copy of the cursor logic — which is the part that must not be duplicated,
-    /// because it is where the galloping search and the seqlock retry live.
+    /// copy of the cursor logic — which is the part that must not be
+    /// duplicated, because it is where the galloping search and the seqlock
+    /// retry live — and over the *stamp* type so [`Self::at_many`], whose
+    /// `Stamp<D>` is not `repr(transparent)` and cannot be cast to `&[i64]`,
+    /// shares the same body instead of keeping a second copy of it.
+    ///
+    /// # The shape, and why it is not a per-stamp loop any more
+    ///
+    /// `docs/decisions/0060` Decision A. A monotone batch of at least
+    /// [`FOLD_MIN_BATCH`] stamps is walked in chunks of [`FOLD_LANES`], and
+    /// each chunk is folded **step by step rather than stamp by stamp**: for
+    /// every dynamic step, phase 1 reads every lane's bracket through
+    /// [`SampleRing::read_from`](crate::buffer::SampleRing::read_from) — one
+    /// loop of bracket searches and seqlocked slot reads, with no interpolation
+    /// between them — and phase 2 calls the scalar `Interp::eval` for every
+    /// lane, with no atomic load and no policy dispatch between its elements.
+    ///
+    /// §10.1 of that record attributes the win: hoisting the sampler and the
+    /// policy dispatch out of the per-stamp loop is +0.71% / −1.59% and the
+    /// loop order alone is −1.3% to −3.4%, both inside the floor; **the phase
+    /// buffering carries the whole 23–25%**, and on the recorded `/tf` stream
+    /// A clears its ~5% floor by 4–7× at every batch entry point (§10.5).
+    ///
+    /// **The arithmetic is untouched.** Phase 2 calls the same `Interp::eval`
+    /// on the same endpoints the per-stamp fold would have passed it, so every
+    /// row is bit-identical to [`Self::at`] on a quiescent ring — which
+    /// `crates/tf_tree/tests/batch_phases.rs` asserts by `to_bits`, per stamp,
+    /// including with each stamp alone in lane 0 and in lane 1.
+    ///
+    /// # Two shapes stay per-stamp
+    ///
+    /// * **A non-monotone batch**, which has no cursor to ride and folds
+    ///   through [`Self::fold_at`] exactly as before. Chunking it is not
+    ///   refused on principle, it is simply unmeasured, and §1's unexplained
+    ///   monotone-slower-than-non-monotone inversion is the reason not to guess.
+    /// * **A batch below [`FOLD_MIN_BATCH`]**, which pays a chunk's setup for
+    ///   one or two stamps and loses (§10.4). That constant carries the rows.
+    ///
+    /// # What a failing batch does
+    ///
+    /// Exactly what the per-stamp fold did, from the caller's side: the rows
+    /// before the first failing stamp are written, that stamp's error is
+    /// returned, and the rows from it on are untouched. Inside, a chunk can
+    /// have read brackets for stamps *after* the failure during an earlier
+    /// step, and those reads update the ring cursors. Cursors are hints and
+    /// never change a result (see [`Guard::cursor`]), so the observable
+    /// behaviour — the rows, the error, and the per-stamp counter calls — is
+    /// unchanged.
     #[inline]
-    fn fold_batch<T, W>(
+    fn fold_batch<S, T, W, N>(
         &self,
         g: &Guard,
-        stamps: &[i64],
+        stamps: &[S],
+        nanos: N,
         write: W,
         elems: usize,
         out: &mut [T],
     ) -> Result<(), LookupError>
     where
+        S: Copy,
         W: Fn(&Iso3, &mut [T]),
+        N: Fn(S) -> i64,
     {
+        // Hoisted: loop-invariant (see [`Self::note`]; it is O(1) since `d546462`).
+        let edge = self.first_dynamic_edge();
+
         // `chunks_exact_mut` rather than `out[i * elems..(i + 1) * elems]`,
         // and zipped against `stamps` so the walk is bounded by the batch and a
         // caller's over-long buffer is left untouched past the end.
@@ -1924,19 +2037,165 @@ impl Plan {
         // already elides the check and because ~245 us of interpolation dwarfs
         // it either way. It stays because it says what it means and drops the
         // manual index arithmetic, not because it is faster.
-        // Hoisted: loop-invariant (see [`Self::note`]; it is O(1) since `d546462`).
-        let edge = self.first_dynamic_edge();
-        let monotone = stamps.windows(2).all(|w| w[0] <= w[1]);
-        if monotone {
-            let mut cursors = [0u64; MAX_DEPTH];
+        if !stamps.windows(2).all(|w| nanos(w[0]) <= nanos(w[1])) {
             for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
-                let iso = self.note(g, edge, self.fold_at_cursors(g, *s, &mut cursors))?;
+                let iso = self.note(g, edge, self.fold_at(g, nanos(*s)))?;
                 write(&iso, dst);
             }
-        } else {
+            return Ok(());
+        }
+        if stamps.len() < FOLD_MIN_BATCH {
+            let mut cursors = [0u64; MAX_DEPTH];
             for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
-                let iso = self.note(g, edge, self.fold_at(g, *s))?;
+                let iso = self.note(g, edge, self.fold_at_cursors(g, nanos(*s), &mut cursors))?;
                 write(&iso, dst);
+            }
+            return Ok(());
+        }
+
+        self.fold_chunked(g, edge, stamps, nanos, write, elems, out)
+    }
+
+    /// [`Self::fold_batch`]'s chunked pass, in **its own stack frame**.
+    ///
+    /// # Why `#[inline(never)]`, and what it is *not* for
+    ///
+    /// It is for the frame. The lane buffers are ~4 kB and a frame that size is
+    /// reserved and probed in the prologue, before any branch in the body runs,
+    /// so a chunked pass inlined into the entry point would charge that to
+    /// every call including the ones that bypass it. With the split, measured
+    /// on the shipped bench binary:
+    ///
+    /// | symbol | `2524667` | as landed |
+    /// | --- | --- | --- |
+    /// | `at_many_into_tagged` | `sub $0x378` (888 B) | **`sub $0x378`, unchanged** |
+    /// | `at_many_into_f32_tagged` | `sub $0x158` (344 B) | **`sub $0x158`, unchanged** |
+    /// | `fold_chunked` (4 instantiations) | — | `sub $0xfd8`–`$0xff8` (4 056–4 088 B) |
+    ///
+    /// `docs/decisions/0060`'s *Consequences* predicted *"the stack frame of
+    /// every batch entry grows from 344–1 256 B to ~16 kB"*, and reached for
+    /// `MaybeUninit` — `unsafe` of no kind `0007` permits — to shrink it. As
+    /// landed the entry frames do not grow **at all**: they are the same two
+    /// numbers that bullet quotes, and the lanes live one call away, in a frame
+    /// a batch under [`FOLD_MIN_BATCH`] never enters.
+    ///
+    /// **What it is not for is the small-N rows, and that correction is the
+    /// point of this paragraph.** The split was reached for on the hypothesis
+    /// that the prologue was what made `at_many_small/at_many_1` **+27.9%** and
+    /// `at_many_2` +23.6% against `2524667` with the bypass already taken. It
+    /// was not: splitting the frame moved those rows by nothing (+27.9% and
+    /// +24.0% after it), and `objdump` says why — the entry prologue was
+    /// `sub $0x378` in *both* arms before the split too. The real cause was
+    /// [`SampleRing::read_from`](crate::buffer::SampleRing::read_from) staying
+    /// out of line and returning its bracket by `sret`, which those rows'
+    /// on-grid stamps pay per sample and per step; its `#[inline(always)]`
+    /// carries its own note. The split is kept on the evidence above, which is
+    /// a different claim measured separately.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn fold_chunked<S, T, W, N>(
+        &self,
+        g: &Guard,
+        edge: EdgeId,
+        stamps: &[S],
+        nanos: N,
+        write: W,
+        elems: usize,
+        out: &mut [T],
+    ) -> Result<(), LookupError>
+    where
+        S: Copy,
+        W: Fn(&Iso3, &mut [T]),
+        N: Fn(S) -> i64,
+    {
+        // Declared once for the whole batch, not once per chunk: their cost is
+        // the reservation and the initial write, and paying that per chunk is
+        // what made the small-N rows in §10.4 as bad as they were.
+        let mut cursors = [0u64; MAX_DEPTH];
+        let mut acc = [Iso3::IDENTITY; FOLD_LANES];
+        let mut brackets = [Bracket::Exact(Iso3::IDENTITY); FOLD_LANES];
+
+        for (chunk, dsts) in stamps
+            .chunks(FOLD_LANES)
+            .zip(out.chunks_mut(FOLD_LANES * elems))
+        {
+            // `live` is how many lanes of this chunk are still going to be
+            // written. It only ever shrinks, and it shrinks to the index of the
+            // lowest-numbered stamp that has failed — which is exactly the
+            // stamp the per-stamp fold would have stopped at, because a lane
+            // that fails at step `k` failed at no earlier step.
+            let mut live = chunk.len();
+            let mut failure: Option<LookupError> = None;
+            acc[..live].fill(Iso3::IDENTITY);
+
+            for (k, step) in self.steps().iter().enumerate() {
+                match step {
+                    Step::Static(m) => {
+                        for a in &mut acc[..live] {
+                            *a = *a * *m;
+                        }
+                    }
+                    Step::Dyn { edge: e, inverted } => {
+                        // One bounds check and one policy dispatch per chunk
+                        // per step, where the per-stamp fold paid both per
+                        // stamp. Worth little on its own (§10.1) and free here.
+                        let Some((interp, ring)) = g.view().sampler(*e) else {
+                            failure = Some(LookupError::UnknownEdge { edge: *e });
+                            live = 0;
+                            break;
+                        };
+                        let cursor = &mut cursors[k];
+
+                        // Phase 1: every bracket, no arithmetic.
+                        let mut read = live;
+                        for (lane, s) in chunk[..live].iter().enumerate() {
+                            match ring.read_from::<Bracket>(nanos(*s), ExtrapPolicy::Error, cursor)
+                            {
+                                Ok(b) => brackets[lane] = b,
+                                Err(err) => {
+                                    read = lane;
+                                    failure = Some(err);
+                                    break;
+                                }
+                            }
+                        }
+                        live = read;
+
+                        // Phase 2: every fold, no atomics.
+                        match InterpPolicy::from_u8(interp) {
+                            InterpPolicy::LerpSlerp => {
+                                fold_lanes::<LerpSlerp>(
+                                    &mut acc[..live],
+                                    &brackets[..live],
+                                    *inverted,
+                                );
+                            }
+                            InterpPolicy::ScLerp => {
+                                fold_lanes::<ScLerp>(
+                                    &mut acc[..live],
+                                    &brackets[..live],
+                                    *inverted,
+                                );
+                            }
+                        }
+                        if live == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            for (a, dst) in acc[..live].iter().zip(dsts.chunks_exact_mut(elems)) {
+                write(a, dst);
+            }
+            // Per stamp, as [`Self::note`] requires: the counters are a count of
+            // *lookups*, and a chunk is a fold strategy rather than a lookup.
+            for _ in 0..live {
+                g.note_ok(edge);
+            }
+            if let Some(err) = failure {
+                g.note_err(&err);
+                return Err(err);
             }
         }
         Ok(())

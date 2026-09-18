@@ -1,16 +1,26 @@
 # 0060: the batch fold that reads before it interpolates
 
-**Status:** draft
+**Status:** ready — **Decision A has landed** (§11, 2026-09-18); Decision B is
+still proposed and its step 0b has not run, so this record is not `implemented`.
 **Owner:** @NoeFontana
-**Implementation:** none of the engine. The prototype this record measures was
-built in a detached worktree at `681e601`, was never committed and is not coming
-in as it stands. **Steps 0a and 1 are done.** Step 0a's harness is committed —
-`crates/tf_tree_bench/examples/bracket_mix.rs`, no engine code and nothing timed
-— and its result is §9, which answers open question 1. Step 1's *arms* are not
-committed, but its **bench rows are** (`at_many_small/*` and
-`at_many_recorded/*`, which no campaign had run); its result is §10, which
-answers open question 2, attributes A's win and amends Decision A in three
-places. **Step 0b, which needs the vanished prototype's kernels, has not run.**
+**Implementation:** **Decision A is in the engine** — `Plan::fold_batch` is a
+chunked two-phase fold at sixteen lanes with a per-stamp bypass below three
+stamps, all four batch entry points share it, and `SampleRing::sample_from` and
+the batch share one read body (`read_from`). §11 is what landed and what it
+cost. **Decision B is not**, and the prototype this record measures its kernels
+against was built in a detached worktree at `681e601`, was never committed and
+is not coming in as it stands.
+
+Step by step: **0a done** — its harness is committed
+(`crates/tf_tree_bench/examples/bracket_mix.rs`, no engine code and nothing
+timed) and its result is §9, which answers open question 1. **1 done** — its
+*arms* are not committed but its **bench rows are** (`at_many_small/*` and
+`at_many_recorded/*`); its result is §10, which answers open question 2,
+attributes A's win and amends Decision A in three places. **2 done** — §11, with
+`at_many_shapes/*` added, `crates/tf_tree/tests/batch_phases.rs`, a loom model
+and six mutants; it answers open question 3 and reports one regression it did
+not close. **0b, which needs the vanished prototype's kernels, has not run**, so
+Decision B is still not taken. **4 (aarch64) has not run.**
 
 ## Context
 
@@ -932,6 +942,227 @@ live in the uncommitted matrix bench, and the committed rows added here are all
 monotone. It is not decision-affecting for A — every arm above rides the same
 cursor as `base` — so it is carried rather than blocking.
 
+### 11. Step 2: A as landed, and the one thing it costs
+
+Landed 2026-09-18 against parent `2524667`. The shape is Decision A as step 1
+amended it — one fold body, sixteen lanes, the per-stamp fold below three
+stamps, and `sample_from` expressed through the bracket read — plus two things
+this step had to find out for itself, in 11.2 and 11.3.
+
+`crates/tf_tree_core/src/plan.rs` carries `FOLD_LANES = 16`, `FOLD_MIN_BATCH = 3`
+and a `const` assertion pinning both, because
+`crates/tf_tree/tests/batch_phases.rs` restates them.
+
+#### 11.1 The numbers, `[profile.bench]`
+
+Interleaved paired runs against `2524667`, arm order rotated per rep, **7 reps**,
+`taskset -c 2`, per-arm `CRITERION_HOME`, median of the per-rep deltas. Both
+arms are the same bench harness; only the engine differs.
+
+| row | `2524667` | A | delta |
+| --- | ---: | ---: | ---: |
+| `at_many/monotone_1024` | 273 811 ns | 220 115 ns | **−19.19%** |
+| `at_many/into_mat4_1024` | 270 537 | 221 967 | −18.08% |
+| `at_many/into_quat_1024` | 272 144 | 220 264 | −19.06% |
+| `at_many/into_affine32_1024` | 280 733 | 223 481 | −20.38% |
+| `at_many/into_quat_twist_1024` **(control)** | 340 851 | 340 862 | **+0.00%** |
+| `at_many_recorded/moving_at_many_1024` | 102 193 | 81 821 | −18.20% |
+| `at_many_recorded/moving_into_mat4_1024` | 105 225 | 84 172 | −17.96% |
+| `at_many_recorded/mixed_at_many_1024` | 206 754 | 141 119 | **−31.35%** |
+| `at_many_recorded/mixed_into_mat4_1024` | 204 648 | 174 914 | −14.17% |
+| `at_many_small/at_many_1` | 104 | 101 | −2.18% |
+| `at_many_small/at_many_2` | 261 | 260 | +2.34% |
+| `at_many_small/at_many_3` | 651 | 577 | −11.52% |
+| `at_many_small/at_many_16` | 3 723 | 3 116 | −16.31% |
+| `at_many_small/at_many_63` | 16 782 | 13 536 | −18.63% |
+| `at_many_small/into_mat4_1` | 105 | 102 | −2.84% |
+| `at_many_small/into_mat4_3` | 656 | 591 | −8.19% |
+| `at_many_shapes/one_dyn_sclerp_on_grid_at_many_1024` | 35 455 | 25 236 | −28.30% |
+| `at_many_shapes/one_dyn_sclerp_off_grid_at_many_1024` | 96 227 | 75 015 | −21.46% |
+| `at_many_shapes/one_dyn_sclerp_off_grid_into_mat4_1024` | 95 602 | 77 575 | −18.58% |
+| `at_many_shapes/one_dyn_lerpslerp_off_grid_at_many_1024` | 75 699 | 55 404 | −25.18% |
+| `at_many_shapes/stationary_sclerp_off_grid_at_many_1024` | 99 457 | 75 004 | −23.21% |
+| `at_many_shapes/stationary_lerpslerp_off_grid_at_many_1024` | 40 809 | 31 296 | −23.52% |
+
+**`into_quat_twist_1024` is the control and it is flat to two decimal places.**
+It is the one layout whose fold, sampler and cursor branch are all its own
+(`fold_batch_with_twist` / `sample_with_twist_from`), it was deliberately not
+touched, and a run that moved it would be measuring the host rather than the
+change.
+
+**A's per-entry-point stop rule: PASSED everywhere.** On step 0a's recorded
+stream the two plans clear the ~5% floor by 2.8–6.3× at both entry points.
+**No batch size loses**: `at_many_1` and `into_mat4_1` are −2.2% and −2.8%, and
+`at_many_2`'s +2.34% is the only positive number in the table and is inside this
+host's noise. That is the sub-`FOLD_MIN_BATCH` bypass doing its job together
+with 11.3; step 1 measured +82.5% at N = 1 for the same lane count without it.
+
+#### 11.2 The frame the record predicted, and what actually happened
+
+*Consequences* said *"the stack frame of every batch entry grows from
+344–1 256 B to ~16 kB"*, and reached for `MaybeUninit` — `unsafe` of no kind
+`0007` rule 1 permits — to shrink it. **As landed the entry frames do not grow
+at all.** The chunked pass is a separate `#[inline(never)]` function, so the
+lanes are reserved one call in, in a frame a batch under three stamps never
+enters. Read off the prologues of the shipped bench binaries:
+
+| symbol | `2524667` | A |
+| --- | --- | --- |
+| `at_many_into_tagged` | `sub $0x378,%rsp` (888 B) | `sub $0x378,%rsp` (888 B) |
+| `at_many_into_f32_tagged` | `sub $0x158,%rsp` (344 B) | `sub $0x158,%rsp` (344 B) |
+| `fold_chunked`, 4 instantiations | — | `sub $0xfd8`–`$0xff8` (4 056–4 088 B) |
+
+Those are the same two numbers *Consequences* quotes as the **before** state.
+The `API.md` §8.3 page-fault residual therefore does not move for a caller that
+never batches, and moves by one page for one that does.
+
+**The split was reached for on a hypothesis that was wrong, and the correction
+is the more useful half of this subsection.** Before it, `at_many_small/at_many_1`
+was +27.9% and `at_many_2` +23.6% against `2524667` **with the bypass already in
+place and taken**, and the obvious reading was that the prologue reserved and
+probed the lanes before the bypass could return. Splitting the frame moved those
+rows by nothing — +27.9% and +24.0% after — and `objdump` says why: the entry
+prologue was `sub $0x378` in *both* arms before the split too. The cause was
+11.3. The split is kept on the table above, which is a different claim measured
+separately.
+
+#### 11.3 The cost of one read body, which is real and is on `Plan::at`
+
+Open question 3 asked for one read body, and the obvious way to get one — have
+`read_from` return a `Bracket` and let `sample_from` fold it — **is a regression
+on the scalar path**, because a `Bracket` is 128 bytes (as wide as its
+interpolating variant) and `Plan::at` then carries one through a `Result` on
+every sample of every step. Measured on the `lookup` bench, same method:
+
+| arrangement | `lookup/depth3/sclerp/exact_hit`, `[profile.bench]` |
+| --- | --- |
+| `read_from -> Bracket`, out of line | 45 ns → 85 ns, **+86.4%** |
+| the same, `#[inline]` (LLVM declines it; the symbol survives in the binary) | +84.9% |
+| the same, `#[inline(always)]` | +6.7% |
+| **as landed:** `read_from` generic over `FromBracket` | **−7.0% … +1.4%** |
+
+**As landed the return type is the parameter.** `read_from` is generic over a
+`FromBracket` trait; the batch instantiates it at `Bracket` and the scalar path
+at `Interpolated<I>`, which is 56 bytes and never builds an enum. The search,
+the seqlocked slot reads and the trailing lap check live in exactly one
+function, which is what open question 3 asked for, and the scalar path stops
+paying for a shape it does not want. At `[profile.bench]` every `lookup/*` row
+is then within **±1.4%** of `2524667`, reproduced across two independent 7-rep
+runs.
+
+**At `[profile.embedder]` it still costs, and this is the one negative result in
+step 2.** Cargo's `--release` defaults (`lto = false`, `codegen-units = 16`):
+
+| `lookup/*` row | `[profile.bench]` | `[profile.embedder]` |
+| --- | ---: | ---: |
+| `depth1/sclerp` | +0.26% | **+10.13%** |
+| `depth3/sclerp` | −0.71% | **+10.77%** |
+| `depth3/lerpslerp` | +1.40% | **+7.72%** |
+| `depth6/sclerp` | −0.35% | **+10.95%** |
+| `depth3/sclerp/exact_hit` | +1.36% | −3.37% |
+
+**It is the read split and nothing else, and that is measured rather than
+assumed.** A third arm — this change's `sample.rs` with **`2524667`'s own
+`plan.rs`**, so no chunked fold exists at all — reproduces it to within a
+percentage point (+10.34%, +10.69%, +8.12%, +10.66%, −4.12%). So it is not the
+chunked fold, not `plan.rs` growing, and not codegen-unit partitioning shifting
+underneath `fold_at`. `read_from` is fully inlined in that binary — `nm` finds
+no symbol for it — so it is not a call either; what is left is that LLVM without
+LTO optimises the split function worse than it optimised the monolith, and
+nothing here pins that further.
+
+**Why it lands anyway, as a principal decision on the owner's delegation:**
+
+- `[profile.bench]` is this workspace's own profile and the one
+  `crates/tf_tree_bench/baseline/results.json` was taken under; there, the
+  scalar path is unchanged and every batch row wins 14–31%.
+- `docs/API.md` §2.3 already records that this exact path costs **25%** at
+  `lto = false, codegen-units = 16` for a cross-crate caller and that
+  `lto = "thin"` in the embedder's own profile erases it. The mitigation is the
+  knob that document already tells an embedder to set.
+- The alternative is two read bodies, and `sample.rs`'s own module doc records
+  what that costs here: the trailing revalidation *"has seven places that need
+  it and six of them did not have it"*. Trading a structural correctness
+  invariant for 10% on one profile is the wrong way round.
+- `just bench-check`'s `lookup_latency` and `embedding_cross_crate` rows are
+  **UNAVAILABLE on this host** — `bench_report`'s own fitness probe refuses
+  them for SMT and an unreadable governor — so no committed gate can see this
+  either way, and saying so is part of the result.
+
+**Reopen it** if a quiet, non-SMT, fixed-governor host reproduces the embedder
+column, or if `just embed-cost`'s gated row ever resolves on such a host and
+moves.
+
+#### 11.4 A lever found and not taken
+
+`#[inline(always)]` on `SampleRing::sample_from` itself — not on `read_from`,
+which already has it — is **−27.6% to −38.0%** on every interpolating
+`lookup/*` row at `[profile.bench]` (`depth3/sclerp` 277 → 194 ns) and
+**+13.5% to +20.2%** at `[profile.embedder]`. It is the same trade as 11.3 and
+in the same direction, so it is not taken here; it is written down because it is
+the largest unexploited number this campaign produced and it belongs to
+`docs/API.md` §2.3's inline-placement question, not to this record's.
+
+#### 11.5 What holds it
+
+- **`crates/tf_tree/tests/batch_phases.rs`, 6 tests** (the sixth
+  `unstable`-gated, for the reason `tests/counters.rs` is gated whole),
+  reproducing §8's engine test: eleven crafted branch regions (knots, an `s` that rounds to exactly
+  `1.0` over a 2⁵⁵ ns segment, identical rotations, the LERP fallback at 1e-7
+  rad, 0.2998 and 0.3002 rad either side of the 0.3 rad series bound, a large
+  arc, the far hemisphere, exact identity, signed zeros, non-finite
+  translations) repeated 4× plus 200 random series steps; six plan shapes over
+  both policies, mixed policies and both `inverted` flags; every batch entry
+  point compared to `Plan::at` by `to_bits`; every stamp alone, paired, and in
+  lane 0, lane 1 and lane 15 of a 17-stamp batch; the error grid at five
+  lengths × six positions × three failure kinds, asserting the error, the rows
+  before it, a sentinel from it on and the per-edge counters; and the identity
+  and all-static plans. One of the six —
+  `the_fixture_reaches_the_branches_it_names` — asserts the *inputs* instead,
+  because every other assertion in the file is satisfied trivially by a fixture
+  that reaches one arm.
+- **A loom model**, `read_from_validates_the_bracket_it_hands_back`, at
+  `LOOM_MAX_PREEMPTIONS = 3`. Its control — deleting `read_from`'s trailing
+  `head - i > retained` check — **FAILS** it, and necessarily also fails
+  `sample_from_with_a_stale_cursor_across_a_lap`: there is one check now, and a
+  control that killed only one of two models would mean there were still two.
+  What the new model adds is the deferred-evaluation caller, asserting the
+  *endpoints* rather than a pose folded from them. The three older
+  `sample_from_*` models' mutants were re-run at their moved sites and all three
+  still fail. `just loom`: 27 passed.
+- **Mutants**, each applied exactly once, run, reverted by copy plus `touch`,
+  sha256 checked:
+
+  | mutant | outcome |
+  | --- | --- |
+  | **M5** — an error does not lower the chunk limit (`let _ = read;`) | **caught**, by the error grid alone. It does not merely write rows past the refusal: the failed lane keeps being read, fails again at a *later* step, and the later error overwrites the earlier one, so the call returns the wrong edge's `Extrapolation` |
+  | phase 2 ignores `inverted` | caught, 3 tests |
+  | phase 1 reads `chunk[0]` for every lane | caught, 3 tests |
+  | the accumulator is not reset per chunk | caught, 3 tests |
+  | `cursors` reset at the top of every chunk | **survives — equivalent.** A cold cursor is a valid cursor; the same limit `batch.rs` records for `fold_batch_with_twist` |
+  | `FOLD_MIN_BATCH = 1` (no bypass) | **caught by the `const` pin**, which is the pin working. With the pin relaxed too it **survives — equivalent**, which is the point: the bypass is a performance boundary held by `at_many_small/at_many_2` and `at_many_3`, not a correctness one |
+- **Gates:** `just test` (1 008 + 6 new), `just shm-check`, `just stable-tier-check`,
+  `just msrv`, `just doc`, `just lint`, `just loom`, `just miri`, `just tsan`,
+  `just py-test`, `just py-lint`, and `just bench-check` under CI's own
+  `EMBED_COST_KNOWN_COLLAPSED=1` (PASS — 2 directional metrics held; the two
+  rows that would speak to 11.3 are UNAVAILABLE on this host).
+
+#### 11.6 What step 2 does not close
+
+- **§1's monotone-slower-than-non-monotone inversion** is still unexplained and
+  still has no committed non-monotone row. The non-monotone batch keeps the
+  per-stamp `fold_at` loop, deliberately: chunking it is unmeasured, and that
+  inversion is the reason not to guess.
+- **`[profile.embedder]`'s scalar column** (11.3), with the reopen criterion
+  above.
+- **aarch64** — plan step 4, untouched.
+- **Two levers inside A that were not pulled**, both noted rather than measured
+  so that a later reader does not have to rediscover them. The accumulator is
+  refilled with `Iso3::IDENTITY` once per chunk — 57 kB of writes over a
+  1024-stamp batch — where the plan's *first* step could assign into it instead
+  of multiplying; and the non-monotone batch still folds per stamp. Neither is
+  decision-affecting for what landed, and both are inside the margin above.
+
 ### MEASURED and INFERRED
 
 | claim | standing |
@@ -953,8 +1184,11 @@ cursor as `base` — so it is carried rather than blocking.
 | a motionless `ScLerp` edge takes the degenerate arm | **FALSE in general**, MEASURED (§9.3): it does so only when the quaternion's zero pattern makes `conj(q)·q` cancel exactly. Otherwise `sh2 ≈ 5e-36` and it is **series**. §5's "generic" is an erratum |
 | the chunk-level series fraction a bail-out would see | MEASURED (§9.4): near-bimodal, 70 of 74 chunks all-in or all-out, so no threshold to tune on this data |
 | a rough break-even for `v2` over `scal`: ~27% of elements falling back under ScLerp, ~24% under LerpSlerp | INFERRED, see below |
-| aarch64/NEON, `[profile.embedder]` (`lto = false`, `codegen-units = 16`), AVX hosts | UNMEASURED |
-| `read_bracket_from`'s earlier lap check is as sound as `sample_from`'s | ARGUED (below) and audited by the re-measurement; **no loom model** |
+| aarch64/NEON and AVX hosts | UNMEASURED |
+| `[profile.embedder]` (`lto = false`, `codegen-units = 16`) | **MEASURED (§11.1, §11.3)**: the batch rows still win 10–24%, and the **scalar `Plan::at` rows lose 6–11%** — the one negative result in this record. Isolated to the read split, with `2524667`'s own `plan.rs`, so it is neither the chunked fold nor CGU partitioning |
+| the bracket read's earlier lap check is as sound as `sample_from`'s | ~~ARGUED, **no loom model**~~ — **MODELLED (§11.5)**: `read_from_validates_the_bracket_it_hands_back`, at `LOOM_MAX_PREEMPTIONS = 3`, with a disabled-check control that fails it. And for the scalar path it did not move at all: `Interpolated::between` interpolates as the bracket is built, so `Plan::at` still checks after the `eval` |
+| A's entry frames | **MEASURED (§11.2)**: they do **not** grow. `at_many_into_tagged` is `sub $0x378` and `at_many_into_f32_tagged` `sub $0x158` in both arms — the same two numbers *Consequences* quotes as the *before* state — and the 4 056–4 088 B of lanes live one `#[inline(never)]` call in. No `MaybeUninit`, no `unsafe` |
+| A costs nothing at any batch size | **MEASURED (§11.1)**: with the sub-three bypass, `at_many_1` is −2.2% and `into_mat4_1` −2.8%; the only positive number in the table is `at_many_2`'s +2.34%, inside this host's noise |
 
 **The break-even line is a linear interpolation between two unlike datasets, and
 must not be used as a threshold.** On 1dyn ScLerp mono/1024, `v2` saves 22.85
@@ -979,16 +1213,20 @@ accept an argument in place of a model. The three `loom_tests.rs` lap models
 `sample_from_hold_revalidates_across_a_lap`,
 `sample_from_exact_newest_revalidates_across_a_lap`) do not cover the copy.
 
-## Decision (proposed, not taken)
+## Decision (A taken and landed; B proposed, not taken)
 
 **Verdict: PROCEED to the measurements in *Implementation plan* step 0, not to an
-implementation and not to the prototype as built.** **This is a draft and
-authorises nothing.** **Step 0a is done** — §9, and it answers open question 1.
+implementation and not to the prototype as built.** That is what this record
+said as a draft, and it is what happened: the measurements ran, and **Decision A
+below is now in the engine (§11, landed 2026-09-18)** while **Decision B is
+still undecided** because its step 0b needs kernels that went with the
+prototype's worktree. **Step 0a is done** — §9, and it answers open question 1.
 Step 0b, which is timing on the uncommitted prototype, is not. What steps 0 and 1 feed is two separable decisions, taken
 in order. The two campaigns agree on the verdict. Where their attributions
 differ, the conservative reading above is the one carried forward.
 
-1. **Decision A — the restructure, with no kernel.** Rewrite `Plan::fold_batch`,
+1. **Decision A — the restructure, with no kernel. LANDED 2026-09-18 (§11).**
+   Rewrite `Plan::fold_batch`,
    and `at_many`'s loop through it, as a chunked two-phase fold. Per chunk and per
    step, phase 1 reads every bracket through **the one** seqlocked read path and
    phase 2 calls the scalar `Interp::eval`. It is proposed first because:
@@ -1124,7 +1362,17 @@ differ, the conservative reading above is the one carried forward.
   end of the chunk. Results and counters are unchanged, because hints never
   change a result. The error returned and the rows written are exactly the
   per-stamp fold's.
-- **The stack frame of every batch entry grows** from 344–1 256 B to ~16 kB at a
+- ~~**The stack frame of every batch entry grows**~~ — **it does not, and §11.2
+  is the measurement.** As landed, `at_many_into_tagged` is `sub $0x378` (888 B)
+  and `at_many_into_f32_tagged` `sub $0x158` (344 B) in both arms: the same two
+  numbers this bullet quotes as the *before* state. The lanes are 4 056–4 088 B
+  and live in `fold_chunked`, one `#[inline(never)]` call in, which a batch under
+  three stamps never enters. **The `MaybeUninit` this bullet reaches for below is
+  not needed for any of it.** The rest of the bullet is kept as written, because
+  its arithmetic is what the split answers, and because it was the reasoning that
+  reached for `unsafe`:
+
+  The frame grows from 344–1 256 B to ~16 kB at a
   64-stamp chunk — **measured 17 720 B, and 6 600 B at the 16 lanes Decision A
   now takes (§10.3)**; the rest of this bullet is written against 64 and its
   arithmetic scales by a quarter. That matters to `no_std` and small-stack embedders, and to
@@ -1173,6 +1421,14 @@ differ, the conservative reading above is the one carried forward.
   A touches `sample_from`. **Neither is evidence for the lever,** and a toolchain
   that stopped vectorising B's loop would pass both. Open question 4 asks what the
   gate becomes.
+
+  **And on this host neither can do the scalar half either**, which A's landing
+  made concrete rather than hypothetical: `just bench-check`'s `lookup_latency`
+  and `embedding_cross_crate` rows report **UNAVAILABLE**, refused by
+  `bench_report`'s own fitness probe for SMT and an unreadable CPU governor. So
+  the 6–11% `[profile.embedder]` scalar cost in §11.3 was found by this record's
+  own interleaved runs and would not have been found by any recipe. That is a
+  second reason open question 4 is not cosmetic.
 - **`fold_batch`'s doc comment says the cursor logic "must not be duplicated,
   because it is where the galloping search and the seqlock retry live".** The
   prototype duplicated it. A must not.
@@ -1279,33 +1535,73 @@ differ, the conservative reading above is the one carried forward.
        +208.9% at N = 1 for 64 lanes and +82.5% for 16 — and that is what the
        small-N bypass in Decision A is for. With the bypass, no row loses.
 2. **Land A**, as amended by §10: **16 lanes, one fold body, and the per-stamp
-   fold for a batch under three stamps.**
+   fold for a batch under three stamps. DONE, 2026-09-18 — §11.**
+
+   **Outcome:** −14.2% to −31.4% on every 1024-stamp batch row at
+   `[profile.bench]` with the `into_quat_twist_1024` control flat to two decimal
+   places, and −10.4% to −24.2% at `[profile.embedder]`; no batch size loses;
+   the entry frames do not grow at all (§11.2); one read body is bought with a
+   `FromBracket` return-type parameter rather than a 128-byte enum, and still
+   costs 6–11% on the *scalar* rows at `[profile.embedder]` (§11.3), which is
+   the one negative result and is disclosed rather than closed. Each item below
+   is marked with how it came out.
    - **One read body.** `sample_from` expressed through the bracket read, so the
-     scalar path runs the same lap check in the same position.
+     scalar path runs the same lap check in the same position. **DONE, and the
+     second clause turned out to be free**: `read_from` is generic over what it
+     makes of the bracket, and the scalar instantiation folds as it reads, so
+     `Plan::at`'s check did not move at all. §11.3 is what it cost anyway.
    - **The bypass is a tested boundary, not a constant in a comment.** N = 2 and
      N = 3 are committed bench rows either side of it (`at_many_small/*`), and
      the threshold has to be re-derivable on another host rather than trusted
-     from this one.
+     from this one. **DONE** — and with `FOLD_MIN_BATCH = 1` the tests still
+     pass, which is the point: the boundary is a performance one, held by those
+     two rows, and the `const` pin is what stops the test's lane shapes
+     retargeting silently.
    - **A loom model** for that read, mirroring the three `sample_from_*` lap
      models. It must carry a disabled-check control that fails, and run at
-     `LOOM_MAX_PREEMPTIONS >= 3`.
+     `LOOM_MAX_PREEMPTIONS >= 3`. **DONE** —
+     `read_from_validates_the_bracket_it_hands_back`; the control fails it *and*
+     the stale-cursor model, necessarily, because there is one check now. The
+     three older models' own mutants were re-run at their moved sites.
    - **A one-dynamic-step fixture** in `crates/tf_tree/tests/` under both
      policies. It must reproduce §8's engine test in full: branch regions,
      isolated stamps in lanes 0 and 1, the error-contract grid, counters, and
-     the identity and all-static plans.
+     the identity and all-static plans. **DONE** —
+     `crates/tf_tree/tests/batch_phases.rs`, 6 tests. It goes past the plan in
+     two places: lanes **0, 1 and 15** of a 17-stamp batch, because below
+     `FOLD_MIN_BATCH` a stamp alone no longer reaches the chunked fold at all;
+     and one of the six asserts the *fixture's* branch coverage instead,
+     because every other assertion in the file is satisfied by a fixture that
+     reaches one arm.
    - **A one-dynamic-step `at_many` bench row,** plus the off-grid and stationary
-     rows.
+     rows. **DONE** — the `at_many_shapes` group: one dynamic step, on-grid and
+     off-grid, moving and stationary, under both policies. On-grid and off-grid
+     are 25 µs against 79 µs on the same data, so they are different code paths
+     and not a relabelling.
    - **A run mutant:** M5 (an error does not lower the chunk limit) applied,
-     observed failing, and reverted with a `touch`.
+     observed failing, and reverted with a `touch`. **DONE, and it fails for a
+     sharper reason than the name says** — the failed lane keeps being read,
+     fails again at a later step, and the later error overwrites the earlier
+     one, so the call returns the wrong edge's `Extrapolation`. Five more
+     mutants ran beside it (§11.5); two survive and are argued equivalent.
    - **Verified by** `just test`, `just shm-check`, `just stable-tier-check`,
      `just loom`, `just miri`, `just tsan`, `just lint`, `just doc`,
      `just py-test`, `just bench-check` and `just embed-cost-check`.
      `just py-test` is the only gate that runs the Python batch path's
      partial-write and error behaviour, because `tf_tree_py` is outside the
      workspace. Also by the new rows timed interleaved against the parent
-     commit, at `[profile.bench]` **and** `[profile.embedder]`.
+     commit, at `[profile.bench]` **and** `[profile.embedder]`. **ALL RUN**, and
+     `just bench-check` needed CI's own `EMBED_COST_KNOWN_COLLAPSED=1`, which is
+     a pre-existing disclosed escape and not this change's doing. Its
+     `lookup_latency` and `embedding_cross_crate` rows are UNAVAILABLE on this
+     host, so no committed gate can see §11.3 either way.
    - **Stop point:** if the embedder profile loses what the bench profile wins,
-     A does not land as measured.
+     A does not land as measured. **NOT TRIGGERED** — at `[profile.embedder]`
+     the batch rows win 10.4–24.2%, less than the bench profile's 14.2–31.4% but
+     in the same direction everywhere. What the embedder profile *does* lose is
+     a row this stop point does not name, the **scalar** `Plan::at` (§11.3);
+     that is disclosed, argued and given a reopen criterion rather than
+     silently passed.
 3. **Only if step 0b left B open, land B on A.**
    - **The kernel:** ScLerp only unless step 0b re-admitted LerpSlerp, with
      step 0b's knot handling, and the chunk bail-out if step 0b kept it.
@@ -1385,11 +1681,25 @@ differ, the conservative reading above is the one carried forward.
    they do say is that the price is 6.6 kB rather than 16 kB, and that the caller
    who cannot pay it — the one asking for one or two stamps — no longer does.
 3. **One read body: is the lap check's move acceptable on the scalar path?**
-   Decision A requires `sample_from` to become "read the bracket, then `eval`",
-   which moves `Plan::at`'s lap check before `eval` too. The argument is above
-   and the loom model is step 2. But `Plan::at` is `API.md` §2.3's measured hot
-   path, and re-spelling it may move its codegen. The alternative keeps two read
-   bodies, and `fold_batch`'s own doc comment refuses that.
+   ~~Open.~~ **ANSWERED by step 2 (§11.3, §11.5), and the question turned out to
+   be half wrong and half understated.**
+
+   **The lap check does not move on the scalar path at all.** `read_from` is
+   generic over what it makes of the bracket, and the scalar instantiation
+   interpolates *as the bracket is built*, so `Plan::at` still runs the check
+   after the `eval`, in the same position, on the same values. It moves only for
+   the batch instantiation, where there is no `eval` left to put it after, and
+   that is what `read_from_validates_the_bracket_it_hands_back` models with a
+   control that fails.
+
+   **What this question should have asked about was the codegen, and there the
+   answer is yes with a named cost.** One read body is worth ±1.4% on every
+   `lookup/*` row at `[profile.bench]` and **+6% to +11% at
+   `[profile.embedder]`**, isolated to the split itself. §11.3 carries the
+   numbers, the reason it lands anyway and the criterion that would reopen it.
+   Two read bodies were not taken: `sample.rs`'s own module doc records that the
+   trailing revalidation *"has seven places that need it and six of them did not
+   have it"*.
 4. **What gates the batch lever?** `bench-check` and `embed-cost` cannot see it.
    Options:
    - add a batch row to `bench_report`, which is a gated latency row and needs
@@ -1419,6 +1729,32 @@ cargo run --release -p tf_tree_bench --example bracket_mix
 
 with an optional stream path and sweep rate as its two arguments. §9's tables are
 that command's output on `main` at the date §9 gives.
+
+**Step 2's artefacts are all committed**, because A landed: the fold is
+`Plan::fold_batch` / `Plan::fold_chunked`, the read is
+`SampleRing::read_from`, the test is `crates/tf_tree/tests/batch_phases.rs`, the
+model is `loom_tests::read_from_validates_the_bracket_it_hands_back` and the
+rows are the `at_many_shapes` group. §11's deltas come from the A/B below, whose
+driver is not committed:
+
+```text
+# two arms of the same bench harness, differing only in the engine
+git worktree add --detach <dir> <this commit>
+cd <dir> && git checkout 2524667 -- crates/tf_tree_core/src/{plan,sample}.rs
+
+cargo bench --bench at_many --no-run                     # and --bench lookup
+cargo bench --bench at_many --no-run --profile embedder  # and --bench lookup
+
+# one cell; the driver loops rows x arms x reps and rotates arm order per rep
+CRITERION_HOME=<per-arm dir> taskset -c 2 <arm binary> --bench --noplot \
+    --warm-up-time 1 --measurement-time 2 --exact at_many/monotone_1024
+
+# §11.2's frames, off the shipped binaries
+objdump -d --start-address=<sym> <binary> | grep -m1 'sub .*,%rsp'
+nm -C <binary> | grep read_from     # empty iff `read_from` inlined everywhere
+
+# §11.3's isolation arm: this change's sample.rs, 2524667's plan.rs
+```
 
 **Nothing else below is added to the repository as a file.** The prototype diff,
 test, logs and binaries stayed in the session's scratch directory (see the

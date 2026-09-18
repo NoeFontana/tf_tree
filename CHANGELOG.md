@@ -41,6 +41,71 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — `at_many` and friends read a whole chunk before they interpolate (`0060` Decision A)
+
+`Plan::at_many`, `at_many_into` and `at_many_into_f32` no longer fold a batch
+one stamp at a time. A monotone batch of three stamps or more is now walked in
+chunks of sixteen and folded **step by step**: for each dynamic step, one loop
+reads every lane's bracket through the seqlocked ring and a second loop
+interpolates them. `Layout::QuatTwist` is deliberately unchanged.
+
+**Every row is bit-identical to `Plan::at`**, per stamp, by `to_bits` — that is
+what makes batch a layout and not a second answer, and
+`crates/tf_tree/tests/batch_phases.rs` asserts it over eleven crafted numerical
+regions, six plan shapes, both interpolation policies, both `inverted` flags,
+and every stamp in lane 0, lane 1 and lane 15 of a chunk. A refused batch
+behaves exactly as before: the rows before the first failing stamp are written,
+that stamp's error is returned, the rest are untouched, and the counters still
+count one lookup per row written.
+
+Measured against `2524667`, interleaved paired runs, 7 reps, `taskset`-pinned,
+on the workspace's own `[profile.bench]`:
+
+- **−14.2% to −31.4%** on every 1024-stamp batch row, including −18.2% and
+  −31.4% on the two plans that sweep the recorded `/tf` stream `0060` step 0a
+  measured. The untouched `into_quat_twist_1024` control is flat to two decimal
+  places.
+- **No batch size loses.** A batch under three stamps takes the per-stamp fold,
+  because the chunked path sets up its lanes whatever the batch holds; `N = 1`
+  is −2.2%.
+- At `[profile.embedder]` (cargo's `--release` defaults) the batch rows still
+  win **10.4–24.2%**.
+
+**Two things a consumer may care about, stated rather than buried.** The stack
+frames of the batch entry points do **not** grow — 888 B and 344 B, the same as
+before, with the lane buffers one non-inlined call in — so `API.md` §8.3's
+page-fault residual is unchanged for a caller that never batches. And under a
+live writer, the gap between two plan steps' reads for one stamp grows from one
+fold to at most one chunk; a batch was never a snapshot and still is not.
+
+### Changed — one bracket-read body behind `Plan::at` and the batch fold
+
+`SampleRing::sample_from` and the new batch fold share one function: the
+galloping search, the seqlocked slot reads and the trailing lap check exist
+once, and the caller chooses at the type level whether it gets the bracket or
+the interpolated pose. `Plan::at`'s result, its arithmetic and the position of
+its lap check are unchanged.
+
+**It costs, on one profile, and the number is here rather than in a footnote.**
+At `[profile.bench]` every `lookup/*` row is within ±1.4% of `2524667`. At
+`[profile.embedder]` — `lto = false`, `codegen-units = 16`, which is what an
+embedder gets from a bare `cargo build --release` — the interpolating rows are
+**+6% to +11%**. It is the split itself and not the batch fold: an arm carrying
+this change's `sample.rs` with `2524667`'s own `plan.rs` reproduces it within a
+percentage point. `docs/API.md` §2.3 already records that `lto = "thin"` in an
+embedder's own profile erases a larger cost on this same path, and that is the
+mitigation. `docs/decisions/0060` §11.3 carries the full reasoning, including
+why two read bodies were not the answer.
+
+### Added — the `at_many_shapes` bench group
+
+One dynamic step, on-grid and off-grid stamps, moving and stationary edges,
+under both interpolation policies. Benchmarks only. The shapes `0060` step 2
+owed: on-grid is every bracket an exact hit and no `Interp::eval` at all,
+off-grid is every bracket interpolating, and a stationary edge is the regime
+four of the five dynamic edges of the one real recording in this tree are in.
+
+
 ### Added — the two `at_many` bench groups `0060` step 1 needed and nobody had run
 
 `at_many_small` (N = 1, 2, 3, 4, 8, 16, 63 at both pose entry points) and

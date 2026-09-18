@@ -47,6 +47,8 @@
 //! This module is `unsafe`-free: it drives the [`SampleRing`] atomics through the
 //! safe `push`/`read_slot` surface exposed by [`crate::buffer`].
 
+use core::marker::PhantomData;
+
 use tf_tree_math::{Interp, Iso3, ScLerp, Twist};
 
 /// Nanoseconds per second, as the `f64` the twist scaling needs.
@@ -75,6 +77,123 @@ pub enum ExtrapPolicy {
     /// Extend the constant screw twist implied by the two newest samples. Falls
     /// back to [`ExtrapPolicy::Hold`] when fewer than two samples exist.
     ConstantTwist,
+}
+
+/// One seqlocked read of an edge's bracket, before any interpolation.
+///
+/// [`SampleRing::read_from`] returns this and [`SampleRing::sample_from`]
+/// immediately folds it with [`Interp::eval`]. Splitting the two is what
+/// `docs/decisions/0060` calls the *phase buffering*, and §10.1 of that record
+/// measured it as the whole of the batch fold's 23–25%: a chunk's reads run as
+/// one loop with no interpolation between them, and the arithmetic runs as a
+/// second loop with no atomic load, no bracket search and no branch on a policy
+/// between its elements.
+///
+/// **It is not an optimisation of the arithmetic.** Whichever variant comes
+/// back, evaluating it produces exactly the bits the per-stamp fold produced,
+/// because it is exactly the same call on exactly the same values — which is
+/// the property `crates/tf_tree/tests/batch_phases.rs` asserts by `to_bits` and
+/// not by tolerance.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Bracket {
+    /// A pose that needs no interpolation: an exact stamp hit, or the answer an
+    /// extrapolation policy produced on its own.
+    Exact(Iso3),
+    /// Interpolate between the two retained samples that bracket the query.
+    Between {
+        /// The older endpoint.
+        a: Iso3,
+        /// The newer endpoint.
+        b: Iso3,
+        /// Where the query falls between them, in `[0, 1)`.
+        s: f64,
+    },
+}
+
+impl Bracket {
+    /// Fold this bracket under interpolation policy `I`.
+    ///
+    /// **Through [`Interpolated`], deliberately.** This is what the batch's
+    /// phase 2 calls and `Interpolated` is what the scalar read builds
+    /// directly, so routing both through one pair of constructors leaves
+    /// exactly one place that decides what an exact bracket folds to and one
+    /// that decides what an interpolating one folds to. Writing `I::eval` here
+    /// as well would be a second spelling of the same arithmetic
+    /// (`docs/PROJECT.md` §6), and the first symptom of the two drifting apart
+    /// would be a batch row disagreeing with `Plan::at` — which is the one
+    /// property this whole restructure is not allowed to break.
+    #[inline]
+    pub(crate) fn eval<I: Interp>(&self) -> Iso3 {
+        match *self {
+            Bracket::Exact(p) => Interpolated::<I>::exact(p).0,
+            Bracket::Between { a, b, s } => Interpolated::<I>::between(a, b, s).0,
+        }
+    }
+}
+
+/// What [`SampleRing::read_from`] turns a bracket into — chosen by the caller,
+/// at the type level, so there is one read body and no caller pays for a shape
+/// it does not want.
+///
+/// # This is what "one read body" cost, and how it was bought back
+///
+/// The batch fold wants the bracket itself: phase 1 stores it and phase 2
+/// interpolates later, which is the whole of `docs/decisions/0060` Decision A.
+/// The scalar fold wants the pose, immediately. Having `read_from` return
+/// [`Bracket`] and `sample_from` fold it looks like the obvious way to share
+/// one body, and it is a real regression on `Plan::at`: a `Bracket` is 128
+/// bytes — as wide as its interpolating variant — and the scalar path then
+/// carries one through a `Result` on every sample of every step. Measured
+/// against `2524667`, interleaved paired runs, 9 reps, `taskset`-pinned:
+///
+/// | `lookup/*` row | `[profile.bench]` | `[profile.embedder]` |
+/// | --- | --- | --- |
+/// | `depth1/sclerp` | +2.65% | **+14.62%** |
+/// | `depth3/sclerp` | +1.52% | **+14.13%** |
+/// | `depth3/lerpslerp` | +5.56% | **+10.76%** |
+/// | `depth6/sclerp` | +2.32% | **+15.33%** |
+/// | `depth3/sclerp/exact_hit` | +7.40% | **+12.67%** |
+///
+/// `#[inline]` and `#[inline(always)]` on `read_from` move that cost between
+/// the scalar and batch paths and do not remove it; the attribute's own note
+/// carries those rows.
+///
+/// So the *return type* is the parameter. `read_from` is generic over this
+/// trait, the batch instantiates it at [`Bracket`] and the scalar path at
+/// [`Interpolated<I>`], which is 56 bytes and never builds an enum — and the
+/// search, the seqlocked slot reads and the trailing lap check stay in exactly
+/// one function, which is what `0060`'s open question 3 asked for.
+pub(crate) trait FromBracket {
+    /// A pose that needs no interpolation.
+    fn exact(p: Iso3) -> Self;
+    /// The two retained samples that bracket the query, and where it falls.
+    fn between(a: Iso3, b: Iso3, s: f64) -> Self;
+}
+
+impl FromBracket for Bracket {
+    #[inline]
+    fn exact(p: Iso3) -> Bracket {
+        Bracket::Exact(p)
+    }
+    #[inline]
+    fn between(a: Iso3, b: Iso3, s: f64) -> Bracket {
+        Bracket::Between { a, b, s }
+    }
+}
+
+/// A bracket folded at the moment it is read, under interpolation policy `I` —
+/// the scalar path's [`FromBracket`].
+pub(crate) struct Interpolated<I>(pub Iso3, PhantomData<I>);
+
+impl<I: Interp> FromBracket for Interpolated<I> {
+    #[inline]
+    fn exact(p: Iso3) -> Self {
+        Interpolated(p, PhantomData)
+    }
+    #[inline]
+    fn between(a: Iso3, b: Iso3, s: f64) -> Self {
+        Interpolated(I::eval(&a, &b, s), PhantomData)
+    }
 }
 
 /// Nanoseconds from `from` to `to` as an `f64`, for a pair the caller has
@@ -224,27 +343,91 @@ impl SampleRing<'_> {
         Ok(v)
     }
 
-    /// Sample at stamp `t` like [`Self::sample`], but resume the bracket search
-    /// from the logical index in `cursor` using an exponential (galloping) search.
+    /// Read the bracket at stamp `t`, resuming the search from `cursor`, and
+    /// return it **without interpolating**.
     ///
-    /// For a monotone non-decreasing sweep of stamps this turns the per-query
-    /// `O(log n)` binary search into `O(1)` amortized: each call gallops from the
-    /// previous result rather than restarting at the window midpoint. `cursor` is
-    /// updated to the lower bracket index found, so the next call resumes there.
-    /// Pass a `cursor` seeded to `0` for the first call.
+    /// For a monotone non-decreasing sweep of stamps the galloping resume turns
+    /// the per-query `O(log n)` binary search into `O(1)` amortized: each call
+    /// gallops from the previous result rather than restarting at the window
+    /// midpoint. `cursor` is updated to the lower bracket index found, so the
+    /// next call resumes there. Pass a `cursor` seeded to `0` for the first
+    /// call.
     ///
-    /// The result is identical to [`Self::sample`] for the same `t`; only the
-    /// search path differs.
+    /// # This is the one read body, and the lap check moved with it
+    ///
+    /// [`Self::sample_from`] is this function plus one [`Interp::eval`], and
+    /// `Plan`'s chunked batch fold is this function for a whole chunk and then
+    /// one [`Interp::eval`] per element. `docs/decisions/0060` step 2 requires
+    /// exactly that — *"`sample_from` expressed through the bracket read, so
+    /// the scalar path runs the same lap check in the same position"* — because
+    /// the alternative is a second copy of the galloping search and the seqlock
+    /// retry living beside this one.
+    ///
+    /// The trailing `head - i > retained` check sits after the slot reads and
+    /// before the return, which is where `sample_from` always had it —
+    /// `Interpolated::between` interpolates *as the bracket is built*, so on
+    /// the scalar path the check still runs after the `Interp::eval`, in the
+    /// same position, on the same values. **Nothing moved for `Plan::at`.**
+    ///
+    /// For the batch instantiation it does move, because there is no
+    /// interpolation left to put it after: `B = Bracket` stores the endpoints
+    /// and phase 2 folds them a chunk later. That is not a weakening of what
+    /// the check proves. It asks whether logical index `i` is still inside the
+    /// readable window, and the values it judges are the ones
+    /// [`Self::read_slot`](crate::buffer::SampleRing::read_slot) already copied
+    /// out; no arithmetic performed afterwards can change them. A lap that
+    /// completes strictly after the last `read_slot` returned overwrote a slot
+    /// this call had already finished with, so catching it was a false refusal,
+    /// not a save.
+    ///
+    /// **What does shrink for the batch is a probabilistic window, and it was
+    /// never a guarantee at either position.** `push` writes the slot and
+    /// *then* stores `head`. A reader that reads the freshly overwritten slot
+    /// and then loads `head` before that store lands passes the check and
+    /// returns a pose from the wrong lap — at the old position too, which
+    /// merely gave the writer one `Interp::eval` more in which to land the
+    /// store. That interleaving is this module's hazard 1 wearing different
+    /// clothes; it is open, it is documented there, and neither position
+    /// closes it.
+    ///
+    /// # `#[inline(always)]`, which `nm` decided and not a preference
+    ///
+    /// `#[inline]` is a hint and **LLVM declines it here**: built with the
+    /// plain attribute, `<SampleRing>::read_from` is still a defined symbol in
+    /// the `at_many` bench binary — phase 1 calls it once per lane, which is
+    /// exactly the site whose cost model says "too big to inline sixteen
+    /// times" — while the `lookup` binary, which calls it once, has none.
+    /// Under `#[inline(always)]` neither binary has one. That is the whole
+    /// argument, and it shows up where it should:
+    ///
+    /// | row, vs `2524667`, `[profile.bench]` | `#[inline]` | `#[inline(always)]` |
+    /// | --- | --- | --- |
+    /// | `at_many/into_mat4_1024` | −7.81% | **−17.06%** |
+    /// | `at_many/monotone_1024` | −17.70% | −19.17% |
+    /// | `at_many_recorded/mixed_at_many_1024` | −29.79% | −31.16% |
+    /// | `lookup/depth3/sclerp` | −1.12% | −0.88% |
+    /// | `lookup/depth3/sclerp/exact_hit` | −4.91% | +1.22% |
+    ///
+    /// Interleaved paired runs of three arms, 7 reps, `taskset`-pinned,
+    /// medians. The cost is ~1–2% on two scalar rows, against ~9 points on the
+    /// batch row where the hint was refused, and the refusal is a property of a
+    /// cost model that can change under the crate rather than of the code.
+    ///
+    /// **`docs/API.md` §2.3's rule is that a placement is measured, not
+    /// assumed**, and the negative result is kept here for the same reason
+    /// `Plan::fold_at_cursors` keeps its own: the obvious attribute did
+    /// something other than what it says.
     ///
     /// # Errors
     ///
     /// Identical to [`Self::sample`].
-    pub fn sample_from<I: Interp>(
+    #[inline(always)]
+    pub(crate) fn read_from<B: FromBracket>(
         &self,
         t: i64,
         policy: ExtrapPolicy,
         cursor: &mut u64,
-    ) -> Result<Iso3, LookupError> {
+    ) -> Result<B, LookupError> {
         let h = self.head.load(Ordering::Acquire);
         if h == 0 {
             return Err(LookupError::NoData { edge: self.edge });
@@ -276,16 +459,17 @@ impl SampleRing<'_> {
                 }),
                 ExtrapPolicy::Hold => self
                     .read_slot((newest & self.mask()) as usize)
-                    .and_then(|p| self.revalidated(newest, retained, p)),
+                    .and_then(|p| self.revalidated(newest, retained, p))
+                    .map(B::exact),
                 ExtrapPolicy::ConstantTwist => self
                     .constant_twist(lo_logical, newest, t, t_new)
-                    .map(|(pose, _)| pose),
+                    .map(|(pose, _)| B::exact(pose)),
             };
         }
         if t == t_new {
             *cursor = newest;
             let p = self.read_slot((newest & self.mask()) as usize)?;
-            return self.revalidated(newest, retained, p);
+            return self.revalidated(newest, retained, p).map(B::exact);
         }
 
         // Here t_old <= t < t_new, so the window endpoints already bracket `t`
@@ -295,19 +479,46 @@ impl SampleRing<'_> {
         let t_i = self.stamp_at(i);
 
         let result = if t_i == t {
-            self.read_slot((i & self.mask()) as usize)?
+            B::exact(self.read_slot((i & self.mask()) as usize)?)
         } else {
             let t_j = self.stamp_at(i + 1);
             let a = self.read_slot((i & self.mask()) as usize)?;
             let b = self.read_slot(((i + 1) & self.mask()) as usize)?;
             let s = span_ns(t_i, t) / span_ns(t_i, t_j);
-            I::eval(&a, &b, s)
+            B::between(a, b, s)
         };
 
         if self.head.load(Ordering::Acquire) - i > retained {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
         Ok(result)
+    }
+
+    /// Sample at stamp `t` like [`Self::sample`], but resume the bracket search
+    /// from the logical index in `cursor` using an exponential (galloping)
+    /// search.
+    ///
+    /// The result is identical to [`Self::sample`] for the same `t`; only the
+    /// search path differs.
+    ///
+    /// One `read_from` — the crate-private body that the batch fold also uses,
+    /// so the galloping search, the seqlocked slot reads and the trailing lap
+    /// check exist once — instantiated so that it interpolates under `I` as it
+    /// reads. The batch instantiates the same body to hand back the bracket
+    /// instead and fold it a chunk later; nothing about this call's arithmetic,
+    /// its result or the position of its lap check differs from before that was
+    /// true.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`Self::sample`].
+    pub fn sample_from<I: Interp>(
+        &self,
+        t: i64,
+        policy: ExtrapPolicy,
+        cursor: &mut u64,
+    ) -> Result<Iso3, LookupError> {
+        Ok(self.read_from::<Interpolated<I>>(t, policy, cursor)?.0)
     }
 
     /// Load the stamp at a logical index (masked to physical). Relaxed is correct:
