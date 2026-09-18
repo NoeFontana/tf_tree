@@ -82,7 +82,11 @@ compile error in the test build: `status_is_a_refusal` is a total `match` kept
 for no other purpose, because safe Rust cannot enumerate an enum and
 `HelloStatus::from_u32`'s catch-all arm absorbs a new variant without complaint.
 It lives in `#[cfg(test)]`, so it is `--all-targets` that fails and not a plain
-`cargo check`. The per-status check
+`cargo check`. A downstream crate cannot have the same prompt — `HelloStatus` is
+`#[non_exhaustive]` so that a newer owner's newer refusal keeps compiling — so
+the other half is on the wire: a status `from_u32` cannot produce never reaches
+a joining client, and the one that *can* be added and delivered is what
+`a_status_this_build_cannot_receive_needs_no_row` catches. The per-status check
 requires a table **row** rather than a mention, since the section's prose names
 two of the statuses while telling them apart from the header checks that share
 those names, and the worked example that section quotes is asserted to be
@@ -108,9 +112,11 @@ the problem.
 
 **The message now states facts and ends with its own name; the remedy moved to
 `docs/RUNBOOK.md`**, whose reader has every process in hand. The same state is
-**143 bytes** and ASCII; the widest ids those fields can carry render **164**
-(this said 158 before the sample set swept `first_pid`, and 158 was a state the
-gate did not construct).
+**143 bytes** and ASCII. The arm's range is **116 to 164**: the widest *ids* —
+a 64-bit mask and two `u32::MAX`s — render 158, and the widest rendering of all
+is 164, at **slot 0**, because `, the creator's` outweighs the nine digits a
+wide slot adds. *This said "158 at the widest", from a sweep that pinned
+`first_pid` at 4242 and measured 152.*
 The split is the point rather than the size: this type sees which lock bytes are
 held and cannot see who holds them, so it cannot tell one process holding two
 bytes from two holding one each — and a remedy that guesses is wrong in

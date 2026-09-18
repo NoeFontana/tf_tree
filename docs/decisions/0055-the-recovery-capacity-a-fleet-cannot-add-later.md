@@ -661,14 +661,17 @@ deliberately unplanned.
    step back is named with the answer.
 6. **Reduce what the `ArenaHeldButUnreachable` remedy claims. DONE,
    2026-09-18** (*Decision* part 4, and this record's own question 3).
-   **793 bytes non-ASCII → 143 bytes ASCII**, 164 at the widest ids — *this
-   read 152 until step 7, and 152 was what `samples()` measured rather than what
-   the arm can render: it swept the mask and the slot to their maxima and left
-   `first_pid` at 4242, six digits short, and never combined a wide mask with
-   slot 0, whose `, the creator's` costs more than a wide slot's nine digits.
-   The sweep and the figure are both corrected, and the correction is the
-   step-6 lesson arriving one level up: a number is only as measured as the
-   sample that produced it* — and the
+   **793 bytes non-ASCII → 143 bytes ASCII**, and 164 at the widest — which is
+   **slot 0**, not the widest ids: `, the creator's` outweighs the nine digits a
+   `u32::MAX` slot adds, and the widest ids render 158. *This read "152 at the
+   widest ids" until step 7, and 152 was what `samples()` measured rather than
+   what the arm can render: the sweep took the mask and the slot to their maxima
+   and left `first_pid` at 4242, six digits short, and never combined a wide
+   mask with slot 0. The sweep and the figure are both corrected, and the
+   correction is the step-6 lesson arriving one level up: a number is only as
+   measured as the sample that produced it — and "at the widest ids" survived
+   two rounds of correcting the number itself, which is the same sentence
+   describing a state nobody constructed.* And the
    remedy is `docs/RUNBOOK.md`'s eight-row table, indexed by the facts the
    message still prints — the mask, the lowest slot and its pid, and the
    ownership byte — and placed where the search key lands a reader rather than
@@ -789,6 +792,17 @@ deliberately unplanned.
    said "fails to compile" without the qualifier until review round 2 measured
    it. `just build` and `just lint` both pass the flag, so the gate holds.
 
+   **What the answer leaves open elsewhere, named so it is not lost.**
+   `PHASE2.md` §0.0's `shm_torture` row and §13's ASan box were both conditioned
+   on this record being answered — "ticking this box again waits on `0055`, not
+   on a re-run" — and the answer does not tick it. It says the red is not a
+   defect in the library, which leaves the harness: a torture run whose
+   population can reach zero heirs is measuring the fleet this record describes
+   rather than the code. Whether `shm_torture` should guarantee an heir at every
+   kill, so that a `POPULATION` classification becomes a real failure again, is
+   a harness decision nobody has taken. Both sites now say that instead of
+   pointing here.
+
    **Round 2 found three more gates that were narrower than their own labels**,
    and they are recorded because each is the same shape as the defect this step
    is about — a check whose name promises more than it asserts. The runbook's
@@ -804,6 +818,28 @@ deliberately unplanned.
    `contains` satisfied with one wide field. Each id is now checked on its own,
    and the widest state — slot 0, whose `, the creator's` outweighs a wide
    slot's digits — is swept beside it.
+
+   **Round 3 found six more, and one of them refuted its own suggested fix.**
+   The review asked that `tf_tree_cli`'s list be derived from a total `match`
+   over `HelloStatus` so the second crate breaks too; it cannot be, because
+   `HelloStatus` is `#[non_exhaustive]` — a downstream `match` is *required* to
+   keep compiling when a status is added, which is the same argument that makes
+   `from_u32` fold unknown codes onto `Malformed`. So the gap is closed from the
+   other side: a status the codec cannot produce cannot reach a joining client,
+   whose status always comes through `from_u32`, so a missing row is
+   unreachable. `a_status_this_build_cannot_receive_needs_no_row` guards the one
+   addition that *can* reach an operator — a variant wired into the codec — and
+   the compile-time match guards the rest. Neither is the tripwire alone; a
+   first cut of this step shipped the wire half and called it one.
+
+   The other five were figures and scopes: "164 at the widest ids" attributed
+   the worst case to the wrong state (the widest *ids* render 158; 164 is slot
+   0, where `, the creator's` outweighs a wide slot's nine digits), in two
+   documents; "nine digits short" for `4242` against a `u32`, which is six;
+   the runbook's worked example had its *values* transcribed on both sides, so
+   the format break `0032` owes would have left it quoting numbers no build
+   produces with the gate green — they come from `FORMAT_VERSION` and
+   `layout_hash()` now; and `PHASE2.md` restated this record's status.
 
    - **Verified by** the step-6 gate with the exception and
      `HANDSHAKE_REJECTED_LENGTHS` both removed, so the variant is measured with

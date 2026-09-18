@@ -710,8 +710,13 @@ mod tests {
     /// deleted it; `HelloStatus::from_u32`'s `_` arm cannot replace it, because
     /// a variant added without touching the codec compiles clean. So the prompt
     /// lives here: adding one fails to compile, and the author who fixes this
-    /// match is the author standing in front of [`ALL_STATUSES`], the runbook's
-    /// table and `tf_tree_cli`'s `runbook.rs`.
+    /// match owes an entry to [`ALL_STATUSES`], a row to the runbook's table,
+    /// and a line to `tf_tree_cli`'s `tests/runbook.rs` — which cannot have a
+    /// prompt of its own, because `HelloStatus` is `#[non_exhaustive]` and a
+    /// downstream `match` is required to keep compiling when a status is added.
+    ///
+    /// It is in `#[cfg(test)]`, so `cargo check -p tf_tree_ipc` still passes and
+    /// `--all-targets` is what fails. `just build` and `just lint` pass it.
     fn status_is_a_refusal(status: crate::wire::HelloStatus) -> bool {
         use crate::wire::HelloStatus as H;
         match status {
@@ -1111,6 +1116,51 @@ mod tests {
         }
     }
 
+    /// **A status this build cannot receive needs no runbook row**, which is
+    /// what closes the gap `status_is_a_refusal` leaves.
+    ///
+    /// That match is a compile error *in this crate*, and nothing downstream can
+    /// have one — `HelloStatus` is `#[non_exhaustive]` on purpose. So a variant
+    /// could in principle be added, that one match fixed, and
+    /// `tf_tree_cli`'s list and the runbook's table left behind. The reason that
+    /// is harmless is on the wire rather than in the type: a joining client's
+    /// status comes from `HelloResponse::from_bytes`, therefore from
+    /// `HelloStatus::from_u32`, which folds every code it has no name for onto
+    /// `Malformed`. A variant that codec cannot produce never reaches a client,
+    /// so no operator ever follows `(HandshakeRejected)` to a row that is not
+    /// there.
+    ///
+    /// **So this test guards the one addition that can reach an operator**: a
+    /// status wired into the codec. `from_u32` answering anything but
+    /// `Malformed` for the first unused value means exactly that, and the
+    /// failure names what is owed.
+    ///
+    /// *A first cut of step 7 had this test and not the match, and called it
+    /// the tripwire for a new status; it is half of one, and the half that
+    /// fires later.*
+    #[test]
+    fn a_status_this_build_cannot_receive_needs_no_row() {
+        use crate::wire::HelloStatus as H;
+        // The named codes each round-trip to themselves, so none of them is a
+        // fallback.
+        let mut v = 0u32;
+        for status in ALL_STATUSES {
+            assert_eq!(status.as_u32(), v, "{status:?} is not wire value {v}");
+            assert_eq!(H::from_u32(v), status, "wire value {v} lost its status");
+            v += 1;
+        }
+        // `v` is now the first value past the list, which is the one a new
+        // status would take.
+        assert_eq!(
+            H::from_u32(v),
+            H::Malformed,
+            "the first unused wire value decodes to a status of its own, so `HelloStatus` \
+             grew and the codec can now deliver it: give it a row in docs/RUNBOOK.md's \
+             `HandshakeRejected` section, an entry in ALL_STATUSES here and in \
+             tf_tree_cli's tests/runbook.rs, and an arm in `status_is_a_refusal`"
+        );
+    }
+
     /// **The facts each `ArenaHeldButUnreachable` state prints** — the remedy is
     /// `docs/RUNBOOK.md`'s (`0055` part 4, step 6).
     ///
@@ -1139,7 +1189,7 @@ mod tests {
         // **The widest state needs the pid too, and that is why it is a second
         // closure.** `samples()` carried the same defect until step 7: it swept
         // the mask and the slot to their maxima, left `first_pid` at 4242 —
-        // nine digits short — and its label said *widest*. The figure that came
+        // six digits short — and its label said *widest*. The figure that came
         // out was 152, and the arm renders 164. A label is not a measurement.
         let held_wide = |slots: u64, first: Option<u32>, owned: bool| {
             IpcError::ArenaHeldButUnreachable {

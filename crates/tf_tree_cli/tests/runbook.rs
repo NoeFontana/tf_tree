@@ -28,6 +28,32 @@
 
 use tf_tree::{HelloStatus, IpcError};
 
+/// Every `HelloStatus`.
+///
+/// **A total `match` here is impossible, and that is deliberate rather than an
+/// oversight.** `HelloStatus` is `#[non_exhaustive]`, because a newer owner may
+/// refuse for a reason this build has no name for and a downstream `match` must
+/// keep compiling when one is added — the same argument that makes
+/// `HelloStatus::from_u32` fold every unknown code onto `Malformed`. So the
+/// compile-time prompt for a new status cannot live in this crate; it is
+/// `status_is_a_refusal` in `tf_tree_ipc`'s `error.rs`, whose doc names this
+/// list among the things its author then owes an entry.
+///
+/// What covers the gap from *here* is on the wire:
+/// `a_status_this_build_cannot_receive_needs_no_row` in that same module. A
+/// variant `from_u32` does not produce cannot arrive in a `HelloResponse`, so a
+/// client never renders it and no operator ever follows a search key to a
+/// missing row.
+const ALL: [HelloStatus; 7] = [
+    HelloStatus::Ok,
+    HelloStatus::VersionMismatch,
+    HelloStatus::LayoutMismatch,
+    HelloStatus::BootIdMismatch,
+    HelloStatus::NoParticipantSlots,
+    HelloStatus::ModeNotPermitted,
+    HelloStatus::Malformed,
+];
+
 /// `docs/RUNBOOK.md`'s `HandshakeRejected` section.
 fn section() -> &'static str {
     const RUNBOOK: &str = include_str!("../../../docs/RUNBOOK.md");
@@ -75,14 +101,8 @@ const REMEDY_FLOOR: usize = 60;
 fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     let section = section();
 
-    for status in [
-        HelloStatus::VersionMismatch,
-        HelloStatus::LayoutMismatch,
-        HelloStatus::BootIdMismatch,
-        HelloStatus::NoParticipantSlots,
-        HelloStatus::ModeNotPermitted,
-        HelloStatus::Malformed,
-    ] {
+    // Every status but the acceptance, which is not a refusal and has no row.
+    for status in ALL.into_iter().filter(|s| *s != HelloStatus::Ok) {
         // A **row**, not a mention: the section's prose names `VersionMismatch`
         // and `LayoutMismatch` while distinguishing them from the
         // header-validation checks that share those names, so a `contains` over
@@ -123,10 +143,14 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     // **The worked example is the real rendering.** A quoted message is the
     // shape that drifts; this repository has corrected one figure across three
     // documents more than once.
+    // **The values are the build's, not a second transcription.** A first cut
+    // hard-coded `3` and `0x3D104195` on both sides, so the format break `0032`
+    // already owes would have left the runbook quoting numbers no build
+    // produces with this assertion green.
     let example = IpcError::HandshakeRejected {
         status: HelloStatus::LayoutMismatch,
-        owner_format_version: 3,
-        owner_layout_hash: 0x3D10_4195,
+        owner_format_version: tf_tree_arena::header::FORMAT_VERSION,
+        owner_layout_hash: tf_tree_arena::layout::layout_hash(),
     }
     .to_string();
     assert!(
@@ -142,15 +166,7 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
             "docs/RUNBOOK.md's `HandshakeRejected` section no longer says {word:?}, which \
              the message is forbidden to say: the remedy is in neither place"
         );
-        for status in [
-            HelloStatus::Ok,
-            HelloStatus::VersionMismatch,
-            HelloStatus::LayoutMismatch,
-            HelloStatus::BootIdMismatch,
-            HelloStatus::NoParticipantSlots,
-            HelloStatus::ModeNotPermitted,
-            HelloStatus::Malformed,
-        ] {
+        for status in ALL {
             let text = IpcError::HandshakeRejected {
                 status,
                 owner_format_version: u32::MAX,
