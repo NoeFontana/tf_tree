@@ -765,10 +765,20 @@ deliberately unplanned.
    `docs/RUNBOOK.md` with `include_str!` and requires a table **row** per
    refusal status (a `contains` over the section is satisfied for two of the six
    by the prose that tells them apart from the header checks sharing their
-   names), requires those rows to carry the remedy words the message is
-   forbidden to carry — the two halves keep each other honest — and requires the
-   section's worked example to be `Display`'s own output rather than a
-   transcription of it.
+   names), holds each row's remedy cell to a length floor, requires the
+   *section* to carry the remedy words the message is forbidden to carry — the
+   two halves keep each other honest — and requires the section's worked example
+   to be `Display`'s own output rather than a transcription of it.
+
+   **Section-wide and not per row, which two sentences here claimed until round
+   9.** Per row is the stronger rule and it is refused on purpose: measured,
+   `Malformed`'s remedy carries none of the five words, and the only way to pass
+   a per-row rule would be to write one into prose that does not want it. A gate
+   that edits the text to satisfy itself is worse than one that checks less, and
+   the length floor is what holds a single row to account. *The review that
+   raised this proposed the per-row move on the grounds that "every current row
+   carries at least one"; that is false of `Malformed`, which is why the
+   documents moved and the check did not.*
 
    **It lives in `tf_tree_cli` and not beside the type, and that is not a
    preference.** `tf_tree_ipc` is published, and `cargo package` does not put a
@@ -809,7 +819,9 @@ deliberately unplanned.
    is about — a check whose name promises more than it asserts. The runbook's
    remedy words were required *of the section* and not of the row, so blanking a
    remedy cell passed with the row still present; a row's *what to do* cell now
-   has a floor, and blanking or stubbing one fails. The section's end bound
+   has a floor, and blanking or stubbing one fails. (The words stayed
+   section-wide — see above — so a cell can still be replaced by *other* prose
+   of the same length. The floor is what a row owes.) The section's end bound
    stopped only at `###`, so a `HandshakeRejected` section that ever became the
    last one under its chapter would have swallowed the rest of the runbook and
    every `contains` in that test would have held vacuously. And
@@ -863,9 +875,19 @@ deliberately unplanned.
    rejection to name *both* sides' values, and this arm prints one.** §3.7 is
    explicit — "Each must name both sides' values", and for `LayoutMismatch`
    "**The message must say exactly that** and print both hashes". The arm has
-   only ever carried the owner's, so the divergence predates this step; what
-   this step did was assert the opposite in three places, citing §3.7 as the
-   reason the owner's numbers are there.
+   only ever carried the owner's, so **the hash half of the divergence predates
+   this step** — and the sentence quoted above has two clauses, which an earlier
+   revision of this bullet ran together. *"The message must say exactly that"*
+   was satisfied until this step: `rejection_advice(LayoutMismatch)` said "same
+   version, different record layout: this binary was built against a different
+   arena layout than the running owner". **This step deleted that clause's
+   satisfaction and moved it to the runbook row**, which is the shape `0059`
+   settled for the sibling `ShmError::LayoutMismatch` — and `0059` already flags
+   this same §3.7 sentence as stale for that variant (its *Decision* 4 note). So
+   the behaviour is consistent with an `implemented` convention and §3.7 has an
+   erratum owed on both clauses, not one. What this step also did was assert the
+   opposite in three places, citing §3.7 as the reason the owner's numbers are
+   there.
 
    **Why it is not step 7's to fix.** `tf_tree_ipc`'s dependencies are `rustix`
    and `libc`, so it cannot read this build's `FORMAT_VERSION` or

@@ -114,6 +114,17 @@ fn section() -> &'static str {
 /// pairing that keeps either half honest: a forbidden list nobody would ever
 /// write is vacuous, and a row can be checked for existing without being
 /// checked for saying anything.
+///
+/// **Section-wide, and deliberately not per row.** Per row would be the
+/// stronger rule and it is refused because it would dictate vocabulary:
+/// measured, `Malformed`'s remedy — *confirm both sides are the same release
+/// before reading this as corruption* — carries none of these five, and the
+/// only way to pass would be to write one in. A gate that edits prose to
+/// satisfy itself is worse than one that checks less. What holds a single row
+/// to account is [`REMEDY_FLOOR`], which is a length and says nothing about
+/// wording. Two documents described this check as per-row until round 9; they
+/// were corrected rather than the check, because the check is the defensible
+/// one.
 const REMEDY_WORDS: [&str; 5] = ["rebuild", "restart", "read-only", "/proc", "doctor"];
 
 /// The shortest a row's *what to do* cell may be.

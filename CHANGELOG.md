@@ -62,12 +62,19 @@ makes: the handshake statuses are the *owner's* comparison against an attach
 request, decided before this process ever saw a segment.
 
 **`PHASE2.md` §3.7 asks a rejection to name *both* sides' values and this arm
-prints one.** That is older than this change — `tf_tree_ipc` depends on `rustix`
-and `libc`, so it cannot read this build's `layout_hash()` — and it is recorded
-in `0055` step 7 rather than fixed here, because closing it means new fields on a
-published crate's error type. The remedy is unaffected; the runbook now says
-which build to read the second number from, since `tf_tree doctor` prints the
-CLI's own and that is a third value.
+prints one.** The hash half is older than this change — `tf_tree_ipc` depends on
+`rustix` and `libc`, so it cannot read this build's `layout_hash()` to print
+beside the owner's — and closing it means new fields on a published crate's
+error type, so it is recorded in `0055` step 7 rather than fixed here. §3.7's
+other clause for `LayoutMismatch`, that the message "must say exactly that",
+*was* satisfied and moved to the runbook row in this change — which is the shape
+`0059` settled for the sibling `ShmError::LayoutMismatch`, and that record
+already calls this same §3.7 sentence stale for it. §3.7 has an erratum owed on
+both clauses.
+
+The remedy is unaffected either way; the runbook now says which build to read
+the second number from, since `tf_tree doctor` prints the CLI's own and that is
+a third value.
 
 **Writing those rows found two of them false.** The `BootIdMismatch` remedy said
 the arena had "outlived a reboot" and should be removed. A serving owner is
@@ -87,8 +94,9 @@ from the status names.
 Both halves are gated. No rendering may name a status it did not get, which is
 the original defect of this arm made unexpressible; each of the owner's two
 numbers is asserted with the label that says which one it is; the runbook section must
-carry a row per refusal status and those rows must contain the remedy words the
-message is forbidden to contain; and a new `HelloStatus` trips a wire-value
+carry a row per refusal status, each row's remedy cell must clear a length
+floor, and the section must carry the remedy words the message is forbidden to
+carry — section-wide, because requiring them per row would dictate vocabulary; and a new `HelloStatus` trips a wire-value
 compile error in the test build: `status_is_a_refusal` is a total `match` kept
 for no other purpose, because safe Rust cannot enumerate an enum and
 `HelloStatus::from_u32`'s catch-all arm absorbs a new variant without complaint.
