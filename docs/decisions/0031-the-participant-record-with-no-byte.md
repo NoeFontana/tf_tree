@@ -1,8 +1,11 @@
 # 0031: the participant record with no byte
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** none. This record authorises nothing.
+**Implementation:** *Implementation plan* below — one PR. **Decided 2026-09-18,
+on the owner's delegation**: question 2 is answered *out of contract*, which
+selects the small branch this record predicted for that answer, and questions 3
+and 4 are answered with it.
 
 ## Context
 
@@ -90,7 +93,101 @@ close it too.
 
 ## Decision
 
-**None yet.** `draft`. The two shapes on the table, neither costed:
+**A served `build_shared` arena is out of contract.** Question 2 is the one this
+record said had to be answered by the owner because it selects between two very
+different sizes of fix; answered that way, the fix is the small one this record
+already described — *"a refusal plus a sentence in the docs"* — with one
+correction to that phrasing, in part 2.
+
+### 1. Why out of contract, on evidence rather than preference
+
+**The composition is a hand-assembled half of a path that already exists.**
+`tf_tree_c`'s bridge states the whole argument in code, and it was written
+without this record in view (`crates/tf_tree_c/src/bridge.rs`, *Why
+`tf_tree::Open` and not `TreeBuilder::build_shared`*): `build_shared` "publishes
+no rendezvous … the fd is the capability", and **the path that publishes is
+`Open::open`'s `Created` arm, which is `build_shared` *plus* OFD liveness, claim
+leases, the owner server and ownership**. Serving a `build_shared` arena by hand
+is that composition with the OFD-liveness half left out — and every consequence
+question 1 measured is a consequence of leaving it out. The project already had
+its answer; it was in a rustdoc rather than a record.
+
+**Nothing composes it, measured now rather than quoted from the draft.** `rg`
+over every `build_shared` call in the workspace: `tf_tree_bench`'s `backing.rs`,
+`workload.rs`, `mp_bench`, `attach_bench`, `shm_scaling`, `tests/population.rs`,
+`tests/multiprocess.rs`, and `tf_tree_cli`'s `replay_bit_identity.rs` — all pass
+the fd directly and stand up no rendezvous. The **only** composition of
+`build_shared` with `OwnerServer` in the tree is
+`a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`, the
+test this record's measurement is written from, which stages the shape on
+purpose.
+
+**And it reaches neither binding — question 3, answered by checking.**
+`tf_tree_py` exposes exactly one shared path, `open_arena`, which is
+`tf_tree::Open`; `build_shared` appears nowhere in `crates/tf_tree_py/src/`. In
+`crates/tf_tree_c/src/` it appears only in the two doc comments quoted above and
+in `unstable.rs`'s note about a byte-less participant. So the shape is reachable
+only by a Rust caller who composes two public APIs that no shipped path composes,
+and the answer costs no binding a capability it has.
+
+### 2. What that selects, and the correction to "a refusal plus a sentence"
+
+**The refusal cannot be mechanical, because there is nowhere to put it.** This
+record's own third option — *refuse `build_shared` on an arena that will be
+served* — is unexpressible at `build_shared`, which cannot know whether a server
+will later be bound over its fd; that much the draft already says. What the draft
+did not check is the other end: **`tf_tree_ipc` cannot express it either.**
+`OwnerServer::bind_at` takes a `SegmentDescriptor` — `format_version`,
+`layout_hash`, `arena_size`, `instance_uuid`, `boot_id` — and `serve` takes a
+`BorrowedFd`, and the crate's dependencies are `rustix` and `libc` and nothing
+else, so neither can map a participant table to see the absent byte. A refusal
+there would need `tf_tree_arena` on a crate that deliberately has no arena
+dependency, which is a larger change than the defect.
+
+So the answer is **prose plus a characterisation test**, and the second half is
+what keeps it from being only prose: the shape stays *executed*, with its
+consequences asserted, so the boundary cannot rot into a sentence nobody runs.
+That is the same reason `PHASE2.md` §0.0's false claim survived three days —
+this record's own measurement section says it: *"what let it survive is that
+nobody executed it."*
+
+### 3. Why step 0b closed two byte-less entry points and this answer closes the third differently
+
+This record requires that of whatever it decides, and the answer is that the
+three are not the same shape.
+
+`attach_shared(ReadWrite)` and `attach_shared_at(ReadWrite, slot)` attach to an
+arena **somebody else created and may be serving**. A byte-less `LIVE` record
+appears in a table that probe-carrying observers are already looking at, so the
+wrong opinion is available the moment the record exists, and the only way to stop
+it is to refuse the call — which is what step 0b did, breaking the API to do it.
+
+`build_shared` creates an arena whose **fd is the capability** and which nothing
+can find by name. Unserved — every composition in this workspace — there is no
+rendezvous, no lock file, and therefore no observer holding a probe: the record
+is byte-less and *unobserved*, which is not a defect but the design
+(`PHASE2.md` §3.2). What makes the opinion available is binding a rendezvous over
+it afterwards, and that is a **second call by the same caller**, not a property
+of `build_shared`.
+
+So step 0b refused the calls whose defect is intrinsic, and this answer refuses
+the **composition** whose defect is not in either call. That is also why the
+refusal is not mechanical: the defect belongs to a pair of calls, and neither
+member can see the other.
+
+### 4. What is *not* decided, and must not be read into this
+
+Options 1 and 2 are **not taken and not refused** — they are moot, because both
+buy a way to judge a byte-less record and this answer says the arena that
+produces one is not a shape to support. If question 2 is ever reopened by a
+measured field need, both are still on the table at the cost the draft records.
+
+**Question 4 does not count for anything here.** Option 1 would have closed #201
+as a side effect; option 1 is not taken, so #201 is untouched and keeps its own
+narrower fix. The draft warned against double-counting that argument and this is
+where the warning applies.
+
+### The two shapes that are now moot, kept for a reopening
 
 1. **Give the record a byte.** `build_shared` acquires a lock file and a byte, or
    registers no record until something does. Keeps the predicate as `0028` left
@@ -229,7 +326,11 @@ will later be bound over it.
    drop each round, which *releases* the claim, so rounds 2–4 reaped 0 and the
    run read as "safe after the first eviction". Both were caught only by having a
    stage with a known-good expected value in it.
-2. **Is a served `build_shared` arena a shape this project supports at all?**
+2. **ANSWERED 2026-09-18: no — out of contract. *Decision* parts 1 and 3.**
+   The question is kept in full below rather than collapsed, because a
+   reopening needs the framing that made it a scope decision.
+
+   **Is a served `build_shared` arena a shape this project supports at all?**
    `0028:1113` calls `build_shared` "a supported shape — it is how an arena gets
    created", but every composition of it in this workspace
    passes the fd directly and stands up no rendezvous — `mp_bench`, `attach_bench`,
@@ -237,21 +338,78 @@ will later be bound over it.
    record's answer is a refusal plus a sentence in the docs, and it is small. If
    it is in contract, it is option 1 or 2 above. **Nothing currently says which**,
    and that ambiguity is the reason this is a record rather than a patch.
-3. **Does the same hole reach `tf_tree_c` or `tf_tree_py`?** Both bind the Rust
-   core directly. Whether either exposes a byte-less read-write registration was
-   not checked.
-4. **What happens to `#201` if option 1 is taken?** Giving every registration a
+3. **ANSWERED 2026-09-18 by checking: no.** ~~Does the same hole reach
+   `tf_tree_c` or `tf_tree_py`? Both bind the Rust core directly. Whether either
+   exposes a byte-less read-write registration was not checked.~~
+
+   `tf_tree_py` reaches a shared arena through exactly one function,
+   `open_arena`, which is `tf_tree::Open`; `build_shared` appears nowhere in
+   `crates/tf_tree_py/src/`. In `crates/tf_tree_c/src/` it appears only in
+   `bridge.rs`'s *Why `tf_tree::Open` and not `TreeBuilder::build_shared`* and
+   in `unstable.rs`'s note about a byte-less participant — no entry point
+   registers one. **This is load-bearing for the answer above**: had either
+   binding exposed the shape, "out of contract" would have been a much harder
+   position, because it would have meant withdrawing a capability a shipped
+   binding already had.
+4. **MOOT 2026-09-18: option 1 is not taken.** *Decision* part 4 says why this
+   must not be counted as an argument for anything.
+
+   **What happens to `#201` if option 1 is taken?** Giving every registration a
    byte by construction would make the two indices one number and close #201 as a
    side effect, which is an argument for option 1 that has nothing to do with this
    record's own defect. It should not be double-counted: #201 also has its own
    narrower fix.
 
-## What would make this `ready`
+## What made this `ready`
 
-- Question 1 answered by a measurement, not by reading the claim path.
-- Question 2 answered by the owner, because it is a scope decision rather than an
-  engineering one, and it selects between two very different sizes of fix.
-- Whichever option is chosen, the §11.2 or §11.3 walk that D15 makes it owe.
+- ~~Question 1 answered by a measurement, not by reading the claim path.~~
+  **Done 2026-08-22**, and the measurement is what sets the severity: D7 holds
+  and no data is corrupted, but a byte-less publisher cannot keep an edge in the
+  presence of a sweeper, and the participant table stops uniquely identifying a
+  process.
+- ~~Question 2 answered by the owner.~~ **Done 2026-09-18, on delegation:** out
+  of contract.
+- ~~Whichever option is chosen, the §11.2 or §11.3 walk that D15 makes it owe.~~
+  **Not owed by this answer.** D15 makes a *mutation protocol* walk the crash
+  matrix; this answer adds no protocol and changes no code path. What it owes
+  instead is that the shape stay executed, which is step 2 of the plan.
+
+## Implementation plan
+
+**One PR.** The answer changes no code path, so what it ships is where the
+boundary is written and what keeps it measured.
+
+1. **Say it where the call is.** `TreeBuilder::build_shared`'s rustdoc gains the
+   boundary: this creates an arena whose fd is the capability, and **binding a
+   rendezvous over it is out of contract**, with the reason (the byte-less record
+   no observer can judge) and a pointer here. `PHASE2.md` §3.2 — where *the fd is
+   the capability* is stated — gains the same sentence, because that is the
+   section a reader consults for this property rather than a rustdoc.
+   - **Verified by** `just doc`, and by `rg 'build_shared' docs/ crates/` finding
+     no other site that describes the shape as supported.
+2. **Keep it executed.** `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
+   says of itself *"It pins the defect, not the fix. When `0031` is answered this
+   test flips, and each `PIN:` message says which way."* This is the answer, so
+   it flips: from a defect pinned pending a decision to a **characterisation of
+   an unsupported composition**, asserting the same observable facts with the
+   `PIN:` messages restated as what the boundary costs. The assertions do not
+   change — the behaviour does not change — only what the test claims about it.
+   - **Verified by** the test still passing unmodified in substance, and by the
+     mutant the test already documents (`reap_participants` counting the verdict
+     without calling `reclaim`) still failing it.
+3. **Remove the ledger row.** `PROJECT.md` §5.1 carries *"`0031`'s question |
+   `0031` (`draft`) | Queued only if `0031` is answered by giving a byte-less
+   participant record something to be judged by"*. It is not, so the row goes —
+   and by that ledger's own rule, *"Adding a row is not a decision; removing one
+   is"*, which is why the removal belongs to this record and not to a tidy-up.
+   - **Verified by** `just lint`'s `artifact-versions`, which holds every table
+     row to its header's cell count.
+4. **Update `decisions/README.md`'s row** to say what was decided, per that
+   file's rule that it records the decision and never restates a status.
+
+**Stop point:** if step 1 cannot state the boundary without also describing a
+mechanism that does not exist, the answer is being written as though it were
+enforced, and the wording is wrong rather than the decision.
 
 ## Not in this record
 

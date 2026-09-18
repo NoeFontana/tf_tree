@@ -199,10 +199,11 @@ When a cargo feature is compiled out, the arena *regions* it would use stay decl
 
 **Nothing in this table is authorised.** An entry here means *this is where the argument goes when the break is scheduled*, not *this ships in it*. Adding a row is not a decision; removing one is.
 
+*One row has been removed: [`0031`](./decisions/0031-the-participant-record-with-no-byte.md)'s question, queued only if that record were answered by giving a byte-less participant record something to be judged by. It was answered on 2026-09-18 the other way — a served `build_shared` arena is out of contract — so no arena byte is wanted and the row had nothing to hold. Recorded here because removing a row is a decision by the rule above.*
+
 | Entry | Source | Why it is queued |
 |---|---|---|
 | Phase 6's spline region | `PHASE5.md` §1.2, [`0009`](./decisions/0009-descoping-phase-6.md) (Rationale, *B-splines*) | The entry §1.2 was written for: a spline *region* is a region, and no region slot is reserved. `0009` cuts the other way and is worth reading before this row is treated as certain — *"a spline evaluation needs a wider bracket read, not a new region shape. Its reserved header fields are therefore earned and stay."* Nobody has designed Phase 6, so whether this entry is a region at all is open. What is not open is that if it is one, it costs a `FORMAT_VERSION`. |
-| [`0031`](./decisions/0031-the-participant-record-with-no-byte.md)'s question | `0031` (`draft`) | Queued only if `0031` is answered by giving a byte-less participant record something to be judged by. `0031` is `draft` and authorises nothing, so this row is contingent on that record, not on this ledger. |
 | An `EdgeMeta` provenance byte | no record | **No record argues for it or against it.** It is listed so that a future request has somewhere to be argued rather than an absence to read as an oversight; a row here is not the record such a request would still need. |
 
 
