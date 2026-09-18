@@ -61,9 +61,9 @@ neither the C nor the Python binding can reach it.
 Nothing changes in behaviour. `reclamation_verdict`'s rustdoc said the question
 was "being decided"; it now says what was decided and why nothing here changes
 because of it, and `Tree::participant_slot`'s says that the peer which could hold
-the wrong opinion only exists in the composition that is out of contract. The advisory in 0.0.4's entry and in `PHASE2.md` §0.0 is
-**permanent, not lifted** — both said "until `0031` is answered", which after an
-answer reads as expired.
+the wrong opinion only exists in the composition that is out of contract. The
+advisory in 0.0.4's entry and in `PHASE2.md` §0.0 is **permanent, not lifted** —
+both said "until `0031` is answered", which after an answer reads as expired.
 
 ### Fixed — attach refusals did not fit the C ABI's message buffer (`0055` step 7)
 
@@ -3568,8 +3568,12 @@ same shape one layer up. Each has a home; none is a surprise waiting to be found
   deployment that passes `Tree::shared_fd` to children and stands up no
   rendezvous: no peer there carries a probe. *This said "Nothing in this
   workspace composes it the affected way", and it was false when it shipped:
-  three tests in `crates/tf_tree/tests/rendezvous.rs` compose it on purpose and
-  predate this tag. What is true is that **no shipped path** does.* **Do not call `Tree::reap_participants` in a process
+  `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
+  composes it on purpose and is in the tree at this tag. (The other two tests
+  that compose it landed later the same day. *An earlier revision of this
+  erratum said "three tests … predate this tag", replacing one wrong count with
+  another — `git grep` at `v0.0.4` finds one.*) What is true is that **no
+  shipped path** composes it.* **Do not call `Tree::reap_participants` in a process
   tree where anything served a `build_shared` arena by hand.** *This read "until
   `docs/decisions/0031` is answered"; it was answered on 2026-09-18, and the
   answer is that **serving a `build_shared` arena is out of contract** — so the

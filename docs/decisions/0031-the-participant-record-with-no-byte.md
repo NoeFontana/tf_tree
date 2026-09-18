@@ -20,10 +20,10 @@ That sentence is false of one call, and the call is `pub`:
 `TreeBuilder::build_shared` registers a `LIVE` participant record
 (`register_participant`, `crates/tf_tree/src/tree.rs`) and takes **no lock
 byte**, because such an arena has no lock file at all — the fd is the capability
-(`docs/PHASE2.md` §3.1 — *this cited §3.2 until 2026-09-18, which is
-*Identity and defaults*; the phrase "the fd is the capability" appears nowhere in
-`PHASE2.md`, and §3.1 is the section that states the sharing boundary this arena
-sits outside*). So the arena can contain a `LIVE` record over a
+(`docs/PHASE2.md` §3.1 — *this cited §3.2 until 2026-09-18; that section is
+"Identity and defaults", the phrase "the fd is the capability" appears nowhere in
+`PHASE2.md`, and §3.1 is the section stating the sharing boundary this arena sits
+outside*). So the arena can contain a `LIVE` record over a
 permanently free byte, and every reclaimer `0028` shipped reads that as *dead*.
 
 This is not #201. #201 is a byte and a record with **different indices**;
@@ -131,7 +131,7 @@ gets a different answer than the record — the failure this project keeps havin
 with enumerations.
 
 *No line numbers in this section. The first version had them, and **this PR's own
-rustdoc edit to `open.rs` moved every one by six lines** — a citation invalidated
+rustdoc edit to `open.rs` moved every one by seven lines** — a citation invalidated
 by the commit that wrote it. The round-4 sweep that says so **left two**, and a
 round-5 edit to a test's doc comment moved both: the announcement of the fix was
 itself incomplete, which is why this note now names that too.*
@@ -166,8 +166,9 @@ a reader can re-run.*
 **And it reaches neither binding — question 3, answered by checking.**
 `tf_tree_py` exposes exactly one shared path, `open_arena`, which is
 `tf_tree::Open`; `build_shared` appears nowhere in `crates/tf_tree_py/src/`. In
-`crates/tf_tree_c/src/` it appears only in the two doc comments quoted above and
-in `unstable.rs`'s note about a byte-less participant. So the shape is reachable
+`crates/tf_tree_c/src/` it appears in two doc comments only — `bridge.rs`'s
+*Why `tf_tree::Open` and not `TreeBuilder::build_shared`*, quoted above, and
+`unstable.rs`'s note about a byte-less participant. So the shape is reachable
 only by a Rust caller who composes two public APIs that no shipped path composes,
 and the answer costs no binding a capability it has.
 
@@ -543,7 +544,7 @@ it.
   `Tree::participant_slot`'s. Each correction restated a closed count and the
   next round found one more.
 - **Line citations were invalidated by the commit that wrote them.** A rustdoc
-  edit in this branch moved `open.rs`'s by six lines; the sweep that de-numbered
+  edit in this branch moved `open.rs`'s by seven lines (`git diff --numstat main...HEAD`); the sweep that de-numbered
   them left two, which a later edit moved as well. The section cites symbols now
   — **and a symbol goes stale the same way**: the record quoted
   `self.claim_lock`, a field `0029` renamed to `lock_file`, and the de-numbering
@@ -554,6 +555,10 @@ it.
   call. The composition the ruling rests on is unchanged; the sequence written
   down was not the sequence.
 
+- **A fix reported as landed had not been written.** Round 4's commit message
+  says the nested emphasis in the §3.1 erratum was closed; the script that made
+  that edit threw before writing the file, and the nesting survived four more
+  rounds. A commit message is not a gate.
 - **And a correction inverted the thing it corrected.** `Tree::participant_slot`'s
   rustdoc carries a guard naming the symbols that must *not* become intra-doc
   links, because linking a `shm`-gated name reddens `just stable-tier-check` on

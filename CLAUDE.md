@@ -43,11 +43,12 @@ over the README, and over this file.
   the owner's hangup callback now revokes a dead participant's **claims**, not
   only its record, so a restarted publisher granted its predecessor's slot can
   take its own edges back. **Two producers of a stale claim remain and have no
-  hangup**: a dead owner, and a `build_shared` participant with no socket — the
-  second **only in a composition [`0031`](./docs/decisions/0031-the-participant-record-with-no-byte.md)
-  answered *out of contract* on 2026-09-18, since its claim can go stale to
-  another process only through the rendezvous or the `ReadWrite` fd-attach
-  `0028` step 0b refuses.
+  hangup**: a dead owner, and a `build_shared` participant with no socket. **The
+  second exists only in a composition that
+  [`0031`](./docs/decisions/0031-the-participant-record-with-no-byte.md) answered
+  *out of contract* on 2026-09-18**: such a claim can go stale to another process
+  only through the rendezvous, or through the `ReadWrite` fd-attach that `0028`
+  step 0b refuses. The dead owner is in contract and unchanged.
 - **Phase 4: implemented except** §5.9 affinity knobs and §6.3 replay rows. C ABI
   and C++ wrapper frozen; ROS 2 ingest bridge done. §1's operational exit
   criterion is **open and not satisfiable by code**.

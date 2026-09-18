@@ -3859,12 +3859,14 @@ fn a_read_only_tree_reaps_no_participant_records() {
 /// `Tree::reap_participants`. **No shipped path composes them this way** — the
 /// only `build_shared` calls in the workspace that stand a **rendezvous** up
 /// without a lock file are this test and the `byteless_served_arena()` helper
-/// the other two use, both on purpose — which is why running the suite never
-/// found it: the benches and
-/// examples that call `build_shared` pass the fd directly and stand up no
-/// rendezvous, so no probe-carrying observer exists in them to hold the wrong
-/// opinion. *This read "Nothing in this workspace composes them this way",
-/// written inside one of the two call sites that do.*
+/// the other two use, both on purpose. **Everything else that calls
+/// `build_shared` — benches, examples and eight other tests — stands up no
+/// rendezvous at all**, so no probe-carrying observer exists in them to hold the
+/// wrong opinion, which is why the suite went on passing while `PHASE2.md`
+/// §0.0's claim was false. *This read "Nothing in this workspace composes them
+/// this way", written inside one of the two call sites that do; and its
+/// replacement blamed "the benches and examples", when eight of the sixteen
+/// unserved call sites are tests and both staging sites are in this file.*
 ///
 /// **Mutant, run rather than asserted.** `Tree::reap_participants` counting the
 /// verdict without calling `ParticipantTable::reclaim`:
