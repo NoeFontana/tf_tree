@@ -852,6 +852,25 @@ deliberately unplanned.
    the compile-time match guards the rest. Neither is the tripwire alone; a
    first cut of this step shipped the wire half and called it one.
 
+   **Owed, and found in round 13: `IpcError::RejectionCarriedFd` is the third
+   arm that carries a `HelloStatus` and is outside everything this step built.**
+   It is the sibling one line below in the same `match` — an owner that refuses
+   an attach and sends a segment fd anyway, which is an owner bug and therefore
+   exactly when an operator reaches for a runbook. Its rendering has no
+   `(RejectionCarriedFd)` search key and `docs/RUNBOOK.md` has no section for
+   it, so there is nothing to grep and nothing to land on. The substance is
+   currently fine — it names no foreign status — and **the gate now holds it
+   there**, renamed `both_rejection_arms_name_only_the_status_they_carry`
+   because the old name promised every rejection and covered one. The search key
+   and the row are a third variant's worth of this step's work and are not taken
+   here; they are the natural next slice if `IpcError` is brought fully under
+   `0059` convention (g).
+
+   Also round 13: the **public** doc on `HandshakeRejected` pointed at
+   `MESSAGE_BUDGET` "below" for the 35-byte bridge prefix. That constant is
+   `#[cfg(test)]`, so a docs.rs reader of a published crate followed it to
+   nothing; it cites `0059`'s *Rationale*, which is where the figure comes from.
+
    **Round 12: a producer list wrong one revision after being corrected, and a
    budget claim true of five statuses out of seven.** The `ModeNotPermitted`
    cell said "a rejection has exactly two sources". There are three —

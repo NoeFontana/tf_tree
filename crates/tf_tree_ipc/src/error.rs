@@ -352,9 +352,14 @@ pub enum IpcError {
     /// `tft_error::message` is 256 and `set_message` truncates at 255, so
     /// **four of the seven statuses reached a C operator cut off mid-remedy** —
     /// four on `tft_tree_open_named`'s path, whose wrapper is 26 bytes, and six
-    /// on the bridge's 35-byte one, which `MESSAGE_BUDGET`'s doc below records
-    /// as the longest a C path puts in front. A count of truncations is a
-    /// statement about a prefix, and this one used to name none.
+    /// on the bridge's 35-byte one — which [`0059`]'s *Rationale* names as the
+    /// longest fixed text a C path puts in front of one of these renderings. A
+    /// count of truncations is a statement about a prefix, and this one used to
+    /// name none. *It pointed at a `MESSAGE_BUDGET` "below" until round 13;
+    /// that constant is `#[cfg(test)]`, so a docs.rs reader following it found
+    /// nothing.*
+    ///
+    /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
     /// It is the message length the buffer sees, which is why the figures
     /// quoted anywhere are renderings and not arms. A per-status remedy that C cannot finish reading is the
     /// same defect one layer down, which is what a runbook row does not have.
@@ -1096,8 +1101,18 @@ mod tests {
     ///
     /// Length and ASCII are `every_ipc_error_message_fits_the_c_abis_buffer`'s,
     /// which this variant is no longer excepted from.
+    ///
+    /// **Both variants that carry a `HelloStatus`, because the name used to
+    /// promise that and cover one.** [`IpcError::RejectionCarriedFd`] is the
+    /// sibling arm one line below in the same `match`; the no-foreign-status
+    /// rule is held for it here. **What it still lacks is `0059` convention
+    /// (g)** — its rendering has no `(RejectionCarriedFd)` search key and
+    /// `docs/RUNBOOK.md` has no section for it, so an operator meeting the
+    /// owner bug it exists to report has nothing to grep. That is a third
+    /// variant's worth of the work this step did for two, and `0055` step 7
+    /// records it as owed rather than widening here.
     #[test]
-    fn every_rejection_names_only_the_status_it_carries() {
+    fn both_rejection_arms_name_only_the_status_they_carry() {
         // Six of the seven are refusals, and the odd one out is the acceptance.
         // Cheap, and it is what keeps `status_is_a_refusal` — the compile error
         // a new `HelloStatus` meets — attached to something that runs.
@@ -1165,6 +1180,13 @@ mod tests {
                 text.len()
             );
 
+            // The sibling arm, held to the same negative rule.
+            let carried = IpcError::RejectionCarriedFd { status }.to_string();
+            assert!(
+                carried.contains(&format!("{status:?}")),
+                "a carried-fd rejection that does not name its status: {carried}"
+            );
+
             // No other status's name, ever.
             //
             // **The status's own name is removed first, rather than skipped in
@@ -1173,13 +1195,16 @@ mod tests {
             // contain the shorter one's name, and a bare `contains` would fail
             // a message that is right. Cutting the name this rendering is
             // *supposed* to carry leaves exactly the question being asked.
-            let without_its_own = text.replacen(&format!("{status:?}"), "", 1);
-            for other in ALL_STATUSES {
-                assert!(
-                    other == status || !without_its_own.contains(&format!("{other:?}")),
-                    "a {status:?} rejection names {other:?}, which is the defect that \
-                     cost a rebuild before anyone reread the word in front of it: {text}"
-                );
+            for rendering in [&text, &carried] {
+                let without_its_own = rendering.replacen(&format!("{status:?}"), "", 1);
+                for other in ALL_STATUSES {
+                    assert!(
+                        other == status || !without_its_own.contains(&format!("{other:?}")),
+                        "a {status:?} rejection names {other:?}, which is the defect that \
+                         cost a rebuild before anyone reread the word in front of it: \
+                         {rendering}"
+                    );
+                }
             }
         }
     }
