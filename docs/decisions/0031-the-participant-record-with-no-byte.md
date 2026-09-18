@@ -118,9 +118,12 @@ its answer; it was in a rustdoc rather than a record.
 
 **The discriminator is the lock file, not the server** — and a first version of
 this section got that wrong, which is worth stating because the counterexample is
-the library. There are **19** `.build_shared(` call sites in the workspace — 20
-`rg` hits, one of which (`crates/tf_tree_c/tests/bridge_shared.rs:324`) is a
-`///` comment describing a mutant and calls nothing — and one of the 19,
+the library. There are **19** `.build_shared(` call sites in the workspace —
+`rg -n '\.build_shared\(' crates/` gives 20 hits, one of which
+(`crates/tf_tree_c/tests/bridge_shared.rs:324`) is a `///` comment describing a
+mutant and calls nothing. *The path matters: run at the repo root the same
+pattern gives 27, the extra seven being prose in `docs/decisions/`, this record
+among them.* One of the 19,
 `crates/tf_tree/src/open.rs:1224`, is `Open::open`'s `Created` arm:
 it calls `build_shared` **and** binds an `OwnerServer` at `:1388`. Writing "the
 only composition of `build_shared` with `OwnerServer` is the test" was therefore
@@ -422,7 +425,11 @@ ship is where the boundary is written and what keeps it measured.
    step said §3.2; that section is env-var defaults.*
    - **Three shipped sites describe the shape and must be reconciled, found by
      review rather than by the plan**, which is why the step names them instead
-     of a `rg` that would have to find them again:
+     of a `rg` that would have to find them again. *A fourth,
+     `crates/tf_tree/src/open.rs`'s `reclamation_verdict` rustdoc, said the
+     question was "being decided"; it was corrected with the promotion, because
+     a status change is what falsified it. Writing "three" as a closed count was
+     the enumeration failure this record spends a paragraph on.*
      - `crates/tf_tree_cli/src/checks.rs` — *"`TreeBuilder::build_shared` called
        directly still registers without a byte **and is still supported**"*. The
        sentence is true of the **call** and this answer does not change it; what

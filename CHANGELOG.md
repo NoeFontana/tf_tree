@@ -41,6 +41,27 @@ is a bug.
 
 ## [Unreleased]
 
+### Documented — a served `build_shared` arena is out of contract (`0031`)
+
+`TreeBuilder::build_shared` registers a participant record and takes no lock
+byte, because such an arena has no lock file: the fd is the capability. Publish
+one through a hand-bound `tf_tree_ipc::OwnerServer` and every reclaimer reads
+that record as dead — measured, and it costs the creator the edge it is
+publishing to, repeatedly, with no data corrupted (`edge::reap` bumps the epoch
+first, so the victim's next `push` is refused rather than interleaved).
+
+**`0031` answers that this composition is not a shape the project supports.** The
+supported way to serve a created arena is `tf_tree::Open::open`'s `Created` arm,
+which is `build_shared` **plus** the rendezvous, the lock byte and the claim
+leases. Nothing in the workspace composes the byte-less served shape, and neither
+the C nor the Python binding can reach it.
+
+Nothing changes in behaviour. `reclamation_verdict`'s rustdoc said the question
+was "being decided"; it now says what was decided and why nothing here changes
+because of it. The advisory in 0.0.4's entry and in `PHASE2.md` §0.0 is
+**permanent, not lifted** — both said "until `0031` is answered", which after an
+answer reads as expired.
+
 ### Fixed — attach refusals did not fit the C ABI's message buffer (`0055` step 7)
 
 `IpcError::HandshakeRejected` appended a per-status remedy to every rejection,

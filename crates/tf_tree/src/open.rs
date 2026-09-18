@@ -192,8 +192,14 @@ pub(crate) enum Reclamation {
 /// (`crates/tf_tree/tests/rendezvous.rs`) pins it. The predicate is therefore
 /// **total only over participants that joined through the rendezvous**, which is
 /// a property of the arena's population and not of this caller.
-/// `docs/decisions/0031-the-participant-record-with-no-byte.md` is where that is
-/// being decided; nothing here changes until it is.
+/// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided that on
+/// 2026-09-18, and **nothing here changes because of it**: a `build_shared`
+/// arena served through a hand-bound `OwnerServer` is *out of contract*, so the
+/// population this predicate is not total over is one the project does not
+/// support rather than one it owes a fix. The supported way to serve a created
+/// arena is `Open::open`'s `Created` arm, which is `build_shared` **plus** the
+/// rendezvous, the lock byte and the claim leases — and over that population the
+/// predicate is total.
 ///
 /// **Step 0c buys *the byte at index `slot` is the byte of the record at index
 /// `slot`***, and nothing else does. The two indices are chosen by code that
