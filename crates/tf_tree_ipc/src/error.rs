@@ -554,9 +554,23 @@ impl fmt::Display for IpcError {
             // every process in hand and can be given an ordering; this one is a
             // process being refused an attachment.
             //
-            // The shape is `0059`'s conventions (e) and (g): ASCII, short, and
-            // ending with the variant name as the runbook's search key. Both
-            // matter at the C boundary — `tft_tree_open_named` formats this into
+            // The shape is `0059`'s convention (g): ASCII, ending with the
+            // variant name **in parentheses** as the runbook's search key — the
+            // spelling `tf_tree_arena`'s `check.rs` and `frozen.rs` already use
+            // (`(Unsealed)`, `(LayoutMismatch)`). A first version ended
+            // `: ArenaHeldButUnreachable`, a second spelling of a convention
+            // living in two other crates.
+            //
+            // **Convention (e) — at most 120 bytes — is NOT met, and that is
+            // stated rather than claimed away.** These arms run 115 to 146
+            // bytes at the sample widths and further with wide ids. (e) was
+            // derived for an arena error nested inside *two* wrappers (35 + 21
+            // bytes of prefix) carrying errnos and layout hashes; this variant
+            // carries a 64-bit mask and two 32-bit ids, up to 38 bytes of
+            // digits on their own. `MESSAGE_BUDGET` below is what binds it,
+            // derived from the same C path `0059` measured.
+            //
+            // ASCII and length both matter at the C boundary — `tft_tree_open_named` formats this into
             // a 256-byte `tft_error::message` and substitutes `?` per non-ASCII
             // byte, so the 788-byte four-branch version reached a C operator as
             // `"... Stop th"` with its em-dashes as `???`. `MESSAGE_BUDGET` and
@@ -568,7 +582,7 @@ impl fmt::Display for IpcError {
                 ..
             } => f.write_str(
                 "nobody attached; the ownership byte was held for the whole open timeout \
-                 by a process that never served; nothing created: ArenaHeldButUnreachable",
+                 by a process that never served; nothing created (ArenaHeldButUnreachable)",
             ),
             // Same empty mask, but the ownership probe at the deadline came back
             // free: the mask and the probe are read at two instants, so a holder
@@ -578,7 +592,7 @@ impl fmt::Display for IpcError {
                 holder_slots: 0, ..
             } => f.write_str(
                 "no byte was held at the open deadline, so whatever blocked every attempt \
-                 had let go; retry: ArenaHeldButUnreachable",
+                 had let go; retry (ArenaHeldButUnreachable)",
             ),
             IpcError::ArenaHeldButUnreachable {
                 holder_slots,
@@ -588,8 +602,8 @@ impl fmt::Display for IpcError {
             } => write!(
                 f,
                 "arena alive but unreachable: participant bytes {holder_slots:#x} held, \
-                 lowest slot {slot} (pid {first_pid}{creator}), ownership byte {own}: \
-                 ArenaHeldButUnreachable",
+                 lowest slot {slot} (pid {first_pid}{creator}), ownership byte {own} \
+                 (ArenaHeldButUnreachable)",
                 creator = if slot == 0 { ", the creator's" } else { "" },
                 own = if ownership_held { "held" } else { "free" },
             ),
@@ -597,7 +611,7 @@ impl fmt::Display for IpcError {
                 first_slot: None, ..
             } => f.write_str(
                 "arena alive but unreachable: no participant byte held, yet ownership \
-                 could not be taken before the deadline: ArenaHeldButUnreachable",
+                 could not be taken before the deadline (ArenaHeldButUnreachable)",
             ),
             IpcError::Proc(e) => write!(f, "{e}"),
         }
@@ -693,9 +707,26 @@ mod tests {
     /// Every [`IpcError`] variant, **and every value its `Display` branches
     /// on**, for the length and ASCII gates.
     ///
-    /// The exhaustive `match` below keeps the variant list complete: `IpcError`
-    /// is not `#[non_exhaustive]` and this module is inside its own crate, so a
-    /// new variant that is not sampled here fails to compile.
+    /// **Two mechanisms, and what each one actually catches — because a first
+    /// version of this doc claimed one of them did both.**
+    ///
+    /// * The exhaustive `match` at the end forces a *new* variant to be
+    ///   handled here: `IpcError` is not `#[non_exhaustive]` and this module is
+    ///   inside its own crate, so adding a variant without adding an arm fails
+    ///   to compile. It does **not** force a `push`, which is what the first
+    ///   version claimed ("a new variant that is not sampled here fails to
+    ///   compile") — deleting `out.push(IpcError::ArenaAbsent)` left all three
+    ///   tests green.
+    /// * `VARIANTS_SAMPLED` is what catches that: the gate counts distinct
+    ///   `mem::discriminant`s and refuses a set smaller than this. It catches a
+    ///   push that is deleted or forgotten among the variants that exist today.
+    ///
+    /// **What neither forces** is bumping `VARIANTS_SAMPLED` when a variant is
+    /// added, so a new variant can still arrive sampled-by-nobody if its author
+    /// adds a match arm and stops. Safe Rust has no way to enumerate a plain
+    /// enum's variants, so this is a review rule and is written down rather
+    /// than implied. The match arm is the prompt; this sentence is the reason.
+    const VARIANTS_SAMPLED: usize = 24;
     ///
     /// **One sample per variant is not enough, and four mutants proved it.** A
     /// first version of this returned exactly that. Three of four deliberate
@@ -813,6 +844,11 @@ mod tests {
         // readings, and the `first_slot: None` arm with a non-empty mask, which
         // no other test constructs.
         for (holder_slots, first_slot, ownership_held) in [
+            // The widest ids the fields can carry: a 64-bit mask and two 32-bit
+            // ids are 38 bytes of digits, which a `0x5` / `pid 4242` sample does
+            // not measure and the budget has to survive.
+            (u64::MAX, Some(u32::MAX), true),
+            (u64::MAX, Some(u32::MAX), false),
             (0u64, None, true),
             (0, None, false),
             (0b1, Some(0u32), false),
@@ -899,20 +935,27 @@ mod tests {
     /// `"... Stop th"` — truncated before the remedy began, em-dashes as `???`.
     /// Measured on #355 rather than inferred.
     ///
-    /// **Why 229 and not 256.** 255 bytes are usable (the NUL takes one), and
-    /// the wrapper this crate's errors are actually formatted into is
-    /// `could not open the arena: `, 26 bytes. 255 − 26 = 229. That is the
-    /// budget, and it is a property of the longest *known* wrapper: a caller
-    /// that wraps more deeply gets less, which is an argument for `0059`'s
-    /// aspirational 120 rather than against this number. The worst message here
-    /// is currently 147 bytes, the `HandshakeRejected` ratchet aside.
+    /// **Why 220.** 255 bytes are usable (the NUL takes one) and the longest
+    /// fixed text a C path puts *before* one of these renderings is the bridge's
+    /// `shared arena could not be created: `, 35 bytes
+    /// (`tf_tree_c::bridge::generic_failure_message`). 255 − 35 = 220. That path
+    /// appends `(arena_name {name:?})` afterwards, and the suffix is **not**
+    /// subtracted because that function's own doc makes the name the part the
+    /// buffer is meant to eat: *"the fixed clause leads, `OpenError`'s unbounded
+    /// rendering comes second, and the name … is what the buffer eats into."*
     ///
-    /// `tf_tree_ipc` cannot see `TFT_MESSAGE_LEN` — `tf_tree_c` depends on this
-    /// crate, not the reverse — so the constant is repeated here with its
-    /// derivation, and `tf_tree_c`'s own
-    /// `the_message_buffer_is_the_size_this_crates_budget_assumes` is what keeps
-    /// the two in step.
-    const MESSAGE_BUDGET: usize = 229;
+    /// **A first version of this said 229, from the 26-byte
+    /// `could not open the arena: ` wrapper — and that contradicted `0059`,
+    /// which this arm cites two paragraphs earlier.** That record's *Rationale*
+    /// names the 35-byte bridge prefix as "the longest fixed text a C path puts
+    /// before one of these payloads". Taking the shorter wrapper as "the
+    /// longest known" was wrong by inspection of a record already in hand.
+    ///
+    /// The worst message under this budget is currently **205 bytes**
+    /// (`NetworkFilesystem` from `$XDG_RUNTIME_DIR`), not the 147 the first
+    /// version of this comment claimed — so the real headroom is 15 bytes, and
+    /// `0059`'s aspirational 120 is a long way below what these texts are.
+    const MESSAGE_BUDGET: usize = 220;
 
     /// `HandshakeRejected` is over budget and **this step is not chartered to
     /// fix it** — a ratchet, not an exemption.
@@ -920,17 +963,33 @@ mod tests {
     /// Its length is `rejection_advice`, seven per-status remedies concatenated
     /// into the message. That is exactly the pattern `0055` part 4 ends, and
     /// applying it here means writing a `docs/RUNBOOK.md` section for the seven
-    /// statuses, which is `0055` step 7 rather than step 6. Four of its seven
-    /// statuses truncate in C today (239, 253, 320 and 378 bytes against 229).
+    /// statuses, which is `0055` step 7 rather than step 6.
     ///
-    /// **Pinned at its current worst case so it can only shrink.** If a status's
-    /// advice grows, this test fails; when step 7 lands, this constant and its
-    /// exception go with it.
-    const HANDSHAKE_REJECTED_RATCHET: usize = 378;
+    /// **Per status, because a max-over-statuses ratchet is not a ratchet.** A
+    /// first version pinned only the worst (378); growing `HelloStatus::Ok`'s
+    /// advice from 112 to 306 bytes — enough to truncate in C — passed it, and
+    /// six of seven statuses carried 58–266 bytes of silent headroom. Each
+    /// status is now pinned at its own measured length, so any of them growing
+    /// fails. When step 7 lands, this table and the exception go with it.
+    ///
+    /// Four of the seven truncate today at the 26-byte wrapper (239, 253, 320,
+    /// 378 against 255), and under this crate's own 220-byte budget all but
+    /// `Ok` are over.
+    const HANDSHAKE_REJECTED_LENGTHS: [(crate::wire::HelloStatus, usize); 7] = {
+        use crate::wire::HelloStatus as H;
+        [
+            (H::Ok, 112),
+            (H::VersionMismatch, 225),
+            (H::LayoutMismatch, 253),
+            (H::BootIdMismatch, 239),
+            (H::NoParticipantSlots, 378),
+            (H::ModeNotPermitted, 229),
+            (H::Malformed, 320),
+        ]
+    };
 
     #[test]
     fn every_ipc_error_message_fits_the_c_abis_buffer() {
-        use crate::wire::HelloStatus as H;
         let mut worst = 0usize;
         for e in samples() {
             let text = e.to_string();
@@ -949,6 +1008,18 @@ mod tests {
             );
             worst = worst.max(text.len());
         }
+        // Every variant that exists today is represented: this is what catches a
+        // deleted or forgotten `push`, which the exhaustive match cannot.
+        let kinds: std::collections::HashSet<_> =
+            samples().iter().map(core::mem::discriminant).collect();
+        assert_eq!(
+            kinds.len(),
+            VARIANTS_SAMPLED,
+            "samples() covers {} of {VARIANTS_SAMPLED} IpcError variants; a push is missing, \
+             or a variant was added and this constant not bumped",
+            kinds.len()
+        );
+
         // **The budget must be a real constraint, not headroom nobody uses.**
         // Without this the assertions above would pass just as well against a
         // set of one-word messages, and the gate would say nothing about whether
@@ -958,17 +1029,10 @@ mod tests {
             "the worst message is only {worst} bytes, so this budget is not measuring anything"
         );
 
-        // The ratchet: `HandshakeRejected` over every status it can carry.
-        let mut rejected_worst = 0usize;
-        for status in [
-            H::Ok,
-            H::VersionMismatch,
-            H::LayoutMismatch,
-            H::BootIdMismatch,
-            H::NoParticipantSlots,
-            H::ModeNotPermitted,
-            H::Malformed,
-        ] {
+        // The ratchet, per status: each is pinned at the length measured on
+        // 2026-09-18, so growth anywhere fails rather than only growth of the
+        // current worst.
+        for (status, pinned) in HANDSHAKE_REJECTED_LENGTHS {
             let text = IpcError::HandshakeRejected {
                 status,
                 owner_format_version: 3,
@@ -976,14 +1040,13 @@ mod tests {
             }
             .to_string();
             assert!(text.is_ascii(), "non-ASCII in {status:?}: {text}");
-            rejected_worst = rejected_worst.max(text.len());
+            assert_eq!(
+                text.len(),
+                pinned,
+                "{status:?} moved from its pinned {pinned} bytes; it is already over the \
+                 {MESSAGE_BUDGET}-byte budget and may only shrink (0055 step 7)"
+            );
         }
-        assert!(
-            rejected_worst <= HANDSHAKE_REJECTED_RATCHET,
-            "HandshakeRejected grew to {rejected_worst} bytes, past its \
-             {HANDSHAKE_REJECTED_RATCHET}-byte ratchet; it is already over the \
-             {MESSAGE_BUDGET}-byte budget and may only shrink (0055 step 7)"
-        );
     }
 
     /// **The facts each `ArenaHeldButUnreachable` state prints** — the remedy is
@@ -1012,20 +1075,26 @@ mod tests {
             .to_string()
         };
 
+        // **Every state the four arms can render, not the seven a first version
+        // listed.** That list omitted `(0b1000, Some(3), true)` and both
+        // `first_slot: None` states with a non-empty mask — and a procedure
+        // added to the `first_slot: None` arm passed both gates because of it.
+        // Those two are unconstructible through the rendezvous, which derives
+        // `first_slot` from the mask (`crates/tf_tree_ipc/src/open.rs`), so no
+        // operator meets them; the variant and its fields are `pub`, so the arm
+        // is reachable by construction and is swept rather than argued away.
         let states = [
             ("slot 0 alone, ownership free", held(0b1, Some(0), false)),
             ("slot 0 alone, ownership held", held(0b1, Some(0), true)),
-            (
-                "slot 0 and others, ownership free",
-                held(0b101, Some(0), false),
-            ),
-            (
-                "slot 0 and others, ownership held",
-                held(0b101, Some(0), true),
-            ),
-            ("a stranded non-creator", held(0b1000, Some(3), false)),
-            ("nobody attached, ownership held", held(0, None, true)),
+            ("slot 0 and others, free", held(0b101, Some(0), false)),
+            ("slot 0 and others, held", held(0b101, Some(0), true)),
+            ("stranded non-creator, free", held(0b1000, Some(3), false)),
+            ("stranded non-creator, held", held(0b1000, Some(3), true)),
+            ("nobody attached, held", held(0, None, true)),
             ("nobody attached, nothing held", held(0, None, false)),
+            ("no first slot, mask set, free", held(0b1, None, false)),
+            ("no first slot, mask set, held", held(0b1, None, true)),
+            ("widest ids", held(u64::MAX, Some(u32::MAX), true)),
         ];
 
         for (state, message) in &states {
@@ -1061,7 +1130,7 @@ mod tests {
             // (g): the runbook's search key is how a reader gets from the message
             // to the remedy, so it is the one thing every arm must end with.
             assert!(
-                message.ends_with("ArenaHeldButUnreachable"),
+                message.ends_with("(ArenaHeldButUnreachable)"),
                 "{state}: must end with the search key: {message}"
             );
         }
@@ -1069,29 +1138,48 @@ mod tests {
         // The facts, per state. These are exactly the columns `RUNBOOK.md`'s
         // table is indexed by, so a message that drops one leaves a reader
         // unable to find their row.
-        assert!(states[0].1.contains("participant bytes 0x1 held"));
-        assert!(states[0]
-            .1
-            .contains("lowest slot 0 (pid 4242, the creator's)"));
-        assert!(states[0].1.contains("ownership byte free"));
-        assert!(states[1].1.contains("ownership byte held"));
-        assert!(states[2].1.contains("participant bytes 0x5 held"));
-        assert!(states[4].1.contains("lowest slot 3"));
+        //
+        // **Looked up by label, not by index.** A first version indexed
+        // `states` positionally and broke the moment three states were added to
+        // close a coverage hole — silently pointing each assertion at a
+        // different state than its text claimed.
+        // `assert!` rather than `expect`/`panic!`: the workspace denies
+        // `clippy::panic`, `expect_used` and `unwrap_used`, in test code too.
+        let of = |label: &str| -> String {
+            let found = states.iter().find(|(l, _)| *l == label);
+            assert!(found.is_some(), "no state labelled {label:?}");
+            found.map(|(_, m)| m.clone()).unwrap_or_default()
+        };
+        let free_alone = of("slot 0 alone, ownership free");
+        assert!(free_alone.contains("participant bytes 0x1 held"));
+        assert!(free_alone.contains("lowest slot 0 (pid 4242, the creator's)"));
+        assert!(free_alone.contains("ownership byte free"));
+        assert!(of("slot 0 alone, ownership held").contains("ownership byte held"));
+        assert!(of("slot 0 and others, free").contains("participant bytes 0x5 held"));
+        let stranded = of("stranded non-creator, free");
+        assert!(stranded.contains("lowest slot 3"));
         assert!(
-            !states[4].1.contains("the creator's"),
-            "slot 3 is not the creator's slot: {}",
-            states[4].1
+            !stranded.contains("the creator's"),
+            "slot 3 is not the creator's slot: {stranded}"
         );
-        assert!(states[5].1.contains("nobody attached"));
-        assert!(states[6].1.contains("retry"));
+        assert!(of("nobody attached, held").contains("nobody attached"));
+        assert!(of("nobody attached, nothing held").contains("retry"));
 
         // **The pid is carried, and it is the one identifying fact the message
         // may state**, because it is read from the identity record rather than
         // inferred. `0055` part 4's prescription names it explicitly.
         assert!(
-            states[0].1.contains("4242"),
-            "the first slot's pid is a fact, not an inference: {}",
-            states[0].1
+            free_alone.contains("4242"),
+            "the first slot's pid is a fact, not an inference: {free_alone}"
+        );
+
+        // **The widest ids are what the budget has to survive, and a sample at
+        // 0x5 / pid 4242 does not measure them.** A 64-bit mask and two 32-bit
+        // ids are up to 38 bytes of digits on their own.
+        let widest = of("widest ids");
+        assert!(
+            widest.contains("0xffffffffffffffff") && widest.contains("4294967295"),
+            "the widest ids must render in full rather than being abbreviated: {widest}"
         );
     }
 

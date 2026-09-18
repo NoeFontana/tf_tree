@@ -662,38 +662,44 @@ deliberately unplanned.
    step back is named with the answer.
 6. **Reduce what the `ArenaHeldButUnreachable` remedy claims. DONE,
    2026-09-18** (*Decision* part 4, and this record's own question 3).
-   **788 bytes non-ASCII → 142 bytes ASCII**, and the remedy is
-   `docs/RUNBOOK.md`'s eight-row table, indexed by the two facts the message
-   still prints. The negative rule is what makes the old defect unexpressible
-   rather than merely fixed: no arm may state a count of holders or a procedure,
-   asserted over all seven states by
+   **793 bytes non-ASCII → 143 bytes ASCII**, 152 at the widest ids, and the
+   remedy is `docs/RUNBOOK.md`'s eight-row table, indexed by the facts the
+   message still prints — the mask, the lowest slot and its pid, and the
+   ownership byte — and placed where the search key lands a reader rather than
+   165 lines into a bullet about #201.
+
+   The negative rule is what makes the old defect unexpressible rather than
+   merely fixed: no arm may state a count of holders or a procedure, asserted
+   over **every state the four arms can render** by
    `every_unreachable_state_reports_the_facts_and_prescribes_nothing`. **That
    rule took two attempts** — a first version forbade the word "process" and
    failed on the empty-mask arm's "a process that never served", which is a fact
-   (the byte was held throughout and nothing answered), not a count.
+   (the byte was held throughout and nothing answered), not a count. **And a
+   first version of the state list was not every state**: it omitted
+   `(0b1000, Some(3), true)` and both `first_slot: None` states with a non-empty
+   mask, and a procedure added to that arm passed both gates.
 
-   **Four tests needed rewriting, not the three this step predicted**:
-   `a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through` and
-   `a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass` also pinned
-   the remedy. All four now assert the facts the runbook's rows are indexed by. The arm states the bytes held, the first
-   slot and its pid, and points at [`RUNBOOK.md`](../RUNBOOK.md); the four-form
-   remedy #353 landed moves there, where the reader has every process in hand.
+   The messages end with `(ArenaHeldButUnreachable)` — convention (g)'s
+   parenthesised form, as `tf_tree_arena`'s `check.rs` and `frozen.rs` already
+   spell it; a first version ended `: ArenaHeldButUnreachable`, a second
+   spelling of a convention living in two other crates. **Convention (e), at
+   most 120 bytes, is not met and is no longer claimed**: these arms are 115 to
+   152 bytes, because (e) was derived for an arena error nested in two wrappers
+   carrying an errno, and this one carries a 64-bit mask and two 32-bit ids.
+
+   **Five tests needed rewriting, not the three this step predicted**: the two
+   it named, plus
+   `a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through`,
+   `a_live_byte_0_refuses_both_policies` — renamed, because it no longer says
+   what no force can pass, since the message does not — and the unit test
+   itself, renamed from `…remedy_names_what_the_operator_must_supply`.
    - **Not a deletion of the prose, a reduction of what it claims.**
      [`API.md`](../API.md) R5 keeps the prose in the message layer, and nothing
      enters the error type: the variant stays `Copy`, its four fields unchanged.
-   - **Three tests pin the prose this step reduces, not two**, and the third
-     arrived with step 3 rather than being planned here:
-     `every_unreachable_remedy_names_what_the_operator_must_supply`,
-     `a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process` and
-     `byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_a_topology`.
-     All three are rewritten rather than deleted — the first asserts the facts and the pointer,
-     the second keeps the reachability it measured. The negative assertion that no
-     branch names a holder it cannot see is what the reduction makes structural,
-     so it stays and gets easier to hold.
    - **And the measurement this step was missing, which makes it a defect fix
      rather than a tidying.** `tft_tree_open_named`'s failure arm formats
      `could not open the arena: {e}` into `tft_error::message`, which is
-     `TFT_MESSAGE_LEN = 256` and truncated by `set_message` at 255 bytes, with a
+     `TFT_MESSAGE_LEN = 256` and truncated by `set_message` at 255 bytes (pinned), with a
      `?` substituted per non-ASCII **byte**. The `(0b1, true)` remedy as landed
      is **790 bytes**, 816 with that prefix: a C operator reads as far as
      `"Stop th"`, the whole remedy is gone, and the em-dashes render `???`. So
@@ -722,13 +728,14 @@ deliberately unplanned.
 7. **The same reduction for `HandshakeRejected`.** Step 6's gate measured what it
    was not chartered to fix: that variant is **378 bytes at its worst status**,
    and **four of its seven statuses truncate** in `tft_error::message` (239, 253,
-   320, 378 against a 229-byte budget). The length is `rejection_advice`, seven
+   320, 378 against 255 with the 26-byte wrapper, and all but `Ok` over this crate's own 220-byte budget). The length is `rejection_advice`, seven
    per-status remedies concatenated into the message — the same pattern part 4
    ends. The fix is the same shape: facts plus the search key, and a new
    `docs/RUNBOOK.md` section for the seven statuses, which is why it is a step
    and not a clause of step 6.
-   - Until it lands, `HANDSHAKE_REJECTED_RATCHET` pins it at 378 so it can only
-     shrink, and the gate's exception names this step. **A ratchet, not an
+   - Until it lands, `HANDSHAKE_REJECTED_LENGTHS` pins **each status** at its measured length so
+     none of them can grow — a first version pinned only the worst, and growing
+     `Ok` from 112 to 306 bytes passed it, and the gate's exception names this step. **A ratchet, not an
      exemption**: if a status's advice grows, the gate fails.
    - **Verified by** the same gate with the exception removed.
 

@@ -663,6 +663,22 @@ mod tests {
             "tf_tree_ipc's MESSAGE_BUDGET of 229 is derived from 256; move both together"
         );
 
+        // **The truncation bound itself, which is the "255 usable" term in that
+        // budget and was not pinned.** Mutating `min(TFT_MESSAGE_LEN - 1)` to
+        // `min(TFT_MESSAGE_LEN / 4)` left all 34 tests in this crate green — so
+        // the budget could have gone wrong in the unsafe direction with the gate
+        // passing, which is the exact hazard this test's doc says it prevents.
+        let mut long = last();
+        long.set_message(&"x".repeat(300));
+        let kept = long.message.iter().take_while(|&&c| c != 0).count();
+        assert_eq!(
+            kept,
+            TFT_MESSAGE_LEN - 1,
+            "a 300-byte message must keep exactly {} bytes and then NUL; \
+             tf_tree_ipc's budget subtracts the wrapper from this number",
+            TFT_MESSAGE_LEN - 1
+        );
+
         let mut e = last();
         e.set_message("a\u{2014}b");
         let rendered: Vec<u8> = e

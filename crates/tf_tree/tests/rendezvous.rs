@@ -571,14 +571,6 @@ fn byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_
         "two holders present the same triple a single owner of both bytes does"
     );
 
-    // **Only the guard is asserted here.** `"the ownership byte is held too"` and
-    // `"a second process has it"` are already asserted on this exact triple by
-    // `every_unreachable_remedy_names_what_the_operator_must_supply`
-    // (`crates/tf_tree_ipc/src/error.rs`), and repeating them would be a second
-    // spelling of an existing assertion (`PROJECT.md` §6). What this test owes
-    // that the unit test cannot is the **reachability** above — a state built by
-    // two real holders rather than by a struct literal — plus the one clause
-    // that makes the create promise conditional.
     // **This test's contribution is the reachability, and after step 6 that is
     // all of it.** Two real holders present the same triple a single owner of
     // both bytes does, and the message now says only what is true of both: the
@@ -634,7 +626,7 @@ fn byte_0_and_ownership_held_by_two_different_holders_is_refused_without_naming_
 /// byte and may not name a holder it cannot see.
 ///
 /// The message text for all four branches is pinned in `tf_tree_ipc`'s own
-/// `every_unreachable_remedy_names_what_the_operator_must_supply`; this test
+/// `every_unreachable_state_reports_the_facts_and_prescribes_nothing`; this test
 /// owes the reachability and the one clause an operator acts on.
 #[test]
 fn a_live_owner_holding_both_bytes_is_not_told_to_stop_a_second_process() {
@@ -780,10 +772,10 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
     );
 
     // **The message read verbatim, in the state that reaches the lock file.**
-    // Every `ArenaHeldButUnreachable` arm that sends an operator to
-    // `CreatePolicy::Always` also tells them a forced create needs a layout to
-    // build from and a read-write mode to build it in (`0055` step 2). This
-    // asserts the half that is a property of *this* state: from here the
+    // **No arm sends an operator anywhere any more** — `0055` step 6 moved the
+    // remedy, and the layout-and-read-write requirement step 2 added to the
+    // message went with it to `RUNBOOK.md`. What survives here, and is what this
+    // assertion was always really about, is the *behaviour*: from here the
     // rendezvous returns `Created`, and the policy alone then reaches a second,
     // different error exactly as the message says.
     //
@@ -793,7 +785,7 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
     // byte and asserting it beside this one would be a second spelling of
     // `a_read_only_attach_refuses_to_create`. The message *text* — both halves,
     // all four branches — is pinned in `tf_tree_ipc`'s own
-    // `every_unreachable_remedy_names_what_the_operator_must_supply`, which is
+    // `every_unreachable_state_reports_the_facts_and_prescribes_nothing`, which is
     // what makes the prose non-revertible.
     //
     // The attempt creates nothing, so the wedge is still the wedge below.
@@ -863,12 +855,13 @@ fn the_escape_hatch_creates_over_a_stranded_participant() {
 /// `expected ArenaHeldButUnreachable with ownership_held, got …
 /// ownership_held: false`. **Mutant: `(Some(0), _) if false`, i.e. the slot-0
 /// arm folded back into the generic one.** Applied ⇒ measured, this test fails
-/// on `the message must not send an operator to the escape hatch here`, and the
+/// on the message assertions this test used to carry (deleted by `0055` step 6,
+/// which took the remedy out of the message), and the
 /// message it printed was the stranded-joiner one — "CreatePolicy::Always will
 /// create a fresh arena and abandon this one", recommended for the one state
 /// where it cannot work.
 #[test]
-fn a_live_byte_0_refuses_both_policies_and_says_no_force_can_pass() {
+fn a_live_byte_0_refuses_both_policies() {
     use tf_tree::{AttachMode, Capacity, CreatePolicy, EdgeCfg, InterpPolicy, TreeBuilder};
 
     let scratch = Scratch::new("force-boundary");
@@ -1095,8 +1088,9 @@ fn a_held_ownership_byte_refuses_the_hatch_and_freeing_it_lets_one_through() {
         "the message must report the held ownership byte: {message}"
     );
     assert!(
-        message.ends_with("ArenaHeldButUnreachable"),
-        "the message must end with the runbook's search key: {message}"
+        message.ends_with("(ArenaHeldButUnreachable)"),
+        "the message must end with the runbook's search key, in the parenthesised \
+         form `0059` (g) specifies: {message}"
     );
 
     // The control: release the ownership byte and change nothing else.

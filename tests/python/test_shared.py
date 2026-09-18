@@ -590,8 +590,10 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
     * ``ownership_held`` set ``true`` => ``assert True is False``.
     * ``holder_slots`` decoded from bit 63 down => ``assert (2, 1) == (1, 2)``.
     * `open_err`'s ``ArenaHeldButUnreachable`` arm deleted, so the forwarding
-      arm raises the base class => ``tf_tree.TfTreeError: an arena is alive but
-      unreachable: participant slots 0x6 ...`` escapes ``pytest.raises``.
+      arm raises the base class => ``tf_tree.TfTreeError: arena alive but
+      unreachable: participant bytes 0x6 ...`` escapes ``pytest.raises``.
+      (The quoted wording is the message as ``0055`` step 6 left it; the mutant
+      and its outcome are unchanged, and nothing here asserts message text.)
     """
     owner = subprocess.Popen(
         [

@@ -41,46 +41,50 @@ is a bug.
 
 ## [Unreleased]
 
-### Fixed — a C caller could not read the end of an error message, and `ArenaHeldButUnreachable` was 788 bytes of it (`0055` step 6)
+### Fixed — a C caller could not read the end of an error message, and `ArenaHeldButUnreachable` was 793 bytes of it (`0055` step 6)
 
 `tft_tree_open_named` reports a failure by formatting
 `could not open the arena: {e}` into `tft_error::message`, which is
 `TFT_MESSAGE_LEN = 256` bytes. `tf_tree_c`'s `set_message` truncates at 255 and
 substitutes `?` for **each non-ASCII byte**.
 
-`IpcError::ArenaHeldButUnreachable` rendered **790 bytes**, 816 with that
-prefix. A C operator hitting a wedged arena read as far as `"Stop th"` — the
-entire remedy truncated away — with every em-dash as `???`. Measured, not
-inferred.
+`IpcError::ArenaHeldButUnreachable`'s worst state rendered **793 bytes** at a
+four-digit pid — 819 with that prefix. A C operator hitting a wedged arena read
+to `"… so no forced create can pass this. Stop"` and no further, with every
+em-dash as `???`. The remedy was entirely truncated away. Measured, not
+inferred; the figure moves with the pid and the mask, which is itself part of
+the problem.
 
 **The message now states facts and ends with its own name; the remedy moved to
-`docs/RUNBOOK.md`**, whose reader has every process in hand. It is **142 bytes
-and ASCII**. The split is the point rather than the size: this type sees which
-lock bytes are held and cannot see who holds them, so it cannot tell one process
-holding two bytes from two holding one each — and a remedy that guesses is wrong
-in whichever state it did not guess. It guessed wrong three times in a day. The
+`docs/RUNBOOK.md`**, whose reader has every process in hand. The same state is
+**143 bytes** and ASCII, and **152** with the widest ids the fields can carry.
+The split is the point rather than the size: this type sees which lock bytes are
+held and cannot see who holds them, so it cannot tell one process holding two
+bytes from two holding one each — and a remedy that guesses is wrong in
+whichever state it did not guess. It guessed wrong three times in a day. The
 runbook's `ArenaHeldButUnreachable` section gained an eight-row table indexed by
-the two facts the message still prints.
+the facts the message prints, placed where the search key lands a reader rather
+than 165 lines into a bullet.
+
+The messages end with `(ArenaHeldButUnreachable)` — `0059` convention (g)'s
+parenthesised form, as `tf_tree_arena`'s `check.rs` and `frozen.rs` already
+spell it. **Convention (e), at most 120 bytes, is not met**: these arms are 115
+to 152 bytes, because (e) was derived for an arena error nested in two wrappers
+whose payload is an errno, and this one carries a 64-bit mask and two 32-bit
+ids.
 
 **The gate that was missing.**
 `every_ipc_error_message_fits_the_c_abis_buffer` now holds every `IpcError`
-variant to ASCII and to a 229-byte budget (255 usable, less the 26-byte
-wrapper), with an exhaustive `match` so a new variant cannot go unmeasured, and
-`tf_tree_c`'s `the_message_buffer_is_the_size_this_crates_budget_assumes` pins
-the buffer the budget is derived from — the two crates cannot see each other's
-constants. Three further messages were non-ASCII and are now ASCII.
-
-The buffer pin carries an `#[allow(clippy::unnecessary_cast)]`, for the same
-reason `set_message` beside it has carried one since the first `ubuntu-24.04-arm`
-job this repository ran: `c_char` is `i8` on x86-64 and `u8` on aarch64, so
-reading the buffer back casts to the same type on exactly one of them. No
-behaviour differs between the two.
-
-**Disclosed and not fixed:** `IpcError::HandshakeRejected` is **378 bytes** at
-its worst status, and four of its seven statuses truncate. Its length is seven
-per-status remedies concatenated into the message — the same pattern, needing
-its own runbook section. It is `0055` step 7, pinned meanwhile by a ratchet at
-its current size so it can only shrink.
+variant to ASCII and to a **220**-byte budget — 255 usable, less the longest
+fixed C prefix, the bridge's 35-byte `shared arena could not be created: `,
+which is the same wrapper `0059` measured. The worst message under it today is
+205 bytes (`NetworkFilesystem`). The sampler sweeps every value each `Display`
+switches on, not one value per variant, and the gate counts distinct
+discriminants so a deleted sample fails it. `tf_tree_c`'s
+`the_message_buffer_is_the_size_this_crates_budget_assumes` pins the 256-byte
+buffer, the 255-byte truncation bound and the per-byte `?` substitution the
+budget is derived from, because neither crate can see the other's constants.
+Four message texts across two variants were non-ASCII and are now ASCII.
 
 ### Fixed — the escape hatch out of `ArenaHeldButUnreachable`, in the arm that did not say it (`0055` step 2)
 
@@ -121,9 +125,12 @@ removed underneath it — and pins the hedge.
 
 No type changed: errors stay `Copy` identifiers with the prose in the message
 layer (`docs/API.md` R5). What is new is that the prose is now *pinned*.
-`every_unreachable_remedy_names_what_the_operator_must_supply`
-(`crates/tf_tree_ipc/src/error.rs`) asserts, per branch, the clauses an operator
-cannot act without, with a control on the one remedy that really is sufficient;
+`every_unreachable_state_reports_the_facts_and_prescribes_nothing`
+(`crates/tf_tree_ipc/src/error.rs`; it was
+`every_unreachable_remedy_names_what_the_operator_must_supply` until step 6
+below took the remedy out of the message) asserts, per state, what the message
+owes an operator, with a control so it cannot pass against a message that
+promises nothing;
 and `the_escape_hatch_creates_over_a_stranded_participant` asserts the verbatim
 reading of the recommendation — in the stranded state, the policy alone returns
 `NoLayoutToCreate`. Before this, every test of this error asserted `open()`'s
