@@ -1144,6 +1144,22 @@ mod tests {
             );
         }
 
+        // **The section's worked example is the real rendering**, not a
+        // transcription of it. A quoted message is the shape that drifts: this
+        // repository has corrected the same figure in three documents more than
+        // once, and the fix is to state it where it executes.
+        let example = IpcError::HandshakeRejected {
+            status: H::LayoutMismatch,
+            owner_format_version: 3,
+            owner_layout_hash: 0x3D10_4195,
+        }
+        .to_string();
+        assert!(
+            section.contains(&example),
+            "docs/RUNBOOK.md's `HandshakeRejected` section quotes a message this code does \
+             not produce; it must contain, verbatim: {example}"
+        );
+
         // The rows say something. Without this the check above is satisfied by
         // seven bare status names.
         for word in REMEDY_WORDS {
