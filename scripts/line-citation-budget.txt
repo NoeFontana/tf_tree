@@ -16,10 +16,21 @@
 #
 # `just lint` refuses any increase. A decrease is reported; lower the number
 # here in the same commit.
+#
+# **One row was ADDED after the fact, on 2026-09-19, and that is not a licence
+# to add more.** `docs/PHASE5.md` had no row because the scanner reported zero
+# for it: the first fence-stripper was `re.sub(r"```.*?```", ...)`, which counts
+# a triple backtick written inside an inline code span, and an odd marker count
+# inverts the pairing for the rest of a file — prose blanked, code blocks
+# scanned. The two citations were always there and were never gated. The
+# stripper is line-anchored now (`strip_fenced_blocks`), so the row records what
+# the file has always carried. A row added for any other reason is a budget
+# being raised, which this file does not permit.
 2	CHANGELOG.md
 17	docs/PHASE2.md
 3	docs/PHASE3.md
 5	docs/PHASE4.md
+2	docs/PHASE5.md
 2	docs/PROJECT.md
 1	docs/RUNBOOK.md
 2	docs/benchmarks/tf2.md

@@ -18,6 +18,18 @@ load-bearing and are not to be trimmed. A row for a record with no erratum is a
 sentence or two saying what it decided and what it cost; it is an index, and the
 record is the artifact.
 
+**One erratum applies to several rows at once, so it is stated here rather than
+copied into each.** On 2026-09-19 a twenty-four-line rustdoc was added to
+`TreeBuilder::build_shared`, near the top of `crates/tf_tree/src/tree.rs`
+([`0031`](./0031-the-participant-record-with-no-byte.md) step 1). **Every
+`crates/tf_tree/src/tree.rs:NNN` citation in a frozen record with `NNN` past
+that point is now twenty-four lines early** — they are in `0019`, `0028`,
+`0034`, `0055` and `0057`. They are not repaired, because a frozen record is not
+edited and a line-number erratum per site would bury this file's real ones.
+`scripts/line-citation-budget.txt` is the register of what remains and the gate
+that stops more being written; the rule those sites predate is `CLAUDE.md`'s
+*cite a symbol, never a line number*.
+
 **This table does not restate a record's status, and it used to.** The status is
 the record's own first line, and a column that copies it is a second place to
 maintain — which is the same argument `CLAUDE.md`'s decisions row makes for not

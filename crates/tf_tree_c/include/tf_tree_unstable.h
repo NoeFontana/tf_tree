@@ -1690,8 +1690,18 @@ tft_status tft_tree_inherit_ownership(const tft_tree *tree,
  * hand-bound `OwnerServer`, and
  * `docs/decisions/0031-the-participant-record-with-no-byte.md` decided that
  * composition **out of contract** on 2026-09-18. Sweeping in a process tree
- * that contains one frees the records and claims of *live* publishers; against
- * the supported population this call has nothing to do but the owner's leavings.
+ * that contains one frees the records and claims of *live* publishers.
+ *
+ * **The pair above is two producers of a stale claim, not two situations, and
+ * the in-contract one is wider than "the owner's".** A hangup is observed by
+ * the owner's `epoll` and by nothing else, so once the owner is dead nobody
+ * watches any peer: a participant killed after that leaves claims this call is
+ * the only collector of, and they are not the dead owner's. Inheriting the
+ * role does not close it — `Tree::inherit_ownership` binds a fresh
+ * `OwnerServer`, and the survivors that were attached before the death still
+ * hold sockets to the process that died, which the heir's `epoll` never
+ * watched. `docs/PHASE2.md` §6.3 states the same reach from the other side:
+ * the sweep is what gets "any slot on an arena whose owner is dead".
  *
  * Returns `0` written to `out` for a read-only tree, a heap tree, or a tree
  * with no rendezvous: none of them can prove a holder is gone, and none of them

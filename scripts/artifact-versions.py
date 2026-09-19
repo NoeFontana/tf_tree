@@ -1266,6 +1266,40 @@ RELEASE_VISIBLE = (
 NO_CHANGELOG = "[no changelog]"
 
 
+def strip_fenced_blocks(text: str) -> str:
+    """Blank fenced code blocks, recognising a fence only at the start of a line.
+
+    **The first spelling was a regex, and it was a silent false pass.** It read
+    ``re.sub(r"```.*?```", "", text, flags=re.S)``, which treats *any* triple
+    backtick as a fence — including one written inside an inline code span, as
+    `docs/PHASE5.md` and `CHANGELOG.md` each do. That makes the marker count
+    odd, and an odd count does not merely lose a block: it **inverts the
+    pairing** for the rest of the file, so prose is blanked and the code blocks
+    are scanned instead. `docs/PHASE5.md` reported 0 citations that way while
+    carrying two in prose, and was therefore ungated with no row in the budget
+    at all.
+
+    Found 2026-09-19 while writing a changelog sentence that would have
+    explained the zero as "its citations are inside fenced blocks". They were
+    not.
+
+    A fence inside a blockquote counts, because the documents use them; a
+    triple backtick anywhere but the start of a line does not.
+    """
+    out: list[str] = []
+    fenced = False
+    for line in text.split("\n"):
+        bare = line.lstrip()
+        while bare.startswith(">"):
+            bare = bare[1:].lstrip()
+        if bare.startswith("```"):
+            fenced = not fenced
+            out.append("")
+            continue
+        out.append("" if fenced else line)
+    return "\n".join(out)
+
+
 def check_line_citations() -> str:
     """`path.rs:LINE` citations in Markdown may not increase, per file.
 
@@ -1288,7 +1322,7 @@ def check_line_citations() -> str:
     max-over-a-set bound.
 
     **Fenced blocks are excluded and code spans are not.** A `path:line` inside
-    a ``` fence is compiler output or a shell transcript; the citations this
+    a fenced block is compiler output or a shell transcript; the citations this
     gate is about are written inside single-backtick spans, and blanking those
     took the scan from 157 hits to 0 — which is how the first version of this
     check would have passed vacuously.
@@ -1309,7 +1343,7 @@ def check_line_citations() -> str:
     total = 0
     for rel in files:
         text = Path(rel).read_text(errors="replace")
-        prose = re.sub(r"```.*?```", "", text, flags=re.S)
+        prose = strip_fenced_blocks(text)
         hits = len(pattern.findall(prose))
         if hits:
             found[rel] = hits

@@ -2494,23 +2494,41 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 ///   the claim's *own* lease first; this check has no such probe, so it reports
 ///   neither and loses a claimer killed inside that window.
 ///
-/// **The one place it used to fail the other way has had its producer
-/// removed.** A `ReadWrite` `Tree::attach_shared` wrote an arena record and
-/// took no lock byte, so its healthy participant read as a leak; `0028` step 0b
-/// made both fd-attach arms refuse `ReadWrite`, so every supported read-write
-/// participant now joins through the rendezvous and takes its byte before the
-/// record leaves `FREE`. `TreeBuilder::build_shared` called directly still
-/// registers without a byte and is still supported — but such a tree has no
-/// lock file, so it reaches [`slot_leak`]'s `unknown` byte row and is judged by
-/// `/proc` alone, exactly as it was before.
+/// **The one place it used to fail the other way has had one of its two
+/// producers removed.** A `ReadWrite` `Tree::attach_shared` wrote an arena
+/// record and took no lock byte, so its healthy participant read as a leak;
+/// `0028` step 0b made both fd-attach arms refuse `ReadWrite`, so every
+/// supported read-write participant now joins through the rendezvous and takes
+/// its byte before the record leaves `FREE`.
 ///
-/// **"Still supported" is about the call, not about serving its result.**
+/// **The second producer is still here, and the sentence that used to say
+/// otherwise was wrong.** It read: *"`TreeBuilder::build_shared` called
+/// directly still registers without a byte and is still supported — but such a
+/// tree has no lock file, so it reaches [`slot_leak`]'s `unknown` byte row and
+/// is judged by `/proc` alone, exactly as it was before."* That offers the
+/// **subject's** missing lock file as though it decided the **observer's**
+/// evidence, which is the confusion `docs/decisions/0028`'s erratum retracts
+/// one layer down. [`LockByte::Unknown`] means *this run read no lock file*,
+/// and a `doctor --attach` reached its arena by name, so it has one: the
+/// byte-less record probes [`LockByte::Free`] with no identity record beside it
+/// — `(LockByte::Free, RecordedProcess::Unknown)`, which is
+/// [`SlotLeak::Abandoned`]. A live, publishing process is reported as an
+/// abandoned slot, over the evidence clause *"the lock byte is free"*. Pinned
+/// by `a_byteless_record_in_a_served_arena_is_accused_of_leaking`, whose mutant
+/// also says what the retracted sentence did **not** get wrong: the `unknown`
+/// row accuses too, on `state == LIVE && !alive`. The difference is the
+/// evidence an operator is then sent after — under that row the message adds
+/// *"/proc says its process is gone, and no lock file was read on this run"*,
+/// which is a claim about a syscall this run did make.
+///
+/// **What bounds it is where "still supported" stops.** That phrase is about
+/// the **call**, not about serving its result:
 /// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
 /// 2026-09-18 that binding a rendezvous over a `build_shared` arena is *out of
-/// contract*, and that is the only composition in which anything ever asks this
-/// check about a byte-less record: unserved, the fd goes to a child and no peer
-/// holds a probe. So the `unknown` row is what a supported byte-less
-/// participant gets, and the population it is *wrong* about is one the project
+/// contract*, and serving is the only way a byte-less `LIVE` record is ever put
+/// in front of this check — unserved, the fd goes to a child, nothing attaches
+/// by name, and no `doctor` run can reach the arena at all. So the check is
+/// wrong, in the accusing direction, about exactly the population the project
 /// does not support.
 ///
 /// **The claim half rests on the owner word being decoded correctly.** It is
@@ -5161,6 +5179,73 @@ mod tests {
             "the message must say which word it found, or an operator cannot \
              tell a half-finished registration from a finished one: {}",
             o.findings[0].message
+        );
+    }
+
+    /// **A byte-less record in a served arena is accused of leaking, and the
+    /// accusation is about a process that is running.**
+    ///
+    /// The shipped rustdoc on [`tft014`] said such a record "reaches
+    /// [`slot_leak`]'s `unknown` byte row and is judged by `/proc` alone". It
+    /// does not, and this test is why that sentence is now a quotation of
+    /// itself. [`LockByte::Unknown`] is a fact about the **run** — no lock file
+    /// was read — and a `doctor --attach` reached its arena through the
+    /// rendezvous, so it holds one. What it sees is a `LIVE` record whose byte
+    /// probes free and whose lock-file identity record was never written,
+    /// because a `TreeBuilder::build_shared` creator writes neither.
+    ///
+    /// That is `(Free, Unknown)`, which is [`SlotLeak::Abandoned`]. The
+    /// fixture is built by hand rather than through `slot()` for the one field
+    /// the helper ties together and a real run does not: this row has a probed
+    /// byte *and* no `recorded_pid`.
+    ///
+    /// **`alive` is `false` and no row below reads it**, which is the point —
+    /// the byte-driven arms decide, and they decide wrongly here. The arena
+    /// record's pid names a process this host is still scheduling
+    /// (`docs/decisions/0031`'s measurement, `C: CREATOR STILL PUBLISHING
+    /// AFTER THE SWEEP: true`).
+    ///
+    /// **Mutant, run rather than asserted, and it corrected this note.** Give
+    /// the row `LockByte::Unknown`, which is what the retracted sentence
+    /// claimed it gets. Applied: the finding still **fires** — the
+    /// `(LockByte::Unknown, _)` arm accuses on `state == LIVE && !alive`, which
+    /// this row satisfies — and it is the *second* assertion that fails, on the
+    /// evidence clause. A first draft of this note predicted the finding would
+    /// vanish. So the two rows are not a fire-or-not difference: **both accuse
+    /// a running process**, and what the retracted sentence got wrong is which
+    /// evidence an operator is sent after. Under it the message reads *"/proc
+    /// says its process is gone, and no lock file was read on this run"* —
+    /// three claims about a live publisher, one of them about a syscall the run
+    /// did make.
+    #[test]
+    fn a_byteless_record_in_a_served_arena_is_accused_of_leaking() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants.push(ParticipantInfo {
+            slot: 1,
+            state: SlotState::Live,
+            pid: 4712,
+            alive: false,
+            byte: LockByte::Free,
+            recorded: RecordedProcess::Unknown,
+            recorded_pid: None,
+        });
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        assert_eq!(o.findings.len(), 1, "one slot, no edge: {o:?}");
+        let m = &o.findings[0].message;
+        assert!(
+            m.starts_with("a record left behind —"),
+            "the abandoned shape, not the fork one: {m}"
+        );
+        assert!(
+            m.contains("the lock byte is free"),
+            "the evidence must be the byte this run actually probed, which is              how an `--attach` finding is told apart from a `--from-bag` one: {m}"
+        );
+        assert!(
+            !m.contains("no lock file was read on this run"),
+            "this run read one — that clause is the `LockByte::Unknown` row,              and reaching it would mean the retracted sentence was right: {m}"
         );
     }
 
