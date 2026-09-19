@@ -59,11 +59,22 @@ first is not.**
 
 ### 1. The spin yields (not a protocol change)
 
-`sync::spin` gains a std-backed arm that calls `std::thread::yield_now` after a
-short pure-spin prefix, on the same shape `crash-points` already uses: the
-feature pulls `std` in **for itself** via an `extern crate std` under its own
-`cfg`, rather than through a `std` feature a default build could enable by
-unification. `#![no_std]` on the crate root stays unconditional.
+The waiter yields to the scheduler after a short pure-spin prefix. **How the
+yield reaches `tf_tree_core` is a seam, not a feature**, and the draft's answer —
+"the same shape `crash-points` already uses" — does not work: that shape is
+sound only because nothing shipped enables `crash-points`. A yield behind a
+default-off feature never reaches a `tf_tree` user and is compiled by no gate
+(`cargo nextest run --workspace` builds default features); a yield behind a
+default-**on** one puts `extern crate std` into every `tf_tree_core` in the graph
+by unification, which is what `lib.rs`'s own comment argues against.
+
+**So the facade installs it, the way it already installs liveness.**
+`ArenaView::with_liveness` takes a predicate from `tf_tree`, which is `std`;
+the yield travels the same seam. `tf_tree_core` keeps `#![no_std]`
+unconditionally and pure-spins when no hook is installed — which is correct on a
+bare-metal target, where there is no scheduler to yield to — and a shipped
+`tf_tree` user gets the yield with no feature to enable and no `std` in the
+core's dependency graph.
 
 This changes nothing about *whether* the wait ends. It changes only whether the
 waiter is holding the CPU the claimant needs. **A `no_std` build keeps the pure
@@ -129,29 +140,72 @@ is what this layer can express, and its calibration is the same kind of number
 
 ## Implementation plan
 
-1. **`spin` splits** (question 3). `sync::spin` is unchanged and stays pure for
-   the four store-waiters; a second function — yielding under the std-backed arm,
-   pure-spinning otherwise — is used by `frame::wait_for_publish` alone. Both
-   must keep yielding under `cfg(loom)`, or the models stop scheduling the thread
-   they wait on.
+1. **`spin` splits, and the yield arrives through the facade's seam** (question
+   3 and *Decision* §1). `sync::spin` is unchanged and stays pure for the four
+   store-waiters; a second function, used by `frame::wait_for_publish` alone,
+   calls an installed yield hook after a pure-spin prefix and pure-spins when
+   none is installed. `tf_tree` installs it. Both functions keep yielding under
+   `cfg(loom)`, or the models stop scheduling the thread they wait on.
    - **Verified by** `just bench-check` against the committed baseline, reported
-     rather than assumed; by `just loom`; and by the existing frame tests passing
-     unchanged.
-   - **Stop point:** if `bench-check` moves on a path that does *not* reach
-     `wait_for_publish`, the split did not happen — the yield leaked into
-     `spin`.
+     rather than assumed; by `just loom`; by `just stable-tier-check` and the
+     `no_std` build, which must still compile with no hook; and by the existing
+     frame tests passing unchanged.
+   - **Two stop points, because the first is only half a check.** If
+     `bench-check` moves on a path that does *not* reach `wait_for_publish`, the
+     yield leaked into `spin`. And **a test must prove the hook is actually
+     installed on a `tf_tree` tree** — a default-off feature or an uninstalled
+     hook leaves the yield unreachable for every shipped user while every gate
+     stays green, which is the failure mode `bench-check` structurally cannot
+     see.
 2. Both roles count every liveness round; past the limit, `Wait::Contended` →
    `FrameError::InternContended`. **Report the measured worst-case intern
    duration and derive N from question 2's rule** — the number is not to be
    assumed.
-   - **Verified by** a test that stages a claimant which reads alive and never
-     publishes. The existing suite already stages exactly that shape in
-     `a_claimant_that_cannot_be_proven_dead_is_never_stolen_from`, which asserts
-     the *opposite* property and **must keep passing**: it is the control that
-     says the bound did not become a takeover. A8's invariant is that a slow
-     interner is never stolen from, and that test is what holds it.
+   - **The existing control must be rewritten, and saying it "keeps passing" was
+     wrong.** `a_claimant_that_cannot_be_proven_dead_is_never_stolen_from` stages
+     exactly this shape and asserts the waiter is *still blocked after 250 ms*
+     — `rx.recv_timeout(250ms).is_err()`. Step 2 makes that false by design at
+     any N under the ceiling, and the assertion's message would then misdiagnose
+     the refusal: *"an unproven claimant was stolen from"* is what it prints, and
+     a `Contended` return steals nothing.
+
+     **The property survives; the proxy does not.** "Never stolen from" must be
+     asserted **structurally** — `claiming[i]` still names the original claimant
+     and no id was published — rather than inferred from continued blocking.
+     Rewritten that way it holds under any N, which is what lets N be actionable
+     instead of being forced above 250 ms.
+
+     *The draft reconciled the two with "a limit large enough not to fire", which
+     is a real constraint (N ≳ 625) and contradicts this record's ceiling. This
+     step deleted that clause and asserted the test would pass unchanged, which
+     is false; the resolution is to fix the test's mechanism, not to inflate N.*
+   - **Verified by** that rewritten control, plus a new test staging a claimant
+     that reads alive and never publishes and asserting `InternContended` inside
+     the bound.
 3. `docs/PHASE2.md` §1's A8 gains the amendment; `Tree::lookup`, the C entry
    point and the Python method document the new refusal.
+
+   **And `FrameError::InternContended`'s own prose is wrong for the new
+   producer, in three places that ship.** Its variant doc says it is raised when
+   the claimant is an **anonymous** view and is "actionable: identify the view";
+   its `Display` says "another process may have died mid-intern";
+   `LookupError::UnknownFrame`, which is what a Rust caller actually sees, is
+   documented as **transient**. For a `SIGSTOP`ped claimant all three are false —
+   it is identified, it is alive, and nothing about it is transient.
+
+   **Worse, `tf_tree_py`'s error docs name this variant in the *retry loop***
+   alongside `SlotContended` and `LeaseContended`. A control loop following the
+   shipped guidance retries forever against a stopped claimant, which relocates
+   the unbounded wait into the caller rather than ending it — defeating the
+   purpose of step 2. So step 3 covers the variant doc, the `Display`,
+   `intern_core`'s `# Errors` (which does not mention the variant today) and the
+   Python retry guidance.
+
+   **The alternative, costed rather than taken:** a distinct `Copy` identifier
+   for "the claimant will not progress", which is what D11 would suggest if the
+   two causes need different handling. It is new public surface on a published
+   crate and `API.md` §7's checklist; this record takes the cheaper route and
+   names it so a reopening starts from the cost.
 4. A `loom` model reaches the bound, with a control that fails when the bound is
    unreachable.
 
@@ -207,13 +261,36 @@ each answer says where the evidence is.
      refusal has to arrive inside a period to be worth anything. That puts
      N × `INTERN_SPIN_LIMIT` in **single-digit milliseconds** — N of about 8.
 
-   **The rule, which is what this record fixes:** N is the smallest value whose
-   product with `INTERN_SPIN_LIMIT` exceeds the measured worst-case intern by at
-   least two orders of magnitude *and* stays under 10 ms. **Step 2 must report
-   the measured intern duration** rather than assume the sub-microsecond figure
-   above — that measurement is the one thing this question asked for that the
-   repository still does not record, and a bound derived from an assumed
-   numerator is the shape `0060` and `0055` both had to correct.
+   **The floor is structural, not a duration, and a first version of this answer
+   missed it.** `READER_UNRECORDED_ROUNDS` is 4: a reader waits that many rounds
+   on a `CLAIM_UNRECORDED` slot before concluding the name is absent, because one
+   round made `find_frame` report a live in-flight name as missing. A global
+   bound of N ≤ 4 fires **first** and answers `InternContended` where the correct
+   answer is *not there* — reintroducing the false negative that constant exists
+   to prevent. So **N > `READER_UNRECORDED_ROUNDS`**, and the two constants move
+   together: whoever changes one must re-derive the other.
+
+   **The rule, which is what this record fixes:**
+
+   - **Floor:** N > `READER_UNRECORDED_ROUNDS`, so the reader's abandon path
+     still fires before the global bound.
+   - **Ceiling:** N × `INTERN_SPIN_LIMIT` inside one control-loop period.
+   - Both hold at **N = 8**, which is the value to implement unless the
+     measurement moves the ceiling.
+
+   *An earlier version of this answer read "the smallest value whose product …
+   exceeds the measured intern by two orders of magnitude and stays under 10 ms".
+   That has a floor a single round already clears, so it yields **N = 1** — below
+   `READER_UNRECORDED_ROUNDS`, which is the one value that must not be chosen. It
+   stated the "N of about 8" conclusion beside a rule that contradicts it.*
+
+   **Step 2 must still report the measured worst-case intern**, on **both**
+   architectures this project gates — `spin_loop()` is a `pause` of ~140 cycles
+   on recent x86-64 and an `isb` of tens of cycles on aarch64, so the same
+   iteration count is several times shorter there and the "~0.4 ms at 3 GHz"
+   figure below is x86-specific. A ceiling expressed in milliseconds and derived
+   from an x86 count loses most of its headroom on the `ubuntu-24.04-arm` row and
+   on a Jetson.
 
    ~~What is the limit?~~ `INTERN_SPIN_LIMIT` is 10 000 pure-spin iterations
    between liveness checks (~0.4 ms at 3 GHz). A round bound of *N* liveness
