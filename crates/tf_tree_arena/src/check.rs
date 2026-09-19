@@ -113,14 +113,10 @@ pub enum ShmError {
 // `tf_tree::Tree::attach_shared` return this type bare, so without the traits
 // nothing `?`-chains it into `Box<dyn Error>` or `anyhow::Error`.
 //
-// The rules the text follows are `0059`'s decision 2, and they are why it looks
-// the way it does: numbers in decimal and layout hashes as `0x{:08X}`, an errno
-// as `errno N` from `raw_os_error()` (never `Errno`'s own rendering, whose bytes
-// depend on a `rustix` feature and on the host's locale), ASCII only because the
-// C ABI's message buffer replaces every other byte, no remedy that names one
-// binding's API, and the variant name last, in parentheses, as the key
-// `docs/RUNBOOK.md` is searched by. The text also has to fit `FrozenError::Arena`'s
-// nested rendering inside `0059`'s 120-byte bound, so every arm stays short.
+// The rules the text follows are
+// `docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md`
+// decision 2 (a)-(g); an errno is `errno N` from `raw_os_error()`, never `Errno`'s
+// own rendering (locale/feature dependent).
 //
 // The match is exhaustive and there is no catch-all, so a variant added later
 // fails to compile here rather than rendering as something generic.

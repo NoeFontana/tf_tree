@@ -41,28 +41,9 @@
 //! report ≈1.00× for ever while the real boundary went unmeasured.
 //!
 //! **That failure happened, from the other end, and the row could not see it.**
-//! On 2026-08-29 `Plan::at_tagged` was interposed between `Plan::at` and the
-//! fold carrying no `#[inline]`, so *both* columns became the same call stub
-//! around one out-of-line symbol in `tf_tree_core` — `nm -C --print-size` gives
-//! `one` and `tf_tree_core::bench_probe::depth3_lookup` the same 58 bytes and
-//! `objdump -R` resolves both `call`s to the same GOT slot. Which crate the stub
-//! was compiled in changes nothing; the quotient is 1.0 by construction and
-//! `Verdict::Over` is unreachable. Measured on this host, pinned, at
-//! `[profile.embedder]`: **`1.000x (rounds spanned 0.997-1.004), within PHASE5
-//! §9.2's 5% gate`** — a clean PASS with a 1 % band, not an `unresolved`, which
-//! is what a gate looks like when its variable is gone. Marking `at_tagged` and
-//! changing nothing else, same sitting: `1.243x, OVER`.
+//! `docs/API.md` §2.3's 2026-09-06 amendment is the record.
 //!
-//! **`just embed-cost` now asserts the two bodies differ before it times
-//! anything**, and refuses if it cannot find either symbol; the recipe's comment
-//! carries the argument and the two ways out. `docs/API.md` §2.3's 2026-09-06
-//! amendment is the record. It exits non-zero on the collapse unless
-//! `EMBED_COST_KNOWN_COLLAPSED=1` is set, which CI's `bench-gate` job does; with
-//! the escape the whole diagnosis still prints, followed by a line saying the
-//! run's quotient is not a measurement. The escape is deleted by the commit that
-//! restores the variable.
-//!
-//! **The `1.243x` above is a reading through a probe shape
+//! **The `1.243x` in that amendment is a reading through a probe shape
 //! `Plan::at_tagged`'s own doc names as a trap, and this module is where that
 //! shape lives.** Both columns are
 //! `match plan.at(g, s) { Ok(iso) => iso.t.x, Err(_) => f64::NAN }` — see

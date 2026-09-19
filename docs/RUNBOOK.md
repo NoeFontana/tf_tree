@@ -343,14 +343,7 @@ there:
 the arena owner refused this attach: LayoutMismatch (owner format_version 3, layout_hash 0x3D104195) (HandshakeRejected)
 ```
 
-**The remedy is this table, and it left the message on 2026-09-18.** Seven
-per-status remedies made messages of 112 to 378 bytes — the buffer sees the
-rendering, not the remedy, and the remedies themselves were 22 to 272; the C ABI's `tft_error::message`
-is 256 bytes and `set_message` truncates at 255, so four of the seven reached a C
-operator cut off mid-sentence — four behind `tft_tree_open_named`'s 26-byte
-wrapper, and six behind the bridge's 35-byte one — which is worse than a status and a place to look
-([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
-step 7).
+**The remedy is this table, and it left the message on 2026-09-18** (see the Erratum in [`PHASE2.md` §3.7](./PHASE2.md#37-attach); [`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md) step 7).
 
 **Two of these statuses share a name with a check below and are not that check.**
 `VersionMismatch` and `LayoutMismatch` here are the **owner's** comparison
@@ -358,12 +351,7 @@ against the attach request, made before this process ever saw the segment, which
 is why `found`/`expected` do not appear.
 
 **The message prints the owner's hash and not this build's, and
-[`PHASE2.md`](./PHASE2.md) §3.7 asks for both.** That divergence is older than
-the reduction and is recorded in
-[`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
-step 7 rather than fixed by it: `tf_tree_ipc` depends on `rustix` and `libc`
-alone, so it cannot read this build's `layout_hash()` to print beside the
-owner's. **It does not change the remedy** — rebuilding every participant from
+[`PHASE2.md`](./PHASE2.md) §3.7 asks for both.** See the Erratum in `PHASE2.md` §3.7. **It does not change the remedy** — rebuilding every participant from
 one release is the fix whichever pair of numbers you are holding — and where
 this build's own constants *are* printed is `tf_tree doctor --explain-version`,
 **run from the refused binary's build**, not from whichever `tf_tree` is on the
@@ -464,13 +452,13 @@ finding, do not read it as "the process is gone" — check whether the pid it
 names is alive before you act on it.
 
 **Those two blind spots are not the same kind of thing, and what you do about
-them differs.** A dead **owner** is in contract: it happens to every fleet, and
-`tf_tree doctor` simply cannot see what it left — a surviving read-write peer's
-sweep is the collector. A byte-less `build_shared` participant only becomes
-*anybody else's* problem if the arena it created was published into a rendezvous
-by hand, and
-[`0031`](./decisions/0031-the-participant-record-with-no-byte.md) decided that
-composition **out of contract** on 2026-09-18. So a byte-less record in a served
+them differs.** A dead **owner** is in contract, and `tf_tree doctor` simply
+cannot see what it left — a surviving read-write peer's sweep is the collector
+([`PHASE2.md` §3.9](./PHASE2.md#39-teardown), *A participant dies*). A byte-less
+`build_shared` participant is **out of contract** where it is published into a
+rendezvous by hand ([`0031`](./decisions/0031-the-participant-record-with-no-byte.md);
+[`PHASE2.md` §3.1](./PHASE2.md#31-the-sharing-boundary-is-the-runtime-directory--normative)).
+So a byte-less record in a served
 arena is a report about the *application*, not about this tool: something called
 `TreeBuilder::build_shared` and then bound an `OwnerServer` over the fd, where
 `tf_tree::Open` is the supported way to create and serve. Until that is fixed,
@@ -677,12 +665,8 @@ dies, and the live probe handles that case by itself. In a healthy deployment th
 whole thing is one non-blocking `poll` that answers `false`.
 
 **The catch, and it decides whether your fleet can recover at all: nothing calls
-this for you.** There is no background thread and no daemon watching the socket
-— that is [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)
-holding that every process a user is *required* to run is a place adoption dies
-— so **a survivor that never calls `owner_lost()` never becomes owner**, and the
-arena stays ownerless exactly as it did before this shipped. Three things to
-check when owner death has wedged a live system:
+this for you.** See [`PHASE2.md` §3.5](./PHASE2.md#35-ownership-migrates-the-data-plane-never-pauses--normative), *The trigger is the caller's*.
+Three things to check when owner death has wedged a live system:
 
 - **Is any survivor read-write?** `inherit_ownership()` answers
   `Inheritance::ReadOnly` on a read-only attachment and does nothing else. An

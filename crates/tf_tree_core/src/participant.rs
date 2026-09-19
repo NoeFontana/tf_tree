@@ -156,8 +156,7 @@ pub enum ParticipantError {
 }
 
 // `Display` and `core::error::Error` follow `docs/decisions/0059`, which extends
-// `0040` to this type: ASCII, decimal numbers, one clause, and the variant name
-// last in parentheses as a search key. Only `TableFull` says the table is full,
+// `0040` to this type. Only `TableFull` says the table is full,
 // because only it can mean that. The match is exhaustive: `#[non_exhaustive]`
 // grants no catch-all inside this crate.
 
@@ -485,10 +484,8 @@ mod tests {
     use alloc::vec::Vec;
 
     /// `docs/decisions/0059` step 1(b) for `ParticipantError`: every variant
-    /// renders by decision 2's rules — non-empty, not its `Debug`, no brace,
-    /// ASCII, at most 120 bytes with every carried integer at `u32::MAX`, ending
-    /// with the variant's name in parentheses, and containing every number it
-    /// carries. Structure only: `docs/API.md` R5 makes the sentence
+    /// renders by decision 2's rules, with every carried integer at `u32::MAX`.
+    /// Structure only: `docs/API.md` R5 makes the sentence
     /// uncontracted, which is why no literal appears here. `tf_tree_arena`'s
     /// `render_test` holds the same rules for its three types; this crate
     /// cannot share it, because a test module is not part of either crate's API.

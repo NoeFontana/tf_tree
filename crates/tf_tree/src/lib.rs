@@ -208,34 +208,8 @@
 //! cargo's default, so every latency number this project publishes is taken
 //! under whole-program optimisation and your node's is not.
 //!
-//! Measured rather than asserted, because the last claim made here about this
-//! mechanism was wrong in a way only a probe could show. One program — a
-//! depth-3 `map <- imu_link` lookup, `LerpSlerp`, off-grid stamps so the
-//! interpolation runs, one lookup per non-inlinable call — built twice and
-//! pinned to one core, nine rounds each, three consecutive runs:
-//!
-//! | downstream profile | ns/lookup |
-//! | --- | --- |
-//! | `lto = false`, `codegen-units = 16` (cargo's `--release` default) | 240 |
-//! | `lto = "thin"`, `codegen-units = 1` | 193–195 |
-//!
-//! On a 4-physical-core AMD EPYC-Milan VM under moderate load, 2026-08-02, so
-//! read it as "about a quarter", not as three digits — the ratio itself moved
-//! between 1.19× and 1.24× across those runs.
-//!
-//! **The same runs also say *why*.** They time a second, identical body
-//! compiled *inside* `tf_tree_core` and compare it against the one outside:
-//!
-//! | downstream profile | from outside the engine | from inside it |
-//! | --- | --- | --- |
-//! | `lto = false`, `codegen-units = 16` | 240 ns | 191 ns |
-//! | `lto = "thin"`, `codegen-units = 1` | 193 ns | 194 ns |
-//!
-//! At cargo's defaults the crate boundary costs about a quarter of the lookup;
-//! with thin LTO it costs nothing measurable, because the boundary is gone at
-//! link time. `just embed-cost` in this repository re-measures both, and
-//! `docs/PHASE5.md` §9.2 makes the second one a standing, gated benchmark row so
-//! the next change to those attributes moves a number somebody sees.
+//! The measurements behind this, and what `just embed-cost` re-measures:
+//! `docs/API.md` §2.3.
 //!
 //! The cost of taking this advice is build time: thin LTO adds a link-time
 //! optimisation pass, and `codegen-units = 1` gives up intra-crate build

@@ -67,11 +67,8 @@ test passed on x86-64; that is what the loom suite is for.
 
 **`0.0.x` promises nothing.** Cargo treats every `0.0.x` release as
 incompatible with every other, which is the intended signal: pin exactly, and
-expect a later release to break. The number is deliberately not repeated here —
-this line read `0.0.1` for three releases, because nothing gates a version in
-prose. The reasoning is written out in the
-repository's [`Cargo.toml`](https://github.com/NoeFontana/tf_tree/blob/main/Cargo.toml)
-under `[workspace.package] version`, and the release notes are in
+expect a later release to break. The number is deliberately not repeated here.
+The reasoning and the release notes are in
 [`CHANGELOG.md`](https://github.com/NoeFontana/tf_tree/blob/main/CHANGELOG.md).
 
 MSRV is **1.87**; see

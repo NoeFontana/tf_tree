@@ -1,31 +1,8 @@
 //! C ABI overhead against native Rust — `docs/PHASE4.md` §7, gate criterion 1.
 //!
-//! # What this measures, and the two ways it used to fail to
+//! # What this measures
 //!
-//! For a long time this file could not answer criterion 1 at all, for two
-//! compounding reasons — both fixed here, both worth knowing before trusting
-//! any number below.
-//!
-//! **1. It was built at the workspace `release` profile, which is
-//! `lto = "thin"`.** That inlines `tft_plan_at` into a Rust caller, so the C
-//! boundary the gate exists to price was *not in the binary doing the pricing*.
-//! `report.rs`'s PHASE5 §9.2 embedding row had already written down that trap in
-//! those words — thin LTO "is exactly what erases the boundary" — and nothing
-//! had applied it here. `just abi-cost` now builds this twice and **only the
-//! `[profile.embedder]` run (`lto = false`) gates**; the `release` run is kept
-//! as the contrast. On this host the same C ABI prices at **1.019x** with the
-//! boundary erased (1.016-1.019) and **1.03-1.04x** with it present, so thin
-//! LTO was hiding about half the thing being measured.
-//!
-//! **2. The denominator was at LLVM's discretion.** Adding a second, wholly
-//! unrelated `Tree::guard()` call site to this file moved the native baseline
-//! 133 -> 190 ns (43%) and the verdict FAIL -> PASS. The ABI arm never moved.
-//! Every native comparand is now `#[inline(never)]` with `black_box` on the
-//! stamp going in and the scalar coming out, and the ladder carries a **control
-//! row** — two structurally identical native arms, two symbols, two call sites —
-//! that fails if a call site ever specialises one of them again. The same
-//! unrelated edit was re-applied after the pin: the ratios moved by at most
-//! 0.4 percentage points while the *host* moved the absolute baseline 14%.
+//! The profile it is built at and the pinned comparands: `docs/decisions/0023`.
 //!
 //! # What it reports
 //!

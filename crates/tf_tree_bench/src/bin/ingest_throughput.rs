@@ -2,66 +2,8 @@
 //! throughput >= 10x real time on a representative recording.*
 //!
 //! `docs/decisions/0050-what-ten-times-real-time-divides.md` is the record this
-//! implements, and it is where the four questions below are argued rather than
-//! restated. Read it before changing what this measures.
-//!
-//! # What the ratio divides
-//!
-//! * **Numerator**: wall time of `tf_tree_ingest::run` — *both* passes, survey
-//!   and fill. The figure §12 quoted was a `survey` (pass one) number reused as
-//!   an ingest number, and a full run is about twice it.
-//! * **Denominator**: `Survey::span_ns()`, the recording's own stamp span,
-//!   computed by this harness from the survey it just ran rather than declared
-//!   by whoever wrote the corpus. That accessor already exists; a second
-//!   spelling of `max(newest) - min(oldest)` here would be one more thing to
-//!   drift.
-//!
-//! # The ratio is a statement about the corpus's DENSITY, and that is gated
-//!
-//! At an identical per-transform cost, a 10 Hz x 5-transform recording reads a
-//! hundred times higher than a 100 Hz x 50 one, so under `--gate` this binary
-//! **refuses** a corpus sparser than `GATE_DENSITY_FLOOR`. A sparser corpus
-//! passes without checking anything, which is the empty-subject-set shape:
-//! green exactly when the measurement did not happen.
-//!
-//! The density is also *reported* on every run, in transforms per second of
-//! recording and in transforms per second of wall clock, so that a later change
-//! to the corpus shows up as a change in the corpus rather than as a win.
-//!
-//! # The pass count is a declared parameter, and the criterion is stated over
-//! the grouped arm
-//!
-//! `FillStats::passes` counts fill passes; `1` is the ordinary case, and the
-//! *recording is read* `1 + passes` times because the survey reads it too. The
-//! count is not a constant: `plan_groups` splits pass two into groups whenever
-//! the buffered samples would exceed `--max-memory`, and **§12's own
-//! representative recording does not fit the default cap** — four hours at
-//! 100 Hz x 50 transforms is 72e6 samples at `SAMPLE_BYTES` = 64, i.e.
-//! 4 608 000 000 B against a `DEFAULT_MAX_MEMORY_BYTES` of 4 294 967 296. It
-//! gets two groups and one extra whole re-read.
-//!
-//! So a gate measured at `passes == 1` and the criterion as written are not the
-//! same claim, and this binary measures **both arms**:
-//!
-//! * `in-memory` — the default cap, one fill pass. Reported.
-//! * `grouped` — the cap lowered until pass two takes the same number of groups
-//!   the criterion's own recording forces. **This is the gated arm**, because it
-//!   is the regime the criterion's own words put the measurement in — not
-//!   because it is the slower one.
-//!
-//! **The grouped cap is derived from the SURVEY, not from the arguments**
-//! (`grouped_cap_from`), and each arm asserts the pass count it declares and
-//! **REFUSES** if the run did not take it.
-//!
-//! # Why this may be gated on a host that fails the timing probe
-//!
-//! `docs/PHASE5.md` §9.3's **one-sided-budget amendment**, in the same shape
-//! §12 gate 2 uses it: every check `Fitness::probe` fails here can only make an
-//! ingest *slower*, so a PASS with margin is a conservative claim and a FAIL is
-//! not attributable to the code. The verdict line prints the fitness reasons
-//! whichever way it goes. It is not a `bench_report` row and not a
-//! `Sensitivity::Ratio` — that axis means two engines interleaved within one
-//! round, and this is one engine against a clock.
+//! implements, and it is where the four questions this binary answers are argued
+//! rather than restated. Read it before changing what this measures.
 //!
 //! # The falsifier
 //!
@@ -108,9 +50,10 @@ const FLOOR: f64 = 10.0;
 /// its density, in transforms per second of recording, and a gated run may not
 /// be sparser: at an identical per-transform cost a sparser corpus reads
 /// arbitrarily higher.
+// See `0050` Q2.
 const GATE_DENSITY_FLOOR: f64 = 100.0 * 50.0;
 
-/// Fill passes the criterion's own recording forces (see the header): four
+/// Fill passes the criterion's own recording forces (see `0050` Q4): four
 /// hours at the density above does not fit `DEFAULT_MAX_MEMORY_BYTES`, so
 /// `plan_groups` gives it two groups.
 const CRITERION_PASSES: u32 = 2;
@@ -369,6 +312,7 @@ fn measure(label: &'static str, path: &Path, rounds: usize, max_memory_bytes: u6
 /// which is why the repair is a reserve in the planner rather than a wider
 /// threshold — a gate whose bound is moved to stop it going red is the shape
 /// this binary's `--gate` refusals exist to prevent.
+// See `0050` Q4.
 fn grouped_cap_from(edge_bytes_desc: &[u64]) -> u64 {
     let first_group = edge_bytes_desc
         .len()

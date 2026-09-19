@@ -398,10 +398,9 @@ impl<'a> ArenaView<'a> {
             self.header.topo_block_off as usize + index * self.header.topo_block_stride as usize;
         // The two u32 arrays come first so both stay 4-byte aligned for any `mf`.
         // Module invariant: the topology region holds `TOPO_BLOCKS` blocks of
-        // `topo_block_stride == align64(mf * 12)` bytes each (parent u32 +
-        // edge_of_child u32 + depth u16 + 2 bytes of padding, `topology.rs`),
-        // starting 64-aligned at `topo_block_off`. `heap.rs` writes that stride
-        // from `ArenaLayout`, and `check.rs` refuses a mapped header whose
+        // `topo_block_stride == align64(mf * 12)` bytes each (12 B per frame: two
+        // u32 arrays then depth u16, `docs/PHASE1.md` §4.3), starting 64-aligned
+        // at `topo_block_off`. `heap.rs` writes that stride from `ArenaLayout`, and `check.rs` refuses a mapped header whose
         // stride or offset disagrees with the layout it implies. `index <
         // TOPO_BLOCKS` because the only caller is `topology()`'s `from_fn` over
         // `[Block; TOPO_BLOCKS]`, so `block_off` names a whole reservation.

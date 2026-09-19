@@ -20,37 +20,15 @@ over the README, and over this file.
 
 - **Phases 1–3: implemented, §3.5 ownership migration included since
   2026-08-28.** Rendezvous, fd passing, claims-as-leases, reaping, fork
-  poisoning, Python bindings. **§3.5 is `0037`'s shape, not the one #275
-  deleted**: `Session::take_over_ownership` takes byte 0 on the description the
-  survivor's session already holds — so nothing has to be verified — and
-  `Tree::inherit_ownership` binds and serves the *existing* segment.
-  `Tree::owner_lost` is the trigger, which had never existed at all. **It is
-  caller-driven by design** ([`0019`](./docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md)):
-  no background thread, no daemon, so a survivor that never calls it never
-  becomes owner and its arena stays ownerless. `OpenOutcome::TookOver` and
-  `OpenError::TakeoverUnsupported` are **deleted** — `0037` question 3 answered
-  that the variant does not survive, because inheritance is a method on an
-  attached session and not an `open()` outcome, and the removal has since been
-  made. `PHASE2.md` §0.0's row is authoritative.
+  poisoning, Python bindings. `PHASE2.md` §0.0's row *Ownership migration (§3.5)*
+  and [`PHASE2.md` §3.5](./docs/PHASE2.md#35-ownership-migrates-the-data-plane-never-pauses--normative)
+  are authoritative.
 - **Recovery reaches C, C++ and Python since 2026-08-29**
-  ([`0044`](./docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)):
-  `inherit_ownership` takes `&self` — both bindings hold the tree in an `Arc`,
-  where `Arc::get_mut` fails as soon as a plan or publisher holds a clone —
-  and the *unstable* C header gains `tft_tree_open_named` (the only read-write
-  attachment C has ever had), `tft_tree_owner_lost`,
-  `tft_tree_inherit_ownership` and `tft_tree_reap_dead`. **`owner_lost` answers
-  "the arena has no owner", not "my socket is dead"**
-  ([`0043`](./docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md));
-  before that it was permanently `true` for every survivor but the winner. And
-  the owner's hangup callback now revokes a dead participant's **claims**, not
+  ([`0044`](./docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+  The owner's hangup callback now revokes a dead participant's **claims**, not
   only its record, so a restarted publisher granted its predecessor's slot can
-  take its own edges back. **Two producers of a stale claim remain and have no
-  hangup**: a dead owner, and a `build_shared` participant with no socket. **The
-  second exists only in a composition that
-  [`0031`](./docs/decisions/0031-the-participant-record-with-no-byte.md) answered
-  *out of contract* on 2026-09-18**: such a claim can go stale to another process
-  only through the rendezvous, or through the `ReadWrite` fd-attach that `0028`
-  step 0b refuses. The dead owner is in contract and unchanged.
+  take its own edges back. Stale claims with no hangup:
+  [`PHASE2.md` §3.9](./docs/PHASE2.md#39-teardown), *A participant dies*.
 - **Phase 4: implemented except** §5.9 affinity knobs and §6.3 replay rows. C ABI
   and C++ wrapper frozen; ROS 2 ingest bridge done. §1's operational exit
   criterion is **open and not satisfiable by code**.
@@ -59,14 +37,11 @@ over the README, and over this file.
   catalogue detects 17 of 19. **§12 criteria 2 and 5 are gated since
   2026-09-05** — `just gate2`, `just gate5`, both steps of `nightly.yml`'s
   `gate4` job and both exiting non-zero on a FAIL. `PHASE5.md` §0.0's §11/§12
-  row is authoritative and had said criterion 5 was *held by nobody* for the
-  whole of the wave that gated it. **`TFT009` also reports the gap that has not
-  ended** — a publisher that stopped, which every rule in the catalogue was blind
-  to because they all measure *between retained stamps*, and a full ring of
-  perfectly spaced samples from three weeks ago reads healthy.
+  row is authoritative. **`TFT009` also reports the gap that has not ended** —
+  see the amendments in [`PHASE5.md` §6](./docs/PHASE5.md#6-the-diagnostics-catalogue).
 - **Published** to crates.io and PyPI since 2026-08-17, on the `0.0.x` line —
-  cargo treats every `0.0.x` as incompatible with every other, so *every release
-  may break every other* and that is the whole promise. The number itself is not
+  see [`CHANGELOG.md`](./CHANGELOG.md), *Versioning, stated before anything
+  else*. The number itself is not
   repeated here because nothing would gate it: read `[workspace.package]
   version`, which `just artifact-versions` holds every other site to. MSRV
   **1.87**.
@@ -123,9 +98,7 @@ ros/tf_tree_bench_ros/  ament_cmake: PHASE5 §9.1 DDS comparison. Benchmark-only
 xtask/                  loom / bench-gate / headers runners (Miri is `just miri`)
 ```
 
-**Five crates publish:** `tf_tree`, `tf_tree_core`, `tf_tree_math`,
-`tf_tree_arena`, `tf_tree_ipc`. The rest carry `publish = false` with the reason
-in their manifest.
+Which crates publish: [`README.md`](./README.md#workspace).
 
 `tf_tree_py` and `tf_tree_tf2_sys` are **excluded** from the cargo workspace
 (libpython, ROS 2). `ros/*` needs `rclcpp`, so `cargo fmt`/`clippy`/`nextest`
@@ -214,15 +187,10 @@ cannot see it — **`just ros-build` and `just ros-test` are its entire gate**;
 - Do not add a **second spelling** of an existing path (a `coverage` beside
   `span`, a `resample` beside `at(arange(...))`). Document the one that exists.
 - **Cite a symbol, never a line number.** `path.rs:123` in a Markdown file
-  breaks on the next edit to that file, and a 2026-09-19 sweep found citations
-  already landing on blank lines, bare `///` markers and closing braces.
-  `just lint` ratchets the existing ones down per file
-  (`scripts/line-citation-budget.txt`), each row an equality; a new one fails.
-  **The gate sees only the prefixed spelling** (`crates/`, `xtask/`, `scripts/`,
-  `ros/`), not a bare `tree.rs:123`, so its rows are a floor on the rot and not
-  a census. It prints both totals on every run, which is why no figure is
-  written down here.
-  *Writing the prefixed form here as an example failed this very gate.*
+  breaks on the next edit to that file. `just lint` ratchets the existing ones
+  down per file (`scripts/line-citation-budget.txt`); a new one fails. The
+  gate's scope and the measurements: `check_line_citations` in
+  `scripts/artifact-versions.py`.
 - **A comment states the decision and its load-bearing evidence, then stops.**
   Rustdoc is the item's contract: what it does, what the caller must guarantee,
   what they get, and any warning a future editor needs. Provenance is not
@@ -261,13 +229,13 @@ second opinion, not the first.
 | `just py-cross-check` | `cargo check` for `tf_tree_py` at `{x86_64,aarch64}-apple-darwin` and `x86_64-pc-windows-msvc`, with `pure-hash`. The only thing that compiles that feature — `bindings-non-linux` uses native runners. Guards #180's 2027 fallback; `check` not `build`, because linking needs an Apple SDK no Linux host has |
 | `just py-test` / `py-lint` | Python on two interpreters; `py-lint` also carries `tf_tree_py`'s rustdoc, which `just doc` structurally cannot reach (excluded crate) |
 | `just msrv` | **three** arms: a `--locked` `cargo +<floor>` build, every hand-written `rust-version`, and the floor as stated in the prose a user reads (`README.md`, `SUPPORT.md`, `lib.rs`) — the third exists because the first two both passed while README said 1.85 and the manifest said 1.87 |
-| `just no-network` | PHASE5 §5.1's NORMATIVE assertion and §13's box 4: every `socket(2)` in the **library**'s test binaries names `AF_UNIX`, under `strace -f`. Runs in `ci.yml`'s `shm` job. It **refuses** rather than skips — no `strace`, a `strace` that cannot see a socket it is shown on purpose, a traced binary that exited non-zero, or a run in which `tests/rendezvous.rs` was not traced. `tf_tree top --web`'s `AF_INET` listener is the recipe's **positive control**, traced separately and required to be found, not an exception inside the scanner |
+| `just no-network` | PHASE5 §5.1's NORMATIVE assertion and §13's box 4: every `socket(2)` in the **library**'s test binaries names `AF_UNIX`, under `strace -f`. Runs in `ci.yml`'s `shm` job. What it refuses and its positive control: the header of `scripts/no-network.sh` |
 | `just loom` / `miri` / `tsan` | concurrency model checking / UB / thread sanitizer. `miri` appends to `$MIRIFLAGS`; CI sets `-Zmiri-strict-provenance` there, so CI is the stricter run of the same recipe |
 | `just audit` | `cargo deny check` |
 | `just bench` / `bench-check` / `bench-baseline-update` | suite + go/no-go gate against the committed baseline |
 | `just embed-cost` / `embed-cost-check` | PHASE5 §9.2's two embedding measurements; `bench-check` depends on it |
 | `just gate2` / `gate5` | PHASE5 §12 gate 2 (a `.tft` open under 10 ms at the criterion's own 233 MB scale) and gate 5 (ingest throughput ≥ 10× real time). Both **exit non-zero on a FAIL** and both print the run's own numbers; **no figure from either is repeated here** — `docs/benchmarks/EVIDENCE.md`'s Gates table is the register and `just evidence-audit` is what keeps it honest. Each is also driven per-PR through the shipped binary rather than only nightly: `tests/gate2.rs` under `just shm-check`, `tests/ingest_throughput.rs` under `just test`. **Which tests `--workspace` actually runs is not restated here**: `cargo nextest list --workspace` is the whole answer, and it is the only place a manifest `required-features` entry and a file's own crate-level `#![cfg]` are read together |
-| `just gate4` / `gate4-python` | PHASE5 §12 gate 4 — 16 workers on one frozen `.tft` — with its two worker arms. `gate4` **is** the criterion (Rust worker), runs nightly, and **exits non-zero on a FAIL since 2026-09-04**; it did not before, so that job could not go red. `gate4-python` **reports** the same measurement through the same driver with a spawned CPython worker and exits 0 on the FAIL it prints, because `S ≥ 74p` makes the verdict a function of the worker's private cost and a second *gated* arm is a decision. The mechanism is a `--gate` flag the caller passes: the binary refuses `--gate --python` rather than letting the deferred decision arrive as a flag pair. Both arms' current readings live in `docs/benchmarks/EVIDENCE.md`, not here — nothing audits this table |
+| `just gate4` / `gate4-python` | PHASE5 §12 gate 4 — 16 workers on one frozen `.tft` — with its two worker arms. `gate4` **is** the criterion (Rust worker), runs nightly, and **exits non-zero on a FAIL**. `gate4-python` **reports** the same measurement through the same driver with a spawned CPython worker and exits 0 on the FAIL it prints. The arithmetic, the `--gate` flag and the history are in [`PHASE5.md` §12](./docs/PHASE5.md#12-gate), criterion 4. Both arms' current readings live in `docs/benchmarks/EVIDENCE.md`, not here — nothing audits this table |
 | `just test-doc-error-codes` | the `compile_fail,E0277` pins, on nightly (stable rustdoc ignores the code) |
 | `just ros-build` / `ros-test` / `tf2-check` / `dds-bench` | container-only; nothing on the host can run them |
 | `just contended-scaling` / `scale-sweep` / `soak` / `bench-run` / `bench-ab` | exploratory; emit JSON, do **not** feed `bench-check` |

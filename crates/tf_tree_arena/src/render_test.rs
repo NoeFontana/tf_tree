@@ -4,11 +4,7 @@
 //!
 //! **Structure, never a sentence.** `docs/API.md` R5 is NORMATIVE that message
 //! text is not a compatibility promise, so nothing here compares a rendering
-//! with a literal. What it does pin is decision 2's rules, each of which a real
-//! regression breaks: a `Debug` fallback (braces, or the rendering *being* the
-//! `Debug`), a dropped field (a carried number missing), non-ASCII text (the C
-//! buffer turns it into `?`), a remedy paragraph (the length bound), and a lost
-//! search key (the trailing variant name).
+//! with a literal. What it does pin is decision 2's rules.
 
 use alloc::format;
 use alloc::string::String;

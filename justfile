@@ -649,14 +649,6 @@ gate RECIPE POLICY:
 # gated on a host that fails the timing probe, and at what pass count the
 # criterion is stated. Read it before changing any of the four.
 #
-# **The gated arm is the GROUPED one.** §12's own representative recording — four
-# hours at 100 Hz x 50 transforms — is 72e6 samples at 64 B, which does not fit
-# `DEFAULT_MAX_MEMORY_BYTES`, so pass two takes two groups and the recording is
-# read three times rather than twice. A gate measured at one fill pass and the
-# criterion as written are not the same claim, so this binary measures both and
-# gates the slower one. Each arm asserts the pass count it declares and REFUSES
-# if the run did not take it.
-#
 # **The corpus is generated, not committed.** `tf_tree_ingest::fixture` writes it
 # at run time, so nothing here adds megabytes of MCAP to a clone, and there is no
 # stale-fixture hazard for `rm -f` to defeat — the binary rewrites the file every
@@ -664,18 +656,6 @@ gate RECIPE POLICY:
 # zstd frames come from `ruzstd`'s own encoder, so this is a **round-trip**
 # corpus rather than a conformance one, and `testdata/zstd_conformance.mcap` is
 # what closes the conformance half for the decoder.
-#
-# **The density floor is what stops a vacuous pass**, and it is measured off the
-# survey rather than taken from the arguments: "10x real time" is a statement
-# about the corpus as much as about the code — at an identical per-transform cost
-# a 10 Hz x 5-transform recording reads a hundred times higher — so a gated run
-# on a corpus sparser than §12's own representative one REFUSES.
-#
-# **It publishes an absolute duration on a host that fails `Fitness::probe`**,
-# under §9.3's one-sided-budget amendment, in exactly the shape `just gate2`
-# uses it. Not a `bench_report` row and not `Sensitivity::Ratio` — that axis is
-# two engines interleaved within one round, and this is one engine against a
-# clock.
 #
 # **Not PHASE4 §6.3.** That section has a *different* "10x real time" criterion —
 # ROS 2 bag replay, no drops, bounded queue depth — which is unmet and which
@@ -696,37 +676,14 @@ gate5:
 # Both land on the same ~338 MiB `Fleet`, and gate 4's own comment below already
 # points at "the 233 MB index §12 gate 2 names".
 #
-# **What is gated, and what is only reported.** Two cache states, and only one
-# of them is a claim about this code. The *resident* arm — page cache warm — is
-# the gate: `open_frozen` does the same O(1) work whatever the index size, so
-# the same measurement on a 2 MiB fixture and on the 338 MiB one must agree, and
-# that is the half §12's parenthesis is actually about ("anything more means
-# work is happening that should not"). The *evicted* arm is reported with the
-# host beside it and gates nothing: its size dependence is the storage device
-# fetching pages for the one major fault an open takes — the fault *count* does
-# not move between the two fixtures, and the binary prints it — so gating on it
-# would gate the disk under the runner.
-#
-# **It publishes an absolute duration on a host that fails `Fitness::probe`, and
-# §9.3's one-sided-budget amendment is what admits that.** Every check the probe
-# fails here can only make an open slower, so a PASS with margin is conservative
-# and a FAIL is not attributable to the code. The verdict line prints the
-# fitness reasons whichever way it goes. This is not a `bench_report` row and
-# not a new `Sensitivity`; read the amendment before copying the pattern.
+# What is gated and what is only reported, why an absolute duration may be published
+# on a host that fails `Fitness::probe`, and the `--prefault` falsifier:
+# `docs/PHASE5.md` §12 criterion 2 (and §9.3's one-sided-budget amendment).
 #
 # **The fixtures are deleted first, for `gate4`'s reason and after checking that
 # the reason transfers.** `frozen_open` reuses an existing `--tft`, so without
 # the `rm` this recipe times last week's file — and gate 2 is a claim about the
 # open of a `.tft` *this build* wrote. It costs ~1.4 s.
-#
-# **The falsifier is `--prefault`, not `--budget-ms`.** It reads every byte of
-# the index inside the timed region, which is the regression this gate exists to
-# catch (a populate arm reaching the frozen backing) and edits no threshold: it
-# puts the open tens of milliseconds over the 10 ms budget and an order of
-# magnitude past the 4x scale bound, so both gated halves go red and neither is
-# marginal. No interval is written here — run it. `crates/tf_tree_bench/tests/gate2.rs`
-# drives it through the shipped binary, in both directions and one half at a
-# time, and runs per-PR from `just shm-check`.
 #
 # **The fixtures are deleted again on the way out, and only on success.** The
 # `rm -f` above is what makes the measurement about this build; this one is
@@ -777,17 +734,8 @@ gate2:
 # cached — but that is a property of a third-party action's cleanup routine, not
 # of this gate, and it is worth nothing locally.
 #
-# **`--gate` is what makes this recipe a gate, and it was missing.** Until it
-# existed the binary printed `PASS`/`FAIL` and returned `Ok(())` on both, so
-# `nightly.yml`'s `gate4` job — whose only step is this recipe — was green on
-# every possible reading of criterion 4. That is `docs/benchmarks/EVIDENCE.md`'s
-# founding failure (a recorded number nothing re-derives) in its other form: a
-# recipe that re-derives the number and then discards the verdict.
-#
-# The flag is on the *caller* rather than inferred by the binary, because
-# `gate4-python` below runs the same driver and must keep exiting 0 — see its
-# comment, and PHASE5 §12 gate 4's amendment. `--gate` refuses `--python` and
-# `--no-touch` outright, so the deferred decision cannot arrive as a flag pair.
+# Why `--gate` exists and what it refuses: `docs/PHASE5.md` §12 criterion 4,
+# *Correction — until 2026-09-04 this criterion was measured and not gated*.
 #
 # To iterate without re-freezing, run the binary directly:
 #   ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16
@@ -796,39 +744,9 @@ gate4:
     rm -f target/gate4/workers.tft
     ./target/release/frozen_workers --tft target/gate4/workers.tft --workers 1,16 --gate
 
-# **The same measurement with a *Python* worker, because gate 4's verdict is a
-# function of the worker's language.**
-#
-# `(S + 16p)/(S + p) <= 1.2` is `S >= 74p`, so criterion 4 is arithmetic about
-# `p` — private bytes per worker — as much as about sharing, and `p` is a
-# property of the interpreter, its extension modules and the worker's own
-# allocations. None of those belong to tf_tree. `docs/PHASE5.md` §12 gate 4's
-# amendment records what follows: the Rust worker's `p` is 0.36 MiB and a
-# spawned CPython one's is 13.44 MiB, so the criterion wants ~994 MiB of arena
-# where the fixture supplies 338, and **gate 4's own file fails gate 4's own
-# criterion at 1.785x with a Python worker.**
-#
-# **This recipe exists because that 1.785x had no recipe.** `just gate4`
-# regenerated the 1.024x and nothing regenerated the qualification, which is
-# `docs/benchmarks/EVIDENCE.md`'s founding failure — a recorded number nothing
-# re-derives — reappearing inside the register itself. §12 gate 4's amendment
-# names the obligation directly: any record that gives criterion 4 a second
-# worker arm owes a recipe with it.
-#
-# **It reports; it does not gate**, and the exit status says so: a Python row
-# printing FAIL still leaves this recipe at 0. Criterion 4 is stated over the
-# Rust worker and its **MET** is that row; giving the gate a second *gated* arm
-# is a decision and needs a record, which the amendment says in as many words. A
-# recipe that quietly promoted a reported number to a gate would be deciding
-# that here.
-#
-# **The mechanism is the absent `--gate` flag, and it is now load-bearing rather
-# than incidental.** `just gate4` passes `--gate` and this recipe does not, and
-# the binary *refuses* `--gate --python` naming the record it would be making —
-# so the two arms cannot be collapsed by editing one line of this file.
-# `crates/tf_tree_bench/tests/gate4.rs` drives the same failing measurement
-# through both shapes and asserts the statuses differ, which is the assertion
-# that stops a later "consistency" cleanup from quietly deciding this.
+# Why this arm exists, why it reports rather than gates, and why `--gate` refuses
+# `--python`: `docs/PHASE5.md` §12 criterion 4, "Amendment — 1.024× is a statement about a
+# Rust worker".
 #
 # **Same fixture, same deletion, for `gate4`'s reason.** It writes and deletes
 # `target/gate4/workers.tft` — gate 4's own file, not a copy — so "on the same
@@ -877,15 +795,8 @@ gate4-python: py-setup
 # `docs/PHASE4.md` carried "1.020×, PASS" as a frozen historical reading while
 # the example itself had started printing FAIL.
 #
-# **Two builds, and the second one is the gate.** The workspace `release`
-# profile is `lto = "thin"`, which inlines `tft_plan_at` into this Rust caller —
-# so the boundary the gate exists to price is *not in that binary*.
-# `report.rs`'s §9.2 embedding row already says thin LTO "is exactly what erases
-# the boundary"; nothing had applied it to §7. `[profile.embedder]` is
-# `lto = false` and is the honest one, and `just embed-cost` builds there for the
-# same reason. The `release` run is kept because the contrast between the two is
-# the finding, and because deleting it would leave nobody able to check the
-# claim.
+# The two builds and why only the `embedder` one gates:
+# `docs/decisions/0023-the-gate-that-could-not-gate.md` (*Context*, and *Decision*).
 #
 # **Pinned**, for `cpp-bench`'s reason.
 #
@@ -2533,26 +2444,8 @@ shm-check:
     # `cargo nextest list -p tf_tree_bench --features shm --bins`, against the
     # same command without the feature, is the instrument.
     #
-    # **CORRECTION (2026-09-04, same day):** the first version of this comment
-    # said "not one of them had ever been run by a recipe". That was false, and
-    # `just shm-test`, earlier in this same Phase 2 block, is the refutation —
-    # it has run
-    # `cargo nextest run -p tf_tree_bench --features shm --bin owner_migration`
-    # since before this line existed, so `owner_migration`'s unit tests
-    # (`gate_arithmetic_is_not_vacuous` among them) did run. What was true, and
-    # is the reason for this line, is narrower and about CI reach rather than
-    # execution: `grep -rn 'just shm-test' .github/` returns nothing, while
-    # `just shm-check` is a step of the `shm` job in `.github/workflows/ci.yml`
-    # (`grep -n 'just shm-check' .github/workflows/ci.yml` locates it; a line
-    # number is not written here because an edit above it moves one). So
-    # the negative control `docs/benchmarks/EVIDENCE.md`'s `owner_migration`
-    # row cites — the reason that gate's verdict is known to be able to flip —
-    # was reachable only by a human typing `just shm-test`, and is now reached
-    # by the job. `frozen_workers`'s tests are new with `--gate` and had no
-    # recipe of either kind before this line; whether some later recipe also
-    # reaches them is a `grep -n 'tf_tree_bench --features shm' justfile` away,
-    # and no claim about that set is written here — the last two comments in
-    # this file that made one were both wrong.
+    # Why this line exists, and the correction to its first explanation:
+    # `docs/PHASE5.md` §12 criterion 4, *Correction — until 2026-09-04 this criterion was measured and not gated*.
     cargo nextest run -p tf_tree_bench --features shm --bins
     # **PHASE5 §12 gate 4's exit status** — that `just gate4` fails on a FAIL and
     # `just gate4-python` does not, driven through the shipped binary on a
@@ -2997,41 +2890,7 @@ shm-torture-self-test:
 # **`docs/PHASE5.md` §5.1's NORMATIVE CI test, and §13's box 4** — the library
 # opens no network socket, asserted rather than promised.
 #
-# §5.1: *"run the full test suite under `strace` (or a seccomp filter) and
-# assert that `socket(2)` is called only with `AF_UNIX`"*. It backs the sentence
-# a robotics team makes a procurement decision on — "the `tf_tree` **library**
-# opens no network sockets. Ever." — and §5.1 itself says a promise in a README
-# is worth less than an assertion in CI. Until 2026-09-04 there was no
-# assertion: every hit of
-# `git grep -nE 'AF_UNIX|AF_INET|seccomp|strace' main` was prose or a comment
-# rather than an assertion — including the design note in
-# `crates/tf_tree_cli/src/web.rs` that scopes the assertion away from the CLI.
-# **A hit count stood here, in `scripts/no-network.sh` and in `docs/PHASE5.md`
-# §5.1's amendment; it is deleted rather than corrected a third time.** It was
-# published wrong, corrected, and then printed beside a basic-regex spelling of
-# that command in which `|` is a literal, so a reader who ran what was printed
-# got a different number — the instrument and the measurement disagreeing.
-#
-# **Scoped to the library's own suite, which is §11's wording and not a
-# narrowing.** The five published crates are traced; `tf_tree_cli` is not,
-# because `tf_tree top --web` is an `AF_INET` listener by construction. The
-# scope is a package list rather than an exception list inside the scanner: an
-# assertion that has learned to ignore an `AF_INET` socket has stopped being
-# this assertion.
-#
-# **It refuses rather than skips**, three ways, and each is red-tested: no
-# `strace` on the host; a `strace` that cannot see a `socket(2)` it is shown on
-# purpose (the script opens a real `AF_INET` socket through bash's `/dev/tcp`
-# on every run and requires the scanner to catch it); and a traced binary that
-# exits non-zero, whose remaining tests never ran. It also refuses a run in
-# which **no** socket was observed at all — the rendezvous is the one socket the
-# library is supposed to have, and without it "no non-`AF_UNIX` socket" is true
-# of an empty set.
-#
-# `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header. The
-# shortest thing it does not prove: a code path no test takes, and a socket the
-# library never creates but *inherits* — `tf_tree_ipc` passes the rendezvous fd,
-# and `socket(2)` is the syscall §5.1 names.
+# `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header.
 #
 # ~25 s of tracing on this host, on top of building the binaries; the run
 # prints how many binaries and `socket(2)` calls that was, and the totals are

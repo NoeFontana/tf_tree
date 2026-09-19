@@ -218,9 +218,8 @@ The gaps:
 
 - **Phase 2** — the daemon and recorder surface (§9–§10) are absent. §3.5's
   ownership migration works: kill the arena's owner and a surviving read-write
-  participant inherits the role. Its trigger is caller-driven — `owner_lost()`
-  is a non-blocking check a survivor makes in its own loop, and nothing makes it
-  for you, because there is no daemon.
+  participant inherits the role. Its trigger is caller-driven
+  ([`PHASE2.md` §3.5](./docs/PHASE2.md#35-ownership-migrates-the-data-plane-never-pauses--normative)).
 - **Phase 4** — everything except §5.9's affinity knobs and §6.3's replay rows.
   §1's exit criterion is **operational, not a feature list**: it is open, and no
   amount of code closes it.

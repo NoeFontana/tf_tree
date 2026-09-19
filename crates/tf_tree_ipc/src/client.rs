@@ -9,15 +9,9 @@
 //! participant holds its connection for the lifetime of the attachment, because
 //! that is how it learns the *owner* died — process death of any kind closes
 //! the fd and the peer sees the hangup, with no timeout to tune and no
-//! heartbeat to misinterpret. **It sees it when the kernel closes the dying
-//! process's files, at the end of its exit**: after any core dump and after its
-//! address space is torn down, and not before a `fork` child sharing the
-//! description exits
-//! ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md);
-//! §3.5's NORMATIVE sentence). That is exact, and it is not necessarily prompt:
-//! one host measured about a quarter of a millisecond for a small `SIGKILL`ed
-//! process and about 1.1 s for a small one dumping core through a piped
-//! `core_pattern`. Closing after the handshake would throw away the
+//! heartbeat to misinterpret. When it sees it: `docs/PHASE2.md` §3.5's
+//! NORMATIVE `owner_lost()` paragraph, and §3.7 step 9 for one host's figures.
+//! Closing after the handshake would throw away the
 //! liveness signal the whole design rests on, so [`Attached`] owns the socket
 //! and the caller must keep it alive.
 //!

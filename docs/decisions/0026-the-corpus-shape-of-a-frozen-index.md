@@ -634,9 +634,8 @@ write the signatures the question forks.
    `PHASE5.md` §12 gate 4**, on the argument that nothing is being decided — the
    criterion, the harness and the 1.024× all stand — so the qualification belongs
    beside the number it qualifies. It re-measured the whole table on gate 4's
-   *own* fixture rather than on this corpus: spawned-Python `p` = 13.44 MiB there,
-   and the gate's own file fails its own criterion at **1.785×** with a Python
-   worker. Also resolves this record's open question 3.
+   *own* fixture rather than on this corpus (`PHASE5.md` §12 criterion 4,
+   *Amendment*). Also resolves this record's open question 3.
 
 ## What would make this ready
 

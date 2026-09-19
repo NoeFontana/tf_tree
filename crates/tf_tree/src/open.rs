@@ -577,19 +577,13 @@ impl Tree {
     /// }
     /// ```
     ///
-    /// There is no background thread and no daemon, because
-    /// [`0019`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md)
-    /// holds that every process a user is *required* to run is a place adoption
-    /// dies — and a thread per attachment is the library-shaped version of the
-    /// same cost. A survivor that never calls this simply never becomes owner,
-    /// and the arena stays ownerless exactly as it does today.
+    /// There is no background thread and no daemon: `docs/PHASE2.md` §3.5,
+    /// *The trigger is the caller's*.
     ///
     /// # Lookups do not pause
     ///
-    /// Not during the poll, not during the lock, not during the bind. `Plan::at`
-    /// touches the mapping and nothing else; ownership lives entirely in the
-    /// control plane. That is the answer to the first question any integrator
-    /// asks about owner death, and it is unchanged by this method existing.
+    /// `docs/PHASE2.md` §3.5, *Lookups do not stop, slow down, or observe
+    /// anything during a takeover*.
     ///
     /// # Errors
     ///
@@ -602,16 +596,12 @@ impl Tree {
     ///
     /// # It takes `&self`, and that is what makes it reachable at all
     ///
-    /// It took `&mut self` until 2026-08-29, which cost two things
-    /// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
-    /// `docs/PHASE2.md` §3.5 had to carry a caller-side qualification — the
-    /// inheriting handle's own `Guard<'_>` could not be outstanding across the
-    /// call, so a control loop had to arrange recovery *between* cycles. And
     /// **both bindings could not call it at all**: `tft_tree` holds an
     /// `Arc<TreeShare>` and `PyTree` the `Arc<Tree>` that `Tree::claim_owned`
     /// requires, and `Arc::get_mut` fails the moment any plan or publisher holds
-    /// a clone — which, in a binding, is always. So §3.5's recovery was
-    /// unreachable from the languages a robot's nodes are written in.
+    /// a clone — which, in a binding, is always. Rationale:
+    /// [`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)
+    /// Decision 1.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     pub fn inherit_ownership(&self) -> Result<Inheritance, OpenError> {
         if !self.is_joined() {

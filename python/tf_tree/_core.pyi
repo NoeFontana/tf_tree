@@ -78,9 +78,7 @@ class TopologyChangedError(TfTreeError):
 class FrameNotDeclaredError(TfTreeError):
     """No such frame in this arena.
 
-    `name` exists only on instances the library raises. It is the name the
-    caller passed, and `None` only when the engine reported a hash with no name
-    left to recover.
+    `name` exists only on instances the library raises. See `docs/PHASE3.md` §4.4.
     """
 
     name: str | None
@@ -92,8 +90,7 @@ class TimeDomainMismatchError(TfTreeError):
 
     Raised at plan time by `Tree.plan(..., domain=)` and per query by
     `Tree.lookup(..., domain=)`: one class for both. The attributes exist only
-    on instances the library raises. `expected` is the path's or the plan's
-    tag, and `got` is the one the caller supplied.
+    on instances the library raises. See `docs/PHASE3.md` §4.4.
     """
 
     expected: int
@@ -120,10 +117,9 @@ class EdgeAlreadyClaimedError(TfTreeError):
 
     Raised by `Tree.publisher` and `tf_tree.push`. The holder must release the
     edge, or be reaped, first. The attributes exist only on instances the
-    library raises: `edge` is the arena's stored `(parent, child)` pair, and
-    `owner_slot` is the holder's participant **slot**, not a pid — `tf_tree
-    participants` lists the held slots and `tf_tree doctor` names the process
-    behind one. `owner_slot` is `None` while the holder's claim is still being
+    library raises (see `docs/PHASE3.md` §4.4): `owner_slot` is the holder's
+    participant **slot**, not a pid — `tf_tree participants` lists the held
+    slots and `tf_tree doctor` names the process behind one. `owner_slot` is `None` while the holder's claim is still being
     taken, or was abandoned mid-claim, which records no slot yet.
     """
 
@@ -704,16 +700,9 @@ class Tree:
         **A dying owner is seen at the end of its exit, not at its signal**
         (`PHASE2` §3.5, NORMATIVE): once the attach connection has hung up and
         the last open file description holding the ownership byte has closed.
-        The kernel writes any core dump and tears down the address space first,
-        so an owner dumping core through a piped `core_pattern` can take about
-        a second to be seen, and nothing a survivor can take shortens it
-        (`docs/decisions/0057`).
+        See `docs/decisions/0057`.
 
             if tree.owner_lost():
-                # "Contended" or "OwnerAlive": another survivor won, or a fresh
-                # open held the ownership byte in passing and will hand it back.
-                # Neither is final while owner_lost() says True; the next pass
-                # asks again.
                 tree.inherit_ownership()
         """
 

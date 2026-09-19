@@ -11,8 +11,7 @@
 #[cfg(not(loom))]
 pub(crate) use core::sync::atomic::{fence, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
-// `AtomicU16` backs the topology `depth` field (2 bytes/frame within the
-// 10-byte-per-frame topology block: parent u32 + edge_of_child u32 + depth u16).
+// `AtomicU16` backs the topology `depth` field (2 of the block's 12 B per frame; stride in PHASE1 §4.3, field layout §5.2).
 // It is only used by the production arena view, which is itself
 // `#[cfg(not(loom))]`, so it is not re-exported under loom (loom need not model
 // it — the topology loom test uses a bespoke wider model).

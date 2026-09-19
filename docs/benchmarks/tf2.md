@@ -278,9 +278,8 @@ same fixture. Both numbers are real; they are answers to different questions, an
 > item 3 of the guidance were all written against a §7 gate 1 that was a single
 > quotient — `tft_plan_at` over a native Rust arm. `docs/PHASE4.md` §0.0's §7
 > row now records that criterion **NOT EVALUABLE**: its denominator moved 43%
-> on an edit that did not touch the ABI at all (a second `Tree::guard()` call
-> site stops LLVM specialising the hoisted comparand — §7's ladder, where
-> the native arm goes 133 ns → ~190 ns while **the ABI arm does not move**), so
+> on an edit that did not touch the ABI at all
+> ([`0023`](../decisions/0023-the-gate-that-could-not-gate.md)'s *Context*), so
 > neither 1.020× nor 1.34–1.46× is a statement about the ABI. What gates today is
 > [`0023`](../decisions/0023-the-gate-that-could-not-gate.md)'s re-cut, run by
 > `just abi-cost` and recorded in [`EVIDENCE.md`](./EVIDENCE.md)'s `abi_cost`
@@ -1878,8 +1877,8 @@ makes `Plan` `Copy`, heap-free and allocation-free. It was hit while building th
 scaling row above (a 24-deep spine was refused outright when **one** number did
 both jobs), so it is recorded here rather than discovered by a user.
 [`0034`](../decisions/0034-the-depth-bound-priced-two-slots-the-same.md) split
-the two and re-sized both against a survey of 91 real robot descriptions, whose
-worst graph *diameter* is 30 joints.
+the two and re-sized both; the survey behind the sizes is in
+[`PHASE1.md` §7.1](../PHASE1.md#71-step-representation).
 
 **If you are migrating from tf2, the number to compare is your worst frame
 pair's diameter — up to the common ancestor and back down — not your tree's

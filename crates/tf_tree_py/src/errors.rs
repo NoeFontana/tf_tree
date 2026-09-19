@@ -11,14 +11,9 @@
 //! # How an attribute is attached ([`with_attrs`])
 //!
 //! **Set on the raised instance after construction, into its `__dict__`, with
-//! `args` left `(message,)`.** `BaseException.__reduce__` carries `__dict__`,
-//! so pickle, `copy` and `multiprocessing` keep the attributes with no
-//! `__reduce__` of ours, and `str(e)` is unchanged. Fields in `args` would turn
-//! `str(e)` into a tuple repr; a keyword constructor fails `pickle.loads`.
-//! Values are plain data (`int`, `str`, `bool`, `None`, tuples of those), never
-//! a handle. **An id is never an integer**: an edge is its stored `(parent,
-//! child)` names, the shape `Tree.edges()` returns, and a frame its stored name,
-//! each `None` where the arena holds no usable record (next section).
+//! `args` left `(message,)`.** Fields in `args` would turn
+//! `str(e)` into a tuple repr; a keyword constructor fails `pickle.loads`. The
+//! rest is in `docs/PHASE3.md` §4.4 and `docs/decisions/0058`.
 //!
 //! **Every mapper that attaches one takes `py: Python<'_>`, and that is what
 //! keeps the work off a detached thread.** `Python<'py>` is not `Ungil`, so
@@ -1548,10 +1543,8 @@ pub(crate) fn claim_err(
 /// The participant slot holding a claim, for [`claim_err`]'s message and
 /// `EdgeAlreadyClaimedError.owner_slot`.
 ///
-/// A slot, **not a pid**: amendment A3 made the claim word an indirection into
-/// the participant table, and the number is only useful next to `tf_tree
-/// doctor`, which prints both. Saying "pid" here would send an operator to
-/// `kill` an unrelated process.
+/// A slot, **not a pid** (`docs/PHASE3.md` §4.4; `docs/decisions/0058` for
+/// `tf_tree doctor`).
 ///
 /// **`None` exactly for `u32::MAX`**, which `tf_tree_core::edge::slot_of`
 /// returns for a claim word in `CLAIMING`: a claim between its

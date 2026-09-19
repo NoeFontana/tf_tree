@@ -1,37 +1,15 @@
 # Per-file budget for `path.rs:LINE` citations in tracked Markdown.
 #
-# A line number into a churning file is a citation the next edit to that file
-# silently breaks. Measured 2026-09-19: four citations into
-# `crates/tf_tree/src/{open,tree}.rs` already pointed at a blank or bare-`///`
-# line on `main`, and a seven-line rustdoc edit in one PR moved twenty-two more.
-# Twenty-three of those sites sit in `implemented` records, which this project
-# freezes, so they cannot be repaired in place.
+# The rule, its measurements and what the scanner matches: `check_line_citations`
+# in `scripts/artifact-versions.py`.
 #
 # The existing ones are grandfathered and the count may only fall. Cite a
 # **symbol** instead — `reclamation_verdict` in `crates/tf_tree/src/open.rs` —
 # which survives every edit that does not rename it.
 #
-# Fenced blocks are excluded (a `path:line` there is compiler output); code
-# spans are not, because that is where these citations are written.
-#
-# `just lint` refuses any increase **and any decrease left unrecorded**: each
-# row is an equality with what the scanner matches in its file, so shedding a
-# citation means lowering the number here in the same commit.
-#
-# **The scanner matches only the full-path form**, with a `crates/` or
-# `xtask/` or `scripts/` or `ros/` prefix, and not a bare `tree.rs:2182` — which
-# is the form `CLAUDE.md`'s rule names. These rows are therefore a floor on the
-# rot and not a census of it; `just artifact-versions` prints both totals — on
-# a failing run as well as a passing one — so neither is written down here to go
-# stale.
-#
 # **It scans tracked Markdown and nothing else.** The same citations are
 # written in Rust doc comments, where nothing gates them and several are
 # already stale. Covering those, and the bare spelling, is one follow-up.
-#
-# A row sitting above its file is headroom for a citation nobody had to
-# justify — and, until 2026-09-19, the way to raise a budget without anyone
-# noticing, because a drop was only a printed note.
 #
 # **One row was ADDED after the fact, on 2026-09-19, and that is not a licence
 # to add more.** `docs/PHASE5.md` had no row because the scanner reported zero

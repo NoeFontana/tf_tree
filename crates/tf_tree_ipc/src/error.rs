@@ -333,40 +333,15 @@ pub enum IpcError {
     /// ([`0059`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md)
     /// convention (g)).
     ///
-    /// **Two measurements put the remedy there rather than here, and the second
-    /// is why the first one's fix was not enough.** The message once appended a
-    /// single sentence about `LayoutMismatch` to *every* rejection, so a torture
-    /// run that exhausted the participant table printed, thousands of times:
-    ///
-    /// ```text
-    /// the arena owner refused this attach: NoParticipantSlots (owner format_version 3,
-    /// layout_hash 0x3D104195). A LayoutMismatch means this binary was built against a
-    /// different record layout than the running arena — rebuild both from the same source
-    /// ```
-    ///
-    /// The status is right there and it is not `LayoutMismatch`, but the advice
-    /// is the longest and last thing on the line, so it reads as the diagnosis
-    /// and costs a rebuild before anyone rereads the word in front of it. That
-    /// was repaired with one arm per status — and the *messages* those arms
-    /// produced were 112 to 378 bytes (the arms themselves 22 to 272), while
-    /// `tft_error::message` is 256 and `set_message` truncates at 255, so
-    /// **four of the seven statuses reached a C operator cut off mid-remedy** —
-    /// four on `tft_tree_open_named`'s path, whose wrapper is 26 bytes, and six
-    /// on the bridge's 35-byte one — which [`0059`]'s *Rationale* names as the
-    /// longest fixed text a C path puts in front of one of these renderings. A
-    /// count of truncations is a statement about a prefix, and this one used to
-    /// name none, and it is the message length the buffer sees, which is why
-    /// the figures quoted anywhere are renderings and not arms. A per-status
-    /// remedy that C cannot finish reading is the same defect one layer down,
-    /// which is what a runbook row does not have.
-    ///
-    /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
+    /// Why the remedy is not in the message, and why only the owner's numbers
+    /// are: `docs/PHASE2.md` §3.7, Erratum (2026-09-18, `0055` step 7).
     HandshakeRejected {
         /// Why.
         status: crate::wire::HelloStatus,
-        /// The **owner's** format version, so a caller can print both sides.
+        /// The **owner's** format version; the client's is not carried
+        /// (`docs/PHASE2.md` §3.7, Erratum).
         owner_format_version: u32,
-        /// The **owner's** layout hash, likewise.
+        /// The **owner's** layout hash.
         owner_layout_hash: u32,
     },
     /// The owner *rejected* the attach but sent a segment fd anyway.
@@ -1071,13 +1046,7 @@ mod tests {
     /// (`0055` step 7) — and, above all, **never names a status it did not
     /// get**.
     ///
-    /// That last rule is the shipped defect made unexpressible rather than
-    /// fixed. One sentence about `LayoutMismatch` was once appended to every
-    /// rejection, so a torture run that exhausted the participant table printed
-    /// a `NoParticipantSlots` refusal whose longest, last clause explained a
-    /// layout mismatch; the repair was one arm per status, and *those* were 112
-    /// to 378 bytes against a 256-byte C buffer. Both defects are refused here:
-    /// the prose is gone, and no rendering may contain another status's name.
+    /// The shipped defect and its measurements: `docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md`, step 7.
     ///
     /// Length and ASCII are `every_ipc_error_message_fits_the_c_abis_buffer`'s,
     /// which this variant is no longer excepted from.

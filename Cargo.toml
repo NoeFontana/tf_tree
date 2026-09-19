@@ -25,33 +25,15 @@ exclude = [
 
 [workspace.package]
 # **0.0.1, and the number is a statement about compatibility rather than about
-# maturity.** Under `0.0.x` cargo treats every release as incompatible with
-# every other: `^0.0.1` — which is what a bare `tf_tree = "0.0.1"` means —
-# matches `0.0.1` and nothing else, so a later `0.0.2` reaches no existing
-# dependant through `cargo update`. That is the honest signal for a first
-# publish of an engine whose §0.0 tables still carry open rows: nothing is
-# promised, and every release may break.
+# maturity.** `CHANGELOG.md`, *Versioning, stated before anything else*.
 #
 # **This supersedes `SUPPORT.md`'s minor-bump-on-MSRV rule for the whole 0.0.x
-# line, and the tension it creates is stated rather than deleted.** This field
-# read 0.2.0 on the argument that an MSRV bump is a minor-version bump pre-1.0,
-# and that the policy should be applied uniformly rather than skipped when it
-# happens to be cheap — two measured raises, 1.83 → 1.85 → 1.87, two minor
-# slots. Under 0.0.x there is no minor slot for that rule to occupy. The only
-# field left to move is the patch, and a patch release is exactly what the rule
-# says an MSRV bump must never be. What breaks the deadlock is that the rule's
-# purpose — never move the floor under a dependant who resolved by a range —
-# is already served here by the resolver: no range spans two 0.0.x releases, so
-# an MSRV raise reaches nobody who did not opt into it by editing a manifest.
-# The rule comes back into force at 0.1.0, where a minor slot exists again.
-# `SUPPORT.md`'s MSRV section carries the same statement in its own voice.
+# line.** `SUPPORT.md`'s *MSRV policy* section carries the argument.
 version = "0.0.5"
 edition = "2021"
 # **1.87, and each step was forced by a dependency rather than chosen.**
 #
-# 1.83 → 1.85: `cargo +1.83 build --workspace` failed to *parse* a manifest —
-# `blake3 1.8.5` pulls `constant_time_eq 0.4.2`, which is `edition = "2024"` and
-# declares `rust-version = "1.85.0"`. So 1.83 was a promise nothing kept.
+# 1.83 → 1.85: `SUPPORT.md`, *MSRV policy*.
 #
 # 1.85 → 1.87: `ruzstd 0.9.0` declares `rust-version = "1.87"`. It is the
 # pure-Rust zstd decoder `tf_tree_ingest` reads compressed MCAP chunks with, and
