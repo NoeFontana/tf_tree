@@ -36,7 +36,8 @@ defined by the status tables in `docs/`; they win over this file.
 
 - **Documentation and comments cut by about 85%** over two passes: records, specs, tests and
   code comments keep the decision and the contract; released entries moved to
-  `docs/changelog/`; `0002`/`0003` deleted; no line-number citations remain.
+  `docs/changelog/`; `0002`/`0003` deleted; no line-number citations remain. The C
+  headers' doc text is shortened to match; no signature changes.
 - **Python exceptions carry attributes and pickle**; `Tree.freeze` in a fork child
   raises instead of `SIGSEGV` ([`0058`](docs/decisions/0058-the-fields-a-python-exception-only-printed.md)).
 - **`ShmError`, `FrozenError`, `LayoutError`, `ParticipantError` implement
