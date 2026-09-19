@@ -1849,16 +1849,33 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > stable slot states can show which read went first, so no test in the CLI
 > claims to.
 >
-> **The false positive named above has had its producer removed.** `0028` step
-> 0b made both `Tree::attach_shared` and `Tree::attach_shared_at` refuse
-> `AttachMode::ReadWrite`, so a byte-less writer has no in-tree producer left.
-> `TreeBuilder::build_shared` called directly still registers without a byte and
-> is still supported, but such a tree has no lock file at all — it reaches the
-> *byte unknown* row of `slot_leak`'s table and is judged by `/proc` alone,
-> exactly as it was before. That row is also what `--from-bag` and the in-process
-> fixture take, so a source with no rendezvous keeps the predicate this check
-> shipped with rather than falling silent, and its message says so instead of
-> claiming a probe the run never made.
+> **The false positive named above has had *one of its two* producers
+> removed.** `0028` step 0b made both `Tree::attach_shared` and
+> `Tree::attach_shared_at` refuse `AttachMode::ReadWrite`, so that byte-less
+> writer has no in-tree producer left.
+>
+> **The second is still here, and the sentence that used to follow was wrong.**
+> It read: *"`TreeBuilder::build_shared` called directly still registers without
+> a byte and is still supported, but such a tree has no lock file at all — it
+> reaches the* byte unknown *row of `slot_leak`'s table and is judged by `/proc`
+> alone, exactly as it was before."* **The `byte unknown` row is about the
+> observer's evidence, not the subject's lock file.** A `doctor --attach` run
+> reached its arena through the rendezvous, so it holds a lock file and probes:
+> a byte-less record reads `(byte free, recorded process unknown)`, which is
+> `SlotLeak::Abandoned` — a leak reported against a process that is running and
+> publishing. `crates/tf_tree_cli/src/checks.rs`'s
+> `a_byteless_record_in_a_served_arena_is_accused_of_leaking` executes it, and
+> the retraction is written on `tft014` where the sentence lived. What bounds it
+> is [`0031`](./decisions/0031-the-participant-record-with-no-byte.md): serving
+> a `build_shared` arena is *out of contract*, and serving is the only way such
+> a record is ever put in front of this check.
+>
+> The `byte unknown` row is what `--from-bag` and the in-process fixture take —
+> a source with no rendezvous keeps the predicate this check shipped with rather
+> than falling silent, and its message says so instead of claiming a probe the
+> run never made. It is **also** where a probe that *errors* lands, on a run
+> that did read a lock file, which is why `slot_facts` is three-valued on
+> purpose.
 >
 > **Still detection, and still no new id.** Nothing here reclaims anything:
 > `0028` reclaims from the assigner (step 3) and from `Tree::reap_participants`

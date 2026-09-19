@@ -2254,11 +2254,16 @@ pub enum SlotLeak {
 /// removed the producer of — and naming a process `/proc` says is *running* as
 /// leaked is the one false positive that gets a `warn` suppressed for good.
 ///
-/// **The `unknown` byte row is the source with no lock file at all** — the
-/// in-process fixture and `--from-bag`, whose participant table is this
-/// process's own. It keeps exactly the predicate this check shipped with, so a
-/// source that cannot be asked about a byte reports what it always did rather
-/// than falling silent.
+/// **The `unknown` byte row is the run with no byte answer** — usually the
+/// source with no lock file at all, the in-process fixture and `--from-bag`,
+/// whose participant table is this process's own. It keeps exactly the
+/// predicate this check shipped with, so a source that cannot be asked about a
+/// byte reports what it always did rather than falling silent. **An `--attach`
+/// run reaches it too**, for any slot whose `F_OFD_GETLK` returns `Err`, which
+/// is why `slot_facts` is three-valued rather than folding a failed probe into
+/// `Free` — a failed probe is not an accusation. The cost is that
+/// [`abandoned_evidence`]'s message for this row says "no lock file was read on
+/// this run", which on that path is false.
 ///
 /// **The one race left in it is the creator's, and it is µs-wide.** That path
 /// takes the byte *before* writing the identity record (a deliberate deviation
@@ -2537,9 +2542,13 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 /// is judged by `/proc` alone, exactly as it was before."* That offers the
 /// **subject's** missing lock file as though it decided the **observer's**
 /// evidence, which is the confusion `docs/decisions/0028`'s erratum retracts
-/// one layer down. [`LockByte::Unknown`] means *this run read no lock file*,
-/// and a `doctor --attach` reached its arena by name, so it has one: the
-/// byte-less record probes [`LockByte::Free`] with no identity record beside it
+/// one layer down. [`LockByte::Unknown`] is a fact about **this run's
+/// evidence**, not about the subject: `slot_facts`
+/// (`crates/tf_tree_cli/src/lib.rs`) produces it when no lock file was read
+/// *and* when a probe returns `Err` — three-valued on purpose, and neither
+/// value is "the subject has no lock file". A `doctor --attach` reached its
+/// arena by name, so it holds one and it probes: the
+/// byte-less record reads [`LockByte::Free`] with no identity record beside it
 /// — `(LockByte::Free, RecordedProcess::Unknown)`, which is
 /// [`SlotLeak::Abandoned`]. A live, publishing process is reported as an
 /// abandoned slot, over the evidence clause *"the lock byte is free"*. Pinned
@@ -2547,8 +2556,12 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 /// also says what the retracted sentence did **not** get wrong: the `unknown`
 /// row accuses too, on `state == LIVE && !alive`. The difference is the
 /// evidence an operator is then sent after — under that row the message adds
-/// *"/proc says its process is gone, and no lock file was read on this run"*,
-/// which is a claim about a syscall this run did make.
+/// *"/proc says its process is gone, and no lock file was read on this run"*.
+/// On a `--from-bag` or fixture source that clause is true. On an `--attach`
+/// run it is not, and an `--attach` run *can* land there, because a failed
+/// probe reaches the same row: that message is the one shape in this check
+/// whose prose is wrong about its own run rather than about its subject, and
+/// it predates all of this.
 ///
 /// **What bounds it is where "still supported" stops.** That phrase is about
 /// the **call**, not about serving its result:
@@ -5274,7 +5287,7 @@ mod tests {
         );
         assert!(
             !m.contains("no lock file was read on this run"),
-            "this run read one, so that clause belongs to the `LockByte::Unknown` row — reaching it would mean the retracted sentence was right: {m}"
+            "that clause belongs to the `LockByte::Unknown` row, which this shape does not take: reaching it would mean the retracted sentence was right: {m}"
         );
     }
 

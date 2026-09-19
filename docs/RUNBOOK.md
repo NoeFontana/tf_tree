@@ -450,10 +450,19 @@ the arena's own table is `tf_tree doctor --attach`**, whose `TFT014` walks the
 participant records, says how many slots are spent of how many, and names each
 pid — see its row in *Diagnostics* below for what reclaims one. Its own
 detection limits are written where it is implemented (`tft014`,
-`crates/tf_tree_cli/src/checks.rs`): a record with no lock byte reaches the
-`unknown` byte row and is judged by `/proc` alone, and a claim left by a dead
-owner or by a `build_shared` participant is invisible to it, because neither has
-a socket hangup anybody sees.
+`crates/tf_tree_cli/src/checks.rs`): a claim left by a dead owner or by a
+`build_shared` participant is invisible to it, because neither has a socket
+hangup anybody sees.
+
+**And a record with no lock byte is worse than invisible — it is accused.**
+This paragraph used to say such a record "reaches the `unknown` byte row and is
+judged by `/proc` alone", which is what the run does when it read *no lock
+file*. A `doctor --attach` reached the arena through the rendezvous, so it has
+one and it probes: the byte-less record reads free, no lock-file identity names
+it, and `TFT014` reports **`a record left behind — … the lock byte is free`**
+about a process that is running and publishing. If you are looking at that
+finding, do not read it as "the process is gone" — check whether the pid it
+names is alive before you act on it.
 
 **Those two blind spots are not the same kind of thing, and what you do about
 them differs.** A dead **owner** is in contract: it happens to every fleet, and

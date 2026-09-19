@@ -82,6 +82,18 @@ it — **do not sweep**, because `Tree::reap_dead`, `tft_tree_reap_dead` and
 `Tree.reap_dead()` will take the claims of publishers that are running, while no
 `tf_tree` subcommand sweeps at all, so `doctor` is safe either way.
 
+**The sentence being retracted had five copies, and the plan named one.**
+`TFT014`'s rustdoc said a byte-less record "reaches `slot_leak`'s `unknown`
+byte row and is judged by `/proc` alone"; `docs/RUNBOOK.md` said it to
+operators and `docs/PHASE5.md` said it in the spec. The claim is false — that
+row is about **this run's** evidence, and a `--attach` run holds a lock file, so
+the record reads `(byte free, process unknown)` and is reported as an abandoned
+slot against a process that is publishing. The runbook copy was the one with
+teeth: an operator reading a real `TFT014` finding was told to interpret it as
+"the process is gone", three lines above the paragraph telling them not to
+sweep. Found by grepping the claim rather than by working the list, which is
+how the count went from three sites to five over four review rounds.
+
 That rustdoc is twenty-four lines, so it moved every line-number citation into
 `tree.rs` that pointed past it by exactly that much. The ones in `PHASE2.md`,
 `PHASE3.md` and `PHASE5.md` are symbol citations now. One had been stale on
