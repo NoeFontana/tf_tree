@@ -101,19 +101,25 @@ That rustdoc is twenty-four lines, so it moved every line-number citation into
 `impl Drop for Tree`, which is some two thousand lines away, at a benchmark
 note.
 
-**`0028`'s, `0034`'s and `0055`'s are wrong by twenty-four lines each and stay
-that way** — those records are `implemented` and frozen, and a line-number
-erratum per site would bury `decisions/README.md`'s real ones, so that file
-carries one erratum covering all of them. That is not a side effect to swallow
-quietly: it is the ratchet's grandfathered set decaying on schedule, which is
-the argument the ratchet was built on.
+**The ones in frozen records are now unreliable and stay that way** — the
+displaced sites are in `0005`, `0028`, `0034`, `0055` and `0059`, all
+`implemented`, and a line-number erratum per site would bury
+`decisions/README.md`'s real ones, so that file carries one erratum covering all
+of them. *Unreliable* rather than *off by twenty-four*, for the reason two
+paragraphs down. That is not a side effect to swallow quietly: it is the
+ratchet's grandfathered set decaying on schedule, which is the argument the
+ratchet was built on.
 
-`0019`'s and `0057`'s are repaired instead, because those records are `ready`
-and so may be edited. **Repairing `0019`'s is also what showed this paragraph
-was overstating**: its `tree.rs:1166-1181` was not displaced by twenty-four
-lines, it was *already* pointing at the wrong item on `main` — the tail of
-`impl Drop for EdgeWriter` and `impl Deref for EdgeWriter`, some six hundred
-lines from the `Tree::frame` the surrounding sentence is about. So the
+Every site in a record that may be edited is repaired instead — `0019` and
+`0057` (`ready`), `0027` and `0030` (`draft`), and `docs/benchmarks/tf2.md`.
+That list took three passes to get right, because it was assembled from memory
+twice before it was measured.
+
+**Repairing `0019`'s is also what showed this paragraph was overstating**: its
+`tree.rs:1166-1181` was not displaced by twenty-four lines, it was *already*
+pointing at the wrong item on `main` — the tail of `impl Drop for EdgeWriter`
+and `impl Deref for EdgeWriter`, some six hundred lines from the `Tree::frame`
+the surrounding sentence is about. So the
 grandfathered set is not uniformly twenty-four lines out; it is
 twenty-four-lines-out *on top of* whatever it already was, which nothing has
 measured site by site.

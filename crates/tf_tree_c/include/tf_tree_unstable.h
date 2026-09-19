@@ -1700,8 +1700,10 @@ tft_status tft_tree_inherit_ownership(const tft_tree *tree,
  * role does not close it — `Tree::inherit_ownership` binds a fresh
  * `OwnerServer`, and the survivors that were attached before the death still
  * hold sockets to the process that died, which the heir's `epoll` never
- * watched. `docs/PHASE2.md` §6.3 states the same reach from the other side:
- * the sweep is what gets "any slot on an arena whose owner is dead".
+ * watched. `docs/PHASE2.md` states the same reach from the other side, in
+ * §0.0's *Reaping (§6.3)* row rather than in §6.3 itself: this sweep is what
+ * gets "any slot on an arena whose owner is dead". §6.3's own body is the
+ * normative rule it satisfies — *"reaping must not be owner-only"*.
  *
  * Returns `0` written to `out` for a read-only tree, a heap tree, or a tree
  * with no rendezvous: none of them can prove a holder is gone, and none of them

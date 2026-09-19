@@ -1647,11 +1647,26 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > the members that
 > leave a `LIVE` record over a free byte are the owner's own slot, an owner
 > killed between the hangup's probe and its CAS, a client the owner's
-> `epoll::add` failed for, a `ReadWrite` `Tree::attach_shared` participant, and —
-> once §3.5 is wired — a takeover heir's inherited peers. **Two of those five
-> leave the owner dead, so `doctor --attach` cannot be pointed at them:** the
-> rendezvous died with the owner and a fresh join is refused
-> `ArenaHeldButUnreachable`. That is a limit on the *source*, not on the check;
+> `epoll::add` failed for, a takeover heir's inherited peers, and a byte-less
+> `TreeBuilder::build_shared` creator in an arena somebody served by hand.
+>
+> **This list named a `ReadWrite` `Tree::attach_shared` participant and gated
+> the takeover entry on "once §3.5 is wired", and both were stale.** `0028`
+> step 0b made both fd-attach arms refuse `ReadWrite`, so that shape cannot be
+> constructed; §3.5 shipped 2026-08-28 (§0.0). The byte-less creator is the
+> entry that was never here: it is
+> [`0031`](./decisions/0031-the-participant-record-with-no-byte.md)'s subject,
+> *out of contract*, and the only member of this list that `TFT014` does not
+> merely miss but **accuses** — see the amendment below.
+>
+> **It also read "Two of those five leave the owner dead, so `doctor --attach`
+> cannot be pointed at them", and sorting the members that way is wrong.**
+> What `--attach` can reach is a property of the arena when you run it, not of
+> the member: a dead owner's rendezvous refuses a fresh join with
+> `ArenaHeldButUnreachable`, and a survivor calling `Tree::inherit_ownership`
+> makes the same arena serve again — with the owner's own leaked slot now
+> visible, beside the heir's unwatched peers. So it is a limit on the *source at
+> that moment*, not on the check and not on the member.
 > `crates/tf_tree/tests/rendezvous.rs`'s
 > `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` stages the
 > reclaimed peer and the unreclaimable owner on one real arena and asserts the

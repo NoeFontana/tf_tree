@@ -2305,14 +2305,29 @@ pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
 
 /// The evidence clause of an [`SlotLeak::Abandoned`] finding.
 ///
-/// Three renderings because there are three evidence sets. A message that says
-/// "the lock byte is free" on a run that never opened a lock file is asserting
-/// a syscall it did not make, and an operator who then goes looking for the
-/// holder has been sent by the tool.
+/// One rendering per evidence set. A message that says "the lock byte is free"
+/// on a run that never opened a lock file is asserting a syscall it did not
+/// make, and an operator who then goes looking for the holder has been sent by
+/// the tool.
+///
+/// **[`RecordedProcess::Unknown`] has two causes and they are not one clause.**
+/// Its own doc says so — *"no identity record to ask about, **or** `/proc`
+/// would not say"* — and this function collapsed them into "/proc could not say
+/// what became of the process" until 2026-09-19. On the byte-less
+/// `build_shared` record that `a_byteless_record_in_a_served_arena_is_accused_of_leaking`
+/// pins, there is no identity record, so `/proc` was never asked about anybody:
+/// the message named a syscall the run did not make, beside a pid `/proc` would
+/// have answered for instantly. `recorded_pid` is what separates them, because
+/// it is `Some` exactly when a record was read.
 fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
     match (p.byte, p.recorded) {
         (LockByte::Free, RecordedProcess::Gone) => {
             "the lock byte is free, and /proc has no running process for it"
+        }
+        (LockByte::Free, RecordedProcess::Unknown) if p.recorded_pid.is_none() => {
+            "the lock byte is free, and the lock file holds no identity record for this slot \
+             — so nothing names a process for /proc to be asked about, and the kernel's \
+             answer about the byte is the whole of the evidence"
         }
         (LockByte::Free, _) => {
             "the lock byte is free, and /proc could not say what became of the process — so \
@@ -2559,9 +2574,13 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 /// *"/proc says its process is gone, and no lock file was read on this run"*.
 /// On a `--from-bag` or fixture source that clause is true. On an `--attach`
 /// run it is not, and an `--attach` run *can* land there, because a failed
-/// probe reaches the same row: that message is the one shape in this check
-/// whose prose is wrong about its own run rather than about its subject, and
-/// it predates all of this.
+/// probe reaches the same row — a message wrong about its own run rather than
+/// about its subject, and it predates all of this. *This said "the one shape in
+/// this check" whose prose is wrong that way, and the shape this paragraph is
+/// about was a second: `abandoned_evidence`'s free-byte arm said `/proc` could
+/// not say, where there was no identity record for `/proc` to be asked about.
+/// That one is fixed; this one is not, because the row it belongs to is the
+/// no-evidence row and there is nothing truer to put there.*
 ///
 /// **What bounds it is where "still supported" stops.** That phrase is about
 /// the **call**, not about serving its result:
@@ -5287,6 +5306,14 @@ mod tests {
         assert!(
             m.contains("the lock byte is free"),
             "the evidence must name the byte this run probed, which is what tells an `--attach` finding from a `--from-bag` one: {m}"
+        );
+        assert!(
+            m.contains("no identity record for this slot"),
+            "this slot has no lock-file record, so nothing named a process for /proc to be asked about: {m}"
+        );
+        assert!(
+            !m.contains("/proc could not say"),
+            "/proc was never asked here — that clause is for a record that exists and a probe that would not answer: {m}"
         );
         assert!(
             !m.contains("no lock file was read on this run"),

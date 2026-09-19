@@ -349,7 +349,7 @@ about the shape:
 
    **A `build_shared` / `attach_shared` tree holds only the memfd** —
    `attachment`, `claim_lock` and `ofd_probe` are all `None`
-   (`tree.rs:1250-1260`) — and every `attach_shared` caller in the workspace
+   (`crates/tf_tree/src/tree.rs`) — and every `attach_shared` caller in the workspace
    reaches its fd through `exec` (`load_child` takes it from stdin), where the
    registry is a freshly zeroed static. So registering the memfd does not break
    the inheritance path.
