@@ -287,9 +287,7 @@ impl OffsetTable {
         }
         let offset = stamp_nanos.saturating_sub(received.0);
 
-        let Some(id) = self.ids.intern(owner) else {
-            return None;
-        };
+        let id = self.ids.intern(owner)?;
         if self.rows.len() <= id.get() {
             self.rows.resize(id.get() + 1, None);
         }

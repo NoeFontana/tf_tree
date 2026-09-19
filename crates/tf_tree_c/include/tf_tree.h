@@ -572,6 +572,8 @@ tft_status tft_plan_at(const tft_plan *plan, int64_t stamp, tft_layout layout, v
  * with the buffer untouched; `TFT_ERR_NO_SEGMENT` can fire part-way. Sort your stamps:
  * non-decreasing stamps ride a resumable cursor.
  *
+ * # Safety
+ *
  * `plan` must be a live handle. `stamps` must point to `n` readable `int64_t`. `out` must point to at
  * least `n * stride` writable bytes (`stride` is `out_stride_bytes`, or the payload size if zero).
  */

@@ -41,6 +41,7 @@
 //! * [`profile_settings_from_manifest`] reads `lto` and `codegen-units` from the
 //!   workspace manifest, and a test asserts the profiles still say what this
 //!   module claims.
+//!
 //! [`Plan::at`]: tf_tree::Plan::at
 
 use std::path::Path;
