@@ -2340,8 +2340,8 @@ fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
         }
         (LockByte::Free, RecordedProcess::Unknown) if p.recorded_pid.is_none() => {
             "the lock byte is free, and this run got no identity record out of the lock file \
-             for this slot — so nothing there named a process, /proc was asked about none, \
-             and the pid below is the arena record's own"
+             for this slot — none written, or none readable — so /proc was asked about \
+             nobody and the pid below is the arena record's own"
         }
         (LockByte::Free, _) => {
             "the lock byte is free, and /proc could not say what became of the process — so \
@@ -5323,7 +5323,11 @@ mod tests {
         );
         assert!(
             m.contains("no identity record out of the lock file"),
-            "this run got no lock-file record for the slot, so nothing there named a process: {m}"
+            "this run got no lock-file record for the slot: {m}"
+        );
+        assert!(
+            m.contains("none written, or none readable"),
+            "the clause must not settle which of the two it was — a failed read and an absent record fold together upstream: {m}"
         );
         assert!(
             m.contains("the pid below is the arena record's own") && m.contains("pid 4712"),

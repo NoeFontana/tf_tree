@@ -1336,11 +1336,11 @@ def check_line_citations() -> str:
     names the bare form explicitly. The gate covers well under half of what it
     is named for, and it is the *later*-written half, since the bare spelling is
     what a record reaching for brevity produces. **Both totals are printed on
-    every run** rather than recorded in prose: the figure went stale in three
-    documents inside the change that first measured it, because the same branch
-    kept converting bare citations. Extending the pattern grandfathers a few
-    hundred more sites, which is its own change and its own review; it is not
-    folded in here.
+    every run, failing ones included** rather than recorded in prose: the figure
+    went stale in three documents inside the change that first measured it,
+    because the same branch kept converting bare citations. Extending the
+    pattern grandfathers a few hundred more sites, which is its own change and
+    its own review; it is not folded in here.
 
     **Per file rather than in total**, because a total is not a ratchet: one
     document could shed five citations while another gained five and the sum
@@ -1366,7 +1366,13 @@ def check_line_citations() -> str:
     )
     files = tracked("*.md")
     found: dict[str, int] = {}
+    # The same citation with the directory prefix made optional — the form
+    # `CLAUDE.md`'s rule names and this gate does not hold. Counted in the same
+    # pass, so the two figures cannot be taken over different corpora.
+    bare = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|py):\d+")
+
     total = 0
+    wider = 0
     unreadable: set[str] = set()
     for rel in files:
         prose, unclosed = strip_fenced_blocks(Path(rel).read_text(errors="replace"))
@@ -1378,6 +1384,7 @@ def check_line_citations() -> str:
                 f"goes uncounted and the budget passes on a partial read"
             )
         hits = len(pattern.findall(prose))
+        wider += len(bare.findall(prose))
         if hits:
             found[rel] = hits
             total += hits
@@ -1452,16 +1459,23 @@ def check_line_citations() -> str:
             f"row that sits above its file is headroom for a citation nobody "
             f"had to justify."
         )
-    # **The uncounted half, measured on every run rather than written down.**
-    # This number went stale three times in the PR that first wrote it — in
-    # `CLAUDE.md`, in the budget header and in this docstring — because the
-    # branch kept converting bare citations while the figure stayed put. It is
-    # printed instead of quoted, so no document has to carry it.
-    bare = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|py):\d+")
-    wider = 0
-    for rel in files:
-        prose, _ = strip_fenced_blocks(Path(rel).read_text(errors="replace"))
-        wider += len(bare.findall(prose))
+    # **The uncounted half went into three documents and went stale in all of
+    # them inside one branch**, so it is printed rather than written down — and
+    # a printed number nothing can contradict is the shape this gate keeps
+    # finding, so it gets the same anti-vacuity treatment as the pattern above.
+    # `bare` is a strict superset of `pattern` by construction: every prefixed
+    # citation is also a bare one.
+    if wider < total:
+        fail(
+            f"the wider citation census counted {wider} against the gated "
+            f"{total}, and it cannot be smaller — every prefixed citation is "
+            f"also a bare one, so the `bare` pattern has stopped matching"
+        )
+    if not bare.search("see `tree.rs:2182` for it"):
+        fail(
+            "the wider census pattern no longer matches a bare citation; the "
+            "figure it prints is asserting nothing"
+        )
     return (
         f"{total} `path.rs:LINE` citations in {len(found)} documents, "
         f"each matching its row in {budget_path} "
@@ -1590,6 +1604,14 @@ def main() -> int:
     ]
 
     if failures:
+        # **The summaries go out on a failing run too.** Every check that got
+        # far enough to produce one has something a reader wants precisely when
+        # something is wrong — the citation census most of all, since a person
+        # reading a ratchet failure is the person who needs both totals. They
+        # went to stdout only on success until 2026-09-19, and three documents
+        # had been changed to defer to output that a red run suppressed.
+        for line in lines:
+            print(f"artifact-versions: {line}")
         print(
             "artifact-versions: the repository disagrees with itself.\n",
             file=sys.stderr,

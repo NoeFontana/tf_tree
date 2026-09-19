@@ -154,7 +154,10 @@ about it:
   that *this run* got no identity record, because a failed read and an absent
   one are folded together upstream;
 - `Tree.reap_dead()`'s Python docstring carried the pre-retraction framing while
-  the runbook was warning operators about that exact call.
+  the runbook was warning operators about that exact call — **and so did
+  `python/tf_tree/_core.pyi`**, which is the one a wheel user's editor shows.
+  The PyO3 docstring and the stub are a paired site that nothing gates, which
+  `0057` had already found the hard way.
 
 `a_byteless_record_in_a_served_arena_is_accused_of_leaking` executes the whole
 shape, and its mutant is recorded against the first note written about it, which

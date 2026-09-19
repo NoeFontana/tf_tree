@@ -218,12 +218,14 @@ cannot see it — **`just ros-build` and `just ros-test` are its entire gate**;
   (`scripts/line-citation-budget.txt`), each row an equality with its file; a new
   one fails. **The gate sees only the spelling that carries a
   directory prefix** (`crates/`, `xtask/`, `scripts/`, `ros/`), not a bare
-  `tree.rs:123` — so its rows are a floor on the rot and not a census. It prints
-  both totals on every run rather than either being written down here, because
-  the figure went stale in three documents inside the PR that measured it.
+  `tree.rs:123` — so its rows are a floor on the rot and not a census. **Both
+  totals are printed by the gate, on a failing run as well as a passing one**,
+  rather than either being written down here: the figure went stale in three
+  documents inside the PR that measured it, and it is wanted most by whoever is
+  reading a ratchet failure. `scripts/line-citation-budget.txt` is the register;
+  no total belongs in this file.
   *Writing the prefixed form here as an example failed this very gate, which is
-  the shortest demonstration that it works.* No count is repeated here beyond that
-  one measurement, because the budget file is the register.
+  the shortest demonstration that it works.*
 - No blocking wait, futex, or notification primitive **in the arena**
   ([`0018`](./docs/decisions/0018-blocking-waits-belong-in-the-shim.md)).
 - **Cut, not deferred** ([`0009`](./docs/decisions/0009-descoping-phase-6.md)):

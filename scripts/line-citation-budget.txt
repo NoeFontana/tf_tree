@@ -21,8 +21,9 @@
 # **The scanner matches only the full-path form**, with a `crates/` or
 # `xtask/` or `scripts/` or `ros/` prefix, and not a bare `tree.rs:2182` — which
 # is the form `CLAUDE.md`'s rule names. These rows are therefore a floor on the
-# rot and not a census of it; `just artifact-versions` prints both totals on
-# every run, so neither is written down here to go stale.
+# rot and not a census of it; `just artifact-versions` prints both totals — on
+# a failing run as well as a passing one — so neither is written down here to go
+# stale.
 #
 # A row sitting above its file is headroom for a citation nobody had to
 # justify — and, until 2026-09-19, the way to raise a budget without anyone
