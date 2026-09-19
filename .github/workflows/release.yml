@@ -125,7 +125,8 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/v}"
-          header="$(grep -m1 -F "## [${tag}]" CHANGELOG.md || true)"
+          # The section is in CHANGELOG.md until the next release moves it.
+          header="$(grep -m1 -F "## [${tag}]" CHANGELOG.md docs/changelog/"${tag}".md 2>/dev/null | head -1 | sed 's/^[^:]*://' || true)"
           if [[ -z "$header" ]]; then
             echo "::error::CHANGELOG.md has no '## [${tag}]' section" >&2
             exit 1
@@ -562,12 +563,14 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/}"
           ver="${tag#v}"
+          notes_src=CHANGELOG.md
+          grep -qF "## [${ver}]" "$notes_src" || notes_src="docs/changelog/${ver}.md"
           {
             awk -v v="$ver" '
               $0 ~ "^## \\[" v "\\]" { p = 1; next }
               p && /^## \[/ { exit }
               p { print }
-            ' CHANGELOG.md
+            ' "$notes_src"
             cat <<'EOF'
 
           ## Prebuilt `tf_tree` CLI

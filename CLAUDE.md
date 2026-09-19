@@ -11,6 +11,8 @@ D1–D22 in §5, design smells in §6), then the spec for the phase you touch,
 **before** touching code. When they do not answer a question — **stop and ask.**
 Never invent an answer in the concurrency or arena-layout sections.
 
+`docs/changelog/` is frozen per-release history: do not search, sweep or edit it.
+
 Each spec's **§0.0 status table is the source of truth**, over its own prose,
 over the README, and over this file.
 

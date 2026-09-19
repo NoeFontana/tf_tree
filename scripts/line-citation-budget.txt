@@ -43,7 +43,7 @@
 # counted a triple backtick written inside an inline code span, and an odd
 # marker count inverts the pairing for the rest of a file — prose blanked, code
 # blocks scanned. The stripper is line-anchored now (`strip_fenced_blocks`).
-2	CHANGELOG.md
+2	docs/changelog/0.0.5.md
 17	docs/PHASE2.md
 3	docs/PHASE3.md
 5	docs/PHASE4.md
