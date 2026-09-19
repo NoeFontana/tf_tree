@@ -1,18 +1,10 @@
 // tf_tree — header-only C++17 wrapper over the C ABI. docs/PHASE4.md §4.
-// Hand-written; `tf_tree.h` is generated.
-//
-// No logic (§4.1): every function is a thin inline over the C ABI; a behaviour
-// that needs a branch belongs in Rust. Whatever can be wrong here should be a
-// compile error (`static_assert`), not a runtime one.
+// Hand-written; `tf_tree.h` is generated. No logic (§4.1): thin inlines over the C ABI.
 //
 // Error modes, chosen at include time:
 //   default                     -> throws tf_tree::Error
 //   #define TF_TREE_NO_EXCEPTIONS -> returns tf_tree::expected<T, Error>
-// `-fno-exceptions` defines the macro for you.
-//
-// Layouts are selected by type, not by argument (§3.5): `plan.at<Eigen::Isometry3d>(t)`
-// picks `MAT4_COL`. `layout_of<T>` is the mechanism; a new type needs a
-// specialisation with its own `static_asserts`.
+// Layouts are selected by type (§3.5) via `layout_of<T>`.
 
 #ifndef TF_TREE_HPP
 #define TF_TREE_HPP
@@ -43,12 +35,10 @@
 #include <stdexcept>
 #endif
 
-// ---------------------------------------------------------------------------
-// Optional third-party interop, detected rather than configured
-// ---------------------------------------------------------------------------
+// --- Optional third-party interop, detected rather than configured ---
 //
-// Detected with `__has_include`; include Eigen first to get the interop. These
-// includes must stay outside `namespace tf_tree` (inside, they break `<cmath>`).
+// Detected with `__has_include`; include Eigen first. Must stay outside
+// `namespace tf_tree`.
 
 #if defined(__has_include)
 #if __has_include(<Eigen/Geometry>)
@@ -68,15 +58,10 @@
 
 namespace tf_tree {
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors ---
 
-/// A failed call, carrying the full `tft_error` the C ABI recorded.
-///
-/// The detail is **copied out at the point of failure**: `tft_last_error`'s
-/// thread-local slot is overwritten by the next call on this thread (§3.3), so
-/// an `Error` is safe to store and log later.
+/// A failed call, with the `tft_error` detail copied out at the point of failure
+/// (§3.3), so it is safe to store.
 class Error
 #ifndef TF_TREE_NO_EXCEPTIONS
     : public std::runtime_error
@@ -92,7 +77,7 @@ public:
     {
     }
 
-    /// The status code. Always the one the failing call returned.
+    /// The status code the failing call returned.
     tft_status code() const noexcept { return detail_.code; }
     /// The offending edge, or `TFT_INVALID_ID`.
     std::uint32_t edge() const noexcept { return detail_.edge; }
@@ -103,11 +88,10 @@ public:
     std::int64_t newest() const noexcept { return detail_.newest; }
     std::uint64_t plan_generation() const noexcept { return detail_.plan_generation; }
     std::uint64_t current_generation() const noexcept { return detail_.current_generation; }
-    /// The whole struct, for a caller that wants to print it uniformly.
+    /// The whole struct.
     const tft_error& detail() const noexcept { return detail_; }
 
-    /// The human-readable message. Available in both error modes;
-    /// `std::runtime_error::what()` is not, under `-fno-exceptions`.
+    /// The human-readable message (available in both error modes).
     const char* message() const noexcept { return detail_.message; }
 
 private:
@@ -116,9 +100,6 @@ private:
         tft_error e{};
         e.struct_size = static_cast<std::uint32_t>(sizeof(tft_error));
         if (tft_last_error(&e) != TFT_OK) {
-            // The detail could not be retrieved — a struct_size mismatch, which
-            // means header and library disagree. Report the status we were
-            // actually given rather than inventing one.
             e = tft_error{};
             e.struct_size = static_cast<std::uint32_t>(sizeof(tft_error));
             e.code = status;
@@ -128,8 +109,6 @@ private:
             std::strncpy(e.message, "tf_tree: error detail unavailable (ABI mismatch?)",
                          sizeof(e.message) - 1);
         }
-        // A caller can pass a status the slot does not describe if it ignored an
-        // earlier failure. The status is authoritative; the detail is context.
         e.code = status;
         return e;
     }
@@ -147,18 +126,15 @@ private:
 
 #ifdef TF_TREE_NO_EXCEPTIONS
 
-/// Tag for constructing an `expected` whose payload is default-initialised
-/// **in place**. See `make_result`.
+/// Tag: construct the payload default-initialised in place.
 struct in_place_value_t {
     explicit in_place_value_t() = default;
 };
 inline constexpr in_place_value_t in_place_value{};
 
 /// A minimal `expected` for exceptions-off builds (C++23 will replace it).
-/// The error is held in a `std::optional`: a plain `Error` initialised on the
-/// success path called `tft_last_error` once per lookup (1.064x the C ABI against
-/// §7 gate 2's 1.02). The width is kept: fetching the detail lazily would report
-/// another call's failure (§3.3); `check_errors` clobbers the slot to pin this.
+/// The error is a `std::optional` so the success path does not call
+/// `tft_last_error` (§7 gate 2).
 template <typename T>
 class expected {
 public:
@@ -169,15 +145,13 @@ public:
     explicit operator bool() const noexcept { return !error_.has_value(); }
     bool has_value() const noexcept { return !error_.has_value(); }
 
-    /// **Unchecked.** Reading the value of a failed `expected` is your bug, in
-    /// the same way that dereferencing a null pointer is; there is no exception
-    /// to throw, which is the point of this mode.
+    /// **Unchecked**: reading the value of a failed `expected` is a caller bug.
     const T& operator*() const noexcept { return value_; }
     T& operator*() noexcept { return value_; }
     const T* operator->() const noexcept { return &value_; }
     T* operator->() noexcept { return &value_; }
 
-    /// **Unchecked**, like `operator*`: only meaningful when `!*this`.
+    /// **Unchecked**: only meaningful when `!*this`.
     const Error& error() const noexcept { return *error_; }
 
 private:
@@ -203,16 +177,14 @@ private:
 template <typename T>
 using result = expected<T>;
 
-/// A pointer to the payload **inside the object that will be returned**, so no
-/// local is moved out (two 128-byte moves NRVO cannot elide here; 1.028x).
+/// A pointer to the payload inside the object that will be returned, so no local is moved out.
 template <typename T>
 inline T* value_ptr(expected<T>& e) noexcept
 {
     return &*e;
 }
 
-/// An empty result whose payload is default-initialised **in place**;
-/// `expected<T> out{T{}}` costs a 128-byte move (3-5 % over the C ABI).
+/// An empty result whose payload is default-initialised in place (avoids a 128-byte move).
 template <typename T>
 inline expected<T> make_result()
 {
@@ -228,19 +200,12 @@ inline expected<T> make_result()
         }                                                                     \
     } while (0)
 
-/// Fail *into an existing result object* rather than returning a second one.
+/// Fail *into* the existing result object, keeping NRVO
+/// (`check_at_writes_into_the_returned_object` pins it).
 ///
-/// NRVO is all-or-nothing per function: a `return Error(s);` beside `return out;`
-/// disabled it and copied the whole 456-byte `expected` per lookup (~3.5 % on §7
-/// gate 2). Assigning into `out` keeps the elision in both modes;
-/// `check_at_writes_into_the_returned_object` pins it.
-///
-/// **Contract 1:** never returns to the next statement, in either mode (return
-/// here, throw there), so code between the failure and `return out;` cannot
-/// run in one mode only. `check_fail_into_leaves_the_function` pins it.
-///
-/// **Contract 2:** `out` is a bare identifier naming the return object; the
-/// `-fno-exceptions` expansion substitutes it twice, and NRVO demands the same.
+/// **Contract 1:** never returns to the next statement, in either mode
+/// (`check_fail_into_leaves_the_function`). **Contract 2:** `out` is a bare
+/// identifier naming the return object.
 #define TF_TREE_FAIL_INTO(out, status)                                        \
     do {                                                                      \
         (out) = ::tf_tree::Error(status);                                     \
@@ -252,7 +217,7 @@ inline expected<T> make_result()
 template <typename T>
 using result = T;
 
-/// `result<T>` *is* `T`: the identity, and NRVO does the rest.
+/// `result<T>` is `T`.
 template <typename T>
 inline T* value_ptr(T& v) noexcept
 {
@@ -275,8 +240,7 @@ inline T make_result()
         }                                                                     \
     } while (0)
 
-/// Here a `throw` was never a `return`, so NRVO is intact. `out` is still
-/// evaluated so a misspelling fails to compile in this mode too.
+/// `out` is still evaluated so a misspelling fails to compile in this mode too.
 #define TF_TREE_FAIL_INTO(out, status)                                        \
     do {                                                                      \
         (void)(out);                                                          \
@@ -285,20 +249,13 @@ inline T make_result()
 
 #endif  // TF_TREE_NO_EXCEPTIONS
 
-// ---------------------------------------------------------------------------
-// ABI check — §3.6
-// ---------------------------------------------------------------------------
+// --- ABI check — §3.6 ---
 
 namespace detail {
 
-/// Verify at load time that the header and the library agree (§3.6);
-/// `tft_check_abi` names both versions, so this only surfaces it.
-///
-/// Whether the check has run, so a test can assert it happened.
+/// Verify at load time that the header and the library agree (§3.6).
 inline bool abi_check_ran = false;
 
-/// Runs at dynamic initialization: a mismatched ABI found at the first lookup is
-/// found too late.
 struct AbiCheck {
     AbiCheck()
     {
@@ -313,14 +270,12 @@ struct AbiCheck {
         abi_check_ran = true;
     }
 
-    // `[[noreturn]]` in both modes: an ABI mismatch is not recoverable.
     [[noreturn]] static void fail(const char* msg)
     {
         std::fputs("tf_tree: ", stderr);
         std::fputs(msg, stderr);
         std::fputc('\n', stderr);
 #ifdef TF_TREE_NO_EXCEPTIONS
-        // Nothing to throw, and continuing is worse than stopping.
         std::abort();
 #else
         throw Error(TFT_ERR_ABI_MISMATCH);
@@ -328,19 +283,14 @@ struct AbiCheck {
     }
 };
 
-/// A namespace-scope `inline` variable, not a function-local static and not
-/// behind any `#ifdef` (§3.6): one object across all TUs, so the check runs once
-/// per program, during dynamic initialization, with no `.cpp` to link.
+/// A namespace-scope `inline` variable (§3.6): the check runs once per program.
 inline const AbiCheck abi_check_instance{};
 
 }  // namespace detail
 
-// ---------------------------------------------------------------------------
-// Layout selection — §3.5, made unmisusable
-// ---------------------------------------------------------------------------
+// --- Layout selection — §3.5, made unmisusable ---
 
-/// The payload size of `layout`, at compile time. `tft_layout_size` is the
-/// authority; a test walks every layout and asserts the two agree.
+/// The payload size of `layout`, at compile time.
 constexpr std::size_t payload_bytes(tft_layout layout)
 {
     return layout == TFT_LAYOUT_QVEC7_WXYZ || layout == TFT_LAYOUT_QVEC7_XYZW ? 56
@@ -350,16 +300,11 @@ constexpr std::size_t payload_bytes(tft_layout layout)
                                                                               : 0;
 }
 
-/// Whether `layout` can be *read from* caller memory, i.e. published.
-///
-/// `Publisher::push<Quat7Twist6>` would otherwise pass every `static_assert` and
-/// fail only at run time with `TFT_ERR_BAD_ENUM`; `docs/API.md` §4 wants a
-/// `static_assert`, so `push`/`push_many` assert on this. Mirrors the library's
-/// refusals, cross-checked in `wrapper.cpp`:
+/// Whether `layout` can be published; `push`/`push_many` `static_assert` on it
+/// (`docs/API.md` §4):
 ///
 /// * `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` — a twist is derived, never stored.
-/// * `TFT_LAYOUT_AFFINE12_ROW_F32` — an `f32` output encoding
-///   (`docs/PROJECT.md` §5, "f64 only").
+/// * `TFT_LAYOUT_AFFINE12_ROW_F32` — an `f32` output encoding (`docs/PROJECT.md` §5).
 constexpr bool publishable(tft_layout layout)
 {
     return layout != TFT_LAYOUT_QVEC7_WXYZ_TWIST6 && layout != TFT_LAYOUT_AFFINE12_ROW_F32;
@@ -367,15 +312,11 @@ constexpr bool publishable(tft_layout layout)
 
 /// Whether `T` may receive a raw layout write into its own storage.
 ///
-/// Defaults to `std::is_trivially_copyable`, which `Eigen::Isometry3d` fails
-/// (user-declared copy constructor) although its storage is a plain `double`
-/// array at offset 0. The specialisation's premise is checked at run time by the
-/// wrapper's test (`matrix().data()` equals the object's address).
+/// Defaults to `std::is_trivially_copyable`.
 template <typename T>
 struct raw_writable : std::integral_constant<bool, std::is_trivially_copyable<T>::value> {};
 
-/// The `tft_layout` that `T`'s memory representation *is*. Unspecialised on
-/// purpose: an unknown type is a compile error (§3.5 has no default).
+/// The `tft_layout` of `T`'s memory representation; unknown types do not compile (§3.5).
 template <typename T, typename Enable = void>
 struct layout_of;
 
@@ -390,18 +331,11 @@ struct layout_of<Quat7> {
 };
 static_assert(sizeof(Quat7) == 56, "Quat7 must be tightly packed");
 
-/// `[qw qx qy qz tx ty tz | wx wy wz vx vy vz]` — a pose and its body twist,
-/// contiguous.
+/// `[qw qx qy qz tx ty tz | wx wy wz vx vy vz]` — a pose and its body twist.
 ///
-/// Asking for this type from `Plan::at` or `Plan::at_many` *is* asking for
-/// derivatives: the call evaluates the plan with them. It is the only layout
-/// whose evaluation can fail for a reason the pose layouts cannot —
-/// `TFT_ERR_NO_DERIVATIVES` if an edge on the path interpolates with
-/// `LerpSlerp`, `TFT_ERR_NO_SEGMENT` if it has a pose at that stamp but no
-/// segment to differentiate.
-///
-/// The first seven members are `Quat7`'s. `omega` is rad/s, `v` m/s, both in the
-/// plan's **source** frame.
+/// Requesting this type evaluates with derivatives and can fail with
+/// `TFT_ERR_NO_DERIVATIVES` or `TFT_ERR_NO_SEGMENT`. `omega` is rad/s, `v` m/s,
+/// in the plan's source frame.
 struct Quat7Twist6 {
     double qw, qx, qy, qz, tx, ty, tz;
     double wx, wy, wz;
@@ -416,7 +350,7 @@ static_assert(sizeof(Quat7Twist6) == 104, "Quat7Twist6 must be tightly packed");
 static_assert(offsetof(Quat7Twist6, wx) == 56,
               "the twist tail must start exactly where the Quat7 pose half ends");
 
-/// Row-major 4x4, the shape a C or NumPy user means by "a transform".
+/// Row-major 4x4.
 struct Mat4Row {
     double m[16];
 };
@@ -427,30 +361,20 @@ struct layout_of<Mat4Row> {
 };
 static_assert(sizeof(Mat4Row) == 128, "Mat4Row must be tightly packed");
 
-// ---------------------------------------------------------------------------
-// Extrapolation — docs/decisions/0039
-// ---------------------------------------------------------------------------
+// --- Extrapolation — docs/decisions/0039 ---
 
 /// A pose, and how far past the route's newest common sample it was extrapolated.
-///
-/// `Plan::at_extrapolating` returns this and no member yields the pose alone
-/// (as Rust's `Extrapolated`): the distance travels with the pose, and reading
-/// the pose without it takes a deliberate `.pose`.
 template <typename T>
 struct Extrapolated {
     /// The pose, in whatever layout `T` selects.
     T pose;
-    /// Nanoseconds past the newest stamp every dynamic edge on the route has
-    /// data for. `0` means the answer was interpolated, not invented.
+    /// Nanoseconds past the newest stamp every dynamic edge has data for; `0` means interpolated.
     std::int64_t by_ns;
-    /// The edge that ran out of data first, or `TFT_INVALID_ID` when `by_ns`
-    /// is `0`. See `tft_extrapolated::edge` for why the sentinel is there.
+    /// The edge that ran out of data first, or `TFT_INVALID_ID` when `by_ns` is `0`.
     std::uint32_t edge;
 };
 
-// ---------------------------------------------------------------------------
-// Eigen interop — §4.2
-// ---------------------------------------------------------------------------
+// --- Eigen interop — §4.2 ---
 
 #ifdef TF_TREE_HAS_EIGEN
 template <>
@@ -458,36 +382,28 @@ struct layout_of<Eigen::Isometry3d> {
     static constexpr tft_layout value = TFT_LAYOUT_MAT4_COL;
 };
 
-/// See [`raw_writable`]. Opted in because Eigen's storage is a plain `double`
-/// array at offset 0; verified at run time by the wrapper test.
+/// See [`raw_writable`].
 template <>
 struct raw_writable<Eigen::Isometry3d> : std::true_type {};
 
-// §4.2: assert, not assume. A 4x4 column-major `Matrix4d` is 128 bytes, so an
-// array is tightly packed and `MAT4_COL` writes into it with no stride.
 static_assert(sizeof(Eigen::Isometry3d) == 128,
               "unexpected Eigen Transform layout; the zero-copy batch path assumes 128 bytes");
 static_assert(alignof(Eigen::Isometry3d) <= 128 && (128 % alignof(Eigen::Isometry3d)) == 0,
               "Eigen::Isometry3d's alignment does not divide its size, so an array of them "
               "is not tightly packed");
-// C++17 over-aligned `new` makes `std::vector<Eigen::Isometry3d>` correct.
 static_assert(__cplusplus >= 201703L,
               "the std::vector<Eigen::Isometry3d> overload needs C++17 over-aligned new");
 #endif  // TF_TREE_HAS_EIGEN
 
-// ---------------------------------------------------------------------------
-// Sophus interop and the alignment hazard — §4.3
-// ---------------------------------------------------------------------------
+// --- Sophus interop and the alignment hazard — §4.3 ---
 
 #ifdef TF_TREE_HAS_SOPHUS
 template <>
 struct layout_of<Sophus::SE3d> {
-    // Eigen/Sophus store the quaternion (x, y, z, w) (§3.5).
     static constexpr tft_layout value = TFT_LAYOUT_QVEC7_XYZW;
 };
 
-/// As Eigen's; the quaternion-first, no-padding constraint is checked at run
-/// time by `detail::sophus_is_directly_writable()` (Sophus's members are private).
+/// As Eigen's; checked at run time by `detail::sophus_is_directly_writable()`.
 template <>
 struct raw_writable<Sophus::SE3d> : std::true_type {};
 
@@ -495,12 +411,8 @@ namespace detail {
 
 /// Whether an array of `Sophus::SE3d` can be written directly with a stride.
 ///
-/// §4.3's hazard: the payload is 56 bytes but `sizeof(Sophus::SE3d)` is rounded
-/// up by alignment (commonly 64), so an array is usually not tightly packed and
-/// a `memcpy` of `n x 56` bytes corrupts every later element; use
-/// `out_stride_bytes`. The direct path also needs the quaternion first with no
-/// padding, checked once at run time via `so3().data()`/`translation().data()`
-/// (`offsetof` on private members does not compile).
+/// §4.3: `sizeof(Sophus::SE3d)` is usually 64, not the 56-byte payload; use
+/// `out_stride_bytes`.
 inline bool sophus_is_directly_writable()
 {
     static const bool ok = [] {
@@ -519,9 +431,7 @@ inline bool sophus_is_directly_writable()
 }  // namespace detail
 #endif  // TF_TREE_HAS_SOPHUS
 
-// ---------------------------------------------------------------------------
-// Handles
-// ---------------------------------------------------------------------------
+// --- Handles ---
 
 namespace detail {
 
@@ -573,17 +483,14 @@ private:
 class Plan;
 class Publisher;
 
-/// A transform tree. `Send + Sync` on the Rust side, so this is safe to share
-/// between threads; `Publisher` is not, and says so.
+/// A transform tree; safe to share between threads (`Publisher` is not).
 class Tree {
 public:
     Tree() = default;
 
 #ifdef TFT_HAVE_SHM
-    /// Join the running arena named by the environment, read-only.
-    ///
-    /// Mirrors `tf_tree::open()`: `$TF_TREE_DOMAIN`, `$TF_TREE_NAME` and
-    /// `$TF_TREE_RUNTIME_DIR` select which arena.
+    /// Join the running arena named by `$TF_TREE_DOMAIN`, `$TF_TREE_NAME` and
+    /// `$TF_TREE_RUNTIME_DIR`, read-only (as `tf_tree::open()`).
     static result<Tree> open()
     {
         Tree t;
@@ -592,7 +499,7 @@ public:
     }
 #endif
 
-    /// Adopt a handle from the C ABI, taking ownership of it.
+    /// Adopt a handle from the C ABI, taking ownership.
     static Tree adopt(tft_tree* raw) noexcept
     {
         Tree t;
@@ -605,11 +512,9 @@ public:
 
     inline result<Plan> plan(const char* target, const char* source) const;
 
-    /// Compile a plan queried in time domain `domain`. `plan(target, source)` is
-    /// `domain = 0`, the real-time tag; a **simulated** tree carries its own
-    /// (`docs/PHASE4.md` §5.5, `docs/decisions/0038`). The tag is an integer because
-    /// the Rust `Domain` trait is open (custom tags from `4`). A mismatch is reported
-    /// here, once, not on every `at()`.
+    /// Compile a plan queried in time domain `domain`; `plan(target, source)` is
+    /// `domain = 0`, real time (`docs/PHASE4.md` §5.5, `docs/decisions/0038`). A
+    /// mismatch is reported here, not on every `at()`.
     inline result<Plan> plan_in_domain(const char* target, const char* source,
                                        std::uint8_t domain) const;
 
@@ -636,12 +541,9 @@ public:
 
     /// Evaluate at `stamp` into a `T` chosen by [`layout_of`].
     ///
-    /// **On a hot path, prefer `at_many`.** Each call builds a `Guard` inside the
-    /// ABI (302 ns/lookup against `tft_plan_at_many`'s 261 at a batch of 256, depth-3
-    /// fixture; whether the C tier should hold a guard is `docs/decisions/0022`).
+    /// On a hot path prefer `at_many` (`docs/decisions/0022`).
     ///
-    /// `T` must be trivially copyable and at least the layout's payload size; both
-    /// are `static_assert`ed.
+    /// `T` must be trivially copyable and at least the payload size (`static_assert`ed).
     template <typename T>
     result<T> at(std::int64_t stamp) const
     {
@@ -650,9 +552,7 @@ public:
                       "if its storage really is a plain scalar array at offset 0");
         static_assert(sizeof(T) >= payload_bytes(layout_of<T>::value),
                       "T is smaller than the layout it selects, so the write would overrun it");
-        // `result<T>`, not `T`: this local IS the return slot under NRVO (see
-        // `value_ptr`). Every `return` must name `out` (`TF_TREE_FAIL_INTO`, never
-        // `TF_TREE_FAIL`), and nothing may sit between the macro and `return out;`.
+        // NRVO: every `return` names `out` (`TF_TREE_FAIL_INTO`).
         result<T> out = make_result<T>();
         const tft_status s =
             tft_plan_at(h_.get(), stamp, layout_of<T>::value, value_ptr(out));
@@ -663,15 +563,12 @@ public:
     }
 
     /// Evaluate at `stamp` under `policy`, and learn how far past the newest sample
-    /// that went (`docs/decisions/0039`). `at()` refuses such a stamp; a 1 kHz
-    /// controller on a 100 Hz estimate is always asking past it.
+    /// that went (`docs/decisions/0039`). `at()` refuses such a stamp.
     ///
-    /// `TFT_EXTRAP_CONSTANT_TWIST` suits a controller, `TFT_EXTRAP_HOLD` a latched
-    /// value, `TFT_EXTRAP_ERROR` is `at()`'s refusal. All three report the distance
-    /// in `Extrapolated<T>`, which has no member yielding the pose alone.
+    /// `TFT_EXTRAP_ERROR` is `at()`'s refusal; all policies report the distance
+    /// in `Extrapolated<T>`.
     ///
-    /// `T = Quat7Twist6` is refused with `TFT_ERR_BAD_ENUM`: no extrapolating form of
-    /// `at_with_derivatives` exists.
+    /// `T = Quat7Twist6` is refused with `TFT_ERR_BAD_ENUM`.
     template <typename T>
     result<Extrapolated<T>> at_extrapolating(std::int64_t stamp,
                                              tft_extrap_policy policy) const
@@ -681,7 +578,6 @@ public:
                       "if its storage really is a plain scalar array at offset 0");
         static_assert(sizeof(T) >= payload_bytes(layout_of<T>::value),
                       "T is smaller than the layout it selects, so the write would overrun it");
-        // `at()`'s NRVO discipline: every `return` names `out`.
         result<Extrapolated<T>> out = make_result<Extrapolated<T>>();
         tft_extrapolated info;
         info.struct_size = sizeof(info);
@@ -691,17 +587,15 @@ public:
         if (s != TFT_OK) {
             TF_TREE_FAIL_INTO(out, s);
         }
-        // Two scalar stores, not a branch; embedding `tft_extrapolated` would put `.info.` in every field name.
         value_ptr(out)->by_ns = info.by_ns;
         value_ptr(out)->edge = info.edge;
         return out;
     }
 
     /// Evaluate at `n` stamps, writing straight into `out`. **The hot-path entry
-    /// point**: it pays the per-call `Guard` once per batch (261 vs 302 ns/element at
-    /// 256, depth-3 fixture). **Sort your stamps**; a scattered sweep restarts the
-    /// cursor. No copy when `sizeof(T)` equals the payload; otherwise `sizeof(T)` is
-    /// the stride (§4.3 `out_stride_bytes`).
+    /// point**: it pays the per-call `Guard` once per batch. **Sort your stamps**;
+    /// a scattered sweep restarts the cursor. `sizeof(T)` is the stride when it
+    /// differs from the payload (§4.3 `out_stride_bytes`).
     template <typename T>
     result<void> at_many(const std::int64_t* stamps, std::size_t n, T* out) const
     {
@@ -720,7 +614,7 @@ public:
 #endif
     }
 
-    /// Convenience over a `std::vector`. Sizes the output from the input.
+    /// Convenience over a `std::vector`.
     template <typename T>
     result<void> at_many(const std::vector<std::int64_t>& stamps, std::vector<T>& out) const
     {
@@ -733,9 +627,8 @@ private:
     detail::Handle<tft_plan, tft_plan_free> h_;
 };
 
-/// An exclusive claim on one edge. **`Send + !Sync`**: move-only, and the library
-/// checks affinity to the claiming thread (debug `abort()`, release
-/// `TFT_ERR_WRONG_THREAD`), including after a move to another thread.
+/// An exclusive claim on one edge. Move-only; the library checks affinity to the
+/// claiming thread (debug `abort()`, release `TFT_ERR_WRONG_THREAD`).
 class Publisher {
 public:
     Publisher() = default;
@@ -797,7 +690,7 @@ public:
 #endif
     }
 
-    /// Give the edge back now, without destroying the handle.
+    /// Give the edge back now.
     result<void> release()
     {
         const tft_status s = tft_publisher_release(h_.get());
@@ -817,7 +710,6 @@ private:
 inline result<Plan> Tree::plan(const char* target, const char* source) const
 {
     Plan p;
-    // `p.h_.out()` through friendship, not a cast of `&p` to `tft_plan**` (layout-compatibility is not guaranteed).
     TF_TREE_TRY(tft_plan_create(h_.get(), target, source, p.h_.out()));
     return p;
 }
@@ -825,7 +717,7 @@ inline result<Plan> Tree::plan(const char* target, const char* source) const
 inline result<Plan> Tree::plan_in_domain(const char* target, const char* source,
                                         std::uint8_t domain) const
 {
-    // A separate member, not a defaulted argument: one C entry point per function (§4.1).
+    // A separate member: one C entry point per function (§4.1).
     Plan p;
     TF_TREE_TRY(tft_plan_create_in_domain(h_.get(), target, source, domain, p.h_.out()));
     return p;

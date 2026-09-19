@@ -1,19 +1,10 @@
 //! Does an interpolation-seeded bracket search actually work on real data?
 //!
-//! [`docs/design/fast-path.md`](../../../docs/design/fast-path.md) §5 proposes replacing the bracket
-//! search's `log2(n)` dependent probes with one interpolated guess plus a few branchless corrections:
-//!
-//! ```text
-//! guess = lo + (t − t_lo)·(hi − lo)/(t_hi − t_lo)
-//! ```
-//!
-//! Exact for isochronous stamps and degrading with jitter, so §10 makes it conditional: measure the
-//! correction-step distribution on `indoor_atelier.tfstream`. This is a **pure analysis of stamp
-//! sequences**: it touches no engine internals.
-//!
-//! Two seeds are compared: **global** (interpolate across the whole window; wrong when the rate varies)
-//! and **local** (mean period of the newest few samples; useless under burstiness). Reported as
-//! quantiles of `|guess − true|` in index units, because a mean hides a 400-off tail.
+//! [`docs/design/fast-path.md`](../../../docs/design/fast-path.md) §5's seed replaces the bracket search's
+//! `log2(n)` probes with one interpolated guess, `lo + (t − t_lo)·(hi − lo)/(t_hi − t_lo)`, plus a few
+//! corrections; §10 makes it conditional on the correction-step distribution on `indoor_atelier.tfstream`.
+//! Pure analysis of stamp sequences: a **global** seed (whole window) against a **local** one (mean period of
+//! the newest few samples), as quantiles of `|guess − true|` in index units.
 //!
 //! Run: `cargo run --release -p tf_tree_bench --example search_seed`
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
@@ -23,10 +14,8 @@ use std::path::Path;
 use tf_tree_bench::fixture;
 use tf_tree_bench::replay::TfStream;
 
-/// Queries drawn per edge.
 const QUERIES: usize = 20_000;
 
-/// The last index `i` with `stamps[i] <= t`, by binary search — the answer the seed must reproduce.
 fn true_index(stamps: &[i64], t: i64) -> usize {
     let (mut lo, mut hi) = (0usize, stamps.len() - 1);
     while lo + 1 < hi {
@@ -40,7 +29,6 @@ fn true_index(stamps: &[i64], t: i64) -> usize {
     lo
 }
 
-/// Linear interpolation across the whole window.
 fn seed_global(stamps: &[i64], t: i64) -> usize {
     let (lo, hi) = (0usize, stamps.len() - 1);
     let span = stamps[hi] - stamps[lo];
@@ -51,8 +39,7 @@ fn seed_global(stamps: &[i64], t: i64) -> usize {
     ((frac * (hi - lo) as f64) as usize).min(hi)
 }
 
-/// Seed from the mean period of the newest `k` samples, extrapolated backwards
-/// from the newest.
+/// Seed from the mean period of the newest `k` samples.
 fn seed_local(stamps: &[i64], t: i64, k: usize) -> usize {
     let hi = stamps.len() - 1;
     let k = k.min(hi);
@@ -63,12 +50,10 @@ fn seed_local(stamps: &[i64], t: i64, k: usize) -> usize {
     if period <= 0.0 {
         return hi;
     }
-    // `ceil`: we want the *lower* bracket, and truncating toward zero lands one past it.
     let back = ((stamps[hi] - t) as f64 / period).ceil() as i64;
     (hi as i64 - back).clamp(0, hi as i64) as usize
 }
 
-/// Quantiles of a distribution of absolute index errors.
 struct Dist {
     sorted: Vec<u64>,
 }
@@ -85,15 +70,12 @@ impl Dist {
         let i = ((self.sorted.len() - 1) as f64 * p) as usize;
         self.sorted[i]
     }
-    /// Fraction of queries within `d` index units — i.e. solvable by `d`
-    /// correction steps.
     fn within(&self, d: u64) -> f64 {
         let c = self.sorted.partition_point(|&x| x <= d);
         c as f64 / self.sorted.len() as f64
     }
 }
 
-/// Deterministic stamps spanning `[stamps[0], stamps[last]]`.
 fn queries(stamps: &[i64]) -> Vec<i64> {
     let (lo, hi) = (stamps[0], stamps[stamps.len() - 1]);
     (0..QUERIES as i64)
@@ -116,7 +98,6 @@ fn report(label: &str, stamps: &[i64]) {
     }
     let (g, l) = (Dist::new(g), Dist::new(l));
 
-    // Jitter: coefficient of variation of the inter-sample period.
     let d: Vec<f64> = stamps.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
     let mean = d.iter().sum::<f64>() / d.len() as f64;
     let var = d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / d.len() as f64;
@@ -150,7 +131,6 @@ fn main() {
         "", "", "CV", "global seed", "local seed (k=8)"
     );
 
-    // --- synthetic fixture: perfectly isochronous, the best case -------------
     println!("\n-- synthetic fixture (isochronous by construction) --");
     for &(parent, child, hz) in fixture::DYNAMIC_EDGES {
         let period = (1e9 / hz) as i64;
@@ -159,7 +139,6 @@ fn main() {
         report(&format!("{parent}->{child} @{hz:.0}Hz"), &stamps);
     }
 
-    // --- the real recording: the case that decides it ------------------------
     println!("\n-- recorded /tf stream (indoor_atelier.tfstream) --");
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/tfstream/indoor_atelier.tfstream");

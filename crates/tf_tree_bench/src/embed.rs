@@ -3,70 +3,44 @@
 //!
 //! | | question | how | status |
 //! | --- | --- | --- | --- |
-//! | **`embedding_cross_crate`** | what does *crossing the crate boundary* cost? | one build, one profile, two identical bodies — one compiled in `tf_tree_bench`, one in `tf_tree_core` | §9.2's row, **gated at 5%** |
+//! | **`embedding_cross_crate`** | what does *crossing the crate boundary* cost? | one build, one profile, two identical bodies — one in `tf_tree_bench`, one in `tf_tree_core` | §9.2's row, **gated at 5%** |
 //! | **profile comparison** | what does *the embedder's own `[profile.*]`* cost? | one body, two builds: `[profile.embedder]` against `[profile.release]` | **exploratory**, `just embed-cost` only, never gated |
 //!
 //! # The gated row: one build, two crates
 //!
-//! This module's private `one` and `tf_tree_core::bench_probe::depth3_lookup`
-//! are the same three lines with the same `#[inline(never)]`; the timing
-//! difference is the crate boundary and nothing else (`docs/API.md` §2.3
-//! item 3).
+//! This module's private `one` and `tf_tree_core::bench_probe::depth3_lookup` are
+//! the same three lines with the same `#[inline(never)]`; the timing difference is
+//! the crate boundary (`docs/API.md` §2.3 item 3).
 //!
-//! * The in-crate half must live in `tf_tree_core`: a probe in the `tf_tree`
-//!   facade measured 241.5 ns against 243.6 out-of-crate and 199.4 in
-//!   `tf_tree_core::plan`.
-//! * It must not be generic: a generic body is monomorphized in the caller, and
-//!   the row read 1.000×.
-//! * Both columns read one of seven pose components
-//!   (`match plan.at(g, s) { Ok(iso) => iso.t.x, Err(_) => f64::NAN }`), which
-//!   suits a ratio of identical shapes but can invert a marked-vs-unmarked
-//!   comparison (`Plan::at_tagged`'s doc; `docs/API.md` §2.3's 2026-09-06
-//!   amendment).
-//! * `benches/lookup.rs` cannot serve: every criterion body is codegen'd in
-//!   `tf_tree_bench` (no in-crate column), and criterion does not pair two
-//!   columns ([`Run::boundary_ratio`]).
+//! * The in-crate half must live in `tf_tree_core`, not the `tf_tree` facade.
+//! * It must not be generic: a generic body is monomorphized in the caller.
+//! * Both columns read one of seven pose components, which suits a ratio of
+//!   identical shapes but can invert a marked-vs-unmarked comparison
+//!   (`Plan::at_tagged`'s doc).
+//! * `benches/lookup.rs` cannot serve: no in-crate column, and criterion does not
+//!   pair two columns ([`Run::boundary_ratio`]).
 //!
-//! The gated row is read off the `[profile.embedder]` run only: under
-//! `[profile.release]`'s thin LTO the boundary is erased by construction, so
-//! that run is the control (§9.2).
-//!
-//! The figures below predate 2026-08-29, when the row still had an independent
-//! variable (8-vCPU EPYC-Milan VM, `taskset -c 2`, [`ROUNDS`] rounds of 409 600
-//! lookups; the host fails [`crate::report::Fitness`], so they are not §9.3
-//! claims):
-//!
-//! | profile | out-of-crate | in-crate | boundary ratio (band) |
-//! | --- | --- | --- | --- |
-//! | `[profile.embedder]` — `lto = false`, `codegen-units = 16` | 240.0–240.1 ns | 191.3–191.8 ns | **1.250, 1.254, 1.254** (rounds 1.216–1.270) |
-//! | `[profile.release]` — `lto = "thin"`, `codegen-units = 1` | 193.0–195.0 ns | 194.2–196.2 ns | 0.994–0.996 (rounds 0.985–1.022) |
-//!
-//! Removing `#[inline]` from `Plan::fold_at` closed the ratio to 1.001 by making
-//! the in-crate and LTO'd columns ~7% slower and the out-of-crate embedder
-//! column 15% faster, which is why every duration is gated and not only the
-//! quotient.
+//! The gated row is read off the `[profile.embedder]` run only; under
+//! `[profile.release]`'s thin LTO the boundary is erased, so that run is the
+//! control (§9.2). Every duration is gated, not only the quotient.
 //!
 //! # The exploratory measurement: one crate position, two profiles
 //!
-//! [`Pair::profile_ratio`] divides the `[profile.embedder]` out-of-crate column
-//! by the `[profile.release]` one (`docs/API.md` §2.3 item 2; it caught
-//! `fold_at_cursors` being a pessimization). Two processes seconds apart, so it
-//! is not gated and does not enter `results.json` (§11.2's exploratory shape); it
-//! moved 1.188–1.235 across runs in which the gated ratio moved 0.004.
+//! [`Pair::profile_ratio`] divides the `[profile.embedder]` out-of-crate column by
+//! the `[profile.release]` one (`docs/API.md` §2.3 item 2). Two processes seconds
+//! apart, so it is not gated and does not enter `results.json` (§11.2).
 //!
 //! # Honesty (§9.3)
 //!
-//! * Both columns are timed back to back inside a round, so [`Run::verdict`]
-//!   reads the observed band of per-round ratios and answers
-//!   [`Verdict::Unresolved`] when it straddles the threshold. A band only has to
-//!   be narrow when the ratio is close to 5%.
+//! * Both columns are timed back to back inside a round, so [`Run::verdict`] reads
+//!   the band of per-round ratios and answers [`Verdict::Unresolved`] when it
+//!   straddles the threshold.
 //! * `build.rs` digests the measured sources into [`SOURCE_ID`]; [`Pair::load`]
 //!   refuses two runs that disagree, or that are not one `embedder` and one
-//!   `release` run (read from `OUT_DIR`, not a flag).
-//! * [`profile_settings_from_manifest`] reads `lto` and `codegen-units` back out
-//!   of the workspace manifest, and a test asserts the profiles still say what
-//!   this module claims.
-//!
+//!   `release` run (read from `OUT_DIR`).
+//! * [`profile_settings_from_manifest`] reads `lto` and `codegen-units` from the
+//!   workspace manifest, and a test asserts the profiles still say what this
+//!   module claims.
 //! [`Plan::at`]: tf_tree::Plan::at
 
 use std::path::Path;
@@ -75,9 +49,8 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::report::Metric;
 
-// The timing half is behind `embed-probe` (the in-crate column is
-// `tf_tree_core::bench_probe`). The JSON, gate arithmetic and report row stay
-// unconditional, since `bench_report` reads a pair it did not measure.
+// The timing half is behind `embed-probe`; the JSON, gate arithmetic and report
+// row stay unconditional (`bench_report` reads a pair it did not measure).
 #[cfg(feature = "embed-probe")]
 use std::hint::black_box;
 #[cfg(feature = "embed-probe")]
@@ -95,10 +68,8 @@ pub const EMBEDDER_PROFILE: &str = "embedder";
 /// The profile directory the reference run is built into.
 pub const REFERENCE_PROFILE: &str = "release";
 
-/// `docs/PHASE5.md` §9.2's gate on the ratio: 5%. Used as the absolute
-/// criterion ([`Run::verdict`], within `1.0 + GATE`) and as the tolerance on
-/// every directional metric this row hands the regression gate
-/// ([`crate::baseline`]).
+/// `docs/PHASE5.md` §9.2's gate on the ratio: 5%; also the tolerance on every
+/// directional metric this row hands the regression gate ([`crate::baseline`]).
 pub const GATE: f64 = 0.05;
 
 /// Rounds timed per run. Each round times both columns, in that order.
@@ -130,8 +101,7 @@ pub enum Verdict {
     Within,
     /// The whole observed band is outside it.
     Over,
-    /// The band straddles the threshold, so this run cannot answer; reported
-    /// rather than rounded to a pass or a fail.
+    /// The band straddles the threshold; reported, not rounded to pass or fail.
     Unresolved,
 }
 
@@ -158,8 +128,7 @@ pub struct Run {
     pub out_of_crate_ns: f64,
     /// Fastest round of the probe compiled in `tf_tree_core`, ns per lookup.
     pub in_crate_ns: f64,
-    /// Median per-round `out_of_crate / in_crate`: paired, not the quotient of
-    /// the two numbers above, so common machine noise cancels per round.
+    /// Median per-round `out_of_crate / in_crate`: paired, so machine noise cancels per round.
     pub boundary_ratio: f64,
     /// Smallest per-round ratio observed.
     pub ratio_lo: f64,
@@ -176,8 +145,7 @@ pub struct Run {
 }
 
 impl Run {
-    /// `(ratio_hi - ratio_lo) / ratio_lo`: how far the ratio moved between
-    /// rounds, and therefore what it can resolve.
+    /// `(ratio_hi - ratio_lo) / ratio_lo`: what the ratio can resolve.
     #[must_use]
     pub fn ratio_spread(&self) -> f64 {
         (self.ratio_hi - self.ratio_lo) / self.ratio_lo
@@ -197,8 +165,7 @@ impl Run {
         }
     }
 
-    /// The §9.2 criterion as a line of prose, stating the measured value either
-    /// way; not an exit code (`PHASE4.md` §7 reports the C ABI gate the same way).
+    /// The §9.2 criterion as a line of prose, stating the measured value either way.
     #[must_use]
     pub fn verdict_line(&self) -> String {
         let (r, lo, hi) = (self.boundary_ratio, self.ratio_lo, self.ratio_hi);
@@ -226,9 +193,7 @@ impl Run {
         }
     }
 
-    /// The row's metrics, in report order. All three durations are directional,
-    /// not just the ratio: dropping `#[inline]` from `Plan::fold_at` took the
-    /// ratio from 1.253 to 1.001 (a pass) while `in_crate_ns` rose 6.7%.
+    /// The row's metrics, in report order. All three durations are directional, not just the ratio.
     #[must_use]
     pub fn metrics(&self) -> Vec<Metric> {
         vec![
@@ -248,8 +213,7 @@ impl Run {
         ]
     }
 
-    /// The `embed-cost.json` document, hand-written because the schema is a
-    /// compatibility surface (see [`crate::report`]).
+    /// The `embed-cost.json` document, hand-written: the schema is a compatibility surface.
     #[must_use]
     pub fn to_json(&self) -> String {
         format!(
@@ -323,8 +287,7 @@ impl Run {
     }
 }
 
-/// The two profile runs the **exploratory** profile comparison is made of; the
-/// gated row is [`Run`] on its own.
+/// The two profile runs of the **exploratory** comparison; the gated row is [`Run`] alone.
 #[derive(Debug, Clone)]
 pub struct Pair {
     /// Built with cargo's `--release` defaults (`[profile.embedder]`).
@@ -384,9 +347,8 @@ impl Pair {
     }
 }
 
-/// Time both columns under whatever profile this binary was built with, on
-/// [`crate::fixture`]'s tree with stamps off-grid on all three dynamic edges
-/// (`docs/decisions/0013`).
+/// Time both columns under this binary's profile, on [`crate::fixture`]'s tree
+/// with stamps off-grid on all three dynamic edges (`docs/decisions/0013`).
 ///
 /// # Errors
 ///
@@ -397,8 +359,7 @@ pub fn measure() -> Result<Run> {
     measure_with(ROUNDS, SWEEPS, WARMUP)
 }
 
-/// [`measure`] with the loop counts as parameters, so a unit test can run it in
-/// a debug build.
+/// [`measure`] with the loop counts as parameters, for debug-build unit tests.
 ///
 /// # Errors
 ///
@@ -424,8 +385,7 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
         .map(|i| Stamp::from_nanos(stamp_ns(i)))
         .collect();
 
-    // The two bodies must agree before either is timed, or a fast denominator
-    // that evaluates something else would look like an expensive boundary.
+    // The bodies must agree before timing, or a fast denominator computing something else looks like a boundary cost.
     for &s in &stamps {
         let out = one(&plan, &guard, s);
         let inside = tf_tree_core::bench_probe::depth3_lookup(&plan, &guard, s);
@@ -450,8 +410,7 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
     let mut in_ns = Vec::with_capacity(rounds);
     let mut ratios = Vec::with_capacity(rounds);
     for _ in 0..rounds {
-        // Fixed order, not alternated: alternation changes which column pays for
-        // a cold branch predictor after the timing call.
+        // Fixed order, not alternated: alternation moves the cold-predictor cost between columns.
         let t0 = Instant::now();
         for _ in 0..sweeps {
             for &s in &stamps {
@@ -478,8 +437,7 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
         ratios.push(o / i);
     }
 
-    // A failed lookup returns NaN from either probe, and NaN propagates through
-    // the sum: the run is discarded rather than reported as a fast one.
+    // A failed lookup returns NaN and poisons the sum: the run is discarded.
     if sink.is_nan() {
         bail!(
             "a lookup failed during the probe (the accumulator went NaN), so the timing \
@@ -520,8 +478,7 @@ fn spread_of(v: &[f64]) -> f64 {
     (max_of(v) - min_of(v)) / min_of(v)
 }
 
-/// Middle element by value. Even lengths take the upper middle, which is the
-/// conservative half for a ratio that is being checked against a ceiling.
+/// Middle element by value; even lengths take the upper middle (conservative).
 #[cfg(feature = "embed-probe")]
 fn median_of(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
@@ -529,19 +486,17 @@ fn median_of(v: &[f64]) -> f64 {
     s[s.len() / 2]
 }
 
-/// The `i`th query stamp: `NOW_NS` lands on the knots of all three dynamic
-/// edges, so a 3.7 ms offset plus a prime 9631 ns step keeps the sweep off every
-/// grid; 1024 steps stay inside every ring.
+/// The `i`th query stamp: an offset from `NOW_NS` plus a prime step keeps the
+/// sweep off every grid; 1024 steps stay inside every ring.
 #[cfg(feature = "embed-probe")]
 const fn stamp_ns(i: i64) -> i64 {
     crate::fixture::NOW_NS - 3_700_000 - i * 9_631
 }
 
-/// One lookup per non-inlinable call, **compiled in `tf_tree_bench`**: an
-/// embedder's position, the numerator of §9.2's ratio. Byte-identical to
-/// `tf_tree_core::bench_probe::depth3_lookup` (the denominator).
-/// `#[inline(never)]` makes it a measurement of the call. The error arm returns
-/// `NaN`, which [`measure_with`] checks, rather than adding a branch.
+/// One lookup per non-inlinable call, **compiled in `tf_tree_bench`**: the
+/// numerator of §9.2's ratio, byte-identical to
+/// `tf_tree_core::bench_probe::depth3_lookup`. The error arm returns `NaN`, which
+/// [`measure_with`] checks.
 #[cfg(feature = "embed-probe")]
 #[inline(never)]
 fn one(plan: &Plan, g: &Guard, s: Stamp) -> f64 {
@@ -553,11 +508,10 @@ fn one(plan: &Plan, g: &Guard, s: Stamp) -> f64 {
 
 /// `(lto, codegen-units)` as the workspace manifest declares them for `profile`.
 ///
-/// The report's `lto = false, codegen-units = 16` prose (`crate::report`'s
-/// `EMBEDDING_NOTE`) is retyped, and checked by
+/// The report's `EMBEDDING_NOTE` prose is checked by
 /// `the_row_note_states_the_settings_the_manifest_declares` and
 /// `the_two_profiles_still_say_what_this_module_says_they_say`. A small TOML
-/// reader; `tf_tree_bench` has no TOML dependency.
+/// reader; the crate has no TOML dependency.
 ///
 /// # Errors
 ///
@@ -569,8 +523,7 @@ pub fn profile_settings_from_manifest(manifest: &str, profile: &str) -> Result<(
     ))
 }
 
-/// One key out of one `[profile.*]` section of the workspace manifest, split out
-/// so [`lto_for_profile_dir`] can ask for `lto` alone.
+/// One key out of one `[profile.*]` section of the workspace manifest.
 ///
 /// # Errors
 ///
@@ -582,8 +535,7 @@ pub fn profile_key(manifest: &str, profile: &str, key: &str) -> Result<String> {
         .split(&header)
         .nth(1)
         .ok_or_else(|| anyhow!("the workspace manifest has no {header}"))?;
-    // Stop at the next section header so a key from a later profile cannot be
-    // read as this one's.
+    // Stop at the next section header.
     let body = body.split("\n[").next().unwrap_or(body);
     body.lines()
         .map(str::trim)
@@ -598,22 +550,14 @@ pub fn profile_section_exists(manifest: &str, profile: &str) -> bool {
     manifest.contains(&format!("[profile.{profile}]"))
 }
 
-/// The `lto` setting behind a *profile directory*, spelled for a provenance
-/// block.
+/// The `lto` setting behind a *profile directory*, for a provenance block.
 ///
-/// A binary can measure its directory (`build.rs` reads `OUT_DIR`,
-/// [`PROFILE_DIR`]) but not its profile name, so the name is derived:
-/// `debug/` is asked about `dev`, and `release/` is shared with
-/// `[profile.bench]`, so this reports `[profile.release]`'s setting and
-/// `the_two_profiles_that_share_the_release_directory_agree_about_lto` fails if
-/// the two ever disagree.
-///
-/// Returns a `String`, not a `bool`: `lto` is `false`, `true`, `"thin"` or
-/// `"fat"`, and "we do not know" is spelled `unknown (…)` rather than defaulted.
-/// An undeclared `lto` reports cargo's default, saying so.
-///
-/// `inherits` is followed (a bounded walk of 8): `[profile.profiling]` declares
-/// no `lto` yet inherits `release`'s `"thin"`.
+/// `debug/` maps to `dev`; `release/` is shared with `[profile.bench]`, so this
+/// reports `[profile.release]`'s setting
+/// (`the_two_profiles_that_share_the_release_directory_agree_about_lto`). Returns
+/// a `String`: `lto` may be `false`, `true`, `"thin"` or `"fat"`, and an unknown
+/// is spelled `unknown (…)`. An undeclared `lto` reports cargo's default, saying
+/// so. `inherits` is followed (bounded walk of 8).
 #[must_use]
 pub fn lto_for_profile_dir(manifest: &str, profile_dir: &str) -> String {
     let mut profile = if profile_dir == "debug" {
@@ -622,8 +566,7 @@ pub fn lto_for_profile_dir(manifest: &str, profile_dir: &str) -> String {
         profile_dir.to_owned()
     };
     let start = profile.clone();
-    // Cargo's own inheritance chains are a handful of links at most; anything
-    // longer here is a malformed manifest and is reported, not chased.
+    // Bounded: a longer chain is a malformed manifest and is reported.
     for _ in 0..8 {
         if let Ok(v) = profile_key(manifest, &profile, "lto") {
             return if profile == start {
@@ -635,14 +578,10 @@ pub fn lto_for_profile_dir(manifest: &str, profile_dir: &str) -> String {
         if !profile_section_exists(manifest, &profile) {
             return format!("unknown (the workspace manifest has no [profile.{profile}])");
         }
-        // The parent's name is a TOML string, so strip the quotes the reader
-        // hands back verbatim.
         let Ok(parent) = profile_key(manifest, &profile, "inherits") else {
             return format!("false (cargo's default; [profile.{profile}] declares no `lto`)");
         };
         let parent = parent.trim_matches('"').to_owned();
-        // `inherits = "release"` from a section *named* release would loop; so
-        // would any longer cycle, which the bounded loop below catches anyway.
         if parent == profile {
             return format!("unknown ([profile.{profile}] inherits itself)");
         }
@@ -653,15 +592,13 @@ pub fn lto_for_profile_dir(manifest: &str, profile_dir: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    // As in `crate::report`'s test module: a failed assertion is the intended
-    // failure mode here, and the messages name the field they came from.
+    // A failed assertion is the intended failure mode here.
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
     use crate::report::Drift;
 
-    /// To the precision [`Run::to_json`] emits, so a fixture can round-trip
-    /// exactly. A fixture that cannot is a fixture, not a bug in the writer.
+    /// To the precision [`Run::to_json`] emits, so a fixture round-trips exactly.
     fn round5(x: f64) -> f64 {
         (x * 1e5).round() / 1e5
     }
@@ -679,8 +616,7 @@ mod tests {
             out_of_crate_spread: 0.004,
             in_crate_spread: 0.004,
             rounds: ROUNDS,
-            // `SWEEPS * STAMPS`, spelled out: those two constants exist only
-            // under `embed-probe` and this fixture must build without it.
+            // `SWEEPS * STAMPS`, spelled out: they exist only under `embed-probe`.
             lookups_per_round: 409_600,
         }
     }
@@ -709,7 +645,6 @@ mod tests {
         assert_eq!(back, r);
     }
 
-    // Mutant: `if schema != SCHEMA` -> `if false` in `Run::from_json`.
     #[test]
     fn a_foreign_schema_is_refused() {
         let text = run(EMBEDDER_PROFILE, 240.0, 200.0)
@@ -718,7 +653,6 @@ mod tests {
         assert!(Run::from_json(&text).is_err());
     }
 
-    // Mutant: drop the `!(x.is_finite() && x > 0.0)` guard in `positive`.
     #[test]
     fn a_zero_duration_is_refused_rather_than_dividing_into_infinity() {
         let text = run(EMBEDDER_PROFILE, 240.0, 200.0)
@@ -727,10 +661,8 @@ mod tests {
         assert!(Run::from_json(&text).is_err());
     }
 
-    // Mutant: drop the `run.profile_dir != want` check in `Pair::load`.
     #[test]
     fn two_runs_of_the_same_build_are_refused() {
-        // The reference file, but built into the embedder profile.
         let dir = write_pair(
             "same-build",
             &run(EMBEDDER_PROFILE, 240.0, 200.0),
@@ -744,8 +676,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Mutant: drop the `embedder.source_id != reference.source_id` check in
-    /// `Pair::load`.
     #[test]
     fn two_runs_built_from_different_source_are_refused() {
         let mut stale = run(REFERENCE_PROFILE, 200.0, 195.0);
@@ -760,16 +690,13 @@ mod tests {
     }
 
     /// The build script must produce a digest, not the empty-set sentinel.
-    ///
-    /// Mutant: make `MEASURED_SOURCES` empty in `build.rs` — the digest becomes
-    /// `unknown`, every pair then agrees, and the check above is vacuous.
     #[test]
     fn this_build_knows_what_source_it_came_from() {
         assert_ne!(SOURCE_ID, "unknown", "build.rs found no source to digest");
         assert_eq!(SOURCE_ID.len(), 16, "source id is not a 64-bit digest");
     }
 
-    /// The exploratory profile comparison, and it is not the gated ratio.
+    /// The exploratory profile comparison, not the gated ratio.
     #[test]
     fn the_profile_ratio_divides_the_two_out_of_crate_columns() {
         let p = Pair {
@@ -779,9 +706,6 @@ mod tests {
         assert!((p.profile_ratio() - 1.25).abs() < 1e-12);
     }
 
-    // Mutant: `self.ratio_hi <= threshold` -> `self.boundary_ratio <= threshold`
-    // in `Run::verdict` — the band check collapses to a point check and the
-    // straddling case below reports `Within`.
     #[test]
     fn a_band_that_straddles_the_threshold_is_unresolved_not_a_verdict() {
         let mut r = run(EMBEDDER_PROFILE, 104.0, 100.0);
@@ -794,14 +718,11 @@ mod tests {
             r.verdict_line()
         );
 
-        // The same central ratio, measured tightly enough to resolve it.
         r.ratio_lo = 1.039;
         r.ratio_hi = 1.041;
         assert_eq!(r.verdict(), Verdict::Within);
     }
 
-    // Mutant: `let threshold = 1.0 + GATE` -> `1.0 + 2.0 * GATE` in
-    // `Run::verdict`.
     #[test]
     fn the_gate_boundary_is_five_percent() {
         let mut inside = run(EMBEDDER_PROFILE, 104.9, 100.0);
@@ -815,10 +736,7 @@ mod tests {
         assert!(outside.verdict_line().contains("OVER"));
     }
 
-    /// The failure line must not repeat the refuted claim that no `#[inline]`
-    /// placement closes the gap, and must cite the control column instead.
-    ///
-    /// Mutant: put that sentence back in `verdict_line`'s `Over` arm.
+    /// The failure line must not repeat the refuted claim that no `#[inline]` placement closes the gap.
     #[test]
     fn the_failure_line_does_not_claim_inline_placement_cannot_help() {
         let mut over = run(EMBEDDER_PROFILE, 124.0, 100.0);
@@ -835,8 +753,6 @@ mod tests {
         );
     }
 
-    // Mutant: give `boundary_ratio` `Drift::Informational` instead of
-    // `lower_is_better`.
     #[test]
     fn every_duration_this_row_reports_is_gated() {
         let m = run(EMBEDDER_PROFILE, 240.0, 200.0).metrics();
@@ -850,10 +766,7 @@ mod tests {
         }
     }
 
-    /// The row states what the two profiles are; this is what makes that true.
-    ///
-    /// Mutant: change `[profile.embedder]`'s `codegen-units` to `1` in the
-    /// workspace manifest; nothing else would notice.
+    /// The row states what the two profiles are; this makes that true.
     #[test]
     fn the_two_profiles_still_say_what_this_module_says_they_say() {
         let m = manifest();
@@ -874,31 +787,20 @@ mod tests {
         assert!(profile_settings_from_manifest(&manifest(), "no-such-profile").is_err());
     }
 
-    /// A profile *directory* is not a profile *name*; the two places they differ
-    /// are the two places a provenance block could lie.
-    ///
-    /// Mutant (observed): delete the `profile_dir == "debug"` arm of
-    /// [`lto_for_profile_dir`]; the `debug` assertion fails with
-    /// `unknown (the workspace manifest has no [profile.debug])`.
+    /// A profile *directory* is not a profile *name*; the two places they differ.
     #[test]
     fn a_profile_directory_maps_to_the_section_that_built_it() {
         let m = manifest();
         assert_eq!(lto_for_profile_dir(&m, EMBEDDER_PROFILE), "false");
         assert_eq!(lto_for_profile_dir(&m, REFERENCE_PROFILE), "\"thin\"");
-        // `[profile.dev]` builds into `debug/` and declares no `lto`, so this is
-        // both irregularities at once: the name mapping, and cargo's default.
         assert_eq!(
             lto_for_profile_dir(&m, "debug"),
             "false (cargo's default; [profile.dev] declares no `lto`)"
         );
-        // And a directory nothing declares says so rather than defaulting to
-        // `false`.
         let unknown = lto_for_profile_dir(&m, "no-such-dir");
         assert!(unknown.starts_with("unknown"), "{unknown}");
     }
 
-    /// Mutant (observed): set `[profile.bench]`'s `lto` to `false` in the
-    /// workspace manifest; this test fails on the shared `target/release/`.
     #[test]
     fn the_two_profiles_that_share_the_release_directory_agree_about_lto() {
         let m = manifest();
@@ -912,14 +814,7 @@ mod tests {
         );
     }
 
-    /// A profile that declares no `lto` but does declare `inherits` gets its
-    /// parent's, not cargo's default. The synthetic manifest carries shapes the
-    /// workspace's does not (a two-link chain, a missing parent, a
-    /// self-inheriting section).
-    ///
-    /// Mutant (observed): replace the loop body's `inherits` lookup with a
-    /// single `profile_key(…, "lto")`; the first assertion fails with
-    /// `false (cargo's default; …)`.
+    /// A profile that declares no `lto` but declares `inherits` gets its parent's.
     #[test]
     fn a_profile_with_no_lto_of_its_own_reports_the_one_it_inherits() {
         let m = "[profile.base]\nlto = \"thin\"\n\n\
@@ -933,26 +828,18 @@ mod tests {
             lto_for_profile_dir(m, "child"),
             "\"thin\" (inherited from [profile.base])"
         );
-        // Two links, and it still names the section the value actually came
-        // from rather than the immediate parent.
         assert_eq!(
             lto_for_profile_dir(m, "grandchild"),
             "\"thin\" (inherited from [profile.base])"
         );
-        // A profile that declares `lto` itself is unannotated, as before.
         assert_eq!(lto_for_profile_dir(m, "base"), "\"thin\"");
-        // No `inherits` and no `lto` is the one case where cargo's default is
-        // genuinely the answer, and it still says it is a default.
         assert!(lto_for_profile_dir(m, "plain").starts_with("false (cargo's default;"));
-        // The three ways not to know, each distinguishable from an answer.
         assert!(lto_for_profile_dir(m, "orphan").starts_with("unknown ("));
         assert!(lto_for_profile_dir(m, "ouroboros").starts_with("unknown ("));
         assert!(lto_for_profile_dir(m, "absent").starts_with("unknown ("));
     }
 
-    /// The workspace's `[profile.profiling]` must still share `release`'s
-    /// codegen: `docs/benchmarks/tf2.md` uses it as the control that the depth-3
-    /// number tracks `lto`. Compares two manifest reads, not `"thin"`.
+    /// `[profile.profiling]` must still share `release`'s codegen (`docs/benchmarks/tf2.md`); compares two manifest reads.
     #[test]
     fn the_profiling_profile_reports_the_reference_profiles_lto() {
         let m = manifest();
@@ -968,22 +855,13 @@ mod tests {
     }
 
     /// The reader must not read a later section's keys as this profile's.
-    ///
-    /// Mutant: drop the `split("\n[")` truncation.
     #[test]
     fn a_profile_does_not_borrow_the_next_profiles_keys() {
         let m = "[profile.a]\nlto = false\n\n[profile.b]\nlto = true\ncodegen-units = 16\n";
         assert!(profile_settings_from_manifest(m, "a").is_err());
     }
 
-    /// The probe has to actually run.
-    ///
-    /// Mutant (observed): replace `one`'s body with `let _ = (plan, g, s); 0.0`;
-    /// the **agreement check** fires before any timing ("the out-of-crate and
-    /// in-crate probes disagree at stamp …"). The 20 ns lower bound below is the
-    /// second line of defence, for both columns broken the same way (a constant
-    /// `#[inline(never)]` call measured 10.8 ns; a depth-3 lookup has never
-    /// measured below ~115 ns).
+    /// The probe has to actually run: the agreement check catches one broken column, the 20 ns lower bound both.
     #[cfg(feature = "embed-probe")]
     #[test]
     fn the_probe_measures_a_working_depth_three_lookup() {
@@ -996,11 +874,7 @@ mod tests {
         assert!(r.ratio_lo <= r.boundary_ratio && r.boundary_ratio <= r.ratio_hi);
     }
 
-    /// Every stamp the probe queries must fall strictly between two knots on
-    /// every dynamic edge of the path (`docs/decisions/0013`).
-    ///
-    /// Mutant: drop the `- 3_700_000` offset from [`stamp_ns`]; `i = 0` is then
-    /// `NOW_NS`, on the knot of all three edges.
+    /// Every stamp the probe queries falls strictly between two knots on every dynamic edge (`docs/decisions/0013`).
     #[cfg(feature = "embed-probe")]
     #[test]
     fn every_probe_stamp_is_off_grid_on_every_edge() {

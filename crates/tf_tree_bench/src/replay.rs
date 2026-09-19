@@ -1,26 +1,25 @@
 //! Replay of a real recorded `/tf` stream through the engine: irregular
-//! periods, duplicated stamps, late frames, approximately normalised
-//! quaternions, none of which [`crate::fixture`] has.
+//! periods, duplicated stamps, late frames, approximately normalised quaternions,
+//! none of which [`crate::fixture`] has.
 //!
 //! # The `.tfstream` format
 //!
-//! `scripts/bag_to_tfstream.py` (ROS container) converts a bag once into a
-//! line-oriented ASCII format, so this module has no ROS dependency:
+//! `scripts/bag_to_tfstream.py` converts a bag into a line-oriented ASCII format,
+//! so this module has no ROS dependency:
 //!
 //! ```text
 //! S <parent> <child> <qw> <qx> <qy> <qz> <tx> <ty> <tz>
 //! D <parent> <child> <stamp_ns> <qw> <qx> <qy> <qz> <tx> <ty> <tz>
 //! ```
 //!
-//! Quaternions are w-first (matching [`Iso3`]). Stamps are rebased so the
-//! earliest sample is 0.
+//! Quaternions are w-first (matching [`Iso3`]). Stamps are rebased so the earliest
+//! sample is 0.
 //!
-//! # There is exactly one clock in this format, and it is the header stamp
+//! # One clock
 //!
-//! A `D` line carries `<stamp_ns>` and no log or arrival time. A caller feeding
-//! it to `tf_tree_bridge`'s §5.5 clock rules (`tf_tree_cli`'s
-//! `topology --discover`) must pass `SteadyNanos::UNKNOWN`, and **must not pass
-//! `stamp_ns` as the receipt time**, which would zero every measured offset.
+//! A `D` line carries only the header stamp. Feeding it to `tf_tree_bridge`'s §5.5
+//! clock rules must pass `SteadyNanos::UNKNOWN`, **not** `stamp_ns` as receipt
+//! time, which would zero every measured offset.
 
 use std::collections::BTreeMap;
 
@@ -48,7 +47,7 @@ pub struct TfStream {
     pub dynamic_edges: Vec<(String, String)>,
     /// Every dynamic sample, sorted by stamp.
     pub samples: Vec<Sample>,
-    /// Header comments from the file, retained so a report can cite provenance.
+    /// Header comments from the file.
     pub provenance: Vec<String>,
 }
 
@@ -108,8 +107,7 @@ impl TfStream {
         if out.samples.is_empty() && out.static_edges.is_empty() {
             bail!("stream contains no transforms");
         }
-        // The converter sorts, but a hand-assembled stream might not; the engine
-        // rejects a regressing stamp, so normalise rather than fail late.
+        // Normalise: the engine rejects a regressing stamp.
         out.samples.sort_by_key(|s| s.stamp_ns);
         Ok(out)
     }
@@ -152,8 +150,7 @@ impl TfStream {
         counts
     }
 
-    /// The stamp window in which every dynamic edge has data, or `None` if some
-    /// edge has no samples. Queries outside it extrapolate on some edge.
+    /// The stamp window in which every dynamic edge has data, or `None`.
     #[must_use]
     pub fn common_window(&self) -> Option<(i64, i64)> {
         if self.dynamic_edges.is_empty() {
@@ -173,8 +170,7 @@ impl TfStream {
         (lo < hi).then_some((lo, hi))
     }
 
-    /// Build a [`Tree`] with this recording's topology and replay its history
-    /// into it, with each ring sized so every sample stays readable.
+    /// Build a [`Tree`] with this topology and replay the history into it.
     ///
     /// # Errors
     ///
@@ -186,9 +182,7 @@ impl TfStream {
         }
         let counts = self.samples_per_edge();
         for (i, (p, c)) in self.dynamic_edges.iter().enumerate() {
-            // A ring of `cap` slots retains only `cap - 1` samples, so ask for
-            // one more than the recording holds or `common_window`'s lower bound
-            // is declined whenever `count` is a power of two.
+            // A ring of `cap` slots retains `cap - 1` samples; ask for one more.
             let want = u32::try_from(counts[i])
                 .unwrap_or(u32::MAX)
                 .saturating_add(1);
@@ -197,7 +191,6 @@ impl TfStream {
         }
         let tree = b.build().map_err(|e| anyhow!("build replay tree: {e}"))?;
 
-        // Claim every dynamic edge, replay in stamp order, then release.
         let mut writers = Vec::with_capacity(self.dynamic_edges.len());
         for (p, c) in &self.dynamic_edges {
             let parent = tree.frame(p).map_err(|e| anyhow!("frame {p}: {e:?}"))?;
@@ -229,9 +222,7 @@ fn parse_pose(f: &[&str], lineno: usize) -> Result<Iso3> {
     Ok(Iso3::from_bits(&bits))
 }
 
-/// A deterministic query set over a recording: random frame pairs at random
-/// stamps inside the common window, shared by the replay differential and
-/// benchmarks.
+/// A deterministic query set: random frame pairs at random stamps inside the common window.
 pub struct QuerySet {
     /// `(target, source, stamp_ns)` triples.
     pub queries: Vec<(String, String, i64)>,
@@ -267,9 +258,8 @@ impl QuerySet {
     }
 }
 
-/// Synthesise a [`TfStream`] shaped like a real robot description: a dynamic
-/// spine of `chain_depth` joints with `branches_per_link` static fan-out, so
-/// lookup cost and tree size vary independently.
+/// Synthesise a [`TfStream`]: a dynamic spine of `chain_depth` joints with
+/// `branches_per_link` static fan-out.
 #[must_use]
 pub fn synth_robot(
     chain_depth: usize,
@@ -283,12 +273,10 @@ pub fn synth_robot(
          samples={samples_per_edge} rate={rate_hz}Hz"
     ));
 
-    // Dynamic spine: link_0 -> link_1 -> ... -> link_n.
     for d in 0..chain_depth {
         s.dynamic_edges
             .push((format!("link_{d}"), format!("link_{}", d + 1)));
     }
-    // Static sensor/appendage subtrees hanging off every spine link.
     for d in 0..=chain_depth {
         for b in 0..branches_per_link {
             let pose = crate::fixture::dynamic_pose((d * 31 + b) as f64 * 0.017, 0);
@@ -312,8 +300,7 @@ pub fn synth_robot(
     s
 }
 
-/// SplitMix64, so the harness needs no `rand` dependency and every run is
-/// byte-reproducible from its seed.
+/// SplitMix64: no `rand` dependency; byte-reproducible from its seed.
 struct Rng(u64);
 impl Rng {
     fn next_u64(&mut self) -> u64 {
@@ -328,8 +315,7 @@ impl Rng {
     }
 }
 
-/// Evaluate a query set against a replayed [`Tree`], returning the poses it
-/// resolved and how many it declined (a recorded tree is often disconnected).
+/// Evaluate a query set against a replayed [`Tree`]; returns the poses and the declined count.
 ///
 /// # Errors
 ///

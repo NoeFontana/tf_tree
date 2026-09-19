@@ -1,40 +1,31 @@
 #![forbid(unsafe_code)]
 //! Bag ingestion for `tf_tree` — `docs/PHASE5.md` §3.
 //!
-//! Reads an MCAP recording's `tf2_msgs/msg/TFMessage` traffic and produces a
-//! [`tf_tree::Tree`], or (with `--features shm`) a frozen `.tft` index, plus an
-//! ingest report (§3.2). A separate crate because `mcap` would break the core's
-//! dependency budget and `tf_tree_py` cannot depend on the CLI binary.
+//! Reads an MCAP recording's `tf2_msgs/msg/TFMessage` traffic into a
+//! [`tf_tree::Tree`], or (with `--features shm`) a frozen `.tft`, plus an ingest
+//! report (§3.2).
 //!
 //! # Compression
-//!
-//! `mcap` is taken with `default-features = false` (`docs/PHASE5.md` §0.0;
-//! `docs/PHASE2.md` §2 forbids its C build steps). `crate::decompress` decodes
-//! zstd and lz4 chunks with pure-Rust codecs (`ruzstd`, `lz4_flex`) behind the
-//! default-on `compression` feature. Two cases remain unreadable: a codec no one
-//! names ([`IngestError::CompressedChunk`] with [`ChunkCodec::Other`]) and a
-//! `--no-default-features` build; the remedy is `mcap compress --compression none`.
-//!
-//! Decompression is bounded by [`IngestOptions::max_chunk_uncompressed_bytes`],
-//! [`IngestOptions::max_chunk_expansion_ratio`] and a zstd window limit, all
-//! checked before allocation; `crate::decompress` lists what each guard covers.
+//! `mcap` is taken with `default-features = false` (`docs/PHASE5.md` §0.0). zstd
+//! and lz4 chunks decode with pure-Rust codecs behind the default-on
+//! `compression` feature. An unnamed codec ([`IngestError::CompressedChunk`] with
+//! [`ChunkCodec::Other`]) and a `--no-default-features` build are unreadable;
+//! the remedy is `mcap compress --compression none`. Decompression is bounded
+//! by [`IngestOptions::max_chunk_uncompressed_bytes`],
+//! [`IngestOptions::max_chunk_expansion_ratio`] and a zstd window limit
+//! (`crate::decompress`).
 //!
 //! # Status against §3
+//! Implemented: §3.1's passes, §3.3's MCAP source, and every row of §3.2 except
+//! `--on-clock-reset=split` ([`IngestError::ClockResetSplitUnsupported`]). Not
+//! here: `rosbag2` sqlite3 and `freeze_from_arrays`.
 //!
-//! Implemented: §3.1's passes (group re-read, spill-to-run-file), §3.3's MCAP
-//! source, and every row of §3.2 except `--on-clock-reset=split`, which is refused
-//! ([`IngestError::ClockResetSplitUnsupported`]; `docs/PHASE5.md` §3.2 holds the
-//! argument). Not here: `rosbag2` sqlite3 and `freeze_from_arrays`.
+//! **No time-domain detection** (§3.1's amendment): every ingested edge takes
+//! `TreeBuilder`'s default (`SystemDomain`, tag 0).
 //!
-//! **No time-domain detection.** §3.1's pass one is NORMATIVE that it detects the
-//! domain; nothing here does, so every ingested edge takes `TreeBuilder`'s default
-//! (`SystemDomain`, tag 0). A `TFMessage` carries no domain and every other domain
-//! in the project is declared, not inferred; this is a specification gap,
-//! deliberately not closed by code (`docs/PHASE5.md` §3.1's amendment).
-//!
-//! **Every test here reads a recording this crate wrote** (`crate::fixture`), so
-//! the suite gates this reader's bookkeeping, not its agreement with a real
-//! `rosbag2` writer (`testdata/ATTRIBUTION.md`).
+//! Every test reads a recording this crate wrote (`crate::fixture`), so the
+//! suite gates this reader's bookkeeping, not agreement with a real `rosbag2`
+//! writer (`testdata/ATTRIBUTION.md`).
 
 use std::path::Path;
 
@@ -53,11 +44,9 @@ mod decompress;
 pub use decompress::{BadChunkKind, ChunkCodec, ChunkLimits};
 
 /// Whether this build compiled the zstd and lz4 chunk decoders in.
-///
 /// Evaluated here because a consumer's `cfg!(feature = "compression")` reports
-/// what *it* asked for, not how this crate was built (Cargo unifies features).
-/// `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader` compares
-/// the two. Mirrors [`tf_tree::counters_compiled_in`].
+/// what *it* asked for (Cargo unifies features). Mirrors
+/// [`tf_tree::counters_compiled_in`].
 #[must_use]
 pub fn compression_compiled_in() -> bool {
     cfg!(feature = "compression")
@@ -68,8 +57,7 @@ pub mod fixture;
 
 /// BLAKE3 of a recording's bytes, streamed in 1 MiB chunks (§2.3).
 ///
-/// Not behind the `shm` cfg: `tf_tree_py`'s `ingest_bag` reports it on every
-/// platform (`docs/decisions/0046`).
+/// Not behind the `shm` cfg (`docs/decisions/0046`).
 ///
 /// # Errors
 ///
@@ -109,9 +97,8 @@ pub struct FrameId(pub u32);
 
 /// Why an ingest failed.
 ///
-/// `Copy` and `String`-free (D11); edge variants name frames by [`FrameId`],
-/// an index into the [`Frames`] table that [`survey`] takes as `&mut` so a failed
-/// pass can still say which edge. [`describe`] does the join.
+/// `Copy` and `String`-free (D11); edge variants name frames by [`FrameId`].
+/// [`describe`] joins the names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum IngestError {
@@ -134,9 +121,8 @@ pub enum IngestError {
     /// A top-level record declared a body larger than the reader will allocate
     /// for — [`IngestOptions::max_record_bytes`], `--max-record-size` at the CLI.
     ///
-    /// Not [`IngestError::Mcap`]: the file may be well formed, with a record
-    /// (an attachment, likely) over a policy number. `declared` is the value to
-    /// pass to `--max-record-size`.
+    /// Not [`IngestError::Mcap`]: the file may be well formed. `declared` is the
+    /// value to pass to `--max-record-size`.
     #[error(
         "a record declared {declared} bytes, over the {ceiling}-byte ceiling; \
          raise --max-record-size"
@@ -154,10 +140,8 @@ pub enum IngestError {
     Rosbag2Sqlite,
     /// A chunk names a codec this build has no decoder for.
     ///
-    /// The crate docs list the two cases that reach here; a chunk that claims
-    /// zstd but is not is [`IngestError::BadChunk`]. Never skippable: every chunk
-    /// shares the codec, so skipping would yield a misleading
-    /// [`IngestError::NoTransforms`].
+    /// Never skippable: every chunk shares the codec, so skipping would yield a
+    /// misleading [`IngestError::NoTransforms`].
     #[error("the recording uses {codec}-compressed chunks, which this build cannot read")]
     CompressedChunk {
         /// Which codec, as far as it could be identified.
@@ -182,10 +166,7 @@ pub enum IngestError {
     #[error("the recording is truncated, and the part that survived holds no transforms")]
     TruncatedBeforeAnyChunk,
     /// Every chunk that could have held a transform was refused by one of this
-    /// reader's own limits (`--max-chunk-size`, the expansion ratio,
-    /// [`BadChunkKind::ImplausibleWindow`]); the remedy is a flag. The refusals
-    /// stay skippable so one corrupt `uncompressed_size` does not cost a recording
-    /// `--on-bad-chunk=skip` would recover.
+    /// reader's own limits; the remedy is a flag. The refusals stay skippable.
     #[error(
         "every chunk was refused by this reader's limits ({skipped} of them), so nothing was read"
     )]
@@ -207,9 +188,8 @@ pub enum IngestError {
     /// One edge's stamps jumped backwards past the reset threshold, under
     /// [`ClockResetPolicy::Halt`].
     ///
-    /// The guard is per edge (`ingest`'s module docs). `at_ns` is the regressed
-    /// stamp, which a looped recording repeats; `at_log_time_ns` is the recorder's
-    /// monotone clock, the coordinate `mcap` and `ros2 bag` cut on.
+    /// `at_ns` is the regressed stamp; `at_log_time_ns` is the recorder's monotone
+    /// clock.
     #[error(
         "clock reset on edge {parent:?} -> {child:?} at stamp {at_ns} \
          (log time {at_log_time_ns}, backwards by {by_ns} ns)"
@@ -239,7 +219,7 @@ pub enum IngestError {
     #[error("push rejected: {0}")]
     Push(tf_tree::PushError),
     /// A surveyed frame was not present in the built tree. Structurally
-    /// impossible; an error rather than an `unwrap` because this crate denies both.
+    /// impossible; an error rather than an `unwrap`.
     #[error("frame {frame:?} was surveyed but is not in the built tree")]
     FrameLost {
         /// The missing frame.

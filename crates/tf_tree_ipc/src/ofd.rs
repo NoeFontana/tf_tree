@@ -1,35 +1,27 @@
 //! Open file description locks — `F_OFD_SETLK` / `F_OFD_GETLK`.
 //!
-//! `docs/PHASE2.md` §3.3 requires OFD locks. Classic POSIX locks are owned by the
-//! process and dropped when *any* descriptor to the file closes, so an unrelated
-//! crate opening the lock file would silently release ownership. OFD locks
-//! (Linux ≥ 3.15) belong to the open file description, release when its last
-//! descriptor closes (including on `SIGKILL`), and conflict even inside one
-//! process.
+//! `docs/PHASE2.md` §3.3 requires OFD locks: classic POSIX locks are dropped
+//! when *any* descriptor to the file closes. OFD locks (Linux ≥ 3.15) belong
+//! to the open file description and release when its last descriptor closes,
+//! including on `SIGKILL`.
 //!
-//! # Why `libc::fcntl`
-//!
-//! `rustix` 1.1 has no OFD locking, so this module calls `fcntl` through `libc`:
-//! a deviation from §2's "no libc crate", which exists to avoid a C build step
-//! that `libc` does not introduce. It is one of two `unsafe` sites in this crate;
-//! the other is `fork`'s `pthread_atfork` shim.
+//! `rustix` has no OFD locking, so `fcntl` goes through `libc` (a deviation
+//! from §2's "no libc crate"); this and `fork`'s `pthread_atfork` shim are the
+//! crate's two `unsafe` sites.
 //!
 //! # SAFETY (module invariant)
 //!
 //! [`fcntl_flock`] passes `fcntl` a `&mut libc::flock` owned by the caller's
-//! frame for the call. The kernel reads it (and writes it for `F_OFD_GETLK`),
-//! never retains it, and touches no other user memory; the pointer is valid,
-//! aligned and unaliased, and `libc::flock` is the kernel's `struct flock`.
+//! frame for the call; the kernel never retains it, and the pointer is valid,
+//! aligned and unaliased.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use rustix::io::Errno;
 
-// `libc` carries the correct `struct flock`, `F_OFD_*` numbers and `fcntl`
-// syscall for every target (32-bit `flock64`, sparc/hppa renumbering).
+// `libc` carries the correct `struct flock` and `F_OFD_*` numbers per target.
 
-/// `F_OFD_GETLK` — query without taking. Reports only *conflicting* locks, so a
-/// lock held by the querying description itself always reads as free.
+/// `F_OFD_GETLK` — query without taking; reports only *conflicting* locks.
 const F_OFD_GETLK: i32 = libc::F_OFD_GETLK;
 /// `F_OFD_SETLK` — non-blocking acquire or release.
 const F_OFD_SETLK: i32 = libc::F_OFD_SETLK;
@@ -50,8 +42,7 @@ pub(crate) enum LockKind {
 /// `SEEK_SET`: offsets in [`Range`] are absolute file offsets.
 const SEEK_SET: i16 = 0;
 
-/// A byte range of the lock file. Ranges are single bytes: the range names a
-/// lock, it does not protect data.
+/// A byte range of the lock file; a range names a lock, it protects no data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Range {
     /// First byte of the range.
@@ -82,12 +73,11 @@ pub enum LockAttempt {
 /// What `F_OFD_GETLK` reports about a range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LockProbe {
-    /// Whether a *conflicting* lock is held; the querying description's own locks
-    /// are invisible.
+    /// Whether a *conflicting* lock is held; the querying description's own
+    /// locks are invisible.
     pub held: bool,
-    /// The `l_pid` the kernel filled in: `-1` for an OFD lock (nobody can be
-    /// named, `docs/PHASE2.md` §3.3), `0` when nothing is held. Names come from
-    /// the identity records.
+    /// The kernel's `l_pid`: `-1` for an OFD lock (`docs/PHASE2.md` §3.3), `0`
+    /// when nothing is held.
     pub holder_pid: i32,
 }
 
@@ -134,9 +124,8 @@ pub(crate) fn probe(fd: BorrowedFd<'_>, range: Range) -> Result<LockProbe, Errno
 
 /// `fcntl(fd, cmd, &mut flock)`, returning the kernel's errno on failure.
 fn fcntl_flock(fd: BorrowedFd<'_>, cmd: i32, lock: &mut libc::flock) -> Result<(), Errno> {
-    // SAFETY: `fcntl` with an `F_OFD_*` command reads (and, for `F_OFD_GETLK`,
-    // writes) one `struct flock` through the pointer without retaining it; `lock`
-    // is live, aligned and uniquely borrowed, and the fd is borrowed for the call.
+    // SAFETY: an `F_OFD_*` `fcntl` reads (and for GETLK writes) one `struct
+    // flock` without retaining it; `lock` is live, aligned and uniquely borrowed.
     let ret = unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), cmd, lock as *mut libc::flock) };
     if ret < 0 {
         return Err(Errno::from_raw_os_error(
@@ -154,8 +143,7 @@ mod tests {
 
     #[test]
     fn flock_matches_the_kernel_abi() {
-        // OFD commands must exist and differ from the classic ones; an alias would
-        // silently make locks process-owned.
+        // An alias of the classic commands would make locks process-owned.
         assert_ne!(libc::F_OFD_SETLK, libc::F_SETLK);
         assert_ne!(libc::F_OFD_GETLK, libc::F_GETLK);
         assert_ne!(libc::F_OFD_SETLK, libc::F_OFD_GETLK);

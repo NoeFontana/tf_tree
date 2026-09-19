@@ -1,36 +1,17 @@
 //! What the arena's backing costs a hot lookup: heap against shared `memfd`.
 //!
-//! `docs/benchmarks/tf2.md` records a C++ caller at 306.7 ns against native Rust's
-//! 201.5 ns (+52%); the run changed the call boundary and the backing together.
-//! This module runs the §11.1 fixture, off-grid (`0013`), paired, on both backings.
-//! Neither is the cause: the C ABI's per-call `Guard` is (`PHASE4.md` §7 gate 1,
-//! `0022`).
-//!
-//! ```text
-//!   H  native Rust API, heap arena, in-process         200.7 ns
-//!   S  native Rust API, memfd arena, in-process RW     203.2 ns  <- measure()
-//!   A  native Rust API, memfd arena, RO cross-process  202.5 ns  <- measure_attached()
-//!   C  C ABI (tft_plan_at), same arena as A            302.0 ns
-//!   C' C ABI (tft_plan_at_many), same arena as A       261.0 ns
-//! ```
-//!
-//! The mapping costs <= 9.6 ns, the attach -0.7 ns, the link mode ~1 ns; the
-//! remaining +99.5 ns is `tft_plan_at` building a `Guard` per call. `C'` recovers
-//! 41 ns of it. [`guard_cost_both`] shows the guard costs ~17 ns on both backings.
+//! Runs the §11.1 fixture, off-grid (`0013`), paired, on both backings. Neither backing causes
+//! `docs/benchmarks/tf2.md`'s C++ gap; the C ABI's per-call `Guard` does (`PHASE4.md` §7 gate 1, `0022`).
 //!
 //! # Method
 //!
-//! As `crate::ratio`: a quotient of two arms timed inside one round, the leading
-//! arm alternating, reported as the median of per-round quotients with its band.
-//! Both arms are the same engine on the same read path, so host load is
-//! common-mode. The row is declared
-//! [`Sensitivity::Ratio`](crate::report::Sensitivity::Ratio).
+//! As `crate::ratio`, declared [`Sensitivity::Ratio`](crate::report::Sensitivity::Ratio).
 
 use anyhow::{anyhow, bail, Result};
 
 use tf_tree::{InterpPolicy, Stamp, Tree};
 
-/// Rounds of the interleaved pair. Odd, so the median is an observation.
+/// Rounds of the interleaved pair (odd).
 pub const ROUNDS: usize = 9;
 
 /// Sweeps of the stamp table per arm per round.
@@ -39,46 +20,44 @@ const SWEEPS: usize = 40;
 /// Stamps swept, all off every dynamic grid (`0013`).
 const STAMPS: usize = 256;
 
-/// Lookups per arm before any round is timed, so first-touch faults are not charged
-/// to the `memfd` arm.
+/// Lookups per arm before timing, so first-touch faults are not charged to `memfd`.
 const WARMUP: usize = 60_000;
 
 /// The pair measured: three dynamic steps after folding, matching `crate::ratio`.
 const TARGET: &str = "imu_link";
 const SOURCE: &str = "map";
 
-/// The `memfd` arena's rendezvous name; `build_shared` fails on a collision.
+/// The `memfd` arena's rendezvous name.
 const ARENA: &str = "tf_tree_bench_backing";
 
-/// Stamps off every dynamic grid so `I::eval` runs; identical to `ratio::stamp_ns`
-/// (`NOW_NS` is on-grid, which is `0013`'s defect).
+/// Stamps off every dynamic grid so `I::eval` runs (`0013`); identical to `ratio::stamp_ns`.
 const fn stamp_ns(i: i64) -> i64 {
     crate::fixture::NOW_NS - 3_700_000 - i * 9_631
 }
 
-/// One interleaved run: both backings, one process, `ROUNDS` rounds.
+/// One interleaved run of both backings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
-    /// Median per-round `memfd_ns / heap_ns`; above 1.0 the mapping costs something.
+    /// Median per-round `memfd_ns / heap_ns`.
     pub ratio: f64,
-    /// Smallest per-round ratio observed.
+    /// Smallest per-round ratio.
     pub ratio_lo: f64,
-    /// Largest per-round ratio observed.
+    /// Largest per-round ratio.
     pub ratio_hi: f64,
-    /// Median heap-arena nanoseconds per lookup. Reported, never gated.
+    /// Median heap ns per lookup.
     pub heap_ns: f64,
-    /// Median `memfd`-arena nanoseconds per lookup. Reported, never gated.
+    /// Median `memfd` ns per lookup.
     pub shm_ns: f64,
     /// Rounds timed.
     pub rounds: usize,
     /// Lookups per arm per round.
     pub lookups_per_round: u64,
-    /// Queries on which the two arenas were checked to agree before timing.
+    /// Queries checked to agree before timing.
     pub agreed: usize,
 }
 
 impl Run {
-    /// `(ratio_hi - ratio_lo) / ratio_lo`: what this run can resolve.
+    /// `(ratio_hi - ratio_lo) / ratio_lo`: what this run resolves.
     #[must_use]
     pub fn spread(&self) -> f64 {
         (self.ratio_hi - self.ratio_lo) / self.ratio_lo
@@ -96,16 +75,13 @@ impl Run {
         }
     }
 
-    /// The nanoseconds the backing costs a lookup (difference of medians), or `None`
-    /// when the sign is unresolved.
+    /// The nanoseconds the backing costs a lookup, or `None` when the sign is unresolved.
     #[must_use]
     pub fn backing_ns(&self) -> Option<f64> {
         self.resolved().map(|_| self.shm_ns - self.heap_ns)
     }
 
-    /// The most the backing could cost a lookup, consistent with the band: taken from
-    /// `ratio_hi` against the heap median, floored at zero. Available when the sign
-    /// is not.
+    /// The most the backing could cost a lookup: `ratio_hi` against the heap median, floored at zero.
     #[must_use]
     pub fn backing_ns_bound(&self) -> f64 {
         (self.heap_ns * (self.ratio_hi - 1.0)).max(0.0)
@@ -145,13 +121,12 @@ impl Run {
 /// Measure the pair.
 /// # Errors
 ///
-/// If either arena cannot be built or populated, the pair cannot be planned, or
-/// the two arenas disagree on an answer before either is timed.
+/// If either arena cannot be built, or the arenas disagree before timing.
 pub fn measure() -> Result<Run> {
     measure_with(ROUNDS, SWEEPS, WARMUP)
 }
 
-/// [`measure`] with loop counts as parameters, so a unit test can run it in debug.
+/// [`measure`] with loop counts as parameters, so a unit test can run in debug.
 ///
 /// # Errors
 ///
@@ -177,7 +152,6 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
         .map(|i| Stamp::from_nanos(stamp_ns(i)))
         .collect();
 
-    // The two arenas must agree before timing; tolerance 1e-15 (same engine both sides).
     let mut agreed = 0usize;
     for &s in &stamps {
         let h = heap_plan
@@ -202,7 +176,6 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
         let mut acc = 0.0f64;
         for _ in 0..sweeps {
             for &s in &stamps {
-                // Symmetric `if let` on both arms so the branch cancels; no `expect` in a timed loop.
                 if let Ok(v) = heap_plan.at(&heap_guard, std::hint::black_box(s)) {
                     acc += v.t.x;
                 }
@@ -234,7 +207,6 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
     let mut heap_ns = Vec::with_capacity(rounds);
     let mut shm_ns = Vec::with_capacity(rounds);
     for r in 0..rounds {
-        // Alternate the leading arm so neither always meets the colder cache.
         let (h, m) = if r % 2 == 0 {
             let t0 = std::time::Instant::now();
             let _ = sweep_heap();
@@ -272,14 +244,10 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
     })
 }
 
-/// Time the same sweep against an arena another process is serving, attached
-/// read-only through the rendezvous (rung `A` of the ladder). Unpaired, since the
-/// comparands are in different processes; the ~145 ns difference under test is far
-/// outside the ~4% spread.
+/// Time the same sweep against an arena another process serves, attached read-only (rung `A`); unpaired.
 /// # Errors
 ///
-/// If no arena of that name is being served, the pair cannot be planned, or a
-/// timed round measures a non-duration.
+/// If no arena of that name is served, or the pair cannot be planned.
 pub fn measure_attached(
     name: &str,
     rounds: usize,
@@ -315,9 +283,7 @@ pub fn measure_attached(
         }
         std::hint::black_box(acc)
     };
-    // The same sweep with a guard acquired per lookup, the shape `tft_plan_at` is forced
-    // into, on the arena the C++ probe measures. Read-only, so `Guard::drop` skips the
-    // counter flush.
+    // A guard per lookup, as `tft_plan_at` is forced to; read-only, so `Guard::drop` skips the flush.
     let sweep_per_call = || {
         let mut acc = 0.0f64;
         for _ in 0..sweeps {
@@ -366,16 +332,12 @@ pub fn measure_attached(
     Ok((median(&mut ns), median(&mut pc)))
 }
 
-/// What acquiring a [`tf_tree::Guard`] per lookup costs against hoisting one, on a
-/// tree the caller supplies (`0022` question 4), in safe Rust with no C ABI: the same
-/// `Plan::at` sweep twice. Heap against shared prices the `is_shared()` branch in
-/// `Tree::guard`.
-///
-/// Returns `(hoisted_ns, per_call_ns)`, paired and interleaved.
+/// What a per-call [`tf_tree::Guard`] costs against a hoisted one (`0022` question 4): the same `Plan::at`
+/// sweep twice. Returns `(hoisted_ns, per_call_ns)`.
 ///
 /// # Errors
 ///
-/// If the pair cannot be planned or a timed round measures a non-duration.
+/// If the pair cannot be planned or a round is not a duration.
 pub fn measure_guard_cost(
     tree: &Tree,
     rounds: usize,
@@ -385,12 +347,11 @@ pub fn measure_guard_cost(
     measure_guard_cost_between(tree, TARGET, SOURCE, rounds, sweeps, warmup)
 }
 
-/// [`measure_guard_cost`] over a named frame pair, for a fixture without `imu_link`
-/// (asking for one fails with `CapacityExceeded`).
+/// [`measure_guard_cost`] over a named frame pair, for a fixture without `imu_link`.
 ///
 /// # Errors
 ///
-/// If the pair cannot be planned or a timed round measures a non-duration.
+/// As [`measure_guard_cost`].
 pub fn measure_guard_cost_between(
     tree: &Tree,
     target: &str,
@@ -415,7 +376,6 @@ pub fn measure_guard_cost_between(
         .map(|i| Stamp::from_nanos(stamp_ns(i)))
         .collect();
 
-    // The hoisted arm acquires one guard for the whole sweep.
     let hoisted = || {
         let g = tree.guard();
         let mut acc = 0.0f64;
@@ -428,7 +388,6 @@ pub fn measure_guard_cost_between(
         }
         std::hint::black_box(acc)
     };
-    // The per-call arm acquires one inside the loop, as `tft_plan_at` must.
     let per_call = || {
         let mut acc = 0.0f64;
         for _ in 0..sweeps {
@@ -494,10 +453,7 @@ impl GuardCost {
     }
 }
 
-/// What each backing holds resident for the same declared arena. `populate_hot`
-/// pre-faults every declared slot on the shared path (`docs/PHASE2.md` §7.1); the heap
-/// arena is demand-faulted (`0021`). Each figure is a Pss delta across building one
-/// arena, so the order of magnitude is the finding.
+/// What each backing holds resident for the same declared arena (Pss delta; `docs/PHASE2.md` §7.1).
 ///
 /// Returns `(heap_kib, shm_kib, arena_bytes)`.
 ///
@@ -529,9 +485,7 @@ pub fn residency_both() -> Result<(u64, u64, usize)> {
     Ok((heap_kib.0, shm_kib, heap_kib.1))
 }
 
-/// [`measure_guard_cost`] on a heap arena then a shared one. The difference prices
-/// the `is_shared()` fork check (+2.1 ns counters off, -8.4 on: noise; `0022`
-/// question 4). A per-call guard costs ~17 ns; the diagnostic counters roughly double it.
+/// [`measure_guard_cost`] on a heap arena then a shared one (prices the `is_shared()` check, `0022` q4).
 ///
 /// # Errors
 ///
@@ -560,9 +514,8 @@ pub fn guard_cost_both(
     ))
 }
 
-/// A three-edge, 256-slot heap tree matching `crates/tf_tree_c/examples/abi_cost.rs`
-/// (whose R3 row `0023` §7 gates), for [`guard_cost_fixture_pair`]: its 2 KiB stamp
-/// arrays sit in L1d, §11.1's 1 kHz edge searches 128 KiB.
+/// A three-edge, 256-slot heap tree matching `crates/tf_tree_c/examples/abi_cost.rs` (`0023` §7), for
+/// [`guard_cost_fixture_pair`].
 fn build_three_edge_tree() -> Result<Tree> {
     let cfg = tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(256));
     let mount = tf_tree_math::exp_se3([0.3, -0.7, 0.2, 0.11, -0.05, 0.37]);
@@ -602,13 +555,8 @@ fn build_three_edge_tree() -> Result<Tree> {
     Ok(tree)
 }
 
-/// `docs/decisions/0023` open question 3's falsifier: the per-call guard on the
-/// three-edge fixture and on §11.1's, heap-backed, in one binary, the fixture order
-/// alternating each round. If the paired difference does not reproduce ~18 ns, the
-/// recommendation to move R3 is withdrawn.
-///
-/// Returns `(three_edge, phase11_1)` per-call guard cost in ns/lookup, as plain
-/// differences (there is no single hoisted figure).
+/// `docs/decisions/0023` open question 3's falsifier: per-call guard cost on the three-edge fixture and on
+/// §11.1's. Returns `(three_edge, phase11_1)` ns/lookup.
 ///
 /// # Errors
 ///
@@ -618,14 +566,12 @@ pub fn guard_cost_fixture_pair(rounds: usize, sweeps: usize, warmup: usize) -> R
     let big = crate::fixture::build_tree_with(InterpPolicy::LerpSlerp)?;
     let (_w, _s) = crate::fixture::spin_up(&big)?;
 
-    // The three-edge tree's own chain, `map` -> `sensor`; it has no `imu_link`.
     let small_round = |t: &Tree, sweeps: usize, warmup: usize| {
         measure_guard_cost_between(t, "sensor", "map", 1, sweeps, warmup)
     };
     let mut small_acc = Vec::with_capacity(rounds);
     let mut big_acc = Vec::with_capacity(rounds);
     for r in 0..rounds {
-        // One round each, alternating the leading fixture.
         let (a, b) = if r % 2 == 0 {
             let a = small_round(&small, sweeps, if r == 0 { warmup } else { 0 })?;
             let b = measure_guard_cost(&big, 1, sweeps, if r == 0 { warmup } else { 0 })?;
@@ -641,8 +587,7 @@ pub fn guard_cost_fixture_pair(rounds: usize, sweeps: usize, warmup: usize) -> R
     Ok((median(&mut small_acc), median(&mut big_acc)))
 }
 
-/// The fixture topology on a `MAP_SHARED` `memfd`, via `build_shared` rather than the
-/// rendezvous, which adds nothing to the timed read path.
+/// The fixture topology on a `MAP_SHARED` `memfd` via `build_shared`.
 fn build_shared_fixture() -> Result<Tree> {
     let mut b = tf_tree::TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
     for e in crate::fixture::EDGES {
@@ -702,8 +647,7 @@ mod tests {
         }
     }
 
-    /// The sign is read off the band, not the median. Mutant: compare `self.ratio`
-    /// against 1.0.
+    /// The sign is read off the band, not the median.
     #[test]
     fn a_band_containing_one_cannot_say_the_backing_costs_anything() {
         assert_eq!(run(0.97, 1.06, 200.0, 201.0).resolved(), None);
@@ -711,31 +655,27 @@ mod tests {
         assert_eq!(run(0.90, 0.98, 200.0, 190.0).resolved(), Some(false));
     }
 
-    /// An unresolved run reports no nanosecond figure. Mutant: return
-    /// `Some(shm_ns - heap_ns)` unconditionally.
+    /// An unresolved run reports no nanosecond figure.
     #[test]
     fn an_unresolved_run_publishes_no_nanosecond_split() {
         assert_eq!(run(0.97, 1.06, 200.0, 201.0).backing_ns(), None);
         assert_eq!(run(1.02, 1.09, 200.0, 210.0).backing_ns(), Some(10.0));
     }
 
-    /// The bound survives an unresolved sign. Mutant: return `0.0` when `resolved()`
-    /// is `None`.
+    /// The bound survives an unresolved sign.
     #[test]
     fn the_upper_bound_survives_an_unresolved_sign() {
-        // Band 0.97-1.06 on a 200 ns arm: at most 6% of 200 ns.
         let bound = run(0.97, 1.06, 200.0, 201.0).backing_ns_bound();
         assert!((bound - 12.0).abs() < 1e-9, "got {bound}");
     }
 
-    /// A band entirely below 1.0 bounds the cost at zero. Mutant: drop the `.max(0.0)`.
+    /// A band entirely below 1.0 bounds the cost at zero.
     #[test]
     fn a_band_entirely_below_one_bounds_the_cost_at_zero() {
         assert_eq!(run(0.90, 0.98, 200.0, 190.0).backing_ns_bound(), 0.0);
     }
 
-    /// The verdict line names the direction, so a run where the shared mapping
-    /// is *faster* cannot be read as though it were slower.
+    /// The verdict line names the direction.
     #[test]
     fn the_verdict_line_states_its_direction() {
         assert!(run(1.02, 1.09, 200.0, 210.0)

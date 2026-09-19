@@ -6,27 +6,20 @@
 
 Zero-configuration rendezvous for [`tf_tree`](https://crates.io/crates/tf_tree)
 shared arenas: runtime-directory discovery, the OFD lock file, `SOCK_SEQPACKET`
-descriptor passing, and the `open()` decision machine. **Linux only**: the crate
-is `#![cfg(target_os = "linux")]` and compiles empty elsewhere. You normally reach
-it through `tf_tree`'s default-off `shm` feature.
+descriptor passing, and the `open()` decision machine. **Linux only** (compiles
+empty elsewhere); reach it through `tf_tree`'s `shm` feature.
 
 A process calls `open()` and either joins the arena on this machine or creates
-it — no configuration file, no daemon, no start-order requirement, and **no
-possibility of two processes silently ending up on different arenas**.
+it: no configuration file, no daemon, no start-order requirement.
 
 ## Borrow the kernel's locks; do not implement leader election
 
-Linux open file description locks give mutual exclusion, automatic release when
-the holder dies, and a way to ask whether anyone holds it, with no timeouts or
-heartbeats. So:
+Liveness is an open file description lock: no timeouts, no heartbeats.
 
 * A dead participant's lock is released **by the kernel at the end of its exit**
-  (after any core dump and address-space teardown,
-  [`docs/decisions/0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
-  Nothing to tune, nothing to reap.
+  ([`docs/decisions/0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
 * A `SIGSTOP`ped participant **still holds its lock**, so it is never mistaken
   for a dead one.
-* "Is anyone alive?" is a kernel fact; `/proc` parsing survives only as diagnostics.
 
 ## The sharing boundary is a directory
 
@@ -38,20 +31,18 @@ directory, domain and name:
 <runtime_dir>/<domain>/<name>.sock     # SOCK_SEQPACKET, owner-bound, FD passing
 ```
 
-Sharing it between containers is a volume mount; not sharing it is complete
-isolation; either way it is inspectable with `ls`.
+Sharing between containers is a volume mount.
 
 ## Dependencies, sandbox, version
 
-`rustix` for raw syscalls; `libc` for exactly one call, `fcntl(F_OFD_SETLK)`,
-because `rustix` 1.1 has no OFD locking and classic whole-file locks are dropped
-when *any* descriptor to the file closes.
+`rustix` for raw syscalls; `libc` for one call, `fcntl(F_OFD_SETLK)`, which
+`rustix` lacks.
 
 Processes sharing an arena are **mutually trusting, same-user, cooperating
 processes**; a read-write participant can corrupt any part of the arena
 ([`SECURITY.md`](https://github.com/NoeFontana/tf_tree/blob/main/SECURITY.md)).
 
-**`0.0.x` promises nothing**: pin exactly and expect a later release to break
+**`0.0.x` promises nothing**: pin exactly
 ([`CHANGELOG.md`](https://github.com/NoeFontana/tf_tree/blob/main/CHANGELOG.md)).
 MSRV is **1.87** ([`SUPPORT.md`](https://github.com/NoeFontana/tf_tree/blob/main/SUPPORT.md)).
 The normative spec is
@@ -61,5 +52,4 @@ The normative spec is
 
 ## Licence
 
-Dual [MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE), at your option. See
-[`NOTICE`](NOTICE).
+Dual [MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE), at your option; see [`NOTICE`](NOTICE).

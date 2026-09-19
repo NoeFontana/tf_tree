@@ -1,23 +1,16 @@
-//! Identity types and the `Copy`, allocation-free error enums.
-//!
-//! Errors carry integer IDs, never a `String`, so they can be returned from the
-//! wait-free read path. **Every variant that can name an edge does name one**
-//! (D11).
+//! Identity types and the `Copy`, allocation-free error enums. Errors carry
+//! integer IDs, never a `String`; every variant that can name an edge does (D11).
 
 use core::fmt;
 use core::num::NonZeroU32;
 
-/// Stable identity of a frame.
-///
-/// A `NonZeroU32` so `Option<FrameId>` is four bytes and index `0` is reserved
-/// as the root / "no parent" sentinel. Identity is append-only (invariant 1 /
-/// D10): a `FrameId` is never reused, so a stale reference is always in bounds.
+/// Stable identity of a frame: a `NonZeroU32` (`0` is the root / "no parent"
+/// sentinel). Append-only (invariant 1 / D10): never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FrameId(NonZeroU32);
 
 impl FrameId {
-    /// Construct a `FrameId` from a raw index, returning `None` for the reserved
-    /// root sentinel `0`.
+    /// Construct a `FrameId` from a raw index; `None` for the sentinel `0`.
     #[inline]
     #[must_use]
     pub const fn new(index: u32) -> Option<FrameId> {
@@ -35,14 +28,11 @@ impl FrameId {
     }
 }
 
-/// Stable identity of an edge (index into the edge table).
+/// Stable identity of an edge (index into the edge table); append-only,
+/// removal is tombstoning (invariant 1 / D10).
 ///
-/// Like [`FrameId`], edge identity is append-only; removal is tombstoning, never
-/// recycling (invariant 1 / D10).
-///
-/// A plain `u32`; index `0` is representable but no builder hands it out:
-/// `TreeBuilder::build` reserves it (`edge_count` is `declared + 1`), so consumers
-/// see `1 ..= declared`, like [`FrameId`].
+/// Index `0` is representable but reserved by `TreeBuilder::build`: consumers
+/// see `1 ..= declared`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EdgeId(pub u32);
 
@@ -55,11 +45,9 @@ impl EdgeId {
     }
 }
 
-/// A lookup or sample failure.
-///
-/// Returned by the sample/read path and by plan compilation and evaluation
-/// ([`crate::plan`]). Implements `Display` and [`core::error::Error`], so it
-/// propagates with `?` ([`0040`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0040-the-error-that-cannot-be-returned.md)).
+/// A lookup or sample failure, from the read path and plan compilation and
+/// evaluation ([`crate::plan`]). Implements `Display` and [`core::error::Error`]
+/// ([`0040`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0040-the-error-that-cannot-be-returned.md)).
 ///
 /// ```
 /// use tf_tree_core::{EdgeId, LookupError};
@@ -72,24 +60,21 @@ impl EdgeId {
 /// }
 ///
 /// let e = newest_pose(true).unwrap_err();
-/// // Identifiers, not names: this type has no arena to resolve against.
+/// // Identifiers, not names.
 /// assert!(e.to_string().contains('3'));
 /// ```
 ///
 /// # Identifiers here, names from `Tree::describe`
 ///
-/// Messages say `edge 3`, not `odom -> base_link`: naming needs the arena, which
-/// the wait-free read path cannot carry (D11, `docs/API.md` R5). Use
-/// `tf_tree::Tree::describe` where a tree is in hand. **The message text is a
-/// diagnostic, not a compatibility promise**; the type and discriminant are.
+/// Messages say `edge 3`, not `odom -> base_link`: naming needs the arena (D11,
+/// `docs/API.md` R5); use `tf_tree::Tree::describe`. **The message text is not a
+/// compatibility promise**; the type and discriminant are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LookupError {
-    /// A frame name that does not resolve to a frame of this tree.
-    ///
-    /// Usually a name never interned. `tf_tree::Tree::lookup` also reports a hash
-    /// collision ([`FrameError::FrameHashCollision`]) and a mid-publish interner
-    /// ([`FrameError::InternContended`]) here; see its `# Errors`.
+    /// A frame name that does not resolve to a frame of this tree. Usually never
+    /// interned; `tf_tree::Tree::lookup` also reports hash collision and
+    /// mid-publish interner here (see its `# Errors`).
     UnknownFrame {
         /// The 64-bit BLAKE3 prefix hash of the requested name.
         hash: u64,
@@ -104,15 +89,11 @@ pub enum LookupError {
         /// The frame at which the ancestor walk ran out of parents.
         cut_at: FrameId,
     },
-    /// The path is too long for one of the two bounds it has to fit: more than
-    /// [`crate::MAX_PATH_EDGES`] raw edges to walk, or more than
-    /// [`crate::MAX_DEPTH`] steps once folded.
-    ///
-    /// `docs/PHASE1.md` §7.1 says why one variant covers both; `depth` tells them apart.
+    /// The path exceeds [`crate::MAX_PATH_EDGES`] raw edges or [`crate::MAX_DEPTH`]
+    /// folded steps (`docs/PHASE1.md` §7.1); `depth` tells them apart.
     TreeTooDeep {
-        /// The count that overran its bound. `MAX_PATH_EDGES + 1` means the walk
-        /// (a lower bound; it stops when the buffer is full). `MAX_DEPTH + 1 ..=
-        /// MAX_PATH_EDGES` means the folded step array, and is **exact**.
+        /// The count that overran. `MAX_PATH_EDGES + 1` is the walk (a lower
+        /// bound); `MAX_DEPTH + 1 ..= MAX_PATH_EDGES` is the folded array, exact.
         depth: u16,
     },
     /// The edge has no published samples yet.
@@ -156,8 +137,7 @@ pub enum LookupError {
         /// The domain actually supplied.
         got: u8,
     },
-    /// The path crosses dynamic edges in **different** time domains, so no single
-    /// query stamp can address all of them (D9). Rejected at compile time.
+    /// The path crosses dynamic edges in different time domains (D9); rejected at compile time.
     MixedTimeDomains {
         /// The edge whose domain differs from the rest of the path.
         edge: EdgeId,
@@ -166,21 +146,18 @@ pub enum LookupError {
         /// The domain `edge` declares.
         got: u8,
     },
-    /// An edge id that names no usable edge record in this arena: out of range
-    /// for the edge table, or naming a slot with no sample ring.
+    /// An edge id naming no usable edge record: out of range, or no sample ring.
     UnknownEdge {
         /// The offending edge id.
         edge: EdgeId,
     },
-    /// A frame id out of range for this arena's frame table. [`FrameId`] only
-    /// guarantees non-zero, not that the frame exists here.
+    /// A frame id out of range for this arena ([`FrameId`] guarantees only non-zero).
     FrameOutOfRange {
         /// The offending frame id.
         frame: FrameId,
     },
-    /// A caller's output buffer is too small for the batch.
-    ///
-    /// Checked before any element is written (`docs/PHASE3.md` §5.3).
+    /// A caller's output buffer is too small; checked before any write
+    /// (`docs/PHASE3.md` §5.3).
     BufferTooSmall {
         /// Elements required.
         need: usize,
@@ -189,29 +166,19 @@ pub enum LookupError {
     },
     /// An `f32` layout was passed to the `f64` entry point, or the reverse.
     WrongElementType,
-    /// This handle belongs to a process that no longer exists: it was created
-    /// before a `fork()` and is being used in the child.
-    ///
-    /// A shared arena is mapped `MADV_DONTFORK` (`docs/PHASE2.md` §7.3), so the
-    /// child has no mapping. Only the `std` facade detects this; this crate never
-    /// constructs it. Not retryable: open a new tree in the child, or `exec`.
+    /// This handle was created before a `fork()` and is used in the child
+    /// (`MADV_DONTFORK`, `docs/PHASE2.md` §7.3). Only the `std` facade constructs
+    /// it. Not retryable: open a new tree, or `exec`.
     ChildDetached,
-    /// The topology says this frame has a parent, but records no edge for the
-    /// link (`edge_of_child == 0`, the "no edge" sentinel); edge slot `0` must not
-    /// be sampled in its place.
+    /// The topology gives this frame a parent but no edge (`edge_of_child == 0`).
     MissingEdge {
         /// The child frame whose parent link carries no edge.
         child: FrameId,
     },
-    /// A derivative was requested from an edge whose interpolation policy does
-    /// not have one worth reporting — `docs/PHASE4.md` §2.4.
-    ///
-    /// A **refusal, not a limitation**: `LerpSlerp`'s body twist is an artifact of
-    /// the interpolant (it holds the world-frame velocity constant, so the
-    /// body-frame velocity rotates while its norm looks fine), and the
-    /// compatibility interpolator exists to bit-match `tf2`.
-    ///
-    /// The fix is to declare the edge `ScLerp`, which is the default.
+    /// A derivative was requested from an edge whose interpolation policy has
+    /// none worth reporting (`docs/PHASE4.md` §2.4): a refusal, not a
+    /// limitation (`LerpSlerp`'s body twist is an interpolant artifact). Declare
+    /// the edge `ScLerp`, the default.
     DerivativesUnavailable {
         /// The edge whose policy has no reportable derivative.
         edge: EdgeId,
@@ -219,9 +186,8 @@ pub enum LookupError {
         interp: u8,
     },
     /// A derivative was requested at a stamp with no segment to differentiate.
-    ///
-    /// Unlike [`LookupError::NoData`], the pose is defined. Transient: the ring
-    /// holds one sample, or the bracketing samples share a stamp (invariant 6).
+    /// Unlike [`LookupError::NoData`] the pose is defined; transient (one
+    /// sample, or bracketing samples share a stamp).
     NoSegment {
         /// The edge with no differentiable segment at the requested stamp.
         edge: EdgeId,
@@ -232,27 +198,23 @@ pub enum LookupError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PushError {
-    /// The pushed stamp is strictly older than the edge's newest stamp. Stamps
-    /// are non-decreasing per edge (invariant 6); equal stamps are accepted and
-    /// the newer value wins.
+    /// The pushed stamp is older than the edge's newest (invariant 6); equal
+    /// stamps are accepted.
     NonMonotonicStamp {
-        /// The edge whose newest stamp the push predates (D11: an error names
-        /// the edge it is about).
+        /// The edge whose newest stamp the push predates.
         edge: EdgeId,
         /// The edge's current newest stamp.
         last: i64,
         /// The (rejected) stamp that was pushed.
         got: i64,
     },
-    /// The claim was revoked (the edge was reaped) and the push refused
-    /// (`docs/PHASE2.md` §1, A4). Stop publishing; re-claim if still wanted.
+    /// The claim was revoked (reaped) and the push refused (`docs/PHASE2.md` §1
+    /// A4). Stop publishing; re-claim if wanted.
     ClaimRevoked {
         /// The edge whose claim was revoked.
         edge: EdgeId,
     },
-    /// This handle belongs to a process that no longer exists: it was created
-    /// before a `fork()` and is being used in the child. See
-    /// [`LookupError::ChildDetached`].
+    /// See [`LookupError::ChildDetached`].
     ChildDetached,
 }
 
@@ -272,31 +234,21 @@ pub enum ClaimError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FrameError {
-    /// Two distinct names collided on the same 64-bit hash (~3e-12 at 1e4 frames).
+    /// Two distinct names collided on the same 64-bit hash.
     FrameHashCollision {
         /// The colliding 64-bit hash.
         hash: u64,
     },
-    /// The frame table is full (`max_frames` reached). Capacity is fixed at
-    /// construction (invariant 3); there is no growth.
+    /// The frame table is full (`max_frames`); capacity is fixed (invariant 3).
     CapacityExceeded,
-    /// Another interner holds this name's slot and cannot be judged.
-    ///
-    /// The claimant is an *anonymous* view (no `ArenaView::as_participant`), so
-    /// its liveness cannot be judged; taking over would mint a second id and
-    /// waiting is the hang A8 prevents.
+    /// Another interner holds this name's slot and, being anonymous
+    /// (no `ArenaView::as_participant`), cannot be judged; waiting is the hang A8 prevents.
     InternContended,
-    /// This handle belongs to a process that no longer exists: it was created
-    /// before a `fork()` and is being used in the child. See
-    /// [`LookupError::ChildDetached`].
+    /// See [`LookupError::ChildDetached`].
     ChildDetached,
     /// **This name is not declared in this arena, and this participant cannot
-    /// declare it.**
-    ///
-    /// Interning publishes into the hash table with a `compare_exchange`, which
-    /// a `PROT_READ` mapping answers with `SIGSEGV`; resolving declared names
-    /// works. Wait for the publisher that will intern it, or declare it where the
-    /// arena is created.
+    /// declare it** (a `PROT_READ` mapping cannot publish). Wait for the
+    /// publisher, or declare it where the arena is created.
     ReadOnly,
 }
 
@@ -304,8 +256,7 @@ pub enum FrameError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TopologyError {
-    /// Attaching `child` under the requested parent would create a cycle (the
-    /// ancestor walk exceeded its `max_frames` step budget).
+    /// Attaching `child` would create a cycle (ancestor walk exceeded `max_frames`).
     WouldCreateCycle {
         /// The child frame whose attachment was rejected.
         child: FrameId,
@@ -320,8 +271,7 @@ pub enum TopologyError {
 }
 
 // `Display` and `core::error::Error` (0040): identifiers, never names (`docs/API.md`
-// R5, D11); `core::error::Error` keeps the crate `no_std` (MSRV 1.87 > 1.81).
-// Matches are exhaustive on purpose, so a new variant fails to compile here.
+// R5, D11). Matches are exhaustive so a new variant fails to compile here.
 
 impl fmt::Display for LookupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -1,30 +1,24 @@
-//! Safe Rust bindings to ROS 2's `tf2::BufferCore`, for the `tf_tree`
-//! differential and benchmark harnesses.
+//! Safe Rust bindings to ROS 2's `tf2::BufferCore`, for the `tf_tree` differential and
+//! benchmark harnesses.
 //!
-//! Isolated in a `-sys` crate because FFI is `unsafe` and `tf_tree_bench`'s library root
-//! forbids it. `publish = false`; reached only through `tf_tree_bench --features tf2`. Unsafe
-//! budget kind 3 (a foreign runtime that owns its objects; `0007`, `0048`).
+//! A `-sys` crate because FFI is `unsafe` and `tf_tree_bench`'s library root forbids it;
+//! `publish = false`. Unsafe budget kind 3 (`0007`, `0048`).
 //!
 //! # SAFETY (module invariant)
 //!
-//! Every `unsafe` call below crosses into `src/shim.cpp`. The bridge is sound
-//! because:
+//! Every `unsafe` call below crosses into `src/shim.cpp`, which is sound because:
 //!
 //! * [`Tf2Buffer`] owns its handle: one `tft2_new`, one `tft2_free` in [`Drop`]; never null,
-//!   never dangling (private field).
-//! * The C++ side catches **all** exceptions at the boundary and converts them
-//!   to return codes. No unwinding crosses the FFI edge.
-//! * Every `*const c_char` passed in is a [`CString`] that outlives the call.
-//!   Frame names are validated to be NUL-free before conversion.
+//!   never dangling.
+//! * The C++ side catches **all** exceptions and returns codes; no unwinding crosses FFI.
+//! * Every `*const c_char` is a [`CString`] outliving the call, NUL-free by validation.
 //! * Every `const void*` name handle is a live `std::string` owned by a borrowed
-//!   [`FrameName`]; the shim only reads it.
+//!   [`FrameName`], only read.
 //! * Every pose buffer is `[f64; 7]` = `double[7]`, `{qw, qx, qy, qz, tx, ty, tz}` on both
-//!   sides, the order of [`Iso3::to_bits`].
+//!   sides ([`Iso3::to_bits`]).
 //!
-//! `Tf2Buffer` is `Send + Sync`: `BufferCore` locks internally and the shim's last-error
-//! slot is `thread_local`.
-//!
-//! Sharing **one** buffer across reader threads is deliberate: tf2's per-lookup mutex is what
+//! `Tf2Buffer` is `Send + Sync`: `BufferCore` locks internally and the shim's last-error slot
+//! is `thread_local`. Sharing **one** buffer across reader threads is deliberate: it is what
 //! the concurrent read benchmark measures.
 
 use std::ffi::{c_char, c_double, c_int, CStr, CString};
@@ -84,8 +78,7 @@ pub enum Tf2Error {
     NegativeStamp(i64),
     /// `setTransform` rejected the transform (tf2's own validation).
     SetRejected(String),
-    /// `lookupTransform` threw — extrapolation, a disconnected pair, or an
-    /// unknown frame. The string is tf2's own message.
+    /// `lookupTransform` threw; the string is tf2's own message.
     Lookup(String),
 }
 
@@ -184,12 +177,9 @@ impl Tf2Buffer {
             return Err(Tf2Error::NegativeStamp(stamp_ns));
         }
         let bits = pose.to_bits();
-        // `to_bits` is f64 bit patterns; the shim wants the values themselves.
         let vals: [f64; 7] = core::array::from_fn(|i| f64::from_bits(bits[i]));
 
-        // SAFETY: module invariant — `self.handle` is live and uniquely owned;
-        // the `FrameName`s own live `std::string`s that outlive the call and are
-        // only read; `vals` is exactly the `double[7]` the shim reads.
+        // SAFETY: module invariant; `vals` is exactly the `double[7]` the shim reads.
         let rc = unsafe {
             ffi::tft2_set_pre(
                 self.handle,
@@ -213,8 +203,7 @@ impl Tf2Buffer {
     ///
     /// # Errors
     ///
-    /// [`Tf2Error::Lookup`] carrying tf2's own message — extrapolation, an
-    /// unknown frame, or a disconnected pair.
+    /// [`Tf2Error::Lookup`] carrying tf2's own message.
     pub fn lookup(&self, target: &str, source: &str, stamp_ns: i64) -> Result<Iso3, Tf2Error> {
         self.lookup_by_name(&FrameName::new(target)?, &FrameName::new(source)?, stamp_ns)
     }
@@ -237,9 +226,7 @@ impl Tf2Buffer {
         }
         let mut out = [0.0f64; 7];
 
-        // SAFETY: module invariant — `self.handle` is live; the `FrameName`s own
-        // live `std::string`s that outlive the call and are only read; `out` is
-        // exactly the `double[7]` the shim writes, and only on rc == 0.
+        // SAFETY: module invariant; `out` is the `double[7]` the shim writes, only on rc == 0.
         let rc = unsafe {
             ffi::tft2_lookup_pre(
                 self.handle,
@@ -294,8 +281,7 @@ impl Tf2Buffer {
 
 impl Drop for Tf2Buffer {
     fn drop(&mut self) {
-        // SAFETY: module invariant — the handle came from exactly one
-        // `tft2_new`, was never duplicated, and is freed exactly once here.
+        // SAFETY: module invariant — freed exactly once here.
         unsafe { ffi::tft2_free(self.handle) }
     }
 }
@@ -348,9 +334,7 @@ impl FrameName {
 
 impl Drop for FrameName {
     fn drop(&mut self) {
-        // SAFETY: module invariant — `cpp` came from exactly one
-        // `tft2_name_new`, was never duplicated (the type is not `Clone`), and
-        // is freed exactly once here.
+        // SAFETY: module invariant — `cpp` is never duplicated (not `Clone`), freed once here.
         unsafe { ffi::tft2_name_free(self.cpp) }
     }
 }
@@ -360,8 +344,7 @@ fn cstr(s: &str) -> Result<CString, Tf2Error> {
     CString::new(s).map_err(|_| Tf2Error::FrameNameHasNul(s.to_owned()))
 }
 
-/// Everything [`Tf2Buffer::lookup_by_name`] does except the `BufferCore` call, so a benchmark
-/// can subtract the bridge's own overhead.
+/// Everything [`Tf2Buffer::lookup_by_name`] does except the `BufferCore` call.
 ///
 /// # Errors
 ///

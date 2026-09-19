@@ -16,13 +16,11 @@
 //!               .await_open(timeout)          -- the publisher may not be up yet
 //! ```
 //!
-//! Without `require_create(true)` a second publisher silently joins the first's
-//! arena; with it, it gets `ArenaAlreadyLive`. `await_open` retries until the
-//! timeout, so startup order does not matter and no daemon is needed
-//! (`docs/decisions/0019`). The consumer prints the transform and
-//! `Extrapolated::by_ns`, which is `0` only when every edge bracketed the query.
+//! Without `require_create(true)` a second publisher joins the first's arena;
+//! with it, `ArenaAlreadyLive`. `await_open` makes startup order irrelevant
+//! (`docs/decisions/0019`). `Extrapolated::by_ns` is `0` only when every edge
+//! bracketed the query.
 
-// An example's stdout IS its output, and its panics are its assertions.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -39,7 +37,6 @@ fn main() {
         TreeBuilder,
     };
 
-    /// One name for both halves (`$TF_TREE_ARENA` is the other way to say it).
     const ARENA: &str = "tf_tree_two_processes_example";
     const STEP_NS: i64 = 10_000_000; // 100 Hz
 
@@ -55,8 +52,7 @@ fn main() {
                 TreeBuilder::new()
                     .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::slots(256)))
                     .dynamic_edge("odom", "base_link", EdgeCfg::new(Capacity::slots(256)))
-                    // A constant mount is a *static* edge: folded in at plan time.
-                    // `exp_se3` takes `[ω, v]`, rotation first; the wrong order is silent.
+                    // `exp_se3` takes `[ω, v]`, rotation first.
                     .static_edge(
                         "base_link",
                         "lidar",
@@ -76,7 +72,6 @@ fn main() {
         println!("publisher: arena `{ARENA}` created, publishing 100 samples at 100 Hz");
         for k in 0..100i64 {
             let t = k * STEP_NS;
-            // A slow drift, so the answer is visibly a function of the stamp.
             a.push(
                 t,
                 &tf_tree::exp_se3([0.0, 0.0, 0.0, 0.01 * k as f64, 0.0, 0.0]),
@@ -94,15 +89,13 @@ fn main() {
     }
 
     fn consumer() {
-        // The publisher may not be up yet; this is why no daemon is needed (0019).
         let tree = tf_tree::Open::new()
             .name(ARENA)
             .expect("arena name")
             .await_open(Duration::from_secs(5))
             .expect("the publisher did not come up within 5 s");
 
-        // Wait for history, not just the arena: `await_open` returns before anything
-        // worth reading is published.
+        // `await_open` returns before anything worth reading is published.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let g = tree.guard();
@@ -124,8 +117,6 @@ fn main() {
         let map = tree.frame("map").expect("map");
         let plan = tree.plan(lidar, map).expect("compile map -> lidar");
 
-        // Compiled once, evaluated many times. The static mount becomes a
-        // `Step::Static` (one multiply) rather than a ring search plus interpolation.
         let dynamic = plan
             .steps()
             .iter()
@@ -136,15 +127,13 @@ fn main() {
             plan.len()
         );
 
-        // One guard per cycle, covering every query the cycle makes.
         let g = tree.guard();
-        // The newest stamp every dynamic edge can answer for; the slowest bounds a composed answer.
+        // The newest stamp every dynamic edge can answer for.
         let (_, newest) = plan
             .span(&g)
             .expect("span")
             .expect("the route has a retained window");
         for offset in [0, STEP_NS / 2, STEP_NS * 3] {
-            // `Stamp<D>` carries its domain in the type (D9); these edges are tag 0.
             let t: Stamp<SystemDomain> = Stamp::from_nanos(newest + offset);
             match plan.at_extrapolating(&g, t, ExtrapPolicy::ConstantTwist) {
                 Ok(e) => {
@@ -163,14 +152,12 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("--publish") => publisher(),
         Some("--consume") => consumer(),
-        // No switch: be the harness, so this is one command.
         _ => {
             let exe = std::env::current_exe().expect("current exe");
             let mut pubr = std::process::Command::new(&exe)
                 .arg("--publish")
                 .spawn()
                 .expect("spawn the publisher");
-            // No sleep: `await_open` is the synchronisation.
             let cons = std::process::Command::new(&exe)
                 .arg("--consume")
                 .status()

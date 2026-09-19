@@ -2,23 +2,18 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 //! Implementation of the `tf_tree` diagnostics CLI.
 //!
-//! Printing to stdout/stderr is this crate's whole job, so the workspace
-//! `print_stdout`/`print_stderr` lints are allowed here.
+//! Printing to stdout/stderr is this crate's whole job, so the `print_stdout`
+//! and `print_stderr` lints are allowed here.
 //!
-//! # Four sources, and the fixture is only the one you get by naming none
+//! # Four sources
 //!
-//! `tf_tree --help` names all four. The bare invocation builds the in-process
-//! [`tf_tree_bench::fixture`]; `--attach` and `doctor --from-file` need Linux
-//! and `--features shm`. Everything downstream reads a captured
-//! [`doctor::Snapshot`], so a source is a capture, not a code path through the
-//! catalogue; `checks::PushStream` says where sources differ (no arena can
-//! answer `TFT018`).
+//! The bare invocation builds the in-process [`tf_tree_bench::fixture`];
+//! `--attach` and `doctor --from-file` need Linux and `--features shm`.
+//! Everything downstream reads a captured [`doctor::Snapshot`];
+//! `checks::PushStream` says where sources differ.
 
-// Compiles `README.md`'s `rust` fence, which no gate otherwise parses. Here
-// rather than in `tf_tree` because `include_str!` of a file outside the package
-// breaks `cargo package`; this crate is `publish = false`. It gates the API,
-// not the output, and only the `rust` fence, against the *union* of features
-// (`unstable`, `counters`) rather than the default tier a README reader has.
+// Compiles `README.md`'s `rust` fence (gates the API, not the output) against the
+// union of features; here because `include_str!` outside the package breaks `cargo package`.
 #[cfg(doctest)]
 #[doc = include_str!("../../../README.md")]
 mod root_readme {}
@@ -50,9 +45,9 @@ use doctor::{Observations, Snapshot};
 /// `tf_tree` — inspect and debug a transform tree.
 ///
 /// Name no source and every subcommand builds an in-process fixture. Real-data
-/// sources: `doctor --from-bag <recording.mcap>` and `tf_tree ingest` (read a
-/// file); `--attach` (live arena, read-only) and `doctor --from-file
-/// <index.tft>` (frozen); the last two need a Linux `--features shm` build.
+/// sources: `doctor --from-bag <recording.mcap>`, `tf_tree ingest`, `--attach`
+/// (live, read-only) and `doctor --from-file <index.tft>`; the last two need a
+/// Linux `--features shm` build.
 #[derive(Parser)]
 #[command(name = "tf_tree", version, about)]
 struct Cli {
@@ -64,12 +59,7 @@ struct Cli {
     attach: attach::AttachArgs,
 }
 
-/// `--color` for `tf_tree top`.
-///
-/// The severity floor `--exit-code` gates on.
-///
-/// A tier so bare `--exit-code` still means `--exit-code error`; `warn` is
-/// warn-and-above.
+/// The severity floor `--exit-code` gates on; bare `--exit-code` means `error`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ExitSeverity {
     /// Only error-severity findings fail (on a live arena: `TFT006`, `TFT012`).
@@ -79,8 +69,7 @@ enum ExitSeverity {
     Warn,
 }
 
-/// Three states rather than a `bool`: colour belongs on a terminal, not in a
-/// piped bug report.
+/// `--color` for `tf_tree top`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ColorChoice {
     /// Colour if and only if stdout is a terminal.
@@ -102,9 +91,7 @@ impl ColorChoice {
     }
 }
 
-/// `--interp` as a flag value.
-///
-/// A separate enum so `clap` stays out of the facade's dependency tree.
+/// `--interp` as a flag value (separate so `clap` stays out of the facade).
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum InterpArg {
     /// Screw-linear interpolation — the default.
@@ -139,46 +126,34 @@ enum Command {
     /// Diagnose cycles, unclaimed edges, contention, stale buffers, and more.
     Doctor {
         /// Explain this build's arena format version and what a mismatch means
-        /// (`docs/PHASE5.md` §1.2). Prints both versions, the layout hash and
-        /// the action; needs no arena.
+        /// (`docs/PHASE5.md` §1.2); needs no arena.
         #[arg(long)]
         explain_version: bool,
-        /// Emit the report as JSON on one stream (`docs/PHASE5.md` §6). The
-        /// schema (see [`catalogue::render_json`]) always carries every
-        /// catalogue id.
+        /// Emit the report as JSON on one stream (`docs/PHASE5.md` §6; see
+        /// [`catalogue::render_json`]).
         #[arg(long)]
         json: bool,
         /// Exit non-zero if any unsuppressed check at this severity or above
         /// fired. `--exit-code` alone means `--exit-code error`.
-        ///
-        /// Opt-in so `doctor` does not break `&&` in an operator's shell.
-        /// `--exit-code warn` also gates on warnings (unclaimed edge,
-        /// undersized ring, slot leak, ...); on a live arena `error` reduces to
-        /// `TFT006` and `TFT012`.
+        /// `--exit-code warn` also gates on warnings.
         #[arg(long, value_name = "SEVERITY", num_args = 0..=1, default_missing_value = "error")]
         exit_code: Option<ExitSeverity>,
         /// Remove a check from the `--exit-code` gate, by id (`--suppress
         /// TFT013`). Repeatable; a suppressed check still runs and prints.
         #[arg(long, value_name = "TFTNNN")]
         suppress: Vec<String>,
-        /// Diagnose an MCAP recording instead of the built-in fixture. Needs
-        /// nothing installed, and is the only source `TFT018`/`TFT019` can
-        /// judge (an arena holds only accepted pushes). The §3.2 ingest report
-        /// goes to **stderr**, so `--json` stays parseable.
+        /// Diagnose an MCAP recording instead of the built-in fixture; the only
+        /// source `TFT018`/`TFT019` can judge. The §3.2 ingest report goes to
+        /// **stderr**, so `--json` stays parseable.
         ///
-        /// Mutually exclusive with `--attach`, enforced in [`doctor_source`]
-        /// rather than `conflicts_with`: `--attach` is `global = true` on the
-        /// root, so `tf_tree --attach doctor --from-bag x` never reaches the
-        /// `doctor` matcher.
+        /// Exclusive with `--attach`, enforced in [`doctor_source`]: `--attach` is
+        /// `global = true`, so `conflicts_with` never sees it.
         #[arg(long, value_name = "PATH")]
         from_bag: Option<std::path::PathBuf>,
-        /// Diagnose a frozen `.tft` index (`docs/PHASE5.md` §2). §2.1 is
-        /// NORMATIVE that it is read by the identical code as a live arena, so
-        /// every check runs as on an attach except `TFT018`/`TFT019` (use
-        /// `--from-bag`).
+        /// Diagnose a frozen `.tft` index (`docs/PHASE5.md` §2); every check runs
+        /// as on an attach except `TFT018`/`TFT019` (use `--from-bag`).
         ///
-        /// Mutually exclusive with `--from-bag` (a `clap` conflict) and
-        /// `--attach` (checked in [`doctor_source`]).
+        /// Exclusive with `--from-bag` (`clap`) and `--attach` ([`doctor_source`]).
         #[cfg(all(feature = "shm", target_os = "linux"))]
         #[arg(long, value_name = "PATH", conflicts_with = "from_bag")]
         from_file: Option<std::path::PathBuf>,
@@ -291,8 +266,7 @@ enum Command {
 ///
 /// # Errors
 ///
-/// Any failure obtaining or inspecting the named tree, plus the command-line
-/// refusals `doctor_source` raises.
+/// Any failure obtaining or inspecting the named tree, or a `doctor_source` refusal.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -359,8 +333,6 @@ pub fn run() -> Result<()> {
                 interp.map(InterpArg::policy),
             ),
             (None, Some(cfg)) => topology::cmd_check(&cfg, domain),
-            // A group's error names the flags without saying what the command
-            // is for; this one does.
             (None, None) => Err(anyhow::anyhow!(
                 "give --discover <file.tfstream> to obtain a topology file, \
                  or --config <file.toml> to check one"
@@ -386,9 +358,7 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// Default for `--max-memory`, in MiB. A constant because
-/// [`IngestArgs::default`] must state the identical value
-/// ([`IngestArgs::flags_set`] compares them).
+/// Default for `--max-memory`, in MiB; [`IngestArgs::flags_set`] compares against it.
 const DEFAULT_MAX_MEMORY_MIB: u64 = 4096;
 
 /// Default for `--future-horizon`, in seconds. See [`DEFAULT_MAX_MEMORY_MIB`].
@@ -398,15 +368,12 @@ const DEFAULT_FUTURE_HORIZON_S: f64 = 10.0;
 /// [`DEFAULT_MAX_MEMORY_MIB`].
 const DEFAULT_CLOCK_RESET_THRESHOLD_MS: u64 = 100;
 
-/// The knobs `docs/PHASE5.md` §3 puts on an ingest, shared by `ingest` and
-/// `freeze --from-bag` via `#[command(flatten)]`; `doctor` flattens it
-/// conditionally on `--from-bag` (see [`IngestArgs::flags_set`]).
+/// The `docs/PHASE5.md` §3 ingest knobs, flattened into `ingest`, `freeze
+/// --from-bag` and `doctor` (see [`IngestArgs::flags_set`]).
 #[derive(clap::Args, Clone, Debug)]
 pub struct IngestArgs {
-    /// Peak buffered-sample memory for pass two, in MiB (§3.1). Under `doctor
-    /// --from-bag` it also bounds pass three
-    /// ([`recording::arrival_observations`]); exceeding it is an error naming
-    /// this flag, not a truncation.
+    /// Peak buffered-sample memory for pass two, in MiB (§3.1); under `doctor
+    /// --from-bag` it also bounds [`recording::arrival_observations`].
     #[arg(long, value_name = "MIB", default_value_t = DEFAULT_MAX_MEMORY_MIB)]
     pub max_memory: u64,
     /// What to do when the recording's clock jumps backwards (§3.2).
@@ -418,8 +385,7 @@ pub struct IngestArgs {
     #[arg(long, value_enum, default_value_t = BadChunkArg::Skip, value_name = "POLICY")]
     pub on_bad_chunk: BadChunkArg,
     /// Treat this topic as carrying static transforms. Repeatable. **Replaces**
-    /// the default rule (last path segment is `tf_static`); does not narrow
-    /// which topics are read.
+    /// the default rule (last path segment `tf_static`).
     #[arg(long, value_name = "TOPIC")]
     pub static_topic: Vec<String>,
     /// Read only this topic's dynamic transforms. Repeatable. The only flag
@@ -438,8 +404,7 @@ pub struct IngestArgs {
     #[arg(long, value_name = "MILLIS", default_value_t = DEFAULT_CLOCK_RESET_THRESHOLD_MS)]
     pub clock_reset_threshold: u64,
     /// Largest chunk this reader will decompress, in MiB. Bounds the output
-    /// buffer, not peak memory: allow about 2.6× it for the decoder's working
-    /// set. The default is derived from the library constant.
+    /// buffer, not peak memory: allow about 2.6× it for the decoder.
     #[arg(
         long,
         value_name = "MIB",
@@ -455,8 +420,7 @@ pub struct IngestArgs {
     )]
     pub max_chunk_expansion: u64,
     /// Largest top-level record body the reader will allocate for, in MiB;
-    /// guards against a corrupt length. Raise it for recordings with large
-    /// attachments. Derived from the library constant.
+    /// raise it for recordings with large attachments.
     #[arg(
         long,
         value_name = "MIB",
@@ -510,19 +474,13 @@ impl Default for IngestArgs {
 }
 
 impl IngestArgs {
-    /// The flags in this group whose value differs from the default, by the
-    /// spelling a user types.
-    ///
-    /// `doctor` flattens the group, so without this a flag given against the
-    /// fixture or a `.tft` would parse and be silently ignored. It compares
-    /// against [`IngestArgs::default`] because `clap`'s derive gives no
-    /// `ArgMatches`; a flag passed explicitly at its default is missed,
-    /// harmlessly.
+    /// The flags whose value differs from the default, by the spelling a user
+    /// types, so `doctor` can refuse one it would ignore. A flag passed at its
+    /// default is missed, harmlessly.
     #[must_use]
     pub fn flags_set(&self) -> Vec<&'static str> {
         let d = IngestArgs::default();
         let mut out = Vec::new();
-        // Field by field so the error can name the flag.
         if self.max_memory != d.max_memory {
             out.push("--max-memory");
         }
@@ -591,11 +549,9 @@ impl IngestArgs {
                 .saturating_mul(1_000_000),
             future_horizon_ns: horizon as i64,
             tf_prefix: self.tf_prefix.clone(),
-            // `saturating_mul`: an overflow would wrap a huge value into a tiny
-            // ceiling that refuses every recording.
+            // `saturating_mul`: wrapping would give a tiny ceiling that refuses everything.
             max_chunk_uncompressed_bytes: self.max_chunk_size.saturating_mul(1024 * 1024),
             max_chunk_expansion_ratio: self.max_chunk_expansion,
-            // `saturating_mul` for the same reason as the chunk ceiling above.
             max_record_bytes: self.max_record_size.saturating_mul(1024 * 1024),
             spill_dir: self.spill_dir.clone(),
         })
@@ -620,25 +576,21 @@ fn cmd_ingest(
     Ok(())
 }
 
-/// Render an ingest failure with the frame names it names by index, plus the
-/// one remedy the message lacks.
-/// The remedy shared by every refusal that came from a ceiling rather than
-/// damage. One constant so the `BadChunk` and `AllChunksOverLimit` arms cannot
-/// drift.
+/// The remedy shared by the `BadChunk` and `AllChunksOverLimit` arms.
 const LIMIT_REMEDY: &str =
     "\x20 --max-chunk-size <MiB> raises the ceiling on a chunk's uncompressed\n\
      \x20 size, and --max-chunk-expansion its ratio to the compressed bytes.\n\
      \x20 Both bound what this reader will allocate for one chunk, so raise them\n\
      \x20 to what the recording actually needs rather than to the maximum.";
 
+/// Render an ingest failure with its frame names, plus the one remedy the message lacks.
 pub(crate) fn ingest_err(
     e: tf_tree_ingest::IngestError,
     frames: &tf_tree_ingest::Frames,
 ) -> anyhow::Error {
     let text = tf_tree_ingest::describe(e, frames).to_string();
     match e {
-        // The two limit refusals get the flags, not `skip` (already the
-        // default, and the chunk is fine).
+        // Limit refusals get the flags, not `skip` (already the default).
         tf_tree_ingest::IngestError::BadChunk {
             kind:
                 tf_tree_ingest::BadChunkKind::ImplausibleSize { .. }
@@ -658,8 +610,7 @@ pub(crate) fn ingest_err(
              \x20 with big chunks produces.\n\
              {LIMIT_REMEDY}"
         ),
-        // One message for both builds: the user cannot tell an unknown codec
-        // name from a `--no-default-features` build, so it names both.
+        // One message for both builds: it names an unknown codec and `--no-default-features`.
         tf_tree_ingest::IngestError::CompressedChunk { .. } => anyhow::anyhow!(
             "{text}\n\
              \x20 zstd and lz4 are read by pure-Rust codecs behind tf_tree_ingest's\n\
@@ -699,13 +650,9 @@ type Live<'a> = &'a ();
 enum Source {
     /// The in-process benchmark fixture, with its recorded push stream.
     Fixture(Observations),
-    /// An MCAP recording, ingested in-process (`doctor --from-bag`), carrying
-    /// the transforms **in the recording's own log order**.
-    ///
-    /// `docs/PHASE5.md` §4.1 is NORMATIVE that there is no separate offline
-    /// API: `tf_tree_ingest::run` hands back the ordinary [`Tree`]; the
-    /// [`Observations`] beside it are what an arena cannot supply
-    /// ([`checks::PushStream::RingsAtRest`]).
+    /// An MCAP recording ingested in-process (`doctor --from-bag`), with its
+    /// transforms in log order as [`Observations`] (`docs/PHASE5.md` §4.1;
+    /// [`checks::PushStream::RingsAtRest`]).
     Bag(Observations),
     /// A live arena somebody else is publishing into.
     #[cfg(all(feature = "shm", target_os = "linux"))]
@@ -727,9 +674,8 @@ impl Source {
         }
     }
 
-    /// How this source's push stream was obtained: decides whether `TFT001`,
-    /// `TFT011`'s Phase 1 half, `TFT018` and `TFT019` have evidence (see
-    /// [`checks::PushStream`]).
+    /// How this source's push stream was obtained; decides whether `TFT001`,
+    /// `TFT011`'s Phase 1 half, `TFT018` and `TFT019` have evidence.
     fn stream(&self) -> checks::PushStream {
         match self {
             Source::Fixture(_) => checks::PushStream::Observed,
@@ -741,10 +687,8 @@ impl Source {
         }
     }
 
-    /// What kind of participant table this source's arena carries; decides
-    /// whether `TFT014` has evidence. Differs from [`Self::stream`]: an
-    /// ingested bag's table is this process's own, and only a frozen `.tft`
-    /// carries somebody else's.
+    /// What kind of participant table this source carries; decides whether
+    /// `TFT014` has evidence.
     fn slot_table(&self) -> checks::SlotTable {
         match self {
             Source::Fixture(_) | Source::Bag(_) => checks::SlotTable::Current,
@@ -756,9 +700,8 @@ impl Source {
     }
 }
 
-/// Build the fixture, or attach, and keep whatever has to stay alive alive.
-/// Trees and attached handles are `Box::leak`ed: the process inspects once and
-/// exits, and `Drop` (slot release, owner thread) has nothing useful to do.
+/// Build the fixture, or attach. Trees and handles are `Box::leak`ed: the process
+/// inspects once and exits.
 fn source(live: Live<'_>) -> Result<(&'static Tree, Source)> {
     #[cfg(all(feature = "shm", target_os = "linux"))]
     if live.attach {
@@ -773,9 +716,7 @@ fn source(live: Live<'_>) -> Result<(&'static Tree, Source)> {
     Ok((tree, Source::Fixture(Observations::from_samples(samples))))
 }
 
-/// `doctor`'s sources: the two `source` offers, plus the two recording ones.
-/// Only `doctor` has them; `tree`, `echo` and `top` are about *now*. The tree
-/// is leaked as in [`source`].
+/// `doctor`'s sources: those of [`source`] plus the two recording ones; the tree is leaked.
 fn doctor_source(
     live: Live<'_>,
     from_bag: Option<&std::path::Path>,
@@ -783,8 +724,7 @@ fn doctor_source(
     ingest: &IngestArgs,
 ) -> Result<(&'static Tree, Source)> {
     let _ = from_file;
-    // One arena per run: `--attach` and the recording flags name different ones
-    // (see `from_bag`'s doc for why not `conflicts_with`).
+    // One arena per run (see `from_bag`'s doc for why not `conflicts_with`).
     #[cfg(all(feature = "shm", target_os = "linux"))]
     if live.attach {
         let other = if from_bag.is_some() {
@@ -800,8 +740,7 @@ fn doctor_source(
              --attach to diagnose the file, or drop {other} to diagnose the live arena."
         );
     }
-    // Refuse a flag this invocation will ignore: `IngestArgs` is flattened
-    // whole, and a silently accepted `--tf-prefix` reads as applied.
+    // Refuse a flag this invocation will ignore.
     if from_bag.is_none() {
         let set = ingest.flags_set();
         anyhow::ensure!(
@@ -816,9 +755,7 @@ fn doctor_source(
     if let Some(bag) = from_bag {
         let opts = ingest.to_options()?;
         let ingested = recording::open_bag(bag, &opts)?;
-        // To stderr, always: `--json` keeps stdout a parseable
-        // `tf_tree.doctor/1` document, and the §3.2 report must not be hidden
-        // behind it.
+        // Stderr, always: `--json` keeps stdout a parseable `tf_tree.doctor/1` document.
         eprint!("{}", ingested.report.summary());
         let tree: &'static Tree = Box::leak(Box::new(ingested.tree));
         let snap = Snapshot::capture(tree);
@@ -846,13 +783,8 @@ fn doctor_source(
     source(live)
 }
 
-/// The push stream a command's checks run against. A live arena has none, so it
-/// is reconstructed from the rings (rate, ordering and buffer-depth work;
-/// multi-writer cannot fire).
-///
-/// Taken out of the `Source`, not cloned: on `--from-bag` the stream is one
-/// 24-byte sample per dynamic transform, the one footprint that scales with
-/// recording length.
+/// The push stream a command's checks run against; a live arena has none, so it
+/// is reconstructed from the rings. Taken out of the `Source`, not cloned.
 fn observations(tree: &Tree, src: &mut Source) -> Observations {
     // Used only by the arms that replay from the rings (need `shm`).
     let _ = tree;
@@ -877,10 +809,7 @@ fn cmd_tree(live: Live<'_>) -> Result<()> {
         tree.arena_size_bytes() / 1024
     );
 
-    // Index edges by child frame so we can annotate each frame with its edge.
-    // The reference clock, not `fixture::NOW_NS`: on a real arena
-    // (Unix-nanosecond stamps) the synthetic constant clamped every age to 0.
-    // `Clock::decide` is the estimator `doctor` and `top` share.
+    // The reference clock (`Clock::decide`, shared with `doctor` and `top`), not `fixture::NOW_NS`.
     let clock = checks::Clock::decide(&checks::newest_stamps(&snap), unix_nanos_now());
     println!(
         "  {:<22} {:>5} {:<8} {:>9} {:>12} {:>10} {:>8}",
@@ -944,9 +873,7 @@ fn cmd_tree(live: Live<'_>) -> Result<()> {
 /// `tf_tree echo target source [--rate]`.
 fn cmd_echo(live: Live<'_>, target: &str, source_frame: &str, rate: bool) -> Result<()> {
     let (tree, src) = source(live)?;
-    // The fixture's history is anchored to its synthetic `NOW_NS`, a live
-    // arena's to its publishers' stamps; echoing a live tree at the fixture's
-    // clock would report `Extrapolation` everywhere.
+    // A live arena is anchored to its publishers' stamps, not the fixture's `NOW_NS`.
     let now = newest_stamp(tree).unwrap_or(fixture::NOW_NS);
 
     if rate {
@@ -991,8 +918,7 @@ fn fmt_iso(iso: &Iso3) -> String {
     )
 }
 
-/// `tf_tree doctor` — the `docs/PHASE5.md` §6 catalogue. `--exit-code` is
-/// opt-in: a diagnostic that fails by default gets wrapped in `|| true`.
+/// `tf_tree doctor` — the `docs/PHASE5.md` §6 catalogue; `--exit-code` is opt-in.
 #[allow(clippy::too_many_arguments)]
 fn cmd_doctor(
     live: Live<'_>,
@@ -1006,8 +932,6 @@ fn cmd_doctor(
     let mut ids = std::collections::BTreeSet::new();
     for s in suppress {
         let id = catalogue::Tft::parse(s).ok_or_else(|| {
-            // Refused, not ignored: a typo would leave a gate that looks
-            // configured and is not.
             anyhow::anyhow!("unknown check id {s:?} — expected one of TFT001..TFT019")
         })?;
         ids.insert(id);
@@ -1015,13 +939,10 @@ fn cmd_doctor(
 
     let (tree, mut src) = doctor_source(live, from_bag, from_file, ingest)?;
     let obs = observations(tree, &mut src);
-    // The arena first, the lock file second (`docs/decisions/0028` piece 2
-    // constraint 3); [`slot_facts`] takes the captured row, so the order cannot
-    // be inverted.
+    // The arena first, the lock file second (`docs/decisions/0028` piece 2 constraint 3).
     #[allow(unused_mut)]
     let mut snap = Snapshot::capture(tree);
-    // `TFT014`'s participant half needs the lock file (`0028` plan step 6),
-    // only on `--attach`; no other source has a rendezvous.
+    // `TFT014`'s participant half needs the lock file (`0028` plan step 6); only `--attach` has one.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     if live.attach {
         if let Some(lock) = live
@@ -1032,14 +953,10 @@ fn cmd_doctor(
         {
             snap.probe_lock_facts(|row| slot_facts(&lock, row));
         }
-        // No `else`, no error: the arena mapped. Without the file every slot
-        // keeps `LockByte::Unknown`, so the check narrows rather than
-        // fabricates.
+        // No `else`: without the file every slot keeps `LockByte::Unknown`.
     }
     let stats = checks::collect_edge_stats(tree, &snap);
     let clock = checks::Clock::decide(&checks::newest_stamps(&snap), unix_nanos_now());
-    // Captured here so `TFT019`'s outcome and its `Meta.notes` entry read the
-    // same split.
     let clock_step = checks::ClockStepEvidence::capture(&snap, &obs);
 
     let inputs = checks::Inputs {
@@ -1069,8 +986,6 @@ fn cmd_doctor(
         now_nanos: clock.nanos(),
         clock_source: clock.label(),
         counters_compiled_in: tf_tree::counters_compiled_in(),
-        // Same call as `tft010`/`tft011`, and the same edges the checks ran
-        // against, so skip, disclosure and byte figures describe one arena.
         rings: sizing::Rings::from_edges(snap.edges.iter().map(|e| (e.capacity, e.occupancy()))),
         notes: evidence_notes(
             src.stream(),
@@ -1079,7 +994,6 @@ fn cmd_doctor(
             inputs.clock,
             &clock_step,
             checks::no_counter_evidence(inputs.counters, inputs.stats),
-            // The outcome itself, not a second predicate.
             report.outcome(catalogue::Tft::Tft009),
         ),
     };
@@ -1093,8 +1007,7 @@ fn cmd_doctor(
     let gate_fired = match exit_code {
         None => false,
         Some(ExitSeverity::Error) => report.has_error(),
-        // `!is_healthy()`, not `count_at(Warn) > 0`: `warn` is warn-and-above,
-        // so an error still fails it.
+        // `!is_healthy()`, not `count_at(Warn) > 0`: `warn` is warn-and-above.
         Some(ExitSeverity::Warn) => !report.is_healthy(),
     };
     if gate_fired {
@@ -1105,16 +1018,12 @@ fn cmd_doctor(
 
 /// Disclosures for a check that ran with one of its evidence sources missing.
 ///
-/// `TFT011`: the counters half ([`checks::no_counter_evidence`]) and the
-/// `capacity x period` half (needs per-sample arrival delay, which only the
-/// fixture records; [`checks::PushStream::no_arrival_delays`]). Exactly one
-/// note appears, since when both are blind the skip reason carries both.
-/// `TFT009`'s takes the check's own outcome, not a second predicate, because
-/// skip and note are independent (`checks::silence_coverage_note`; its `None`
-/// is unreachable from `checks::run`). `TFT017`: every dynamic edge unclaimed,
-/// a note not a skip so a fleet of dead publishers is never silent. `TFT015`:
-/// unconditional (an engine gap). `TFT007`, `TFT019`: only when the check
-/// covered some edges and not others.
+/// `TFT011`: the counters half ([`checks::no_counter_evidence`]) and the arrival
+/// delay half ([`checks::PushStream::no_arrival_delays`]); when both are blind
+/// the skip reason carries both. `TFT009` takes the check's own outcome
+/// (`checks::silence_coverage_note`). `TFT017`: every dynamic edge unclaimed.
+/// `TFT015`: unconditional. `TFT007`, `TFT019`: only when the check covered some
+/// edges and not others.
 fn evidence_notes(
     stream: checks::PushStream,
     snap: &Snapshot,
@@ -1131,7 +1040,6 @@ fn evidence_notes(
     notes.extend(tft009.and_then(|o| checks::silence_coverage_note(o, clock, stream)));
     notes.extend(checks::stopped_publisher_note(obs, clock, stream));
     match (counter_evidence, stream.no_arrival_delays()) {
-        // Both blind: `tft011` skipped and said so itself.
         (Some(_), Some(_)) => {}
         (None, Some(why)) => notes.push(format!(
             "TFT011 ran on its counter evidence only — its capacity-vs-latency half cannot \
@@ -1147,8 +1055,7 @@ fn evidence_notes(
     notes
 }
 
-/// `TFT017`'s disclosure: it fired on **every** dynamic edge. The count comes
-/// from [`doctor::check_unclaimed_dynamic`], not a second walk.
+/// `TFT017`'s disclosure: it fired on **every** dynamic edge ([`doctor::check_unclaimed_dynamic`]).
 fn unclaimed_coverage_note(snap: &Snapshot) -> Option<String> {
     let dynamic = snap
         .edges
@@ -1186,19 +1093,15 @@ fn host_facts() -> Option<hostfacts::HostFacts> {
     }
 }
 
-/// The arena's instance uuid, which only a shared arena has.
 /// The rendezvous runtime directory this host resolves to, with its source
-/// (`docs/PHASE2.md` §15). Consults no tree and degrades to `None` rather than
-/// failing. The source is included because an unexpected path is usually an
-/// unexpected rule.
+/// (`docs/PHASE2.md` §15); `None` rather than failing.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn resolved_runtime_dir() -> Option<String> {
     let d = tf_tree_ipc::RuntimeDir::resolve().ok()?;
     Some(format!("{} ({:?})", d.path().display(), d.source()))
 }
 
-/// See [`resolved_runtime_dir`]. Without `shm` there is no rendezvous to have a
-/// directory for, so there is nothing to resolve and nothing to report.
+/// See [`resolved_runtime_dir`]; without `shm` there is nothing to resolve.
 #[cfg(not(all(feature = "shm", target_os = "linux")))]
 fn resolved_runtime_dir() -> Option<String> {
     None
@@ -1215,11 +1118,7 @@ fn instance_uuid(tree: &Tree, src: &Source) -> Option<String> {
 
 /// `tf_tree top` — `docs/PHASE5.md` §7's live view.
 ///
-/// # `--rw` is refused, not ignored
-///
-/// The attach flags are global, so `tf_tree --rw top` parses; a read-write
-/// mapping is what D18 keeps away from a diagnostic tool, so it is refused
-/// rather than silently downgraded.
+/// `--rw` is refused, not ignored (D18).
 fn cmd_top(
     live: Live<'_>,
     interval_ms: u64,
@@ -1228,8 +1127,7 @@ fn cmd_top(
     color: Option<bool>,
     web: Option<std::net::SocketAddr>,
 ) -> Result<()> {
-    // A floor, not a clamp: `--interval 0` would spin a core over a robot's
-    // arena, the one way this tool can perturb what it observes.
+    // A floor: `--interval 0` would spin a core over a robot's arena.
     anyhow::ensure!(
         interval_ms >= 50,
         "--interval {interval_ms} is below the 50 ms floor: a faster redraw perturbs the arena it \
@@ -1244,8 +1142,6 @@ fn cmd_top(
 
     let (tree, src) = source(live)?;
 
-    // The lock file makes read-only participants (a byte, no arena record)
-    // visible, `top` itself included.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     let merge: Box<dyn Fn(&mut top::Capture) + Sync> = if live.attach {
         match live
@@ -1254,8 +1150,7 @@ fn cmd_top(
             .filter(|rv| rv.lock_path().exists())
             .and_then(|rv| tf_tree_ipc::LockFile::open(rv.lock_path()).ok())
         {
-            // Not an error: the arena mapped. A missing lock file costs the
-            // `mode`/`comm` columns and read-only rows.
+            // Not an error: a missing lock file costs the `mode`/`comm` columns.
             None => Box::new(|_: &mut top::Capture| {}),
             Some(lock) => Box::new(move |cap: &mut top::Capture| {
                 let mut rows = Vec::new();
@@ -1319,19 +1214,9 @@ fn cmd_top(
 
 /// `tf_tree top --web` — the same sampler, served instead of drawn.
 ///
-/// # The rate limit is correctness, not politeness
-///
-/// One [`top::Sampler`] holds the per-tick state and every delta is a
-/// difference between two observations; two polling tabs would each see half
-/// the samples and every rate would read half. A poll sooner than `interval`
-/// after the last is answered from the previous document (idempotent within a
-/// tick; a reload or second tab is not an error).
-///
-/// # The `Mutex`
-///
-/// `web::serve` runs a thread per connection, so the closure is serialised; it
-/// costs a cache hit or one capture, and no socket I/O is inside it. A poisoned
-/// lock is recovered so one panicking handler does not end the view.
+/// One [`top::Sampler`] holds per-tick state, so two polling tabs would each see
+/// half the samples: a poll sooner than `interval` is answered from the previous
+/// document. The closure is serialised by a `Mutex` (poison recovered).
 fn cmd_top_web(
     tree: &Tree,
     source: &'static str,
@@ -1356,8 +1241,6 @@ fn cmd_top_web(
         }
         let mut capture = top::Capture::from_tree(tree, source);
         merge(&mut capture);
-        // `--edge` seeds the page's selection once (`web/index.html` reads it
-        // from the first document); the browser owns it after.
         let selected = selected_at_start
             .as_deref()
             .and_then(|needle| top::select_edge(&capture.edges, needle))
@@ -1380,9 +1263,8 @@ fn cmd_top_web(
 
 /// `tf_tree bench [--gate]`.
 ///
-/// Runs the runnable correctness half in-process (naive-Rust differential,
-/// agreement within `1e-12`). The perf and zero-allocation gates need dedicated
-/// hardware: `cargo xtask bench-gate`, `cargo bench`.
+/// Runs the correctness half in-process (naive-Rust differential, `1e-12`); the
+/// perf gates are `cargo xtask bench-gate` and `cargo bench`.
 fn cmd_bench(gate: bool) -> Result<()> {
     println!("tf_tree bench — runnable checks (perf gate needs `cargo xtask bench-gate`)");
     let report = tf_tree_bench::differential::run_naive_rust(50_000, 0x5EED_1234_ABCD_0001)?;
@@ -1412,15 +1294,8 @@ fn hex16(bytes: [u8; 16]) -> String {
 
 /// `tf_tree freeze --from-live` — `docs/PHASE5.md` §2, and §5.6's capture.
 ///
-/// Attaches **read-only** (`AttachArgs` defaults, D18) and copies the arena.
-///
-/// # It is a snapshot, not a transaction
-///
-/// Publishers keep publishing, so the image is a smear (see
-/// `tf_tree_arena::write_frozen`); the output says so.
-///
-/// `source_digest` is all-zero for `--from-live`; `--from-bag` fills it with
-/// BLAKE3 of the recording (§2.3).
+/// Attaches **read-only** (D18) and copies the arena: a smear, not a transaction
+/// (see `tf_tree_arena::write_frozen`). `source_digest` is all-zero here; §2.3.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn cmd_freeze(
     live: Live<'_>,
@@ -1433,15 +1308,11 @@ fn cmd_freeze(
     if let Some(bag) = from_bag {
         return cmd_freeze_bag(bag, out, report, ingest);
     }
-    // `conflicts_with` makes the flags exclusive, not required, so "neither" is
-    // handled here.
     anyhow::ensure!(
         from_live,
         "`freeze` needs a source; pass `--from-live` or `--from-bag <PATH>`"
     );
-    // The same rule as `doctor`: `--from-live` reads no recording, so the
-    // flattened §3 knobs are dead. `--report` is the exception (an output
-    // path).
+    // As `doctor`: the §3 knobs are dead under `--from-live` (`--report` excepted).
     let set = ingest.flags_set();
     anyhow::ensure!(
         set.is_empty(),
@@ -1451,13 +1322,10 @@ fn cmd_freeze(
         if set.len() == 1 { "is" } else { "are" },
     );
     let tree = live.open()?;
-    // Saturating: `as i64` would wrap past 2^63 ns (2262) into a negative
-    // "created" stamp.
+    // Saturating: `as i64` would wrap past 2^63 ns.
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
-    // One message, not an `anyhow` chain: `FrozenFileError` is `Copy` and
-    // `String`-free, so the path is joined here.
     let header = tree
         .freeze_to(out, None, [0; 32], created)
         .map_err(|e| anyhow::anyhow!("could not freeze to {}: {e}", out.display()))?;
@@ -1479,13 +1347,8 @@ fn cmd_freeze(
 
 /// `tf_tree freeze --from-bag` — `docs/PHASE5.md` §3 into §2's container.
 ///
-/// # Why this one *is* an atomic snapshot and `--from-live` is not
-///
-/// The tree is built in this process from a file nobody else writes, so a
-/// `.tft` frozen from a recording is exactly the recording.
-///
-/// The report is written alongside the `.tft` by default (§3.2), under a
-/// derived name so two `.tft` files in one directory do not collide.
+/// Unlike `--from-live`, this is an exact snapshot of the recording. The report
+/// is written alongside the `.tft` by default (§3.2), under a derived name.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn cmd_freeze_bag(
     bag: &std::path::Path,
@@ -1531,18 +1394,11 @@ fn tf_tree_arena_align_mib() -> u64 {
 }
 
 /// The lock file's facts about **one** captured participant slot, for `TFT014`
-/// (`docs/decisions/0028` plan step 6): one iteration of `cmd_participants`'
-/// loop, reshaped for [`doctor::Snapshot::probe_lock_facts`].
+/// (`docs/decisions/0028` plan step 6).
 ///
-/// # It takes the captured row, and that is the read-order pin
-///
-/// `0028` piece 2 constraint 3 requires the `state` word be read before the
-/// byte. The parameter is the already-captured [`doctor::ParticipantInfo`], not
-/// a slot number, so no call can be hoisted above `Snapshot::capture`; `loom`
-/// (in `tf_tree`) is where the ordering itself is argued.
-///
-/// Three-valued: a failed `probe_participant` is not "free" (§6.2's fail-safe
-/// rule).
+/// It takes the already-captured [`doctor::ParticipantInfo`], so the `state` word
+/// is read before the byte (`0028` piece 2 constraint 3). Three-valued: a failed
+/// `probe_participant` is not "free" (§6.2).
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn slot_facts(lock: &tf_tree_ipc::LockFile, row: &doctor::ParticipantInfo) -> doctor::SlotFacts {
     let byte = match lock.probe_participant(row.slot) {
@@ -1560,11 +1416,9 @@ fn slot_facts(lock: &tf_tree_ipc::LockFile, row: &doctor::ParticipantInfo) -> do
 
 /// What `/proc` says about the process a lock-file identity record names.
 ///
-/// A diagnostic inference, never a protocol decision (`docs/PHASE2.md` §5.1),
-/// spelled here rather than via `Identity::matches_running_process` because
-/// that is two-valued and reads every failure as gone (`docs/decisions/0028`,
-/// *"the fail-safe claim is false on this code"*). The verdict is
-/// [`recorded_given`]; this function is the two reads it needs.
+/// A diagnostic inference, never a protocol decision (`docs/PHASE2.md` §5.1); not
+/// `Identity::matches_running_process`, which reads every failure as gone
+/// (`docs/decisions/0028`). The verdict is [`recorded_given`].
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn recorded_process(id: Option<&tf_tree_ipc::Identity>) -> doctor::RecordedProcess {
     let Some(id) = id else {
@@ -1573,63 +1427,29 @@ fn recorded_process(id: Option<&tf_tree_ipc::Identity>) -> doctor::RecordedProce
     recorded_given(
         id.start_time,
         tf_tree_ipc::start_time_of(id.pid),
-        // Would this host show us an entry? Test whether it shows our own:
-        // `/proc/self/stat` is running by construction.
+        // Would this host show us an entry? Test our own.
         tf_tree_ipc::self_start_time().is_ok(),
         id.pid_ns_inode,
-        // The observer's own namespace, never one read through the recorded pid
-        // (`docs/decisions/0033` *Decision* 2): a namespace-local pid may name
-        // an unrelated process here and fail open. Zero on a failed read keeps
-        // pre-`0033` behaviour; `Unknown` for every slot would leave `TFT014`
-        // unable to fire.
+        // The observer's own namespace (`docs/decisions/0033` *Decision* 2); zero on a failed read.
         tf_tree_ipc::self_pid_ns_inode().unwrap_or(0),
-        // Whether this `/proc` describes this process's pid namespace, read in
-        // one process (a forked shell probe disagrees in a container). `true`
-        // on a failed read, by the same rule.
+        // Whether this `/proc` is this process's pid namespace; `true` on a failed read.
         tf_tree_ipc::proc_self_pid().is_none_or(|p| p == std::process::id()),
     )
 }
 
-/// Turn a recorded `start_time`, what the `/proc` read came back as, and three
-/// facts about where the observer is standing, into one of the three
-/// [`doctor::RecordedProcess`] answers.
+/// Turn a recorded `start_time`, the `/proc` read and three host facts into a
+/// [`doctor::RecordedProcess`]; `alive_given` (`crates/tf_tree/src/tree.rs`) made
+/// three-valued with the same bias: never call a live process gone.
 ///
-/// `tf_tree`'s `alive_given` (`crates/tf_tree/src/tree.rs`) with a three-valued
-/// result and the same bias: telling an operator a live process is gone is the
-/// corruption to avoid. Host facts arrive as parameters because none can be
-/// arranged in a test.
+/// The two guards precede the match (`docs/decisions/0033` *Decision* 3):
+/// `recorded_pid_ns` against `observer_pid_ns` (zero on either side is unknown
+/// namespace), and `proc_is_ours`. Both yield `Unknown`.
 ///
-/// # The two guards, before the match
-///
-/// Placed ahead of the whole `match probe` because the namespace false
-/// positives take different arms (`docs/decisions/0033` *Decision* 3): a
-/// namespaced participant seen from the host takes `Ok(_)`, a host participant
-/// seen from a container takes `ENOENT`, and a real fork inheritor takes
-/// `ENOENT` with byte-identical text.
-///
-/// * `recorded_pid_ns` against `observer_pid_ns`: a record from another PID
-///   namespace names a pid this `/proc` does not use. Zero on either side is
-///   *unknown namespace* and keeps the pre-`0033` behaviour.
-/// * `proc_is_ours`: false when this `/proc` is not the observer's namespace's
-///   (a bare `unshare --fork --pid`), so every recorded pid is incomparable. A
-///   failed `readlink` takes the failed-read rule at the call site, never
-///   `Unknown` for all.
-///
-/// Both land on `slot_leak`'s `(LockByte::Held, Unknown) => None`, so
-/// `checks.rs` needs no edit. They do move one verdict: a non-`FREE` record
-/// with a free byte and a `Running` process goes from silence to `TFT014` *byte
-/// free* once degraded to `Unknown` (accepted, `0033` *Consequences*).
-///
-/// The arms:
-///
-/// * stored `start_time` of zero ("could not read my own"): not compared, since
-///   it would report a running process dead.
-/// * start time matches: running; differs: pid recycled, gone.
-/// * `ENOENT` on a host that would have shown an entry: gone, the only arm that
-///   proves death.
-/// * `ENOENT` on a host that says so about everybody: unknown.
-/// * any other read or parse failure (`EACCES` from `hidepid`, `EMFILE`, ...):
-///   unknown, never gone.
+/// * stored `start_time` of zero: not compared.
+/// * start time matches: running; differs: gone.
+/// * `ENOENT` on a host that would have shown an entry: gone, the only proof of death.
+/// * `ENOENT` on a host that says so about everybody, or any other failure
+///   (`EACCES` from `hidepid`, `EMFILE`, ...): unknown.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn recorded_given(
     stored_start_time: u64,
@@ -1643,8 +1463,6 @@ fn recorded_given(
     if stored_start_time == 0 {
         return R::Unknown;
     }
-    // Zero on either side is "unknown namespace": comparing would turn every
-    // pre-`0033` record into `Unknown`.
     if recorded_pid_ns != 0 && observer_pid_ns != 0 && recorded_pid_ns != observer_pid_ns {
         return R::Unknown;
     }
@@ -1668,8 +1486,7 @@ fn recorded_given(
     }
 }
 
-/// Liveness is the kernel's answer (`F_OFD_GETLK` on the participant's byte),
-/// not an inference from the identity record (§5.1).
+/// Liveness is the kernel's answer (`F_OFD_GETLK` on the participant's byte), §5.1.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn cmd_participants(live: Live<'_>) -> Result<()> {
     let rv = live.rendezvous()?;
@@ -1677,12 +1494,10 @@ fn cmd_participants(live: Live<'_>) -> Result<()> {
     println!("tf_tree participants — {}", path.display());
 
     if !path.exists() {
-        // Not an error: "nothing is running" is a legitimate answer.
         println!("  no lock file: nothing has ever attached to this domain/name");
         return Ok(());
     }
 
-    // `IpcError` chains into `anyhow`; the operator reads its sentence.
     use anyhow::Context as _;
     let lock =
         tf_tree_ipc::LockFile::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -1695,8 +1510,7 @@ fn cmd_participants(live: Live<'_>) -> Result<()> {
             .map(|p| p.held)
             .unwrap_or(false);
         let id = lock.read_identity(slot).ok().flatten();
-        // A byte held with no identity record: a participant between taking its
-        // byte and writing its record.
+        // A byte held with no identity record: a participant mid-attach.
         if !held && id.is_none() {
             continue;
         }
@@ -1717,8 +1531,7 @@ fn cmd_participants(live: Live<'_>) -> Result<()> {
                 },
             ),
         };
-        // "stale": the kernel released the byte but the record remains; a
-        // reaper is owed.
+        // "stale": the byte is released but the record remains.
         let state = if held { "live" } else { "stale" };
         println!("  {slot:>4}  {pid:>8}  {mode:<6}  {state:<7}  {comm}");
     }
@@ -1782,15 +1595,12 @@ fn explain_format_version() {
 mod tests {
     use super::*;
 
-    /// A `TFT009` outcome that **ran**, the state every note test here assumes;
-    /// the skipping arm is driven by
-    /// [`the_silence_coverage_note_reaches_the_report_metadata`].
+    /// A `TFT009` outcome that **ran**, the state the note tests assume.
     fn tft009_ran() -> catalogue::CheckOutcome {
         catalogue::CheckOutcome::ran(catalogue::Tft::Tft009, Vec::new())
     }
 
-    /// One running writer in slot 0, the owner every claimed edge in these
-    /// snapshots names.
+    /// One running writer in slot 0, the owner every claimed edge names.
     fn live_writer() -> Vec<doctor::ParticipantInfo> {
         vec![doctor::ParticipantInfo {
             slot: 0,
@@ -1803,16 +1613,7 @@ mod tests {
         }]
     }
 
-    /// **The `TFT007` coverage note reaches `Meta.notes`.**
-    /// `checks::rate_coverage_note` is unit tested but its call site is not
-    /// reachable from those tests.
-    ///
-    /// Snapshot: two dynamic edges, one declaring a rate and measurable, one
-    /// declaring nothing.
-    ///
-    /// Mutant: delete `notes.extend(checks::rate_coverage_note(snap, obs,
-    /// clock, stream));` from `evidence_notes` ⇒ the `expect` fires with "no
-    /// coverage note".
+    /// The `TFT007` coverage note reaches `Meta.notes`.
     #[test]
     fn the_rate_coverage_note_reaches_the_report_metadata() {
         use doctor::{EdgeInfo, FrameInfo};
@@ -1852,8 +1653,6 @@ mod tests {
             edges: vec![dyn_edge(1, 1, 2, Some(20_000)), dyn_edge(2, 2, 3, None)],
             participants: live_writer(),
         };
-        // 20 Hz on edge 1, above `RATE_MIN_INTERVALS`, so it is compared; edge
-        // 2 declares nothing.
         let obs = Observations::from_samples(
             (0..12i64)
                 .map(|k| PushSample {
@@ -1884,13 +1683,7 @@ mod tests {
         );
     }
 
-    /// **The `TFT009` silence note reaches `Meta.notes`, and is silent when the
-    /// half actually ran.** The third case is the contradiction the note could
-    /// produce: `TFT009` `not run` beside a note saying gaps were measured.
-    ///
-    /// Mutant: delete the `silence_coverage_note` line from `evidence_notes` ⇒
-    /// "no TFT009 silence note". Mutant: drop the `Status::Skipped` guard in
-    /// `checks::silence_coverage_note` ⇒ the third case fails.
+    /// The `TFT009` silence note reaches `Meta.notes`, and is silent when the half ran.
     #[test]
     fn the_silence_coverage_note_reaches_the_report_metadata() {
         use doctor::{EdgeInfo, FrameInfo};
@@ -1935,7 +1728,6 @@ mod tests {
         let obs = Observations::new();
         let step = checks::ClockStepEvidence::capture(&snap, &obs);
 
-        // A source nothing is writing: the half cannot run and must say so.
         let notes = evidence_notes(
             checks::PushStream::RingsAtRest,
             &snap,
@@ -1954,7 +1746,6 @@ mod tests {
             "the note must say which of the two reasons applied: {note}"
         );
 
-        // And on the live case it ran, so there is nothing to disclose.
         let notes = evidence_notes(
             checks::PushStream::RingsUnderWriter,
             &snap,
@@ -1969,8 +1760,7 @@ mod tests {
             "the half ran; a note about coverage it did reach is noise: {notes:?}"
         );
 
-        // The third case: the same source with `TFT009` `not run`; the note
-        // must not claim gaps were measured.
+        // With `TFT009` `not run`, the note must not claim gaps were measured.
         let notes = evidence_notes(
             checks::PushStream::RingsAtRest,
             &snap,
@@ -1990,12 +1780,7 @@ mod tests {
         );
     }
 
-    /// **The stopped-publisher note reaches `Meta.notes`, and is silent when
-    /// nothing was withheld.** Without it `TFT007` and `TFT008` skip with no
-    /// line saying which edge was declined.
-    ///
-    /// Mutant: delete `notes.extend(checks::stopped_publisher_note(obs, clock,
-    /// stream));` ⇒ "no stopped-publisher note".
+    /// The stopped-publisher note reaches `Meta.notes`, and is silent when nothing was withheld.
     #[test]
     fn the_stopped_publisher_note_reaches_the_report_metadata() {
         use doctor::{EdgeInfo, FrameInfo};
@@ -2039,7 +1824,6 @@ mod tests {
             }],
             participants: live_writer(),
         };
-        // A flawless 100 Hz stream that stopped 8 seconds ago.
         let obs = Observations::from_samples(
             (0..40i64)
                 .map(|k| PushSample {
@@ -2068,8 +1852,6 @@ mod tests {
             .expect("no stopped-publisher note: two silent skips with no named subject");
         assert!(note.contains("1 edge(s)"), "{note}");
 
-        // The same arena read from a source nobody is writing: nothing is
-        // withheld, so a note about it would be about a decision never made.
         let notes = evidence_notes(
             checks::PushStream::RingsAtRest,
             &snap,
@@ -2085,13 +1867,7 @@ mod tests {
         );
     }
 
-    /// **The `TFT019` coverage note reaches `Meta.notes` too, and is silent on
-    /// a live arena** (where `TFT019` skipped, so a note would describe a run
-    /// that never happened); `live` is threaded, not guarded at the call site.
-    ///
-    /// Mutant: delete `notes.extend(clock_step.coverage_note(live));` ⇒ "no
-    /// TFT019 coverage note". Mutant B: pass `false` for `live` ⇒ "a live arena
-    /// skipped TFT019 outright".
+    /// The `TFT019` coverage note reaches `Meta.notes`, and is silent on a live arena.
     #[test]
     fn the_clock_step_coverage_note_reaches_the_report_metadata() {
         use doctor::{EdgeInfo, FrameInfo};
@@ -2123,8 +1899,6 @@ mod tests {
             depth,
             edge_of_child: 0,
         };
-        // Edge 1 is on the wall clock and attributed; edge 2 is on a steady
-        // clock and refused.
         let snap = Snapshot {
             frames: vec![
                 frame(1, "map", 0, 0),
@@ -2134,9 +1908,7 @@ mod tests {
             edges: vec![dyn_edge(1, 1, 2, 0), dyn_edge(2, 2, 3, 3)],
             participants: live_writer(),
         };
-        // A clock step, not a stray inversion: ten pushes, the clock jumps 100
-        // ms back, the publisher carries on, so ten arrivals are rejected in
-        // one run (what `TFT019` reads).
+        // A clock step: the clock jumps 100 ms back and ten arrivals are rejected in one run.
         let back = |edge: u32| {
             let mut stamps: Vec<i64> = (0..10).map(|i| i * 10 * MS).collect();
             let last = stamps[stamps.len() - 1];
@@ -2185,11 +1957,7 @@ mod tests {
         );
     }
 
-    /// **The `CompressedChunk` remedy is a bare string** for a narrower case
-    /// than before (see `ingest_err`'s arm); only reachable at this level.
-    ///
-    /// Mutant: delete the `CompressedChunk` arm ⇒ only the generic "uses
-    /// compressed chunks" line and no command.
+    /// The `CompressedChunk` remedy is a bare string (see `ingest_err`'s arm).
     #[test]
     fn the_compressed_chunk_error_carries_the_command_that_fixes_it() {
         let frames = tf_tree_ingest::Frames::default();
@@ -2215,14 +1983,7 @@ mod tests {
         );
     }
 
-    /// **The chunk bounds default to exactly what the library defaults to, and
-    /// are reachable from the command line.**
-    ///
-    /// Mutant: pass `DEFAULT_MAX_CHUNK_EXPANSION_RATIO` in `to_options` instead
-    /// of `self.max_chunk_expansion` ⇒ the `--max-chunk-expansion 4` assertion
-    /// fails with 1024. A literal `default_value_t = 64` is not caught until
-    /// the library constant moves; the derived expression is what holds the
-    /// property.
+    /// The chunk bounds default to the library's and are reachable from the command line.
     #[test]
     fn the_chunk_bounds_default_to_the_librarys_and_are_settable() {
         let parse = |extra: &[&str]| -> tf_tree_ingest::IngestOptions {
@@ -2230,8 +1991,6 @@ mod tests {
             args.extend_from_slice(extra);
             match Cli::try_parse_from(args).expect("parse").command {
                 Command::Ingest { opts, .. } => opts.to_options().expect("options"),
-                // `Command` derives no `Debug`, so the failure names the
-                // subcommand asked for.
                 _ => panic!("`ingest` did not parse as Command::Ingest"),
             }
         };
@@ -2251,17 +2010,12 @@ mod tests {
         assert_eq!(set.max_chunk_uncompressed_bytes, 7 * 1024 * 1024);
         assert_eq!(set.max_chunk_expansion_ratio, 4);
 
-        // A MiB count no multiplication can hold saturates rather than wrapping into
-        // a ceiling that refuses every recording.
+        // A MiB count no multiplication can hold saturates rather than wrapping.
         let huge = parse(&["--max-chunk-size", &u64::MAX.to_string()]);
         assert_eq!(huge.max_chunk_uncompressed_bytes, u64::MAX);
     }
 
-    /// A bad chunk's error points at the policy that would have kept the rest
-    /// of the recording.
-    ///
-    /// Mutant: delete the `BadChunk` arm ⇒ the `--on-bad-chunk` assertion
-    /// fails.
+    /// A bad chunk's error points at the policy that would have kept the rest.
     #[test]
     fn a_bad_chunk_error_names_the_policy_that_would_recover() {
         let frames = tf_tree_ingest::Frames::default();
@@ -2286,12 +2040,7 @@ mod tests {
         );
     }
 
-    /// **A refusal that came from a ceiling names the ceiling's flag, never
-    /// `--on-bad-chunk=skip`.** Both policies are covered (`BadChunk` under
-    /// `halt`, `AllChunksOverLimit` under `skip`).
-    ///
-    /// Mutant: delete the `ImplausibleSize | ImplausibleWindow` arm ⇒ the
-    /// `--max-chunk-size` assertion fails while the `--on-bad-chunk` one fires.
+    /// A ceiling refusal names the ceiling's flag, never `--on-bad-chunk=skip`.
     #[test]
     fn a_ceiling_refusal_names_the_flag_that_raises_it() {
         let frames = tf_tree_ingest::Frames::default();
@@ -2332,8 +2081,7 @@ mod tests {
         );
     }
 
-    /// A window refusal reaches the same arm as a size refusal (two variants in
-    /// one pattern).
+    /// A window refusal reaches the same arm as a size refusal.
     #[test]
     fn a_window_refusal_reaches_the_ceiling_remedy_too() {
         let frames = tf_tree_ingest::Frames::default();
@@ -2353,9 +2101,6 @@ mod tests {
     }
 
     /// The `split` refusal cites the section that records it as unbuilt.
-    ///
-    /// Mutant: replace the `ClockResetSplitUnsupported` arm with bare `{text}`
-    /// ⇒ the `PHASE5` assertion fails.
     #[test]
     fn the_split_refusal_cites_the_section_that_records_it() {
         let frames = tf_tree_ingest::Frames::default();
@@ -2370,14 +2115,7 @@ mod tests {
         );
     }
 
-    /// **`--web` with no value binds loopback, and `--web ADDR` binds what the
-    /// operator named.** The loopback default lives only in
-    /// `default_missing_value`; integration tests pass `127.0.0.1:0` and would
-    /// not notice. Asserted through `clap`, not a fixed port.
-    ///
-    /// Mutant: delete `default_missing_value = web::DEFAULT_ADDR` ⇒ `--web` is
-    /// rejected. Mutant: default `0.0.0.0:8787` ⇒ the `is_loopback` assertion
-    /// fails.
+    /// `--web` with no value binds loopback; `--web ADDR` binds what was named.
     #[test]
     fn bare_web_binds_the_loopback_default() {
         let parse = |args: &[&str]| -> Option<std::net::SocketAddr> {
@@ -2389,8 +2127,6 @@ mod tests {
         let addr = parse(&["tf_tree", "top", "--web"]).expect("--web alone must bind a default");
         assert_eq!(addr.to_string(), DEFAULT_WEB_ADDR_FOR_TEST);
         assert!(addr.ip().is_loopback(), "§7: loopback by default");
-        // An explicit address still wins, including the `:0` spelling the
-        // integration tests rely on.
         assert_eq!(
             parse(&["tf_tree", "top", "--web", "127.0.0.1:0"])
                 .expect("an explicit address")
@@ -2400,12 +2136,10 @@ mod tests {
         assert_eq!(parse(&["tf_tree", "top"]), None, "no --web, no server");
     }
 
-    /// [`web::DEFAULT_ADDR`] spelled out, since comparing a constant to itself
-    /// would pass with it changed.
+    /// [`web::DEFAULT_ADDR`] spelled out: a constant compared to itself proves nothing.
     const DEFAULT_WEB_ADDR_FOR_TEST: &str = "127.0.0.1:8787";
 
-    /// A snapshot of `n` dynamic edges, `claimed` deciding whether each carries
-    /// a live writer.
+    /// A snapshot of `n` dynamic edges, each with a live writer iff `claimed`.
     fn claim_snapshot(n: u32, claimed: bool) -> Snapshot {
         use doctor::{EdgeInfo, FrameInfo};
         use tf_tree::InterpPolicy;
@@ -2443,11 +2177,7 @@ mod tests {
         }
     }
 
-    /// **`TFT011` discloses exactly the half that is blind, and says nothing
-    /// when it skipped.**
-    ///
-    /// Mutant: change the `(Some(_), Some(_)) => {}` arm to push the counter
-    /// note ⇒ the third assertion fails.
+    /// `TFT011` discloses exactly the blind half, and nothing when it skipped.
     #[test]
     fn the_tft011_disclosure_names_the_half_that_could_not_fire() {
         let snap = claim_snapshot(1, true);
@@ -2460,7 +2190,6 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        // Counters have a verdict, the stream has no arrival delays.
         let note = tft011(evidence_notes(
             checks::PushStream::RingsUnderWriter,
             &snap,
@@ -2475,7 +2204,6 @@ mod tests {
             "{note}"
         );
 
-        // The reverse: an arena nobody has read, on the fixture's stream.
         let note = tft011(evidence_notes(
             checks::PushStream::Observed,
             &snap,
@@ -2491,7 +2219,6 @@ mod tests {
             "{note}"
         );
 
-        // Neither half: `tft011` skipped, so there is nothing to disclose.
         assert_eq!(
             tft011(evidence_notes(
                 checks::PushStream::Recorded,
@@ -2506,7 +2233,6 @@ mod tests {
             "a note beside a `not run` line repeats the skip reason"
         );
 
-        // Both halves live: nothing to disclose either.
         assert_eq!(
             tft011(evidence_notes(
                 checks::PushStream::Observed,
@@ -2521,13 +2247,7 @@ mod tests {
         );
     }
 
-    /// **`TFT017` firing on every dynamic edge is a fact about the arena, and
-    /// says so.** A bag-built or frozen arena has no writer, so every healthy
-    /// recording warned per edge. A note not a skip, so a fleet of dead
-    /// publishers is never silent.
-    ///
-    /// Mutant: change the `!= dynamic` guard in `unclaimed_coverage_note` to
-    /// `== 0` ⇒ the second assertion fails.
+    /// `TFT017` firing on every dynamic edge is disclosed as a fact about the arena.
     #[test]
     fn a_wholly_unclaimed_arena_is_disclosed_as_an_arena_fact() {
         let note = unclaimed_coverage_note(&claim_snapshot(3, false))
@@ -2537,21 +2257,16 @@ mod tests {
             "{note}"
         );
 
-        // One writer still alive: the finding is about that edge, not the arena.
         let mut partial = claim_snapshot(3, false);
         partial.edges[0].claimed = true;
         partial.edges[0].owner_pid = 4711;
         assert_eq!(unclaimed_coverage_note(&partial), None);
 
-        // Nothing unclaimed, and an arena with no dynamic edges at all.
         assert_eq!(unclaimed_coverage_note(&claim_snapshot(3, true)), None);
         assert_eq!(unclaimed_coverage_note(&claim_snapshot(0, false)), None);
     }
 
-    /// **An ingest flag `doctor` will ignore is named, one at a time.** Pins
-    /// both directions.
-    ///
-    /// Mutant: `flags_set` returns `Vec::new()` ⇒ the second assertion fails.
+    /// An ingest flag `doctor` will ignore is named, one at a time.
     #[test]
     fn an_ingest_flag_left_at_its_default_is_not_reported_as_set() {
         assert_eq!(IngestArgs::default().flags_set(), Vec::<&str>::new());
@@ -2572,12 +2287,7 @@ mod tests {
         assert_eq!(IngestArgs::default().flags_set(), Vec::<&str>::new());
     }
 
-    /// **"Cannot tell" is not "dead", and every arm that could have said
-    /// otherwise is here.** The three `Unknown` rows are the ones the earlier
-    /// revision got wrong (`hidepid=2`, `EMFILE`).
-    ///
-    /// Mutant: restore `Err(_) if proc_answers => Gone` as one arm ⇒ the
-    /// `EACCES` row fails with *left: Gone, right: Unknown*.
+    /// "Cannot tell" is not "dead": every `Unknown` arm is covered (`hidepid=2`, `EMFILE`).
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[test]
     fn a_proc_read_that_cannot_answer_is_never_read_as_death() {
@@ -2591,14 +2301,11 @@ mod tests {
                 raw_os_error: errno,
             })
         };
-        // The `docs/decisions/0033` facts held at "observer where the record
-        // was written", so these rows are about the `/proc` classification
-        // alone.
+        // `0033` facts held at "observer where the record was written".
         let here = |stored, probe, proc_answers| {
             recorded_given(stored, probe, proc_answers, HERE, HERE, true)
         };
 
-        // The two arms that are evidence, and the only two.
         assert_eq!(here(STORED, Ok(STORED), true), R::Running);
         assert_eq!(
             here(STORED, Ok(STORED + 1), true),
@@ -2612,7 +2319,6 @@ mod tests {
              proof of death"
         );
 
-        // Everything else is a refusal to answer.
         assert_eq!(
             here(STORED, unreadable(2), false),
             R::Unknown,
@@ -2641,7 +2347,6 @@ mod tests {
             "a stat line we could not parse is not a death certificate"
         );
 
-        // And the record that never had a start time to compare.
         assert_eq!(
             here(0, Ok(STORED), true),
             R::Unknown,
@@ -2650,29 +2355,16 @@ mod tests {
         );
     }
 
-    /// A namespace inode standing in for "the observer's own"; nonzero, since
-    /// zero means *unknown namespace*.
+    /// The observer's own namespace inode; nonzero (zero is unknown).
     #[cfg(all(feature = "shm", target_os = "linux"))]
     const HERE: u64 = 4_026_531_836;
-    /// A second, different namespace (values as measured in
-    /// `docs/decisions/0033`).
+    /// A second, different namespace.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     const ELSEWHERE: u64 = 4_026_532_488;
 
-    /// **A pid from another PID namespace is not a pid this `/proc` can be
-    /// asked about** (`docs/decisions/0033`). The namespace-mismatch rows hold
-    /// `proc_is_ours = true` and the `proc_is_ours = false` rows hold the
-    /// namespaces equal, so neither guard carries the other's rows.
-    ///
-    /// Arms `0033` stages: (A) a namespaced participant seen from the host
-    /// (`Ok(_)`); (B) a host participant seen from a container (`ENOENT`); (C)
-    /// a real fork inheritor (`ENOENT`, byte-identical to A), which must stay
-    /// `Gone`; (D) participant and observer in one bare `unshare --fork --pid`.
-    /// A and B are the first block, D the second. End-to-end:
-    /// `tests/attach.rs`'s `tft014_namespace_*`.
-    ///
-    /// Mutant: drop the `recorded_pid_ns != 0` conjunct ⇒ the pre-`0033`-record
-    /// row fails with *left: Unknown, right: Gone*.
+    /// A pid from another PID namespace is not askable of this `/proc`
+    /// (`docs/decisions/0033`, arms A-D; end-to-end `tests/attach.rs`'s
+    /// `tft014_namespace_*`). Each guard is exercised with the other neutral.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[test]
     fn a_pid_from_another_namespace_is_not_a_pid_this_proc_can_answer_about() {
@@ -2684,23 +2376,20 @@ mod tests {
             raw_os_error: 2,
         });
 
-        // Arm A: recorded pid 1 exists here (`systemd`) with another start
-        // time; a live participant one namespace away.
+        // Arm A: a live participant one namespace away.
         assert_eq!(
             recorded_given(STORED, Ok(STORED + 1), true, ELSEWHERE, HERE, true),
             R::Unknown,
             "a recycled-pid verdict about a pid from another numbering is not \
              a verdict"
         );
-        // Arm B, the mirror: the recorded pid is not in this `/proc`. The guard
-        // is before the match for this reason.
+        // Arm B: the recorded pid is not in this `/proc`.
         assert_eq!(
             recorded_given(STORED, enoent, true, ELSEWHERE, HERE, true),
             R::Unknown,
             "ENOENT about a pid this /proc does not number proves nothing"
         );
-        // Arm C, the true positive: same `ENOENT` arm as B, same text; only the
-        // namespace separates them.
+        // Arm C, the true positive: same `ENOENT` as B; only the namespace differs.
         assert_eq!(
             recorded_given(STORED, enoent, true, HERE, HERE, true),
             R::Gone,
@@ -2708,8 +2397,7 @@ mod tests {
              TFT014 exists to report"
         );
 
-        // Zero is *unknown namespace* on either side and must not fire the
-        // guard.
+        // Zero is unknown namespace and must not fire the guard.
         assert_eq!(
             recorded_given(STORED, enoent, true, 0, HERE, true),
             R::Gone,
@@ -2722,8 +2410,7 @@ mod tests {
              today's behaviour, not to a check that can never fire"
         );
 
-        // Arm D: every namespace matches, so only this guard stands between
-        // `doctor` and a finding about its own slot.
+        // Arm D: only `proc_is_ours` stands between `doctor` and a finding about its own slot.
         assert_eq!(
             recorded_given(STORED, enoent, true, HERE, HERE, false),
             R::Unknown,
@@ -2736,8 +2423,6 @@ mod tests {
             "not even a start time that matches, since it matched some other \
              namespace's pid 7"
         );
-        // And the same two facts with `/proc` back to its own: the guard is
-        // about the observer's `/proc` and nothing else.
         assert_eq!(
             recorded_given(STORED, Ok(STORED), true, HERE, HERE, true),
             R::Running

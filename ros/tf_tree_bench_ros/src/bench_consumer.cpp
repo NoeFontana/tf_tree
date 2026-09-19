@@ -1,26 +1,14 @@
 // One consumer process, either engine, over a real DDS (`docs/PHASE5.md` §9.1).
 //
 // Modes:
-// * `--mode tf2` — `tf2_ros::Buffer` + `TransformListener`, `--consumers N` query
-//   threads. Run as N processes of 1 (ordinary deployment) or one process of N
-//   (tf2's best case, the control).
-// * `--mode tf_tree` — §5.8 form 3: hosts the ingest bridge and `--consumers N`
-//   threads read the arena it fills.
-// * `--mode tf_tree_bridge` + `--mode tf_tree_attach` — §9.1's "one bridge plus N
-//   consumers" as N+1 processes. The bridge hosts form 3 under a non-empty
-//   `arena_name` with no query threads; each attach process joins read-only via
-//   `tft_tree_open()`, subscribing to nothing.
+// * `--mode tf2`: `tf2_ros::Buffer` + `TransformListener`, `--consumers N` query threads.
+// * `--mode tf_tree`: §5.8 form 3; `--consumers N` threads read the arena it fills.
+// * `--mode tf_tree_bridge` + `--mode tf_tree_attach`: §9.1's one bridge plus N
+//   consumers as N+1 processes; attach processes join read-only via `tft_tree_open()`.
+//   The bridge is a mode because `--consumers 0` stays refused.
 //
-// The bridge emits the same stats block as every process with `consumers 0`;
-// `dds_report` sums `cpu_ns` and `pss_kib` per arm label over the summed consumer
-// count, so its cost lands in its arm. It is a mode rather than `--consumers 0`
-// because `--consumers 0` stays refused (an empty query arm would look perfect).
-//
-// Where tf_tree is worse (§9.3): `tf_tree.processes` runs N+1 processes to tf2's
-// N, plus a `memfd`, a rendezvous entry and a participant slot.
-//
-// Measurement is `measure.hpp`: open-loop schedule, `service` and `cycle`
-// distributions, whole-process CPU in ns, PSS.
+// `dds_report` sums `cpu_ns` and `pss_kib` per arm label, so the bridge's cost
+// lands in its arm. Measurement is `measure.hpp`.
 
 #include <atomic>
 #include <chrono>
@@ -46,8 +34,7 @@ extern "C" {
 }
 
 #if !defined(TFT_HAVE_SHM)
-// `#error`, not a runtime refusal (as in `test_shared_arena.cpp`): otherwise the
-// `tf_tree.processes` arm would silently stop being built.
+// `#error`, not a runtime refusal: the `tf_tree.processes` arm must not vanish.
 #error "TFT_HAVE_SHM is not defined: libtf_tree_c was built without --features shm, \
 or the CMake package's nm probe did not find tft_tree_open in it. See ros/build.sh step 1."
 #endif
@@ -68,12 +55,9 @@ struct Args
   double hz = 100.0;
   double seconds = 20.0;
   double warmup = 3.0;
-  /// How far behind "now" every query is aimed, in ns; a query at the present
-  /// asks for a sample that has not arrived (an error path).
+  /// How far behind "now" every query is aimed, in ns.
   int64_t lag_ns = 100'000'000;
-  /// `--mode tf_tree_bridge` only: keep serving this long after the measured
-  /// window, since consumers start late and would otherwise read an unwritten
-  /// arena. The driver sets it.
+  /// `--mode tf_tree_bridge` only: keep serving this long after the window.
   double linger = 0.0;
   /// `--mode tf_tree_attach` only: how long to wait for the arena to appear.
   double attach_timeout = 30.0;
@@ -171,7 +155,7 @@ ThreadResult tf2_consumer_loop(
 int run_tf2(const Args & args, const std::vector<Pair> & pairs)
 {
   auto node = std::make_shared<rclcpp::Node>("tf_bench_tf2_consumer");
-  // The 10 s default cache, as deployed and as the tf_tree rings retain.
+  // The 10 s default cache, as tf_tree's rings retain.
   auto buffer = std::make_unique<tf2_ros::Buffer>(node->get_clock(), tf2::durationFromSec(10.0));
   auto listener = std::make_shared<tf2_ros::TransformListener>(*buffer, node, true);
 
@@ -220,7 +204,6 @@ ThreadResult tf_tree_consumer_loop(
   while (!stop.load(std::memory_order_relaxed)) {
     const auto due = rate.next_due();
     const auto t0 = std::chrono::steady_clock::now();
-    // Same stamp policy as the tf2 arm.
     const int64_t stamp = node->now().nanoseconds() - args.lag_ns;
     const tft_status s = tft_plan_at(plans[k % plans.size()], stamp,
         TFT_LAYOUT_QVEC7_WXYZ, out);
@@ -239,8 +222,7 @@ ThreadResult tf_tree_consumer_loop(
   return r;
 }
 
-/// Compile one plan per query pair; frees what it compiled and empties `out` on
-/// failure.
+/// Compile one plan per query pair; frees and empties `out` on failure.
 bool compile_plans(
   tft_tree * tree, const std::vector<Pair> & pairs, std::vector<tft_plan *> & out)
 {
@@ -261,8 +243,7 @@ bool compile_plans(
 }
 
 /// Spin the node, warm up, measure `--consumers N` query threads over `plans`,
-/// and emit the per-thread and per-process blocks. Shared by `--mode tf_tree`
-/// and `tf_tree_attach` so the arms differ only in where the arena came from.
+/// and emit the per-thread and per-process blocks.
 void measure_tf_tree_consumers(
   const std::vector<tft_plan *> & plans, const std::shared_ptr<rclcpp::Node> & node,
   const Args & args)
@@ -318,8 +299,7 @@ int run_tf_tree(const Args & args, const std::vector<Pair> & pairs)
 
   tf_tree_ros::BridgeOptions o;
   o.topology_toml = read_file(args.topology_path);
-  // Defaults, including `first_writer_wins`: a bridge tuned for the benchmark
-  // would not be the bridge an operator deploys (§9.3).
+  // Defaults, including `first_writer_wins` (§9.3).
   tf_tree_ros::BridgeHandle bridge(node.get(), o);
 
   std::vector<tft_plan *> plans;
@@ -336,8 +316,7 @@ int run_tf_tree(const Args & args, const std::vector<Pair> & pairs)
 // tf_tree, across processes — `docs/decisions/0015` step 5
 // ---------------------------------------------------------------------------
 
-/// The rendezvous name both halves select by: `$TF_TREE_NAME`, not a flag, since
-/// `tft_tree_open()` takes no name and the environment selects the arena.
+/// The rendezvous name both halves select by, from `$TF_TREE_NAME`.
 std::string arena_name_from_env()
 {
   const char * n = std::getenv("TF_TREE_NAME");
@@ -345,9 +324,6 @@ std::string arena_name_from_env()
 }
 
 /// `tft_tree_open` until it succeeds or `timeout` passes; nullptr on timeout.
-///
-/// The C ABI has no timeout parameter, so poll (as `test_shared_arena.cpp`'s
-/// `open_within` does).
 tft_tree * open_within(std::chrono::duration<double> timeout)
 {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -363,8 +339,7 @@ tft_tree * open_within(std::chrono::duration<double> timeout)
   }
 }
 
-/// One bridge process: hosts §5.8 form 3 under a rendezvous name and serves the
-/// arm's consumers; reports `consumers 0` (see the file header).
+/// One bridge process: form 3 under a rendezvous name; reports `consumers 0`.
 int run_tf_tree_bridge(const Args & args)
 {
   const std::string name = arena_name_from_env();
@@ -380,20 +355,16 @@ int run_tf_tree_bridge(const Args & args)
 
   tf_tree_ros::BridgeOptions o;
   o.topology_toml = read_file(args.topology_path);
-  // Defaults everywhere else (see `run_tf_tree`).
   o.arena_name = name;
-  // A `BridgeError` here has no heap fallback (`docs/decisions/0015`); it exits
-  // non-zero and `dds_bench.sh` stops the run.
+  // No heap fallback (`docs/decisions/0015`): a `BridgeError` exits non-zero.
   tf_tree_ros::BridgeHandle bridge(node.get(), o);
 
   std::thread spinner([&node]() {rclcpp::spin(node);});
 
-  // Same warm-up and window as the consumers it serves.
   std::this_thread::sleep_for(std::chrono::duration<double>(args.warmup));
   const auto before = ProcStats::read();
   std::this_thread::sleep_for(std::chrono::duration<double>(args.seconds));
   const auto after = ProcStats::read();
-  // Outside the measured window on purpose — see `Args::linger`.
   std::this_thread::sleep_for(std::chrono::duration<double>(args.linger));
 
   rclcpp::shutdown();
@@ -405,11 +376,9 @@ int run_tf_tree_bridge(const Args & args)
   return 0;
 }
 
-/// One consumer process: attaches read-only to the arena a `tf_tree_bridge`
-/// process published and runs `--consumers N` query threads. It hosts no bridge
-/// and no `/tf` subscription (the bridge pays that once; `dds_report`'s footer
-/// says so), but does spin an rclcpp node: queries are aimed with `node->now()`
-/// like every arm, and PSS/CPU stay comparable with a DDS participant present.
+/// One consumer process: attaches read-only to a `tf_tree_bridge` process's arena
+/// and runs `--consumers N` query threads. It spins an rclcpp node so queries
+/// are aimed with `node->now()` like every arm.
 int run_tf_tree_attach(const Args & args, const std::vector<Pair> & pairs)
 {
   const std::string name = arena_name_from_env();
@@ -483,7 +452,6 @@ int main(int argc, char ** argv)
   }
 
   const bool is_bridge = args.mode == "tf_tree_bridge";
-  // The one process that is not a consumer; a mode so `--consumers 0` stays refused.
   if (is_bridge) {args.consumers = 0;}
 
   const bool known_mode = args.mode == "tf2" || args.mode == "tf_tree" ||

@@ -1,42 +1,11 @@
-//! The chunked batch fold against `Plan::at`, bit for bit.
+//! The chunked batch fold against `Plan::at`, bit for bit
+//! (`docs/decisions/0060` Decision A, step 2).
 //!
-//! `docs/decisions/0060` Decision A replaced the batch entry points' per-stamp
-//! loop with a chunked two-phase fold: per chunk and per plan step, phase 1
-//! reads every lane's bracket and phase 2 interpolates every lane. Step 2 of
-//! that record requires this file, and requires it to *"reproduce §8's engine
-//! test in full: branch regions, isolated stamps in lanes 0 and 1, the
-//! error-contract grid, counters, and the identity and all-static plans"* —
-//! §8 being the prototype's own bit-identity test, which lived in a worktree
-//! that no longer exists.
-//!
-//! # What makes this a test and not a tautology
-//!
-//! The property is **bit identity with the scalar `Plan::at`**, per stamp, by
-//! `to_bits` rather than by tolerance. That is what makes batch a *layout*
-//! rather than a second answer, and it is the only assertion that can see a
-//! reassociated sum or a bracket built from the wrong pair.
-//!
-//! Two shapes of the fixture carry that weight, and both are there because the
-//! prototype's campaign found them the hard way:
-//!
-//! * **Crafted branch regions.** Every arm of `slerp` and of `screw_parts` is
-//!   reached on purpose — knots, an `s` that rounds to exactly `1.0`, identical
-//!   rotations, the LERP fallback, either side of the 0.3 rad series threshold,
-//!   a large arc, the far hemisphere, signed zeros and non-finite translations.
-//!   A fixture of well-conditioned random poses reaches one arm and calls it a
-//!   pass; §8 records two real mutants that survived exactly that.
-//! * **Each stamp in a named lane.** A defect that depends on *where in the
-//!   chunk* a stamp lands is invisible to a batch that always presents it in
-//!   the same position. Every stamp is therefore also run alone, in lane 0, in
-//!   lane 1, in the last lane of a chunk and in the first lane of the second
-//!   chunk. §8's M3 and M4 were caught by nothing else.
-//!
-//! # The two constants this file mirrors
-//!
-//! `FOLD_LANES` (16) and `FOLD_MIN_BATCH` (3) are private to
-//! `tf_tree_core::plan`, and `plan.rs` pins both with a `const` assertion that
-//! names this file — so moving either one there breaks a build rather than
-//! silently retargeting the lane shapes below.
+//! The property is bit identity with the scalar `Plan::at` by `to_bits`, over
+//! crafted branch regions (every arm of `slerp` and `screw_parts`) and each
+//! stamp run alone in lane 0, lane 1, the last lane of a chunk and the first
+//! lane of the next. `FOLD_LANES` and `FOLD_MIN_BATCH` are mirrored below and
+//! pinned by a `const` assertion in `tf_tree_core::plan`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -53,22 +22,12 @@ const LANES: usize = 16;
 /// `tf_tree_core::plan::FOLD_MIN_BATCH`: below this a batch stays per-stamp.
 const MIN_BATCH: usize = 3;
 
-/// The bit pattern every output buffer is filled with before a call. Rows a
-/// refused batch must not touch still hold it afterwards.
+/// Fill pattern for output buffers; rows a refused batch must not touch keep it.
 const SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 
-// ---------------------------------------------------------------------------
-// Poses
-// ---------------------------------------------------------------------------
-
-/// A pose with a rotation of exactly `angle` radians about a fixed unit axis.
-///
-/// One axis for the whole fixture, so the relative rotation between two
-/// consecutive samples is the difference of their angles and a region can name
-/// the branch it is aiming at.
+/// A pose rotated by exactly `angle` radians about a fixed unit axis.
 fn at_angle(angle: f64, t: [f64; 3]) -> Iso3 {
-    // (1, 2, 2)/3 — a unit axis with no zero component, so no branch is reached
-    // by accident through a zero in the rotation vector.
+    // (1, 2, 2)/3: no zero component, so no branch is reached by accident.
     let k = angle / 3.0;
     Iso3::new(
         exp_so3(Vec3::new(k, 2.0 * k, 2.0 * k)),
@@ -76,18 +35,12 @@ fn at_angle(angle: f64, t: [f64; 3]) -> Iso3 {
     )
 }
 
-/// A pose with an explicitly given quaternion, for the regions that need bit
-/// patterns `exp_so3` will not produce.
+/// A pose with an explicit quaternion, for bit patterns `exp_so3` will not produce.
 fn raw(q: Quat, t: [f64; 3]) -> Iso3 {
     Iso3::new(q, Vec3::new(t[0], t[1], t[2]))
 }
 
-// ---------------------------------------------------------------------------
-// The fixture's sample stream
-// ---------------------------------------------------------------------------
-
-/// One crafted numerical region: the consecutive samples it publishes and the
-/// stamps it asks about, both as nanosecond offsets from the region's base.
+/// One crafted numerical region: its consecutive samples and query stamps (ns offsets).
 struct Region {
     name: &'static str,
     offsets: Vec<i64>,
@@ -109,17 +62,12 @@ impl Region {
 
 const MS: i64 = 1_000_000;
 
-/// Every crafted region, in publication order.
-///
-/// The angles are chosen against the thresholds `docs/decisions/0060` §9.1
-/// pins: `slerp` takes its series arm while the relative rotation is at most
-/// 0.3 rad (a half-angle of `THETA_SLERP_SMALL = 0.15`), its LERP fallback
-/// below `SLERP_LERP_FALLBACK = 1e-6` of chord, and its closed form above.
+/// Every crafted region, in publication order, aimed at the thresholds of
+/// `docs/decisions/0060` §9.1.
 fn crafted() -> Vec<Region> {
     let mut r = Vec::new();
 
-    // Knots: three series-region samples, queried both *on* every stamp
-    // (`t_i == t`, no interpolation at all) and between them.
+    // Knots: queried on every stamp and between them.
     r.push(Region::new(
         "knots",
         vec![
@@ -130,11 +78,7 @@ fn crafted() -> Vec<Region> {
         vec![0, MS / 2, MS, 3 * MS / 2, 2 * MS],
     ));
 
-    // `s` rounds to exactly 1.0. Over a segment of 2^55 ns the ratio
-    // (2^55 - 1)/2^55 is a tie at the last representable step below one and
-    // rounds to 1.0, so the query lands on the *upper* endpoint by rounding
-    // rather than by equality — the one input that reaches an endpoint through
-    // `s` instead of through the exact-hit branch.
+    // `s` rounds to exactly 1.0 over a 2^55 ns segment.
     const WIDE: i64 = 1 << 55;
     r.push(Region::new(
         "wide_span",
@@ -145,9 +89,7 @@ fn crafted() -> Vec<Region> {
         vec![1, WIDE / 2, WIDE - 1],
     ));
 
-    // Identical rotations: `h == 0` for LerpSlerp, and the degenerate screw for
-    // ScLerp. The translation still moves, so a fold that returned either
-    // endpoint outright would be caught.
+    // Identical rotations: `h == 0` and the degenerate screw; translation still moves.
     let q_fixed = exp_so3(Vec3::new(0.4 / 3.0, 0.8 / 3.0, 0.8 / 3.0));
     r.push(Region::new(
         "stationary",
@@ -159,7 +101,6 @@ fn crafted() -> Vec<Region> {
         vec![0, MS / 3, MS, 5 * MS / 3],
     ));
 
-    // The LERP fallback band: 1e-7 rad between consecutive samples.
     r.push(Region::new(
         "lerp_fallback",
         vec![
@@ -169,7 +110,6 @@ fn crafted() -> Vec<Region> {
         vec![MS / 4, MS / 2],
     ));
 
-    // Either side of the series threshold, 2e-4 rad apart.
     r.push(Region::new(
         "below_series_threshold",
         vec![
@@ -187,8 +127,7 @@ fn crafted() -> Vec<Region> {
         vec![MS / 2],
     ));
 
-    // A large arc, and one past the hemisphere boundary where `slerp` must flip
-    // the sign of the second quaternion and take the short way round.
+    // A large arc, and one past the hemisphere boundary (sign flip).
     r.push(Region::new(
         "large_arc",
         vec![
@@ -206,17 +145,14 @@ fn crafted() -> Vec<Region> {
         vec![MS / 2, 7 * MS / 8],
     ));
 
-    // Exact identity at both endpoints: every difference is zero and every
-    // series denominator is at its own limit.
+    // Exact identity at both endpoints.
     r.push(Region::new(
         "identity",
         vec![(0, Iso3::IDENTITY), (MS, Iso3::IDENTITY)],
         vec![0, MS / 2],
     ));
 
-    // Signed zeros. `-0.0 == 0.0` compares true and `to_bits` does not, which
-    // is the whole reason this file compares bits: a fold that reached an
-    // endpoint by arithmetic rather than by copy loses the sign here.
+    // Signed zeros: `to_bits` sees what `==` cannot.
     r.push(Region::new(
         "signed_zeros",
         vec![
@@ -226,10 +162,7 @@ fn crafted() -> Vec<Region> {
         vec![0, MS / 2, MS],
     ));
 
-    // Non-finite translations. The engine has no opinion about them — `push`
-    // stores what it is given — so what this pins is that the batch fold
-    // propagates exactly the bits the scalar fold propagates, NaN payload
-    // included.
+    // Non-finite translations: the batch must propagate the scalar's exact bits.
     r.push(Region::new(
         "non_finite",
         vec![
@@ -243,8 +176,7 @@ fn crafted() -> Vec<Region> {
     r
 }
 
-/// A deterministic 64-bit LCG — the fixture must be the same on every host and
-/// in every run, so `rand` is neither wanted nor in the dependency budget.
+/// A deterministic 64-bit LCG (no `rand` in the dependency budget).
 struct Lcg(u64);
 
 impl Lcg {
@@ -257,13 +189,8 @@ impl Lcg {
     }
 }
 
-/// The whole stream: the crafted regions four times over, then 200 random
-/// series steps.
-///
-/// Four repeats because a region that is only ever the *first* thing a chunk
-/// sees is a region tested in one lane. Repeating shifts every region across
-/// the 16-lane grid, and the random tail — whose stamps are irregular — shifts
-/// it again.
+/// The crafted regions four times over (to shift them across the lane grid),
+/// then 200 random series steps.
 fn stream() -> (Vec<(i64, Iso3)>, Vec<i64>) {
     let mut samples: Vec<(i64, Iso3)> = Vec::new();
     let mut queries: Vec<i64> = Vec::new();
@@ -283,13 +210,11 @@ fn stream() -> (Vec<(i64, Iso3)>, Vec<i64>) {
                 );
                 queries.push(base + q);
             }
-            // A gap no query falls in, so every bracket belongs to one region.
             base += span + 10 * MS;
         }
     }
 
-    // 200 random series steps: rotations well inside the series arm, stamps
-    // irregular so the queries are neither on a grid nor evenly spread.
+    // 200 random series steps with irregular stamps.
     let mut rng = Lcg(0x5EED_0060);
     let mut angle = 0.0f64;
     let mut prev = base;
@@ -304,8 +229,7 @@ fn stream() -> (Vec<(i64, Iso3)>, Vec<i64>) {
         }
         prev = stamp;
     }
-    // `t == t_new`: the very last published stamp, which is the one arm that
-    // needs the newest sample and no interpolation.
+    // `t == t_new`: the newest sample, no interpolation.
     queries.push(prev);
 
     for w in samples.windows(2) {
@@ -316,10 +240,6 @@ fn stream() -> (Vec<(i64, Iso3)>, Vec<i64>) {
     }
     (samples, queries)
 }
-
-// ---------------------------------------------------------------------------
-// Trees
-// ---------------------------------------------------------------------------
 
 /// A built tree plus the plan under test and the stamps to sweep.
 struct Case {
@@ -333,8 +253,7 @@ fn cfg(cap: u32, interp: InterpPolicy) -> EdgeCfg {
     EdgeCfg::new(Capacity::slots(cap)).interp(interp)
 }
 
-/// Every plan shape §8 names: one dynamic step, and dyn/static/dyn folded in
-/// both directions so both `inverted` flags run.
+/// Every plan shape §8 names: one dynamic step, and dyn/static/dyn both ways.
 fn cases() -> Vec<Case> {
     let (samples, queries) = stream();
     let cap = u32::try_from(samples.len()).unwrap() + 1;
@@ -403,8 +322,7 @@ fn cases() -> Vec<Case> {
             let w_cd = tree.claim(d, c).unwrap();
             for (i, (s, p)) in samples.iter().enumerate() {
                 w_ab.push(*s, p).unwrap();
-                // A different stream on the second edge, so a fold that used
-                // one edge's bracket for the other is visible.
+                // A different stream on the second edge.
                 w_cd.push(*s, &at_angle(0.013 * i as f64, [p.t.z, p.t.x, p.t.y]))
                     .unwrap();
             }
@@ -425,15 +343,7 @@ fn cases() -> Vec<Case> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// The comparison
-// ---------------------------------------------------------------------------
-
-/// The scalar answer for every stamp, each on its own fresh `Guard`.
-///
-/// A fresh guard per stamp is deliberate: the guard carries the cursor hints,
-/// and the reference must not be able to inherit a hint from the query before
-/// it. The batch calls below get a fresh guard each too.
+/// The scalar answer per stamp, each on its own fresh `Guard`.
 fn scalar(tree: &Tree, plan: &Plan, stamps: &[i64]) -> Vec<Result<Iso3, LookupError>> {
     stamps
         .iter()
@@ -472,8 +382,8 @@ fn first_err(expected: &[Result<Iso3, LookupError>]) -> Option<(usize, LookupErr
         .find_map(|(i, r)| r.as_ref().err().map(|e| (i, *e)))
 }
 
-/// Run every batch entry point over `stamps` and check each against `expected`,
-/// bit for bit, including where the batch stops and what it leaves untouched.
+/// Run every batch entry point over `stamps` and compare with `expected` bit
+/// for bit, including where the batch stops and what it leaves untouched.
 fn assert_batch(
     tree: &Tree,
     plan: &Plan,
@@ -586,19 +496,8 @@ fn assert_batch(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// The fixture reaches the branches its regions are named after.
-///
-/// **This is the anti-vacuity check, and it is not decoration.** Every
-/// assertion in this file is "the batch agrees with the scalar fold", which is
-/// satisfied trivially by a fixture that only ever reaches one arm — and
-/// §8 of `docs/decisions/0060` records two real mutants that survived exactly
-/// that fixture. What is asserted here is the *input*: that the relative
-/// rotation between the two samples of each crafted region is the one the
-/// region's name claims, against the thresholds §9.1 pins.
+/// The fixture reaches the branches its regions are named after
+/// (anti-vacuity; §9.1 thresholds).
 #[test]
 fn the_fixture_reaches_the_branches_it_names() {
     /// The rotation angle between two poses, in radians.
@@ -610,8 +509,7 @@ fn the_fixture_reaches_the_branches_it_names() {
         crafted().into_iter().map(|r| (r.name, r)).collect();
     let get = |n: &str| by_name.get(n).unwrap_or_else(|| panic!("region {n}"));
 
-    // The series arm runs while the arc is at most 0.3 rad; either side of it,
-    // by 2e-4.
+    // The series arm runs while the arc is at most 0.3 rad.
     let below = get("below_series_threshold");
     assert!(
         (arc(&below.poses[0], &below.poses[1]) - 0.2998).abs() < 1e-9,
@@ -624,12 +522,10 @@ fn the_fixture_reaches_the_branches_it_names() {
         "the above-threshold region is at {a} rad"
     );
 
-    // The LERP fallback wants a chord under 1e-6; 1e-7 rad is well inside it.
     let fb = get("lerp_fallback");
     let f = arc(&fb.poses[0], &fb.poses[1]);
     assert!(f > 0.0 && f < 1e-6, "the fallback region is at {f} rad");
 
-    // A large arc, and one the short-way-round flip has to handle.
     assert!(arc(&get("large_arc").poses[0], &get("large_arc").poses[1]) > 2.0);
     let far = get("far_hemisphere");
     assert!(
@@ -637,7 +533,6 @@ fn the_fixture_reaches_the_branches_it_names() {
         "the far-hemisphere region does not cross the hemisphere"
     );
 
-    // Identical rotations, bit for bit — `h == 0` and the degenerate screw.
     let st = get("stationary");
     let qbits = |q: Quat| (q.w.to_bits(), q.x.to_bits(), q.y.to_bits(), q.z.to_bits());
     assert_eq!(
@@ -651,16 +546,13 @@ fn the_fixture_reaches_the_branches_it_names() {
         "the stationary region does not move at all, so it cannot see a wrong endpoint"
     );
 
-    // Signed zeros really are negative zeros, which `== 0.0` cannot see.
     let sz = get("signed_zeros");
     assert_eq!(sz.poses[0].t.x.to_bits(), (-0.0f64).to_bits());
 
-    // Non-finite translations.
     assert!(get("non_finite").poses[0].t.x.is_nan());
     assert!(get("non_finite").poses[1].t.y.is_infinite());
 
-    // And the sweep is big enough to cross several chunks, with an exact hit on
-    // the newest published stamp at the end of it.
+    // The sweep crosses several chunks and ends on the newest stamp.
     let (samples, queries) = stream();
     assert!(
         queries.len() > 8 * LANES,
@@ -674,8 +566,7 @@ fn the_fixture_reaches_the_branches_it_names() {
     );
 }
 
-/// The whole sweep, and every slice length either side of a chunk boundary, at
-/// three offsets.
+/// The whole sweep, and slice lengths either side of a chunk boundary, at three offsets.
 #[test]
 fn every_batch_entry_point_is_bit_identical_to_at() {
     for case in cases() {
@@ -710,17 +601,8 @@ fn every_batch_entry_point_is_bit_identical_to_at() {
     }
 }
 
-/// Every stamp alone, and every stamp in a named lane of a chunk.
-///
-/// The five shapes are the ones that can disagree. Alone and paired take the
-/// sub-[`MIN_BATCH`] bypass, which is a different fold; the three windowed
-/// shapes put the stamp in lane 0, lane 1 and the last lane of the first chunk
-/// of a 17-stamp batch, which always crosses into a second chunk.
-///
-/// **This is the shape §8 of the record says caught what nothing else did.** A
-/// defect that depends on a stamp's position in the chunk — or that is masked
-/// when some other lane of the same chunk takes a different branch — is
-/// invisible to a fixture that only ever presents a stamp in the same place.
+/// Every stamp alone, and in a named lane of a chunk; alone and paired take the
+/// sub-[`MIN_BATCH`] bypass.
 #[test]
 fn every_stamp_holds_in_every_lane() {
     for case in cases() {
@@ -759,10 +641,6 @@ fn every_stamp_holds_in_every_lane() {
 }
 
 /// The identity plan and two all-static plans, which fold no dynamic step.
-///
-/// They reach the chunked loop's `Step::Static` arm with `live` never lowered,
-/// and the identity plan reaches it with no steps at all — the one input where
-/// a chunk writes its accumulator exactly as it initialised it.
 #[test]
 fn identity_and_static_only_plans_match_at() {
     let tree = TreeBuilder::new()
@@ -797,15 +675,8 @@ fn identity_and_static_only_plans_match_at() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The error contract
-// ---------------------------------------------------------------------------
-
-/// A tree whose two dynamic edges retain **different** windows, so a stamp can
-/// fail on the second step of a plan while the first step answers it.
-///
-/// `a -> b` retains `[0, 63] ms`; `c -> d` retains `[10, 53] ms`. The plan
-/// crosses both.
+/// Two dynamic edges retaining different windows (`a -> b` `[0, 63] ms`,
+/// `c -> d` `[10, 53] ms`), so a stamp can fail on the second step only.
 struct ErrFixture {
     tree: Tree,
     plan: Plan,
@@ -843,29 +714,9 @@ impl ErrFixture {
     }
 }
 
-/// The error contract, on a grid: five batch lengths x six positions x three
-/// failure kinds.
-///
-/// What each cell asserts is everything a caller can observe: the error the
-/// call returns, that it is the *scalar* error for that stamp, that every row
-/// before it is bit-identical to `Plan::at`, and that every row from it on
-/// still holds the sentinel the buffer was filled with.
-///
-/// **The three kinds are three different ways to stop a chunk**, not three
-/// spellings of one:
-///
-/// * `before` — older than the first edge's oldest retained sample, so the
-///   refusal comes from step 0 and the lane's accumulator never gets a pose;
-/// * `after` — newer than the first edge's newest, which is the other arm of
-///   the same branch and the one that also moves the cursor;
-/// * `second_step` — inside the first edge's window and outside the second's,
-///   so phase 1 of an *earlier* step has already read every lane of the chunk
-///   before the refusal happens. That is the cell mutant M5 lives in.
-///
-/// **Mutant M5, run** (`docs/decisions/0060` §8): in `Plan::fold_batch`, do not
-/// lower `live` when phase 1 refuses — `let _ = read;` in place of
-/// `live = read;`. It is the defect that writes rows past the refusal, and it
-/// is what the sentinel assertion exists for.
+/// The error contract on a grid (five lengths x six positions x three failure
+/// kinds): the scalar error is returned, earlier rows are bit-identical, later
+/// rows keep the sentinel (`docs/decisions/0060` §8, M5).
 #[test]
 fn a_refused_batch_stops_where_the_scalar_fold_stops() {
     let f = ErrFixture::new();
@@ -876,17 +727,13 @@ fn a_refused_batch_stops_where_the_scalar_fold_stops() {
     ];
 
     for (kind, bad) in kinds {
-        // Every kind must really refuse, and for its own reason: an assertion
-        // grid whose "failing" stamp answers would pass vacuously.
+        // Every kind must really refuse.
         let g = f.tree.guard();
         let solo = f.plan.at(&g, ns(bad));
         assert!(solo.is_err(), "{kind}: the failing stamp answered");
         drop(g);
 
-        // Lengths and positions either side of both chunk boundaries: a
-        // refusal in the *second* chunk has a whole completed chunk behind it,
-        // which is the case where `live` has to shrink without disturbing rows
-        // an earlier chunk already wrote.
+        // Positions either side of both chunk boundaries.
         for len in [1usize, 2, 3, LANES, LANES + 1, 2 * LANES + 3] {
             for pos in [
                 0usize,
@@ -910,8 +757,7 @@ fn a_refused_batch_stops_where_the_scalar_fold_stops() {
                         }
                     })
                     .collect();
-                // The grid only means anything on a batch the fold accepts as
-                // monotone; a `before` stamp in the middle is not.
+                // Only meaningful on a batch the fold accepts as monotone.
                 if stamps.windows(2).any(|w| w[0] > w[1]) {
                     continue;
                 }
@@ -933,18 +779,8 @@ fn a_refused_batch_stops_where_the_scalar_fold_stops() {
     }
 }
 
-/// The per-edge counters a refused batch leaves behind: one `lookups_ok` per
-/// row written, and nothing for the rows that were never reached.
-///
-/// **A one-dynamic-edge plan, deliberately.** `Plan::first_dynamic_edge`
-/// returns the "credit no edge" sentinel for a plan that crosses several, so a
-/// multi-edge plan's successes are attributed to nobody by design and this
-/// question cannot be asked of one.
-///
-/// Gated on `unstable` for the reason `tests/counters.rs` is gated whole: an
-/// edge counter is only observable through `Tree::arena_view`, and there is no
-/// stable-tier spelling of the question. The count is flushed when the guard
-/// drops, not per lookup, so every case reads it after the guard is gone.
+/// A refused batch leaves one `lookups_ok` per row written on a one-dynamic-edge
+/// plan. Gated on `unstable`: edge counters are read through `Tree::arena_view`.
 #[cfg(all(feature = "unstable", feature = "counters"))]
 #[test]
 fn a_refused_batch_counts_one_lookup_per_row_it_wrote() {

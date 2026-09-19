@@ -7,29 +7,23 @@
 #   * Every `socket(2)` from the five published crates' test binaries (at the
 #     feature set below, whole process tree) names `AF_UNIX`.
 #   * `crates/tf_tree/tests/rendezvous.rs`'s binary opened an `AF_UNIX` socket.
-#   * `strace` here can see `socket(2)` and the scanner flags a non-`AF_UNIX`
-#     one (live check against a real `AF_INET` socket, `self_check`).
-#   * The known exception stays visible: `tf_tree_cli`'s `web` test target opens
-#     `AF_INET` sockets and this script finds them (the positive control).
+#   * `strace` can see `socket(2)` and the scanner flags a non-`AF_UNIX` one
+#     (`self_check`).
+#   * `tf_tree_cli`'s `web` test opens `AF_INET` sockets and this script finds
+#     them (the positive control).
 #
 # ## DOES NOT PROVE
 #
-#   * Anything about `tf_tree_cli` except that it opens one (`tf_tree top --web`;
-#     see `crates/tf_tree_cli/src/web.rs`; loopback binding is asserted by
-#     `crates/tf_tree_cli/tests/web.rs`).
-#   * Inherited sockets: `connect(2)`/`sendto(2)` on a received fd are not traced.
-#   * Code paths no test takes.
-#   * Non-Linux targets or other features. `--features tf_tree/shm,tf_tree_arena/shm`
-#     is deliberate: without `shm` the rendezvous is compiled out. Dropping it
-#     does not zero the socket count (`tf_tree_ipc`'s tests open theirs), which is
-#     why the floor names the `tf_tree::rendezvous` binary instead of counting.
-#   * Any package outside `PACKAGES` and the control: everything else in the
-#     repository is traced by nothing.
+#   * Anything about `tf_tree_cli` except that it opens one (`tf_tree top --web`).
+#   * Inherited sockets, code paths no test takes, non-Linux targets.
+#   * Other features: `shm` is deliberate, without it the rendezvous is compiled
+#     out and the floor names the `tf_tree::rendezvous` binary instead of counting.
+#   * Any package outside `PACKAGES` and the control.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# The library and nothing else: the publishable set, spelled as `just msrv` spells it.
+# The publishable set, as `just msrv` spells it.
 PACKAGES=(tf_tree tf_tree_core tf_tree_math tf_tree_arena tf_tree_ipc)
 FEATURES=tf_tree/shm,tf_tree_arena/shm
 
@@ -37,7 +31,7 @@ OUT=${CARGO_TARGET_DIR:-target}/no-network
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-# Refuse rather than skip: a check that quietly finds nothing reads as coverage.
+# Refuse rather than skip.
 if ! command -v strace >/dev/null 2>&1; then
     echo "no-network: REFUSING — strace is not installed." >&2
     echo "  PHASE5 §5.1's assertion needs it (or a seccomp supervisor, which this" >&2
@@ -47,16 +41,13 @@ if ! command -v strace >/dev/null 2>&1; then
     exit 1
 fi
 
-# Print every family a `socket(2)` line names, over strace logs. Reads the first
-# argument, so a `<unfinished ...>` line still counts.
+# Print every family a `socket(2)` line names, including `<unfinished ...>` lines.
 families() {
     sed -n 's/^[0-9]* *socket(\([A-Z0-9_a-z]*\).*/\1/p' "$@"
 }
 
-# The instrument is checked on every run against a real `AF_INET` socket: bash's
-# `/dev/tcp` issues `socket(AF_INET, ...)` before connecting, so a refusal on port
-# 9 is fine. Rules out `strace` unable to `ptrace` and a scanner whose pattern
-# stopped matching.
+# Checked every run against a real `AF_INET` socket (bash `/dev/tcp`, port 9 may
+# refuse): rules out `strace` unable to `ptrace` and a scanner that stopped matching.
 self_check() {
     # Not under "$OUT/*.strace": the scan globs that, and this socket is on purpose.
     local log="$OUT/self-check/trace"
@@ -77,8 +68,7 @@ self_check() {
 }
 self_check
 
-# Binaries come from cargo's build metadata, not a glob over `target/debug/deps`.
-# `kind == "bin"` is dropped: those are helper children that `strace -f` already follows.
+# Binaries come from cargo's metadata; `kind == "bin"` helpers are followed by `strace -f`.
 pkg_args=()
 for p in "${PACKAGES[@]}"; do pkg_args+=(-p "$p"); done
 mapfile -t BINARIES < <(
@@ -98,13 +88,9 @@ if [ "${#BINARIES[@]}" -eq 0 ]; then
     exit 1
 fi
 
-# `--test-threads 1`: these run outside nextest, and rendezvous tests share a
-# runtime directory and lock file.
-#
-# `prlimit --core=1:1 --` (0057 step 4): a pipe `core_pattern` crash helper can
-# outlast `wait_within(20 s)` in the `abort()`ing rendezvous test and REFUSE this
-# run for a host reason. A limit of 1 stops the pipe dump (0 does not); `strace -f`
-# children inherit it. `just shm-check` and `just shm-rendezvous` carry the same prefix.
+# `--test-threads 1`: rendezvous tests share a runtime directory and lock file.
+# `prlimit --core=1:1` (0057 step 4) stops a pipe core dump from outlasting
+# `wait_within(20 s)`; `just shm-check` and `just shm-rendezvous` carry it too.
 status=0
 for b in "${BINARIES[@]}"; do
     n=$(basename "$b")
@@ -140,10 +126,8 @@ if [ -n "$others" ]; then
     exit 1
 fi
 
-# A run that never opened the rendezvous socket asserts nothing. The floor names
-# the `rendezvous` binary rather than counting sockets, because `tf_tree_ipc`'s
-# own tests open sockets even with `shm` dropped (`required-features = ["shm"]`
-# makes that binary the one that disappears).
+# The floor names the `rendezvous` binary, not a socket count: `tf_tree_ipc`'s
+# own tests open sockets even without `shm`.
 rendezvous_trace=$(ls "$OUT"/rendezvous-*.strace 2>/dev/null | head -1 || true)
 if [ -z "$rendezvous_trace" ]; then
     echo "no-network: REFUSING — no \`tf_tree::rendezvous\` binary was traced, so" >&2
@@ -158,11 +142,9 @@ if [ "$(families "$rendezvous_trace" | grep -cx AF_UNIX || true)" -eq 0 ]; then
     echo "  none did not exercise it, and this scan is then about nothing." >&2
     exit 1
 fi
-# No `unix == 0` check here: the rendezvous floor above is strictly stronger.
 
-# The exception, asserted: `tf_tree top --web` (exercised by
-# `crates/tf_tree_cli/tests/web.rs`) is a separate strace run outside the claim.
-# Finding its `AF_INET` sockets shows the scan can see a violation.
+# The exception, asserted: `tf_tree top --web` (`crates/tf_tree_cli/tests/web.rs`)
+# is traced separately, outside the claim; its `AF_INET` sockets must be found.
 CLI_BIN=$(
     cargo nextest list -p tf_tree_cli --list-type binaries-only --message-format json 2>/dev/null \
     | tail -1 \

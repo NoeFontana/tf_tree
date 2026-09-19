@@ -1,17 +1,8 @@
 // C++ wrapper overhead against the raw C ABI — docs/PHASE4.md §7, rows 3-5.
 //
-// **Gate criterion 2: the wrapper must be within 2 % of the C ABI.** It is
-// inline code over an `extern "C"` call, so anything more means it is not
-// inline — a copy, an allocation, or a layout conversion that should not exist.
-//
-// **Built in BOTH error modes, and that is not optional.** This file used to
-// compile only with exceptions, because it assigned `plan.at<T>()` straight to
-// a `T` — which is the exceptions-mode return type. The `-fno-exceptions` mode
-// returns `expected<T>`, and its first implementation stored an `Error` by
-// value whose constructor calls `tft_last_error`: one extra FFI call per
-// successful lookup, putting that mode at 1.064x against the 1.02 gate while
-// this benchmark measured 1.002x and reported a pass. A gate that can only see
-// the configuration that happens to be fine is not a gate.
+// **Gate criterion 2: the wrapper must be within 2 % of the C ABI.** Built in
+// BOTH error modes: the `-fno-exceptions` `expected<T>` path is the one that
+// regressed once.
 //
 // Run pinned; unpinned runs migrate cores and swing by more than the gate:
 //   taskset -c 2 <this binary>
@@ -65,15 +56,7 @@ double bench(F&& run)
 /// Two paths, **interleaved within each round**, reporting the median of the
 /// per-round *ratios* rather than the ratio of two medians.
 ///
-/// This is the difference between a gate that works and one that does not.
-/// §7 gate 2 allows 2 %, and on this host the run-to-run spread of two
-/// separately-timed loops is around 4 % — frequency scaling, thermal drift and
-/// scheduler noise all move both loops, but not at the same moment. Timing them
-/// back to back in the same round makes that common-mode, and the ratio becomes
-/// stable to well under the gate.
-///
-/// The first version compared medians of separate loops and produced 0.948,
-/// 1.001, 1.002 for the same binary — straddling the gate in both directions.
+/// Timing both in the same round makes host drift common-mode (§7 gate 2 allows 2 %).
 template <typename A, typename B>
 double ratio_of(A&& baseline, B&& candidate)
 {
@@ -84,8 +67,7 @@ double ratio_of(A&& baseline, B&& candidate)
     std::vector<double> ratios;
     ratios.reserve(ROUNDS);
     for (int i = 0; i < ROUNDS; ++i) {
-        // Alternate the order every round so neither path always pays for
-        // warming the caches the other then finds warm.
+        // Alternate order so neither path always finds the caches warm.
         double b, c;
         if (i % 2 == 0) {
             b = one_round(baseline);
@@ -186,10 +168,7 @@ int main()
 
 #ifdef TF_TREE_HAS_SOPHUS
     // --- §7 row 5: the strided write against a packed one ---
-    //
-    // sizeof(Sophus::SE3d) is 64 here against a 56-byte payload, so the stride
-    // is not optional — this row is what it *costs*, measured against the same
-    // batch written packed into a Quat7 array.
+    // sizeof(Sophus::SE3d) is 64 against a 56-byte payload: the stride's cost.
     std::vector<Sophus::SE3d> se3(N);
     const double strided_ns = bench([&] {
         plan.at_many(stamps.data(), N, se3.data());

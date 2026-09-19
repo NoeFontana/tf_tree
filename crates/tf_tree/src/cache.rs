@@ -1,16 +1,10 @@
 //! Per-thread compiled-plan cache behind [`crate::Tree::lookup`].
 //!
 //! Direct-mapped, 16 entries, keyed by `(arena, target, source, generation)`. A
-//! topology mutation bumps the generation, so a stale plan is never served.
-//!
-//! **The arena component is load-bearing** (#196): one thread's cache is shared
-//! by every `Tree` it touches, and trees built from the same names in the same
-//! order agree on the other three components. `tests/plan_cache_identity.rs`
-//! holds the shapes. A slot holds the **result** of compiling that key,
-//! refusal included (#259); see [`Entry`] and [`store_refusal`].
-//!
-//! `docs/API.md` §1 R1 permits `lookup` to collapse the three tiers through this
-//! cache.
+//! topology mutation bumps the generation, so a stale plan is never served. The
+//! arena component is load-bearing: the cache is shared by every `Tree` on the
+//! thread (`tests/plan_cache_identity.rs`). A slot holds the compile **result**,
+//! refusal included; see [`Entry`] and [`store_refusal`]. `docs/API.md` §1 R1.
 
 use std::cell::RefCell;
 
@@ -21,10 +15,7 @@ use crate::tree::Tree;
 /// Number of direct-mapped slots. A power of two so indexing is a mask.
 const SLOTS: usize = 16;
 
-/// The odd multiplier [`index`] folds with. Module scope so
-/// [`tests::the_low_bit_mask_wins_on_a_small_tree_and_ties_on_a_large_one`]
-/// builds its rejected alternative from the same constant. Its final digit is
-/// load-bearing; see [`index`].
+/// The odd multiplier [`index`] folds with; its final digit is load-bearing.
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// What a cached plan was compiled from and for.
@@ -40,17 +31,11 @@ struct Key {
 #[derive(Clone, Copy)]
 struct Entry {
     key: Key,
-    /// What [`Tree::plan`] answered for [`Entry::key`] — **a refusal included**.
+    /// What [`Tree::plan`] answered for [`Entry::key`], refusal included.
     ///
-    /// `compile`'s output, refusals too, is a function of
-    /// `(arena, target, source, generation)`. Not functions of the key, and so
-    /// not stored: errors from `Plan::at` (they travel in [`with_plan`]'s `R`),
-    /// `ChildDetached` (a property of the process after `fork`), and a
-    /// `FrameOutOfRange` from exhausting `TOPO_RETRY_LIMIT` (transient); the
-    /// last two are declined by [`store_refusal`].
-    ///
-    /// Storing one costs no bytes: `size_of::<Result<Plan, LookupError>>()` equals
-    /// `size_of::<Plan>()` through a niche, pinned by
+    /// Not stored, because not functions of the key: `Plan::at` errors,
+    /// `ChildDetached` and a `TOPO_RETRY_LIMIT` `FrameOutOfRange` (the last two
+    /// declined by [`store_refusal`]). A refusal costs no bytes, pinned by
     /// [`tests::a_refusal_is_free_to_cache`].
     result: Result<Plan, LookupError>,
 }
@@ -61,13 +46,10 @@ thread_local! {
 
 /// Map a key to its direct-mapped slot.
 ///
-/// Masks the **low** bits deliberately: `MIX` ends in `5`, and multiplication by
-/// 5 modulo 16 is a bijection, so keys differing in those bits get distinct slots
-/// where a hash collides at the birthday rate.
-/// [`tests::the_low_bit_mask_wins_on_a_small_tree_and_ties_on_a_large_one`]
-/// pins the win on a small tree (0.72 against 0.51 steady-state residency) and
-/// the tie on a large one. The slot decides only whether a lookup hits; the
-/// full [`Key`] comparison decides what it may return.
+/// Masks the **low** bits deliberately: `MIX` ends in `5`, a bijection modulo 16,
+/// so keys differing there get distinct slots.
+/// [`tests::the_low_bit_mask_wins_on_a_small_tree_and_ties_on_a_large_one`] pins it.
+/// The full [`Key`] comparison decides what a lookup may return.
 fn index(key: Key) -> usize {
     let mut h = key.scope;
     h = h.wrapping_mul(MIX) ^ u64::from(key.target);
@@ -76,25 +58,16 @@ fn index(key: Key) -> usize {
     (h as usize) & (SLOTS - 1)
 }
 
-/// Evaluate `f` against the cached plan for
-/// `(tree's arena, target, source, generation)`, compiling and caching it first
-/// on a miss. The `bool` is `true` on a cache hit (used by tests).
+/// Evaluate `f` against the cached plan for `(arena, target, source,
+/// generation)`, compiling and caching it on a miss. The `bool` is `true` on a hit.
 ///
-/// **A refusal is a result and is cached like one** (#259): a pair whose
-/// topology refuses (`Disconnected`, `MissingEdge`, `TreeTooDeep`,
-/// `UnknownEdge`, `MixedTimeDomains`) answers with the refusal, without calling
-/// `f`, instead of recompiling on every lookup. That is −49.6% on a 60-edge
-/// chain (579.0 to 291.5 ns) with the hit path unchanged.
+/// A refusal is cached like a result: it is returned without calling `f`.
 ///
-/// **Why a closure and not `-> Plan`:** `Plan` is `Copy` and 2064 bytes;
-/// returning one copies it. Passing `f` and matching through `&entry.result`
-/// makes a hit copy nothing. **Do not "simplify" the `&` away**: matching the
-/// value lifts the whole `Plan` out of the slot.
+/// `f` is a closure so a hit copies no 2064-byte `Plan`; **do not remove the `&`**
+/// in the match on `&entry.result`.
 ///
-/// **`f` cannot re-enter the cache:** on a hit it runs under an immutable
-/// `RefCell` borrow, so a re-entrant lookup that missed would panic. Today the
-/// crate graph prevents it; re-check when adding a second caller whose closure
-/// reaches back into `tf_tree`.
+/// `f` must not re-enter the cache: on a hit it runs under an immutable `RefCell`
+/// borrow, so a re-entrant miss would panic.
 ///
 /// # Errors
 ///
@@ -118,7 +91,6 @@ pub(crate) fn with_plan<R>(
             let slots = c.borrow();
             if let Some(entry) = &slots[idx] {
                 if entry.key == key {
-                    // Match through the reference so no `Plan` is copied.
                     return match &entry.result {
                         Ok(plan) => (Ok(f(plan)), true),
                         Err(e) => (Err(*e), true),
@@ -146,14 +118,11 @@ pub(crate) fn with_plan<R>(
     })
 }
 
-/// Whether `refusal`, which [`Tree::plan`] just returned for `key`, is a
-/// function of `key` and may be stored under it.
+/// Whether `refusal`, just returned for `key`, is a function of `key` and may be
+/// stored under it.
 ///
-/// Declines `ChildDetached` (matched by name so
-/// [`tests::store_refusal_declines_what_the_key_does_not_determine`] can pin it
-/// without a `fork`) and any refusal computed at a generation other than
-/// `key.generation`: one relaxed load that makes "nothing is stored whose value
-/// the key does not determine" an invariant the code enforces.
+/// Declines `ChildDetached` and any refusal computed at a generation other than
+/// `key.generation`.
 fn store_refusal(tree: &Tree, key: Key, refusal: LookupError) -> bool {
     !matches!(refusal, LookupError::ChildDetached)
         && tree.view().topology().stable_generation() == key.generation
@@ -167,10 +136,7 @@ mod tests {
 
     use crate::{Iso3, TreeBuilder};
 
-    /// [`super::with_plan`] for a pair that is **expected to compile**: asserts
-    /// that it did, and returns the hit flag. Without the assertion the hit-rate
-    /// tests stay green against a build where nothing compiles, since refusals
-    /// are cached too.
+    /// [`super::with_plan`] for a pair expected to compile; returns the hit flag.
     fn compiled_hit(
         tree: &crate::Tree,
         target: tf_tree_core::FrameId,
@@ -182,9 +148,7 @@ mod tests {
         hit
     }
 
-    /// Two frames in **separate components**. `y` is the frame reparented to
-    /// join them because it carries an `edge_of_child`; a link with the `0`
-    /// sentinel would refuse `MissingEdge` instead.
+    /// Two frames in separate components; `y` carries an `edge_of_child`, so it can be reparented.
     fn two_components() -> (crate::Tree, tf_tree_core::FrameId, tf_tree_core::FrameId) {
         let tree = TreeBuilder::new()
             .static_edge("a", "b", &Iso3::IDENTITY)
@@ -196,8 +160,7 @@ mod tests {
         (tree, b, y)
     }
 
-    /// **Caching a refusal costs no bytes** — the claim [`super::Entry`] makes,
-    /// pinned because a wider `LookupError` variant would outgrow the niche.
+    /// Caching a refusal costs no bytes (the claim [`super::Entry`] makes).
     #[test]
     fn a_refusal_is_free_to_cache() {
         use std::mem::size_of;
@@ -209,7 +172,6 @@ mod tests {
             size_of::<Result<tf_tree_core::Plan, LookupError>>(),
             size_of::<tf_tree_core::Plan>(),
         );
-        // An `Entry` is a `Key` rounded up to `Plan`'s alignment, then the `Plan`.
         let a = align_of::<tf_tree_core::Plan>();
         let key_padded = size_of::<super::Key>().div_ceil(a) * a;
         assert_eq!(
@@ -223,8 +185,7 @@ mod tests {
         );
     }
 
-    /// **A refused pair compiles once, not once per lookup** (#259).
-    /// Mutant: delete the `store_refusal` arm ⇒ `hit2` is `false`.
+    /// A refused pair compiles once, then hits.
     #[test]
     fn a_refused_pair_is_compiled_once_and_then_answered_from_the_cache() {
         let (tree, b, y) = two_components();
@@ -247,9 +208,7 @@ mod tests {
         );
     }
 
-    /// **[`super::store_refusal`] declines what the key does not determine**,
-    /// both arms. Mutants: body → `true` ⇒ both `assert!(!…)` fail; drop the `!`
-    /// on the `matches!` ⇒ four tests fail.
+    /// [`super::store_refusal`] declines what the key does not determine, both arms.
     #[test]
     fn store_refusal_declines_what_the_key_does_not_determine() {
         let (tree, b, y) = two_components();
@@ -266,7 +225,6 @@ mod tests {
             cut_at: b,
         };
 
-        // Control: an ordinary refusal at the live generation must be stored.
         assert!(
             super::store_refusal(&tree, key(live), disconnected),
             "control: a refusal at the live generation must be storable"
@@ -282,16 +240,13 @@ mod tests {
         );
     }
 
-    /// **[`super::with_plan`] actually consults [`super::store_refusal`].**
-    /// The key carries a generation the arena does not have, so the refusal must
-    /// not be filed under it. Mutant: `store_refusal` → `true` ⇒ the final
-    /// assertion fails.
+    /// [`super::with_plan`] consults [`super::store_refusal`]: a refusal is not
+    /// filed under a generation the arena does not have.
     #[test]
     fn a_refusal_is_not_stored_under_a_generation_the_arena_does_not_have() {
         let (tree, b, y) = two_components();
         let live = tree.guard().generation();
 
-        // Control, at the live generation: stored, so the repeat hits.
         assert!(super::with_plan(&tree, b, y, live, |_| ()).0.is_err());
         assert!(
             super::with_plan(&tree, b, y, live, |_| ()).1,
@@ -306,9 +261,7 @@ mod tests {
         );
     }
 
-    /// **A cached refusal does not survive the topology that produced it**: the
-    /// key carries the generation, and a mutation bumps it. Mutant: key with
-    /// `generation: 0` ⇒ `!hit3` fails.
+    /// A cached refusal does not survive the topology that produced it.
     #[test]
     fn a_cached_refusal_does_not_survive_the_topology_that_caused_it() {
         let (tree, b, y) = two_components();
@@ -321,8 +274,6 @@ mod tests {
             "precondition: the refusal is in the cache"
         );
 
-        // Join the two components. `y` keeps its edge record, so the path
-        // b -> a <- y is two real edges and compiles.
         tree.reparent(y, a).unwrap();
         let g2 = tree.guard().generation();
         assert_ne!(g1, g2, "re-parent must change the generation");
@@ -336,10 +287,8 @@ mod tests {
         );
     }
 
-    /// **An evaluation error is not a compile refusal and is not cached as
-    /// one.** `WrongElementType` is used because `compile` cannot produce it.
-    /// No mutant: the property is carried by the types, so this guards a
-    /// redesign.
+    /// An evaluation error is not cached as a compile refusal
+    /// (`WrongElementType`, which `compile` cannot produce).
     #[test]
     fn an_error_from_the_evaluation_closure_is_not_cached() {
         let tree = TreeBuilder::new()
@@ -364,15 +313,11 @@ mod tests {
         );
     }
 
-    /// The [`super::index`] mask keeps more of a small tree's working set
-    /// resident than the high bits of a final multiply: the measurement behind
-    /// that function's doc. Residency is the fraction of a working set whose slot
-    /// no other member shares, over 2000 seeded sets. Both assertions are
-    /// relative, so a retune of [`super::MIX`] or [`super::SLOTS`] that
-    /// regressed nothing does not fail the build.
+    /// The [`super::index`] mask keeps more of a small tree's working set resident
+    /// than a final multiply's high bits. Residency is the fraction of a set whose
+    /// slot no other member shares, over 2000 seeded sets; assertions are relative.
     #[test]
     fn the_low_bit_mask_wins_on_a_small_tree_and_ties_on_a_large_one() {
-        // The rejected alternative: one more multiply, top four bits.
         fn hashed(key: super::Key) -> usize {
             let mut h = key.scope;
             h = h.wrapping_mul(super::MIX) ^ u64::from(key.target);
@@ -381,8 +326,7 @@ mod tests {
             (h.wrapping_mul(super::MIX) >> (u64::BITS - super::SLOTS.trailing_zeros())) as usize
         }
 
-        // Mean residency of a `pairs`-pair working set, as (mask, alternative);
-        // xorshift64 keeps the sets identical on every run.
+        // Mean residency as (mask, alternative); xorshift64 keeps sets deterministic.
         let residency = |frames: u32, pairs: usize| {
             let mut state = 0x1234_5678_9ABC_DEF1u64;
             let mut next = move || {
@@ -421,14 +365,12 @@ mod tests {
             )
         };
 
-        // Eight frames: every id fits the mask, so it is a permutation.
         let (mask, hash) = residency(8, 6);
         assert!(
             mask > hash + 0.15,
             "on an 8-frame tree the mask {mask} should beat the alternative {hash} \
              by the margin the choice was made on"
         );
-        // Forty frames: the ids no longer fit, and the two tie.
         let (mask, hash) = residency(40, 6);
         assert!(
             (mask - hash).abs() < 0.05,
@@ -437,9 +379,7 @@ mod tests {
         );
     }
 
-    /// Two trees on one thread do not evict each other: each still hits on a
-    /// repeat and they hold distinct arena ids (#196; and the cache must still
-    /// cache, `docs/API.md` §1 R1).
+    /// Two trees on one thread hold distinct arena ids and each still hits on a repeat.
     #[test]
     fn two_trees_keep_separate_entries_and_still_hit() {
         let build = || {
@@ -463,7 +403,6 @@ mod tests {
         };
         let (a1, b1, g1) = key_of(&first);
         let (a2, b2, g2) = key_of(&second);
-        // The #196 precondition: everything but the arena id agrees.
         assert_eq!((a1.get(), b1.get(), g1), (a2.get(), b2.get(), g2));
 
         let probe = |t: &crate::Tree, target, source, g| compiled_hit(t, target, source, g);
@@ -480,7 +419,6 @@ mod tests {
     /// produces a freshly-compiled plan stamped with the new generation.
     #[test]
     fn cache_hits_and_invalidates_on_generation() {
-        // `c` has an edge so it can be re-parented to bump the generation.
         let tree = TreeBuilder::new()
             .static_edge("a", "b", &Iso3::IDENTITY)
             .static_edge("b", "c", &Iso3::IDENTITY)
@@ -496,11 +434,9 @@ mod tests {
         assert!(!hit1, "first compile is a miss");
         assert_eq!(g1_stamped.unwrap(), gen1);
 
-        // An immediate repeat with the same key hits the per-thread cache.
         let hit2 = compiled_hit(&tree, b, a, gen1);
         assert!(hit2, "repeat lookup hits the cache");
 
-        // A runtime re-parent bumps the generation; the recompiled plan carries it.
         tree.reparent(c, a).unwrap();
         let gen2 = tree.guard().generation();
         assert_ne!(gen1, gen2, "re-parent must change the generation");
@@ -514,16 +450,9 @@ mod tests {
         );
     }
 
-    /// The cache hits *exactly* where its index predicts, on **live trees**: N
-    /// trees, round-robin, three rounds, counting rounds after the first.
-    ///
-    /// It asserts no fixed hit rate: `next_local_scope`'s counter is
-    /// process-global, so under `just miri`'s multi-threaded harness ids have
-    /// gaps and two of sixteen can collide. The expectation is derived from the
-    /// minted ids through [`super::index`]. This catches the #196 defect, an
-    /// eviction or install bug, and an `index` that stopped being a bijection on
-    /// the low bits of `scope`. N = 17 stays because seventeen trees cannot all
-    /// be resident in sixteen slots.
+    /// The cache hits exactly where its index predicts, on live trees: N trees,
+    /// round-robin, three rounds. The expectation is derived from the minted ids
+    /// (the counter is process-global), not a fixed rate; N = 17 cannot all be resident.
     #[test]
     fn the_cache_hits_exactly_where_its_index_predicts() {
         let build = || {
@@ -533,7 +462,6 @@ mod tests {
                 .build()
                 .unwrap()
         };
-        // How many members of `slots` no other member collides with.
         let resident = |slots: &[usize]| {
             slots
                 .iter()
@@ -545,7 +473,6 @@ mod tests {
         for n in [2usize, 16, 17] {
             let trees: Vec<crate::Tree> = (0..n).map(|_| build()).collect();
 
-            // The #196 precondition, asserted: only the arena id differs.
             let a = trees[0].frame("a").unwrap();
             let c = trees[0].frame("c").unwrap();
             let g = trees[0].guard().generation();
@@ -615,11 +542,8 @@ mod tests {
         }
     }
 
-    /// Two handles onto **one shared segment** share one arena identity and so
-    /// one set of cached plans: the peer's *first* lookup must hit the owner's
-    /// entry. Runs only under `just shm-check`. No `TF_TREE_RUNTIME_DIR` scratch
-    /// directory: `build_shared` is `memfd_create` plus `mmap` and touches no
-    /// lock file or socket.
+    /// Two handles onto one shared segment share one arena identity: the peer's
+    /// first lookup hits the owner's entry. Runs under `just shm-check`.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[test]
     fn two_handles_on_one_shared_arena_share_their_plans() {

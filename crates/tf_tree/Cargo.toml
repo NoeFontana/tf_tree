@@ -23,36 +23,21 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["counters"]
-# Passthrough to `tf_tree_core` (`docs/PHASE5.md` §5.5). Off removes the counter code;
-# the arena regions stay (D34).
+# Passthrough to `tf_tree_core` (`docs/PHASE5.md` §5.5).
 counters = ["tf_tree_core/counters"]
-# Forwarded from `tf_tree_core`, like `counters`.
 pure-hash = ["tf_tree_core/pure-hash"]
-# `docs/PHASE2.md` §11.3's fault injection; also arms this crate's own site
-# (`takeover.after_ownership_lock_before_bind`, `crate::CRASH_SITES`).
+# `docs/PHASE2.md` §11.3's fault injection; arms `crate::CRASH_SITES` too.
 crash-points = ["tf_tree_core/crash-points"]
-# `TreeBuilder::build_shared` / `Tree::attach_shared`. Linux-only, off by default.
+# `TreeBuilder::build_shared` / `Tree::attach_shared`. Linux-only.
 shm = ["tf_tree_arena/shm", "dep:tf_tree_ipc"]
 # `docs/API.md` §6's Rust mirror of `tf_tree_unstable.h` (`docs/PHASE4.md` §3.1).
-# The documentation of this feature is the waiver: `tf_tree::unstable::*` and
-# `Tree::arena_view` exist only when it is on, and nothing behind it is covered by semver.
+# Enabling is the waiver: nothing behind it is covered by semver.
 #
-# Every enabling consumer breaks at a patch release, so the list stays short: four,
-# `tf_tree_cli` (arena tables), `tf_tree_c` (unstable header), `tf_tree_bench`
-# (arena measurement) and `tf_tree_py` (`offline.rs` reads a frozen `.tft`'s tables).
-# `just stable-tier-check` reads the list from the `[dependencies]` entries and fails
-# if this comment or `docs/API.md` §6 row 4 disagrees.
-#
-# `--workspace` unifies these consumers' features into the facade, so only a
-# `-p tf_tree` selection compiles the default tier with `unstable` off;
-# `just stable-tier-check` names that configuration and CI runs it.
+# Enabling consumers, checked by `just stable-tier-check` against this comment and
+# `docs/API.md` §6 row 4: `tf_tree_cli`, `tf_tree_c`, `tf_tree_bench`, `tf_tree_py`.
 unstable = []
-# Two seams a test cannot otherwise stand in; `#[doc(hidden)]`, off by default:
-# 1. `CLAIM_WINDOW_HOOK`, between the arena CAS and the lease `SETLK` in
-#    `Tree::claim` (`docs/decisions/0005` §5).
-# 2. `reclamation_verdict_for_test`, the private reclamation predicate of
-#    `docs/decisions/0028` step 2, plus the probe counter reporting its read order.
-# Enabled by `just shm-rendezvous`; linted by `just shm-check`.
+# `#[doc(hidden)]` test seams: `CLAIM_WINDOW_HOOK` (`docs/decisions/0005` §5) and
+# `reclamation_verdict_for_test` (`docs/decisions/0028` step 2). Run by `just shm-rendezvous`.
 test-hooks = []
 
 [dependencies]
@@ -61,29 +46,19 @@ tf_tree_math.workspace = true
 tf_tree_arena.workspace = true
 thiserror.workspace = true
 
-# The rendezvous (`docs/decisions/0005`): this crate owns the composition because
-# `open()` must return a `Tree`. Gated on `shm` and Linux.
+# The rendezvous (`docs/decisions/0005`); gated on `shm` and Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
 tf_tree_ipc = { workspace = true, optional = true }
 
 [dev-dependencies]
-# No dev-dependency on this crate itself: the path-only line is stripped by
-# `cargo package`, leaving the tarball's tests without `unstable`. Tests gate
-# `Tree::arena_view` call sites with `#[cfg(feature = "unstable")]` instead;
-# `tests/feature_gates.rs` fails the build on an undeclared feature name or a file
-# that loses its gate, and `just stable-tier-check`'s `[dev-dependencies]` scan
-# compares the set of crates that enable `unstable` for tests to a recorded one.
-# The rendezvous tests probe the lock file directly, from outside the tree.
+# No self dev-dependency: `cargo package` strips it. Tests gate `arena_view` call
+# sites with `#[cfg(feature = "unstable")]` (`tests/feature_gates.rs`).
 tf_tree_ipc = { workspace = true }
 proptest.workspace = true
 
-# `tests/rendezvous.rs` needs a real second process. This crate is published, so
-# the target is named `tf_tree_rendezvous_child` (a name `cargo install --features shm`
-# writes to `~/.cargo/bin`); a default install exits 0, installs nothing and warns.
-# `CHANGELOG.md` and `README.md` state the residue. The helper cannot move to a
-# `publish = false` crate: `just shm-rendezvous` builds only this package's
-# executables, and `env!("CARGO_BIN_EXE_…")` is a compile-time guarantee. Same shape
-# as `tf_tree_ipc`'s `tf_tree_ipc_child`.
+# `tests/rendezvous.rs`'s second process. Published, so the name is prefixed;
+# `cargo install --features shm` writes it to `~/.cargo/bin` (`README.md`). It
+# stays here because `env!("CARGO_BIN_EXE_…")` needs this package's executable.
 [[bin]]
 name = "tf_tree_rendezvous_child"
 path = "src/bin/rendezvous_child.rs"
@@ -93,8 +68,7 @@ required-features = ["shm"]
 name = "rendezvous"
 required-features = ["shm"]
 
-# `docs/PHASE5.md` §2. The frozen backend is Linux-only and behind `shm`, like
-# the mapping it reuses.
+# `docs/PHASE5.md` §2; Linux-only, behind `shm`.
 [[test]]
 name = "frozen"
 required-features = ["shm"]

@@ -1,8 +1,6 @@
 //! Shared helpers for the `tf_tree` facade integration tests.
 //!
-//! Included via `mod common;` in each test binary; not every helper is used by
-//! every binary, and the `pub` surface is only "reachable" within a given test
-//! crate, so both `dead_code` and `unreachable_pub` are expected here.
+//! Included via `mod common;`; `dead_code` and `unreachable_pub` are expected.
 #![allow(dead_code, unreachable_pub)]
 
 use tf_tree::{
@@ -10,9 +8,7 @@ use tf_tree::{
     TreeBuilder,
 };
 
-/// A `SystemDomain` stamp — a terse constructor whose return type pins the domain
-/// (the bare `Stamp::from_nanos` cannot infer the default when passed to a
-/// generic function).
+/// A `SystemDomain` stamp, so the default domain infers.
 #[must_use]
 pub fn ns(nanos: i64) -> Stamp<SystemDomain> {
     Stamp::from_nanos(nanos)
@@ -25,8 +21,7 @@ pub fn pose(seed: u64) -> Iso3 {
     exp_se3([0.03 * f, -0.02 * f, 0.017 * f, 0.5 * f, -0.25 * f, 0.1 * f])
 }
 
-/// Scale-aware closeness metric: max of absolute rotation error (radians) and
-/// translation error relative to the poses' scale.
+/// Scale-aware closeness: max of rotation error (rad) and relative translation error.
 #[must_use]
 pub fn max_err(a: Iso3, b: Iso3) -> f64 {
     let rot = log_so3(a.q.conjugate() * b.q).norm();
@@ -41,9 +36,8 @@ pub fn assert_close(a: Iso3, b: Iso3, tol: f64, ctx: &str) {
     assert!(e <= tol, "{ctx}: max_err {e:e} > {tol:e}");
 }
 
-/// A three-frame chain `map -> odom -> base` with two dynamic edges, each with a
-/// series of samples published at `dt`-spaced stamps. Returns the tree plus the
-/// three frame ids.
+/// A `map -> odom -> base` chain of two dynamic edges with `dt`-spaced samples;
+/// returns the tree plus the three frame ids.
 pub struct Chain {
     pub tree: Tree,
     pub map: FrameId,
@@ -113,9 +107,8 @@ struct EdgeGt {
     poses: Vec<Iso3>,
 }
 
-/// A robot-shaped fixture (24-ish frames, mixed static + dynamic edges) with a
-/// naive ground-truth reference that composes edge poses without plan folding.
-/// This is the reference the plan-evaluation and folding proptests check against.
+/// A robot-shaped fixture (mixed static + dynamic edges) with a naive
+/// ground-truth reference composing edge poses without plan folding.
 pub struct Robot {
     pub tree: Tree,
     frames: Vec<(&'static str, FrameId)>,
@@ -142,7 +135,7 @@ impl Robot {
             "cam_opt",
         ];
 
-        // (child, parent, dynamic, pose-seed). Depth up to map->odom->base->cam_mount->cam->cam_opt.
+        // (child, parent, dynamic, pose-seed).
         let spec: &[(&str, &str, bool, u64)] = &[
             ("odom", "map", true, 1),
             ("base", "odom", true, 2),
@@ -154,7 +147,6 @@ impl Robot {
             ("cam_opt", "cam", false, 8),
         ];
 
-        // Declare the whole topology on the builder; the arena is sized from it.
         let mut builder = TreeBuilder::new();
         for &(child, parent, dynamic, seed) in spec {
             builder = if dynamic {
@@ -171,7 +163,6 @@ impl Robot {
             .collect();
         let id = |nm: &str| frames.iter().find(|(n, _)| *n == nm).unwrap().1;
 
-        // Record ground truth and publish samples onto the dynamic edges.
         let mut edges = Vec::new();
         for &(child, parent, dynamic, seed) in spec {
             let (c, p) = (id(child), id(parent));
@@ -212,8 +203,7 @@ impl Robot {
         self.frames.iter().map(|(_, f)| *f).collect()
     }
 
-    /// Ground-truth `T_root_frame` at sample index `i`, composed naively up the
-    /// parent chain (no plan folding).
+    /// Ground-truth `T_root_frame` at sample `i`, composed naively up the parents.
     #[must_use]
     pub fn root_transform(&self, frame: FrameId, i: usize) -> Iso3 {
         let mut chain: Vec<&EdgeGt> = Vec::new();

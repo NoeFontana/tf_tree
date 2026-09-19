@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""One release, one version — and every recipe a document names has to exist.
+"""One release, one version, and every recipe a document names has to exist.
 
-`just artifact-versions`. Checks properties of the *repository* that no test
-sees and that can be checked exactly: shipped text that contradicts the
-document it names as authoritative, or that no reader can see (e.g. table cells
-GFM deletes). Every rule was measured against the whole corpus first and
-narrowed until it had no false positive; the README status table is not checked
-because no cheap rule tells a stale row from a reworded true one.
+`just artifact-versions`. Checks exact properties of the *repository* that no
+test sees: shipped text contradicting the document it names as authoritative,
+or invisible to readers (e.g. table cells GFM deletes). The README status table
+is not checked; no cheap rule tells a stale row from a reworded true one.
 
 Run it from anywhere; it chdirs to the repository root.
 """
@@ -21,8 +19,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# `tomllib` is 3.11+ (the package's floor is py310, not this script's): report it
-# rather than a traceback.
+# `tomllib` is 3.11+: report it rather than a traceback.
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -35,15 +32,13 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The five crates this release publishes: the one literal not read from the repository,
-# because `publish` in a manifest is the authority a gate would otherwise compare to
-# itself.
+# The one literal not read from the repository: `publish` in a manifest would be
+# the gate comparing to itself.
 PUBLISHABLE = frozenset(
     {"tf_tree", "tf_tree_core", "tf_tree_math", "tf_tree_arena", "tf_tree_ipc"}
 )
 
-# Every file carrying a hand-kept copy of the version; each must yield at least one
-# site.
+# Every file carrying a hand-kept version; each must yield a site.
 VERSION_FILES = (
     "Cargo.toml",
     "pyproject.toml",
@@ -68,23 +63,20 @@ PACKAGE_XML_FILES = (
     "ros/tf_tree_bench_ros/package.xml",
 )
 
-# The manifests outside `[workspace]` cannot inherit `[workspace.package] version`, so
-# they spell it and are compared.
+# Outside `[workspace]`, so they spell the version and are compared.
 EXCLUDED_MANIFESTS = (
     "crates/tf_tree_py/Cargo.toml",
     "crates/tf_tree_tf2_sys/Cargo.toml",
 )
 
-# `project(<name> VERSION <v> ...)`, anchored on the keyword:
-# `cmake_minimum_required(VERSION 3.16)` precedes it.
+# `project(<name> VERSION <v> ...)`, anchored past `cmake_minimum_required`.
 PROJECT_VERSION_RE = re.compile(
     r"\bproject\s*\(\s*[A-Za-z0-9_]+\s+VERSION\s+([0-9][^\s)]*)"
 )
 
 failures: list[str] = []
 
-# Measurements, as opposed to verdicts: a `check_*` summary asserts its rule and is
-# withheld on failure; these print on every run.
+# Measurements, not verdicts: printed on every run.
 notes: list[str] = []
 
 
@@ -96,15 +88,13 @@ def note(message: str) -> None:
     notes.append(message)
 
 
-# One spelling of the `subprocess.run` boilerplate.
 def _git(*args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=ROOT, capture_output=True, text=True, check=True
     ).stdout
 
 
-# NUL-split so a path with a space survives; sorted; cached so two rules asking for
-# `*.md` see one corpus.
+# NUL-split so a path with a space survives; cached.
 @functools.cache
 def tracked(*globs: str) -> tuple[str, ...]:
     listed = _git("ls-files", "-z", *globs)
@@ -138,13 +128,7 @@ def local_crate_names() -> frozenset[str]:
 
 @functools.cache
 def tracked_lockfiles() -> tuple[str, ...]:
-    """Every tracked `Cargo.lock`, read out of git rather than listed here.
-
-    Generated, so they drift: cargo rewrites a path dependency's lock version
-    silently, and nothing builds the excluded crates `--locked`
-    (`crates/tf_tree_tf2_sys/Cargo.lock` sat at `0.0.1` for four releases).
-    Derived so a fourth lockfile cannot fall outside the gate.
-    """
+    """Every tracked `Cargo.lock`, read out of git rather than listed here."""
     found = tracked("*Cargo.lock")
     if not found:
         fail("no tracked Cargo.lock found; the scan is broken")
@@ -154,15 +138,13 @@ def tracked_lockfiles() -> tuple[str, ...]:
 def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
     """(file, where-in-it, value) for every hand-kept version in the repo.
 
-    TOML and `package.xml` are parsed, not grepped: comments above the field
-    quote versions and would be read as sites.
+    TOML and `package.xml` are parsed, not grepped, so comments are not sites.
     """
     sites: list[tuple[str, str, str]] = []
 
     root = load_toml("Cargo.toml")
 
-    # The intra-workspace pins: a publishable crate wired by path alone is
-    # unpublishable, so a missing pin is its own failure.
+    # Intra-workspace pins: a publishable crate wired by path alone is unpublishable.
     for name, dep in sorted(root["workspace"]["dependencies"].items()):
         if not isinstance(dep, dict):
             continue
@@ -207,8 +189,6 @@ def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
     )
 
     for rel in CMAKE_FILES:
-        # Comment lines stripped (as `evidence-audit.sh` does): the comment above
-        # `project()` quotes a version.
         body = "\n".join(
             line.split("#", 1)[0] for line in (ROOT / rel).read_text().splitlines()
         )
@@ -222,17 +202,13 @@ def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
         sites.append((rel, "project(... VERSION ...)", found[0]))
 
     for rel in PACKAGE_XML_FILES:
-        # ElementTree drops comments, so the note above the tag is not a site.
         version = ET.fromstring((ROOT / rel).read_text()).findtext("version")
         if version is None:
             fail(f"{rel}: no <version> element")
             continue
         sites.append((rel, "<version>", version.strip()))
 
-    # A lockfile lists every package in the graph, so entries are filtered by name
-    # (packages this repository defines) and by the absence of `source` (a path
-    # package). A path `[patch]` to another checkout has no `source` key, so it is
-    # read as ours and compared.
+    # Filtered by name (packages we define) and by no `source` (a path package).
     ours = local_crate_names()
     for rel in tracked_lockfiles():
         for package in load_toml(rel).get("package", []):
@@ -253,7 +229,7 @@ def check_versions() -> str:
     covered = {file for file, _, _ in sites}
     for rel in VERSION_FILES + tracked_lockfiles():
         if rel == "Cargo.toml":
-            continue  # its own [workspace.package] version is the authority
+            continue
         if rel not in covered:
             fail(
                 f"{rel}: no version site found. Either the file stopped carrying one "
@@ -272,17 +248,13 @@ def check_versions() -> str:
                 f"is hand-kept."
             )
 
-    # `covered`, not `len(VERSION_FILES)`: the root `Cargo.toml` is both authority and
-    # carrier.
     return (
         f"{len(sites)} version sites in {len(covered)} files all read "
         f"{authority} — the root Cargo.toml's [workspace.package] version"
     )
 
 
-# ---------------------------------------------------------------------------
 # 2. The release publishes exactly the crates it says it publishes.
-# ---------------------------------------------------------------------------
 
 
 def check_publishable(authority: str) -> str:
@@ -295,8 +267,7 @@ def check_publishable(authority: str) -> str:
     ).stdout
     packages = json.loads(out)["packages"]
 
-    # `publish = false` is an empty allow-list, "anywhere" is null; a registry
-    # allow-list reads as not-publishable (the safe direction).
+    # `publish = false` is an empty allow-list; a registry list reads as unpublishable.
     publishable = {p["name"] for p in packages if p.get("publish") is None}
 
     if publishable != set(PUBLISHABLE):
@@ -331,9 +302,7 @@ def check_publishable(authority: str) -> str:
     return f"the publishable set is exactly {', '.join(sorted(PUBLISHABLE))}"
 
 
-# ---------------------------------------------------------------------------
 # 3. The changelog has an entry for the version being released.
-# ---------------------------------------------------------------------------
 
 
 def check_changelog(authority: str) -> str:
@@ -351,21 +320,14 @@ def check_changelog(authority: str) -> str:
     return f"CHANGELOG.md has a section for {authority}"
 
 
-# ---------------------------------------------------------------------------
 # 4. Every `just <recipe>` a maintained document or a workflow names exists.
-# ---------------------------------------------------------------------------
 
-# A recipe name: lowercase, digits, hyphens. Anything else in the argument
-# position (a flag, a glob like `just py-*`, a metavariable, a token carrying a
-# trailing backtick) is deliberately not checked.
-#
-# Skipped real reference: `.github/workflows/nightly.yml`'s `just ${{ matrix.recipe }}`
-# (`tsan`, `shm-torture-asan`); both are named in the maintained documents and
-# checked by the doc arm.
+# A recipe name: lowercase, digits, hyphens. Flags, globs, metavariables and
+# tokens with a trailing backtick are deliberately not checked. Skipped:
+# nightly.yml's `just ${{ matrix.recipe }}`, which the doc arm covers.
 RECIPE_TOKEN_RE = re.compile(r"[a-z][a-z0-9-]*")
 
-# Root markdown, the phase specs and the benchmark register. `docs/decisions/` is
-# out: a dated record must not be edited for a recipe rename.
+# Root markdown, the phase specs and the benchmark register; not `docs/decisions/`.
 DOC_GLOBS = ("*.md", "docs/*.md", "docs/benchmarks/*.md")
 
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
@@ -374,11 +336,10 @@ JUST_CALL_RE = re.compile(r"\bjust\s+(\S+)")
 
 
 def code_spans(markdown: str) -> list[tuple[int, str]]:
-    """(offset, text) for every fenced block and inline code span — and nothing else.
+    """(offset, text) for every fenced block and inline code span.
 
-    Prose is excluded: "just build it" is English, `just build` is a claim.
-    Offsets index the original document; fences are blanked to spaces (same
-    length) before the inline pass so line numbers stay right.
+    Prose is excluded ("just build it" is English). Fences are blanked before
+    the inline pass so offsets stay right.
     """
     spans = [(m.start(1), m.group(1)) for m in FENCE_RE.finditer(markdown)]
     blanked = FENCE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), markdown)
@@ -389,9 +350,7 @@ def code_spans(markdown: str) -> list[tuple[int, str]]:
 def blank_code(markdown: str, *, fences: bool = True) -> str:
     """`code_spans`' inverse: the document with its code blanked to spaces.
 
-    Same length, newlines kept. The flag chooses whether *fenced* blocks are
-    blanked: a link in a ```sh``` block is not a link, but a version in a fence
-    on a front page is the claim that check looks for.
+    The flag chooses whether fenced blocks are blanked.
     """
     blanked = FENCE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), markdown)
     keep = blanked if fences else markdown
@@ -413,7 +372,6 @@ def check_recipe_references() -> str:
 
     doc_checked = 0
     doc_files = sorted({p for glob in DOC_GLOBS for p in ROOT.glob(glob)})
-    # Sorted: `code_spans` yields fences first, then inline spans.
     doc_findings: list[tuple[str, int, str]] = []
     for path in doc_files:
         rel = path.relative_to(ROOT)
@@ -435,8 +393,7 @@ def check_recipe_references() -> str:
                     doc_findings.append((str(rel), line, message))
     for _, _, message in sorted(doc_findings):
         fail(message)
-    # Anti-vacuity, in the shape siblings use (`if not X`, never a magnitude): catches
-    # a scan that stopped matching.
+    # Anti-vacuity: catches a scan that stopped matching.
     if not doc_files:
         fail(f"DOC_GLOBS {DOC_GLOBS} matched no document; this check scanned nothing")
     if not doc_checked:
@@ -447,7 +404,6 @@ def check_recipe_references() -> str:
         )
 
     wf_checked = 0
-    # Both `.yml` and `.yaml`.
     workflows = sorted(
         {
             p
@@ -458,7 +414,6 @@ def check_recipe_references() -> str:
     for path in workflows:
         rel = path.relative_to(ROOT)
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            # Inline `#` truncates the line: may hide a reference, cannot invent one.
             for match in JUST_CALL_RE.finditer(line.split("#", 1)[0]):
                 token = match.group(1)
                 if not RECIPE_TOKEN_RE.fullmatch(token):
@@ -489,42 +444,25 @@ def check_recipe_references() -> str:
     )
 
 
-# ---------------------------------------------------------------------------
 # 5. Every Markdown table row has as many cells as its header.
-# ---------------------------------------------------------------------------
 #
-# GFM truncates a row to the header's width and says nothing, so a cell past the
-# last column is deleted invisibly (#208). Rows with too few cells are reported
-# too. The splitter is escape-aware (`\|` is legitimate in a cell). A false
-# positive blocks a correct document, so three constructions GFM does not render
-# as tables are guarded:
-#
-#   * a setext H2 (prose containing `|`, then a bare `---`): a delimiter row must
-# contain a `|`;
-#   * a 4-space-indented code block: the threshold is four past the innermost
-#     open list item's content, not the margin (`docs/decisions/0005`);
-#   * an HTML comment, through `-->`.
+# GFM silently deletes cells past the header's width (#208). Three constructions
+# GFM does not render as tables are guarded: a setext H2 (a delimiter row must
+# contain a `|`), a 4-space-indented code block (four past the innermost list
+# item's content, `docs/decisions/0005`), and an HTML comment.
 
-# A delimiter cell: `---`, `:--`, `--:`, `:-:`, any width.
 TABLE_DELIM_CELL_RE = re.compile(r"^\s*:?-+:?\s*$")
 
-# Only ``` and ~~~ fences, up to three leading spaces, as CommonMark has it.
 MD_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
 
-# A list marker (moves the indented-code threshold).
 LIST_MARKER_RE = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])(\s+)")
 
-# A blockquote marker, possibly nested, stripped first: tables inside `>` blocks render
-# and truncate like any other.
+# A blockquote marker, possibly nested, stripped first.
 QUOTE_PREFIX_RE = re.compile(r"^\s*(?:>\s?)+")
 
 
 def table_cells(line: str) -> list[str]:
-    r"""Split a table row on unescaped `|`, the way GFM does.
-
-    A backslash consumes the next character, so `\|` stays in its cell; the empty
-    edge cells from leading and trailing pipes are dropped.
-    """
+    r"""Split a table row on unescaped `|`, as GFM does."""
     cells: list[str] = []
     current: list[str] = []
     i = 0
@@ -549,10 +487,7 @@ def table_cells(line: str) -> list[str]:
 
 
 def strip_html_comments(line: str, inside: bool) -> tuple[str, bool]:
-    """Drop `<!-- ... -->` spans, carrying the open/closed state across lines.
-
-    Returns what is left of the line and whether a comment is still open.
-    """
+    """Drop `<!-- ... -->` spans, carrying open/closed state across lines."""
     kept: list[str] = []
     i = 0
     while i < len(line):
@@ -576,9 +511,8 @@ def strip_html_comments(line: str, inside: bool) -> tuple[str, bool]:
 def parsed_lines(text: str) -> list[str]:
     """Blank every line GFM will not read as Markdown, keeping line numbers.
 
-    Fenced code, HTML comments and indented code come back empty, which also ends
-    a table. The indented-code threshold is four spaces past the innermost open
-    list item's content indent (`docs/decisions/0005` has a table inside a list item).
+    The indented-code threshold is four past the innermost open list item's
+    content indent (`docs/decisions/0005`).
     """
     out: list[str] = []
     fenced = False
@@ -612,12 +546,9 @@ def parsed_lines(text: str) -> list[str]:
 
 
 def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
-    """(tables, body rows, findings) — findings are (line, found, expected, row).
+    """(tables, body rows, findings); findings are (line, found, expected, row).
 
-    A table is a header line plus a delimiter line of the same width that
-    **carries a `|`** (else it is a setext heading). Fences, HTML comments and
-    indented code are skipped. Counts come back so a matcher that stopped
-    matching cannot report a clean corpus.
+    A table is a header plus a same-width delimiter line carrying a `|`.
     """
     lines = parsed_lines(text)
     findings: list[tuple[int, int, int, str]] = []
@@ -628,7 +559,6 @@ def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
         if "|" not in lines[i] or i + 1 >= len(lines):
             i += 1
             continue
-        # A delimiter cell holds no backslash, so a plain `in` is "an unescaped pipe".
         if "|" not in lines[i + 1]:
             i += 1
             continue
@@ -638,7 +568,6 @@ def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
             continue
         header = table_cells(lines[i])
         tables += 1
-        # A delimiter row that does not match its header: GFM renders no table.
         if len(header) != len(delim):
             findings.append((i + 2, len(delim), len(header), lines[i + 1]))
         j = i + 2
@@ -653,11 +582,7 @@ def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
 
 
 def check_markdown_tables() -> str:
-    """**Every tracked Markdown file**, `docs/decisions/` included.
-
-    Wider than the recipe scan: a ragged row is a defect the document had on the
-    day it was written, not a rename a dated record should not track.
-    """
+    """**Every tracked Markdown file**, `docs/decisions/` included."""
     files = tracked("*.md")
     if not files:
         fail("`git ls-files '*.md'` listed nothing; this check would pass trivially")
@@ -670,7 +595,6 @@ def check_markdown_tables() -> str:
         tables += found_tables
         rows += found_rows
         for lineno, found, expected, row in findings:
-            # Too many cells deletes; too few is a table somebody stopped counting.
             why = (
                 "GFM drops every cell past the header count and warns nobody, "
                 "so what is written past the last column renders as nothing at "
@@ -697,18 +621,14 @@ def check_markdown_tables() -> str:
     )
 
 
-# `](target` — an inline link's destination up to the first whitespace or `)`.
-# Reference definitions are out of scope.
+# `](target`: an inline link's destination up to the first whitespace or `)`.
 MD_LINK_RE = re.compile(r"\]\(\s*([^)\s]+)")
 
 
 def check_relative_links() -> str:
     """Every relative Markdown link resolves to a file that exists.
 
-    Code is blanked first, fences included (unlike `check_front_page_versions`):
-    a path in a ```sh``` block is an argument. Anchors are not checked; a
-    `#fragment` is stripped before resolving. The floor fails a scan that matched
-    nothing.
+    Code is blanked first, fences included; `#fragment`s are stripped, not checked.
     """
     files = tracked("*.md")
 
@@ -718,7 +638,6 @@ def check_relative_links() -> str:
         prose = blank_code(text)
         for hit in MD_LINK_RE.finditer(prose):
             target = hit.group(1)
-            # A scheme before the first `/`, or a bare in-page anchor: not a file.
             head = target.split("/", 1)[0]
             if ":" in head or target.startswith("#"):
                 continue
@@ -753,13 +672,9 @@ PROSE_VERSION_RE = re.compile(r"\bv?[0-9]+\.[0-9]+\.[0-9]+\b")
 def check_front_page_versions() -> str:
     """No three-component version literal in prose on a crates.io front page.
 
-    Each crate's front page is named by its manifest's `readme`; the root
-    `README.md` is also checked (PyPI's, per `pyproject.toml`). A crate or
-    project with no `readme` key fails. Inline code is exempt (the defect was
-    bold text); fenced blocks stay in scope. A regression guard: no page makes a
-    live version claim today.
+    Pages come from each manifest's `readme` (plus the root `README.md`, PyPI's);
+    a missing `readme` key fails. Inline code is exempt; fences stay in scope.
     """
-    # (index name, front page) for the five crates.io pages, then the PyPI one.
     pages: list[tuple[str, str]] = []
     for name in sorted(PUBLISHABLE):
         manifest = f"crates/{name}/Cargo.toml"
@@ -789,7 +704,6 @@ def check_front_page_versions() -> str:
     for name, rel in pages:
         text = (ROOT / rel).read_text(encoding="utf-8")
 
-        # Blank inline code, keep prose and fences (see `blank_code`'s flag).
         prose = blank_code(text, fences=False)
 
         for hit in PROSE_VERSION_RE.finditer(prose):
@@ -815,9 +729,8 @@ def check_front_page_versions() -> str:
 def check_distribution_name() -> str:
     """The PyPI distribution name, wherever it is written by hand.
 
-    It is not the import name: the distribution is `transform_tree`, the module
-    stays `tf_tree` (`docs/decisions/0008`). `importlib.metadata.version(...)` and
-    wheel globs take the distribution name.
+    The distribution is `transform_tree`; the module stays `tf_tree`
+    (`docs/decisions/0008`).
     """
     dist = load_toml("pyproject.toml")["project"]["name"]
 
@@ -831,7 +744,6 @@ def check_distribution_name() -> str:
             )
 
     justfile = Path("justfile").read_text(encoding="utf-8")
-    # Executable lines only: a comment may quote a historical filename.
     stale = [
         line.strip()
         for line in justfile.splitlines()
@@ -851,18 +763,15 @@ DECISION_SETTLED_VERB = re.compile(
     r"[*_`]{0,2}\s+by\s+[*_`]{0,2}\[?[*_`]{0,2}(\d{4})[*_`]{0,2}\]?"
 )
 
-# Leading continuation markers stripped before joining, so a citation split across a
-# blockquote or `//!` block is seen.
+# Continuation markers stripped before joining, so a split citation is seen.
 _CONTINUATION = re.compile(r"^\s*(?:>|//!|///|//|#)+\s?")
 
 
 def check_decision_status_citations() -> str:
     """A `draft` decision record may not be cited as settled.
 
-    A draft authorises nothing (`docs/decisions/README.md`). Matches
-    `<verb> by <NNNN>` after normalising continuation markers and Markdown
-    emphasis. Does NOT see a verb after the link, a dash form or bare adjacency;
-    those stay held by review.
+    Matches `<verb> by <NNNN>` after normalising continuation markers and
+    emphasis; a verb after the link, a dash form or bare adjacency is review's.
     """
     statuses: dict[str, str] = {}
     for path in sorted((ROOT / "docs" / "decisions").glob("0*.md")):
@@ -883,15 +792,13 @@ def check_decision_status_citations() -> str:
 
     settled = 0
     for rel in files:
-        # A record may discuss its own state only; the skip is per match, against this
-        # file's own id.
+        # A record may discuss its own state; the skip is per match.
         own = rel.rsplit("/", 1)[-1][:4] if rel.startswith("docs/decisions/") else None
         try:
             raw = (ROOT / rel).read_text(encoding="utf-8").splitlines()
         except (UnicodeDecodeError, OSError):
             continue
-        # Join into one normalised string, keeping an offset -> line-number map
-        # so a finding can be printed as file:line.
+        # Join into one normalised string with an offset -> line-number map.
         parts, offsets, pos = [], [], 0
         for n, line in enumerate(raw, 1):
             piece = _CONTINUATION.sub("", line).strip()
@@ -919,7 +826,6 @@ def check_decision_status_citations() -> str:
             else:
                 settled += 1
 
-    # Anti-vacuity floor, set just under the live count; raise it with the count.
     floor = 25
     if settled < floor:
         fail(
@@ -934,12 +840,9 @@ def check_decision_status_citations() -> str:
     )
 
 
-# ---------------------------------------------------------------------------
 # 10. The changelog is not behind the code a user can observe.
-# ---------------------------------------------------------------------------
 
-# Paths whose contents reach somebody who never clones this repository (shipping inside
-# something counts, not `publish = false`).
+# Paths reaching somebody who never clones this repository.
 RELEASE_VISIBLE = (
     "crates/tf_tree/src/",
     "crates/tf_tree_arena/src/",
@@ -953,26 +856,20 @@ RELEASE_VISIBLE = (
     "crates/tf_tree_ingest/src/",
     "crates/tf_tree_py/src/",
     "python/",
-    # A `find_package(tf_tree CONFIG)` consumer installs these; `cmake-check`
-    # exists because three packaging defects hid in them.
+    # `cmake-check` exists for defects hiding in the installed package.
     "crates/tf_tree_c/CMakeLists.txt",
     "crates/tf_tree_c/cmake/",
-    # The rclcpp bridge node ROS users build against. #322 touched only `ros/`.
     "ros/",
 )
 
-# Reported in the summary line: a silently unfailable override is what `0023` step 5 is
-# about.
+# Reported in the summary line (`0023` step 5).
 NO_CHANGELOG = "[no changelog]"
 
 
 def strip_fenced_blocks(text: str) -> tuple[str, bool]:
-    """Blank fenced code blocks, recognising a fence only at the start of a line.
+    """Blank fenced code blocks, recognising a fence only at a line start.
 
-    A triple backtick inside an inline span is not a fence (a regex spelling
-    inverted the pairing for the rest of the file). A fence inside a blockquote
-    counts. An unclosed fence is reported through the returned flag, so the
-    caller does not read the blanked tail as shed citations.
+    An unclosed fence is reported through the returned flag.
     """
     out: list[str] = []
     opened = 0
@@ -982,8 +879,7 @@ def strip_fenced_blocks(text: str) -> tuple[str, bool]:
             stripped = stripped[1:].lstrip()
         run = len(stripped) - len(stripped.lstrip("`"))
         if run >= 3:
-            # CommonMark: a fence closes only on a run at least as long as the one that
-            # opened it.
+            # A fence closes only on a run at least as long as its opener.
             if opened == 0:
                 opened = run
                 out.append("")
@@ -999,11 +895,9 @@ def strip_fenced_blocks(text: str) -> tuple[str, bool]:
 def check_line_citations() -> str:
     """`path.rs:LINE` citations in Markdown may not increase, per file.
 
-    A ratchet: existing citations are grandfathered per file in
-    `scripts/line-citation-budget.txt`, each row an equality (over or under
-    fails), and the count may only fall. Cite a symbol instead. The pattern sees
-    only the prefixed form (`crates/`, `xtask/`, `scripts/`, `ros/`); both totals
-    print on every run. Fenced blocks are excluded, code spans are not.
+    A ratchet over `scripts/line-citation-budget.txt`, each row an equality. The
+    pattern sees only the prefixed form (`crates/`, `xtask/`, `scripts/`, `ros/`).
+    Fenced blocks are excluded, code spans are not.
     """
     budget_path = "scripts/line-citation-budget.txt"
     budget: dict[str, int] = {}
@@ -1018,8 +912,7 @@ def check_line_citations() -> str:
     )
     files = tracked("*.md")
     found: dict[str, int] = {}
-    # The same citation with the prefix optional (the form `CLAUDE.md` names), counted
-    # in the same pass.
+    # The same citation with the prefix optional, counted in the same pass.
     bare = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|py):\d+")
 
     total = 0
@@ -1051,7 +944,6 @@ def check_line_citations() -> str:
                 f"message cannot give you."
             )
 
-    # A file with an unclosed fence reports a partial count; it already fails above.
     dropped = sorted(
         (rel, budget[rel], found.get(rel, 0))
         for rel in budget
@@ -1059,9 +951,7 @@ def check_line_citations() -> str:
     )
     gone = sorted(rel for rel, _, _ in dropped if rel not in files)
 
-    # An empty scan is not a pass: the equality above fails when the pattern stops
-    # matching. Assert the pattern's shape: it matches the prefixed form and not the
-    # bare form (the documented scope limit).
+    # Assert the pattern's shape: prefixed form matches, bare form does not.
     if not pattern.search("see `crates/tf_tree/src/tree.rs:2182` for it"):
         fail(
             "the `path.rs:LINE` pattern no longer matches a full-path citation; "
@@ -1074,12 +964,10 @@ def check_line_citations() -> str:
             "the rows must be re-derived in the same commit"
         )
 
-    # A drop is a failure, not a note: a row must be brought down in the commit that
-    # shed the citations.
+    # A drop is a failure: lower the row in the commit that shed the citations.
     if dropped:
         shed = sum(was - now for _, was, now in dropped)
         listed = ", ".join(f"{rel} {was}->{now}" for rel, was, now in dropped)
-        # Two remedies: a row for a file that no longer exists has nothing to lower.
         remedy = f"lower them in {budget_path} in the same commit"
         if gone:
             remedy += (
@@ -1093,8 +981,6 @@ def check_line_citations() -> str:
             f"from here. {remedy}: {listed}. A row above its file is headroom "
             f"for a citation nobody had to justify."
         )
-    # The uncounted half is printed, not written down; `bare` is a superset of
-    # `pattern`.
     if wider < total:
         fail(
             f"the wider citation census counted {wider} against the gated "
@@ -1106,8 +992,7 @@ def check_line_citations() -> str:
             "the wider census pattern no longer matches a bare citation; the "
             "figure it prints is asserting nothing"
         )
-    # A file whose fence never closed is read only to the fence, so both totals are
-    # partial.
+    # An unclosed fence makes both totals partial.
     partial = (
         f" — PARTIAL: {len(unreadable)} file(s) were read only as far as an "
         f"unclosed fence, so both totals are short"
@@ -1130,11 +1015,9 @@ def check_line_citations() -> str:
 def check_changelog_freshness() -> str:
     """`CHANGELOG.md` must not sit behind a release-visible commit.
 
-    An ordering, not a per-commit rule: no commit since the last `v*` tag
-    touching a shipped path may land after the newest `CHANGELOG.md` commit. A
-    dirty `CHANGELOG.md` counts as current. Does NOT prove the entries are
-    correct, only that the file was edited after the last observable change.
-    Reads paths, not diffs; reports *not checked* without a `v*` tag.
+    No commit since the last `v*` tag touching a shipped path may land after the
+    newest `CHANGELOG.md` commit; a dirty one counts as current. Reads paths, not
+    diffs; reports *not checked* without a `v*` tag.
     """
     try:
         tag = _git("describe", "--tags", "--abbrev=0", "--match", "v*", "HEAD").strip()
@@ -1146,8 +1029,7 @@ def check_changelog_freshness() -> str:
     if not order:
         return f"changelog freshness: no commits since {tag}"
 
-    # One walk, two answers: `--name-only` with an empty format prints the hash ahead
-    # of that commit's paths.
+    # One walk: `--name-only` with an empty format prints the hash before the paths.
     newest: dict[str, str] = {}
     touches_visible: set[str] = set()
     current = ""
@@ -1184,7 +1066,6 @@ def check_changelog_freshness() -> str:
             "and counts as current"
         )
 
-    # Read from the walk above: `git show` on a merge prints no paths.
     cut = order[changelog] if changelog is not None else len(order)
     waived, owed = [], []
     for h, i in sorted(order.items(), key=lambda kv: kv[1]):
@@ -1221,8 +1102,7 @@ def check_changelog_freshness() -> str:
 def main() -> int:
     authority = load_toml("Cargo.toml")["workspace"]["package"]["version"]
 
-    # A check's summary sentence asserts its rule, so it is withheld when the check
-    # added a failure (snapshot of `failures` around each call).
+    # A summary sentence asserts its rule, so it is withheld when the check failed.
     lines: list[str] = []
     for call in (
         check_versions,
@@ -1243,12 +1123,10 @@ def main() -> int:
             lines.append(summary)
 
     if failures:
-        # A failing run prints the measurements (`notes`) and the surviving verdicts; a
-        # failed check loses its summary.
+        # A failing run prints the notes and surviving verdicts.
         for line in [*lines, *notes]:
             print(f"artifact-versions: {line}")
-        # stdout is block-buffered under a pipe, so flush before the failure block on
-        # stderr.
+        # Flush stdout before the stderr failure block (block-buffered under a pipe).
         sys.stdout.flush()
         print(
             "artifact-versions: the repository disagrees with itself.\n",

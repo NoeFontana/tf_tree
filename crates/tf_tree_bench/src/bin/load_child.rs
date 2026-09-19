@@ -1,37 +1,16 @@
 //! One reader or writer process for the contended-scaling harness, selected by
-//! argv; **the two reach the arena by different routes**:
+//! argv.
 //!
-//! * `reader` attaches read-only to the segment handed over on stdin (`shm_util`)
-//!   and makes two passes over one query set, because `docs/PHASE1.md` §11.2 asks
-//!   for both aggregate throughput and per-lookup p99.9.
-//! * `writer` **joins through the rendezvous** (`tf_tree::Open`), claims one edge
-//!   and publishes at its rate for the window.
+//! * `reader` attaches read-only to the segment on stdin (`shm_util`) and makes
+//!   throughput, service and cycle passes (`docs/PHASE1.md` §11.2).
+//! * `writer` joins through the rendezvous (`tf_tree::Open`), claims one edge and
+//!   publishes at its rate; a read-write attach over a bare descriptor is refused
+//!   (`docs/decisions/0028` step 0b). The join precedes the rate loop and is
+//!   reported as `join_ns`.
 //!
-//! # Why the writer does not use the reader's descriptor
-//!
-//! `docs/decisions/0028` step 0b: `Tree::attach_shared(fd, AttachMode::ReadWrite)`
-//! returns `ShmError::ReadWriteNeedsRendezvous`; a bare descriptor has no lock
-//! file for the byte that decides reclaim, so the record would be indistinguishable
-//! from a slot leaked by a killed process. The join happens before the writer's
-//! clock and `ProcStats` baseline, so the rate loop is unchanged; its cost is
-//! reported as `join_ns`.
-//!
-//! # Why two reader passes
-//!
-//! Per-lookup clock reads cost ~20 ns (`src/bin/tf2_scaling.rs`) against a ~100 ns
-//! operation. The throughput pass times whole batches with no clock in the loop;
-//! only the latency pass pays per-op timestamps and reports that cost
-//! (`clock_overhead_ns`). The window is split between the passes and writers run
-//! across both.
-//!
-//! # Why a reader is a process
-//!
-//! Per-thread pinning needs `sched_setaffinity`, an OS-boundary `unsafe` for
-//! placement only, which `docs/decisions/0007` rule 1 does not admit. `taskset -c N`
-//! places a process with no `unsafe`, closer to a deployment. The coordinator does
-//! the placing.
-//!
-//! Output is a line protocol on stdout; usage errors go to stderr.
+//! A reader is a process so `taskset` can place it without `unsafe`
+//! (`docs/decisions/0007` rule 1). Output is a line protocol on stdout; usage
+//! errors go to stderr.
 // `panic!` is allowed: every use names the frame, pair or edge that failed.
 #![allow(
     clippy::unwrap_used,
@@ -66,7 +45,7 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
-/// The reader's route in: the segment arrives on stdin, mapped read-only.
+/// The segment arrives on stdin, mapped read-only.
 fn attach_read_only() -> Tree {
     let fd = std::io::stdin()
         .as_fd()
@@ -75,18 +54,8 @@ fn attach_read_only() -> Tree {
     Tree::attach_shared(fd, AttachMode::ReadOnly).expect("attach to the shared arena")
 }
 
-/// The writer's route in: the rendezvous, which grants a participant slot and
-/// takes its lock byte. Returns the tree and the join cost in nanoseconds.
-///
-/// `CreatePolicy::Never`: the coordinator created and serves the arena.
-///
-/// `await_open`, not `open`: writers race the coordinator's owner thread, and
-/// `Open::open` is a single attempt (`DEFAULT_OPEN_TIMEOUT`, 5 s) whose failure would
-/// take the sweep down. `await_open` retries only `is_retryable` errors
-/// (`ArenaAbsent`, `ArenaHeldButUnreachable`); anything else is terminal at once.
-/// The bound is [`WRITER_SLACK_S`], the margin the coordinator sized for late
-/// writers: a later join leaves reader rows against a quiescent tree. A real join
-/// takes ~133 us (`docs/decisions/0028`).
+/// Joins through the rendezvous; returns the tree and the join cost in ns.
+/// `await_open` retries only retryable errors, bounded by [`WRITER_SLACK_S`].
 fn join_read_write(arena: &str) -> (Tree, u64) {
     let start = Instant::now();
     let tree = tf_tree::Open::new()
@@ -142,13 +111,12 @@ fn reader(args: &[String]) {
         })
         .collect();
 
-    // Stamps sweep the whole retained window (`read_scaling.rs`): a collapsed sweep
-    // is a degenerate best case for a contention benchmark.
+    // Sweep the whole retained window; a collapsed sweep is a degenerate best case.
     let stamps: Vec<i64> = (0..STAMP_STEPS)
         .map(|k| lo + (hi - lo) * k as i64 / STAMP_STEPS as i64)
         .collect();
 
-    // Warm plans and pages first; first-touch is `docs/PHASE2.md` §7.1's.
+    // Warm plans and pages first (`docs/PHASE2.md` §7.1).
     {
         let guard = tree.guard();
         for p in &plans {
@@ -181,8 +149,7 @@ fn reader(args: &[String]) {
 /// Distinct stamps a reader sweeps across the retained window.
 const STAMP_STEPS: usize = 1024;
 
-/// Closed loop, no clock inside: §11.2's aggregate throughput. Returns
-/// `(lookups, elapsed_ns, declined)`; the clock is read once per `BATCH`.
+/// Closed loop, one clock read per batch. Returns `(lookups, elapsed_ns, declined)`.
 fn throughput_pass(
     tree: &Tree,
     plans: &[Plan],
@@ -196,8 +163,6 @@ fn throughput_pass(
     let mut acc = 0.0f64;
 
     while start.elapsed() < window {
-        // One guard per batch, as a node in a burst and `docs/PHASE5.md`'s
-        // convenience-path guard reuse rule.
         let guard = tree.guard();
         for _ in 0..BATCH {
             let stamp: Stamp = Stamp::from_nanos(stamps[k % stamps.len()]);
@@ -214,11 +179,8 @@ fn throughput_pass(
     (ops, start.elapsed().as_nanos() as u64, declined)
 }
 
-/// Dense, one clock pair per lookup: **§11.2's per-lookup p99.9**. Returns
-/// `(histogram, declined, attempted)`. Deliberately not rate limited: an open-loop
-/// schedule measures the OS deciding to run you (`src/mp.rs`), and a two-engine
-/// comparison belongs in this column. `clock_overhead_ns` is in every sample and
-/// reported so it can be subtracted.
+/// Dense, one clock pair per lookup, not rate limited. Returns
+/// `(histogram, declined, attempted)`; `clock_overhead_ns` is in every sample.
 fn service_pass(
     tree: &Tree,
     plans: &[Plan],
@@ -231,7 +193,6 @@ fn service_pass(
     let mut k = 0usize;
     let mut acc = 0.0f64;
 
-    // The elapsed check is hoisted: it is itself a clock read.
     while start.elapsed() < window {
         let guard = tree.guard();
         for _ in 0..256 {
@@ -251,9 +212,7 @@ fn service_pass(
     (hist, declined, attempted)
 }
 
-/// Open loop at `hz`, measured from each tick's **intended** time (what a node
-/// experiences); a closed loop hides stalls (coordinated omission, `src/mp.rs`).
-/// Mostly measures scheduler wakeup, reported next to the service distribution.
+/// Open loop at `hz`, measured from each tick's intended time (`src/mp.rs`).
 fn cycle_pass(
     tree: &Tree,
     plans: &[Plan],
@@ -285,8 +244,7 @@ fn cycle_pass(
     (hist, declined)
 }
 
-/// What one `Instant::now()` pair costs on this host, in nanoseconds; hundreds
-/// without a vDSO `clock_gettime`, which would look like a slow engine.
+/// Cost of one `Instant::now()` pair, in nanoseconds.
 fn clock_overhead() -> u64 {
     let start = Instant::now();
     for _ in 0..CLOCK_CALIBRATION_ITERS {
@@ -327,7 +285,6 @@ fn writer(args: &[String]) {
 
     let before = ProcStats::read();
     while start.elapsed() < window {
-        // Open loop: a writer that falls behind publishes the schedule it owes.
         let _due = rate.next_due();
         match w.push(stamp, &fixture::dynamic_pose(seed, stamp)) {
             Ok(()) => pushed += 1,
@@ -338,10 +295,8 @@ fn writer(args: &[String]) {
     let after = ProcStats::read();
     let d = after.since(before);
 
-    // Before `pushed`, so a writer that dies mid-window still reports its join cost.
     println!("join_ns {join_ns}");
     println!("pushed {pushed}");
-    // Reported, not swallowed: rejected pushes mean a row against a quiescent tree.
     println!("rejected {rejected}");
     println!("cpu_ns {}", d.cpu_ns);
     println!("pss_kib {}", d.pss_kib);

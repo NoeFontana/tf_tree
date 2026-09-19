@@ -1,6 +1,5 @@
-# Every job wraps a `just` recipe; a job that re-spells a recipe's lines drifts from it.
-# A green check covers only what the jobs cover: timing recipes are gated by hand on
-# a host. The aarch64 rows are execution, not a weak-memory proof (`just loom` is the argument).
+# Every job wraps a `just` recipe. A green check covers only what the jobs cover;
+# timing recipes are gated by hand. The aarch64 rows are execution, not a proof.
 name: CI
 
 on:
@@ -16,16 +15,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # `just lint` is the recipe list (no count is kept here). It depends on
-  # `no-build-output`, `no-conflict-markers`, `py-compile`, `evidence-audit`,
-  # `artifact-versions` (pure text checks, no job of their own) and `sbom`
-  # (checks nothing; exercises `scripts/sbom.py` before a release does).
-  # `just audit` runs `cargo deny` with `deny.toml`.
+  # `just lint` runs its dependency recipes (the text checks have no job of their
+  # own); `just audit` runs `cargo deny`.
   lint:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      # Full history and tags: `artifact-versions`' changelog-freshness rule uses `git describe`.
+      # Full history and tags for `artifact-versions` (`git describe`).
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -41,9 +37,8 @@ jobs:
       - name: just audit
         run: just audit
 
-  # The MSRV floor (`SUPPORT.md`, `docs/PHASE5.md` §10). The version is read from
-  # the manifest and installed so `just msrv` (`cargo +<floor>`, which beats
-  # `rust-toolchain.toml`) can find it; the recipe fails rather than fall back to stable.
+  # The MSRV floor (`SUPPORT.md`, `docs/PHASE5.md` §10), read from the manifest and
+  # installed for `just msrv`.
   msrv:
     name: msrv
     runs-on: ubuntu-latest
@@ -65,10 +60,8 @@ jobs:
       - name: just msrv
         run: just msrv
 
-  # `tf_tree_py` is outside the workspace, so `cargo clippy --workspace` never
-  # compiles it. The facade gates its shared-arena surface on `shm` and Linux, so
-  # only a native macOS/Windows build catches an unconditional import. A check,
-  # not a build; native because blake3's build script needs a target C toolchain.
+  # `tf_tree_py` is outside the workspace. Only a native macOS/Windows check catches
+  # an unconditional `shm` import; native because blake3's build script needs a C toolchain.
   bindings-non-linux:
     name: python bindings compile (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -86,10 +79,8 @@ jobs:
       - name: cargo check (tf_tree_py)
         run: cargo check --manifest-path crates/tf_tree_py/Cargo.toml --features pyo3/extension-module,pyo3/abi3-py39
 
-  # `just py-compile` (fmt + clippy for `tf_tree_py`, which `just lint`'s fmt does
-  # not reach). Also a `lint` dependency, but `pyo3-build-config` emits `Py_3_x`
-  # cfgs for the interpreter it finds, so this job pins 3.13 and is the only place
-  # the binding gate is named.
+  # `just py-compile`; pins 3.13 because `pyo3-build-config` emits `Py_3_x` cfgs
+  # for the interpreter it finds.
   bindings:
     name: python bindings compile
     runs-on: ubuntu-latest
@@ -107,8 +98,7 @@ jobs:
           tool: just
       - name: just py-compile
         run: just py-compile
-      # Cross-compile half, Linux only: the only thing that compiles `tf_tree_py`'s
-      # `pure-hash` feature. Guards #180 (`macos-15-intel` disappears August 2027).
+      # The only thing that compiles `tf_tree_py`'s `pure-hash` feature.
       - name: just py-cross-check
         run: just py-cross-check
 
@@ -117,7 +107,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # aarch64 is a first-class target for the atomic-ordering guarantees.
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
@@ -127,15 +116,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
-      # `just test` also runs `tf_tree_c --features bridge` (the §5 ingest seam's
-      # `extern "C"` entry points), which the default-feature build compiles out.
       - name: just test
         run: just test
 
-  # `tf_tree` with `unstable` OFF, the tier a published consumer gets. `--workspace`
-  # unifies the four consumers' `tf_tree/unstable` into the facade, so only a
-  # `-p tf_tree` selection compiles it off (`just stable-tier-check`;
-  # `docs/API.md` §2.6). Its own job: it needs both `clippy` and `cargo-nextest`.
+  # `tf_tree` with `unstable` OFF, which `--workspace` unifies away
+  # (`just stable-tier-check`, `docs/API.md` §2.6).
   stable-tier:
     name: default features (no unstable)
     runs-on: ubuntu-latest
@@ -151,8 +136,7 @@ jobs:
       - name: just stable-tier-check
         run: just stable-tier-check
 
-  # `just doc`: rustdoc with warnings denied, at the docs.rs configuration, over the
-  # five publishable crates and the four public-API `publish = false` ones.
+  # `just doc`: rustdoc with warnings denied, at the docs.rs configuration.
   docs:
     name: docs
     runs-on: ubuntu-latest
@@ -166,8 +150,7 @@ jobs:
       - name: just doc
         run: just doc
 
-  # `just c-abi-check` (`docs/PHASE4.md` §6.1, §7 gate 4): Miri on the C ABI's four
-  # targets plus ASan. Its own job: `-Zbuild-std` for ASan is slow.
+  # `just c-abi-check` (`docs/PHASE4.md` §6.1, §7 gate 4): Miri plus ASan.
   c-abi:
     name: C ABI (Miri + ASan)
     runs-on: ubuntu-latest
@@ -176,7 +159,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          # `miri`; `rust-src` for the ASan row's `-Zbuild-std`.
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -185,12 +167,8 @@ jobs:
       - name: just c-abi-check
         run: just c-abi-check
 
-  # `docs/PHASE4.md` §6.2 and §4.4. `c-header-check` compiles the committed headers
-  # and fails on drift from `src/`; `cmake-check` builds a `find_package(tf_tree CONFIG)`
-  # consumer. `cbindgen` is not in `taiki-e/install-action` and not a workspace
-  # dependency (0007, MPL-2.0), so it is installed pinned: the check diffs generated
-  # text (0.28.0 and 0.29.4 both reproduce the headers). `clang` is named because the
-  # recipe fails, not skips, on a missing compiler.
+  # `docs/PHASE4.md` §6.2 and §4.4. `cbindgen` is installed pinned, not a workspace
+  # dependency (0007, MPL-2.0); the recipe fails on a missing `clang`.
   c-surface:
     name: C header + CMake package
     runs-on: ubuntu-latest
@@ -211,8 +189,7 @@ jobs:
       - name: just cmake-check
         run: just cmake-check
 
-  # The Python suite on both interpreters, 3.14 and 3.14t (`docs/PHASE3.md` §7.3);
-  # `just py-setup` provisions them through uv.
+  # The Python suite on 3.14 and 3.14t (`docs/PHASE3.md` §7.3).
   python:
     name: python bindings (pytest, 3.14 + 3.14t)
     runs-on: ubuntu-latest
@@ -229,9 +206,7 @@ jobs:
           tool: just
       - name: just py-setup
         run: just py-setup
-      # `just quickstart` runs the README snippet and compares stdout to its `# ->`
-      # marker. Here because the interpreters are already provisioned, and before
-      # the suite so a broken quickstart is not reported behind a test failure.
+      # Runs the README snippet; before the suite so a broken quickstart is not masked.
       - name: just quickstart
         run: just quickstart
       - name: just py-lint
@@ -241,9 +216,8 @@ jobs:
       - name: just py-test-freethreaded
         run: just py-test-freethreaded
 
-  # CI is the stricter run: it sets `-Zmiri-strict-provenance` in `MIRIFLAGS`, which
-  # the recipe appends to, so the recipe stays the one list of Miri targets
-  # (`docs/decisions/0017`). Both architectures (`PHASE1.md` §13).
+  # CI sets `-Zmiri-strict-provenance`, which the recipe appends to
+  # (`docs/decisions/0017`); both architectures (`PHASE1.md` §13).
   miri:
     name: miri (${{ matrix.os }})
     strategy:
@@ -251,7 +225,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    # The recipe appends `-Zmiri-disable-isolation`.
     env:
       MIRIFLAGS: "-Zmiri-strict-provenance"
     steps:
@@ -265,15 +238,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: just miri
         run: just miri
-      # The `compile_fail,E0277` pins need nightly rustdoc; one row, the diagnostics are identical.
+      # The `compile_fail,E0277` pins need nightly rustdoc.
       - name: just test-doc-error-codes
         if: matrix.os == 'ubuntu-latest'
         run: just test-doc-error-codes
 
-  # The only job that needs a container (ROS 2). `tf_tree_tf2_sys` and `ros/*` are
-  # outside the workspace, so `lint` and `test` never see them. `tf2-differential`
-  # and `tf2-replay` run in `nightly.yml`; `tf2-bench` and `tf2-scaling` are timings
-  # and run in no workflow.
+  # The only container job (ROS 2). `tf2-differential` and `tf2-replay` run in
+  # `nightly.yml`; `tf2-bench` and `tf2-scaling` run in no workflow.
   tf2:
     name: tf2 bridge (container)
     runs-on: ubuntu-latest
@@ -286,28 +257,24 @@ jobs:
       - name: just tf2-check
         run: just tf2-check
 
-      # `ros/tf_tree_ros` (ament_cmake, outside cargo): `just ros-build` and
-      # `just ros-test` are its entire gate; reuses the image built above.
+      # `just ros-build` and `just ros-test` are `ros/tf_tree_ros`'s entire gate.
       - name: just ros-test
         run: just ros-test
 
-  # `shm` is off by default, so `lint` and `test` compile none of it. Linux-only
-  # (`memfd_create` + `F_ADD_SEALS`).
+  # `shm` is off by default, so `lint` and `test` compile none of it.
   shm:
     name: shared memory (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        # aarch64 is required: x86-64's near-TSO hides the ordering bugs A1 and A5 fix.
+        # aarch64 is required: x86-64's near-TSO hides the bugs A1 and A5 fix.
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    # `just no-network` builds extra targets and traces single-threaded under `strace -f`.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # Declared: the minimal profile has neither, and `cargo fmt` and `just shm-check` need them.
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -320,26 +287,21 @@ jobs:
           just shm-check
           just shm-rendezvous
 
-      # `docs/PHASE5.md` §5.1 (NORMATIVE) and §13 box 4. Needs `shm` compiled in (the
-      # rendezvous socket must be traced); `strace` is named rather than assumed from
-      # the image. Both rows run it.
+      # `docs/PHASE5.md` §5.1 (NORMATIVE) and §13 box 4.
       - name: install strace
         run: sudo apt-get update -qq && sudo apt-get install -y -qq strace
       - name: just no-network
         run: just no-network
 
-      # PHASE2 §12.3 criterion 4: SIGKILL a writer, measure the re-claim. ~60x margin
-      # (p99 0.16 ms against 10 ms). `may-refuse`: exit 2 (non-vacuity refusal) is a
-      # runner statement, so it warns instead of failing; `scripts/gate-run.sh` reads the code.
+      # PHASE2 §12.3 criterion 4. `may-refuse`: exit 2 warns instead of failing
+      # (`scripts/gate-run.sh`).
       - name: just gate reclaim-latency may-refuse
         run: just gate reclaim-latency may-refuse
 
-      # The reader's nine (policy x exit code) cells against a stub.
       - name: gate-run self-test
         run: ./scripts/gate-run.sh --self-test
 
-  # The model checker, the argument half of the weak-memory defence (`PROJECT.md`
-  # §6); both architectures, the aarch64 row is corroboration.
+  # The model checker (`PROJECT.md` §6); aarch64 is corroboration.
   loom:
     name: loom (${{ matrix.os }})
     strategy:
@@ -357,11 +319,8 @@ jobs:
       - name: just loom
         run: just loom
 
-  # `docs/PHASE5.md` §10: `just bench-check` regenerates the §9 artifact and compares
-  # it to `crates/tf_tree_bench/baseline/results.json`. One runner: the comparison
-  # ignores provenance host facts, and `idle_arena_resident_bytes` (0021 step 4,
-  # `RESIDENCY_SLACK` 300%) is the one host-dependent figure. A green tick is not a
-  # performance claim; the gate is `just bench-check` run locally.
+  # `docs/PHASE5.md` §10: compares against `crates/tf_tree_bench/baseline/results.json`.
+  # A green tick is not a performance claim; the gate is `just bench-check` locally.
   bench-gate:
     name: benchmark regression gate
     runs-on: ubuntu-latest
@@ -369,28 +328,22 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # Named, not inherited from the runner image.
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
-      # `--workspace` compiles out `tf_tree_core/bench-probe` and `tf_tree_bench::embed`'s
-      # driver; this is their debug clippy/test pass.
+      # Debug clippy/test pass for `bench-probe` and `tf_tree_bench::embed`'s driver.
       - name: just embed-cost-check
         run: just embed-cost-check
-      # `bench-check` depends on `just embed-cost`, which builds `[profile.embedder]`
-      # and pins the probe with `taskset -c 2` (needs three CPUs; a public runner has
-      # four). Do not unpin or pick the CPU dynamically: that changes the baseline's conditions.
+      # `embed-cost` pins the probe with `taskset -c 2`; do not unpin, it changes the
+      # baseline's conditions.
       - name: just bench-check
         run: just bench-check
-        # Disclosed escape: `just embed-cost`'s self-check that `embedding_cross_crate`'s
-        # columns compile to different bodies is red, because `Plan::at_tagged` has no
-        # `#[inline]` (`docs/API.md` §2.3). The diagnosis still prints. Delete this `env:`
-        # block and the recipe's escape branch when the row's variable is restored.
+        # Escape for `embed-cost`'s red collapse self-check (`Plan::at_tagged` has no
+        # `#[inline]`, `docs/API.md` §2.3); delete with the recipe's branch.
         env:
           EMBED_COST_KNOWN_COLLAPSED: "1"
-      # Written before comparing, so a failing gate can be inspected.
       - uses: actions/upload-artifact@v7
         if: always()
         with:

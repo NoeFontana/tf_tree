@@ -1,17 +1,13 @@
 //! Detection for the diagnostics catalogue — `docs/PHASE5.md` §6.
 //!
 //! [`crate::catalogue`] owns the identifiers and the printing; this module
-//! decides what fired. Every check is a pure function over captured data
-//! ([`EdgeStats`], [`crate::doctor::Snapshot`], [`crate::doctor::Observations`],
-//! [`crate::hostfacts::HostFacts`]), so a test can construct the offending state
-//! directly.
+//! decides what fired, as pure functions over captured data.
 //!
 //! # Skipped, not passed
 //!
 //! A check that cannot judge reports [`crate::catalogue::Status::Skipped`] with a
-//! reason, because silence is indistinguishable from "found nothing".
-//! `docs/PHASE5.md` §0.0 enumerates them; the instrument for the code is
-//! `rg -n 'CheckOutcome::skipped' crates/tf_tree_cli/src/checks.rs`.
+//! reason, because silence is indistinguishable from "found nothing"
+//! (`docs/PHASE5.md` §0.0 enumerates them).
 //!
 //! * `TFT002`/`TFT003` detect nothing here: their evidence lives in the bridge
 //!   process (`tf_tree_bridge`'s `StaticStore`), not in the arena.
@@ -34,8 +30,7 @@ use crate::doctor::{
 };
 use crate::hostfacts::{HostFacts, MemLock, ShmemThp, Thp};
 
-/// A stamp further than this from the reference clock is not a late sample, it
-/// is a units error or uninitialised memory.
+/// A stamp further than this from the reference clock is a units error, not lateness.
 const ABSURD_HORIZON_NS: i64 = 365 * 24 * 3600 * 1_000_000_000;
 
 /// How far ahead of the wall clock a stamp may sit before `TFT005` fires.
@@ -57,18 +52,14 @@ pub(crate) const OCCUPANCY_LIMIT: f64 = 0.80;
 /// Where the reference clock for the time-based checks came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clock {
-    /// The arena's newest stamp is within `ABSURD_HORIZON_NS` of the system
-    /// clock, so the two share an epoch and wall-clock comparisons mean
-    /// something.
+    /// The newest stamp is within `ABSURD_HORIZON_NS` of the system clock.
     Wall(i64),
-    /// They do not. The **median** of the per-edge newest stamps is used as
-    /// "now", which still supports `TFT006`'s *distance* rule but cannot
-    /// support `TFT005` at all.
+    /// The stamps share no epoch with the system clock; the median stands in.
     NewestStamp(i64),
 }
 
 impl Clock {
-    /// The reference instant, whichever source it came from.
+    /// The reference instant.
     #[must_use]
     pub fn nanos(self) -> i64 {
         match self {
@@ -87,29 +78,22 @@ impl Clock {
         }
     }
 
-    /// Decide which clock applies, given **every** edge's newest stamp and the
-    /// system clock.
+    /// Decide which clock applies, given every edge's newest stamp.
     #[must_use]
     pub fn decide(newest_stamps: &[i64], system_unix_nanos: i64) -> Clock {
-        // The distance is taken in `i128`. A stamp is arbitrary data an arbitrary
-        // publisher wrote — one near `i64::MIN` against a Unix `now` overflows
-        // `i64` on the subtraction, and `.abs()` overflows again on `i64::MIN`
-        // itself. Either is a panic inside `doctor` and inside `top`'s redraw
-        // loop, on exactly the corrupt stamp both tools exist to report.
+        // `i128`: a corrupt stamp must not overflow the distance.
         let horizon = i128::from(ABSURD_HORIZON_NS);
         let now = i128::from(system_unix_nanos);
         let agree = newest_stamps
             .iter()
             .filter(|&&n| (i128::from(n) - now).abs() <= horizon)
             .count();
-        // `>=` rather than `>`, and it also covers the empty arena: nothing has
-        // disagreed with the system clock, so the system clock stands.
+        // `>=` also covers the empty arena.
         if agree * 2 >= newest_stamps.len() {
             return Clock::Wall(system_unix_nanos);
         }
         let mut sorted = newest_stamps.to_vec();
         sorted.sort_unstable();
-        // Non-empty: `agree * 2 >= 0` would have returned above otherwise.
         Clock::NewestStamp(sorted[sorted.len() / 2])
     }
 }
@@ -162,8 +146,7 @@ pub fn collect_edge_stats(tree: &Tree, snap: &Snapshot) -> Vec<EdgeStats> {
     let view = tree.arena_view();
     let max_participants = view.header().max_participants;
 
-    // Build the blame map once: for every participant slot, which edge it most
-    // recently failed on. Doing it per edge would be O(edges x slots).
+    // Blame map: for every participant slot, the edge it most recently failed on.
     let mut blame: Vec<(u32, u32, u32)> = Vec::new(); // (edge, slot, pid)
     for slot in 0..max_participants {
         let Some(pc) = view.participant_counters(slot) else {
@@ -175,8 +158,7 @@ pub fn collect_edge_stats(tree: &Tree, snap: &Snapshot) -> Vec<EdgeStats> {
             continue;
         }
         let edge = pc.last_err_edge.load(Ordering::Relaxed);
-        // `u32::MAX` is the "no edge" sentinel; edge 0 is the table's sentinel
-        // slot and is never handed out, so neither names a real edge.
+        // `u32::MAX` and edge 0 are sentinels, not real edges.
         if edge == u32::MAX || edge == 0 {
             continue;
         }
@@ -206,9 +188,7 @@ pub fn collect_edge_stats(tree: &Tree, snap: &Snapshot) -> Vec<EdgeStats> {
         }
         if let Some(ring) = view.ring(eid) {
             let head = ring.head.load(Ordering::Acquire);
-            // `head - capacity` is the slot currently being overwritten, not a
-            // retained sample, which is why this is `retained()` and not
-            // `capacity()`.
+            // `head - capacity` is being overwritten, hence `retained()`.
             let retained = ring.retained().min(head);
             for i in (head - retained)..head {
                 let s = ring.stamps[(i & ring.mask()) as usize].load(Ordering::Relaxed);
@@ -228,9 +208,8 @@ pub fn collect_edge_stats(tree: &Tree, snap: &Snapshot) -> Vec<EdgeStats> {
 /// How the push stream a check reads was obtained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushStream {
-    /// Every attempted push, recorded as it happened, with the writer that made
-    /// it and the delay it arrived with. Only `tf_tree_bench::fixture` has this:
-    /// it is the publisher, so it can record the pushes the engine refused.
+    /// Every attempted push, recorded as it happened, with the writer that made it and
+    /// the delay it arrived with.
     Observed,
     /// Every transform a recording holds, replayed in the recording's own log
     /// order (`doctor --from-bag`).
@@ -268,10 +247,7 @@ impl PushStream {
     #[must_use]
     pub fn no_live_receipt(self) -> Option<&'static str> {
         match self {
-            // **Both, and for different reasons, which is why they are spelled
-            // out rather than left to the shared arm.** `Observed` is the
-            // fixture: it *is* the publisher and it is running now, so its
-            // offsets were taken against this host's clock moments ago.
+            // `Observed` is the fixture: it is the publisher, running now.
             PushStream::Observed | PushStream::RingsUnderWriter => None,
             PushStream::Recorded => Some(
                 "this arena was built by replaying a recording, so its clock offsets were \
@@ -400,11 +376,9 @@ pub struct Inputs<'a> {
 /// Where the participant table in a [`Snapshot`] came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotTable {
-    /// The table of an arena that exists now — a live shared segment
-    /// (`doctor --attach`), or one this process built and still holds (the
-    /// fixture, `doctor --from-bag`). Its records name processes that could
-    /// still be running, so asking whether they are is a question with an
-    /// answer.
+    /// The table of an arena that exists now — a live shared segment (`doctor
+    /// --attach`), or one this process built and still holds (the fixture, `doctor
+    /// --from-bag`).
     Current,
     /// A byte copy of a table as it stood at some past instant
     /// (`doctor --from-file`).
@@ -469,10 +443,8 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
 
     Report {
         outcomes,
-        // Empty, and the field stays: `uncatalogued` is part of the stable
-        // `--json` schema, and it is the shape a future check with no id would
-        // take. `docs/PHASE5.md` §6's amendment gave the last two occupants
-        // `TFT017`/`TFT018`.
+        // Empty, and the field stays: `uncatalogued` is part of the stable `--json`
+        // schema, and it is the shape a future check with no id would take.
         uncatalogued: Vec::new(),
     }
 }
@@ -508,12 +480,7 @@ fn live_clock_offsets(
              this is TFT005's condition and deliberately the same one",
         );
     }
-    // **`claimed`, for the reason `tft014` gates the same loop.** Nothing clears
-    // `clock_offset_nanos` when a claim is released or reaped — only
-    // `Tree::claim` zeroes it, and that is a *successor* arriving. An edge whose
-    // publisher exited with no replacement therefore still carries the number it
-    // last measured, and reporting it says "this publisher's clock reads X" about
-    // an edge that has no publisher.
+    // `claimed`, for the reason `tft014` gates the same loop.
     let measured: Vec<(&EdgeInfo, i64)> = snap
         .edges
         .iter()
@@ -541,15 +508,9 @@ pub fn clock_offset_note(snap: &Snapshot, stream: PushStream, clock: Clock) -> O
     let mut offsets: Vec<i64> = measured.iter().map(|&(_, ns)| ns).collect();
     offsets.sort_unstable();
     let ms = |ns: i64| ns as f64 / 1e6;
-    // **The mean of the two middles on an even count, not `[len / 2]`.** The
-    // sample here is the *fleet*, so a two-machine robot's "median" under the
-    // upper-median convention is its worse member — and this number exists to be
-    // weighed against exactly that member. `Clock::decide` and `median_period`
-    // take the upper middle because they reduce dozens of samples, where the
-    // bias is invisible; here it is the whole reading.
+    // The mean of the two middles on an even count, not `[len / 2]`.
     let mid = offsets.len() / 2;
     let median = if offsets.len().is_multiple_of(2) {
-        // `i128` so two large offsets of the same sign cannot overflow the sum.
         ((i128::from(offsets[mid - 1]) + i128::from(offsets[mid])) / 2) as i64
     } else {
         offsets[mid]
@@ -576,22 +537,12 @@ fn tft004(inp: &Inputs<'_>) -> CheckOutcome {
 
     let out = measured
         .iter()
-        // **`unsigned_abs`, not `abs`.** This value is arbitrary data an
-        // arbitrary publisher wrote into shared memory, and `i64::MIN.abs()`
-        // panics in debug and evaluates to `i64::MIN` in release — so the single
-        // most extreme skew in the arena would be *filtered out* rather than
-        // reported, by the check that exists to report it. `Clock::decide` above
-        // carries the same warning about the same class of input.
+        // `unsigned_abs`, not `abs`.
         .filter(|(_, ns)| ns.unsigned_abs() > OFFSET_BEYOND_ANY_PIPELINE_NS.unsigned_abs())
         .map(|(e, ns)| {
             let secs = *ns as f64 / 1e9;
-            // **Replay, not staleness, is the alternative reading of a large
-            // positive offset.** The value was captured at one push, so an edge
-            // that stopped publishing an hour ago still carries whatever small
-            // offset it had while running — how long ago it last published is
-            // `TFT008`/`TFT009`'s signal. What does inflate this is a publisher
-            // pushing genuinely old data, which is `ros2 bag play` into a live
-            // stack, and that is the gap this check cannot close on its own.
+            // Replay, not staleness, is the alternative reading of a large positive
+            // offset.
             let direction = if *ns > 0 {
                 "behind this host's — or it is republishing recorded data, which reads the same \
                  way here"
@@ -656,9 +607,7 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
         let Some(e) = index.get(&st.edge) else {
             continue;
         };
-        // Reasons first, label second. `edge_label` formats two linear scans of
-        // `snap.frames` into a fresh `String`, and computing it before any
-        // predicate paid that on every edge of a completely clean arena.
+        // Reasons first, label second.
         let mut reasons: Vec<String> = Vec::new();
         if st.negative_stamps > 0 {
             reasons.push(format!(
@@ -673,17 +622,14 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
                 st.zero_stamps
             ));
         }
-        // The distance rule catches the units error a range check cannot: a
-        // publisher writing nanoseconds into a field it believed was seconds is
-        // off by a factor of a billion, which is far outside any horizon.
+        // The distance rule catches the units error a range check cannot.
         let mut ends = vec![("newest", st.newest_stamp)];
         if st.oldest_stamp != st.newest_stamp {
             ends.push(("oldest", st.oldest_stamp));
         }
         for (what, stamp) in ends {
             let Some(s) = stamp else { continue };
-            // `i128`, like `Clock::decide`: `s - now` for `s` near `i64::MIN`
-            // is a panic in the check written to report exactly that stamp.
+            // `i128`, like `Clock::decide`.
             let dist = (i128::from(s) - i128::from(now)).abs();
             if dist > i128::from(ABSURD_HORIZON_NS) {
                 reasons.push(format!(
@@ -730,17 +676,13 @@ enum RateEvidence {
 /// Relative deviation from a declared rate before `TFT007` fires.
 const RATE_TOLERANCE: f64 = 0.20;
 
-/// Intervals needed before an observed rate is worth comparing to a declared
-/// one. Eight, so a single hiccup cannot carry the median.
+/// Intervals needed before an observed rate is worth comparing to a declared one.
 const RATE_MIN_INTERVALS: usize = 8;
 
 /// What one edge can tell `TFT007`.
 fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&[&PushSample]>) -> RateEvidence {
-    // A static edge carries its pose inline and never publishes, so it has no
-    // rate to hold or miss. The builder writes no nominal for one; this guard is
-    // what keeps a hand-built or corrupt record with a stray non-zero rate from
-    // being counted as declared — which would suppress the whole-check skip and
-    // then compare a stream that does not exist.
+    // A static edge carries its pose inline and never publishes, so it has no rate to
+    // hold or miss.
     if e.kind != EdgeKind::Dynamic {
         return RateEvidence::NotDeclared;
     }
@@ -754,10 +696,7 @@ fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&[&PushSample]>) -> RateE
     if samples.len() < RATE_MIN_INTERVALS + 1 {
         return too_few;
     }
-    // `None` for a non-positive median, which is what a stream of identical or
-    // backwards stamps produces — both would divide into an infinite or
-    // negative observed rate, and comparing either against a nominal produces a
-    // finding about arithmetic rather than about the robot.
+    // `None` for a non-positive median (identical or backwards stamps).
     let Some(observed_hz) = doctor::observed_rate_hz(samples) else {
         return too_few;
     };
@@ -784,11 +723,8 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
                 observed_hz,
             } => {
                 declared += 1;
-                // Withheld rather than reported (the doc above is why): a
-                // second warn id for one fault also inflates the count
-                // `--exit-code warn` gates on, and `docs/PHASE5.md` §6's
-                // TFT017/TFT018 amendment forbids giving an id a second meaning
-                // by name.
+                // Withheld, not reported: a second warn id for one fault
+                // inflates the `--exit-code warn` count (`docs/PHASE5.md` §6).
                 if stopped.contains_key(&e.id) {
                     withheld += 1;
                     continue;
@@ -819,8 +755,7 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
             }
         }
     }
-    // Not `declared == 0`: that guard leaves a hole between itself and
-    // `rate_coverage_note`, which also says nothing when it compared nothing.
+    // Not `declared == 0`: that leaves a hole before `rate_coverage_note`.
     if comparable == 0 {
         return CheckOutcome::skipped(
             Tft::Tft007,
@@ -880,13 +815,7 @@ pub fn rate_coverage_note(
     ))
 }
 
-/// `TFT008` — inter-arrival spread. The Phase 1 `inconsistent-rate` check: a
-/// coefficient of variation *is* the jitter of the inter-arrival distribution
-/// about its own centre. Distinct from [`tft007`] and not redundant with it: a
-/// publisher can hold a perfectly steady period at the wrong rate (`TFT007`
-/// fires, this passes) or average its declared rate while alternating 1 ms and
-/// 100 ms gaps (this fires, `TFT007` passes). This one needs no declaration, so
-/// it has evidence on arenas `TFT007` cannot judge at all.
+/// `TFT008` — inter-arrival spread.
 fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
     let withheld: BTreeSet<u32> = stopped_publishers(inp.obs, inp.clock, inp.stream)
         .into_keys()
@@ -923,9 +852,8 @@ fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
     )
 }
 
-/// Intervals an edge must retain before `TFT009` has an inter-arrival
-/// distribution to measure a gap against. Four, because a median over three is
-/// one sample away from being an extremum.
+/// Intervals an edge must retain before `TFT009` has an inter-arrival distribution to
+/// measure a gap against.
 const GAP_MIN_INTERVALS: usize = 4;
 
 /// The shape of one edge's retained inter-arrival distribution: the median
@@ -943,13 +871,7 @@ enum ShapeGap {
     /// Fewer than [`GAP_MIN_INTERVALS`] intervals. The remedy is to wait for
     /// the ring to fill, or to size it above the floor.
     TooFewIntervals,
-    /// **Any negative interval**, not just a non-positive median. A stream with
-    /// a handful of inverted pairs keeps a healthy positive median, but the
-    /// jump back to the true timeline after an inversion becomes `worst_ns` —
-    /// so `TFT009` would report a dropout of N x the median that never
-    /// happened. The real fault is `TFT018`, which fires on the same stream at
-    /// error severity; adding a warn about a phantom gap next to it sends the
-    /// operator looking for a lost publisher instead of a reordered one.
+    /// Any negative interval, not just a non-positive median.
     NotMonotone,
     /// A non-positive median, which every retained stamp being identical
     /// produces: the ratio would divide by zero and make every non-zero
@@ -1039,8 +961,7 @@ pub fn stopped_publishers(
         let Ok(shape) = interval_shape(&samples) else {
             continue;
         };
-        // Monotone by `interval_shape`'s negative-interval guard, so the last
-        // retained stamp is the newest.
+        // Monotone by `interval_shape`'s guard, so the last stamp is the newest.
         let newest = samples.last().map_or(0, |s| s.stamp_ns);
         let silent = now.saturating_sub(newest);
         if silent > shape.median_ns.saturating_mul(GAP_FACTOR) {
@@ -1100,11 +1021,7 @@ fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
         }
     }
     if judged == 0 {
-        // `stopped_publishers` reads the same `interval_shape`, so its map is a
-        // subset of the edges counted in `judged` and nothing above can have
-        // pushed a finding here. `CheckOutcome::skipped` carries none, so if
-        // that ever stops being true a finding would be dropped silently —
-        // which is the failure this whole repair is about, one layer in.
+        // `stopped_publishers` is a subset of `judged`, so no finding is dropped here.
         debug_assert!(
             out.is_empty(),
             "TFT009 judged no edge and produced {} finding(s): a skip would discard them",
@@ -1281,9 +1198,7 @@ fn tft011(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(Tft::Tft011, out)
 }
 
-/// `TFT012` — the topology walk does not reach everything. Both Phase 1
-/// topology checks land here: a parent cycle and an unattached island are the
-/// same fault seen from two directions, and §6 gives them one id.
+/// `TFT012` — the topology walk does not reach everything.
 fn tft012(inp: &Inputs<'_>) -> CheckOutcome {
     let mut out = Vec::new();
     for f in doctor::check_cycles(inp.snap) {
@@ -1304,9 +1219,7 @@ const DECLARATION_GRACE_NS: i64 = 5_000_000_000;
 /// absences stands in the way of an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublishActivity {
-    /// No dynamic edge has ever accepted a push. Bringup and a total outage at
-    /// once, and no fact in the arena separates them; `TFT017` reports the
-    /// second.
+    /// No dynamic edge has ever accepted a push.
     NoPublisher,
     /// Something **has** published — `largest_head` pushes on the busiest
     /// dynamic edge — and no dynamic edge yielded the two samples
@@ -1316,14 +1229,9 @@ enum PublishActivity {
         /// Accepted pushes on the busiest dynamic edge. The evidence that this
         /// is not the arena above.
         largest_head: u64,
-        /// The most samples any dynamic edge that has published *can* retain
-        /// (`capacity - 1`). Below two, no ring in this arena can ever hold a
-        /// median period and the ring size is the remedy.
+        /// The most samples any published dynamic edge can retain (`capacity - 1`).
         retained_capacity: u32,
-        /// The most samples actually recovered from any of those edges. With
-        /// `retained_capacity` at two or more it separates the second arena
-        /// from the third: below two the stream is short, at two or more the
-        /// samples are there and their cadence is what is missing.
+        /// The most samples actually recovered from any of those edges.
         observed: usize,
     },
     /// A lower bound on how long the longest-running dynamic publisher has been
@@ -1343,9 +1251,7 @@ fn publish_activity(inp: &Inputs<'_>) -> PublishActivity {
             continue;
         }
         largest_head = largest_head.max(e.head);
-        // `SampleRing::retained` is `capacity - 1`. Collected in the same walk
-        // as the span for the reason stated above: a second pass to ask "could
-        // any ring here have held two?" can come to disagree with this one.
+        // `SampleRing::retained` is `capacity - 1`.
         retained_capacity = retained_capacity.max(e.capacity.saturating_sub(1));
         let Some(samples) = by_edge.get(&e.id) else {
             continue;
@@ -1468,13 +1374,8 @@ pub enum SlotLeak {
 /// Whether participant slot `p` is one of the two leaks above.
 #[must_use]
 pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
-    // The word first, and it answers exactly one question: is there an arena
-    // record here? `FREE` means there is not — which is the ordinary state of
-    // a live read-only joiner, whose byte is held and whose arena record was
-    // never written because the mapping is `PROT_READ` (D18, and the Python
-    // default). It is most of a real table. It is *not* a reason to stop
-    // asking: the byte beside a `FREE` record can still be held for a process
-    // that is gone, and that is clause (b) with no arena record under it.
+    // The word first, and it answers exactly one question: is there an arena record
+    // here?
     if p.state == SlotState::Free {
         return (p.byte == LockByte::Held && p.recorded == RecordedProcess::Gone)
             .then_some(SlotLeak::ForkInheritor);
@@ -1486,10 +1387,7 @@ pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
         }
         (LockByte::Held, RecordedProcess::Gone) => Some(SlotLeak::ForkInheritor),
         (LockByte::Held, RecordedProcess::Running | RecordedProcess::Unknown) => None,
-        // No byte was asked for. `alive` is then the `/proc` inference
-        // `Tree::participant_alive` falls back to, and `state == LIVE` is
-        // already folded into it — so `RESERVED` cannot be judged from here and
-        // is not.
+        // No byte was asked for.
         (LockByte::Unknown, _) => {
             (p.state == SlotState::Live && !p.alive).then_some(SlotLeak::Abandoned)
         }
@@ -1566,27 +1464,14 @@ fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
         .filter(|p| slot_leak(p) == Some(SlotLeak::Abandoned))
         .count();
     for p in &inp.snap.participants {
-        // The word this row actually carries. `FREE` used to render as `LIVE`
-        // because no `FREE` row could produce a finding; one can now — the
-        // read-only participant's fork inheritor — and calling its record
-        // `LIVE` would send an operator looking for an arena record that was
-        // never written.
+        // The word this row actually carries.
         let state = match p.state {
             SlotState::Reserved => "RESERVED",
             SlotState::Live => "LIVE",
             SlotState::Free => "FREE (no arena record: a read-only participant, D18)",
         };
-        // **One pid answer for this whole function**, through `named_pid`, so a
-        // change to that predicate reaches every rendering. Only the fork arm
-        // still reads this binding, and it cannot be `None` there:
-        // `SlotLeak::ForkInheritor` needs `RecordedProcess::Gone`, which
-        // `slot_facts` produces only from an `Identity` it parsed — and
-        // `Identity::from_bytes` refuses pid 0. `unwrap_or(0)` is therefore
-        // unreachable rather than a fallback, and is spelled that way so a
-        // future producer of `Gone` without an identity cannot print a bare
-        // zero. *This read `p.recorded_pid.unwrap_or(p.pid)` under a comment
-        // about "every sentence below", which stopped being true when the
-        // abandoned arm moved to `named_pid`.*
+        // One pid answer for this whole function, through `named_pid`, so a change to
+        // that predicate reaches every rendering.
         let pid = named_pid(p).unwrap_or(0);
         match slot_leak(p) {
             None => {}
@@ -1732,11 +1617,8 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
         )),
         Thp::Always | Thp::Madvise => {}
     }
-    // **The knob that governs the live arena**, which is a sealed `memfd` mapped
-    // `MAP_SHARED` — shmem, not anonymous memory. `enabled` above does not apply
-    // to it. Reading only `enabled` reported a host as passing while
-    // `MappedArena`'s `MADV_HUGEPAGE` was a no-op and the arena took 4 KiB
-    // pages, which is the failure this check exists to catch.
+    // The knob that governs the live arena, which is a sealed `memfd` mapped
+    // `MAP_SHARED` — shmem, not anonymous memory.
     if !host.shmem_thp.honours_madvise() {
         out.push(Finding::about(
             Tft::Tft016,
@@ -1823,15 +1705,12 @@ pub struct ClockStepEvidence {
     /// Runs on a `SystemDomain` edge whose rejections are concentrated enough to
     /// be a step, each with the label to report it under.
     attributed: Vec<(doctor::OutOfOrderRun, String)>,
-    /// Runs on a `SystemDomain` edge that are **not** concentrated: fewer than
-    /// [`CLOCK_STEP_MIN_REJECTED_RUN`] consecutive rejected arrivals, as
-    /// `(edge, longest run)`. A stray inversion on a wall clock is a publisher
-    /// fault, and reporting it as a clock step is the false all-clear this check
-    /// refuses in the other direction.
+    /// Runs on a `SystemDomain` edge that are not concentrated: fewer than
+    /// [`CLOCK_STEP_MIN_REJECTED_RUN`] consecutive rejected arrivals, as `(edge,
+    /// longest run)`.
     diffuse: Vec<(u32, usize)>,
-    /// Runs on any other tag, as `(edge, tag)`, with `None` for an edge whose
-    /// tag could not be read at all. Named, not counted: the skip reason has to
-    /// say *which* tag it declined to guess about.
+    /// Runs on any other tag, as `(edge, tag)`, with `None` for an edge whose tag could
+    /// not be read at all.
     refused: Vec<(u32, Option<u8>)>,
 }
 
@@ -1848,10 +1727,8 @@ impl ClockStepEvidence {
         };
         for run in doctor::out_of_order_runs(obs) {
             match index.get(&run.edge).map(|e| (e.domain, *e)) {
-                // A `const` in a pattern, so this is an equality test against
-                // tag 0 and not a binding. Renaming `WALL_CLOCK_TAG` to anything
-                // lowercase would silently turn it into one that matches every
-                // tag.
+                // A `const` in a pattern, so this is an equality test against tag 0
+                // and not a binding.
                 Some((WALL_CLOCK_TAG, e)) => {
                     if run.longest_rejected_run >= CLOCK_STEP_MIN_REJECTED_RUN {
                         ev.attributed.push((run, snap.edge_label(e)));
@@ -1860,10 +1737,8 @@ impl ClockStepEvidence {
                     }
                 }
                 Some((tag, _)) => ev.refused.push((run.edge, Some(tag))),
-                // Reachable from a hand-assembled `Inputs` and from a recorded
-                // stream whose edge is absent from the snapshot. Tag 0 is not
-                // the honest default for an unknown tag — that is the fabricated
-                // all-clear this whole check refuses.
+                // Reachable from a hand-assembled `Inputs` and from a recorded stream
+                // whose edge is absent from the snapshot.
                 None => ev.refused.push((run.edge, None)),
             }
         }
@@ -1933,8 +1808,7 @@ fn tag_list(refused: &[(u32, Option<u8>)]) -> String {
 /// Why a run on `tag` is not attributed to a wall clock stepping.
 fn tag_refusal(tag: u8) -> &'static str {
     match tag {
-        // Unreachable: a tag-0 run is either attributed or diffuse, never
-        // refused. Answered anyway so this stays a total function of the tag.
+        // Unreachable: a tag-0 run is either attributed or diffuse, never refused.
         WALL_CLOCK_TAG => "the system wall clock",
         <SensorDomain as Domain>::TAG => {
             "a sensor's own clock, which this build has no way to call steppable or steady"
@@ -1967,9 +1841,7 @@ fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
     }
     let ev = inp.clock_step;
     if ev.attributed.is_empty() {
-        // A `Skipped` only when *nothing* was judged. A diffuse wall-clock run
-        // was judged — "not concentrated enough to be a step" is an answer, and
-        // `coverage_note` carries it — so it passes rather than skipping.
+        // A `Skipped` only when *nothing* was judged.
         if !ev.refused.is_empty() && ev.diffuse.is_empty() {
             return CheckOutcome::skipped(
                 Tft::Tft019,
@@ -1982,7 +1854,6 @@ fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
             );
         }
         // Either TFT018 found nothing, or what it found is not step-shaped.
-        // Earned: the evidence is complete, not missing.
         return CheckOutcome::ran(Tft::Tft019, Vec::new());
     }
     let findings = ev
@@ -2022,9 +1893,7 @@ pub fn occupancy_of(tree: &Tree) -> Vec<(&'static str, u32, u32)> {
             h.frame_count.load(Ordering::Relaxed),
             h.max_frames,
         ),
-        // Both sides include the sentinel at index 0: `edge_count` is
-        // (declared + 1) and `max_edges` is the table size, so the ratio is
-        // exact rather than off by one slot.
+        // Both sides include the sentinel at index 0.
         ("edges", h.edge_count.load(Ordering::Relaxed), h.max_edges),
     ]
 }
@@ -2129,9 +1998,6 @@ mod tests {
             clock,
             arena_bytes: 1 << 20,
             occupancy: Vec::new(),
-            // Leaked so the helper can keep its four-argument shape across
-            // thirty-odd call sites: `Inputs` borrows the split, and a test
-            // process that exits after one assertion has nothing to reclaim.
             clock_step: Box::leak(Box::new(ClockStepEvidence::capture(snap, obs))),
             stream: PushStream::Observed,
             slots: SlotTable::Current,
@@ -2157,7 +2023,6 @@ mod tests {
     #[test]
     fn a_publisher_that_stopped_is_reported_where_every_retained_stamp_reads_healthy() {
         const MS: i64 = 1_000_000;
-        // A flawless 100 Hz stream, ending 8 seconds ago: ~800 missed samples.
         let stamps: Vec<i64> = (0..40).map(|k| k * 10 * MS).collect();
         let newest = *stamps.last().unwrap();
         let obs = Observations::from_samples(
@@ -2174,9 +2039,6 @@ mod tests {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
         let now = Clock::Wall(newest + 8_000 * MS);
 
-        // What shipped: nothing is writing, so the trailing distance is the age
-        // of the recording and means nothing. Every retained stamp reads healthy
-        // and the check passes — correctly, for this source.
         let o = tft009(&inputs(&snap, &obs, &[], now));
         assert_eq!(
             o.status,
@@ -2189,8 +2051,6 @@ mod tests {
             "a source this half cannot run on must say so"
         );
 
-        // The same stream on a live arena, which is what `doctor --attach`
-        // reads. Now the silence is a stopped publisher.
         let o = tft009(&live_inputs(&snap, &obs, &[], now));
         assert_eq!(o.status, Status::Fired, "{o:?}");
         assert_eq!(o.findings.len(), 1, "{o:?}");
@@ -2204,8 +2064,6 @@ mod tests {
             "the half ran, so there is nothing to disclose"
         );
 
-        // A live arena whose stamps are not wall-clock cannot be judged this
-        // way, and says so rather than guessing.
         let o = tft009(&live_inputs(&snap, &obs, &[], Clock::NewestStamp(newest)));
         assert_eq!(
             o.status,
@@ -2225,15 +2083,7 @@ mod tests {
     #[test]
     fn a_stopped_publisher_is_not_certified_healthy_by_tft007_and_tft008() {
         const MS: i64 = 1_000_000;
-        // A flawless 100 Hz stream, ending 8 seconds ago, on an edge that
-        // declares exactly 100 Hz. Both checks therefore have evidence and both
-        // would report a perfect result.
         let obs = Observations::from_samples(steady(1, 40, 10 * MS));
-        // Read out of the stream the checks read, rather than recomputed from a
-        // second list built to the same recipe: the 8 s below has to be a
-        // silence in *this* stream, and a `stamps.len() == 40` assertion beside
-        // a locally built copy compares a length against a literal and cannot
-        // fail on the property its message names.
         let newest = obs.by_edge()[&1]
             .last()
             .expect("the fixture has samples on edge 1")
@@ -2243,8 +2093,6 @@ mod tests {
         let snap = two_frame_snapshot(e);
         let now = Clock::Wall(newest + 8_000 * MS);
 
-        // Nothing is writing: the trailing distance is the age of the source and
-        // means nothing, so both checks judge the retained window and pass.
         let at_rest = inputs(&snap, &obs, &[], now);
         assert_eq!(
             tft007(&at_rest).status,
@@ -2264,8 +2112,6 @@ mod tests {
             "nothing was withheld here, so there is nothing to disclose"
         );
 
-        // The same stream on a live arena, which is what `doctor --attach`
-        // reads. TFT009 fires; these two must not certify the edge it fired on.
         let live = live_inputs(&snap, &obs, &[], now);
         assert_eq!(
             tft009(&live).status,
@@ -2316,9 +2162,6 @@ mod tests {
             e
         };
 
-        // Arena one: the only declaring edge has stopped, and the other edge
-        // declares nothing. `TFT007` compared nothing and skips, so a note is
-        // the second, contradicting answer.
         let snap = Snapshot {
             frames: vec![
                 frame(1, "map", 0, 0),
@@ -2346,10 +2189,6 @@ mod tests {
              contradicts the status in the same report"
         );
 
-        // Arena two: one stopped declaring edge, one declaring edge still
-        // publishing, one that declares nothing. The check runs on the middle
-        // one, so the note is the disclosure — and it has to name all three
-        // reasons apart.
         let snap = Snapshot {
             frames: vec![
                 frame(1, "map", 0, 0),
@@ -2360,9 +2199,6 @@ mod tests {
             edges: vec![declaring(1, 1, 2), declaring(2, 2, 3), edge(3, 3, 4, 40)],
             participants: live_writer(),
         };
-        // Edge 2 publishes at the same 100 Hz and its newest stamp is `now`, so
-        // it is comparable and not silent; nothing but the stopped set can
-        // explain edge 1 being excluded.
         let mut events = steady(1, 40, 10 * MS);
         let start = newest + 8_000 * MS - 39 * 10 * MS;
         events.extend((0..40i64).map(|k| sample(2, start + k * 10 * MS)));
@@ -2392,7 +2228,6 @@ mod tests {
         const MS: i64 = 1_000_000;
         let snap = two_frame_snapshot(edge(1, 1, 2, 3));
 
-        // Three stamps is two intervals: one short of a spread.
         let obs = Observations::from_samples(steady(1, 3, 10 * MS));
         let o = tft008(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         match &o.status {
@@ -2408,8 +2243,6 @@ mod tests {
             ),
         }
 
-        // Non-vacuity: one more stamp is three intervals, which is a
-        // distribution, and an even one passes.
         let obs = Observations::from_samples(steady(1, 4, 10 * MS));
         assert_eq!(
             tft008(&inputs(&snap, &obs, &[], Clock::Wall(0))).status,
@@ -2434,16 +2267,10 @@ mod tests {
             memlock,
         };
 
-        // A host with nothing wrong with it. Every row below is read against
-        // this one, so a check that fired unconditionally would fail here
-        // rather than look like coverage.
         for quiet in [
             facts(Thp::Madvise, ShmemThp::Advise, MemLock::Unlimited),
             facts(Thp::Always, ShmemThp::Always, MemLock::Unlimited),
-            // `within_size` behaves as `advise` for a whole-file mapping, which
-            // `ShmemThp::honours_madvise` encodes and its doc states.
             facts(Thp::Madvise, ShmemThp::WithinSize, MemLock::Unlimited),
-            // Exactly the arena is enough; the predicate is `limit < arena`.
             facts(Thp::Madvise, ShmemThp::Advise, MemLock::Bytes(arena)),
         ] {
             let o = tft016(&host_inputs(quiet));
@@ -2454,8 +2281,6 @@ mod tests {
             );
         }
 
-        // One arm each, and *one* finding each: a row that fires two arms
-        // cannot say which one the assertion is about.
         let one = |host: HostFacts, needle: &str| {
             let o = tft016(&host_inputs(host));
             assert_eq!(o.status, Status::Fired, "{host:?} must fire: {o:?}");
@@ -2475,7 +2300,6 @@ mod tests {
             facts(Thp::Unknown, ShmemThp::Advise, MemLock::Unlimited),
             "transparent_hugepage/enabled was absent",
         );
-        // The inverted-predicate mutant dies here, against the quiet rows above.
         one(
             facts(Thp::Madvise, ShmemThp::Never, MemLock::Unlimited),
             "shmem transparent huge pages are 'never'",
@@ -2493,7 +2317,6 @@ mod tests {
             "no 'Max locked memory' row",
         );
 
-        // The boundary of `limit < inp.arena_bytes`, whose quiet side is above.
         let msg = one(
             facts(Thp::Madvise, ShmemThp::Advise, MemLock::Bytes(arena - 1)),
             "RLIMIT_MEMLOCK is",
@@ -2502,18 +2325,11 @@ mod tests {
             msg.contains(&format!("{} byte arena", arena)),
             "the limit is compared against the arena and the finding must say so: {msg}"
         );
-        // `docs/decisions/0049`: `MCL_ONFAULT` is what stops the call
-        // prefaulting the whole over-provisioned arena, and the advice without
-        // it shipped once. `mlockall` charges the whole address space, so a
-        // limit above the arena is not sufficient and silence is not a
-        // clearance — both clauses were corrected once and neither was pinned.
         assert!(
             msg.contains("MCL_ONFAULT") && msg.contains("not a clearance"),
             "0049's two corrections must survive a rewording of the paragraph: {msg}"
         );
 
-        // Three unknown sources are three findings, not one: an operator who
-        // can read none of the three files has three things to fix.
         let o = tft016(&host_inputs(facts(
             Thp::Unknown,
             ShmemThp::Unknown,
@@ -2522,17 +2338,12 @@ mod tests {
         assert_eq!(o.status, Status::Fired, "{o:?}");
         assert_eq!(o.findings.len(), 3, "one finding per unknown source: {o:?}");
 
-        // And the skip that was the only reachable arm before this test.
         let o = tft016(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         assert!(
             matches!(&o.status, Status::Skipped(why) if why.contains("only on Linux")),
             "with no host facts the check must skip with its reason: {o:?}"
         );
 
-        // `docs/decisions/0049`'s Consequences: *"correcting the two documents
-        // and leaving `checks.rs` would be the worst outcome"*, and nothing
-        // enforced that. This holds the operator-facing string to
-        // `docs/API.md` §8.3, which is where the wrong advice was copied from.
         let recommended = api_md_recommended_mlockall();
         assert_eq!(
             mlockall_args(&msg),
@@ -2552,8 +2363,6 @@ mod tests {
             .split_once("### 8.3 ")
             .expect("docs/API.md must still carry §8.3");
         let section = after.split_once("\n### ").map_or(after, |(body, _)| body);
-        // An empty parse is not a pass: the comparison above would then hold
-        // the message to nothing.
         mlockall_args(section)
             .into_iter()
             .next()
@@ -2591,8 +2400,6 @@ mod tests {
             )
         };
 
-        // (1) A two-slot ring: it retains one sample whatever the publisher
-        // does, so the ring size is the remedy.
         let mut e = edge(1, 1, 2, 3_600);
         e.capacity = 2;
         let snap = two_frame_snapshot(e);
@@ -2608,8 +2415,6 @@ mod tests {
             other => panic!("TFT013 reported {other:?} on an arena it cannot measure"),
         }
 
-        // (2) A 512-slot ring with one sample in it — `doctor --attach` at
-        // bringup. 511 slots are free and a ring-size remedy is false.
         let snap = two_frame_snapshot(edge(1, 1, 2, 1));
         let o = tft013(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         match &o.status {
@@ -2622,9 +2427,6 @@ mod tests {
             other => panic!("TFT013 reported {other:?} on an arena it cannot measure"),
         }
 
-        // (3) Five samples at one instant: the count and the ring are both
-        // fine and `median_period` declines on the median itself. Neither of
-        // the sentences above is true of this arena.
         let obs = one_sample(1, 7_000_000, 5);
         let snap = two_frame_snapshot(edge(1, 1, 2, 5));
         let o = tft013(&inputs(&snap, &obs, &[], Clock::Wall(0)));
@@ -2648,8 +2450,6 @@ mod tests {
         const MS: i64 = 1_000_000;
         let snap = two_frame_snapshot(edge(1, 1, 2, 4));
         let now = Clock::Wall(5_030 * MS);
-        // Four stamps is three intervals: one short of the floor. The 5 s hole
-        // between the third and the fourth is 500x the 10 ms cadence around it.
         let stamps = [0, 10 * MS, 20 * MS, 5_020 * MS];
         let obs = Observations::from_samples(
             stamps
@@ -2677,25 +2477,17 @@ mod tests {
                  same edge in the same document"
             ),
         }
-        // The other check in that document, on the same inputs, over the same
-        // empty set. It has an answer; a `pass` beside it is two answers.
         assert_ne!(
             tft008(&live_inputs(&snap, &obs, &[], now)).status,
             Status::Pass,
             "if TFT008 ever passes here this test no longer says what it claims"
         );
-        // And the disclosure in `Meta.notes` is the third answer that must not
-        // appear. This source would otherwise get the "nothing is writing this
-        // source" note, which says the retained-gap half ran — beside a `not
-        // run` line for the same id, in the same document.
         assert!(
             silence_coverage_note(&o, Clock::Wall(0), PushStream::Observed).is_none(),
             "TFT009 skipped; a note claiming it measured the retained gaps is the \
              report contradicting itself: {o:?}"
         );
 
-        // Non-vacuity: one more stamp is four intervals, and the dropout that
-        // was always in these samples is reported.
         let obs = Observations::from_samples(
             [0, 10 * MS, 20 * MS, 30 * MS, 5_030 * MS]
                 .iter()
@@ -2714,9 +2506,6 @@ mod tests {
             "the gap was in the samples all along: {o:?}"
         );
 
-        // The third gap, which no other test reaches: five stamps at one
-        // instant is four intervals and a zero median, so the count and the
-        // monotone guards both pass and `median_period` is what declines.
         let obs = Observations::from_samples(
             (0..5)
                 .map(|_| tf_tree_bench::fixture::PushSample {
@@ -2740,9 +2529,6 @@ mod tests {
             ),
         }
 
-        // And an arena nothing has published to at all is its own sentence,
-        // because "no edge retained enough" and "nothing published" are
-        // different arenas with different next steps.
         let o = tft009(&live_inputs(&snap, &Observations::new(), &[], now));
         match &o.status {
             Status::Skipped(why) => assert!(
@@ -2772,7 +2558,6 @@ mod tests {
                 .collect(),
         );
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
-        // One period late, then just under the factor. Neither is a fault.
         for late in [10 * MS, GAP_FACTOR * 10 * MS] {
             let o = tft009(&live_inputs(&snap, &obs, &[], Clock::Wall(newest + late)));
             assert_eq!(
@@ -2810,9 +2595,6 @@ mod tests {
             "the finding does not say how far wrong or which way: {msg}"
         );
 
-        // **`i64::MIN`, the value the arena can hold and arithmetic cannot** —
-        // the fixture for `tft004`'s `unsigned_abs`, whose comment states what
-        // `abs` would do to it.
         let mut extreme = edge(1, 1, 2, 100);
         extreme.clock_offset_nanos = Some(i64::MIN);
         let snap = two_frame_snapshot(extreme);
@@ -2867,7 +2649,6 @@ mod tests {
             );
         }
 
-        // The epoch condition, deliberately the same one TFT005 uses.
         let out = tft004(&inputs(&snap, &obs, &[], Clock::NewestStamp(2_000_000_000)));
         let Status::Skipped(reason) = &out.status else {
             panic!(
@@ -2880,11 +2661,6 @@ mod tests {
             "the epoch skip does not point at the rule it shares: {reason}"
         );
 
-        // **An edge whose publisher is gone.** Nothing clears
-        // `clock_offset_nanos` on release or on reap — only `Tree::claim` does,
-        // and that is a *successor* arriving. Without the `claimed` gate this
-        // arena reports "its clock reads 3600.0 s behind" about an edge that has
-        // no writer at all.
         let mut departed = edge(1, 1, 2, 100);
         departed.clock_offset_nanos = Some(3_600_000_000_000);
         departed.claimed = false;
@@ -2901,7 +2677,6 @@ mod tests {
             "the fleet spread counted an edge with no writer"
         );
 
-        // Nothing sampled: a fresh arena, or one whose writer has not pushed.
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
         let out = tft004(&inputs(&snap, &obs, &[], wall));
         let Status::Skipped(reason) = &out.status else {
@@ -2941,10 +2716,6 @@ mod tests {
                 && note.contains("45.000 ms"),
             "the note does not carry the fleet's range: {note}"
         );
-        // **The median of an even fleet is the mean of its two middles.** Under
-        // the upper-median convention this two-machine fleet's "median" is
-        // 45 ms — its worse member — and the number exists to be weighed against
-        // exactly that member.
         assert!(
             note.contains("median 23.000 ms"),
             "an even fleet's median is the mean of the two middles, not the \
@@ -2969,8 +2740,6 @@ mod tests {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
         let obs = Observations::new();
 
-        // Both fixtures retain the same 1 s window and record the same 5 s
-        // worst gap, so the *only* difference is which end it was past.
         let after_only = [EdgeStats {
             edge: 1,
             lookups_ok: 1000,
@@ -3003,7 +2772,6 @@ mod tests {
             o.findings[0].message
         );
 
-        // And a gap that fits inside the window is not undersizing either.
         let fits = [EdgeStats {
             worst_extrap_gap_ns: 500_000_000,
             ..before[0].clone()
@@ -3027,7 +2795,6 @@ mod tests {
             ..EdgeStats::default()
         }];
 
-        // Boot-relative domain: stamps near zero are the origin, not a bug.
         let o = tft006(&inputs(
             &snap,
             &obs,
@@ -3036,12 +2803,10 @@ mod tests {
         ));
         assert_eq!(o.status, Status::Pass, "{o:?}");
 
-        // Unix domain: the same stamps mean 1970.
         let o = tft006(&inputs(&snap, &obs, &zeros, Clock::Wall(1_000_000_000)));
         assert_eq!(o.status, Status::Fired, "{o:?}");
         assert!(o.findings[0].message.contains("1970"));
 
-        // A negative stamp is invalid in either domain.
         let negs = [EdgeStats {
             negative_stamps: 1,
             zero_stamps: 0,
@@ -3080,8 +2845,6 @@ mod tests {
             Status::Pass
         );
 
-        // The same publisher, having written seconds-worth of nanoseconds into
-        // a nanosecond field: 1e9 times too large.
         let absurd = [EdgeStats {
             newest_stamp: Some(now.saturating_mul(2)),
             ..sane[0].clone()
@@ -3123,7 +2886,6 @@ mod tests {
             two_frame_snapshot(e)
         };
 
-        // Exactly at the tolerance: a publisher stamping just before its push.
         let snap = ahead_by(FUTURE_TOLERANCE_NS);
         let o = tft005(&inputs(&snap, &obs, &stats, Clock::Wall(NOW)));
         assert_eq!(
@@ -3132,16 +2894,12 @@ mod tests {
             "a stamp at the tolerance is the normal case the constant exists for: {o:?}"
         );
 
-        // One nanosecond past it.
         let snap = ahead_by(FUTURE_TOLERANCE_NS + 1);
         let o = tft005(&inputs(&snap, &obs, &stats, Clock::Wall(NOW)));
         assert_eq!(o.status, Status::Fired, "{o:?}");
         assert_eq!(o.findings.len(), 1, "{:?}", o.findings);
         assert_eq!(o.findings[0].edge, Some(1));
 
-        // And the distance reaches the operator, which is the number they act
-        // on: half a second ahead is a publisher whose clock is wrong, not a
-        // late push.
         let snap = ahead_by(500_000_000);
         let o = tft005(&inputs(&snap, &obs, &stats, Clock::Wall(NOW)));
         let msg = &o.findings[0].message;
@@ -3150,8 +2908,6 @@ mod tests {
             "the finding must say how far ahead and against what tolerance: {msg}"
         );
 
-        // The same arena whose stamps are not Unix time: the question has no
-        // meaning and the check says so rather than reporting every edge.
         let o = tft005(&inputs(&snap, &obs, &stats, Clock::NewestStamp(NOW)));
         match &o.status {
             Status::Skipped(why) => assert!(
@@ -3187,7 +2943,6 @@ mod tests {
         assert_eq!(o.findings.len(), 1, "{:?}", o.findings);
         assert_eq!(o.findings[0].edge, Some(2));
 
-        // Non-vacuity: a dynamic edge that has published is clean.
         let (snap, obs) = with_a_running_publisher(edge(2, 2, 3, 7), long_enough);
         assert_eq!(
             tft013(&inputs(&snap, &obs, &stats, Clock::Wall(0))).status,
@@ -3224,8 +2979,6 @@ mod tests {
              this check is for: {o:?}"
         );
 
-        // Nothing has published anywhere: bringup and a total outage are the
-        // same arena, and the check says so rather than choosing one.
         let snap = two_frame_snapshot(edge(1, 1, 2, 0));
         let o = tft013(&inputs(&snap, &Observations::new(), &stats, Clock::Wall(0)));
         match &o.status {
@@ -3242,8 +2995,6 @@ mod tests {
         const PERIOD_NS: i64 = 10_000_000; // 100 Hz, as `with_a_running_publisher`.
         let stats: [EdgeStats; 0] = [];
         let head_for = |activity_ns: i64| u64::try_from(activity_ns / PERIOD_NS).unwrap() + 1;
-        // Edge 2 is the subject: dynamic, `head == 0`, nothing ever published.
-        // Edges 1 and 3 are the publishers whose activity decides the grace.
         let arena = |a: i64, b: i64, kind_of_3: EdgeKind| {
             let mut third = edge(3, 3, 4, head_for(b));
             third.kind = kind_of_3;
@@ -3262,9 +3013,6 @@ mod tests {
             (snap, Observations::from_samples(events))
         };
 
-        // One publisher inside the grace, one well past it — in both orders, so
-        // that neither "the first one that measures" nor "the last one" can
-        // explain the verdict either.
         for (a, b) in [
             (DECLARATION_GRACE_NS - MS, DECLARATION_GRACE_NS * 2),
             (DECLARATION_GRACE_NS * 2, DECLARATION_GRACE_NS - MS),
@@ -3281,9 +3029,6 @@ mod tests {
             assert_eq!(o.findings[0].edge, Some(2));
         }
 
-        // The same durations, with the long-running stream on a *static* edge.
-        // Its head and its samples are both what a correct arena never has, and
-        // neither may extend the grace decision.
         let (snap, obs) = arena(
             DECLARATION_GRACE_NS - MS,
             DECLARATION_GRACE_NS * 2,
@@ -3319,7 +3064,6 @@ mod tests {
         let o = tft010(&inp);
         assert!(matches!(o.status, Status::Skipped(_)), "{o:?}");
 
-        // Non-vacuity: with the counters compiled in, the same state fires.
         inp.counters = true;
         let o = tft010(&inp);
         assert_eq!(o.status, Status::Fired, "{o:?}");
@@ -3329,7 +3073,6 @@ mod tests {
             o.findings[0].message
         );
 
-        // ...and a rate under the threshold does not.
         let cool = [EdgeStats {
             lookups_ok: 100_000,
             extrap_after: 1,
@@ -3343,17 +3086,14 @@ mod tests {
     #[test]
     fn the_reference_clock_refuses_to_mix_time_domains() {
         let unix_now = 1_700_000_000_000_000_000;
-        // A boot-relative arena: 9.9 s since boot, as the benchmark fixture is.
         assert_eq!(
             Clock::decide(&[9_900_000_000, 9_800_000_000], unix_now),
             Clock::NewestStamp(9_900_000_000)
         );
-        // A Unix-stamped arena a minute behind the clock is still Unix.
         assert_eq!(
             Clock::decide(&[unix_now - 60_000_000_000], unix_now),
             Clock::Wall(unix_now)
         );
-        // An empty arena has nothing to disagree about.
         assert_eq!(Clock::decide(&[], unix_now), Clock::Wall(unix_now));
     }
 
@@ -3361,8 +3101,6 @@ mod tests {
     #[test]
     fn a_single_units_error_cannot_capture_the_reference_clock() {
         let unix_now = 1_700_000_000_000_000_000;
-        // Five healthy edges, each with its own stamp within a second of now,
-        // plus one publisher that multiplied instead of dividing.
         let mut stamps: Vec<i64> = (0..5).map(|i| unix_now - i * 200_000_000).collect();
         let rogue = unix_now * 2;
         stamps.push(rogue);
@@ -3374,7 +3112,6 @@ mod tests {
              redefine the domain"
         );
 
-        // ...and with that reference, TFT006 blames exactly the rogue edge.
         let snap = Snapshot {
             frames: vec![frame(1, "map", 0, 0), frame(2, "odom", 1, 1)],
             edges: (0..6).map(|i| edge(i + 1, 1, 2, 100)).collect(),
@@ -3419,9 +3156,6 @@ mod tests {
             "a record in CLAIMING is a handoff in flight, not a leak: {o:?}"
         );
 
-        // The same edge with the sentinel cleared *is* a leak, and must fire —
-        // otherwise the assertion above would hold for a check that never
-        // reports anything.
         let mut leaked = mid;
         leaked.claiming = false;
         let snap = two_frame_snapshot(leaked);
@@ -3443,11 +3177,6 @@ mod tests {
         held.owner_pid = 4711;
 
         let mut snap = two_frame_snapshot(held);
-        // **A source with no lock file**, which is what `byte: Unknown` says:
-        // the fixture and `--from-bag` build their arena in this process and
-        // have no rendezvous to probe. It is the row of [`slot_leak`]'s table
-        // that keeps this check's original predicate, so this test pins that
-        // row rather than the new byte-driven ones.
         snap.participants = vec![
             ParticipantInfo {
                 slot: 0,
@@ -3455,17 +3184,9 @@ mod tests {
                 pid: 4711,
                 alive: false,
                 byte: LockByte::Unknown,
-                // No lock file was read, so there is no recorded pid either:
-                // the arena record's is the only name this row has, and the
-                // finding has to print that one.
                 recorded_pid: None,
                 recorded: RecordedProcess::Unknown,
             },
-            // A joiner mid-attach. `participant_alive` folds `state == LIVE` in
-            // ahead of the lock-byte probe, so this reads `alive: false` on a
-            // perfectly healthy process — which is why a source with no byte to
-            // probe must not report `RESERVED`. With a byte, it can: that is
-            // `a_reserved_record_over_a_free_byte_is_the_leak_a_byte_can_see`.
             ParticipantInfo {
                 slot: 1,
                 state: SlotState::Reserved,
@@ -3480,9 +3201,6 @@ mod tests {
         let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         assert_eq!(o.status, Status::Fired, "{o:?}");
         assert_eq!(o.findings.len(), 2, "one slot and one edge: {o:?}");
-        // `byte not probed`, because this source has no lock file: the subject
-        // states which evidence the run actually had, so a `--from-bag` finding
-        // and an `--attach` one are not read as the same claim.
         assert_eq!(o.findings[0].subject, "slot 0 pid 4711, byte not probed");
         assert_eq!(o.findings[0].edge, None, "a slot leak is not about an edge");
         assert!(
@@ -3496,11 +3214,6 @@ mod tests {
             "the claim half must still name the edge: {o:?}"
         );
 
-        // **The same arena, read out of a `.tft`, must not report any of
-        // it.** A frozen file is a byte copy of the whole arena (PHASE5 §2.3),
-        // so its participant table names a run that ended and its claims name
-        // that run's slots. Firing here is firing on every correct `.tft`, and
-        // it is the only shape of this snapshot that a real source produces.
         let frozen = tft014(&Inputs {
             slots: SlotTable::Image,
             ..inputs(&snap, &obs, &[], Clock::Wall(0))
@@ -3522,15 +3235,9 @@ mod tests {
             slot: n,
             state,
             pid: 4712,
-            // `false` for every non-`LIVE` record and for a `LIVE` one over a
-            // free byte, which is what `Tree::participant_alive` answers. None
-            // of the rows below reads it — that is the point of them.
             alive: false,
             byte,
             recorded,
-            // A row whose byte was never probed read no lock file, so it has no
-            // identity record to name a pid either. Tying the two together here
-            // keeps every fixture in this module a shape a real run produces.
             recorded_pid: (byte != LockByte::Unknown).then_some(4712),
         }
     }
@@ -3642,10 +3349,6 @@ mod tests {
             !m.contains("the pid below is the arena record's own"),
             "there is no pid below — that clause is the sibling's: {m}"
         );
-        // **The other two places the zero used to reach.** Fixing the evidence
-        // clause alone left the message naming `pid 0` and shouting at the
-        // operator to check it, and the subject line rendering the `slot 8
-        // pid 0` shape verbatim.
         assert!(
             !m.contains("pid 0") && !m.contains("CHECK THE PID"),
             "nothing may print a zero as a pid or send anybody to check one: {m}"
@@ -3742,8 +3445,6 @@ mod tests {
             LockByte::Free,
             RecordedProcess::Gone,
         ));
-        // The no-lock-file source: `alive` is the whole of the evidence, and it
-        // is `false` here because `slot` builds it that way.
         snap.participants.push(slot(
             2,
             SlotState::Live,
@@ -3794,9 +3495,6 @@ mod tests {
                 state: SlotState::Free,
                 pid: 0,
                 alive: false,
-                // Half the table is genuinely empty and half is the real shape
-                // of a robot's consumers: a free record with a *held* byte,
-                // because a read-only participant writes no arena record (D18).
                 byte: if slot % 2 == 0 {
                     LockByte::Held
                 } else {
@@ -3823,9 +3521,6 @@ mod tests {
         snap.participants.push(ParticipantInfo {
             slot: 3,
             state: SlotState::Free,
-            // Nothing was ever written to the arena record, so its pid field is
-            // zero — which is why the finding has to take its pid from the lock
-            // file.
             pid: 0,
             alive: false,
             byte: LockByte::Held,
@@ -3859,9 +3554,6 @@ mod tests {
     fn the_subject_names_the_pid_the_evidence_is_about() {
         let obs = Observations::new();
         let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
-        // A registrant that died inside `fill_slot`: the byte it took has been
-        // released by its death, the arena record is `RESERVED` with an unset
-        // pid, and the lock file names it.
         snap.participants.push(ParticipantInfo {
             slot: 8,
             state: SlotState::Reserved,
@@ -3871,10 +3563,6 @@ mod tests {
             recorded: RecordedProcess::Gone,
             recorded_pid: Some(1841),
         });
-        // A slot re-registered by a live process while the lock file still
-        // names the dead previous holder is not this shape — but a `LIVE`
-        // record whose own pid differs from the recorded one is, and both
-        // numbers are then real and worth printing.
         snap.participants.push(ParticipantInfo {
             slot: 9,
             state: SlotState::Live,
@@ -3908,8 +3596,6 @@ mod tests {
     #[test]
     fn an_out_of_order_stream_is_not_reported_as_a_dropout() {
         const MS: i64 = 1_000_000;
-        // Monotone 100 ms cadence except for one sample that arrives late and
-        // is stamped 250 ms in the past; the next sample jumps 350 ms forward.
         let stamps = [0, 100, 200, 300, 50, 400, 500, 600];
         let obs = Observations::from_samples(
             stamps
@@ -3924,11 +3610,6 @@ mod tests {
         );
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
         let o = tft009(&inputs(&snap, &obs, &[], Clock::Wall(0)));
-        // Not `Pass`, which is what this asserted until the empty-subject-set
-        // repair: the one edge in this arena is the one edge declined, so the
-        // subject set is empty and a pass would be the all-clear the repair
-        // removed. The reason has to send the operator to `TFT018` rather than
-        // to a ring that has not filled.
         match &o.status {
             Status::Skipped(why) => assert!(
                 why.contains("goes backwards") && why.contains("TFT018"),
@@ -3942,13 +3623,10 @@ mod tests {
             ),
         }
 
-        // Non-vacuity, twice over. The stream really is out of order...
         assert!(
             !doctor::check_out_of_order(&obs).is_empty(),
             "the fixture must actually be non-monotone, or this asserts nothing"
         );
-        // ...and TFT009 is not simply mute: the same cadence with the inversion
-        // removed, and one genuine 400 ms hole, still reports the dropout.
         let clean = [0, 100, 200, 300, 400, 800, 900, 1000];
         let obs = Observations::from_samples(
             clean
@@ -4013,8 +3691,6 @@ mod tests {
             "TFT018's severity must be the one `out-of-order` assigns"
         );
 
-        // And both really do reach the report through their ids, rather than
-        // through the id-less path they used to take.
         let snap = two_frame_snapshot(EdgeInfo {
             claimed: false,
             owner_pid: 0,
@@ -4048,9 +3724,6 @@ mod tests {
         let mut stamps: Vec<i64> = (0..10).map(|i| i * PERIOD_NS).collect();
         let last = stamps[stamps.len() - 1];
         let mut t = last - back_ns;
-        // `<= last` and not `< last`: the push that lands exactly on the newest
-        // accepted stamp is *accepted* (replay is idempotent), so it ends the
-        // rejected run rather than extending it.
         while t <= last {
             stamps.push(t);
             t += PERIOD_NS;
@@ -4094,9 +3767,6 @@ mod tests {
     #[test]
     fn tft019_fires_only_on_the_wall_clock_tag_and_names_the_tag_it_refuses() {
         const MS: i64 = 1_000_000;
-        // Edge 1 is SystemDomain (0); edge 2 is SteadyDomain (3). Both went
-        // backwards by the same amount, so only the tag can explain the
-        // difference in outcome.
         let snap = chain_with_domains(0, 3);
         let mut events = stepped_back(1, 100 * MS);
         events.extend(stepped_back(2, 100 * MS));
@@ -4117,8 +3787,6 @@ mod tests {
             "the finding must carry the size of the step, the cause, and the fix: {}",
             o.findings[0].message
         );
-        // The half it did not attribute is disclosed, since neither the
-        // findings nor a skip reason can carry it here.
         let note = ClockStepEvidence::capture(&snap, &obs)
             .coverage_note(PushStream::Observed)
             .expect("a partial run discloses");
@@ -4127,9 +3795,6 @@ mod tests {
             "{note}"
         );
 
-        // With *no* wall-clock edge left, the check skips and names the tag it
-        // refused — a `pass` would read as "no clock step", an assurance about
-        // clocks this check cannot give.
         let snap = chain_with_domains(1, 3);
         let o = tft019(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         match &o.status {
@@ -4147,11 +3812,6 @@ mod tests {
             "the skip reason carries the whole disclosure here, so the note stays silent"
         );
 
-        // **Sim time is refused for its own reason.** A `/clock` reset from a
-        // bag loop or a sim restart *is* a backwards step, so the steady tag's
-        // "cannot have stepped at all" would be false here; telling it apart
-        // from a publisher's `transform_tolerance` is what decision 0012 is,
-        // and `doctor` has none of its signals offline.
         let snap = chain_with_domains(2, 2);
         let o = tft019(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         match &o.status {
@@ -4164,9 +3824,6 @@ mod tests {
             other => panic!("expected a skip on the sim tag, got {other:?}"),
         }
 
-        // And a monotone stream on a wall-clock edge is a `Pass`, not a skip:
-        // the evidence is TFT018's and it is complete — every retained stream
-        // was examined and none went backwards.
         let snap = chain_with_domains(0, 0);
         let obs = Observations::from_samples(steady(1, 8, 50 * MS));
         let o = tft019(&inputs(&snap, &obs, &[], Clock::Wall(0)));
@@ -4178,8 +3835,6 @@ mod tests {
     fn tft019_needs_a_run_of_rejections_not_a_single_inversion() {
         let snap = chain_with_domains(0, 0);
 
-        // Two rejected arrivals: one sample out of place, not a clock that
-        // stepped. TFT018 still reports it — nothing is suppressed.
         let obs = Observations::from_samples(stepped_back(1, 2 * PERIOD_NS));
         let inp = inputs(&snap, &obs, &[], Clock::Wall(0));
         assert_eq!(
@@ -4192,7 +3847,6 @@ mod tests {
             Status::Fired,
             "the detector is untouched: rejected pushes are lost data either way"
         );
-        // A pass that covers less than it looks like it does says so.
         let note = ClockStepEvidence::capture(&snap, &obs)
             .coverage_note(PushStream::Observed)
             .expect("a diffuse wall-clock run is disclosed rather than silently passed");
@@ -4202,8 +3856,6 @@ mod tests {
             "{note}"
         );
 
-        // Exactly at the threshold: a step of `CLOCK_STEP_MIN_REJECTED_RUN`
-        // publish periods rejects that many pushes on the way back up.
         let obs = Observations::from_samples(stepped_back(
             1,
             PERIOD_NS * CLOCK_STEP_MIN_REJECTED_RUN as i64,
@@ -4253,7 +3905,6 @@ mod tests {
              happen"
         );
 
-        // Non-vacuity: the same stream, recorded as it arrived, is attributed.
         inp.stream = PushStream::Observed;
         assert_eq!(tft019(&inp).status, Status::Fired);
     }
@@ -4280,7 +3931,6 @@ mod tests {
             }
         }
 
-        // Non-vacuity: the same stream, read out of a recording, is judged.
         inp.stream = PushStream::Recorded;
         assert_eq!(tft018(&inp).status, Status::Fired);
         assert_eq!(tft019(&inp).status, Status::Fired);
@@ -4301,7 +3951,6 @@ mod tests {
             ),
             other => panic!("expected a skip on a recording, got {other:?}"),
         }
-        // Non-vacuity: the fixture's stream does carry pids and does run.
         inp.stream = PushStream::Observed;
         assert_eq!(tft001(&inp).status, Status::Pass);
     }
@@ -4333,9 +3982,6 @@ mod tests {
             "an explained clock step is still lost data and must still gate --exit-code"
         );
 
-        // Suppressing the *explanation* must not disarm the gate, and
-        // suppressing the *detector* must — that is what an id being a contract
-        // means for `--exit-code`.
         let only_019 = run(&inp, &BTreeSet::from([Tft::Tft019]));
         assert!(only_019.has_error(), "TFT019 was never what gated");
         let only_018 = run(&inp, &BTreeSet::from([Tft::Tft018]));
@@ -4348,8 +3994,6 @@ mod tests {
     fn tft019_considers_exactly_the_edges_tft018_fired_on() {
         const MS: i64 = 1_000_000;
         let snap = chain_with_domains(0, 0);
-        // Repeated stamps are *accepted* by invariant 6 — replay is idempotent —
-        // so neither check may treat them as a regression.
         let repeats: Vec<PushSample> = (0..=CLOCK_STEP_MIN_REJECTED_RUN)
             .map(|_| PushSample {
                 edge: 1,
@@ -4373,7 +4017,6 @@ mod tests {
              second copy of it"
         );
 
-        // And where TFT018 does fire, TFT019 considers exactly its edges.
         let mut events = stepped_back(1, 100 * MS);
         events.extend(stepped_back(2, 200 * MS));
         let obs = Observations::from_samples(events);
@@ -4422,7 +4065,6 @@ mod tests {
             ),
             other => panic!("expected a skip on a live arena, got {other:?}"),
         }
-        // Non-vacuity: the same stream off a live arena does fire.
         inp.stream = PushStream::Observed;
         assert_eq!(tft018(&inp).status, Status::Fired);
     }
@@ -4474,9 +4116,6 @@ mod tests {
             o.findings[0].message
         );
 
-        // Publishing *faster* than declared is a finding too: the ring was
-        // sized from rate_hz x history_secs, so it now retains proportionally
-        // less history than every consumer was tuned against.
         let obs = Observations::from_samples(steady(1, 12, 20 * MS)); // 50 Hz
         let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         assert_eq!(o.findings.len(), 1, "{o:?}");
@@ -4489,8 +4128,6 @@ mod tests {
             o.findings[0].message
         );
 
-        // And a rate inside the tolerance band is not a finding: 18 Hz against
-        // a declared 20 Hz is a 10% miss, which is jitter and load.
         let obs = Observations::from_samples(steady(1, 12, 55_555_555));
         let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         assert_eq!(o.status, Status::Pass, "{o:?}");
@@ -4502,8 +4139,6 @@ mod tests {
     fn tft007_skips_when_no_edge_declares_a_rate() {
         const MS: i64 = 1_000_000;
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
-        // A full, healthy, measurable stream — so the skip is about the missing
-        // declaration and not about missing samples.
         let obs = Observations::from_samples(steady(1, 12, 50 * MS));
         let o = tft007(&inputs(&snap, &obs, &[], Clock::Wall(0)));
         match &o.status {
@@ -4514,11 +4149,6 @@ mod tests {
             other => panic!("expected a skip, got {other:?}"),
         }
 
-        // A *static* edge carrying a rate is not a declaration either: it never
-        // publishes, so there is no stream to hold or miss one. Reachable only
-        // from a hand-built or corrupt record — the builder writes no nominal
-        // for a static edge — which is exactly why the guard is not obviously
-        // dead code.
         let snap = two_frame_snapshot(EdgeInfo {
             kind: EdgeKind::Static,
             capacity: 0,
@@ -4531,7 +4161,6 @@ mod tests {
             other => panic!("a static edge cannot declare a publish rate, got {other:?}"),
         }
 
-        // Non-vacuity: the same stream against a declared rate does run.
         let mut declared = edge(1, 1, 2, 100);
         declared.nominal_rate_mhz = Some(20_000);
         let snap = two_frame_snapshot(declared);
@@ -4557,8 +4186,6 @@ mod tests {
                 frame(2, "odom", 1, 1),
                 frame(3, "base", 2, 2),
             ],
-            // Edge 2 appears in no sample at all: `by_edge` has no entry, which
-            // is the `samples: None` path and not the short-slice one.
             edges: vec![short, stopped],
             participants: live_writer(),
         };
@@ -4579,8 +4206,6 @@ mod tests {
             "the note stays silent here, which is why the skip has to carry the disclosure"
         );
 
-        // Non-vacuity: one measurable edge is enough to make the check run, and
-        // then the note — not the skip — carries what it did not cover.
         let obs = Observations::from_samples(
             steady(1, 12, 50 * MS)
                 .into_iter()
@@ -4602,8 +4227,6 @@ mod tests {
     /// decides fired from passed.**
     #[test]
     fn the_rate_tolerance_band_is_pinned_at_its_edge() {
-        // 25 Hz exactly: 40 ms is representable, so the observed side carries
-        // no rounding of its own into the comparison.
         let obs = Observations::from_samples(steady(1, 12, 40_000_000));
         let outcome = |mhz: u32| {
             let mut e = edge(1, 1, 2, 100);
@@ -4643,10 +4266,6 @@ mod tests {
                 declared,
                 short,
                 edge(3, 3, 4, 100),
-                // A static edge cannot declare a rate and cannot publish one,
-                // so it belongs in neither the numerator nor the denominator:
-                // a real arena is mostly static edges, and counting them would
-                // make the note read as near-total blindness on a healthy tree.
                 EdgeInfo {
                     kind: EdgeKind::Static,
                     capacity: 0,
@@ -4656,8 +4275,6 @@ mod tests {
             participants: live_writer(),
         };
         let mut events = steady(1, 12, 50 * MS);
-        // Declared, but only three intervals: a rate measured from that is
-        // noise, so it counts as not compared rather than compared badly.
         events.extend(steady(2, 4, 50 * MS));
         let obs = Observations::from_samples(events);
 
@@ -4670,7 +4287,6 @@ mod tests {
             "{note}"
         );
 
-        // Every edge declared and measurable: nothing to disclose.
         let mut a = edge(1, 1, 2, 100);
         a.nominal_rate_mhz = Some(20_000);
         let full = two_frame_snapshot(a);
@@ -4680,8 +4296,6 @@ mod tests {
             None
         );
 
-        // Nothing declared: the check skips and says so itself, so a note here
-        // would be a second, weaker statement of the same fact.
         let none = two_frame_snapshot(edge(1, 1, 2, 100));
         assert_eq!(
             rate_coverage_note(&none, &obs, Clock::Wall(0), PushStream::Observed),
@@ -4706,9 +4320,6 @@ mod tests {
                     why.contains("served a lookup"),
                     "the skip must name the reason a reader can act on: {why}"
                 );
-                // **The read-only cause specifically**, because it is the one
-                // a running robot is usually in and the one the message omitted
-                // until 2026-08-29.
                 assert!(
                     why.contains("read-only consumer cannot record a counter"),
                     "the deployment-shaped cause is the one an operator meets: {why}"
@@ -4722,8 +4333,6 @@ mod tests {
             other => panic!("an arena nobody has read must not report a verdict: {other:?}"),
         }
 
-        // One successful lookup and nothing else changes: the counters now
-        // distinguish "no failures" from "nothing counted", so the check runs.
         let exercised = [EdgeStats {
             edge: 1,
             lookups_ok: 1,
@@ -4747,7 +4356,6 @@ mod tests {
             ..EdgeStats::default()
         }];
 
-        // A recording: counters unexercised *and* no arrival delays.
         let mut inp = inputs(&snap, &obs, &unexercised, Clock::Wall(0));
         inp.stream = PushStream::Recorded;
         match tft011(&inp).status {
@@ -4764,13 +4372,10 @@ mod tests {
             other => panic!("neither half had evidence and it still reported: {other:?}"),
         }
 
-        // The fixture: counters unexercised, but the stream records an arrival
-        // delay per sample, so half two is a real result and the check runs.
         let mut inp = inputs(&snap, &obs, &unexercised, Clock::Wall(0));
         inp.stream = PushStream::Observed;
         assert_eq!(tft011(&inp).status, Status::Pass);
 
-        // A live arena that has served lookups: half one is a real result.
         let exercised = [EdgeStats {
             edge: 1,
             lookups_ok: 1,
@@ -4794,8 +4399,6 @@ mod tests {
         let on = no_counter_evidence(true, &unexercised).expect("zero counters carry no verdict");
         assert!(on.contains("served a lookup"), "{on}");
 
-        // A failed lookup counts as exercise just as much as a successful one:
-        // it is the same increment site.
         let failed = [EdgeStats {
             edge: 1,
             extrap_before: 1,

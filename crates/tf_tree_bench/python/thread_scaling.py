@@ -1,32 +1,19 @@
-"""`docs/PHASE3.md` §12.2 criterion 4 and §7.3's missing scaling test.
-Criterion 4: *"thread scaling >= 6x from 1 to 8 threads on `3.14t`, and >= 6x on the
-GIL build for batches above the release threshold"*; §7.3: *"1/2/4/8 threads calling
-`plan.at` on a shared `Tree`"*. `tests/python/test_freethreading.py` asserts only
-correctness, so it is not this claim.
+"""`docs/PHASE3.md` §12.2 criterion 4 and §7.3's scaling test: 1/2/4/8 threads calling
+`plan.at` on a shared `Tree`, scaling >= 6x from 1 to 8 threads.
 
 The interpreter decides the half: `python3.14t` is the free-threaded half, `python3.14`
-the GIL half (the default batch clears §6.1's release threshold at depth 3).
+the GIL half. **Run against a `--release` extension** (`just py-thread-scaling`): a
+`develop` build reads roughly a sixth of the throughput. The single-thread arm prints
+ns/sample beside `tree.rs`'s 328 ns/elem release reference.
 
-**Run against a `--release` extension** (`just py-thread-scaling` builds one): a
-`develop` build reads roughly a sixth of the throughput and the scaling curve moves
-with it. Every arm prints ns/sample; the single-thread arm prints it beside `tree.rs`'s
-**328 ns/elem** release reference (a comparison, not a floor).
+**The verdict is one-sided.** Every way a host can be unfair to a scaling floor pushes
+scaling down, so a miss on such a host is `INVALID` with its margin
+(`docs/PHASE5.md` §9.3); on a host with a core per thread a miss is `FAIL`, and
+`--gate` exits 1.
 
-**The verdict is one-sided.** Every way a host can be unfair to a scaling floor (fewer
-physical cores than threads, SMT siblings, another tenant) pushes scaling down, so a
-reading at or above the floor is a conservative PASS and a miss on such a host is
-`INVALID` with its margin (`docs/PHASE5.md` §9.3). On a host with a core per thread a
-miss is the code's: `FAIL`, and `--gate` exits 1.
-
-**`--serialize` is the falsifier**: it wraps every call in one `threading.Lock` and
-must read a flat or falling curve. `--gate` is refused beside it, and beside
-`--call at_into` (§7.3 names `plan.at`; `at_into` writes a caller-owned buffer and
-explains a GIL-half shortfall).
-
-Figures live in `docs/benchmarks/EVIDENCE.md`'s probe row and are not restated here.
-On the development host the free-threaded half straddles the floor (this host cannot
-settle it), and the GIL half reads below it with the host not the explanation: part of
-the gap is GIL-held allocation in `Plan::at`, the rest is unattributed.
+**`--serialize` is the falsifier**: one `threading.Lock` around every call must read a
+flat or falling curve. `--gate` is refused beside it and beside `--call at_into`
+(§7.3 names `plan.at`). Figures live in `docs/benchmarks/EVIDENCE.md`'s probe row.
 """
 
 from __future__ import annotations
@@ -41,30 +28,19 @@ import time
 import numpy as np
 import tf_tree
 
-# Depth 3 after constant folding (`docs/PHASE1.md` §11.3's shape); a one-edge tree
-# times the call, not the fold.
 EDGES = [("map", "odom"), ("odom", "base"), ("base", "imu_link")]
 THREAD_COUNTS = (1, 2, 4, 8)
-# The control-loop batch (`docs/API.md` R2 argues `_into` from n = 64), above §6.1's
-# GIL-release threshold at depth 3.
+# The control-loop batch (`docs/API.md` R2), above §6.1's GIL-release threshold.
 DEFAULT_BATCH = 64
-# Long enough that thread start-up is not measured, short enough for a few-second sweep.
 DEFAULT_SECONDS = 2.0
 DEFAULT_WARMUP = 0.5
 # Criterion 4's floor, for both halves.
 FLOOR = 6.0
-# The wrong-profile detector: `crates/tf_tree_py/src/tree.rs` documents 328 ns/elem for
-# `layout="quat"` at depth 3 in a release build (`docs/PHASE3.md` §6.1); a `develop`
-# build reads ~6x worse. A sanity check a reader applies, not a gate.
 DOCUMENTED_NS_PER_ELEM = 328.0
 
 
 def usable_cpus() -> set[int]:
-    """The CPUs this process may run on, as ids.
-
-    `os.sched_getaffinity`, not `os.cpu_count()` (which ignores `taskset`). It does not
-    see a cgroup bandwidth quota; [`quota_cores`] reads `cpu.max` for that.
-    """
+    """The CPUs this process may run on (`os.sched_getaffinity` sees `taskset`)."""
     try:
         return set(os.sched_getaffinity(0))
     except AttributeError:  # pragma: no cover - not Linux
@@ -72,11 +48,7 @@ def usable_cpus() -> set[int]:
 
 
 def quota_cores() -> float | None:
-    """Cores this process's cgroup bandwidth quota allows, or `None` if unlimited.
-
-    cgroup v2's `cpu.max` is `"<quota> <period>"` (µs) or `"max <period>"`; the affinity
-    mask cannot see it.
-    """
+    """Cores this process's cgroup bandwidth quota allows, or `None` if unlimited."""
     for path in ("/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):
         try:
             with open(path, encoding="utf-8") as f:
@@ -96,14 +68,10 @@ def quota_cores() -> float | None:
 
 
 def physical_cores() -> int | None:
-    """Physical cores this process can actually use, or `None` if undecidable.
+    """Physical cores this process can use, or `None` if undecidable.
 
-
-    Distinct `(physical id, core id)` pairs (as
-    `tf_tree_bench::report::physical_cores`),
-    not `os.cpu_count()`, which counts SMT siblings. Counted only over the CPUs in this
-    process's affinity mask, per processor, so sibling-paired CPUs are not over-counted;
-    [`quota_cores`] is applied as a floor.
+    Distinct `(physical id, core id)` pairs over the affinity mask, with
+    [`quota_cores`] as a floor.
     """
     try:
         with open("/proc/cpuinfo", encoding="utf-8") as f:
@@ -114,7 +82,6 @@ def physical_cores() -> int | None:
     pairs, cpu, phys, core = set(), None, None, None
     for line in text.splitlines():
         if line.startswith("processor"):
-            # A new block: whatever the previous one had is already recorded.
             cpu, phys, core = line.split(":")[-1].strip(), None, None
         elif line.startswith("physical id"):
             phys = line.split(":")[-1].strip()
@@ -132,15 +99,13 @@ def physical_cores() -> int | None:
     n = len(pairs)
     quota = quota_cores()
     if quota is not None:
-        # Floor, not round: two cores' budget cannot run a third thread's work.
         n = min(n, max(1, int(quota)))
     return n
 
 
 def build_tree() -> tf_tree.Tree:
     tree = tf_tree.build(EDGES)
-    # Two samples per edge so every step interpolates: a single sample folds to a
-    # constant and the fold this is meant to time disappears.
+    # Two samples per edge so every step interpolates (one sample folds to a constant).
     for parent, child in EDGES:
         for i, stamp in enumerate((1_000, 2_000)):
             tf_tree.push(
@@ -164,9 +129,7 @@ def one_arm(
 ) -> tuple[float, int]:
     """Aggregate samples per second over `threads` threads, and the call count.
 
-    Every thread runs for the same wall-clock window (a fixed count would make the
-    slowest thread the measurement). Raises if any worker raised, so a dead thread
-    cannot yield a rate for an arm that never ran at its declared width.
+    Every thread runs the same wall-clock window; raises if any worker raised.
     """
     counts = [0] * threads
     errors: list[BaseException] = []
@@ -175,17 +138,11 @@ def one_arm(
 
     def worker(slot: int) -> None:
         try:
-            # The `at_into` buffer is per thread and allocated outside both loops (`at`
-            # allocates per call while the GIL is held); shaped by `plan.at(stamps)` so
-            # a
-            # layout change cannot leave it wrong.
+            # The `at_into` buffer is per thread, allocated outside both loops.
             out = np.empty_like(plan.at(stamps)) if into else None
 
-            # Warm-up iterations are not counted; `is_set` is in both loops so it
-            # cannot bias
-            # one thread count. Both arms call the binding directly: a shared `call()`
-            # adds
-            # a frame to the published `at` numbers.
+            # Warm-up iterations are not counted. Both arms call the binding directly,
+            # so a shared `call()` adds no frame to the `at` numbers.
             if into:
                 while not go.is_set():
                     if lock is None:
@@ -231,9 +188,7 @@ def one_arm(
         t.start()
     time.sleep(warmup)
     # `started` before `go.set()`: taken after, a descheduled main thread inflates the
-    # rate,
-    # more so at higher thread counts, the unsafe direction for a floor. This order
-    # errs low.
+    # rate; this order errs low.
     started = time.perf_counter()
     go.set()
     time.sleep(seconds)
@@ -288,9 +243,7 @@ def main() -> int:
             "flat-curve control, and gating it would report the control as a "
             "regression"
         )
-    # `--gate --call at_into` is refused: §7.3 names `plan.at`, and a criterion
-    # re-pointed
-    # at the faster call stops meaning anything.
+    # `--gate --call at_into` is refused: §7.3 names `plan.at`.
     if args.gate and args.call == "at_into":
         ap.error(
             "--gate --call at_into is refused: PHASE3 §7.3's criterion names "
@@ -347,8 +300,6 @@ def main() -> int:
             plan, stamps, n, args.seconds, args.warmup, lock, args.call == "at_into"
         )
         rows.append((n, rate))
-        # ns/sample makes a wrong build profile visible (~300 at `--release`, ~1900
-        # `develop`).
         per = 1e9 / rate if rate > 0 else float("inf")
         note = ""
         if n == 1:
@@ -361,14 +312,11 @@ def main() -> int:
             f"   {per:7.1f} ns/sample aggregate   ({calls} calls){note}"
         )
 
-    # The verdict distinguishes the two arms, so it needs to know which one ran.
     into = args.call == "at_into"
 
     base = rows[0][1]
     if base <= 0.0:
-        # A 1-thread arm can complete zero calls on legal arguments (`--batch 4000000
-        # --seconds 0.001`); `ZeroDivisionError` would exit 1, indistinguishable from
-        # FAIL.
+        # A 1-thread arm can complete zero calls on legal arguments.
         print(
             "  INVALID — the 1-thread arm completed no calls, so there is no "
             "denominator. Lower --batch or raise --seconds; a window shorter than "
@@ -381,8 +329,7 @@ def main() -> int:
         print(f"  1 -> {n:<2d} scaling   {rate / base:6.3f}x")
     print()
 
-    # One-sided: every host unfairness pushes the reading down, so a miss is INVALID,
-    # never FAIL.
+    # One-sided: host unfairness lowers the reading, so a miss is INVALID, never FAIL.
     scaling = rows[-1][1] / base
     if cores is None:
         print(
@@ -401,8 +348,6 @@ def main() -> int:
         verdict = "CONTROL"
     elif scaling >= FLOOR:
         margin = (scaling / FLOOR - 1.0) * 100.0
-        # "this run clears it", not "the criterion is met": one clearing run is one
-        # observation.
         print(
             f"  PASS — {scaling:.3f}x over {widest} threads against a floor of "
             f"{FLOOR:g}x, {margin:+.1f}%. This run clears criterion 4's {half} "
@@ -427,13 +372,7 @@ def main() -> int:
             "code."
         )
         if gil:
-            # The host is not the whole story for the GIL arm: the free-threaded half
-            # clears the
-            # floor on this host, and `--call at_into` (no per-call allocation) reads
-            # higher yet
-            # still short of it. No readings here: `docs/benchmarks/EVIDENCE.md`'s
-            # probe row is
-            # their only copy.
+            # No readings here: EVIDENCE.md's probe row is their only copy.
             if not into:
                 print(
                     "  And it is not the whole story: the free-threaded arm "
@@ -459,8 +398,7 @@ def main() -> int:
             )
         verdict = "INVALID"
     else:
-        # The one place a miss is the code's: on a host with a core per thread nothing
-        # excuses it, so this is a FAIL (a gate needs a failing state).
+        # The one place a miss is the code's: a core per thread excuses nothing (FAIL).
         margin = (1.0 - scaling / FLOOR) * 100.0
         print(
             f"  FAIL — {scaling:.3f}x over {widest} threads against a floor of "
@@ -481,8 +419,7 @@ def main() -> int:
                 "usable_cpus": len(usable),
                 "quota_cores": quota,
                 "batch": args.batch,
-                # Which call this row measured, so rows taken the other way are not
-                # compared.
+                # Which call this row measured, so rows from the other are not compared.
                 "call": args.call,
                 "serialize": args.serialize,
                 "floor": FLOOR,

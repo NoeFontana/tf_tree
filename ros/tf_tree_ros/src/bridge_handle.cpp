@@ -1,4 +1,4 @@
-// `docs/PHASE4.md` §5.8 form 3 — the implementation the other two forms wrap.
+// `docs/PHASE4.md` §5.8 form 3.
 
 #include "tf_tree_ros/bridge_handle.hpp"
 
@@ -21,27 +21,22 @@ namespace tf_tree_ros
 namespace
 {
 
-/// §5.3's GID is 16 bytes (`tft_bridge_offer`); a build against an RMW with a
-/// smaller one must fail here rather than read past the array.
+/// §5.3's GID is 16 bytes; fail the build on an RMW with a smaller one.
 static_assert(RMW_GID_STORAGE_SIZE >= 16, "a publisher GID must be at least 16 bytes");
 
-/// `builtin_interfaces/Time` to nanoseconds without `rclcpp::Time`, which
-/// carries a clock type; the engine's clock guard is the one time-domain check
-/// (§5.5).
+/// `builtin_interfaces/Time` to nanoseconds; the engine owns the clock guard (§5.5).
 int64_t stamp_nanos(const builtin_interfaces::msg::Time & t)
 {
   return static_cast<int64_t>(t.sec) * 1000000000LL + static_cast<int64_t>(t.nanosec);
 }
 
-/// The backward step asked of rcl, mirroring the engine's 100 ms reset
-/// threshold (§5.5).
+/// The backward step asked of rcl (§5.5).
 constexpr int64_t kClockRewindThresholdNanos = 100000000LL;
 
 /// Consecutive `spin_once` failures tolerated before the ingest thread stops.
 constexpr uint32_t kMaxConsecutiveSpinFailures = 100;
 
-/// One `rcl_time_jump_t` as the ABI's kind code; a source change outranks the
-/// delta.
+/// One `rcl_time_jump_t` as the ABI's kind code; a source change outranks delta.
 tft_bridge_jump_kind jump_kind_of(const rcl_time_jump_t & jump)
 {
   if (jump.clock_change == RCL_ROS_TIME_ACTIVATED ||
@@ -49,7 +44,6 @@ tft_bridge_jump_kind jump_kind_of(const rcl_time_jump_t & jump)
   {
     return TFT_BRIDGE_JUMP_CLOCK_TYPE_CHANGED;
   }
-  // `delta` is new minus old, so a rewind is negative; passed unnegated.
   return jump.delta.nanoseconds < 0 ? TFT_BRIDGE_JUMP_BACKWARD : TFT_BRIDGE_JUMP_FORWARD;
 }
 
@@ -63,9 +57,7 @@ const char * jump_kind_name(tft_bridge_jump_kind k)
   }
 }
 
-/// §5.5's evidence tier ("reported" vs "inferred") as a sentence with a leading
-/// space and trailing full stop, or empty; written to a caller buffer so the
-/// arms stay allocation-free.
+/// §5.5's evidence tier as a sentence (leading space, trailing full stop), or empty.
 void describe_evidence(char * buf, size_t n, const tft_bridge_outcome & out)
 {
   switch (out.clock_evidence) {
@@ -108,7 +100,7 @@ const char * topic_name(tft_bridge_topic t)
   return t == TFT_BRIDGE_TOPIC_TF_STATIC ? "/tf_static" : "/tf";
 }
 
-/// The negotiated reliability, as §5.2's own vocabulary.
+/// The negotiated reliability.
 const char * reliability_name(rclcpp::ReliabilityPolicy p)
 {
   switch (p) {
@@ -119,8 +111,7 @@ const char * reliability_name(rclcpp::ReliabilityPolicy p)
   }
 }
 
-/// The negotiated durability, the field §5.2 is about: a volatile `/tf_static`
-/// subscription fails with no error anywhere.
+/// The negotiated durability (§5.2).
 const char * durability_name(rclcpp::DurabilityPolicy p)
 {
   switch (p) {
@@ -131,7 +122,7 @@ const char * durability_name(rclcpp::DurabilityPolicy p)
   }
 }
 
-/// The message from `tft_last_error`, for the startup failures that throw.
+/// The `tft_last_error` message, for startup failures.
 std::string last_error_message()
 {
   tft_error e{};
@@ -147,8 +138,7 @@ std::string last_error_message()
 BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
 : node_(node), opts_(std::move(options)), log_(node->get_logger().get_child("tf_tree"))
 {
-  // Not added to the node's executor: every callback runs `tft_bridge_offer`,
-  // legal only on this handle's thread (else `TFT_ERR_WRONG_THREAD`).
+  // Not on the node's executor: `tft_bridge_offer` is legal only on this thread.
   group_ = node_->create_callback_group(
     rclcpp::CallbackGroupType::MutuallyExclusive, /*automatically_add_to_executor_with_node=*/
     false);
@@ -156,8 +146,7 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
   rclcpp::SubscriptionOptions sub_opts;
   sub_opts.callback_group = group_;
 
-  // §5.9's overflow signal: rclcpp has no queue-depth API, so use
-  // `message_lost_callback`.
+  // §5.9's overflow signal.
   sub_opts.event_callbacks.message_lost_callback =
     [this](rmw_message_lost_status_t & s) {
       RCLCPP_ERROR(
@@ -168,8 +157,7 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
         s.total_count_change, s.total_count, opts_.queue_depth);
     };
 
-  // §5.2: warn on any incompatibility event, naming the trap (rclcpp's default
-  // handler logs on the node's logger in the middleware's vocabulary).
+  // §5.2: warn on any incompatibility event.
   sub_opts.event_callbacks.incompatible_qos_callback =
     [this](rclcpp::QOSRequestedIncompatibleQoSInfo & s) {
       RCLCPP_WARN(
@@ -182,14 +170,11 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
         static_cast<int>(s.total_count_change));
     };
 
-  // §5.2, NORMATIVE: /tf volatile, /tf_static transient_local (a volatile
-  // subscription misses every broadcaster that published before this node).
+  // §5.2, NORMATIVE.
   const auto qos_tf = rclcpp::QoS(rclcpp::KeepLast(opts_.queue_depth)).reliable().durability_volatile();
   const auto qos_static =
     rclcpp::QoS(rclcpp::KeepLast(opts_.queue_depth)).reliable().transient_local();
 
-  // The `shared_ptr<const T>` signature is what makes §5.8's zero-serialization
-  // intra-process path true.
   sub_tf_ = node_->create_subscription<tf2_msgs::msg::TFMessage>(
     opts_.tf_topic, qos_tf,
     [this](std::shared_ptr<const tf2_msgs::msg::TFMessage> m, const rclcpp::MessageInfo & i) {
@@ -204,22 +189,19 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
     },
     sub_opts);
 
-  // Read back the negotiated QoS once, here (§5.2): the startup line must not
-  // restate the request.
+  // Read back the negotiated QoS once (§5.2).
   actual_tf_qos_ = sub_tf_->get_actual_qos();
   actual_tf_static_qos_ = sub_static_->get_actual_qos();
 
-  // Before the ingest thread exists, so a startup jump is latched, not missed.
+  // Before the ingest thread exists, so a startup jump is latched.
   register_jump_callback();
 
-  // Shared, not a stack local: the ingest thread outlives this constructor.
   auto ready = std::make_shared<std::promise<tft_status>>();
   auto done = ready->get_future();
   thread_ = std::thread([this, ready] {run(*ready);});
   const tft_status rc = done.get();
   if (rc != TFT_OK) {
     thread_.join();
-    // Leave the caller's node without dead entities.
     sub_tf_.reset();
     sub_static_.reset();
     throw BridgeError(rc, create_error_);
@@ -237,7 +219,6 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
     static_cast<int>(opts_.authority), static_cast<int>(opts_.on_clock_reset),
     static_cast<unsigned>(opts_.time_domain));
 
-  // §5.6, NORMATIVE: log the remap table at startup; it is complete here.
   for (const auto & row : remap_) {
     RCLCPP_INFO(
       log_, "frame remap: %s on the wire is declared as %s", row.first.c_str(),
@@ -247,8 +228,7 @@ BridgeHandle::BridgeHandle(rclcpp::Node * node, BridgeOptions options)
 
 BridgeHandle::~BridgeHandle()
 {
-  // First, so the clock thread stops writing into the slot; belt and braces
-  // beside the slot's `shared_ptr` capture, robust to member reordering.
+  // First, so the clock thread stops writing into the slot.
   jump_handler_.reset();
   stop_.store(true, std::memory_order_relaxed);
   if (thread_.joinable()) {
@@ -256,7 +236,6 @@ BridgeHandle::~BridgeHandle()
   }
   sub_tf_.reset();
   sub_static_.reset();
-  // `tft_tree` is `Send + Sync`, so unlike the bridge this may be freed here.
   if (tree_ != nullptr) {
     tft_tree_free(tree_);
     tree_ = nullptr;
@@ -271,8 +250,7 @@ tft_status BridgeHandle::create_bridge()
   o.on_clock_reset = static_cast<tft_bridge_on_clock_reset>(opts_.on_clock_reset);
   o.domain = opts_.time_domain;
   o.tf_prefix = opts_.tf_prefix.empty() ? nullptr : opts_.tf_prefix.c_str();
-  // `docs/decisions/0015`: empty means NULL means a private heap arena.
-  // `struct_size` covers this field (header drift-checked by `just c-header-check`).
+  // `docs/decisions/0015`: empty means a private heap arena.
   o.arena_name = opts_.arena_name.empty() ? nullptr : opts_.arena_name.c_str();
 
   tft_status rc = tft_bridge_create(opts_.topology_toml.c_str(), &o, &bridge_);
@@ -295,43 +273,33 @@ tft_status BridgeHandle::create_bridge()
     remap_.emplace_back(r.from, r.to);
   }
 
-  // `tft_bridge_note_queue_depth` is never called (`queue_high_water` stays 0):
-  // no such API exists in rclcpp (§5.9's amendment); loss is reported through
-  // `message_lost_callback`.
+  // `tft_bridge_note_queue_depth` is never called: rclcpp has no such API (§5.9).
   refresh_stats();
   return TFT_OK;
 }
 
 void BridgeHandle::register_jump_callback()
 {
-  // §5.5's authoritative path: ask the time source, not the publishers under
-  // suspicion (`docs/decisions/0012`).
+  // §5.5's authoritative path: ask the time source (`docs/decisions/0012`).
   rcl_jump_threshold_t threshold{};
 
   threshold.on_clock_change = true;
 
-  // `min_forward` is DISABLED on purpose: rcl fires callbacks for every `/clock`
-  // message, and the first one under `use_sim_time` is a forward jump of
-  // seconds or decades, so any finite threshold stops the bridge at startup. A
-  // forward step is left to the engine's common-mode detector ("reported"
-  // degrades to "inferred", never to "unnoticed").
+  // `min_forward` is DISABLED: the first `/clock` message under `use_sim_time`
+  // is a forward jump that would stop the bridge; forward steps fall to the
+  // engine's common-mode detector.
   threshold.min_forward.nanoseconds = 0;
 
-  // `/clock` does not go backwards normally, so a backward step is the fault.
   threshold.min_backward.nanoseconds = -kClockRewindThresholdNanos;
 
-  // Captured by value; never `this` (see `JumpSlot`).
   auto slot = jump_slot_;
 
   try {
-    // Registered on the node's `RCL_ROS_TIME` clock (jump callbacks apply only to
-    // it); the node outlives this handle by contract.
+    // Jump callbacks apply only to the node's `RCL_ROS_TIME` clock.
     jump_handler_ = node_->get_clock()->create_jump_callback(
-      // The pre-callback receives no `rcl_time_jump_t`, so act on the post-callback.
       [] {},
       [slot](const rcl_time_jump_t & jump) {
-        // May not call the ABI (wrong thread) and must not throw (escaping is
-        // `std::terminate`): record for `drain_time_jump`.
+        // Must not call the ABI (wrong thread) or throw.
         try {
           const std::lock_guard<std::mutex> guard(slot->mutex);
           if (slot->pending) {
@@ -346,8 +314,7 @@ void BridgeHandle::register_jump_callback()
       },
       threshold);
   } catch (const std::exception & e) {
-    // A diagnostic is never a correctness dependency (§5.3): without the
-    // callback the bridge falls back to inferring a reset from publisher stamps.
+    // Diagnostics are never a correctness dependency (§5.3).
     RCLCPP_WARN(
       log_,
       "no time-jump callback could be registered (%s): a /clock reset will be inferred from "
@@ -391,21 +358,18 @@ void BridgeHandle::drain_time_jump()
       last_error_message().c_str());
     return;
   }
-  // Only `HALT`/`RECREATE` can result and `report` ignores the topic; sharing it
-  // renders and rate-limits a clock stop like a transform stop.
+  // Only `HALT`/`RECREATE` can result; the topic is ignored.
   report(out, TFT_BRIDGE_TOPIC_TF);
-  // `/tf` may be silent when the jump arrives (a bag between takes); refresh so
-  // the counter reaches `stats()`.
+  // `/tf` may be silent when the jump arrives; refresh so `stats()` sees it.
   refresh_stats();
 }
 
 namespace
 {
-/// A GID that a graph walk has matched. Distinct from any attempt count.
+/// A GID a graph walk has matched.
 constexpr uint32_t kResolved = UINT32_MAX;
 
-/// Graph walks one unresolvable GID may cost (§5.3: keep running on an RMW with
-/// no usable GIDs).
+/// Graph walks one unresolvable GID may cost (§5.3).
 constexpr uint32_t kMaxAttempts = 20;
 }  // namespace
 
@@ -414,9 +378,7 @@ void BridgeHandle::maybe_attribute(const uint8_t * gid)
   Gid key{};
   std::memcpy(key.data(), gid, key.size());
 
-  // Walk before offering: under `FirstWriterWins` the first sample names the
-  // edge's owner, and a late cache freezes `<unknown publisher>` in as owner
-  // (§5.4). On a new GID, not a graph event, to stay on the ingest thread.
+  // Walk before offering: a late cache freezes `<unknown publisher>` as owner (§5.4).
   const auto it = gid_state_.emplace(key, 0u).first;
   if (it->second == kResolved || it->second >= kMaxAttempts) {
     return;
@@ -425,26 +387,20 @@ void BridgeHandle::maybe_attribute(const uint8_t * gid)
   if (attribute_from_graph(key)) {
     it->second = kResolved;
   }
-  // Else the endpoint is not in the graph yet; the next message walks again.
 }
 
 bool BridgeHandle::attribute_from_graph(const Gid & wanted)
 {
   bool found = false;
-  // The topic the subscription actually got: ROS remapping applies to
-  // `create_subscription` but not to `get_publishers_info_by_topic`. An
-  // unresolved GID makes two broadcasters compare equal, silently disabling
-  // §5.4's detection (`docs/PHASE4.md` §0.0).
+  // Use the topic the subscription got: remapping does not apply to
+  // `get_publishers_info_by_topic`.
   const std::string topics[2] = {sub_tf_->get_topic_name(), sub_static_->get_topic_name()};
   for (const std::string & topic : topics) {
-    // §5.3: an RMW without endpoint introspection throws here. Contained at this
-    // site, not only at `run`, since `maybe_attribute` runs before the transform
-    // loop and an outer catch would lose all ingest.
+    // An RMW without endpoint introspection throws here (§5.3).
     std::vector<rclcpp::TopicEndpointInfo> endpoints;
     try {
       endpoints = node_->get_publishers_info_by_topic(topic);
     } catch (const std::exception & e) {
-      // `steady_`, not the node clock (see `steady_` in the header).
       RCLCPP_WARN_THROTTLE(
         log_, steady_, 5000,
         "the graph could not be walked for %s (%s); publishers on it stay unattributed",
@@ -454,7 +410,6 @@ bool BridgeHandle::attribute_from_graph(const Gid & wanted)
     for (const auto & info : endpoints) {
       const auto & gid = info.endpoint_gid();
 
-      // An all-zero GID is "nothing to report"; `tft_bridge_attribute` refuses it.
       Gid seen{};
       bool all_zero = true;
       for (size_t i = 0; i < seen.size(); i++) {
@@ -465,7 +420,6 @@ bool BridgeHandle::attribute_from_graph(const Gid & wanted)
         continue;
       }
 
-      // `node_namespace()` is "/" for the default namespace.
       std::string name = info.node_namespace();
       if (name.empty() || name.back() != '/') {
         name += '/';
@@ -481,7 +435,6 @@ bool BridgeHandle::attribute_from_graph(const Gid & wanted)
 
 void BridgeHandle::run(std::promise<tft_status> & ready)
 {
-  // Create, offer, stats and free all happen on this thread (ABI affinity).
   const tft_status rc = create_bridge();
   ready.set_value(rc);
   if (rc != TFT_OK) {
@@ -491,15 +444,12 @@ void BridgeHandle::run(std::promise<tft_status> & ready)
   exec_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
   exec_->add_callback_group(group_, node_->get_node_base_interface());
 
-  // `spin_once(timeout)` rather than `spin()` + `cancel()`: a destructor running
-  // before `spin()` starts would cancel nothing and hang the join. A failing
-  // `spin_once` returns at once, so failures are counted, backed off, and
-  // eventually fatal rather than a silent 100 % busy loop.
+  // `spin_once(timeout)`, not `spin()` + `cancel()`, which would hang the join if
+  // the destructor ran first; failures are counted and backed off.
   uint32_t consecutive_failures = 0;
   while (!stop_.load(std::memory_order_relaxed) && rclcpp::ok(node_->get_node_options().context())) {
-    // Nothing may leave a `std::thread` entry point (`std::terminate` kills the
-    // host process; `docs/PHASE4.md` §3.4). This is the backstop; the reachable
-    // throw is contained in `attribute_from_graph`.
+    // Nothing may escape a thread entry point; the reachable throw is contained
+    // in `attribute_from_graph`.
     bool failed = false;
     try {
       exec_->spin_once(std::chrono::milliseconds(50));
@@ -516,10 +466,8 @@ void BridgeHandle::run(std::promise<tft_status> & ready)
     }
 
     if (!failed) {
-      // Consecutive, so an occasional throw never accumulates to fatal.
       consecutive_failures = 0;
     } else if (++consecutive_failures >= kMaxConsecutiveSpinFailures) {
-      // Once per handle life; explains why every counter stopped.
       RCLCPP_FATAL(
         log_,
         "the ingest executor failed %u times in a row; the bridge is giving up and will ingest "
@@ -527,13 +475,11 @@ void BridgeHandle::run(std::promise<tft_status> & ready)
         consecutive_failures);
       stop_.store(true, std::memory_order_relaxed);
     } else {
-      // Linear backoff to a 1 s ceiling.
       const int64_t steps = std::min<uint32_t>(consecutive_failures, 20u);
       std::this_thread::sleep_for(std::chrono::milliseconds(50 * steps));
     }
 
-    // Also drained here: a bag between loops is silent on `/tf` exactly when its
-    // clock rewinds.
+    // A bag between loops is silent on `/tf` exactly when its clock rewinds.
     drain_time_jump();
   }
 
@@ -546,18 +492,14 @@ void BridgeHandle::run(std::promise<tft_status> & ready)
 void BridgeHandle::ingest(
   const tf2_msgs::msg::TFMessage & msg, const rclcpp::MessageInfo & info, tft_bridge_topic topic)
 {
-  // One steady read per message (not per transform), taken first: the step
-  // detector measures one offset per message per publisher, against a clock
-  // independent of the one under suspicion.
+  // One steady read per message, taken first.
   const int64_t received_steady_nanos = steady_.now().nanoseconds();
 
-  // Apply a reported jump before offering, or a message of new-time-base
-  // transforms lands in an arena already known to be finished.
+  // Apply a reported jump before offering.
   drain_time_jump();
 
   tft_bridge_note_message(bridge_);
 
-  // §5.3: an unresolved GID degrades to `<unknown publisher>` on the Rust side.
   const uint8_t * gid = info.get_rmw_message_info().publisher_gid.data;
   maybe_attribute(gid);
 
@@ -572,18 +514,14 @@ void BridgeHandle::offer_one(
   const geometry_msgs::msg::TransformStamped & t, const uint8_t * gid, tft_bridge_topic topic,
   int64_t received_steady_nanos)
 {
-  // Value-initialised: a later ABI field is zero, and zero `received_steady_nanos`
-  // means "no receipt clock" (inference path).
+  // Value-initialised: zero `received_steady_nanos` means "no receipt clock".
   tft_bridge_sample s{};
   s.struct_size = static_cast<uint32_t>(sizeof s);
   // Raw names: §5.6 normalization is the bridge's job, not a second C++ copy.
   s.frame_id = t.header.frame_id.c_str();
   s.child_frame_id = t.child_frame_id.c_str();
   s.stamp_nanos = stamp_nanos(t.header.stamp);
-  // `stamp_nanos` is the broadcaster's claim; `received_steady_nanos` is a local
-  // monotonic reading no publisher can move, and their difference is the offset
-  // the engine subtracts. A parameter so "one read per message" is enforced by
-  // the signature.
+  // Local monotonic receipt reading; its difference from the stamp is the offset.
   s.received_steady_nanos = received_steady_nanos;
   // `[qw qx qy qz tx ty tz]` (`docs/PHASE1.md` §3.1), not `geometry_msgs`' xyzw.
   s.pose[0] = t.transform.rotation.w;
@@ -598,7 +536,6 @@ void BridgeHandle::offer_one(
   out.struct_size = static_cast<uint32_t>(sizeof out);
   const tft_status rc = tft_bridge_offer(bridge_, topic, &s, gid, &out);
   if (rc != TFT_OK) {
-    // The status says the call was malformed; what happened to the sample is in `out`.
     RCLCPP_ERROR(
       log_, "tft_bridge_offer rejected the call (%d): %s", rc, last_error_message().c_str());
     return;
@@ -608,10 +545,7 @@ void BridgeHandle::offer_one(
 
 void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic)
 {
-  // `out.action` is the decision; this only rate-limits. Where the ABI sets
-  // `first_time` (`UNDECLARED`, `STATIC_CONFLICT`, `NOT_THE_OWNER`, `HALT`,
-  // `RECREATE`) use it; `REJECTED` and the other drop reasons never set it, so
-  // they throttle here instead.
+  // `out.action` decides; this only rate-limits where the ABI sets no `first_time`.
   switch (out.action) {
     case TFT_BRIDGE_APPLIED:
     case TFT_BRIDGE_STATIC_VERIFIED:
@@ -643,16 +577,13 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
 
     case TFT_BRIDGE_DROPPED:
       if (out.reason == TFT_BRIDGE_REASON_NOT_THE_OWNER) {
-        // §5.4: name both nodes and the edge; the reason §5.3's attribution exists.
         if (out.first_time != 0) {
           RCLCPP_ERROR(
             log_,
             "%s and %s have both been publishing %s -> %s. %s owns it; %s's samples are dropped.",
             out.owner, out.intruder, out.parent, out.child, out.owner, out.intruder);
         }
-        // The record is not `first_time`-gated: a GID can still be unresolved at
-        // the edge's first conflict, which would freeze `<unknown publisher>` in.
-        // Rewrite whenever the four strings change.
+        // Not `first_time`-gated: the GID may be unresolved at the first conflict.
         const std::lock_guard<std::mutex> guard(stats_mutex_);
         if (!conflict_.observed || conflict_.owner != out.owner ||
           conflict_.intruder != out.intruder || conflict_.parent != out.parent ||
@@ -662,14 +593,8 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
         }
         return;
       }
-      // The other drop reasons throttle, one call site each (`docs/decisions/0011`
-      // D3): the ABI sets no `first_time` on them, and one flag would be wrong
-      // (`NON_MONOTONIC` is high frequency; `BAD_NAME` keys are publisher-chosen
-      // and unbounded). rcutils keeps a throttle per macro expansion, so separate
-      // sites stop a 1 kHz reason starving the rest. Exact counts are
-      // `tft_bridge_stats::dropped_*` (`tf_tree doctor`).
+      // Other drop reasons throttle one call site each (`docs/decisions/0011` D3).
       if (out.reason == TFT_BRIDGE_REASON_BAD_NAME) {
-        // Raw wire names: normalization is what failed.
         RCLCPP_WARN_THROTTLE(
           log_, steady_, 5000,
           "%s carries a frame name that does not normalize (%s -> %s): dropped. "
@@ -686,8 +611,6 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
         return;
       }
       if (out.reason == TFT_BRIDGE_REASON_NON_MONOTONIC) {
-        // One regressing source is dropped at any magnitude and never stops the
-        // bridge; a real reset arrives as `HALT` or `RECREATE`.
         RCLCPP_WARN_THROTTLE(
           log_, steady_, 5000,
           "%s -> %s went backwards by %" PRId64 " ns on %s: dropped. One publisher going "
@@ -696,8 +619,7 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
           out.parent, out.child, out.by_nanos, topic_name(topic));
         return;
       }
-      // `BAD_POSE` is the only reason left, still `first_time`-gated (which the
-      // ABI never sets on a drop, so this is dead; not D3's to change).
+      // `BAD_POSE`: the only reason left.
       if (out.first_time != 0) {
         RCLCPP_WARN(
           log_, "%s -> %s dropped from %s: %s", out.parent, out.child, topic_name(topic),
@@ -706,10 +628,7 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
       return;
 
     case TFT_BRIDGE_REJECTED:
-      // The first refusal always prints and the rest throttle: the ABI never sets
-      // `first_time` here, and a throttle alone is silent through a `use_sim_time`
-      // boot on a clock that reads below one period. An arena refusal of a
-      // declared transform is the line the operator needs.
+      // The ABI never sets `first_time` here; the first refusal always prints.
       if (!rejected_reported_) {
         rejected_reported_ = true;
         RCLCPP_ERROR(
@@ -722,15 +641,11 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
         out.child, out.status, out.detail);
       return;
 
-    // A stop is latched and replayed for every later transform, so both stops
-    // are gated on `first_time` (1 on the stopping offer, 0 on replays); §5.4
-    // wants the diagnostic "loud, rate-limited".
+    // Stops are latched and replayed; gate on `first_time` (§5.4).
     case TFT_BRIDGE_HALT:
       if (out.first_time != 0) {
         char evidence[256];
         describe_evidence(evidence, sizeof evidence, out);
-        // `parent`/`child` are empty when no sample was in hand (a `Strict` window
-        // closing, a reported jump); the sentence has two shapes.
         if (out.parent[0] == '\0' && out.child[0] == '\0') {
           RCLCPP_FATAL(
             log_, "ingest bridge HALTED: %s.%s Every later transform is refused.",
@@ -744,13 +659,10 @@ void BridgeHandle::report(const tft_bridge_outcome & out, tft_bridge_topic topic
       return;
 
     case TFT_BRIDGE_RECREATE:
-      // §5.5's `recreate` is a report: compiled plans point into the current
-      // arena, so the owner destroys this handle and builds a new one.
+      // `recreate` is a report (§5.5): the owner destroys this handle and rebuilds.
       if (out.first_time != 0) {
         char evidence[256];
         describe_evidence(evidence, sizeof evidence, out);
-        // `delta_nanos` is new minus old (negative for a rewind); forward resets
-        // reach this arm too.
         RCLCPP_FATAL(
           log_,
           "the clock jumped by %" PRId64

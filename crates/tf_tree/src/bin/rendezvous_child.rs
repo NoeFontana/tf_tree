@@ -1,9 +1,7 @@
-//! Helper process for `tests/rendezvous.rs`: real processes, because a thread
-//! cannot be `SIGKILL`ed out from under its locks and an inherited descriptor
-//! would make contention assertions vacuous. `tests/python/test_shared.py` also
-//! reads `join-reparent`'s `joined` and `reparented` lines (`docs/decisions/0058`
-//! step 2), so those are a protocol. Stdout is line-oriented and flushed before
-//! parking. The bin target is `tf_tree_rendezvous_child` (see the manifest). Its argv:
+//! Helper process for `tests/rendezvous.rs`: real processes, so a `SIGKILL` takes
+//! its locks with it. `tests/python/test_shared.py` reads `join-reparent`'s
+//! `joined` and `reparented` lines (`docs/decisions/0058` step 2). Stdout is
+//! line-oriented and flushed before parking. Its argv:
 //!
 //! ```text
 //! own           -> "owning <transform>", then parks serving
@@ -26,7 +24,6 @@
 //! serve-then-die -> "serving", then "dying" and `abort` on the first client, from
 //!                  inside the slot assigner (an owner dead between accept and reply)
 //! ```
-// stdout IS this binary's protocol.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -46,16 +43,14 @@ fn main() {
         let _ = std::io::stdout().flush();
     }
 
-    /// One dynamic edge: two processes agreeing on the bytes is the point.
     fn layout() -> TreeBuilder {
         TreeBuilder::new()
             .default_interp(InterpPolicy::LerpSlerp)
             .dynamic_edge("map", "base", EdgeCfg::new(Capacity::slots(64)))
-            // A second edge, so a peer can claim something the owner does not.
             .dynamic_edge("base", "cam", EdgeCfg::new(Capacity::slots(64)))
     }
 
-    /// Format a lookup so the parent can compare two processes' answers exactly.
+    /// Bit patterns, so the parent compares two processes' answers exactly.
     fn render(tree: &tf_tree::Tree, stamp: i64) -> String {
         let g = tree.guard();
         let target = tree.frame("map").unwrap();
@@ -64,7 +59,6 @@ fn main() {
         let iso = plan
             .at(&g, Stamp::<tf_tree::SystemDomain>::from_nanos(stamp))
             .unwrap();
-        // Bit patterns, not formatted floats: a rounding comparison can agree while memory differs.
         let b = iso.to_bits();
         b.iter()
             .map(|w| format!("{w:016x}"))
@@ -90,7 +84,7 @@ fn main() {
             pubr.push(2_000, &iso).expect("push");
 
             say(&format!("owning {}", render(&tree, 1_500)));
-            // Park holding the tree: dropping it releases the ownership byte.
+            // Park holding the tree; dropping it releases ownership.
             loop {
                 std::thread::park();
             }
@@ -110,7 +104,6 @@ fn main() {
             {
                 Ok(tree) => {
                     say(&format!("joined {}", render(&tree, 1_500)));
-                    // Park holding the tree: exiting releases the participant slot.
                     loop {
                         std::thread::park();
                     }
@@ -118,7 +111,7 @@ fn main() {
                 Err(e) => say(&format!("error {e}")),
             }
         }
-        // The zero-argument `tf_tree::open()`, the only caller of `Open::new()`'s defaults.
+        // The zero-argument `tf_tree::open()`.
         "open-free" => {
             match tf_tree::open() {
                 Ok(tree) => {
@@ -130,7 +123,7 @@ fn main() {
                 Err(e) => say(&format!("error {e}")),
             };
         }
-        // Own an arena with headroom (`layout()` has none), intern a frame on the parent's cue.
+        // Own an arena with headroom; intern a frame on the parent's cue.
         "own-headroom" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
@@ -147,7 +140,6 @@ fn main() {
                 std::thread::park();
             }
         }
-        // Create, claim, park holding it, so the parent can probe the lease and kill us.
         "own-claiming" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
@@ -163,7 +155,6 @@ fn main() {
                 std::thread::park();
             }
         }
-        // Join read-write, claim, park holding it, so the parent can kill us and reap.
         "join-claiming" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
@@ -171,11 +162,9 @@ fn main() {
                 .timeout(std::time::Duration::from_millis(500))
                 .open()
                 .expect("join");
-            // The other edge, so the owner's claim is distinguishable from the one to reap.
             let child = tree.frame("cam").unwrap();
             let parent = tree.frame("base").unwrap();
-            // Reported, not `expect`ed: a refusal is a state the test asserts on. Bound for
-            // the scope: `Ok(w) => say(...)` would drop the writer and release the claim.
+            // Bound for the scope: dropping the writer would release the claim.
             let _held = match tree.claim(child, parent) {
                 Ok(w) => {
                     say(&format!("claimed {}", w.edge().get()));
@@ -190,7 +179,6 @@ fn main() {
                 std::thread::park();
             }
         }
-        // Create, claim, report what a reap sweep does (it must not revoke our live claim).
         "own-reap" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
@@ -202,11 +190,10 @@ fn main() {
             let parent = tree.frame("map").unwrap();
             let w = tree.claim(child, parent).expect("claim");
             say("claimed");
-            // Read a line to know when the parent wants the sweep.
             let mut line = String::new();
             let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
             let n = tree.reap_dead();
-            // The decisive part: our own claim must still work afterwards.
+            // The sweep must not revoke our live claim.
             let iso = tf_tree::exp_se3([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
             let still_ours = w.push(9_000, &iso).is_ok();
             say(&format!("reaped {n} still_ours {still_ours}"));
@@ -214,13 +201,7 @@ fn main() {
                 std::thread::park();
             }
         }
-        // Report whether a named peer slot reads alive; a SIGSTOPped holder keeps its lock byte.
-        // A live holder of A2's topology byte (`docs/decisions/0029`), taken through
-        // `tf_tree_ipc::LockFile` (a second open file description, as a mutator mid-`reparent`
-        // presents) so a real process can be `SIGKILL`ed. The path is passed so the parent
-        // decides which rendezvous this is.
-        // §11.3's `topo.holding_lock`: re-parent `cam` under `map`; arm `TF_TREE_CRASH_AT` to
-        // die inside the topology critical section.
+        // §11.3's `topo.holding_lock`: re-parent `cam` under `map`.
         "join-reparent" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
@@ -242,8 +223,7 @@ fn main() {
                 std::thread::park();
             }
         }
-        // Sweep the participant table on demand (`reap_participants`; `own-reap` sweeps
-        // claims), so `reclaim.after_probe_before_cas` can be armed outside the test binary.
+        // Sweep the participant table on demand (`reap_participants`).
         "join-sweep" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
@@ -252,13 +232,14 @@ fn main() {
                 .open()
                 .expect("join");
             say(&format!("joined {}", tree.participant_slot()));
-            // One sweep, then exit, not `park`: a disarmed site then exits 0 and the test
-            // fails fast instead of waiting out a 180 s nextest timeout.
+            // Exits rather than parks, so a disarmed site fails fast.
             let mut line = String::new();
             let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
             let n = tree.reap_participants();
             say(&format!("swept {n}"));
         }
+        // A live holder of A2's topology byte (`docs/decisions/0029`) through a second
+        // open file description.
         "hold-topo" => {
             let path = std::env::args().nth(2).expect("lock file path");
             let lock = tf_tree_ipc::LockFile::open(std::path::Path::new(&path))
@@ -286,23 +267,16 @@ fn main() {
                 std::thread::park();
             }
         }
-        // A survivor reporting on other slots repeatedly, for after the owner dies and no
-        // new process can attach. Reads a slot per stdin line; prints the record's `state`
-        // (`unstable`, via `Tree::arena_view`) and `participant_alive`, which folds `state`
-        // in, so the two are needed to tell "cleared" from "LIVE but gone".
-        // §3.5's survivor: on a poke reports whether the owner is gone and what inheriting
-        // produced, then parks holding the tree (if it inherited it is now the server).
+        // §3.5's survivor: on a poke reports whether the owner is gone and what inheriting produced.
         "join-heir" => {
             let tree = tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
                 .create(CreatePolicy::Never)
                 .open()
                 .expect("join");
-            // The slot is printed on both lines to assert it does not move across takeover.
             say(&format!("joined {}", tree.participant_slot()));
 
-            // One report per poke: a loser is asked twice (`docs/decisions/0043`), and what
-            // serves is the tree this scope holds.
+            // One report per poke (`docs/decisions/0043`).
             let stdin = std::io::stdin();
             let mut line = String::new();
             while std::io::BufRead::read_line(&mut stdin.lock(), &mut line).unwrap_or(0) > 0 {
@@ -318,14 +292,9 @@ fn main() {
                 std::thread::park();
             }
         }
-        // An owner that dies between `accept(2)` and its reply: aborting inside the slot
-        // assigner (called after the `HelloRequest` is read, before any response) reaches
-        // that window through public API. The client then reads zero bytes, not an error.
-        // `abort`, so `OwnerServer::drop` leaves the socket stale as a crashed owner does (§3.9).
-        // This is the only mode that binds a rendezvous path (`OwnerServer::bind_at` renames
-        // over it), inside §3.10's trust model; the manifest records the installed residue.
+        // An owner that dies between `accept(2)` and its reply. `abort` leaves the socket
+        // stale as a crash does (§3.9); the only mode that binds a rendezvous path (§3.10).
         "serve-then-die" => {
-            // Resolved the way `tf_tree::Open` resolves it, so the joiner finds the same one.
             let rd = tf_tree_ipc::RuntimeDir::resolve().expect("runtime dir");
             let domain =
                 tf_tree_ipc::domain_from_env(&tf_tree_ipc::SystemEnv).expect("domain from env");
@@ -333,12 +302,10 @@ fn main() {
             let rv = tf_tree_ipc::Rendezvous::new(rd, domain, name);
             rv.ensure_dir().expect("runtime dir");
 
-            // The descriptor must pass §3.7's `check` (version, layout hash, boot id), or the
-            // owner rejects the client before the assigner.
+            // Must pass §3.7's `check`, or the owner rejects the client first.
             let desc = tf_tree_ipc::SegmentDescriptor {
                 format_version: tf_tree_arena::FORMAT_VERSION,
                 layout_hash: tf_tree_arena::layout_hash(),
-                // Never sent: this process dies first.
                 arena_size: 0,
                 instance_uuid: [0; 16],
                 boot_id: tf_tree_ipc::boot_id().unwrap_or([0; 16]),
@@ -346,7 +313,6 @@ fn main() {
             let server =
                 tf_tree_ipc::OwnerServer::bind_at(rv.sock_path(), desc, std::process::id())
                     .expect("bind the rendezvous socket");
-            // `/dev/null` stands in for the segment; it never reaches a client.
             let devnull = std::fs::File::open("/dev/null").expect("/dev/null");
             say("serving");
             let outcome = server.serve(
@@ -357,19 +323,15 @@ fn main() {
                 },
                 |_slot| {},
             );
-            // Reached only if no client arrived; the parent must see that.
             say(&format!("server-stopped {outcome:?}"));
         }
-        // `docs/PHASE2.md` §11.2 scenarios 7 and 9: every process on one
-        // `(runtime_dir, domain, name)` sees the same `instance_uuid`. Whether this process
-        // created or joined is not reported, so tests compare uuids instead of counting announcements.
+        // `docs/PHASE2.md` §11.2 scenarios 7 and 9: one `instance_uuid` per rendezvous.
         "open-uuid" => {
             match tf_tree::Open::new()
                 .mode(AttachMode::ReadWrite)
                 .create(CreatePolicy::IfAbsent)
                 .layout_if_creating(layout())
-                // The timeout is an argument: scenario 9 runs a thousand times and the ownerless
-                // arm waits it out; the default stays generous for the herd.
+                // Scenario 9's ownerless arm waits the timeout out.
                 .timeout(std::time::Duration::from_millis(
                     std::env::args()
                         .nth(2)
@@ -382,12 +344,10 @@ fn main() {
                     let u = tree.instance_uuid();
                     let hex: String = u.iter().map(|b| format!("{b:02x}")).collect();
                     say(&format!("uuid {hex}"));
-                    // Park holding the tree: releasing it frees the byte the next step needs.
                     loop {
                         std::thread::park();
                     }
                 }
-                // A refusal is legitimate for scenario 9 (a second arena is not); report it as data.
                 Err(e) => say(&format!("refused {e:?}")),
             }
         }

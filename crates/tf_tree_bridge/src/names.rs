@@ -1,20 +1,14 @@
 //! Frame-name normalization — `docs/PHASE4.md` §5.6.
 //!
-//! 1. Strip a **single** leading `/` (ROS 1 legacy) and warn once per distinct
-//!    frame. `//base` keeps its second slash: greedy stripping would merge
-//!    `/base` and `//base`.
-//! 2. Reject empty names.
-//! 3. Otherwise pass UTF-8 through unchanged: no case folding, no Unicode
-//!    normalization. Frame names are identifiers (§5.6).
-//! 4. Apply `tf_prefix` if configured and record the remap table (§5.6 requires
-//!    it logged).
+//! Strips a single leading `/` (warn once per distinct frame), rejects empty
+//! names, passes UTF-8 through unchanged, and applies `tf_prefix`.
 
 use std::collections::BTreeSet;
 
 /// Why a name was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameError {
-    /// The name was empty, or only a slash (an unsubstituted launch variable).
+    /// The name was empty, or only a slash.
     Empty,
 }
 
@@ -27,22 +21,18 @@ pub struct Normalized {
     pub stripped_slash: bool,
     /// Whether a `tf_prefix` was applied.
     pub prefixed: bool,
-    /// Whether this is the **first** time this input has been seen (the
-    /// warn-once rule); the caller does the logging.
+    /// Whether this input is new (warn-once); the caller logs.
     pub first_sight: bool,
 }
 
-/// How many distinct raw frame names the warn-once set remembers; see its use
-/// in [`NameNormalizer::normalize`].
+/// Cap on the warn-once set.
 const MAX_TRACKED_NAMES: usize = 8192;
 
 /// Normalizes frame names and remembers which ones it has warned about.
 #[derive(Debug, Default)]
 pub struct NameNormalizer {
     prefix: Option<String>,
-    /// Inputs already seen, so `first_sight` is per distinct *input*.
     seen: BTreeSet<String>,
-    /// The remap table, for the startup log §5.6 requires.
     remaps: Vec<(String, String)>,
     stripped: u64,
 }
@@ -78,7 +68,6 @@ impl NameNormalizer {
         if raw.is_empty() {
             return Err(NameError::Empty);
         }
-        // One slash, not `trim_start_matches`.
         let (body, stripped_slash) = match raw.strip_prefix('/') {
             Some(rest) => (rest, true),
             None => (raw, false),
@@ -94,11 +83,7 @@ impl NameNormalizer {
             Some(p) => (format!("{p}/{body}"), true),
             None => (body.to_string(), false),
         };
-        // `contains` before `insert`: probing borrows, while `insert` needs an
-        // owned key, so this allocates only for a genuinely new name.
-        // Bounded because the publisher chooses the string and names are
-        // interned before the declared-topology check. Past the cap only the
-        // warn-once bookkeeping is lost (`first_sight` reads `false`).
+        // Bounded: the publisher chooses the string.
         let first_sight = if self.seen.contains(raw) || self.seen.len() >= MAX_TRACKED_NAMES {
             false
         } else {
@@ -116,8 +101,7 @@ impl NameNormalizer {
         })
     }
 
-    /// Every remap applied so far, as `(raw, normalized)`, accumulated as each
-    /// frame is first seen (§5.6).
+    /// Every remap applied so far, as `(raw, normalized)` (§5.6).
     #[must_use]
     pub fn remaps(&self) -> &[(String, String)] {
         &self.remaps
@@ -129,11 +113,7 @@ impl NameNormalizer {
         self.stripped
     }
 
-    /// Add `n` to the stripped-slash count without normalizing.
-    ///
-    /// For `Ingest::resolve`, whose cache skips [`Self::normalize`] on repeats;
-    /// [`Self::stripped_count`] counts every occurrence
-    /// (`a_stripped_slash_is_counted_every_time`), so the caller replays it.
+    /// Add `n` to the stripped-slash count (for `Ingest::resolve`'s cache hits).
     pub(crate) fn note_stripped(&mut self, n: u64) {
         self.stripped += n;
     }
@@ -145,8 +125,6 @@ mod tests {
     use super::*;
 
     /// One leading slash, and only one.
-    ///
-    /// Mutant: `trim_start_matches('/')` merges `//base` and `/base`.
     #[test]
     fn exactly_one_leading_slash_is_stripped() {
         let mut n = NameNormalizer::new();
@@ -161,8 +139,6 @@ mod tests {
     }
 
     /// The warning fires once per distinct frame, not once per message.
-    ///
-    /// Mutant: always report `first_sight: true`.
     #[test]
     fn a_repeated_frame_is_reported_once() {
         let mut n = NameNormalizer::new();
@@ -214,7 +190,7 @@ mod tests {
         );
     }
 
-    /// A trailing slash on the prefix must not double up; an empty prefix is no remap.
+    /// A trailing slash on the prefix does not double up; an empty prefix is no remap.
     #[test]
     fn a_degenerate_prefix_is_treated_as_no_prefix() {
         let mut n = NameNormalizer::with_prefix("robot1/");

@@ -1,19 +1,13 @@
-// What `tf2::BufferCore` costs in memory, in a native C++ process of its own: the
-// tf2 half of the comparison whose tf_tree half is `footprint`'s `mem-tf_tree`
-// mode. Two processes, not two modes, so neither engine's freed chunks satisfy
-// the other's requests and no Rust runtime, allocator or shim is weighed.
+// What `tf2::BufferCore` costs in memory, in a native C++ process of its own: the tf2 half of
+// the comparison whose tf_tree half is `footprint`'s `mem-tf_tree` mode. Two processes so
+// neither engine's freed chunks satisfy the other's requests.
 //
-// Two instruments:
-//   * `mallinfo2`'s `uordblks + hblkhd`: glibc's accounting, identical for both
-//     engines. `hblkhd` is required: the arena is one allocation above the mmap
-//     threshold.
-//   * Pss from `/proc/self/smaps_rollup`: what `top` shows; it sees address space
-//     an allocator holds unfaulted (decision `0021`). The reader mirrors
-//     `ros/tf_tree_bench_ros/include/tf_tree_bench_ros/measure.hpp`.
+// Two instruments: `mallinfo2`'s `uordblks + hblkhd` (glibc's accounting; `hblkhd` because the
+// arena is one mmapped allocation), and Pss from `/proc/self/smaps_rollup` (`0021`; mirrors
+// `ros/tf_tree_bench_ros/include/tf_tree_bench_ros/measure.hpp`).
 //
-// The fixture is the `.tfstream` from `native_arena --dump-only`. The cache is
-// `HISTORY_SECS * 3.0 = 30 s`, matching `tf2.rs`'s `CACHE_SECS`, so nothing is
-// evicted.
+// The fixture is the `.tfstream` from `native_arena --dump-only`; the cache is `30 s`
+// (`tf2.rs`'s `CACHE_SECS`), so nothing is evicted.
 
 #include <tf2/buffer_core.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -80,8 +74,7 @@ geometry_msgs::msg::TransformStamped to_msg(const Sample &x) {
   return m;
 }
 
-// Stored once: a literal past the 15-byte SSO limit would allocate per call, into
-// the very counter this program reads.
+// Stored once: a literal past the 15-byte SSO limit would allocate into the counter read here.
 const std::string kAuthority = "tf_tree_native_ratio";
 
 // In-use bytes across the sbrk heap and mmapped regions; mirrors `footprint.rs`.
@@ -110,8 +103,7 @@ std::uint64_t self_pss_kib() {
 int main(int argc, char **argv) {
   const std::string path = argc > 1 ? argv[1] : "target/native/fixture.tfstream";
 
-  // Parse before the first measurement: the input is the harness's memory, not
-  // tf2's.
+  // Parse before the first measurement: the input is the harness's memory, not tf2's.
   const Stream s = load(path);
 
   // Warm the allocator so first-use bookkeeping is not charged to the engine.

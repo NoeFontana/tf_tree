@@ -1,28 +1,8 @@
 //! The bridge fills a **shared** arena — `docs/decisions/0015`.
-//!
-//! `tests/bridge.rs` covers the seam an `rclcpp` node calls against a private
-//! heap arena, and it cannot host these: its `#![cfg(feature = "bridge")]` is at
-//! file scope, so every test in it must compile in a build with no `shm` at all.
-//! Everything here needs a real rendezvous — a runtime directory, a `memfd`, a
-//! lock file and an owner socket — and therefore `--features bridge,shm`, which
-//! is `just shm-check`'s two new lines and nothing else's.
-//!
-//! **The centrepiece is `a_second_process_reads_what_the_bridge_wrote`.** The
-//! whole record exists because `tft_bridge_create` built a heap arena, so
-//! `docs/PHASE5.md` §9.1's *"one bridge plus N `tf_tree` consumers"* arm was not
-//! merely unmeasured but unconstructible. A test that only asserted
-//! `tft_bridge_create` returned `TFT_OK` under a name would pass against
-//! `TreeBuilder::build_shared`, which publishes no rendezvous at all and which
-//! no second process can find. Reading the transform back from **another
-//! process** — `src/bin/bridge_reader.rs`, spawned — is what distinguishes the
-//! two, and it is a real process for the reason that binary's own docs give.
 #![cfg(all(feature = "bridge", feature = "shm", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
-// exercise or measure it** (`docs/decisions/0048`: a kind is a property, not a
-// crate name). The posture is declared here rather than inherited:
-// `crates/tf_tree_c/src/lib.rs` does not govern this file, because a test or
-// example is a **separate crate root**. `0048` step 4 is what this closes.
+// Posture (`docs/decisions/0007` rule 1, kind 5; `0048` step 4): our own C ABI called
+// from Rust; declared here because a test is a separate crate root.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -34,8 +14,8 @@ use std::path::PathBuf;
 use tf_tree_c::bridge::*;
 use tf_tree_c::*;
 
-/// The same fixture `tests/bridge.rs` uses, so a difference between the heap and
-/// shared paths cannot hide behind a different topology.
+/// The same fixture `tests/bridge.rs` uses, so a difference between the heap and shared paths
+/// cannot hide behind a different topology.
 const TOPO: &str = r#"
 [[edge]]
 parent = "odom"
@@ -50,9 +30,8 @@ kind = "static"
 pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
 "#;
 
-/// A 30° yaw with a translation nothing else in the fixture shares, so a
-/// read-back that returns identity — or the static edge's pose — fails rather
-/// than coincidentally passing.
+/// A 30° yaw with a translation nothing else in the fixture shares, so a read-back that returns
+/// identity — or the static edge's pose — fails rather than coincidentally passing.
 const POSE: [f64; 7] = [
     0.965_925_826_289_068_3,
     0.0,
@@ -65,27 +44,8 @@ const POSE: [f64; 7] = [
 
 const MS: i64 = 1_000_000;
 
-/// The one scratch runtime directory this **process** uses, removed when the
-/// last test holding it finishes.
-///
-/// **Per process rather than per test, and that is the whole design.** The
-/// rendezvous is selected by `$TF_TREE_RUNTIME_DIR`, and `set_var` is
-/// process-wide — so the per-test scratch directory
-/// `crates/tf_tree/tests/rendezvous.rs` uses is only safe because every recipe
-/// that runs *that* target is `cargo nextest run`, which gives each test its own
-/// process. This target is different: `just c-abi-check`'s ASan row is plain
-/// `cargo test`, which runs these three in **threads of one process**, and three
-/// per-test `Scratch`es would race — the loser resolving the winner's
-/// rendezvous, and one test's `Drop` deleting the directory another was still
-/// using.
-///
-/// So the directory is shared and the arena *names* are what keep the tests
-/// apart. `set_var` runs exactly once, inside the `OnceLock`, before any test
-/// gets past its first line — so no thread can be reading the environment while
-/// another writes it.
-///
-/// The count is taken under the same lock that creates and removes, so the
-/// directory cannot be deleted while any test still holds one.
+/// The one scratch runtime directory this **process** uses, removed when the last test holding
+/// it finishes.
 struct Scratch;
 
 static LIVE: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
@@ -96,9 +56,7 @@ fn scratch_dir() -> &'static PathBuf {
         let p = std::env::temp_dir().join(format!("tf_tree_bs-{}", std::process::id()));
         std::env::set_var("TF_TREE_RUNTIME_DIR", &p);
         // The domain is the *rendezvous* domain and comes from the environment
-        // (`docs/decisions/0019` §3 answer 2), never from
-        // `tft_bridge_options::domain`. Pinning it keeps a developer's own
-        // `$ROS_DOMAIN_ID` out of the test.
+        // (`docs/decisions/0019` §3 answer 2), never from `tft_bridge_options::domain`.
         std::env::set_var("TF_TREE_DOMAIN", "0");
         p
     })
@@ -213,21 +171,12 @@ fn text(p: *const c_char) -> String {
 
 /// Attach to `name` **read-only**, in this process.
 fn attach(name: &str) -> Result<tf_tree::Tree, tf_tree::OpenError> {
-    // `Open::new()`'s defaults are the consumer (`docs/decisions/0019` §2a):
-    // read-only, never create. Spelling neither is the point — a consumer of a
-    // bridge-filled arena is an ordinary consumer, which is the record's
-    // "**no new consumer API**".
+    // `Open::new()`'s defaults are the consumer (`docs/decisions/0019` §2a): read-only, never
+    // create.
     tf_tree::Open::new().name(name)?.open()
 }
 
 /// Run `bridge_reader` as a **separate process** and return its one line.
-///
-/// `src/bin/bridge_reader.rs` says why a process rather than another `Open`
-/// here. The environment is passed explicitly rather than inherited: the parent
-/// sets `$TF_TREE_RUNTIME_DIR` with `set_var` inside [`scratch_dir`]'s
-/// `OnceLock`, and reading it back through `std::env` here is what makes the
-/// child's rendezvous provably the same one, with no shared state but those two
-/// strings and the name.
 fn read_in_a_second_process(name: &str, target: &str, source: &str, stamp: i64) -> String {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_bridge_reader"))
         .args([name, target, source, &stamp.to_string()])
@@ -247,8 +196,8 @@ fn read_in_a_second_process(name: &str, target: &str, source: &str, stamp: i64) 
         .to_string()
 }
 
-/// The same lookup in **this** process, rendered the same way, so the two can be
-/// compared bit for bit rather than through two roundings.
+/// The same lookup in **this** process, rendered the same way, so the two can be compared bit
+/// for bit rather than through two roundings.
 fn read_bits(tree: &tf_tree::Tree, target: &str, source: &str, stamp: i64) -> String {
     let g = tree.guard();
     let t = tree
@@ -292,47 +241,8 @@ fn read(tree: &tf_tree::Tree, target: &str, source: &str, stamp: i64) -> [f64; 7
     ]
 }
 
-/// **A separate process reads what the bridge wrote.** The property the whole
-/// record exists for.
-///
-/// `docs/PHASE5.md` §9.1's *"one bridge plus N `tf_tree` consumers"* arm needs
-/// the bridge's arena to be reachable from outside its own process.
-/// `tft_bridge_create` built a heap one, so the arm was not unmeasured but
-/// unconstructible — `just dds-bench` prints that gap above its own table on
-/// every run.
-///
-/// **The reader is `src/bin/bridge_reader.rs`, spawned.** An earlier revision of
-/// this test carried this name over a second `tf_tree::Open` inside the test
-/// process. That attach was genuine — it resolves the rendezvous socket and
-/// receives the segment by fd passing, so it is not reading the bridge's own
-/// `Tree` — but "another process" is a claim about process boundaries, and the
-/// only thing that settles it is one. The child shares no address space, no
-/// mapping and no open file description with the bridge, and finds the arena
-/// from `$TF_TREE_RUNTIME_DIR`, `$TF_TREE_DOMAIN` and the name.
-///
-/// The in-process attach is kept and the two are compared **bit for bit**: it is
-/// now the control rather than the claim, and it is what turns "the child
-/// printed something plausible" into "the child read these bytes".
-///
-/// The attach is `tf_tree::Open` with its **defaults** — read-only, never
-/// create — on both sides, because the record's claim is that a bridge becomes
-/// an ordinary producer of the arena Phase 2 already specified, with **no new
-/// consumer API**. The child links no `tf_tree_c` at all, which is the sharper
-/// half of that: if a consumer needed a bridge-specific call, it could not be
-/// written.
-///
-/// Mutant: route the shared arm through `declared.builder().build_shared(name)`
-/// instead of `tf_tree::Open` ⇒ the create still returns `TFT_OK` (a
-/// `build_shared` name is a debug label, and no rendezvous is published), and
-/// this fails with *"the second process could not read the bridge's arena:
-/// error no arena is serving and CreatePolicy::Never forbids creating one"*.
-/// That mutant is the reason this test reads from outside the process rather
-/// than through `tft_bridge_tree`.
-///
-/// Mutant: drop `.layout_if_creating(builder)` ⇒ *"tft_bridge_create with an
-/// arena_name: -42 (shared arena could not be created: no layout was supplied
-/// and the arena had to be created (arena_name "bridge-read"))"*. That the
-/// message arrives intact is the generic arm doing its job.
+/// **A separate process reads what the bridge wrote.** The property the whole record exists
+/// for.
 #[test]
 fn a_second_process_reads_what_the_bridge_wrote() {
     let _scratch = Scratch::new();
@@ -352,8 +262,8 @@ fn a_second_process_reads_what_the_bridge_wrote() {
         panic!("the second process could not read the bridge's arena: {line}");
     });
 
-    // The control: the same lookup here, compared as bit patterns. A comparison
-    // that rounds is a comparison that can agree while the memory does not.
+    // The control: the same lookup here, compared as bit patterns. A comparison that rounds is
+    // a comparison that can agree while the memory does not.
     let tree = attach(name).unwrap_or_else(|e| {
         panic!("a consumer must be able to find the bridge's arena: {e:?}");
     });
@@ -363,8 +273,8 @@ fn a_second_process_reads_what_the_bridge_wrote() {
         "the second process read different bytes than this one"
     );
 
-    // And the bytes are the pose the bridge was handed, not merely a value two
-    // readers agree on.
+    // And the bytes are the pose the bridge was handed, not merely a value two readers agree
+    // on.
     let got = read(&tree, "odom", "base", 1_000 * MS);
     assert!(
         (got[4] - POSE[4]).abs() < 1e-12
@@ -373,10 +283,8 @@ fn a_second_process_reads_what_the_bridge_wrote() {
         "the consumer read a different transform than the bridge wrote: {got:?}"
     );
 
-    // The static edge is in the same arena, written by the builder rather than
-    // by an offer — so this also rules out an arena that merely happens to hold
-    // one dynamic sample. Read from the second process too: the builder's half
-    // of the arena has to cross the boundary as well as the publisher's.
+    // The static edge is in the same arena, written by the builder rather than by an offer — so
+    // this also rules out an arena that merely happens to hold one dynamic sample.
     let lidar_line = read_in_a_second_process(name, "base", "lidar", 1_000 * MS);
     assert!(
         lidar_line.starts_with("ok "),
@@ -394,35 +302,7 @@ fn a_second_process_reads_what_the_bridge_wrote() {
     );
 }
 
-/// **A second bridge on a name already held is refused, and the first keeps
-/// serving.**
-///
-/// `docs/decisions/0019` §3's question 3: a second bridge on a held name is a
-/// *rendezvous* fault, reported as a startup refusal with its own message —
-/// beside §5.4's per-edge authority machinery, never inside it.
-///
-/// The mechanism is `Open::require_create(true)`. Without it `CreatePolicy`
-/// offers no "create, or refuse if one is already live" setting: `IfAbsent`
-/// takes the **join** path, so the second bridge attaches read-write to an arena
-/// it did not size and goes on to claim edges in it.
-///
-/// Mutant: drop `.require_create(true)` from `open_shared` ⇒ *"a second bridge
-/// must not join an arena it did not size: left: -31, right: -42"*. **The `-31`
-/// is the point, not an incidental code.** `TFT_ERR_ALREADY_CLAIMED` is §5.4's
-/// per-edge authority error, so the joining bridge gets as far as the claim loop
-/// and reports an *edge* conflict for what is an *arena ownership* fault —
-/// exactly the one-diagnostic-two-meanings collapse `docs/decisions/0019` §3's
-/// question 3 refuses. And it is an accident of this fixture: the second bridge
-/// fails only because it declares the same edges. One declaring different edges
-/// would join and start writing, with nothing failing at all.
-///
-/// Mutant: map `OpenError::ArenaAlreadyLive` onto the generic arm ⇒ the status
-/// still matches and the message assertion fails: *"the message must say the
-/// name is taken, not merely that something failed: shared arena could not be
-/// created: an arena is already live at this rendezvous and require_create was
-/// set (arena_name "bridge-held")"*. That is the half keeping *"another bridge
-/// holds this name"* distinguishable from *"the runtime directory is
-/// unusable"*.
+/// **A second bridge on a name already held is refused, and the first keeps serving.**
 #[test]
 fn a_second_bridge_on_a_held_name_is_refused() {
     let _scratch = Scratch::new();
@@ -448,8 +328,8 @@ fn a_second_bridge_on_a_held_name_is_refused() {
         "and it must name the arena the operator has to change: {msg}"
     );
 
-    // **And the first bridge is still the one serving.** A refusal that tore
-    // down the incumbent's rendezvous would be worse than one that joined.
+    // **And the first bridge is still the one serving.** A refusal that tore down the
+    // incumbent's rendezvous would be worse than one that joined.
     let tree = attach(name).expect("the first bridge still serves its arena");
     let got = read(&tree, "odom", "base", 1_000 * MS);
     assert!(
@@ -458,26 +338,7 @@ fn a_second_bridge_on_a_held_name_is_refused() {
     );
 }
 
-/// **A bridge with a NULL `arena_name` publishes nothing**, under `shm` exactly
-/// as without it.
-///
-/// The default is the whole compatibility claim: `arena_name` is opt-in, and a
-/// caller that does not set it — including every caller compiled against the
-/// 0.4 header, whose bytes end before the field — gets the private heap arena it
-/// always had. A shared build that leaked a rendezvous for every bridge would
-/// put a `memfd`, a lock file and a participant slot on §5.8's form 3, which
-/// exists precisely to need none of them.
-///
-/// Mutant: make the arm unconditional — `let arena_name = arena_name.or(Some(
-/// "default"))` before the match in `tft_bridge_create` ⇒ the attach below
-/// succeeds and the run reports *"a NULL arena_name must publish no
-/// rendezvous"*.
-///
-/// **No line number, deliberately.** An earlier revision of this note cited one
-/// and it was wrong by 46 lines — a mutant note is re-run when the code under it
-/// changes, but a line number goes stale when anything *above* it changes, which
-/// is every edit to this file. The panic text is unique in the workspace and
-/// does not rot.
+/// **A bridge with a NULL `arena_name` publishes nothing**, under `shm` exactly as without it.
 #[test]
 fn a_null_arena_name_publishes_no_rendezvous() {
     let _scratch = Scratch::new();
@@ -503,9 +364,8 @@ fn a_null_arena_name_publishes_no_rendezvous() {
         Err(e) => e,
         Ok(_) => panic!("a NULL arena_name must publish no rendezvous"),
     };
-    // `tf_tree_ipc` is not a dependency of this crate — the C ABI reaches the
-    // rendezvous only through the facade — so the variant is asserted on its
-    // rendering rather than by pattern.
+    // `tf_tree_ipc` is not a dependency of this crate — the C ABI reaches the rendezvous only
+    // through the facade — so the variant is asserted on its rendering rather than by pattern.
     let rendered = format!("{err:?}");
     assert!(
         rendered.contains("ArenaAbsent"),

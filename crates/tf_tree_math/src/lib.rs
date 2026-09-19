@@ -4,7 +4,7 @@
 #![deny(missing_docs)]
 //! `no_std` SE(3)/SO(3) and dual-quaternion math for the `tf_tree` engine.
 //!
-//! # Conventions (lock these in — every downstream bug traces back to one)
+//! # Conventions
 //!
 //! 1. **Hamilton** quaternions (not JPL).
 //! 2. **`w` first** storage order (`[w, x, y, z]`) — differs from Eigen; the
@@ -18,18 +18,16 @@
 //!    [`log_se3`] returns the twist `ξ = [ω, v]` of the right-multiplied
 //!    increment and [`exp_se3`] consumes the same ordering.
 //!
-//! `just miri` does not run this crate's own tests; it reaches Miri only as a callee of `tf_tree_core`'s.
-//!
 //! # Numerics
 //!
-//! Verified against a 50-digit reference in `docs/PHASE1.md` §3.3:
+//! See `docs/PHASE1.md` §3.3:
 //!
 //! * [`log_so3`] goes through the quaternion (`2·atan2(‖q_v‖, q_w)`), never
 //!   through `acos((tr − 1)/2)`, which loses nine digits near `θ = π`.
 //! * The small-angle series threshold for the `V`/`V⁻¹` coefficients is
 //!   `θ < 0.1` with four series terms, not the `1e-8` most libraries use.
 
-// README's `rust` fence is a doctest here only; `cfg(doctest)` keeps it out of `cargo doc`.
+// README's `rust` fence is a doctest only.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme {}

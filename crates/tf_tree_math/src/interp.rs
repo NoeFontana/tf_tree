@@ -18,18 +18,13 @@ use crate::twist::Twist;
 /// normalized LERP to avoid dividing by `sin(angle) → 0`.
 const SLERP_LERP_FALLBACK: f64 = 1e-6;
 
-/// Quaternion angle `acos(qa·qb)` (half the rotation angle) above which [`slerp`]
-/// uses the exact `acos`/`sin` form; at or below it, the series in
-/// [`slerp_weight`]. Six terms hold 1e-15 up to 0.165 rad (7 terms: 0.248), so
-/// 0.15 sits inside; `slerp_series_matches_exact_below_threshold` measures it.
-///
-/// Adjacent samples of a 180 °/s body take the series above 10.47 Hz
-/// (`f = ω/(2·0.15)`). Shared with [`crate::dualquat::screw_pow`], which needs
-/// the same `sin(a·φ)/sin(φ)` series over the same half-angle range.
+/// Quaternion angle above which [`slerp`] uses the exact `acos`/`sin` form; at
+/// or below it, the series in [`slerp_weight`]. Measured by
+/// `slerp_series_matches_exact_below_threshold`; shared with
+/// [`crate::dualquat::screw_pow`].
 pub(crate) const THETA_SLERP_SMALL: f64 = 0.15;
 
-// Both constants are quoted as literals in `slerp`'s rustdoc, the crate README,
-// `docs/API.md` §6 row 16 and `tests/slerp_public.rs`; move them together.
+// Quoted as literals in `slerp`'s rustdoc, the README, `docs/API.md` §6 and `tests/slerp_public.rs`.
 const _: () = assert!(SLERP_LERP_FALLBACK == 1e-6);
 const _: () = assert!(THETA_SLERP_SMALL == 0.15);
 
@@ -65,20 +60,14 @@ impl Interp for ScLerp {
 }
 
 impl ScLerp {
-    /// [`Interp::eval`], plus the segment's body twist **per unit `s`** —
-    /// `docs/PHASE4.md` §2.3.
-    ///
-    /// The twist `ξ = log_se3(a⁻¹b)` is constant across the segment; for stamps
-    /// in nanoseconds, `V^b = ξ · 1e9/(t_j − t_i)`. The pose is bit-identical to
-    /// [`Interp::eval`] (`eval_with_twist_pose_matches_eval`). There is no
-    /// [`LerpSlerp`] equivalent (§2.4): its twist is an artifact of the
-    /// interpolant, so `tf_tree_core` refuses the query.
+    /// [`Interp::eval`], plus the body twist `ξ = log_se3(a⁻¹b)` per unit `s`
+    /// (`docs/PHASE4.md` §2.3); for ns stamps, `V^b = ξ · 1e9/(t_j − t_i)`. The
+    /// pose is bit-identical to [`Interp::eval`]. No [`LerpSlerp`] equivalent (§2.4).
     #[inline]
     #[must_use]
     pub fn eval_with_twist(a: &Iso3, b: &Iso3, s: f64) -> (Iso3, Twist) {
         let rel = a.inv_mul(b);
-        // Endpoint test before the power: LLVM does not sink the transcendental
-        // out of the untaken branch. The twist is still needed at the endpoints.
+        // Endpoints first: LLVM does not sink the power out of the untaken branch.
         if s == 0.0 {
             return (*a, screw_twist(&rel));
         }
@@ -107,9 +96,7 @@ impl Interp for LerpSlerp {
 
 impl Iso3 {
     /// `self⁻¹ · rhs`, the relative transform from `self` to `rhs`.
-    ///
-    /// Rotation `q_self*·q_rhs`, translation `q_self*·(t_rhs − t_self)`, without
-    /// materializing `self.inverse()`.
+
     #[inline]
     #[must_use]
     fn inv_mul(&self, rhs: &Iso3) -> Iso3 {
@@ -122,26 +109,21 @@ impl Iso3 {
 
 /// Shortest-arc spherical linear interpolation of two unit quaternions.
 ///
-/// The rotation kernel [`LerpSlerp`] evaluates (`docs/API.md` §2.7); the
-/// `tf_tree` facade re-exports it. Every angle below is a **quaternion** angle,
-/// half the rotation the pair spans.
+/// The rotation kernel of [`LerpSlerp`] (`docs/API.md` §2.7). Every angle below
+/// is a quaternion angle, half the rotation spanned.
 ///
 /// # Preconditions
 ///
-/// Both inputs must be unit; nothing checks. `s` is a dimensionless fraction of
-/// the segment, not a stamp.
+/// Both inputs must be unit; nothing checks. `s` is a fraction, not a stamp.
 ///
 /// # Range of `s`
 ///
-/// `s` belongs to `[0, 1]`; nothing clamps. Outside it only the closed form
-/// holds (`7.2e-15` at `|s| = 20`; the series loses `1e-15` by `|s| ≈ 2.3..5`),
-/// so extrapolation is unsupported: `tf_tree_core` never passes `s` outside
-/// `(0, 1)`. Pinned by `out_of_range_s_extrapolates_and_only_the_closed_form_holds`.
+/// `s` belongs to `[0, 1]`; nothing clamps, and extrapolation is unsupported
+/// (`out_of_range_s_extrapolates_and_only_the_closed_form_holds`).
 ///
 /// # Storage order
 ///
-/// [`Quat`] is `[w, x, y, z]`, scalar first; a transposed conversion from a
-/// last-`w` library returns a unit quaternion that is the wrong rotation.
+/// [`Quat`] is `[w, x, y, z]`, scalar first.
 ///
 /// # Endpoints and degenerate inputs
 ///
@@ -154,16 +136,13 @@ impl Iso3 {
 /// * **A `-0.0` component is lost** (`signed_zero_components_are_the_endpoint_exception`).
 /// * **Numerically identical inputs return `qa` for every `s`**, unread.
 ///
-/// A `NaN` `s` propagates except through the identical-input return; a `NaN`
-/// component reaches the closed form — do not add a `sin_angle == 0.0` guard
-/// (`nan_propagates_except_through_the_identical_input_return`). The output is
-/// unit only to within `f64`.
+/// A `NaN` `s` propagates except through the identical-input return; do not add
+/// a `sin_angle == 0.0` guard (`nan_propagates_except_through_the_identical_input_return`).
 ///
 /// # Numerics
 ///
 /// Above `THETA_SLERP_SMALL` (`0.15` rad) the weights are the closed `acos`/`sin`
-/// form; below it, a six-term series with θ² from the chord. Both constants are
-/// private so a re-measurement may move them.
+/// form; below it, a six-term series with θ² from the chord.
 ///
 /// ```
 /// use tf_tree_math::{exp_so3, slerp, Quat, Vec3};
@@ -172,8 +151,7 @@ impl Iso3 {
 /// let qb = exp_so3(Vec3::new(0.0, 0.0, core::f64::consts::FRAC_PI_2));
 /// let mid = slerp(qa, qb, 0.5);
 ///
-/// // Half of a 90° yaw is a 45° yaw, and the result is unit without a
-/// // normalization step.
+/// // Half of a 90° yaw is a 45° yaw.
 /// let quarter = exp_so3(Vec3::new(0.0, 0.0, core::f64::consts::FRAC_PI_4));
 /// assert!(mid.sub(quarter).norm() < 1e-15);
 /// assert!((mid.norm() - 1.0).abs() < 1e-15);
@@ -211,16 +189,14 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
 
 /// `θ²` from `h = 1 − |cos θ|`, without `acos`.
 ///
-/// `θ² = 2h·Σ Cₖ hᵏ` from squaring the `asin` series of the half-chord, so
-/// nothing forms `1 − dot` or feeds `acos` an argument near 1. `Cₙ = 2ⁿ⁺¹ /
-/// ((n+1)²·C(2n+2, n+1))`.
+/// `θ² = 2h·Σ Cₖ hᵏ` from the squared `asin` series of the half-chord;
+/// `Cₙ = 2ⁿ⁺¹ / ((n+1)²·C(2n+2, n+1))`.
 ///
 /// ```text
 /// C₀..C₇ = 1, 1/6, 2/45, 1/70, 8/1575, 4/2079, 16/21021, 2/6435
 /// ```
 ///
-/// Eight terms are load-bearing: at θ = 0.15, four give 8e-11, six 1.6e-15.
-/// Tested on its own by `theta_sq_matches_acos_across_the_fast_path`.
+/// Eight terms are needed; see `theta_sq_matches_acos_across_the_fast_path`.
 #[inline]
 #[must_use]
 pub(crate) fn theta_sq_from_chord(h: f64) -> f64 {
@@ -254,10 +230,8 @@ pub(crate) fn theta_sq_from_chord(h: f64) -> f64 {
 ///                        + (1−x)(2555−1636x+410x²−52x³+3x⁴)·u⁵/119750400 ]
 /// ```
 ///
-/// From exact rational long division of the two Maclaurin series. Six terms:
-/// the coefficients fall only ~10× per order (see [`THETA_SLERP_SMALL`]). The
-/// `(1 − x)` factor keeps both endpoints exact at any term count. Horner in `u`,
-/// branch-free.
+/// From the two Maclaurin series; the `(1 − x)` factor keeps both endpoints
+/// exact at any term count.
 #[inline]
 #[must_use]
 pub(crate) fn slerp_weight(a: f64, u: f64) -> f64 {
@@ -286,7 +260,7 @@ mod tests {
     use crate::iso3::Vec3;
     use crate::quat::exp_so3;
 
-    /// `sin(aθ)/sin(θ)` the obvious way — the definition the series approximates.
+    /// `sin(aθ)/sin(θ)` directly.
     fn weight_exact(a: f64, theta: f64) -> f64 {
         libm::sin(a * theta) / libm::sin(theta)
     }
@@ -301,7 +275,6 @@ mod tests {
             if theta < 1e-9 {
                 continue;
             }
-            // h = 2*sin^2(theta/2), cancellation-free like production.
             let d = libm::sin(0.5 * theta);
             let h = 2.0 * d * d;
             let got = theta_sq_from_chord(h);
@@ -319,7 +292,7 @@ mod tests {
         );
     }
 
-    /// The `docs/PHASE1.md` §3.3 threshold sweep: series vs exact holds 1e-15 up to `THETA_SLERP_SMALL`.
+    /// `docs/PHASE1.md` §3.3 sweep: series vs exact holds 1e-15 up to `THETA_SLERP_SMALL`.
     #[test]
     fn slerp_series_matches_exact_below_threshold() {
         let mut worst = 0.0f64;
@@ -334,7 +307,7 @@ mod tests {
                 let a = k as f64 / 20.0;
                 let series = slerp_weight(a, u);
                 let exact = weight_exact(a, theta);
-                // Relative error, guarding the a = 0 root where both are 0.
+                // Guard the a = 0 root.
                 let denom = if exact.abs() > 1e-300 {
                     exact.abs()
                 } else {
@@ -356,7 +329,7 @@ mod tests {
         );
     }
 
-    /// The series loses 1e-15 beyond its range; if this fails, re-derive the threshold from a sweep.
+    /// The series loses 1e-15 beyond its range.
     #[test]
     fn series_degrades_beyond_its_range() {
         let theta = 0.45f64;
@@ -382,13 +355,12 @@ mod tests {
         let axis = Vec3::new(0.3 / n, -0.5 / n, 0.81 / n);
         let s = 0.37;
         let mut worst = 0.0f64;
-        // Straddles the threshold: half of it to 1.5×.
         for i in 0..4000 {
             let theta = THETA_SLERP_SMALL * 0.5 + (i as f64) * (THETA_SLERP_SMALL / 4000.0);
             let qa = Quat::IDENTITY;
             let qb = exp_so3(axis.scale(2.0 * theta));
 
-            // Compare against the closed form, not adjacent samples (the slope swamps a mismatch).
+            // Compare against the closed form, not adjacent samples.
             let angle = libm::acos(qa.dot(qb).min(1.0));
             let sin_angle = libm::sin(angle);
             let want = qa
@@ -429,8 +401,6 @@ mod tests {
     }
 
     /// `eval_with_twist`'s pose is bit-identical to `eval`'s.
-    ///
-    /// Mutant: drop the `s == 1.0` shortcut from `eval_with_twist`.
     #[test]
     fn eval_with_twist_pose_matches_eval() {
         for k in 0..50 {

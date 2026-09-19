@@ -27,9 +27,9 @@ const ARENA_ALIGN: usize = 64;
 
 /// The alignment actually requested from the allocator.
 ///
-/// Must stay **at or below `MIN_ALIGN`** (16) so `alloc_zeroed` uses `calloc`
-/// and pages stay demand-faulted (`docs/decisions/0021`). **Raising it to 64
-/// silently undoes that**; `tests/heap_alignment.rs` asserts residency.
+/// Must stay at or below `MIN_ALIGN` (16) so `alloc_zeroed` uses `calloc` and
+/// pages stay demand-faulted; raising it to 64 silently undoes that
+/// (`docs/decisions/0021`, `tests/heap_alignment.rs`).
 const CALLOC_ALIGN: usize = 16;
 
 const _: () = assert!(CALLOC_ALIGN <= ARENA_ALIGN);
@@ -89,9 +89,8 @@ impl HeapArena {
 
         let size = layout.total_size();
 
-        // **Over-allocate at `CALLOC_ALIGN` and align to 64 by hand**: requesting
-        // 64 directly costs ~293x the resident memory (`docs/decisions/0021`;
-        // 4 KiB at align 16, 2356 KiB at 64).
+        // Over-allocate at `CALLOC_ALIGN` and align by hand: requesting 64 costs
+        // ~293x the resident memory (`docs/decisions/0021`).
         // SAFETY: `CALLOC_ALIGN` is a non-zero power of two and `size + 63`
         // cannot overflow `isize::MAX` (`ArenaLayout::new` caps `total_size`).
         let alloc_layout =
@@ -181,8 +180,7 @@ unsafe impl Arena for HeapArena {
 }
 
 /// Write an [`ArenaHeader`] into the first bytes of a freshly zeroed arena
-/// region. Shared by [`HeapArena`] and `MappedArena`, so the two are the same
-/// bytes read by the same code.
+/// region; shared by [`HeapArena`] and `MappedArena`.
 ///
 /// # Safety
 ///

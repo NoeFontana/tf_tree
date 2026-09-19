@@ -12,44 +12,34 @@ instead**; this surface is shaped by a layout that is scheduled to change.
 ## What it is
 
 One flat allocation holds every record and ring buffer and contains **no
-pointers** — every reference is a `u32` element index or a byte offset from the
-arena base. So it is relocatable by `memcpy`, maps into another process at a
-different address with no fixups, and written to a file *is* the file: opening a
-frozen `.tft` is an `mmap`. Two backings implement the `Arena` trait: `HeapArena`
-(everywhere) and `MappedArena` (`memfd_create` + `mmap` + seals; `shm` feature,
-Linux only).
+pointers**: every reference is a `u32` element index or a byte offset from the
+arena base, so it is relocatable by `memcpy` and opening a frozen `.tft` is an
+`mmap`. Two backings implement the `Arena` trait: `HeapArena` and `MappedArena`
+(`shm` feature, Linux only).
 
 ## Identity
 
-`ArenaHeader` carries `FORMAT_VERSION` (currently **3**) and a `layout_hash` of
-the region table; a participant with a different layout is refused at attach, so
-appending a field to a `#[repr(C)]` arena record is a `FORMAT_VERSION` event.
+`ArenaHeader` carries `FORMAT_VERSION` (currently **3**) and a `layout_hash`; a
+participant with a different layout is refused at attach, so appending a field to
+a `#[repr(C)]` arena record is a `FORMAT_VERSION` event.
 
 ## Features
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `shm` | off | `MappedArena` (`memfd` + `mmap` + `F_ADD_SEALS`), the frozen `.tft` reader/writer, a `rustix` dependency. **Linux only**, kernel ≥ 3.17 |
-
-With `shm` off the crate has one dependency (`bytemuck`) and no syscalls.
+| `shm` | off | `MappedArena`, the frozen `.tft` reader/writer, a `rustix` dependency. **Linux only**, kernel ≥ 3.17 |
 
 ## `unsafe`, version, docs
 
-`unsafe` is permitted here (raw arena memory is one of the boundaries in
-[`docs/decisions/0007`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0007-the-unsafe-budget-and-the-c-abi.md));
-every block carries a `// SAFETY:` comment and the crate is
-`#![deny(unsafe_op_in_unsafe_fn)]`.
+`unsafe` is permitted here for raw arena memory
+([`docs/decisions/0007`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0007-the-unsafe-budget-and-the-c-abi.md)).
 
-**`0.0.x` promises nothing**: pin exactly and expect a later release to break —
-sharper here, since the arena layout is what the version is about
-([`docs/PHASE5.md`](https://github.com/NoeFontana/tf_tree/blob/main/docs/PHASE5.md)
-§1.2). MSRV is **1.87**
-([`SUPPORT.md`](https://github.com/NoeFontana/tf_tree/blob/main/SUPPORT.md));
-release notes in
-[`CHANGELOG.md`](https://github.com/NoeFontana/tf_tree/blob/main/CHANGELOG.md).
+**`0.0.x` promises nothing**: pin exactly
+([`CHANGELOG.md`](https://github.com/NoeFontana/tf_tree/blob/main/CHANGELOG.md)).
+MSRV is **1.87**
+([`SUPPORT.md`](https://github.com/NoeFontana/tf_tree/blob/main/SUPPORT.md)).
 Layout and orderings: `docs/PHASE1.md`; shared memory: `docs/PHASE2.md` §2.
 
 ## Licence
 
-Dual [MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE), at your option. See
-[`NOTICE`](NOTICE).
+Dual [MIT](LICENSE-MIT) / [Apache-2.0](LICENSE-APACHE), at your option; see [`NOTICE`](NOTICE).

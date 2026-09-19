@@ -1,36 +1,12 @@
-//! The relocation gate — the one property all of Phase 2 rests on.
-//!
-//! `tf_tree_arena`'s crate docs state that every internal reference is a byte
-//! offset relative to the arena base, "so it is relocatable by `memcpy` and, in
-//! Phase 2, mappable at a different address in another process", and that adding
-//! `MappedArena` is **the only change required** to move to shared memory
-//! (`docs/PHASE1.md` §13 asks for that list to have one entry).
-//!
-//! That claim was documented but never tested. It is exactly the kind of claim
-//! that holds right up until someone stores one absolute address — a cached
-//! pointer, a `&'static` fallback, a `usize` that happened to be an address —
-//! and it would then fail in Phase 2, in another process, as a wild read rather
-//! than a clean error.
-//!
-//! So: build a populated tree, copy its bytes to a **different address**, and
-//! require the copy to answer every query bit-for-bit identically. Anything
-//! absolute in the arena breaks this.
-//!
-//! # Why the comparison is bit-for-bit
-//!
-//! Not `approx_eq`. The relocated arena holds the *same bytes*, so it must
-//! produce the *same `f64`s*, not merely close ones — the two evaluations run
-//! identical code over identical inputs. A tolerance here would hide precisely
-//! the failure being tested: an offset resolving to a neighbouring slot gives a
-//! nearby, plausible pose.
-// `panic`: a test asserting two arenas disagree has nothing to recover to, and
-// the match arm below reports *which* side declined, which `assert!` cannot.
+//! The relocation gate: a byte-copy of a populated arena at a different address
+//! answers every query bit-for-bit identically, so nothing absolute is stored in
+//! the arena (`docs/PHASE1.md` §13). Bit-for-bit, not `approx_eq`: a tolerance
+//! would hide an offset resolving to a neighbouring slot.
+// `panic`: the match arm reports which side declined, which `assert!` cannot.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// **`docs/decisions/0007` rule 1, kind 6 — a trait the language requires be
-// implemented unsafely, in a target that never ships** (`docs/decisions/0048`:
-// a kind is a property, not a crate name). Here that is `unsafe impl Send/Sync for RelocatedArena`. The posture is
-// declared rather than inherited, because a test is a **separate crate root**.
-// `0048` step 4.
+// `docs/decisions/0007` rule 1, kind 6 (`docs/decisions/0048`): the
+// `unsafe impl Send/Sync for RelocatedArena` in a target that never ships. A
+// test is a separate crate root, so the posture is declared here (`0048` step 4).
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -49,9 +25,8 @@ use tf_tree_core::EdgeId;
 /// Alignment the arena requires of its base (`tf_tree_arena`'s `ARENA_ALIGN`).
 const ARENA_ALIGN: usize = 64;
 
-/// An [`Arena`] over a heap block this test owns — the stand-in for Phase 2's
-/// `MappedArena`. It knows nothing about the layout; it just presents `len`
-/// bytes at some address that is *not* the original's.
+/// An [`Arena`] over a heap block this test owns, at an address other than the
+/// original's.
 struct RelocatedArena {
     ptr: NonNull<u8>,
     len: usize,
@@ -85,12 +60,8 @@ impl Drop for RelocatedArena {
     }
 }
 
-/// Byte-copy an arena, given its header (which lives at arena offset 0).
-///
-/// Reaching the bytes through `header()` rather than an accessor is deliberate:
-/// `Tree` does not expose its arena as a slice, and it should not — handing out
-/// a `&[u8]` while writers publish through atomics would be a data race. Here
-/// the tree is quiescent (all publishers dropped), so this read is sound.
+/// Byte-copy an arena from its header (at arena offset 0). `Tree` exposes no
+/// `&[u8]` (it would race with atomic publishers); here the tree is quiescent.
 fn copy_of(header: &ArenaHeader) -> RelocatedArena {
     let len = header.arena_size as usize;
     let src = std::ptr::from_ref(header).cast::<u8>();
@@ -107,9 +78,8 @@ fn copy_of(header: &ArenaHeader) -> RelocatedArena {
     RelocatedArena { ptr, len, layout }
 }
 
-/// `tf_tree::tree::edge_meta`, which is private to the facade. Small enough to
-/// restate; if it ever diverges, the plans compiled here stop matching and this
-/// test fails loudly rather than silently testing the wrong thing.
+/// `tf_tree::tree::edge_meta`, private to the facade; if it diverges the plans
+/// stop matching and the test fails.
 fn edge_meta(view: &ArenaView, eid: EdgeId) -> Option<EdgeMeta> {
     let e = view.edge(eid)?;
     Some(EdgeMeta {
@@ -119,9 +89,8 @@ fn edge_meta(view: &ArenaView, eid: EdgeId) -> Option<EdgeMeta> {
     })
 }
 
-/// Evaluate `target <- source` at `stamp` against an arbitrary arena, going
-/// through the full public path: resolve names, compile a plan, pin a
-/// generation, fold.
+/// Evaluate `target <- source` at `stamp` against an arbitrary arena via the
+/// full public path.
 fn lookup(view: ArenaView, target: &str, source: &str, ns: i64) -> Option<Iso3> {
     let t = view.find_frame(target).ok()??;
     let s = view.find_frame(source).ok()??;
@@ -134,14 +103,13 @@ fn lookup(view: ArenaView, target: &str, source: &str, ns: i64) -> Option<Iso3> 
 /// The gate: a relocated arena answers identically, bit for bit.
 #[test]
 fn relocated_arena_answers_bit_identically() {
-    // `populated_tree` drops its publishers before returning, so the arena is
-    // quiescent and safe to byte-copy.
+    // `populated_tree` drops its publishers, so the arena is quiescent.
     let (tree, _samples) = fixture::populated_tree().expect("build fixture");
 
     let original = tree.arena_view();
     let relocated = copy_of(original.header());
 
-    // The copy must land somewhere else, or this test proves nothing.
+    // The copy must land elsewhere, or the test is vacuous.
     let src_addr = std::ptr::from_ref(original.header()) as usize;
     assert_ne!(
         src_addr,
@@ -149,7 +117,7 @@ fn relocated_arena_answers_bit_identically() {
         "copy landed at the same address; the test would be vacuous"
     );
 
-    // Every frame pair worth asking about, across the history window.
+    // Every frame pair across the history window.
     let names = fixture::frame_names();
     let mut compared = 0usize;
     for (i, &target) in names.iter().enumerate() {
@@ -179,19 +147,15 @@ fn relocated_arena_answers_bit_identically() {
         }
     }
 
-    // Guard against a vacuous pass, the same way the tf2 differential does: if
-    // every query declined, the loop above proves nothing at all.
+    // Guard against a vacuous pass: all-declined proves nothing.
     assert!(
         compared > 1000,
         "only {compared} queries actually compared; the gate is vacuous"
     );
 }
 
-/// Frame interning must resolve from the relocated bytes too.
-///
-/// Separated from the lookup gate because it fails differently: the hash table
-/// stores ids, not pointers, but a regression that cached a resolved address
-/// would still let *plans* work while breaking *name* resolution.
+/// Frame interning resolves from the relocated bytes too; a cached resolved
+/// address would still let plans work.
 #[test]
 fn frame_interning_survives_relocation() {
     let (tree, _samples) = fixture::populated_tree().expect("build fixture");
@@ -211,8 +175,7 @@ fn frame_interning_survives_relocation() {
         assert_eq!(want, got, "frame {name} resolved to a different id");
     }
 
-    // A name that was never interned must still be absent — a relocated hash
-    // table that resolved everything would pass the loop above.
+    // A relocated table that resolved everything would pass the loop above.
     assert_eq!(
         view.find_frame("no_such_frame").expect("lookup"),
         None,
@@ -220,8 +183,7 @@ fn frame_interning_survives_relocation() {
     );
 }
 
-/// The header itself must survive the move: magic, version and layout hash are
-/// what Phase 2 will validate a mapped segment against before touching it.
+/// The header survives the move: magic, version and layout hash.
 #[test]
 fn header_identifies_the_relocated_arena() {
     let (tree, _samples) = fixture::populated_tree().expect("build fixture");

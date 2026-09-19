@@ -1,22 +1,17 @@
 //! Zero-configuration rendezvous for `tf_tree` shared arenas.
 //!
-//! A process calls `open()` and either joins the arena that already exists on
-//! this machine or creates it. No configuration file, no daemon, no start-order
-//! requirement, and **no possibility of two processes silently ending up on
-//! different arenas.** This crate is the substrate that makes that true:
-//! `docs/PHASE2.md` §3.1–§3.4 and §5.1.
+//! A process calls `open()` and either joins the arena that exists on this
+//! machine or creates it: no configuration file, no daemon, no start-order
+//! requirement (`docs/PHASE2.md` §3.1–§3.4, §5.1).
 //!
 //! # Design
 //!
-//! Do not implement leader election; borrow the kernel's. Linux open file
-//! description locks give mutual exclusion, release on holder death, and a way
-//! to ask whether anyone holds it — no timeouts, no heartbeats, no stale state.
+//! The kernel is the leader election: Linux OFD locks give mutual exclusion,
+//! release on holder death, and a way to ask who holds one.
 //!
-//! * A dead participant's lock is released by the kernel at the end of its exit,
-//!   after any core dump
+//! * A dead participant's lock is released at the end of its exit, after any core dump
 //!   ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
-//! * A `SIGSTOP`ped participant still holds its lock, so it is never mistaken
-//!   for a dead one.
+//! * A `SIGSTOP`ped participant still holds its lock.
 //! * `/proc` parsing and PID-reuse defence are diagnostics only (§5.1).
 //!
 //! # The sharing boundary
@@ -43,20 +38,18 @@
 //! | §3.6 `memfd` creation, and wiring this into `tf_tree::open()` | **not yet** — `docs/decisions/0005` step 5 |
 //! | §6.1 claim leases: [`LockFile::try_take_claim`] and friends | implemented; the arena-side two-phase acquire is `docs/decisions/0005` step 7 |
 //!
-//! [`Open::open`] takes a [`ServerProbe`] so the split-brain race in §3.4 is
-//! reproducible on demand.
+//! [`Open::open`] takes a [`ServerProbe`] so §3.4's split-brain race is reproducible.
 //!
 //! # Platform
 //!
 //! Linux only (§2). OFD locks reach the kernel through `libc`'s `fcntl`, a
-//! documented deviation from §2's "no libc crate": `rustix` has no OFD locking,
-//! and classic locks are rejected in §3.3.
+//! deviation from §2's "no libc crate": `rustix` has no OFD locking.
 // `unsafe` boundary: the OS (one `pthread_atfork` shim). See `docs/decisions/0007`.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg(target_os = "linux")]
 #![deny(missing_docs)]
 
-// Wires `README.md`'s fences to the doctest harness; `cfg(doctest)` keeps it out of `cargo doc`.
+// Wires `README.md`'s fences to the doctest harness.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme {}

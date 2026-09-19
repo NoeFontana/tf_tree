@@ -1,16 +1,11 @@
 name: nightly
 
-# Jobs that do not belong on a pull request (`docs/PHASE5.md` §10): the 30-minute
-# `shm_torture` soak (`docs/PHASE2.md` §13), sanitizer suites, container tf2 work
-# and the two-sanitizer C++ build. Each job invokes a `just` recipe and never
-# restates its commands. A green tick means the recipes passed once on a hosted
-# x86-64 runner; a schedule that stops firing looks like one that passes.
+# Jobs that do not belong on a pull request (`docs/PHASE5.md` §10); each invokes
+# a `just` recipe. A green tick means one pass on a hosted x86-64 runner.
 
 on:
   schedule:
-    # 03:17 UTC, off the hour: the hour is when every scheduled workflow starts.
     - cron: "17 3 * * *"
-  # So a change to these recipes can be exercised without waiting a day.
   workflow_dispatch:
 
 permissions:
@@ -20,7 +15,6 @@ jobs:
   torture:
     name: shm_torture (30 min)
     runs-on: ubuntu-latest
-    # The recipe runs 30 minutes; the margin covers build and teardown.
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v7
@@ -29,20 +23,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
-      # Self-test first: a broken detector would make 30 minutes pass meaninglessly.
+      # Self-test first: a broken detector would pass meaninglessly.
       - name: just shm-torture-self-test
         run: just shm-torture-self-test
       - name: just shm-torture
         run: just shm-torture
 
-  # `docs/PHASE2.md` §11.4's other half: a random crash point armed in ~10% of
-  # children. Its own job: the build differs (`--features shm,crash-points`, which
-  # the plain soak must not carry) and so do the parameters (5 min, 10 children,
-  # 2 Hz; a high kill rate wins the race against the site). The binary refuses a
-  # run that armed nothing or fired at none, so the exit status is worth reading
-  # (`a_run_that_validates_nothing_fails_instead_of_passing`). 25 minutes covers two
-  # release builds that cargo cannot share (`crates/tf_tree_bench/Cargo.toml`)
-  # plus the soak; a longer soak means changing the recipe's `*ARGS`.
+  # `docs/PHASE2.md` §11.4's other half: a crash point armed in ~10% of children.
+  # The binary refuses a run that armed or fired nothing
+  # (`a_run_that_validates_nothing_fails_instead_of_passing`). A longer soak means
+  # changing the recipe's `*ARGS`.
   crash-points:
     name: shm_torture --crash-points (§11.3 sites)
     runs-on: ubuntu-latest
@@ -54,8 +44,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
-      # The detector self-test first, for the `torture` job's reason (built without
-      # `crash-points` so it can assert the refusal).
       - name: just shm-torture-self-test
         run: just shm-torture-self-test
       - name: just shm-torture-crash-points
@@ -68,16 +56,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `tsan` is `docs/PHASE3.md` §7.3's concurrent read path;
-        # `shm-torture-asan` is `docs/PHASE2.md` §11.4. There is no Rust UBSan row
-        # (rustc has no `undefined` sanitizer); the UBSan half is `just cpp-check`.
+        # `tsan`: `docs/PHASE3.md` §7.3; `shm-torture-asan`: `docs/PHASE2.md` §11.4.
+        # UBSan is `just cpp-check`.
         include:
           - { recipe: tsan, args: "" }
-          # §15's box is 30 minutes under ASan, so the recipe's 120 s default is
-          # overridden here. Four children is the thinnest fleet the owner-kill arm
-          # accepts (the reap window scales with the victim's dirty pages, 43-49 MB
-          # under ASan) and is kept so this job stays the standing check of the
-          # `kill.in_progress` marker.
+          # §15's box: 30 minutes under ASan; four children is the thinnest fleet
+          # the owner-kill arm accepts (`kill.in_progress`).
           - { recipe: shm-torture-asan, args: "--duration 30m --children 4 --kill-hz 4" }
     steps:
       - uses: actions/checkout@v7
@@ -91,10 +75,8 @@ jobs:
       - name: just ${{ matrix.recipe }} ${{ matrix.args }}
         run: just ${{ matrix.recipe }} ${{ matrix.args }}
 
-  # `tf2-differential` and `tf2-replay` are host-independent tests (generated
-  # topologies; a recorded `/tf` stream) kept off PRs by `ci.yml`. `tf2-bench`,
-  # `tf2-bench-check`, `tf2-scaling` and `dds-bench` are timings a shared runner
-  # cannot produce, so they stay out.
+  # Host-independent tf2 tests kept off PRs by `ci.yml`; the tf2 and DDS timings
+  # stay out because a shared runner cannot produce them.
   tf2-differential:
     name: tf2 differential + replay (container)
     runs-on: ubuntu-latest
@@ -120,17 +102,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
-      # Sophus is optional and the recipe reports its absence; fetch it for the §4.3 stride hazard.
+      # Sophus for the §4.3 stride hazard.
       - name: just cpp-deps
         run: just cpp-deps
       - name: just cpp-check
         run: just cpp-check
 
-  # PHASE5 §12's sharing gates. Nightly because `frozen_workers` needs a `--release`
-  # build of `tf_tree_bench --features shm` that no PR job produces; the measurement
-  # is a memory ratio and needs no quiet host. Its own job so a seconds-long gate is
-  # not reported behind the soak. `just gate2` is a step here for the same build. The
-  # job id stays `gate4`.
+  # PHASE5 §12's sharing gates, on a `--release` build of `tf_tree_bench --features
+  # shm` that no PR job produces. The job id stays `gate4`.
   gate4:
     name: the .tft gates (open time, 16 workers sharing one file)
     runs-on: ubuntu-latest
@@ -146,26 +125,19 @@ jobs:
         run: just gate2
       - name: just gate4
         run: just gate4
-      # Release measurement: a debug ingest reads about a tenth of the shipped one.
       - name: just gate5
         run: just gate5
 
-  # Reports jobs, not the run, so a red nightly reaches somebody. The failed jobs
-  # are read from the jobs API; the `needs` list is still hand-maintained (an
-  # unfinished job has a null conclusion and is excluded). One issue, not one per
-  # night: later runs comment on the open `nightly-red` issue, and a green night
-  # closes it, but only an issue this workflow opened. `always()` so failing needs
-  # do not skip it; `continue-on-error` so it never becomes the message.
+  # Reports jobs, not the run. One `nightly-red` issue: later runs comment on it and
+  # a green night closes it, if this workflow opened it. The `needs` list is hand-kept.
   notify:
     name: report the night's result
     needs: [torture, crash-points, sanitizers, tf2-differential, cpp-sanitizers, gate4]
-    # The ref guard is load-bearing: `workflow_dispatch` can run on any ref, and a
-    # green feature-branch run would otherwise close the alert for a red `main`.
+    # The ref guard is load-bearing: a green feature-branch dispatch must not close a red `main`'s alert.
     if: always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     continue-on-error: true
-    # `actions: read` is required: a job-level `permissions:` replaces the default,
-    # and the first call is `GET .../actions/runs/{id}/jobs`.
+    # `actions: read`: a job-level `permissions:` replaces the default.
     permissions:
       actions: read
       contents: read
@@ -181,39 +153,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Read from the jobs API, not `needs`. This job is in the listing with a
-          # null conclusion, so select on `failure`, which also excludes cancelled and
-          # skipped. `--slurp` flattens pages, or `| length` prints one number per page.
+          # Jobs API, not `needs`; `--slurp` flattens pages.
           jobs=$(gh api --paginate --slurp "repos/$REPO/actions/runs/$RUN_ID/jobs" |
             jq '{jobs: [.[].jobs[]]}')
 
-          # A timeout is a red job.
           failed=$(printf '%s' "$jobs" | jq -r \
             '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out")
              | "- **\(.name)** — \(.html_url)"')
 
-          # Cancelled is not green: without this a stopped run would close the standing
-          # alert. `null` is this job itself.
+          # Cancelled is not green; `null` is this job itself.
           inconclusive=$(printf '%s' "$jobs" | jq -r \
             '[.jobs[] | select(.conclusion != null)
               | select(.conclusion != "success" and .conclusion != "failure"
                        and .conclusion != "timed_out")] | length')
 
-          # Idempotent: the 422 once the label exists is the steady state.
+          # Idempotent; 422 means the label exists.
           gh api -X POST "repos/$REPO/labels" \
             -f name=nightly-red \
             -f color=B60205 \
             -f description='The scheduled nightly run has a failing job' \
             >/dev/null 2>&1 || true
 
-          # The issues API returns PRs too, so exclude them. Select the issue this
-          # workflow opened, not the newest one wearing the label.
+          # The issues API returns PRs too; select the issue this workflow opened.
           standing=$(gh api "repos/$REPO/issues?state=open&labels=nightly-red&per_page=100")
           number=$(printf '%s' "$standing" | jq -r '
             map(select(.pull_request == null and .user.login == "github-actions[bot]"))
             | .[0].number // empty')
 
-          # printf, not a multi-line string: this lives in a YAML block scalar.
           if [ -z "$failed" ] && [ "$inconclusive" != "0" ]; then
             echo "nightly neither passed nor failed ($inconclusive job(s) cancelled or"
             echo "awaiting action). Leaving any standing issue alone: a run that was"

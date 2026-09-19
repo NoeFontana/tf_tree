@@ -1,14 +1,11 @@
 //! What the declared capacities cost, **in bytes**.
 //!
 //! [`tf_tree::Capacity`] is denominated in slots and rounded up to a power of
-//! two (`mask == capacity - 1`), so `Capacity::history(1000.0, 10.0)` asks for
-//! 10 000 slots and gets 16 384. This module makes that visible.
+//! two (`mask == capacity - 1`): `Capacity::history(1000.0, 10.0)` asks for
+//! 10 000 slots and gets 16 384.
 //!
-//! Operational hygiene, not a measured loss: since
-//! [`0021`](../../../docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md)
-//! over-declared slots are never resident. What they cost is reservation
-//! (address space, `.tft` size, segment transfer, strict overcommit); no Pss
-//! claim is made.
+//! Over-declared slots are never resident ([`0021`](../../../docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md));
+//! the cost is reservation (address space, `.tft` size, segment transfer).
 //!
 //! ```text
 //! total = 16 704 B fixed
@@ -29,12 +26,7 @@
 //!
 //! The per-frame term is a range: the intern table is `next_pow2(2 * max_frames)`
 //! slots of 16 B, so 32 B/frame at a power of two and up to 64 just above one.
-//! `align64` padding adds under 384 B fixed, which is why a 1-frame arena reads
-//! 384 B/frame; `tests::the_per_frame_term_stays_inside_its_stated_range` pins it.
-//!
-//! The pre-rounding request is not stored, so the rounding is a bracket: a ring
-//! of capacity `C >= 2` wasted at most `C/2 - 1` slots, reported as "at most" by
-//! [`Rings::rounding_slack_slots`].
+//! `tests::the_per_frame_term_stays_inside_its_stated_range` pins it.
 
 use core::fmt::Write as _;
 
@@ -58,8 +50,6 @@ pub const FORMULA: &str =
     "arena = 16704 B fixed + 320 B/edge + 144-176 B/frame + 72 B/slot (docs/RUNBOOK.md)";
 
 /// What every dynamic ring in a tree reserves, and how much of it holds data.
-///
-/// Built from ring capacity and occupancy so `doctor` and `top` share the arithmetic.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rings {
     /// Dynamic edges with a ring (capacity != 0).
@@ -68,15 +58,12 @@ pub struct Rings {
     pub reserved_slots: u64,
     /// Slots currently holding a sample (`min(head, capacity)`, summed).
     pub used_slots: u64,
-    /// Upper bound on the slots that exist only because of `next_pow2`: `sum(C/2 - 1)`.
-    ///
-    /// A bound, not a figure: the declared count is not stored.
+    /// Upper bound on slots that exist only because of `next_pow2`: `sum(C/2 - 1)`.
     pub rounding_slack_slots: u64,
 }
 
 impl Rings {
-    /// Sum `(capacity, occupancy)` pairs. Static edges (`capacity == 0`) are
-    /// skipped: they reserve no ring and would dilute every percentage here.
+    /// Sum `(capacity, occupancy)` pairs, skipping static edges (`capacity == 0`).
     pub fn from_edges(edges: impl IntoIterator<Item = (u32, u64)>) -> Rings {
         let mut r = Rings::default();
         for (capacity, occupancy) in edges {
@@ -86,7 +73,6 @@ impl Rings {
             r.edges += 1;
             r.reserved_slots += u64::from(capacity);
             r.used_slots += occupancy.min(u64::from(capacity));
-            // `C/2 - 1` for C >= 2; a capacity of 1 rounds from nothing.
             r.rounding_slack_slots += u64::from(capacity / 2).saturating_sub(1);
         }
         r
@@ -116,9 +102,7 @@ impl Rings {
         self.rounding_slack_slots * SLOT_BYTES
     }
 
-    /// The operator's line: declared against used, in slots and in bytes.
-    ///
-    /// The rounding bound reads "at most" (see [`Self::rounding_slack_slots`]).
+    /// The operator's line: declared against used; rounding reads "at most".
     #[must_use]
     pub fn line(&self) -> String {
         if self.edges == 0 {
@@ -160,7 +144,6 @@ pub fn bytes(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    // The crate denies these; tests `expect` layouts they just built.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
@@ -172,22 +155,17 @@ mod tests {
             .total_size() as u64
     }
 
-    /// The four constants are `ArenaLayout`'s own arithmetic, read by differencing.
     #[test]
     fn the_formula_is_the_layouts_own_arithmetic() {
-        // Per slot: 1024 more slots, everything else fixed.
         assert_eq!(
             total(64, 64, 1024 + 1024) - total(64, 64, 1024),
             SLOT_BYTES * 1024
         );
-        // Per edge: a multiple of 64 keeps every `align64` a no-op.
         assert_eq!(total(64, 128, 1024) - total(64, 64, 1024), EDGE_BYTES * 64);
-        // Per frame, at powers of two, where the term is exact.
         assert_eq!(
             total(128, 64, 1024) - total(64, 64, 1024),
             FRAME_BYTES_MIN * 64
         );
-        // Fixed: what is left when the three scaling terms are removed.
         assert_eq!(
             total(64, 64, 32 * 1024)
                 - FRAME_BYTES_MIN * 64
@@ -197,8 +175,7 @@ mod tests {
         );
     }
 
-    /// The per-frame range holds at non-power-of-two frame counts; `PADDING` is
-    /// the fixed `align64` term, kept out of `FRAME_BYTES_MAX`.
+    /// The per-frame range holds at non-power-of-two frame counts.
     #[test]
     fn the_per_frame_term_stays_inside_its_stated_range() {
         const PADDING: u64 = 384;
@@ -210,7 +187,6 @@ mod tests {
                  of region padding"
             );
         }
-        // The upper bound is tight: 65 frames reach the top of the range.
         let per_frame = |f: u32| (total(f, 0, 0) - FIXED_BYTES) as f64 / f64::from(f);
         assert!(
             per_frame(65) > FRAME_BYTES_MAX as f64 - 8.0,
@@ -218,7 +194,6 @@ mod tests {
              it claims to be",
             per_frame(65)
         );
-        // The bottom is exact at a power of two.
         assert_eq!(
             total(1024, 0, 0) - FIXED_BYTES,
             FRAME_BYTES_MIN * 1024,
@@ -248,7 +223,6 @@ mod tests {
         );
     }
 
-    /// Occupancy is clamped to capacity: `head` is monotone and exceeds it on a wrapped ring.
     #[test]
     fn a_wrapped_ring_does_not_report_more_used_than_it_reserves() {
         let r = Rings::from_edges([(1024u32, 4_000_000u64)]);
@@ -256,7 +230,7 @@ mod tests {
         assert_eq!(r.unused_bytes(), 0);
     }
 
-    /// Static edges reserve no ring, so they are not in the denominator.
+    /// Static edges are not in the denominator.
     #[test]
     fn static_edges_are_not_rings() {
         let r = Rings::from_edges([(0u32, 0u64), (256, 128)]);

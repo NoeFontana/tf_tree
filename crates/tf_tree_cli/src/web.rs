@@ -1,28 +1,21 @@
 //! `tf_tree top --web` — `docs/PHASE5.md` §7's embedded static web view.
 //!
 //! No HTTP crate: §7 is NORMATIVE that the page is one embedded HTML file plus
-//! one JSON endpoint, no build step, no npm, no CDN, and a server crate would pull
-//! a runtime into a workspace that forbids `async` (D14). This is
-//! `std::net::TcpListener`, a scoped thread per connection, no keep-alive; it is
-//! not a general-purpose server and must never be pointed at a network ([`serve`]).
+//! one JSON endpoint (no build step, npm or CDN), and a server crate would pull a
+//! runtime into a workspace that forbids `async` (D14). `std::net::TcpListener`,
+//! a scoped thread per connection, no keep-alive; never point it at a network.
 //!
-//! This is the only network socket in the repository and it is opt-in. §5.1's
-//! "no network sockets" is about the library, which cannot reach this code; the
-//! `AF_INET` socket exists only under `--web` and binds loopback by default.
-//! `just no-network` (`scripts/no-network.sh`) scopes its `AF_UNIX` assertion to
-//! the library and uses `crates/tf_tree_cli/tests/web.rs` as its positive control.
+//! The only `AF_INET` socket in the repository, opt-in and loopback by default;
+//! §5.1's "no network sockets" is about the library. `scripts/no-network.sh` uses
+//! `crates/tf_tree_cli/tests/web.rs` as its positive control.
 //!
-//! * Loopback by default (§7): [`DEFAULT_ADDR`], with [`exposure_warning`] for
-//!   anything else.
-//! * A `Host` guard, because DNS rebinding makes a hostile page same-origin with
-//!   a loopback server: when bound to loopback, a non-loopback `Host` is refused
-//!   ([`host_is_loopback`]).
-//! * Nothing is read from the filesystem: two routes, both served from memory,
-//!   matched and never resolved.
+//! * Loopback by default (§7): [`DEFAULT_ADDR`], with [`exposure_warning`] otherwise.
+//! * A `Host` guard against DNS rebinding: bound to loopback, a non-loopback
+//!   `Host` is refused ([`host_is_loopback`]).
+//! * Nothing is read from the filesystem: two routes, served from memory.
 //!
-//! Read-only: the JSON comes from the same [`crate::top::Tick`], `Sampler` and
-//! `Capture` as the TUI; `top::tests::capturing_the_arena_moves_no_counter`
-//! covers this path.
+//! Read-only: the JSON comes from the TUI's [`crate::top::Tick`]
+//! (`top::tests::capturing_the_arena_moves_no_counter`).
 
 use std::fmt::Write as _;
 use std::io::{ErrorKind, Read, Write};
@@ -34,9 +27,7 @@ use anyhow::{Context, Result};
 use crate::catalogue::json_escape;
 use crate::top::{Bucket, EdgeRow, EdgeSample, IntervalStats, ParticipantSample, Tick};
 
-/// The address `--web` binds when given no value.
-///
-/// Loopback, per §7.
+/// The address `--web` binds when given no value (loopback, §7).
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 
 /// The served page. One file, no build step (§7).
@@ -46,26 +37,15 @@ pub const INDEX_HTML: &str = include_str!("web/index.html");
 pub const SCHEMA: &str = "tf_tree.top/1";
 
 /// How long a client gets to send its request head, and to accept the response.
-///
-/// Bounds the cost of a silent socket, which holds a thread and one of
-/// [`MAX_CONNECTIONS`] slots until it fires.
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The largest request head accepted, in bytes.
-///
-/// Bounded because the read loop appends to a `Vec` an unauthenticated peer controls.
 const MAX_HEAD: usize = 8 * 1024;
 
 /// How many histogram buckets each edge carries in the JSON.
-///
-/// Every edge carries a histogram so selecting one is a repaint, not a request
-/// (§7's "one" endpoint).
 const HIST_BUCKETS: usize = 24;
 
-/// How many connections may be in flight at once.
-///
-/// Each costs a thread for at most [`IO_TIMEOUT`]; past the bound a connection
-/// is dropped unread, since a queued poll is a stale poll.
+/// How many connections may be in flight at once; past it one is dropped unread.
 const MAX_CONNECTIONS: usize = 64;
 
 /// What a parsed request resolves to; [`route`] is pure and tested without a socket.
@@ -99,22 +79,16 @@ impl Route {
     }
 }
 
-/// Whether a `Host` header value names the loopback interface.
-///
-/// The value is `host[:port]` (IPv6 literal bracketed); the port is ignored.
-/// `localhost` is accepted by name and every other name refused, which is the
-/// rebinding case.
+/// Whether a `Host` header value (`host[:port]`, port ignored) names loopback;
+/// `localhost` by name, every other name refused.
 #[must_use]
 pub fn host_is_loopback(value: &str) -> bool {
     let host = if let Some(rest) = value.strip_prefix('[') {
-        // `[::1]:8787` -> `::1`; an unclosed bracket is not loopback.
         match rest.split_once(']') {
             Some((inner, _)) => inner,
             None => return false,
         }
     } else {
-        // `127.0.0.1:8787` -> `127.0.0.1`; a bare IPv6 literal is illegal here,
-        // so the first colon is the port separator.
         value.split_once(':').map_or(value, |(h, _)| h)
     };
     if host.eq_ignore_ascii_case("localhost") {
@@ -126,8 +100,7 @@ pub fn host_is_loopback(value: &str) -> bool {
 
 /// Resolve a request head to a [`Route`].
 ///
-/// `head` is everything before the blank line. The `Host` guard applies only
-/// when `bound` is loopback: a non-loopback bind was explicitly requested.
+/// The `Host` guard applies only when `bound` is loopback.
 #[must_use]
 pub fn route(head: &str, bound: SocketAddr) -> Route {
     let mut lines = head.split("\r\n");
@@ -152,7 +125,6 @@ pub fn route(head: &str, bound: SocketAddr) -> Route {
             _ => return Route::ForbiddenHost,
         }
     }
-    // The query string is ignored; selection happens in the page.
     let path = target.split(['?', '#']).next().unwrap_or(target);
     match path {
         "/" | "/index.html" => Route::Index,
@@ -161,9 +133,7 @@ pub fn route(head: &str, bound: SocketAddr) -> Route {
     }
 }
 
-/// A finite `f64` as JSON, or `null`.
-///
-/// `NaN` and `±Infinity` are not JSON; one would blank the whole page.
+/// A finite `f64` as JSON, or `null` (`NaN`/`±Infinity` are not JSON).
 fn num(v: Option<f64>) -> String {
     match v {
         Some(x) if x.is_finite() => format!("{x:.6}"),
@@ -281,8 +251,7 @@ fn participant_json(p: &ParticipantSample) -> String {
 /// }
 /// ```
 ///
-/// `clock` is [`crate::checks::Clock::label`]'s sentence, not a number (§7
-/// amendment): every age is against that reference.
+/// `clock` is [`crate::checks::Clock::label`]'s sentence (§7 amendment).
 #[must_use]
 pub fn tick_json(tick: &Tick, poll: Duration, selected: Option<u32>) -> String {
     let c = &tick.capture;
@@ -321,7 +290,6 @@ pub fn tick_json(tick: &Tick, poll: Duration, selected: Option<u32>) -> String {
         );
     }
     s.push_str("],\"edges\":[");
-    // `zip`: a length mismatch truncates rather than panics in a request handler.
     for (i, (e, r)) in c.edges.iter().zip(tick.rows.iter()).enumerate() {
         if i > 0 {
             s.push(',');
@@ -355,9 +323,7 @@ pub fn tick_json(tick: &Tick, poll: Duration, selected: Option<u32>) -> String {
     s
 }
 
-/// Bind the listener, announcing the URL an operator should open.
-///
-/// Prints the resolved address, so `--web 127.0.0.1:0` names the port picked.
+/// Bind the listener, printing the resolved address.
 ///
 /// # Errors
 ///
@@ -373,10 +339,7 @@ pub fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr)> {
     Ok((listener, local))
 }
 
-/// The stderr line a non-loopback bind earns, or `None` for loopback.
-///
-/// Not an error, but §7's amendment relies on it, so it is a function testable
-/// without a socket.
+/// The stderr line a non-loopback bind earns (§7's amendment), or `None` for loopback.
 #[must_use]
 pub fn exposure_warning(local: SocketAddr) -> Option<String> {
     if local.ip().is_loopback() {
@@ -391,8 +354,7 @@ pub fn exposure_warning(local: SocketAddr) -> Option<String> {
 
 /// Read a request head (everything up to the blank line) from `stream`.
 ///
-/// `Ok(None)` when the peer closed, sent more than [`MAX_HEAD`], or timed out. The
-/// body is never read: neither route has one.
+/// `Ok(None)` when the peer closed, sent more than [`MAX_HEAD`], or timed out.
 fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
@@ -408,7 +370,6 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
         };
         buf.extend_from_slice(&chunk[..n]);
         if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            // Lossy: invalid UTF-8 must yield a 400/404, not its own error path.
             return Ok(Some(String::from_utf8_lossy(&buf[..end]).into_owned()));
         }
         if buf.len() > MAX_HEAD {
@@ -419,11 +380,10 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
 
 /// Write one response and close.
 ///
-/// Every header is load-bearing: `Connection: close` (no keep-alive; one poll is
-/// one connection), `Content-Security-Policy` (enforces §7's "no CDN"; `frame-ancestors`
-/// is listed because it has no `default-src` fallback), `nosniff`, and
-/// `Cache-Control: no-store`. There is deliberately no `Access-Control-Allow-Origin`:
-/// same-origin policy is half of [`route`]'s rebinding defence.
+/// Every header is load-bearing (`Connection: close`, `Content-Security-Policy`
+/// incl. `frame-ancestors`, `nosniff`, `Cache-Control: no-store`). There is
+/// deliberately no `Access-Control-Allow-Origin`: same-origin is half of
+/// [`route`]'s rebinding defence.
 fn respond(stream: &mut TcpStream, route: Route, body: &[u8]) -> std::io::Result<()> {
     let (status, content_type) = route.status();
     let head = format!(
@@ -446,8 +406,7 @@ fn respond(stream: &mut TcpStream, route: Route, body: &[u8]) -> std::io::Result
 }
 
 /// Whether an `accept(2)` failure is about one peer (`ECONNABORTED`, `EINTR`,
-/// `EMFILE`/`ENFILE`) rather than the listener. Transient ones must not let a
-/// scanner kill the view; anything else (closed listener, `EBADF`) propagates.
+/// `EMFILE`/`ENFILE`) rather than the listener; only the latter ends the view.
 #[must_use]
 pub fn accept_is_transient(e: &std::io::Error) -> bool {
     matches!(
@@ -456,8 +415,7 @@ pub fn accept_is_transient(e: &std::io::Error) -> bool {
     ) || is_descriptor_exhaustion(e)
 }
 
-/// `EMFILE`/`ENFILE`, which `std` maps to no [`ErrorKind`]; the raw `errno`s are
-/// consulted on unix only.
+/// `EMFILE`/`ENFILE`, which `std` maps to no [`ErrorKind`] (raw `errno`, unix only).
 #[must_use]
 fn is_descriptor_exhaustion(e: &std::io::Error) -> bool {
     cfg!(unix) && matches!(e.raw_os_error(), Some(23 | 24))
@@ -465,9 +423,7 @@ fn is_descriptor_exhaustion(e: &std::io::Error) -> bool {
 
 /// One connection, start to finish: deadlines, head, route, response.
 ///
-/// Deadlines are per-socket, so they are set here. The write deadline is defence
-/// in depth and deliberately untested: both bodies fit in a default send buffer,
-/// but they grow, and a blocked `write_all` would hold a [`MAX_CONNECTIONS`] slot forever.
+/// The write deadline is deliberately untested: both bodies fit a default send buffer.
 fn handle(
     stream: &mut TcpStream,
     bound: SocketAddr,
@@ -497,22 +453,17 @@ fn handle(
 
 /// Serve the view until `max_requests` connections have been accepted.
 ///
-/// `max_requests == 0` runs until interrupted; the bound counts accepted
-/// connections, so a bounded run ends even if a client says nothing. Returns
-/// once every accepted connection has finished.
+/// `max_requests == 0` runs until interrupted; otherwise the bound counts accepted
+/// connections. One scoped thread per connection, capped at `MAX_CONNECTIONS`
+/// (past it a connection is closed unread and reported once). Returns once every
+/// accepted connection has finished.
 ///
-/// One scoped thread per connection, capped at `MAX_CONNECTIONS`: this is
-/// availability, not throughput (inline handling let five silent sockets blank
-/// the view for ten seconds). `thread::scope` guarantees no handler outlives the
-/// call. Past the cap a connection is closed unread and reported once.
-///
-/// `tick` is `&dyn Fn` because handlers share it; the caller must rate-limit and
-/// serialise it (see `cmd_top_web`), or two tabs split every per-tick delta.
+/// `tick` is shared by handlers; the caller must rate-limit and serialise it
+/// (see `cmd_top_web`), or two tabs split every per-tick delta.
 ///
 /// # Errors
 ///
-/// Only an `accept` failure that ends the listener ([`accept_is_transient`]); a
-/// failure on one connection is reported to stderr and the loop continues.
+/// Only an `accept` failure that ends the listener ([`accept_is_transient`]).
 pub fn serve(
     listener: &TcpListener,
     bound: SocketAddr,
@@ -530,7 +481,6 @@ pub fn serve(
                 Ok(v) => v,
                 Err(e) if accept_is_transient(&e) => {
                     eprintln!("--web: accept failed, still listening: {e}");
-                    // Descriptor exhaustion repeats immediately; back off.
                     if is_descriptor_exhaustion(&e) {
                         std::thread::sleep(Duration::from_millis(50));
                     }
@@ -541,10 +491,8 @@ pub fn serve(
             };
             served += 1;
 
-            // `fetch_add`, not load-then-add: handlers decrement from their own threads.
             if live.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
                 live.fetch_sub(1, Ordering::AcqRel);
-                // Once, not per refusal.
                 if !warned.swap(true, Ordering::Relaxed) {
                     eprintln!(
                         "--web: more than {MAX_CONNECTIONS} connections in flight; dropping the \
@@ -590,8 +538,7 @@ mod tests {
         format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: */*")
     }
 
-    /// The page with `<!-- ... -->` removed, so the substring assertions do not
-    /// fire on the header prose; the JavaScript is left as served.
+    /// The page with `<!-- ... -->` removed; the JavaScript is left as served.
     fn page_without_html_comments() -> String {
         let mut out = String::with_capacity(INDEX_HTML.len());
         let mut rest = INDEX_HTML;
@@ -607,8 +554,6 @@ mod tests {
     }
 
     /// The two routes resolve, and nothing else does.
-    ///
-    /// Mutant: `path.starts_with("/api/tick")` makes the traversal assertion fail.
     #[test]
     fn only_the_two_documented_paths_resolve() {
         let b = loopback();
@@ -634,11 +579,7 @@ mod tests {
         assert_eq!(route("GET\r\nHost: localhost", b), Route::BadRequest);
     }
 
-    /// A loopback bind refuses any `Host` that is not a loopback name (the
-    /// DNS-rebinding defence; origin checks do not help, a rebound origin *is*
-    /// `evil.example`).
-    ///
-    /// Mutant: `_ => {}` in the `match host` arm fails three assertions.
+    /// A loopback bind refuses any non-loopback `Host` (DNS rebinding).
     #[test]
     fn a_foreign_host_header_is_refused_on_a_loopback_bind() {
         let b = loopback();
@@ -648,7 +589,6 @@ mod tests {
             Route::ForbiddenHost
         );
         assert_eq!(route(&get("/", "10.0.0.5:8787"), b), Route::ForbiddenHost);
-        // Absent entirely.
         assert_eq!(route("GET / HTTP/1.1", b), Route::ForbiddenHost);
         for h in ["localhost", "LocalHost:8787", "127.0.0.1", "[::1]:8787"] {
             assert_eq!(route(&get("/", h), b), Route::Index, "host {h}");
@@ -656,8 +596,6 @@ mod tests {
     }
 
     /// The `Host` guard applies only to a loopback bind (see [`route`]).
-    ///
-    /// Mutant: always checking fails the `0.0.0.0` case.
     #[test]
     fn the_host_guard_is_scoped_to_a_loopback_bind() {
         let public = SocketAddr::from(([0, 0, 0, 0], 8787));
@@ -669,9 +607,6 @@ mod tests {
     }
 
     /// `host_is_loopback` is not fooled by a name that merely contains one.
-    ///
-    /// Mutant: `contains("127.0.0.1") || contains("localhost")` accepts
-    /// `127.0.0.1.evil.example`.
     #[test]
     fn a_loopback_name_must_be_the_whole_host() {
         assert!(host_is_loopback("127.0.0.1"));
@@ -684,10 +619,7 @@ mod tests {
         assert!(!host_is_loopback("0.0.0.0"));
     }
 
-    /// The page loads nothing from the network (§7 NORMATIVE): the only absolute
-    /// URL is the SVG namespace, an identifier never dereferenced.
-    ///
-    /// Mutant: a `<script src="https://cdn.example/chart.js">` fails the `assert_eq!`.
+    /// The page loads nothing from the network (§7 NORMATIVE).
     #[test]
     fn the_embedded_page_references_nothing_external() {
         let page = page_without_html_comments();
@@ -714,10 +646,7 @@ mod tests {
         assert!(page.contains("fetch(\"api/tick\""));
     }
 
-    /// The page never builds DOM from a string: frame names and `comm` are bytes
-    /// another process wrote (`top::sanitize` is the ANSI-side twin).
-    ///
-    /// Mutant: `td.innerHTML = text` in `cell()` fails the assertion.
+    /// The page never builds DOM from a string (`top::sanitize` is the ANSI-side twin).
     #[test]
     fn the_embedded_page_never_uses_inner_html() {
         let page = page_without_html_comments();
@@ -725,25 +654,16 @@ mod tests {
         assert!(!page.contains("outerHTML"));
         assert!(!page.contains("insertAdjacentHTML"));
         assert!(!page.contains("document.write"));
-        // `eval`/`new Function`: the CSP blocks them; assert so the failure is a test.
         assert!(!page.contains("eval("));
         assert!(!page.contains("new Function"));
     }
 
     /// A response carries the CSP that makes "no CDN" the browser's rule.
-    ///
-    /// Mutants: deleting the `Content-Security-Policy` line fails the first
-    /// assertion; deleting only `; frame-ancestors 'none'` fails only its own
-    /// (`default-src` does not cover framing). Every header assertion is made
-    /// against `head`, never the whole response: `web/index.html` quotes the CSP
-    /// in a comment, so a body search survived the first mutant. A real socket is
-    /// driven, covering the `\r\n\r\n` read, `Content-Length` and connection close.
     #[test]
     fn a_served_response_carries_its_headers_and_body() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let bound = listener.local_addr().unwrap();
         let h = std::thread::spawn(move || {
-            // Atomic: handlers share `tick` as `&dyn Fn`.
             let n = std::sync::atomic::AtomicU32::new(0);
             serve(&listener, bound, 2, &|| {
                 let seq = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -783,10 +703,7 @@ mod tests {
         h.join().unwrap();
     }
 
-    /// The `tick` closure runs for `/api/tick` and nothing else: it reads the
-    /// arena, so a 404 that sampled it would skew the next poll's deltas.
-    ///
-    /// Mutant: calling `tick()` before the `match r` reads 3 instead of 1.
+    /// The `tick` closure runs for `/api/tick` and nothing else.
     #[test]
     fn only_the_json_route_samples_the_arena() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -814,13 +731,7 @@ mod tests {
         h.join().unwrap();
     }
 
-    /// A silent client is dropped rather than held forever, and a bounded run
-    /// still returns: [`IO_TIMEOUT`] retires the socket.
-    ///
-    /// Mutant: deleting `stream.set_read_timeout(...)` in `handle` makes `serve`
-    /// never return; the 20 s `recv_timeout` fails it by name, where a bare join
-    /// would hang until `.config/nextest.toml`'s `terminate-after` (never, under
-    /// `cargo test`).
+    /// A silent client is dropped after [`IO_TIMEOUT`] and a bounded run still returns.
     #[test]
     fn a_client_that_never_speaks_does_not_wedge_the_server() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -832,7 +743,6 @@ mod tests {
         });
         let silent = TcpStream::connect(bound).unwrap();
         let mut s = TcpStream::connect(bound).unwrap();
-        // Well above the 2 s [`IO_TIMEOUT`].
         s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
@@ -852,12 +762,6 @@ mod tests {
     }
 
     /// Silent peers cost the operator's poll nothing, however many there are.
-    /// Inline handling made one `/api/tick` take 10.047 s behind five silent
-    /// sockets (0.008 s alone).
-    ///
-    /// Mutant: calling `handle` inline where `scope.spawn` is fails the deadline
-    /// assertion. The 2 s threshold asserts the cost does not accumulate, so a
-    /// loaded CI box cannot fail it by being slow.
     #[test]
     fn silent_peers_do_not_delay_the_operators_poll() {
         const SILENT: usize = 5;
@@ -902,10 +806,6 @@ mod tests {
     }
 
     /// Past [`MAX_CONNECTIONS`] a connection is dropped and the loop keeps answering.
-    ///
-    /// Mutants: deleting the `live.fetch_add(...) >= MAX_CONNECTIONS` branch
-    /// answers the excess peer; dropping the handler's `live.fetch_sub` refuses
-    /// the final request.
     #[test]
     fn the_connection_cap_drops_the_excess_and_keeps_serving() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -917,7 +817,6 @@ mod tests {
             tx.send(r.is_ok()).unwrap();
         });
 
-        // Exactly the cap, all silent, all held.
         let held: Vec<TcpStream> = (0..MAX_CONNECTIONS)
             .map(|_| TcpStream::connect(bound).unwrap())
             .collect();
@@ -957,11 +856,7 @@ mod tests {
         h.join().unwrap();
     }
 
-    /// An over-long request head is dropped as soon as it passes the cap. The
-    /// assertion is on latency: without the check the connection still ends,
-    /// but only at [`IO_TIMEOUT`], after buffering everything sent.
-    ///
-    /// Mutant: deleting `buf.len() > MAX_HEAD` fails the `< 1 s` assertion.
+    /// An over-long request head is dropped at the cap, not at [`IO_TIMEOUT`].
     #[test]
     fn an_oversized_request_head_is_refused_promptly() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -971,10 +866,8 @@ mod tests {
         let started = std::time::Instant::now();
         s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
             .unwrap();
-        // Headers forever, twice `MAX_HEAD`.
         let junk = format!("X-Pad: {}\r\n", "a".repeat(1024));
         for _ in 0..16 {
-            // A closed connection is the pass condition.
             if s.write_all(junk.as_bytes()).is_err() {
                 break;
             }
@@ -991,11 +884,7 @@ mod tests {
         h.join().unwrap().unwrap();
     }
 
-    /// A non-finite rate renders as `null` (see [`num`]). No caller reaches that
-    /// branch today (`IntervalStats::rate_hz` and `EdgeRow::observed_hz` are
-    /// guarded); this pins that a new rate cannot bypass [`num`].
-    ///
-    /// Mutant: `format!("{x}")` unconditionally fails the `NaN`/`INFINITY` assertions.
+    /// A non-finite rate renders as `null` (see [`num`]).
     #[test]
     fn non_finite_rates_render_as_null() {
         assert_eq!(num(None), "null");
@@ -1004,11 +893,7 @@ mod tests {
         assert_eq!(num(Some(-0.5)), "-0.500000");
     }
 
-    /// Every string out of the arena is escaped: a frame name is arbitrary UTF-8,
-    /// and a `"` would make `JSON.parse` reject the whole document.
-    ///
-    /// Mutant: dropping `json_escape` around `e.label` in `edge_json` fails the
-    /// `\\\"` assertion.
+    /// Every string out of the arena is escaped.
     #[test]
     fn labels_are_escaped_into_the_document() {
         let mut e = crate::top::EdgeSample {
@@ -1053,9 +938,6 @@ mod tests {
     }
 
     /// A non-loopback bind produces a warning that says what it exposed.
-    ///
-    /// Mutants: removing the loopback guard fails the two loopback assertions;
-    /// returning `None` unconditionally fails the `0.0.0.0` one.
     #[test]
     fn a_non_loopback_bind_warns_and_a_loopback_one_does_not() {
         assert_eq!(exposure_warning(loopback()), None);
@@ -1065,7 +947,6 @@ mod tests {
         );
         let w = exposure_warning(SocketAddr::from(([0, 0, 0, 0], 8787)))
             .expect("a wildcard bind must warn");
-        // What was bound, what it gives away, what to do instead.
         assert!(w.contains("0.0.0.0:8787"), "{w}");
         assert!(w.contains("no authentication"), "{w}");
         assert!(w.contains(DEFAULT_ADDR), "{w}");
@@ -1074,11 +955,7 @@ mod tests {
         assert!(w.contains("10.0.0.5:80"), "{w}");
     }
 
-    /// An `accept(2)` failure about one peer does not end the view. This pins the
-    /// classifier, not the loop: `ECONNABORTED` cannot be provoked in a test.
-    ///
-    /// Mutants: dropping the `ConnectionAborted` arm, or making
-    /// [`is_descriptor_exhaustion`] `false`, fails the matching assertions.
+    /// An `accept(2)` failure about one peer does not end the view (pins the classifier).
     #[test]
     fn a_transient_accept_error_is_not_fatal_but_a_broken_listener_is() {
         use std::io::Error;
@@ -1093,7 +970,6 @@ mod tests {
             assert!(accept_is_transient(&Error::from_raw_os_error(24)), "EMFILE");
             assert!(accept_is_transient(&Error::from_raw_os_error(23)), "ENFILE");
         }
-        // Listener-fatal kinds.
         assert!(!accept_is_transient(&Error::from(ErrorKind::InvalidInput)));
         assert!(!accept_is_transient(&Error::from(
             ErrorKind::PermissionDenied
@@ -1101,13 +977,7 @@ mod tests {
         assert!(!accept_is_transient(&Error::from(ErrorKind::Other)));
     }
 
-    /// The page reads the server's `selected`, so `--edge` reaches the browser
-    /// (it once served `"selected":5` and drew edge 1; no server-side test could
-    /// see the JavaScript defect).
-    ///
-    /// Mutants: deleting the `seed(d);` call in `paint` or the
-    /// `if (d.selected !== null ...)` assignment in `seed` fails the matching
-    /// assertion; dropping the `seeded` guard fails "read once".
+    /// The page reads the server's `selected`, so `--edge` reaches the browser.
     #[test]
     fn the_page_seeds_its_selection_from_the_served_selected() {
         let page = page_without_html_comments();
@@ -1119,7 +989,6 @@ mod tests {
             page.contains("seed(d);"),
             "`paint` must seed the selection before it renders"
         );
-        // Read once: the click handler owns selection afterwards.
         assert!(page.contains("if (seeded) return;"), "seeding must be once");
         assert!(page.contains("seeded = true;"));
         // The fallback keeps a tombstoned `--edge` from blanking the pane.

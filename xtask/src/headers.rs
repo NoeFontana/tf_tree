@@ -1,28 +1,23 @@
-//! `cargo xtask headers [--check]` — generate `tf_tree.h` and
-//! `tf_tree_unstable.h` from `tf_tree_c`.
+//! `cargo xtask headers [--check]`: generate `tf_tree.h` and `tf_tree_unstable.h`
+//! from `tf_tree_c`.
 //!
 //! An xtask, not a `build.rs`: `cbindgen` is MPL-2.0 and `deny.toml` has no MPL
 //! entry, so only its **binary** is invoked (`docs/decisions/0007`). The headers
-//! are committed so an ABI change is a reviewed diff (§3.1); `--check` runs in CI.
+//! are committed so an ABI change is a reviewed diff (§3.1).
 //!
 //! # The partition is a list, on purpose
 //!
 //! Every exported symbol must be in exactly one of [`STABLE`], [`UNSTABLE`] or
-//! [`TEST_ONLY`]; [`check_partition`] fails in either direction, so a new
-//! `extern "C"` function fails until somebody chooses a tier. It scans `extern
+//! [`TEST_ONLY`]; [`check_partition`] fails in either direction. It scans `extern
 //! "C" fn` only: both configs are built by *complement*, so a constant missing
 //! from [`STABLE`] lands in both headers and `--check` reports drift.
 //!
 //! # Duplicate and missing definitions
 //!
 //! [`check_overlap`] fails if a symbol is **defined** in both generated headers
-//! (`TFT_ERR_ARENA_UNAVAILABLE` once shipped in both: an identical `#define`
-//! twice is legal C, so `--check` and the compile matrix passed). Definitions
-//! are read, never references: `tf_tree_unstable.h` includes `tf_tree.h`.
-//!
-//! [`check_stable_is_complete`] is the opposite sign: a [`STABLE`] entry defined
-//! in **neither** header would silently shrink the frozen surface with every
-//! other gate green, because [`check_partition`] exempts screaming-case constants.
+//! (an identical `#define` twice is legal C). [`check_stable_is_complete`] is the
+//! opposite sign: a [`STABLE`] entry defined in **neither** header would silently
+//! shrink the frozen surface.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -36,9 +31,7 @@ const STABLE: &[&str] = &[
     "tft_abi_version_major",
     "tft_abi_version_minor",
     "tft_check_abi",
-    // The three opaque handle typedefs. Emitted by `HANDLE_DECLS`, not cbindgen;
-    // listing them extends `check_stable_is_complete`'s reach to them.
-    // `tft_bridge` is NOT here: it is declared in the unstable header.
+    // The three opaque handle typedefs, from `HANDLE_DECLS`; `tft_bridge` is in the unstable header.
     "tft_tree",
     "tft_plan",
     "tft_publisher",
@@ -79,11 +72,11 @@ const STABLE: &[&str] = &[
     "TFT_ERR_RELEASED",
     "TFT_ERR_PARENT_MISMATCH",
     "TFT_ERR_NO_EDGE",
-    // Returned only by `tft_bridge_create` today; stable because §3.3 defines one status space.
+    // Returned only by `tft_bridge_create`; §3.3 defines one status space.
     "TFT_ERR_BAD_CONFIG",
-    // Added by `docs/decisions/0015`. Stable; omitting it emits it into both headers ([`check_overlap`]).
+    // `docs/decisions/0015`; omitting it emits it into both headers.
     "TFT_ERR_ARENA_UNAVAILABLE",
-    // Returned only by the two stamp converters; stable like every status code the library hands back.
+    // Returned only by the two stamp converters.
     "TFT_ERR_BAD_STAMP",
     "TFT_ERR_INTERNAL",
     // Layouts — §3.5.
@@ -93,27 +86,22 @@ const STABLE: &[&str] = &[
     "TFT_LAYOUT_MAT4_COL",
     "TFT_LAYOUT_MAT4_ROW",
     "TFT_LAYOUT_AFFINE12_ROW_F32",
-    // Appended by `docs/API.md` §3.3 (minor bump, §3.6). Stable because
-    // `tft_plan_at` and `tft_plan_at_many` accept it; a pure input must be
-    // spellable without `TFT_ENABLE_UNSTABLE`.
+    // Appended by `docs/API.md` §3.3 (§3.6); a pure input to `tft_plan_at`.
     "TFT_LAYOUT_QVEC7_WXYZ_TWIST6",
     "tft_layout_size",
-    // Stamps — `docs/API.md` §5.1. Pure functions over integers, stable so no caller has to hand-write the conversion.
+    // Stamps, `docs/API.md` §5.1.
     "tft_stamp_from_parts",
     "tft_stamp_from_timespec",
     // Lifecycle and the hot path — §3.2, §3.7.
     "tft_tree_open",
     "tft_tree_free",
     "tft_plan_create",
-    // `docs/decisions/0038`. Stable: the only way a C caller can read an arena
-    // whose dynamic edges are not tag `0` (`docs/PHASE4.md` §5.5).
+    // `docs/decisions/0038`: the only C read of arenas with non-zero dynamic tags.
     "tft_plan_create_in_domain",
     "tft_plan_free",
     "tft_plan_at",
     "tft_plan_at_many",
-    // Extrapolation — `docs/decisions/0039`. Stable: the policy and struct are
-    // inputs/outputs of a frozen entry point, and the entry point is the only way
-    // C can ask for bounded prediction.
+    // Extrapolation, `docs/decisions/0039`: an input/output of a frozen entry point.
     "tft_extrap_policy",
     "TFT_EXTRAP_ERROR",
     "TFT_EXTRAP_HOLD",
@@ -136,8 +124,7 @@ const UNSTABLE: &[&str] = &[
     "tft_tree_edge_count",
     "tft_tree_frame_name",
     "tft_tree_instance_uuid",
-    // Recovery — `docs/decisions/0044`. Unstable on purpose: the ownership
-    // migration (§3.5) is too young to freeze (`0043`).
+    // Recovery, `docs/decisions/0044`; unstable while the migration (§3.5) is young (`0043`).
     "TFT_INHERITED",
     "TFT_OWNER_ALIVE",
     "TFT_CONTENDED",
@@ -147,8 +134,7 @@ const UNSTABLE: &[&str] = &[
     "tft_tree_owner_lost",
     "tft_tree_inherit_ownership",
     "tft_tree_reap_dead",
-    // The ROS 2 ingest-bridge seam — `docs/PHASE4.md` §5, emitted under
-    // `#if defined(TFT_HAVE_BRIDGE)`. Unstable on purpose: §5 is what dogfooding will argue with.
+    // The ROS 2 ingest-bridge seam (`docs/PHASE4.md` §5), under `#if defined(TFT_HAVE_BRIDGE)`.
     "tft_bridge_create",
     "tft_bridge_tree",
     "tft_bridge_free",
@@ -205,8 +191,7 @@ const UNSTABLE: &[&str] = &[
     "TFT_BRIDGE_EVIDENCE_COMMON_MODE",
 ];
 
-/// Tier entries that name a **type**, not an `extern "C" fn`; [`check_partition`]'s
-/// reverse direction skips them.
+/// Tier entries naming a **type**; [`check_partition`]'s reverse direction skips them.
 const TIER_TYPES: &[&str] = &[
     // The opaque handles: typedefs from `HANDLE_DECLS`.
     "tft_tree",
@@ -232,7 +217,7 @@ const TIER_TYPES: &[&str] = &[
     "tft_bridge_remap",
 ];
 
-/// Rust types `cbindgen` must never emit: the opaque handles (§3.2) and private field types.
+/// Rust types `cbindgen` must never emit: the opaque handles and private field types.
 const OPAQUE: &[&str] = &[
     "tft_tree",
     "tft_plan",
@@ -246,22 +231,19 @@ const OPAQUE: &[&str] = &[
 /// Compiled only under `--features test-hooks`; never in a shipped header.
 const TEST_ONLY: &[&str] = &[
     "tft_test_tree_create",
-    // The tag-1 fixture `docs/decisions/0038` step 3 is verified against (the other three publish in domain `0`).
+    // The tag-1 fixture for `docs/decisions/0038` step 3.
     "tft_test_domain_tree_create",
     "tft_test_publishable_tree_create",
     "tft_test_lerpslerp_tree_create",
     "tft_test_panic",
-    // A boundary with no `tft_status`: forces the panic `guard_value` catches.
     "tft_test_panic_value",
     "tft_guarded_noop",
     "tft_test_push_unguarded",
-    // `docs/PHASE4.md` §7 gate criterion 1's R2 rung: `tft_plan_at` without
-    // `catch_unwind`, so it must never reach a shipped header.
+    // `docs/PHASE4.md` §7 gate 1's R2 rung: no `catch_unwind`, never in a shipped header.
     "tft_test_plan_at_unguarded",
 ];
 
-/// The handle types, declared by hand: §3.2 requires them opaque and cbindgen
-/// would emit their layout.
+/// The handle types, declared by hand: §3.2 requires them opaque.
 const HANDLE_DECLS: &str = "\
 /*
  * Opaque handles — docs/PHASE4.md §3.2.
@@ -279,8 +261,7 @@ typedef struct tft_plan tft_plan;
 typedef struct tft_publisher tft_publisher;
 ";
 
-/// The bridge handle, declared by hand and guarded because the symbol only exists
-/// under `--features bridge`. It lives in the unstable header.
+/// The bridge handle, declared by hand under `--features bridge`; unstable header.
 const BRIDGE_DECLS: &str = "\
 #if defined(TFT_HAVE_BRIDGE)
 /*
@@ -359,13 +340,12 @@ pub(crate) fn run(check: bool) -> ExitCode {
         }
     };
 
-    // Before writing or comparing: a `--check` that only diffed would pass on a committed duplicate.
+    // Before writing or comparing, so `--check` cannot pass on a committed duplicate.
     if let Err(e) = check_overlap(&stable, &unstable) {
         eprintln!("xtask headers: {e}");
         return ExitCode::FAILURE;
     }
 
-    // The other direction: a symbol in neither header.
     if let Err(e) = check_stable_is_complete(&stable) {
         eprintln!("xtask headers: {e}");
         return ExitCode::FAILURE;
@@ -416,7 +396,7 @@ pub(crate) fn run(check: bool) -> ExitCode {
     }
 }
 
-/// Print the first differing line so a `--check` failure says what changed.
+/// Print the first differing line.
 fn report_first_difference(got: &str, want: &str) {
     for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
         if g != w {
@@ -474,8 +454,8 @@ fn generate(crate_dir: &Path, tier: Tier) -> Result<String, String> {
 }
 
 fn config_for(tier: Tier) -> String {
-    // cbindgen emits declarations only; `assemble` supplies every wrapper. Filtering
-    // cbindgen's own guards afterwards left an unmatched `#endif` and did not compile.
+    // cbindgen emits declarations only; `assemble` supplies every wrapper (filtering
+    // its guards afterwards left an unmatched `#endif`).
     let _ = tier;
     let mut s = String::from(
         "language = \"C\"\n\
@@ -502,7 +482,6 @@ fn config_for(tier: Tier) -> String {
     match tier {
         Tier::Stable => {
             s.push_str("[export]\nexclude = [");
-            // Everything not stable, plus the hand-declared handles and private types.
             let excluded: Vec<&str> = UNSTABLE
                 .iter()
                 .chain(TEST_ONLY)
@@ -512,7 +491,7 @@ fn config_for(tier: Tier) -> String {
             push_list(&mut s, &excluded);
         }
         Tier::Unstable => {
-            // `exclude`, not `include`: cbindgen's `include` is additive, so it would emit everything.
+            // `exclude`, not `include`: cbindgen's `include` is additive.
             s.push_str("[export]\nexclude = [");
             let excluded: Vec<&str> = STABLE
                 .iter()
@@ -577,10 +556,8 @@ fn assemble(tier: Tier, body: &str) -> String {
     out
 }
 
-/// Every `extern "C"` symbol in `tf_tree_c` must be in exactly one tier.
-///
-/// Checked in both directions: an unclassified function fails, and so does a
-/// stale entry naming a removed function.
+/// Every `extern "C"` symbol in `tf_tree_c` must be in exactly one tier, checked
+/// in both directions (a stale entry naming a removed function fails).
 fn check_partition(crate_dir: &Path) -> Result<(), String> {
     let mut found = BTreeSet::new();
     let src = crate_dir.join("src");
@@ -594,7 +571,6 @@ fn check_partition(crate_dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
         for line in text.lines() {
             let t = line.trim();
-            // `pub extern "C" fn NAME(` / `pub unsafe extern "C" fn NAME(`.
             let Some(rest) = t
                 .strip_prefix("pub unsafe extern \"C\" fn ")
                 .or_else(|| t.strip_prefix("pub extern \"C\" fn "))
@@ -629,15 +605,13 @@ fn check_partition(crate_dir: &Path) -> Result<(), String> {
         ));
     }
 
-    // The reverse direction; constants and types are skipped.
     let stale: Vec<&&str> = STABLE
         .iter()
         .chain(UNSTABLE)
         .chain(TEST_ONLY)
         .filter(|n| n.starts_with("tft_") && n.contains(|c: char| c.is_lowercase()))
         .filter(|n| !found.contains(**n))
-        // Types, not functions: they are in the lists to steer `cbindgen`'s
-        // include/exclude and have no `extern "C" fn` to find.
+        // Types are in the lists only to steer `cbindgen`; no `extern "C" fn`.
         .filter(|n| !TIER_TYPES.contains(*n))
         .collect();
     if !stale.is_empty() {
@@ -653,10 +627,9 @@ fn check_partition(crate_dir: &Path) -> Result<(), String> {
 
 /// **No symbol may be defined by both generated headers.**
 ///
-/// A symbol in both is in neither tier: it means an entry is missing from
-/// [`STABLE`], which the complement in [`config_for`] then emits into both.
-/// Checked on the generated text. Nothing else catches it: `--check` matches
-/// committed copies, and an identical `#define` twice is legal C.
+/// It means an entry is missing from [`STABLE`], which the complement in
+/// [`config_for`] emits into both; an identical `#define` twice is legal C, so
+/// nothing else catches it.
 fn check_overlap(stable: &str, unstable: &str) -> Result<(), String> {
     let in_stable = defined_symbols(stable);
     let in_unstable = defined_symbols(unstable);
@@ -676,13 +649,10 @@ fn check_overlap(stable: &str, unstable: &str) -> Result<(), String> {
     ))
 }
 
-/// Every [`STABLE`] entry is actually **defined** by the frozen header.
-///
-/// Catches a symbol in **neither** header (the opposite sign of [`check_overlap`]):
-/// [`check_partition`] exempts screaming-case constants and types, so deleting a
-/// `pub const` and leaving its [`STABLE`] entry would otherwise shrink the frozen
-/// header with every other gate green. Grounded in the generated text, so one
-/// rule covers constants, types and functions.
+/// Every [`STABLE`] entry is **defined** by the frozen header. Catches a symbol
+/// in neither header (the opposite sign of [`check_overlap`]): [`check_partition`]
+/// exempts constants and types, so deleting a `pub const` would otherwise shrink
+/// the frozen header with every other gate green.
 fn check_stable_is_complete(stable_header: &str) -> Result<(), String> {
     let defined = defined_symbols(stable_header);
     let missing: Vec<&&str> = STABLE.iter().filter(|n| !defined.contains(**n)).collect();
@@ -702,8 +672,8 @@ fn check_stable_is_complete(stable_header: &str) -> Result<(), String> {
     ))
 }
 
-/// Every symbol a header **defines**, not merely mentions. Definitions sit at
-/// column 0; cbindgen indents fields, variants and continuation lines.
+/// Every symbol a header **defines**, not merely mentions (column 0; cbindgen
+/// indents the rest).
 fn defined_symbols(header: &str) -> BTreeSet<String> {
     let mut defs = BTreeSet::new();
     for line in strip_comments(header).lines() {
@@ -719,7 +689,6 @@ fn defined_symbols(header: &str) -> BTreeSet<String> {
             }
             continue;
         }
-        // Any other preprocessor directive defines nothing.
         if t.starts_with('#') {
             continue;
         }
@@ -730,7 +699,6 @@ fn defined_symbols(header: &str) -> BTreeSet<String> {
             }
             continue;
         }
-        // `extern "C" {` and its closing brace; neither declares anything.
         if t.starts_with("extern") {
             continue;
         }
@@ -811,7 +779,7 @@ fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    //! The overlap check's own gate: shapes it must see, references it must not mistake for definitions.
+    //! The overlap check's own gate.
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::{check_overlap, defined_symbols};
@@ -863,7 +831,7 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         ] {
             assert!(got.contains(want), "{want} was not seen as a definition");
         }
-        // Prose, parameter types and wrapped continuation lines are references.
+        // Prose, parameter types and continuation lines are references.
         for never in [
             "TFT_NOT_A_DEFINITION",
             "TFT_OK",
@@ -882,7 +850,7 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         }
     }
 
-    /// A status code missing from [`super::STABLE`] is emitted into both headers as an identical `#define`.
+    /// A status code missing from [`super::STABLE`] lands in both headers.
     #[test]
     fn a_symbol_defined_by_both_headers_fails() {
         let stable = "#define TFT_ERR_ARENA_UNAVAILABLE -42\n";
@@ -928,8 +896,7 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         }
     }
 
-    /// And it passes on a header that defines everything listed — the direction
-    /// that keeps it from being a check that always fails.
+    /// It passes on a header that defines everything listed.
     #[test]
     fn the_committed_stable_header_defines_every_stable_entry() {
         let inc = super::workspace_root().join("crates/tf_tree_c/include");
@@ -939,8 +906,7 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         }
     }
 
-    /// The one shape [`defined_symbols`] cannot see: `#[repr(C)] pub enum` variants
-    /// (indented by cbindgen). No tier entry is of that shape today.
+    /// The one shape [`defined_symbols`] cannot see: indented `#[repr(C)] pub enum` variants.
     #[test]
     fn enum_variants_are_not_definitions_to_this_scanner() {
         let header = "typedef enum {\n  TFT_KIND_A = 0,\n} tft_kind;\n";

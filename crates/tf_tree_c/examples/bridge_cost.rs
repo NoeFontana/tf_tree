@@ -1,10 +1,7 @@
 //! What one `tft_bridge_offer` costs (`docs/PHASE4.md` §7, bridge row). Not a gate.
 //!
-//! Measures a steady-state accepted `/tf` offer through §5.4-§5.8 and the arena
-//! write, over `EDGES` edges (every §5 table is keyed on `(parent, child)`).
-//! Allocation count is gated by `crates/tf_tree_bridge/tests/steady_state_alloc.rs`.
-//!
-//! Run pinned:
+//! A steady-state accepted `/tf` offer through §5.4-§5.8 and the arena write, over
+//! `EDGES` edges. Run pinned:
 //! `taskset -c 2 cargo run --release -p tf_tree_c --features bridge --example bridge_cost`
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::expect_used)]
 // 0007 rule 1, kind 5 (our own C ABI, called from Rust); 0048: an example is a
@@ -20,13 +17,13 @@ use std::time::Instant;
 use tf_tree_c::bridge::*;
 use tf_tree_c::*;
 
-/// §7's row is "1 kHz x 20 edges".
+/// §7's row: 1 kHz x 20 edges.
 const EDGES: usize = 20;
 /// Offers per round; a multiple of `EDGES`.
 const N: usize = 20_000;
 const ROUNDS: usize = 7;
 
-/// A dynamic chain `link0 -> … -> link20` (a star would share one parent name).
+/// A dynamic chain `link0 -> … -> link20`.
 fn topology() -> String {
     let mut s = String::new();
     for i in 0..EDGES {
@@ -38,7 +35,7 @@ fn topology() -> String {
     s
 }
 
-/// The minimum of `ROUNDS` rounds, in ns per offer (noise only adds time).
+/// The minimum of `ROUNDS` rounds, in ns per offer.
 fn bench(mut run: impl FnMut() -> u64) -> f64 {
     for _ in 0..2 {
         black_box(run());
@@ -61,7 +58,6 @@ fn main() {
         on_clock_reset: TFT_BRIDGE_ON_CLOCK_RESET_HALT,
         domain: 0,
         tf_prefix: ptr::null(),
-        // Private heap arena: no rendezvous in the number.
         arena_name: ptr::null(),
     };
     let mut b: *mut tft_bridge = ptr::null_mut();
@@ -77,7 +73,7 @@ fn main() {
         TFT_OK
     );
 
-    // Built once, as `rclcpp` hands them over; per-offer would measure `CString::new`.
+    // Built once: per-offer would measure `CString::new`.
     let names: Vec<(CString, CString)> = (0..EDGES)
         .map(|i| {
             (
@@ -87,7 +83,6 @@ fn main() {
         })
         .collect();
 
-    // A 30-degree yaw, so pose validation has real components.
     let pose = [
         0.965_925_826_289_068_3,
         0.0,
@@ -99,7 +94,7 @@ fn main() {
     ];
 
     let mut stamp: i64 = 1_000_000_000;
-    // Receipt clock, read once per sweep like the ROS caller; `0` would skip the offset layer.
+    // Read once per sweep; `0` would skip the offset layer.
     let mut received = Instant::now();
     let epoch = received;
     let mut out = tft_bridge_outcome {
@@ -125,7 +120,6 @@ fn main() {
         let mut accepted = 0u64;
         for k in 0..N {
             let (p, c) = &names[k % EDGES];
-            // One sweep shares a stamp, as a batched `TFMessage` does.
             if k % EDGES == 0 {
                 stamp += 1_000_000;
                 received = Instant::now();

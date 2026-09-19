@@ -1,15 +1,5 @@
-//! Stamps far from the origin, and the one property that invites them.
-//!
-//! An all-static path is answerable at *any* stamp — `Plan::span` returns
-//! `Ok(None)` and says so in as many words. That is a real guarantee and this
-//! file is the first thing that pins it, but it is also an *invitation*: it tells
-//! a caller that `i64::MIN` and `i64::MAX` are ordinary arguments. Two arithmetic
-//! sites took the invitation and overflowed.
-//!
-//! Both were found by measuring the guarantee rather than by reading the code,
-//! and both were **worse in release than in debug** — a checked build panics, an
-//! optimised one wraps and returns a confident wrong answer. Published wheels are
-//! built `--release`.
+//! Stamps far from the origin: an all-static path is answerable at any stamp, so
+//! `i64::MIN`/`i64::MAX` are ordinary arguments and must not overflow.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -26,19 +16,7 @@ fn pose(x: f64, y: f64, z: f64) -> Iso3 {
     )
 }
 
-/// The stamp-independence guarantee itself, pinned at the extremes.
-///
-/// Near the origin this is *incidentally* pinned — perturbing a folded static
-/// step by 1e-6 for `t != 0` is caught by three existing tests in `lookup.rs`.
-/// Far from the origin nothing caught it, which is exactly where the arithmetic
-/// below goes wrong, so the extremes are the part worth asserting.
-///
-/// Bit-identical, not approximately equal: an all-static plan folds to a single
-/// constant at compile time, so evaluation reads it back unchanged rather than
-/// recomputing it. (That constant is *not* bit-identical to a naive un-folded
-/// composition of the same edges — the fold composes once, in a different
-/// association order, and 4 ULP of difference in one translation component is
-/// normal. The guarantee is stamp-independence, not fold-exactness.)
+/// An all-static plan is bit-identical at every stamp, pinned at the extremes.
 #[test]
 fn an_all_static_plan_is_bit_identical_at_every_stamp() {
     let tree = TreeBuilder::new()
@@ -81,14 +59,7 @@ fn bits(i: &Iso3) -> [u64; 7] {
     ]
 }
 
-/// `at_adaptive` over the whole `i64` range, which is what `span() == None`
-/// invites on an all-static plan.
-///
-/// Before the fix this panicked with "attempt to subtract with overflow" in a
-/// checked build — `b_s - a_s` for `(i64::MIN, i64::MAX)` — and in a release
-/// build wrapped to a negative width, failed the `> 1` split test and returned
-/// two knots without recursing. Two knots is the *right* answer here, which is
-/// why this test is not sufficient on its own; see the next one.
+/// `at_adaptive` over the whole `i64` range, on an all-static plan.
 #[test]
 fn at_adaptive_spans_the_full_i64_range_on_a_static_plan() {
     let tree = TreeBuilder::new()
@@ -114,16 +85,8 @@ fn at_adaptive_spans_the_full_i64_range_on_a_static_plan() {
     assert_eq!(bits(&poses[0]), bits(&poses[1]), "a constant is constant");
 }
 
-/// The half of the overflow that a panic-free release build turns into a *wrong
-/// answer*: a span wider than `i64::MAX` over a path that genuinely curves.
-///
-/// Samples at `-(2^62) - 1`, `0` and `2^62` — a total span of `2^63 + 1`, one
-/// nanosecond past what an `i64` difference can hold. The middle sample is off
-/// the straight line between the outer two, so a correct adaptive pass *must*
-/// subdivide. With the wrapped width it did not: two knots, endpoint
-/// translations -0.4989 and -0.9953, true midpoint -17.2030, against a requested
-/// tolerance of 1e-6. No error and no panic — just a straight line through a
-/// path that was never straight.
+/// A span wider than `i64::MAX` over a curving path must still subdivide, not
+/// wrap to a negative width and return two knots.
 #[test]
 fn at_adaptive_subdivides_a_span_wider_than_i64_max() {
     let cfg = EdgeCfg::new(Capacity::slots(8));
@@ -138,8 +101,7 @@ fn at_adaptive_subdivides_a_span_wider_than_i64_max() {
     {
         let w = tree.claim(b, a).unwrap();
         w.push(LO, &pose(0.0, 0.0, 0.0)).unwrap();
-        // Off the LO..HI line by a wide margin, so a two-knot LERP cannot be
-        // within tolerance of it.
+        // Off the LO..HI line, so a two-knot LERP cannot be within tolerance.
         w.push(0, &pose(-20.0, 5.0, -3.0)).unwrap();
         w.push(HI, &pose(1.0, 0.0, 0.0)).unwrap();
     }
@@ -163,8 +125,7 @@ fn at_adaptive_subdivides_a_span_wider_than_i64_max() {
          this is the release-build wrap, not a panic",
         stamps.len()
     );
-    // And the knots must actually bracket the excursion rather than merely being
-    // numerous: some emitted pose has to come near the off-line middle sample.
+    // The knots must bracket the excursion: some pose comes near the middle sample.
     let closest = poses
         .iter()
         .map(|p| (p.t.x - -20.0).abs())
@@ -176,14 +137,8 @@ fn at_adaptive_subdivides_a_span_wider_than_i64_max() {
     );
 }
 
-/// The second site, and the one on the hot path: `sample.rs`'s interpolation
-/// parameter, for two bracketing samples more than `i64::MAX` apart.
-///
-/// `t_i <= t < t_j` is guaranteed, so the differences are mathematically
-/// non-negative — but `t_j - t_i` does not fit an `i64` here. Wrapped, it is
-/// negative, so `s` is negative, so the LERP runs *backwards past* the older
-/// sample and returns a pose from outside the bracket. This asserts the result
-/// stays inside it.
+/// `sample.rs`'s interpolation parameter for two bracketing samples more than
+/// `i64::MAX` apart must stay inside the bracket, not run backwards.
 #[test]
 fn interpolating_across_a_span_wider_than_i64_max_stays_inside_the_bracket() {
     let cfg = EdgeCfg::new(Capacity::slots(4));
@@ -202,7 +157,6 @@ fn interpolating_across_a_span_wider_than_i64_max_stays_inside_the_bracket() {
     let plan = tree.plan(a, b).unwrap();
     let g = tree.guard();
 
-    // t = 0 sits almost exactly halfway between the two samples.
     let got = plan.at(&g, ns(0)).unwrap();
     assert!(
         (0.0..=10.0).contains(&got.t.x),

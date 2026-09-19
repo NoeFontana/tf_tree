@@ -1,24 +1,8 @@
 #!/usr/bin/env bash
-# The C++ wrapper's build matrix — docs/PHASE4.md §6.2.
-#
-# "Compiles clean under -Wall -Wextra -Wpedantic, with and without
-#  -fno-exceptions, C++17 and C++20, GCC and Clang."
-#
-# That is 2 compilers x 2 standards x 2 error modes = 8 builds, each of which is
-# also *run*. Compiling is not the assertion: the wrapper is header-only inline
-# code, so a build that compiles and a build that computes the right transform
-# are different claims.
-#
-# Two groups follow the matrix and are not part of it: 4 `--wrap` builds that
-# add `check_at_writes_into_the_returned_object` (see the `WRAP` note below for
-# why they are kept separate), and 1 sanitizer build. 13 in total.
-#
-# Sophus is optional and its absence is reported rather than skipped silently —
-# §4.3's stride hazard only exists where Sophus does, and a run that did not
-# exercise it should not read like one that did. `just cpp-deps` fetches it.
-#
-# ASan + UBSan across the whole suite is §7 gate criterion 4, and runs last
-# because it is the slowest.
+# The C++ wrapper's build matrix — docs/PHASE4.md §6.2: -Wall -Wextra -Wpedantic,
+# with and without -fno-exceptions, C++17 and C++20, GCC and Clang (8 builds, each
+# run), then 4 `--wrap` builds and 1 sanitizer build (§7 gate 4).
+# Sophus is optional and its absence is reported; `just cpp-deps` fetches it.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../../.."   # workspace root
@@ -29,16 +13,8 @@ LIB=target/release/libtf_tree_c.a
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
-# `-isystem`, not `-I`, for both third-party trees. `-Wpedantic -Werror` is
-# aimed at *our* header and our test; pointed at Eigen and Sophus it reports
-# their choices, and clang duly failed the build on Sophus's use of the GNU
-# `##__VA_ARGS__` extension. `-isystem` is how you say "warn about my code".
-# The system copy wins over the fetched one, because §4.2 is about interop with
-# the Eigen a consumer actually has; `target/thirdparty/eigen` is the bootstrap
-# for a machine that has none, which is every GitHub runner. Eigen is NOT
-# optional the way Sophus is — its absence fails rather than skips, and on
-# 2026-08-17 that is exactly what the first nightly run did, because `cpp-deps`
-# fetched Sophus and nothing fetched Eigen.
+# `-isystem` keeps -Wpedantic -Werror aimed at our code. Eigen is required
+# (absence fails); `target/thirdparty/eigen` is the bootstrap copy.
 EIGEN=""
 for d in /usr/include/eigen3 /usr/local/include/eigen3 target/thirdparty/eigen; do
     [ -d "$d" ] && EIGEN="-isystem $d" && break
@@ -52,8 +28,7 @@ fi
 
 SOPHUS=""
 if [ -f target/thirdparty/Sophus/sophus/se3.hpp ]; then
-    # Sophus 1.22's common.hpp pulls in fmt unless basic logging is selected;
-    # fmt is not otherwise needed and is not worth a dependency for a test.
+    # Sophus 1.22 pulls in fmt unless basic logging is selected.
     SOPHUS="-isystem target/thirdparty/Sophus -DSOPHUS_USE_BASIC_LOGGING"
 else
     echo "  note: Sophus absent — §4.3's stride path is NOT exercised."
@@ -64,30 +39,15 @@ cargo build --release -q -p tf_tree_c --features test-hooks
 
 WARN="-Wall -Wextra -Wpedantic -Werror"
 
-# **`--wrap` is what makes §7 gate 2 testable without a stopwatch.** It points
-# this file's calls to `tft_plan_at` at a shim that records the `out` pointer it
-# was handed, so `check_at_writes_into_the_returned_object` can assert that
-# `Plan::at<T>` gave the ABI the address of the object it returns rather than a
-# temporary it copies out of afterwards. The alternative — a `test-hooks` symbol
-# on the Rust side — would put that store inside the function `just cpp-bench`
-# times. The shim forwards to `__real_tft_plan_at`, so the rest of the file
-# behaves identically under it.
-#
-# **It is deliberately kept out of the §6.2 matrix below.** `--wrap` is a
-# GNU-ld/lld option and Mach-O's `ld64` has no equivalent, so putting it on the
-# portability rows would make the repo's C++ *portability* gate require a
-# specific linker family in order to test something that has nothing to do with
-# portability. The four rows below get it instead, and the eight matrix rows
-# stay linker-agnostic.
+# `--wrap` records the `out` pointer given to `tft_plan_at` so §7 gate 2's
+# `check_at_writes_into_the_returned_object` needs no stopwatch. It needs GNU
+# ld/lld, so only the `--wrap` rows below use it, not the §6.2 matrix.
 WRAP="-DTF_TREE_WRAP_PLAN_AT -Wl,--wrap=tft_plan_at"
 
 fail=0
 
 for cxx in g++ clang++; do
-    # **A missing compiler is a failure, not a skip.** §6.2 names GCC *and*
-    # Clang as the requirement; skipping one silently removed 4 of the 8 rows
-    # and left the script printing "cpp-check: OK". Eigen is already a hard
-    # failure a few lines up, and this is the same kind of thing.
+    # A missing compiler is a failure, not a skip (§6.2 names both).
     if ! command -v "$cxx" >/dev/null; then
         echo "  FAIL: $cxx is not installed; §6.2 requires both compilers." >&2
         fail=1
@@ -118,14 +78,7 @@ for cxx in g++ clang++; do
     done
 done
 
-# §7 gate 2, pinned structurally: `check_at_writes_into_the_returned_object`.
-#
-# Both compilers and both error modes, because that is exactly what the property
-# varies with — NRVO is a per-compiler decision, and the error mode is the whole
-# of the asymmetry §0.0 records. **Not** both standard revisions: copy elision
-# is unchanged between C++17 and C++20, so a second `std` would double the rows
-# and hold nothing new. These builds run the whole file, not just the one check,
-# which is also what shows that the forwarding shim perturbs nothing.
+# §7 gate 2: both compilers and error modes (NRVO varies with them), one `std`.
 for cxx in g++ clang++; do
     command -v "$cxx" >/dev/null || continue   # already reported by the matrix
     for mode in exceptions no-exceptions; do
@@ -150,9 +103,7 @@ for cxx in g++ clang++; do
     done
 done
 
-# §7 gate 4: zero ASan/UBSan findings across the C++ suite. One configuration is
-# enough — the sanitizers find memory and UB errors, which do not depend on the
-# standard revision or the error mode.
+# §7 gate 4: zero ASan/UBSan findings; one configuration is enough.
 printf '  %-34s ' "clang++ asan+ubsan"
 if command -v clang++ >/dev/null; then
     # shellcheck disable=SC2086

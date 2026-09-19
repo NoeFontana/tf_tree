@@ -1,9 +1,6 @@
-//! Bake the ROS 2 library path into this crate's own binaries.
-//!
-//! `tf_tree_tf2_sys`'s rpath applies only to the emitting package's targets, so without this the
-//! benches, tests and bins resolve `libtf2.so` only through the container's `LD_LIBRARY_PATH`.
-//! The path comes from that crate's `links` metadata, so there is one ROS-discovery
-//! implementation. Without `--features tf2` this script does nothing.
+//! Bake the ROS 2 library path into this crate's own binaries: `tf_tree_tf2_sys`'s
+//! rpath covers only its own targets. The path comes from that crate's `links`
+//! metadata. Without `--features tf2` this script does nothing.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -25,10 +22,10 @@ fn main() {
 
 /// Bake the profile *directory* this crate was compiled into into its binaries.
 ///
-/// `docs/PHASE5.md` §9.2's embedding row is two runs of one program under two `[profile.*]`
-/// sections, and cargo does not tell a build script the profile name. `OUT_DIR`'s component before
-/// `build` is the profile directory (`release`, `embedder`, `debug`); `src/embed.rs` maps it back to
-/// the profile's declared `lto` and `codegen-units`.
+/// `docs/PHASE5.md` §9.2's embedding row is two runs under two `[profile.*]`
+/// sections; cargo does not expose the profile name, but `OUT_DIR`'s component
+/// before `build` is the profile directory, which `src/embed.rs` maps back to
+/// the declared `lto` and `codegen-units`.
 fn emit_profile_dir() {
     let dir = std::env::var("OUT_DIR").ok().and_then(|out| {
         let path = std::path::PathBuf::from(out);
@@ -49,8 +46,8 @@ fn emit_profile_dir() {
     );
 }
 
-/// Source trees that determine what `embed_cost` measures, relative to the workspace root. The
-/// workspace manifest is included because `[profile.*]` lives there.
+/// Source trees that determine what `embed_cost` measures, relative to the
+/// workspace root (the manifest holds `[profile.*]`).
 const MEASURED_SOURCES: &[&str] = &[
     "Cargo.toml",
     "crates/tf_tree_math/src",
@@ -61,13 +58,10 @@ const MEASURED_SOURCES: &[&str] = &[
     "crates/tf_tree_bench/src/fixture.rs",
 ];
 
-/// Bake a digest of that source into the binary, so a report cannot pair halves of different programs.
-///
-/// `docs/PHASE5.md` §9.2's embedding row is a *ratio*; `src/embed.rs` refuses a pair whose halves
-/// disagree here. The source, not the binary, is hashed: the two halves are built under different
-/// profiles. FNV-1a suffices: this guards against accident. Each file's **base name** (not path) is
-/// hashed with its contents, so a rename changes the digest and moving a file does not (see
-/// [`collect`]).
+/// Bake a digest of that source into the binary, so a report cannot pair halves
+/// of different programs (`src/embed.rs` refuses a mismatch). The source is
+/// hashed, not the binary; FNV-1a, guarding against accident. Each file's base
+/// name (not path) is hashed with its contents (see [`collect`]).
 fn emit_source_id() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -93,10 +87,8 @@ fn emit_source_id() {
     println!("cargo:rustc-env=TF_TREE_BENCH_SOURCE_ID={id}");
 }
 
-/// Every `.rs`/`.toml` file under `path` (or `path` itself), as `(file name, contents)`.
-///
-/// The file name, not the path: two checkouts of one commit must agree. The list is sorted on the
-/// whole pair, so the digest is order-independent.
+/// Every `.rs`/`.toml` file under `path` (or `path` itself), as `(file name,
+/// contents)`, sorted so the digest is order-independent.
 fn collect(path: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
     if path.is_dir() {
         let Ok(entries) = std::fs::read_dir(path) else {

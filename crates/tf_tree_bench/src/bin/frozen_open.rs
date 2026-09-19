@@ -1,62 +1,34 @@
-//! **`docs/PHASE5.md` §12 gate 2**: *`.tft` open time under 10 ms for a 233 MB
-//! index.*
+//! **`docs/PHASE5.md` §12 gate 2**: *`.tft` open time under 10 ms for a 233 MB index.*
 //!
-//! The claim is **complexity**: every step of [`tf_tree::Tree::open_frozen`] is
-//! O(1) in the index size, so a 338 MiB `.tft` and a 2 MiB one cost the same. The
-//! binary gates on both the **budget** (open fits in 10 ms at gate scale) and
-//! **scale invariance** (a fixture two orders of magnitude smaller opens within
-//! `SCALE_BOUND`x).
+//! The claim is **complexity**: every step of [`tf_tree::Tree::open_frozen`] is O(1) in the index size. The
+//! binary gates on the **budget** (open fits in 10 ms at gate scale) and on **scale invariance** (a fixture
+//! two orders of magnitude smaller opens within `SCALE_BOUND`x).
 //!
 //! # Cache states
 //!
-//! Evicted = page cache dropped, resident = warm; each open's major-fault count is
-//! printed. **The evicted arm is REPORTED, the resident arm is GATED**
-//! (`docs/PHASE5.md` §12 criterion 2), and evicted numbers print with the host's
-//! CPU and the fixture's filesystem.
+//! Evicted = page cache dropped, resident = warm; each open's major-fault count is printed. **The evicted arm
+//! is REPORTED, the resident arm is GATED** (§12 criterion 2).
 //!
-//! # Absolute durations on an unfit host
+//! # Fitness
 //!
-//! `docs/PHASE5.md` §9.3's *one-sided budget with a stated margin* amendment admits
-//! this: every check [`tf_tree_bench::report::Fitness::probe`] applies can only make
-//! an open slower, so a PASS is conservative and a FAIL is not attributable to the
-//! code. The verdict line prints the fitness reasons either way. A debug build is
-//! likewise not refused (a debug PASS is stronger; a debug FAIL is not
-//! attributable, and the profile is printed). `just gate2` builds `--release`;
-//! `crates/tf_tree_bench/tests/gate2.rs` drives the debug binary to prove wiring.
+//! Per §9.3's one-sided budget amendment, every [`tf_tree_bench::report::Fitness::probe`] check can only slow an
+//! open, so a PASS is conservative and a FAIL is not attributable to the code. A debug build is not refused
+//! (its profile is printed). `tests/gate2.rs` drives the debug binary to prove wiring.
 //!
-//! # Vacuous passes avoided
+//! # Refusals
 //!
-//! Two floors are checked before any verdict and **refuse** rather than pass: the
-//! gated fixture is at least `GATE_INDEX_FLOOR_BYTES`, and the fixtures differ by
-//! at least `SCALE_SPAN`x. The evicted arm verifies its own premise, with the
-//! child's major-fault count as witness (`POSIX_FADV_DONTNEED` cannot evict a page
-//! another mapping holds). **A `--gate` run whose eviction did not take REFUSES;
-//! an ungated one voids the arm.** The usual cause is a RAM-backed filesystem
-//! (`$TMPDIR` is often tmpfs), which is why `tests/gate2.rs` puts fixtures in the
-//! cargo target directory.
-//!
-//! # `--gate`
-//!
-//! As `src/bin/frozen_workers.rs`: printing FAIL and exiting 0 is what
-//! `docs/benchmarks/EVIDENCE.md` exists to prevent. `--gate` refuses no mode (not
-//! `--prefault`, the falsifier). It refuses a run it cannot evaluate: a fixture
-//! under the criterion's scale, two fixtures too close in size, an unwitnessed
-//! eviction (only under `--gate`), and a PASS against a `--budget-ms` **above** the
-//! criterion's, because a gate whose comparison a caller can loosen can be greened.
+//! `--gate` **refuses** rather than passes on: a gated fixture under `GATE_INDEX_FLOOR_BYTES`; fixtures closer
+//! than `SCALE_SPAN`x; an evicted arm whose eviction the child's major-fault count does not witness (ungated,
+//! the arm is voided; usually a RAM-backed `$TMPDIR`, hence `tests/gate2.rs` uses the cargo target directory);
+//! a PASS against a `--budget-ms` **above** the criterion's. It refuses no mode, not `--prefault`. Printing FAIL
+//! and exiting 0 is what `docs/benchmarks/EVIDENCE.md` exists to prevent (as `src/bin/frozen_workers.rs`).
 //!
 //! # The falsifier
 //!
-//! `--prefault` reads every byte of the `.tft` inside the timed region, standing in
-//! for a `populate_hot` arm reaching the frozen backing
-//! (`crates/tf_tree/src/tree.rs`'s `populate_edge_rings` refuses it today). It edits
-//! no threshold; `--budget-ms` is the weaker control. Fault counts are printed as
-//! corroboration only, since `mmap(MAP_POPULATE)` generates no counted minor faults;
-//! the verdict is on time.
-//!
-//! # Not covered
-//!
-//! §2.2: a `.tft` is deliberately not prefaulted, so this gate cannot see work moved
-//! into the first lookup.
+//! `--prefault` reads every byte of the `.tft` inside the timed region, standing in for a `populate_hot` arm
+//! reaching the frozen backing (`populate_edge_rings` refuses it today). The verdict is on time; fault counts
+//! only corroborate. §2.2: a `.tft` is deliberately not prefaulted, so this gate cannot see work moved into the
+//! first lookup.
 //!
 //! # Usage
 //!
@@ -79,30 +51,21 @@ use tf_tree::Tree;
 use tf_tree_bench::report::Fitness;
 use tf_tree_bench::workload::{Backing, QuerySpec, Topology, Workload};
 
-/// §12 gate 2's budget, in milliseconds.
 const BUDGET_MS: f64 = 10.0;
 
 /// §12 gate 2's "233 MB index", as a floor on the gated fixture.
-/// Decimal MB: §2.5's sizing arithmetic (115 + 92 + 26).
 const GATE_INDEX_FLOOR_BYTES: u64 = 233_000_000;
 
-/// Minimum size ratio of gated to small fixture.
 const SCALE_SPAN: u64 = 8;
 
-/// The factor the two fixtures' open times must agree within. `open_frozen` is
-/// O(1), so the expectation is 1.0; the bound sits above host noise and orders of
-/// magnitude below the size ratio any proportional step would produce.
+/// The factor the two fixtures' open times must agree within; the expectation is 1.0.
 const SCALE_BOUND: f64 = 4.0;
 
-/// §12 gate 2's criterion, one expression for the verdict line and exit status.
 fn within_budget(worst_ms: f64, budget_ms: f64) -> bool {
     worst_ms <= budget_ms
 }
 
-/// The other half: the open does not grow with the index. Taken over each arm's
-/// *best* open (the budget reads the worst): noise is one-sided, so the minimum is
-/// the least contaminated cost estimate and a quotient of worsts doubles the noise.
-/// The control fails it by more than an order of magnitude.
+/// The open does not grow with the index (best open per arm); the control fails it by an order of magnitude.
 fn scale_invariant(large_ms: f64, small_ms: f64) -> bool {
     large_ms <= small_ms * SCALE_BOUND
 }
@@ -215,7 +178,6 @@ enum Mode {
     Drive,
 }
 
-/// Everything the driver was asked for.
 struct Drive {
     path: PathBuf,
     small: PathBuf,
@@ -230,9 +192,7 @@ struct Drive {
     gate: bool,
 }
 
-/// A fixture at §12 gate 2's scale. Same shape as `frozen_workers`'s `Fleet` but
-/// named separately: this binary needs two sizes. Both go through
-/// `workload::Workload`.
+/// A fixture at §12 gate 2's scale, like `frozen_workers`'s `Fleet`; this binary needs two sizes.
 fn spec(name: &'static str, robots: usize, history: f64) -> Workload {
     Workload {
         name,
@@ -251,7 +211,6 @@ fn build(path: &Path, robots: usize, history: f64) -> Result<()> {
     }
     let w = spec("gate2_fleet", robots, history);
     let built = w.build(tf_tree::InterpPolicy::LerpSlerp, Backing::Heap)?;
-    // All-zero `source_digest`, `source` None: synthesized, not recorded.
     built
         .tree
         .freeze_to(path, None, [0u8; 32], 0)
@@ -265,18 +224,15 @@ fn build(path: &Path, robots: usize, history: f64) -> Result<()> {
     Ok(())
 }
 
-/// One child: one timed `Tree::open_frozen`, its fault counts, one line out. A
-/// fresh process per open, because a repeat in-process costs a fraction of the
-/// first and the gate is a worst-case claim.
+/// One child: one timed `Tree::open_frozen`, its fault counts, one line out; a fresh process per open, since
+/// a repeat in-process costs a fraction of the first.
 fn open_once(path: &Path, prefault: bool) -> Result<()> {
     let before = faults()?;
     let started = Instant::now();
     let tree = Tree::open_frozen(path).map_err(|e| anyhow!("opening {}: {e:?}", path.display()))?;
-    // The control, inside the timed region.
     let read = if prefault { read_whole(path)? } else { 0 };
     let elapsed = started.elapsed();
     let after = faults()?;
-    // Dropped after the clock stops, so unmap is not measured.
     drop(tree);
     println!(
         "ns={} minflt={} majflt={} prefaulted={}",
@@ -288,8 +244,7 @@ fn open_once(path: &Path, prefault: bool) -> Result<()> {
     Ok(())
 }
 
-/// Read every byte of the file, returning how many (the `--prefault` control,
-/// via `read(2)`).
+/// Read every byte of the file, returning how many (the `--prefault` control).
 fn read_whole(path: &Path) -> Result<u64> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path)?;
@@ -304,15 +259,13 @@ fn read_whole(path: &Path) -> Result<u64> {
     }
 }
 
-/// `(minflt, majflt)` from `/proc/self/stat`, fields 10 and 12, parsed after the
-/// last `)` because the executable name may contain spaces.
+/// `(minflt, majflt)` from `/proc/self/stat`, parsed after the last `)`.
 fn faults() -> Result<(u64, u64)> {
     let stat = std::fs::read_to_string("/proc/self/stat").context("reading /proc/self/stat")?;
     let rest = stat
         .rsplit_once(')')
         .ok_or_else(|| anyhow!("/proc/self/stat has no `)` — not a Linux stat line"))?
         .1;
-    // After the `)`: `state` is first, so minflt is index 7, majflt index 9.
     let f: Vec<&str> = rest.split_whitespace().collect();
     let get = |i: usize, what: &str| -> Result<u64> {
         f.get(i)
@@ -323,11 +276,9 @@ fn faults() -> Result<(u64, u64)> {
     Ok((get(7, "minflt")?, get(9, "majflt")?))
 }
 
-/// Drop `path`'s page cache, and say whether the request was made. `dd
-/// oflag=nocache conv=notrunc,fdatasync count=0` rather than `posix_fadvise`: no
-/// new `unsafe` kind (as `contended_scaling.rs`, `load_child.rs`), and `fdatasync`
-/// writes back dirty pages `DONTNEED` would skip. Nothing trusts it; the witness is
-/// the child's major-fault count.
+/// Drop `path`'s page cache and say whether the request was made: `dd oflag=nocache conv=notrunc,fdatasync
+/// count=0`, not `posix_fadvise` (no new `unsafe` kind). Nothing trusts it; the witness is the child's
+/// major-fault count.
 fn evict(path: &Path) -> Result<()> {
     let out = Command::new("dd")
         .arg(format!("of={}", path.display()))
@@ -350,12 +301,10 @@ fn evict(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Read the whole file so its pages are resident.
 fn warm(path: &Path) -> Result<()> {
     read_whole(path).map(|_| ())
 }
 
-/// One arm's measurement of one fixture.
 struct Arm {
     worst_ms: f64,
     best_ms: f64,
@@ -382,16 +331,13 @@ impl Arm {
     }
 }
 
-/// Which cache state an arm is measured in.
-/// `Evicted { requested: false }` is the control: evicted arm without evicting,
-/// so the witness has something to catch.
+/// Which cache state an arm is measured in; `Evicted { requested: false }` is the witness's control.
 #[derive(Clone, Copy)]
 enum Cache {
     Evicted { requested: bool },
     Resident,
 }
 
-/// Run one arm: `rounds` fresh processes, each after this arm's cache state.
 fn measure(exe: &Path, path: &Path, rounds: usize, cache: Cache, prefault: bool) -> Result<Arm> {
     let mut worst = f64::MIN;
     let mut best = f64::MAX;
@@ -465,7 +411,6 @@ fn drive(d: &Drive) -> Result<()> {
     let large_bytes = std::fs::metadata(&d.path)?.len();
     let small_bytes = std::fs::metadata(&d.small)?.len();
 
-    // The two floors, checked before anything is measured.
     if d.gate && large_bytes < GATE_INDEX_FLOOR_BYTES {
         bail!(
             "{} is {large_bytes} B and PHASE5 §12 gate 2 is stated over a 233 MB index. An \
@@ -537,8 +482,7 @@ fn drive(d: &Drive) -> Result<()> {
     if !d.evict {
         println!("  --no-evict: the evicted arm's cache was left resident (the control)");
     }
-    // Without `--gate` the floors are not refusals; print a line for **both** so an
-    // ungated PASS does not read as one of the criterion.
+    // Without `--gate` the floors are not refusals; print a line for both so an ungated PASS is not misread.
     if !d.gate && large_bytes < GATE_INDEX_FLOOR_BYTES {
         println!(
             "  NOT AT GATE SCALE: {large_bytes} B is under §12 gate 2's 233 MB index, so this \
@@ -568,9 +512,7 @@ fn drive(d: &Drive) -> Result<()> {
         );
     }
 
-    // The evicted arm's premise is checked, not assumed: a gated run REFUSES, an
-    // ungated one degrades and says so (`contended_scaling.rs`'s shape). Usual cause:
-    // a RAM-backed filesystem that cannot evict.
+    // The evicted arm's premise is checked: a gated run REFUSES, an ungated one degrades and says so.
     let evicted_premise = evicted_large.all_major() && evicted_small.all_major();
     if !evicted_premise {
         let why = format!(
@@ -603,9 +545,7 @@ fn drive(d: &Drive) -> Result<()> {
     let scale_ok = scale_invariant(resident_large.best_ms, resident_small.best_ms);
     let ratio = resident_large.best_ms / resident_small.best_ms;
 
-    // **A loosened budget may not produce a gated PASS**, refused before any verdict
-    // line. Lowering stays legal (`tests/gate2.rs` drives the budget half red), as
-    // does raising while the run still fails (isolating the scale half).
+    // A loosened budget may not produce a gated PASS; lowering stays legal, as does raising while the run fails.
     if d.gate && budget_ok && scale_ok && d.budget_ms > BUDGET_MS {
         bail!(
             "REFUSED — --budget-ms {:.4} is above PHASE5 §12 gate 2's own {BUDGET_MS:.4} ms, \
@@ -671,8 +611,6 @@ fn drive(d: &Drive) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// **The gate's arithmetic can say no**, as `frozen_workers`'s
-    /// `gate_arithmetic_is_not_vacuous`.
     #[test]
     fn the_budget_comparison_is_not_vacuous() {
         assert!(within_budget(2.5, BUDGET_MS));
@@ -683,7 +621,6 @@ mod tests {
         assert!(!within_budget(126.8, BUDGET_MS));
     }
 
-    /// The other half separately: a union of two checks hides one of them.
     #[test]
     fn the_scale_comparison_is_not_vacuous() {
         assert!(scale_invariant(0.09, 0.10));
@@ -692,7 +629,6 @@ mod tests {
         assert!(!scale_invariant(20.0, 0.15), "a size-proportional open");
     }
 
-    /// The two floors stop a small fixture passing trivially.
     #[test]
     fn the_gate_scale_floor_is_the_criterions_own_number() {
         assert_eq!(GATE_INDEX_FLOOR_BYTES, 233_000_000);

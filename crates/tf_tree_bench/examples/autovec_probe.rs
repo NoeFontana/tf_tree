@@ -1,11 +1,8 @@
 //! Does autovectorisation reach the batch interpolation loop for free?
 //!
-//! `docs/decisions/0016` open question 2, step 3: shape the batch loop over `[f64; 4]` and read
-//! the asm. This is the measurement half; the asm half is in `0016`'s *Amendment*. The unit is the
-//! loop over stamps, not the call (`interp_cost`).
-//!
-//! Each variant computes the same interpolation over the same 1024 pose pairs and differs only in
-//! shape:
+//! `docs/decisions/0016` open question 2, step 3 (measurement half; the asm half is
+//! in its *Amendment*). Each variant computes the same interpolation over the same
+//! 1024 pose pairs and differs only in shape:
 //!
 //! | | shape |
 //! |---|---|
@@ -24,7 +21,7 @@
 //!   taskset -c 2 cargo run --release -p tf_tree_bench --example autovec_probe
 //! ```
 //!
-//! The difference is what the vectoriser is worth; a shape whose runs agree was never vectorised.
+//! The difference is what the vectoriser is worth; agreeing runs were never vectorised.
 //! Unpinned runs swing by >30%.
 #![allow(clippy::unwrap_used, clippy::print_stdout)]
 
@@ -40,8 +37,8 @@ const ROUNDS: usize = 20_000;
 /// Repeats; the **best** is reported (a cold round is noise in one direction only).
 const REPEATS: usize = 7;
 
-/// Pose pairs one 200 Hz tick apart on a body rotating at 180 °/s, plus an interior `s`; the arc
-/// sits inside `THETA_SLERP_SMALL`, so every variant takes the series path.
+/// Pose pairs one 200 Hz tick apart on a body rotating at 180 °/s; the arc is
+/// inside `THETA_SLERP_SMALL`, so every variant takes the series path.
 fn data() -> (Vec<Iso3>, Vec<Iso3>, Vec<f64>) {
     let mut a = Vec::with_capacity(N);
     let mut b = Vec::with_capacity(N);
@@ -72,8 +69,7 @@ fn axis_angle(theta: f64, x: f64, y: f64, z: f64) -> Quat {
     Quat::new(half.cos(), sn * x, sn * y, sn * z)
 }
 
-/// **A** — the shipped `Interp::eval`, in the most vectoriser-friendly loop the
-/// engine's arithmetic can be put in.
+/// **A** — the shipped `Interp::eval` in a vectoriser-friendly loop.
 #[inline(never)]
 fn variant_a<I: Interp>(a: &[Iso3], b: &[Iso3], s: &[f64], out: &mut [Iso3]) {
     for (((a, b), s), o) in a.iter().zip(b).zip(s).zip(out) {
@@ -81,8 +77,7 @@ fn variant_a<I: Interp>(a: &[Iso3], b: &[Iso3], s: &[f64], out: &mut [Iso3]) {
     }
 }
 
-/// **B** — as A, with the two endpoint shortcuts, the degenerate-input guard and
-/// the large-arc `acos`/`sin` branch removed, leaving a straight-line body.
+/// **B** — as A without the endpoint shortcuts, guard and large-arc branch.
 #[inline(never)]
 fn variant_b(a: &[Iso3], b: &[Iso3], s: &[f64], out: &mut [Iso3]) {
     for (((a, b), s), o) in a.iter().zip(b).zip(s).zip(out) {
@@ -118,8 +113,7 @@ fn variant_c(qa: &[[f64; 4]], qb: &[[f64; 4]], s: &[f64], ow: &mut [[f64; 4]]) {
     }
 }
 
-/// **D** — `0016`'s implementation-plan step 3, taken literally: `[f64; 4]`
-/// blocks with a compile-time-constant inner trip count.
+/// **D** — `0016` step 3 literally: `[f64; 4]` blocks with a constant trip count.
 #[inline(never)]
 fn variant_d(qa: &[[f64; 4]], qb: &[[f64; 4]], s: &[f64], ow: &mut [[f64; 4]]) {
     let n = s.len() / 4 * 4;
@@ -158,7 +152,7 @@ fn variant_d(qa: &[[f64; 4]], qb: &[[f64; 4]], s: &[f64], ow: &mut [[f64; 4]]) {
     }
 }
 
-/// `θ²` from `h = 1 − |cos θ|` — a local copy of `interp.rs`'s `theta_sq_from_chord` (`pub(crate)`);
+/// `θ²` from `h = 1 − |cos θ|`: a local copy of `interp.rs`'s `theta_sq_from_chord`;
 /// `variants_agree_with_eval` keeps it honest.
 #[inline]
 fn theta_sq(h: f64) -> f64 {
@@ -210,8 +204,8 @@ fn best<F: FnMut()>(label: &str, mut f: F) -> f64 {
     b
 }
 
-/// Every variant must compute the same number: B, C and D drop branches unreachable *for this
-/// data*, and this says so if an edit makes one reachable.
+/// Every variant must compute the same number: B, C and D drop branches unreachable
+/// for this data.
 fn variants_agree_with_eval(a: &[Iso3], b: &[Iso3], s: &[f64]) -> f64 {
     let (qa, qb) = (quats(a), quats(b));
     let mut ob = vec![Iso3::IDENTITY; N];

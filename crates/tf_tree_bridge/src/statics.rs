@@ -1,13 +1,7 @@
 //! Static-transform semantics — `docs/PHASE4.md` §5.7.
 //!
-//! `/tf_static` is latched and re-delivered to late joiners. §5.7's three cases:
-//!
-//! * **Identical value** (bitwise, or within 1e-12): idempotent, silent. The
-//!   tolerance keeps one-ulp re-serialization differences from reading as a
-//!   URDF disagreement.
-//! * **Different value**: a diagnostic naming both publishers *and both values*,
-//!   then the authority policy.
-//! * **A kind change** (static vs dynamic for one edge): a hard error.
+//! Identical value (within 1e-12): silent. Different value: a diagnostic naming
+//! both publishers and values. A kind change: a hard error.
 
 use crate::config::{EdgeShape, TopologyConfig};
 use crate::edgeindex::{EdgeIndex, EdgeSlot};
@@ -37,7 +31,7 @@ pub enum StaticVerdict {
         intruder: Publisher,
         /// The value on file.
         existing: [f64; 7],
-        /// The value just offered. §5.7 requires **both** values reported.
+        /// The value just offered.
         offered: [f64; 7],
         /// First occurrence of this exact conflict, for rate limiting.
         first_time: bool,
@@ -51,21 +45,15 @@ pub enum StaticVerdict {
 
 /// Tracks declared edges and their static values.
 ///
-/// Every table is a `Vec` indexed by the `EdgeSlot` that `EdgeIndex` answers once
-/// per `(parent, child)` (see `crate::edgeindex`). Built unseeded (as
-/// `tf_tree_ingest` does) the index grows.
+/// Every table is a `Vec` indexed by the `EdgeSlot` that `EdgeIndex` returns.
 #[derive(Debug, Default)]
 pub struct StaticStore {
-    /// `(parent, child)` → the slot every vector below is indexed by.
     index: EdgeIndex<EdgeSlot>,
     kinds: Vec<StaticKind>,
-    /// `None` for a dynamic edge, which has no declared constant.
     values: Vec<Option<([f64; 7], Publisher)>>,
-    /// Conflicts already reported per edge, for rate limiting.
     reported: Vec<u64>,
-    /// The **intruder** of an edge's first conflict, for
-    /// [`StaticStore::conflicts_by_edge`]; `values[slot]` holds the owner. Written
-    /// only where `reported[slot]` goes 0 to 1: one clone per edge, ever.
+    /// The intruder of an edge's first conflict, for
+    /// [`StaticStore::conflicts_by_edge`]; written only when `reported` goes 0 to 1.
     first_intruder: Vec<Option<Publisher>>,
     conflicts: u64,
 }
@@ -80,10 +68,8 @@ impl StaticStore {
         StaticStore::default()
     }
 
-    /// A store pre-loaded with a topology config's declarations (§5.8's
-    /// amendment): every static edge's value is on file, owned by
-    /// [`Publisher::Declared`], before any message arrives, so `/tf_static` is
-    /// §5.7's conflict machinery with the config as incumbent.
+    /// A store pre-loaded with a topology config's declarations (§5.8): every
+    /// static edge's value is owned by [`Publisher::Declared`].
     #[must_use]
     pub fn seeded(config: &TopologyConfig) -> StaticStore {
         let mut s = StaticStore {
@@ -107,14 +93,13 @@ impl StaticStore {
         s
     }
 
-    /// Whether the topology declares this edge at all (§5.8's undeclared-edge
-    /// check).
+    /// Whether the topology declares this edge at all (§5.8).
     #[must_use]
     pub fn is_declared(&self, parent: &str, child: &str) -> bool {
         self.index.get(parent, child).is_some()
     }
 
-    /// Record that `(parent, child)` arrived on `/tf` — a dynamic edge.
+    /// Record that `(parent, child)` arrived on `/tf`.
     ///
     /// # Errors
     ///
@@ -142,8 +127,7 @@ impl StaticStore {
         self.observe_static_at(slot, pose, publisher)
     }
 
-    /// [`Self::observe_static`] for a caller that already holds the slot. `Declare`
-    /// is reachable only from an unseeded store.
+    /// [`Self::observe_static`] for a held slot; `Declare` needs an unseeded store.
     pub(crate) fn observe_static_at(
         &mut self,
         slot: EdgeSlot,
@@ -180,8 +164,8 @@ impl StaticStore {
         }
     }
 
-    /// The slot for `(parent, child)`, creating it with `kind` if new. Every
-    /// vector is extended in lockstep, so a slot is always in range of all four.
+    /// The slot for `(parent, child)`, creating it with `kind` if new; every
+    /// vector is extended in lockstep.
     fn slot_or_insert(&mut self, parent: &str, child: &str, kind: StaticKind) -> EdgeSlot {
         if let Some(slot) = self.index.get(parent, child) {
             return slot;
@@ -216,8 +200,7 @@ impl StaticStore {
         self.kinds.len()
     }
 
-    /// Static conflict **observations** (§5.9); see [`StaticStore::conflicts_by_edge`]
-    /// for the fault count.
+    /// Static conflict observations (§5.9); see [`StaticStore::conflicts_by_edge`].
     #[must_use]
     pub fn conflicts(&self) -> u64 {
         self.conflicts
@@ -225,21 +208,12 @@ impl StaticStore {
 
     /// Every static edge with a recorded conflict, as
     /// `(parent, child, owner, intruder, count)` — the shape
-    /// [`crate::Authority::conflicts`] yields (§5.4 requires both publishers
-    /// named for **every** recorded edge).
-    ///
-    /// The iterator's length is the fault count; the count beside each edge is
-    /// how many times it was observed. `/tf_static` is `transient_local`, so one
-    /// misconfiguration redelivered to ten late joiners is ten observations in
-    /// [`StaticStore::conflicts`] and one fault here.
-    ///
-    /// Reading `reported` equals the old counter because `Strict` closes its
-    /// window once.
+    /// [`crate::Authority::conflicts`] yields (§5.4). The iterator's length is
+    /// the fault count; `count` is observations of that edge.
     pub fn conflicts_by_edge(
         &self,
     ) -> impl Iterator<Item = (&str, &str, &Publisher, &Publisher, u64)> {
-        // Membership is `first_intruder`; `?` on the owner rather than a panic in
-        // a diagnostic accessor.
+        // Membership is `first_intruder`.
         self.first_intruder
             .iter()
             .enumerate()
@@ -260,10 +234,10 @@ impl StaticStore {
 
 /// Whether two static poses are "the same" for §5.7's purposes.
 ///
-/// Quaternion and translation are compared separately against `STATIC_EPS`, and
-/// `q` and `-q` are equal (same rotation, sign depends on the conversion).
+/// Quaternion and translation are compared separately against `STATIC_EPS`;
+/// `q` and `-q` are equal.
 fn same_pose(a: &[f64; 7], b: &[f64; 7]) -> bool {
-    // Non-finite never matches: otherwise `NaN != NaN` conflicts with itself forever.
+    // Non-finite never matches.
     if !a.iter().chain(b.iter()).all(|v| v.is_finite()) {
         return false;
     }
@@ -298,7 +272,6 @@ mod tests {
                 StaticVerdict::Idempotent
             );
         }
-        // A different publisher offering the same value is also idempotent.
         assert_eq!(
             s.observe_static("base", "lidar", ID, &node("/rsp2")),
             StaticVerdict::Idempotent
@@ -307,8 +280,6 @@ mod tests {
     }
 
     /// A different value names both publishers and both values.
-    ///
-    /// Mutant: drop `existing`/`offered` from the verdict.
     #[test]
     fn a_differing_value_reports_both_sides() {
         let mut s = StaticStore::new();
@@ -331,7 +302,6 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // Rate-limited: loud once, counted thereafter.
         for _ in 0..10 {
             match s.observe_static("base", "lidar", moved, &node("/rsp_b")) {
                 StaticVerdict::Conflict { first_time, .. } => assert!(!first_time),
@@ -342,8 +312,6 @@ mod tests {
     }
 
     /// `q` and `-q` are the same rotation.
-    ///
-    /// Mutant: compare componentwise without the sign fold.
     #[test]
     fn a_negated_quaternion_is_not_a_conflict() {
         let mut s = StaticStore::new();
@@ -354,7 +322,6 @@ mod tests {
             s.observe_static("a", "b", neg, &node("/y")),
             StaticVerdict::Idempotent
         );
-        // The translation is not sign-folded.
         let flipped_t: [f64; 7] = [-0.5, -0.5, -0.5, -0.5, -1.0, 2.0, 3.0];
         assert!(matches!(
             s.observe_static("a", "b", flipped_t, &node("/y")),
@@ -413,21 +380,13 @@ mod tests {
         assert_eq!(s2.kind_of("base", "lidar"), Some(StaticKind::Static));
     }
 
-    /// `conflicts_by_edge` names 3 contradicted edges against 9 observations, so
-    /// neither can be substituted for the other (§5.4).
-    ///
-    /// Mutant: write `first_intruder[slot]` on every conflict, not only the first
-    /// (`cam`'s intruder then reads `/latecomer`).
-    ///
-    /// Mutant: set `first_intruder[slot]` in `slot_or_insert` (never-contradicted
-    /// edges then appear: 5 entries against 3).
+    /// `conflicts_by_edge` names 3 contradicted edges against 9 observations (§5.4).
     #[test]
     fn conflicts_by_edge_names_every_contradicted_edge_its_publishers_and_no_others() {
         const OTHER: [f64; 7] = [1.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0];
         const THIRD: [f64; 7] = [1.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0];
         let mut s = StaticStore::new();
 
-        // Two edges never contradicted; they must not appear.
         assert_eq!(
             s.observe_static("base", "lidar", ID, &node("/rsp")),
             StaticVerdict::Declare
@@ -457,7 +416,6 @@ mod tests {
                 StaticVerdict::Conflict { .. }
             ));
         }
-        // A second intruder: the recorded one stays the publisher that opened the fault.
         assert!(matches!(
             s.observe_static("base", "cam", THIRD, &node("/latecomer")),
             StaticVerdict::Conflict { .. }
@@ -468,7 +426,6 @@ mod tests {
                 StaticVerdict::Conflict { .. }
             ));
         }
-        // One contradicted exactly once: the membership boundary.
         assert_eq!(
             s.observe_static("base", "gps", ID, &node("/rsp")),
             StaticVerdict::Declare

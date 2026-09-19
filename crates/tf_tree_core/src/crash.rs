@@ -1,38 +1,29 @@
-//! Named, deterministic abort sites — `docs/PHASE2.md` §11.3.
-//!
-//! §11.3 is NORMATIVE: a participant killed at *any* instruction must leave state
-//! another can repair. An outside `SIGKILL` reaches a shallower set of states, so
-//! `shm_torture --crash-points` is not §11.3 coverage.
+//! Named, deterministic abort sites — `docs/PHASE2.md` §11.3 (NORMATIVE).
 //!
 //! `crash_point!("<name>")` expands to nothing unless the default-off
-//! `crash-points` feature is on, when it calls `maybe_abort`, which fires on the
-//! `nth_hit`th reach of the site named by
+//! `crash-points` feature is on, when it aborts on the `nth_hit`th reach of the
+//! site named by
 //!
 //! ```text
 //! TF_TREE_CRASH_AT=<name>:<nth_hit>
 //! ```
 //!
 //! (`:<nth_hit>` defaults to `:1`; one site is armed per process). `SITES` lists
-//! this crate's sites; the other §11.3 rows (`open.*`, `hangup.*`, `reclaim.*`,
-//! `takeover.*`, `topo.holding_lock`) live with the crates that own those
-//! protocols.
+//! this crate's sites; the other §11.3 rows live with the crates that own them.
 //!
 //! # Why `abort`, not `panic!`
 //!
 //! A panic unwinds and runs `Drop` ([`crate::edge::Publisher`] releases its
 //! claim, [`crate::participant::ParticipantTable::release`] frees the slot),
-//! repairing the very damage the test observes. The diagnostic therefore goes out
-//! through `std::io::Write` with errors discarded, not `eprintln!`.
+//! repairing the damage under test; so the diagnostic uses `std::io::Write`,
+//! not `eprintln!`.
 //!
 //! # `no_std`
 //!
-//! The feature pulls in `std` for itself via `extern crate std` in the crate
-//! root; a default build links no `std`.
+//! The feature pulls in `std` via `extern crate std`; a default build links none.
 
 /// Every crash point compiled into **this crate**, in `docs/PHASE2.md` §11.3's
-/// table order.
-///
-/// Harnesses (§11.4) read the names from here so a typo cannot arm nothing.
+/// table order, so harnesses (§11.4) cannot arm nothing by typo.
 #[cfg(feature = "crash-points")]
 pub const SITES: &[&str] = &[
     "push.after_seq_odd",
@@ -57,10 +48,8 @@ static ARMED: std::sync::OnceLock<Option<(alloc::string::String, u64)>> =
 #[cfg(feature = "crash-points")]
 static HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The armed `(name, nth_hit)`, or `None` when the variable is absent, empty, or
-/// does not parse.
-///
-/// A malformed value disarms; each site's test asserts the abort.
+/// The armed `(name, nth_hit)`, or `None` if the variable is absent, empty or
+/// malformed.
 #[cfg(feature = "crash-points")]
 fn spec() -> Option<&'static (alloc::string::String, u64)> {
     ARMED
@@ -79,12 +68,9 @@ fn spec() -> Option<&'static (alloc::string::String, u64)> {
 }
 
 /// Abort this process if `name` is the armed site and this is its armed hit.
-///
-///
 /// # Aborts
 ///
-/// By `std::process::abort`, on the `nth_hit`th call naming the armed site.
-/// **Not** a panic (see the module docs).
+/// By `std::process::abort`, on the `nth_hit`th call naming the armed site (not a panic).
 #[cfg(feature = "crash-points")]
 pub fn maybe_abort(name: &str) {
     use core::sync::atomic::Ordering;

@@ -1,17 +1,13 @@
 //! The ingest report — `docs/PHASE5.md` §3.2.
 //!
-//! Two renderings of one structure: [`IngestReport::to_json`] for the file beside
-//! the `.tft` and [`IngestReport::summary`] for the terminal. The JSON is written
-//! by hand, as `tf_tree`'s CBOR manifest writer is; `push_json_string` is the
-//! escaper.
+//! `to_json` writes the file beside the `.tft`, `summary` the terminal text.
 
 use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::ingest::{FillStats, Frames, Survey};
 
-/// The JSON document's schema tag. Bumped only for a breaking change, so a
-/// consumer can pin it.
+/// The JSON document's schema tag; bumped only for a breaking change.
 pub const REPORT_SCHEMA: &str = "tf_tree.ingest/2";
 
 /// What one ingest did, as data.
@@ -43,14 +39,11 @@ pub struct IngestReport {
     pub remaps: Vec<(String, String)>,
     /// Dynamic edges that ended with no samples.
     pub edges_without_samples: Vec<String>,
-    /// §3.2's static-conflict row, with **both** values — one row per contradicted
-    /// edge ([`crate::Anomalies::static_conflicts`] counts messages).
+    /// §3.2's static-conflict row, with both values, one row per contradicted edge.
     pub static_conflict_details: Vec<StaticConflictRow>,
 }
 
 /// One contradicted static edge in the report, with frame names resolved.
-///
-/// [`crate::StaticConflict`] with names instead of [`crate::FrameId`]s.
 #[derive(Clone, Debug)]
 pub struct StaticConflictRow {
     /// Parent frame name.
@@ -80,13 +73,11 @@ pub struct EdgeRow {
     pub is_static: bool,
     /// Samples the source contained, after pass one's drops.
     pub samples: u64,
-    /// Oldest stamp **in the source**, not the manifest's ring-retained
-    /// `oldest_ns` (§2.3's amendment).
+    /// Oldest stamp in the source, not the manifest's ring-retained `oldest_ns`.
     pub source_oldest_ns: Option<i64>,
     /// Newest stamp in the source.
     pub source_newest_ns: Option<i64>,
-    /// Mean publish rate over the source span, or `None` for fewer than two
-    /// samples or a zero-length span.
+    /// Mean publish rate over the source span; `None` below two samples.
     pub rate_hz: Option<f64>,
 }
 
@@ -94,7 +85,6 @@ impl IngestReport {
     /// Build a report from a completed survey and fill.
     #[must_use]
     pub fn new(path: &Path, survey: &Survey, frames: &Frames, fill: FillStats) -> IngestReport {
-        // Canonical order, via the function `ingest::fill` calls.
         let order = crate::ingest::canonical_order(survey, frames);
         let edges: Vec<EdgeRow> = order
             .iter()
@@ -102,7 +92,6 @@ impl IngestReport {
             .map(|e| {
                 let rate = match (e.source_oldest_ns, e.source_newest_ns) {
                     (Some(lo), Some(hi)) if hi > lo && e.samples > 1 => {
-                        // `samples - 1` intervals over the span.
                         let secs = (hi - lo) as f64 / 1e9;
                         Some((e.samples - 1) as f64 / secs)
                     }
@@ -121,7 +110,7 @@ impl IngestReport {
             })
             .collect();
         let mut anomalies = survey.anomalies.clone();
-        // Duplicates are only knowable after the sort, so pass two owns the count.
+        // Duplicates are only knowable after the sort.
         anomalies.duplicate_stamps = fill.duplicates;
         IngestReport {
             source: path.display().to_string(),
@@ -293,7 +282,6 @@ impl IngestReport {
         }
         s.push(']');
 
-        // §3.2's "report both values"; the count is in `anomalies` above.
         s.push_str(",\"static_conflict_details\":[");
         for (i, c) in self.static_conflict_details.iter().enumerate() {
             if i > 0 {
@@ -317,8 +305,7 @@ impl IngestReport {
         s
     }
 
-    /// The terminal summary. The first three lines answer "did it work, over what,
-    /// and how much"; every anomaly line is omitted when its count is zero.
+    /// The terminal summary; every anomaly line is omitted when its count is zero.
     #[must_use]
     pub fn summary(&self) -> String {
         let mut s = String::new();
@@ -353,7 +340,6 @@ impl IngestReport {
                 self.fill.passes, self.fill.peak_buffer_bytes
             );
         }
-        // Its own line: a spill costs disk, not time.
         if self.fill.spilled_runs > 0 {
             let _ = writeln!(
                 s,
@@ -371,14 +357,12 @@ impl IngestReport {
                 let _ = writeln!(s, "  ! {text}");
             }
         };
-        // First: every other number then describes a prefix.
         row(
             a.truncated,
             "the recording ends mid-record and was read up to that point; \
              every count below covers only the part that exists"
                 .to_owned(),
         );
-        // Like `truncated`, the counts cover only part; the span makes it actionable.
         row(
             a.bad_chunks > 0,
             match a.bad_chunk_span_ns {
@@ -398,7 +382,6 @@ impl IngestReport {
                 ),
             },
         );
-        // A subset of the row above and the only skip with a remedy (a flag).
         row(
             a.chunks_over_limit > 0,
             format!(
@@ -409,8 +392,7 @@ impl IngestReport {
                 a.chunks_over_limit
             ),
         );
-        // States only what is known: this run did not look, and which flag makes it
-        // (`a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so`).
+        // Names only what is known: this run did not look, and which flag makes it.
         row(
             a.oversized_records_skipped > 0,
             format!(
@@ -459,8 +441,7 @@ impl IngestReport {
             ),
         );
         row(a.static_conflicts > 0, {
-            // Both values, at full precision: `StaticStore` treats poses within
-            // 1e-12 as equal, so rounding could print identical-looking numbers.
+            // Full precision: `StaticStore` treats poses within 1e-12 as equal.
             let mut t = format!(
                 "{} /tf_static messages contradicted an already-declared value; the first won",
                 a.static_conflicts
@@ -493,7 +474,6 @@ impl IngestReport {
                 a.empty_names
             ),
         );
-        // One row over two fields; the JSON keeps them apart (different remedies).
         row(
             a.filtered_channels + a.non_cdr_channels > 0,
             format!(
@@ -517,7 +497,7 @@ impl IngestReport {
 
 /// A canonical `[qw qx qy qz tx ty tz]` pose as a JSON array.
 ///
-/// Non-finite components become `null`, as for `rate_hz`: JSON has no `NaN`.
+/// Non-finite components become `null`.
 fn push_pose(s: &mut String, p: &[f64; 7]) {
     s.push('[');
     for (i, v) in p.iter().enumerate() {
@@ -582,8 +562,7 @@ fn push_json_string(s: &mut String, v: &str) {
 mod tests {
     use super::*;
 
-    /// A non-finite rate is emitted as `null`. Built by hand: no readable
-    /// recording produces one.
+    /// A non-finite rate is emitted as `null`.
     #[test]
     fn non_finite_rate_is_null() {
         let row = EdgeRow {
@@ -617,9 +596,7 @@ mod tests {
         assert!(!json.contains("NaN"), "{json}");
     }
 
-    /// A ceiling refusal is reported as one, naming the flag, not as an
-    /// unreadable chunk. Rendering only; end to end is
-    /// `ingest::a_recording_over_every_ceiling_names_the_flag_not_an_empty_recording`.
+    /// A ceiling refusal is reported naming the flag, not as an unreadable chunk.
     #[test]
     fn a_ceiling_refusal_is_reported_apart_from_damage() {
         let with_limit = |over: u64| {
@@ -656,7 +633,6 @@ mod tests {
             "and the report must say the chunks were sound: {text}"
         );
 
-        // Zero is silent, like every other anomaly row.
         assert!(
             !with_limit(0).contains("--max-chunk-size"),
             "{}",

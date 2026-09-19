@@ -1,16 +1,13 @@
 //! Reading a recording from Python — `docs/PHASE5.md` §3 and §4,
 //! [`0046`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0046-the-consumer-the-crate-boundary-was-drawn-for.md).
 //!
-//! [`ingest_bag`] returns an ordinary [`Tree`](crate::tree::PyTree), the type
-//! `open_file` returns (§4.1: no parallel offline API). There is no `freeze_bag`:
-//! it would be a second spelling of `ingest_bag(p).freeze(out)`; the tree carries
-//! its provenance ([`crate::tree::SourceInfo`]) and `Tree.freeze` writes it.
+//! [`ingest_bag`] returns an ordinary [`Tree`](crate::tree::PyTree) (§4.1); there
+//! is no `freeze_bag` — use `ingest_bag(p).freeze(out)`.
 //!
 //! # The GIL
 //!
-//! Released around the whole ingest (seconds of file passes, unlike the 1 µs
-//! [`crate::tree::GIL_RELEASE_THRESHOLD_NS`] of a lookup). Nothing inside the
-//! `detach` touches a Python object.
+//! Released around the whole ingest; nothing inside the `detach` touches a
+//! Python object.
 
 use std::path::PathBuf;
 
@@ -20,12 +17,7 @@ use tf_tree_ingest::{Frames, IngestError, IngestOptions};
 use crate::errors::TfTreeError;
 use crate::tree::{PyTree, SourceInfo};
 
-/// Build the library's options from the keyword arguments this API exposes.
-///
-/// Five of `IngestOptions`' ten fields are keywords: what a user with a real
-/// recording reaches for, plus `max_record_bytes`, which
-/// [`0010`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0010-a-ceiling-on-one-record.md)
-/// exists to let callers raise without forking.
+/// Build the library's options from the exposed keyword arguments.
 fn options(
     static_topics: Option<Vec<String>>,
     tf_topics: Option<Vec<String>>,
@@ -54,8 +46,7 @@ fn options(
 
 /// Map an [`IngestError`] onto Python.
 ///
-/// Errno variants become `OSError` (as `offline::frozen_err`); the rest a
-/// [`TfTreeError`] with the library's rendered message (`docs/API.md` §1 R5).
+/// Errno variants become `OSError`; the rest a [`TfTreeError`] (`docs/API.md` §1 R5).
 fn ingest_err(err: IngestError, frames: &Frames) -> PyErr {
     match err {
         IngestError::Io { raw_os_error } | IngestError::Spill { raw_os_error }
@@ -70,18 +61,14 @@ fn ingest_err(err: IngestError, frames: &Frames) -> PyErr {
 
 /// Read an MCAP recording into an in-memory tree.
 ///
-/// `path` is any `os.PathLike` naming an MCAP recording. Returns an ordinary
-/// `Tree` whose `Tree.source` records the recording, so
-/// `ingest_bag(p).freeze(out)` writes a `.tft` traceable to `p`.
-///
-/// `Tree.source["digest"]` is the BLAKE3 of the recording, one extra sequential
-/// pass taken on every call so a moved file fails here, not at `freeze`.
+/// `path` is any `os.PathLike` naming an MCAP recording. Returns a `Tree`
+/// whose `Tree.source` records it; `Tree.source["digest"]` is its BLAKE3.
 ///
 /// # Errors
 ///
-/// `OSError` for an unreadable recording; `TfTreeError` with the rendered reason
-/// for anything else (not an MCAP, a `.db3` bag, a clock reset, an edge whose
-/// kind changed, a record over `max_record_bytes`).
+/// `OSError` for an unreadable recording; `TfTreeError` for anything else
+/// (not an MCAP, a clock reset, a changed edge kind, a record over
+/// `max_record_bytes`).
 #[pyfunction]
 #[pyo3(signature = (
     path, /, *,

@@ -1,9 +1,7 @@
 //! The shared mobile-robot fixture tree (`docs/PHASE1.md` §11.1): 24 frames,
 //! max depth 6, four dynamic edges (`map→odom` 50 Hz, `odom→base_link` 200 Hz,
-//! `base_link→imu_link` 1 kHz, `lidar_mount→lidar` 10 Hz) and 19 static. Every
-//! dynamic ring retains [`HISTORY_SECS`] at its own rate. The [`EDGES`] table
-//! drives the benches, the CLI demo, the differential harness and the doctor's
-//! healthy-tree tests. Builders return `Result`; the crate holds no `unwrap`.
+//! `base_link→imu_link` 1 kHz, `lidar_mount→lidar` 10 Hz) and 19 static. Each
+//! dynamic ring retains [`HISTORY_SECS`]; [`EDGES`] drives every consumer.
 
 use anyhow::{anyhow, Result};
 
@@ -15,16 +13,12 @@ pub const HISTORY_SECS: f64 = 10.0;
 
 /// A query stamp inside every dynamic edge's retained window.
 ///
-/// It is a knot on all four sample grids (multiple of 20, 5, 1 and 100 ms), so
-/// a query at `NOW_NS` takes the exact-hit branch and the interpolator never
-/// runs: right for a history window, wrong for latency (`docs/decisions/0013`).
-/// Latency benchmarks query [`QUERY_NS`]; do not tidy that offset away.
+/// It is a knot on all four sample grids, so the interpolator never runs: right
+/// for history, wrong for latency (`docs/decisions/0013`); latency uses [`QUERY_NS`].
 pub const NOW_NS: i64 = 9_900_000_000;
 
 /// The stamp every latency benchmark queries: [`NOW_NS`] moved 500 µs off all
-/// four sample grids so the interpolator runs, still inside every retained
-/// window. Interpolation fractions: 0.975 (50 Hz), 0.9 (200 Hz), 0.5 (1 kHz),
-/// 0.995 (10 Hz).
+/// four sample grids so the interpolator runs, inside every retained window.
 pub const QUERY_NS: i64 = NOW_NS - 500_000;
 
 /// What an [`EdgeDef`] describes.
@@ -67,10 +61,9 @@ const fn mount(rz: f64, x: f64, y: f64, z: f64) -> EdgeDefKind {
     }
 }
 
-/// The 23 edges of the fixture (4 dynamic + 19 static), over 24 frames; the
-/// longest chain (`map → … → camera_optical`) is six edges deep.
+/// The 23 edges of the fixture (4 dynamic + 19 static) over 24 frames.
 pub const EDGES: &[EdgeDef] = &[
-    // --- kinematic spine (dynamic) --------------------------------------
+    // kinematic spine (dynamic)
     EdgeDef {
         parent: "map",
         child: "odom",
@@ -91,7 +84,7 @@ pub const EDGES: &[EdgeDef] = &[
         child: "lidar",
         kind: EdgeDefKind::Dynamic { rate_hz: 10.0 },
     },
-    // --- chassis (static) -----------------------------------------------
+    // chassis (static)
     EdgeDef {
         parent: "base_link",
         child: "base_footprint",
@@ -147,7 +140,7 @@ pub const EDGES: &[EdgeDef] = &[
         child: "rear_camera_link",
         kind: mount(core::f64::consts::PI, -0.28, 0.0, 0.20),
     },
-    // --- sensor arch (static) -------------------------------------------
+    // sensor arch (static)
     EdgeDef {
         parent: "sensor_arch",
         child: "lidar_mount",
@@ -243,8 +236,7 @@ pub fn build_tree_with(interp: InterpPolicy) -> Result<Tree> {
     b.build().map_err(|e| anyhow!("build fixture tree: {e}"))
 }
 
-/// A deterministic synthetic pose for dynamic edge `seed` at nanosecond `stamp`:
-/// a smooth, bounded screw motion, well conditioned for interpolation.
+/// A deterministic smooth, bounded screw pose for edge `seed` at `stamp`.
 #[must_use]
 pub fn dynamic_pose(seed: f64, stamp_ns: i64) -> Iso3 {
     let t = stamp_ns as f64 * 1e-9;
@@ -259,8 +251,7 @@ pub fn dynamic_pose(seed: f64, stamp_ns: i64) -> Iso3 {
     exp_se3(xi)
 }
 
-/// One recorded publish, in arrival order: the input the `doctor` diagnostics
-/// consume.
+/// One recorded publish, in arrival order: input to `doctor` diagnostics.
 #[derive(Clone, Copy, Debug)]
 pub struct PushSample {
     /// The edge id the sample was published to.
@@ -269,14 +260,12 @@ pub struct PushSample {
     pub writer_pid: u32,
     /// The sample's timestamp, in nanoseconds.
     pub stamp_ns: i64,
-    /// How late this sample arrived relative to its stamp (publish latency), in
-    /// nanoseconds. The fixture models one nominal period of lateness.
+    /// How late this sample arrived relative to its stamp, in nanoseconds.
     pub arrival_delay_ns: i64,
 }
 
 /// Claim every dynamic edge and publish [`HISTORY_SECS`] of synthetic history,
-/// returning the live [`EdgeWriter`]s (claims held while they live) and the
-/// recorded push stream.
+/// returning the live [`EdgeWriter`]s and the recorded push stream.
 ///
 /// # Errors
 ///
@@ -338,33 +327,23 @@ mod tests {
     use super::{build_tree, DYNAMIC_EDGES, NOW_NS, QUERY_NS};
     use crate::workload::dyn_steps;
 
-    /// The two stamps' relationship to the sample grids (`docs/decisions/0013`):
-    /// edge `k` is published at `0, period, 2·period, …`, so "on the grid" is
-    /// "divisible by the period".
-    ///
-    /// Mutant (confirmed fatal): `QUERY_NS = NOW_NS` fires the second assertion
-    /// on the first edge.
+    /// The stamps' relationship to the sample grids (`docs/decisions/0013`).
     #[test]
     fn the_latency_query_stamp_is_off_every_dynamic_grid() {
         assert!(!DYNAMIC_EDGES.is_empty());
         for &(parent, child, rate_hz) in DYNAMIC_EDGES {
             let period_ns = (1e9 / rate_hz) as i64;
-            // The trap: NOW_NS is a knot on every grid, which is why it is not
-            // the stamp a latency benchmark may use.
             assert_eq!(
                 NOW_NS % period_ns,
                 0,
                 "{parent}->{child}: NOW_NS is documented as on-grid at {rate_hz} Hz"
             );
-            // The fix: QUERY_NS is not, so `I::eval` runs on every edge.
             assert_ne!(
                 QUERY_NS % period_ns,
                 0,
                 "{parent}->{child}: QUERY_NS lands on the {rate_hz} Hz grid, so \
                  that edge takes the exact-hit branch and never interpolates"
             );
-            // …and it interpolates: NOW_NS is a knot on every grid, so a stamp
-            // in `(NOW_NS − period, NOW_NS)` is bracketed by two stored samples.
             assert!(
                 QUERY_NS < NOW_NS && QUERY_NS > NOW_NS - period_ns,
                 "{parent}->{child}: QUERY_NS must fall inside the segment ending \
@@ -373,14 +352,8 @@ mod tests {
         }
     }
 
-    /// What each row of `benches/lookup.rs` compiles to. `docs/PHASE1.md` §11.3
-    /// is NORMATIVE that every latency row states its dynamic-step count;
-    /// `depth6` folds four static edges to one constant step, so it is cheaper
-    /// than `depth3`, and `docs/decisions/0013`'s per-step arithmetic relies on
-    /// these shapes.
-    ///
-    /// Mutant (confirmed fatal): declaring `base_link -> sensor_arch` dynamic
-    /// fails `depth6: compiled step count` (left 4, right 3).
+    /// What each row of `benches/lookup.rs` compiles to; `docs/PHASE1.md` §11.3
+    /// (NORMATIVE) requires each latency row to state its dynamic-step count.
     #[test]
     fn the_benched_paths_have_the_step_counts_the_baseline_assumes() {
         let tree = build_tree().expect("fixture");

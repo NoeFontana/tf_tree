@@ -1,20 +1,10 @@
 //! CDR decoding of `tf2_msgs/msg/TFMessage` — `docs/PHASE5.md` §3.3.
 //!
-//! Hand-written so the `mcap` crate needs no ROS (§0.0): the grammar is four
-//! primitives and two strings.
-//!
 //! ROS transmits quaternions **w-last**; the canonical `[f64; 7]` order is
-//! w-first (`docs/PHASE1.md` §3.1). A transposition yields a valid but wrong
-//! rotation, so it happens once, in `Reader::transform`, and is tested against
-//! wire-order bytes (`wire_bytes_decode_w_last`).
-//!
-//! Decoding allocates per transform (owned `String`s); this is an offline batch
-//! path measured well inside §12 gate 5, so borrowing was not done.
+//! w-first (`docs/PHASE1.md` §3.1). The transposition happens once, in
+//! `Reader::transform`, and is tested by `wire_bytes_decode_w_last`.
 
-/// Why a `TFMessage` payload could not be decoded.
-///
-/// `Copy` and `String`-free (`docs/PROJECT.md` §5); variants carry the byte offset
-/// at which decoding gave up.
+/// Why a `TFMessage` payload could not be decoded; `Copy` and `String`-free (`docs/PROJECT.md` §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CdrError {
@@ -26,16 +16,13 @@ pub enum CdrError {
         /// How many bytes the field needed.
         want: usize,
     },
-    /// The encapsulation header was missing or names an unimplemented
-    /// representation. XCDR2 (`0x0006`..`0x0009`) lands here deliberately, not
-    /// decoded as XCDR1.
+    /// The encapsulation header was missing or unimplemented (XCDR2 lands here).
     #[error("unsupported CDR encapsulation 0x{id:04x}")]
     BadEncapsulation {
         /// The representation identifier that was found.
         id: u16,
     },
-    /// A string length prefix was zero (CDR strings include their NUL) or ran
-    /// past the payload.
+    /// A string length prefix was zero or ran past the payload.
     #[error("bad CDR string length {len} at byte {at}")]
     BadString {
         /// Offset of the length prefix.
@@ -49,8 +36,7 @@ pub enum CdrError {
         /// Offset of the string body.
         at: usize,
     },
-    /// The array length prefix exceeds what the remaining payload could hold at
-    /// the minimum element size; checked before allocating.
+    /// The array length prefix exceeds what the payload could hold; checked before allocating.
     #[error("TFMessage claims {count} transforms, which cannot fit in {bytes} bytes")]
     ImplausibleCount {
         /// The declared element count.
@@ -69,19 +55,14 @@ pub struct TransformStamped {
     pub frame_id: String,
     /// `child_frame_id`, likewise raw.
     pub child_frame_id: String,
-    /// `[qw qx qy qz tx ty tz]`, the canonical order (`docs/PHASE1.md` §3.1),
-    /// already transposed out of ROS's w-last wire order.
+    /// `[qw qx qy qz tx ty tz]` (`docs/PHASE1.md` §3.1), already out of ROS's w-last order.
     pub pose: [f64; 7],
 }
 
-/// A lower bound on one encoded `TransformStamped` (no padding), the
-/// denominator of `decode_tf_message`'s plausibility check.
+/// A lower bound on one encoded `TransformStamped`, for the plausibility check.
 const MIN_TRANSFORM_BYTES: usize = 4 + 4 + 5 + 5 + 56;
 
-/// A cursor over one CDR-encapsulated body.
-///
-/// Every primitive of size `n` starts at a multiple of `n` counted from the
-/// start of the body (after the 4-byte header); `buf` is the body alone.
+/// A cursor over one CDR body (after the 4-byte header); primitives align to their size.
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -134,8 +115,7 @@ impl<'a> Reader<'a> {
         })
     }
 
-    /// A CDR `string`: a `u32` length including the NUL, then the bytes. The NUL
-    /// is dropped if present, since some serializers do not count it.
+    /// A CDR `string`: `u32` length including the NUL, then the bytes. A missing NUL is tolerated.
     fn string(&mut self) -> Result<String, CdrError> {
         let at = self.pos;
         let len = self.u32()?;
@@ -153,14 +133,11 @@ impl<'a> Reader<'a> {
             .map_err(|_| CdrError::NotUtf8 { at: body_at })
     }
 
-    /// One `geometry_msgs/msg/TransformStamped`.
     fn transform(&mut self) -> Result<TransformStamped, CdrError> {
-        // Header: Time { int32 sec, uint32 nanosec }, then frame_id. `sec` is signed.
         let sec = i64::from(self.i32()?);
         let nanosec = i64::from(self.u32()?);
         let frame_id = self.string()?;
         let child_frame_id = self.string()?;
-        // Vector3 translation, then the quaternion as x y z w.
         let tx = self.f64()?;
         let ty = self.f64()?;
         let tz = self.f64()?;
@@ -169,7 +146,6 @@ impl<'a> Reader<'a> {
         let qz = self.f64()?;
         let qw = self.f64()?;
         Ok(TransformStamped {
-            // Saturating: corrupt data should look absurd, not plausible.
             stamp_ns: sec.saturating_mul(1_000_000_000).saturating_add(nanosec),
             frame_id,
             child_frame_id,
@@ -190,7 +166,6 @@ pub fn decode_tf_message(payload: &[u8]) -> Result<Vec<TransformStamped>, CdrErr
             want: 4 - payload.len(),
         });
     }
-    // The header is big-endian whatever the body is.
     let id = u16::from_be_bytes([payload[0], payload[1]]);
     let little_endian = match id {
         0x0000 | 0x0002 => false,
@@ -214,14 +189,11 @@ pub fn decode_tf_message(payload: &[u8]) -> Result<Vec<TransformStamped>, CdrErr
     Ok(out)
 }
 
-/// Encode a `TFMessage` payload the way ROS 2 does (XCDR1, little-endian).
-///
-/// For [`crate::fixture`]. Not the decoder's oracle: see `wire_bytes_decode_w_last`.
+/// Encode a `TFMessage` payload the way ROS 2 does (XCDR1, little-endian), for [`crate::fixture`].
 #[cfg(any(test, feature = "fixture"))]
 #[must_use]
 pub fn encode_tf_message(transforms: &[TransformStamped]) -> Vec<u8> {
     let mut out: Vec<u8> = vec![0x00, 0x01, 0x00, 0x00];
-    // Alignment is counted from the body, so `out.len() - 4` is the origin.
     fn pad(out: &mut Vec<u8>, n: usize) {
         while !(out.len() - 4).is_multiple_of(n) {
             out.push(0);
@@ -251,7 +223,6 @@ pub fn encode_tf_message(transforms: &[TransformStamped]) -> Vec<u8> {
         for v in [t.pose[4], t.pose[5], t.pose[6]] {
             put_f64(&mut out, v);
         }
-        // Back to w-last for the wire.
         for v in [t.pose[1], t.pose[2], t.pose[3], t.pose[0]] {
             put_f64(&mut out, v);
         }
@@ -264,8 +235,7 @@ pub fn encode_tf_message(transforms: &[TransformStamped]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// A hand-assembled little-endian one-transform `TFMessage`, w-last, with
-    /// every quaternion component distinct so a transposition is visible.
+    /// A little-endian one-transform `TFMessage` with distinct quaternion components.
     fn wire_one() -> Vec<u8> {
         let mut b: Vec<u8> = vec![0x00, 0x01, 0x00, 0x00];
         b.extend_from_slice(&1u32.to_le_bytes()); // 1 transform
@@ -273,7 +243,6 @@ mod tests {
         b.extend_from_slice(&250_000_000u32.to_le_bytes()); // nanosec
         b.extend_from_slice(&5u32.to_le_bytes()); // "odom\0"
         b.extend_from_slice(b"odom\0");
-        // Pad to a 4-byte boundary counted from the body.
         while !(b.len() - 4).is_multiple_of(4) {
             b.push(0);
         }
@@ -291,7 +260,6 @@ mod tests {
         b
     }
 
-    /// Wire bytes decode with the quaternion w-first and the stamp in nanoseconds.
     #[test]
     fn wire_bytes_decode_w_last() {
         let got = decode_tf_message(&wire_one()).unwrap();
@@ -305,7 +273,6 @@ mod tests {
         );
     }
 
-    /// The fixture encoder round-trips, with a fractional and a negative stamp.
     #[test]
     fn encoder_round_trips() {
         let src = vec![
@@ -325,7 +292,6 @@ mod tests {
         assert_eq!(decode_tf_message(&encode_tf_message(&src)).unwrap(), src);
     }
 
-    /// A big-endian encapsulation is decoded.
     #[test]
     fn big_endian_encapsulation() {
         let mut b: Vec<u8> = vec![0x00, 0x00, 0x00, 0x00];
@@ -353,7 +319,6 @@ mod tests {
         assert_eq!(got[0].pose[0], 1.0);
     }
 
-    /// A truncated payload is an error, never a panic.
     #[test]
     fn truncation_is_an_error_not_a_panic() {
         let full = wire_one();
@@ -365,7 +330,6 @@ mod tests {
         }
     }
 
-    /// A corrupt element count is rejected before allocating.
     #[test]
     fn absurd_count_is_rejected_before_allocating() {
         let mut b: Vec<u8> = vec![0x00, 0x01, 0x00, 0x00];
@@ -379,7 +343,6 @@ mod tests {
         );
     }
 
-    /// XCDR2 is refused rather than decoded as XCDR1.
     #[test]
     fn xcdr2_is_refused() {
         let mut b: Vec<u8> = vec![0x00, 0x07, 0x00, 0x00];
@@ -390,9 +353,8 @@ mod tests {
         );
     }
 
-    /// A malformed frame name is a named error at a named offset, never a panic
-    /// or a lossy guess: zero length, non-UTF-8, and a length past the payload.
-    /// `wire_one`'s first length prefix is at payload byte 16, body offset 12.
+    /// A malformed frame name is a named error at a named offset (`wire_one`'s
+    /// first length prefix is at body offset 12).
     #[test]
     fn a_malformed_frame_name_is_a_named_error_not_a_guess() {
         let mut b = wire_one();
@@ -408,7 +370,6 @@ mod tests {
 
         let mut b = wire_one();
         b[16..20].copy_from_slice(&4096u32.to_le_bytes());
-        // `take`'s bounds check refuses this; `ImplausibleCount` bounds elements only.
         assert_eq!(
             decode_tf_message(&b),
             Err(CdrError::Truncated { at: 16, want: 4096 }),

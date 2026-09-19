@@ -1,8 +1,6 @@
 //! The lock file — `docs/PHASE2.md` §3.3.
 //!
-//! A regular file that holds no state, only kernel-maintained OFD byte-range
-//! locks: mutual exclusion, release on holder death, and a way to ask whether
-//! anyone holds it.
+//! A regular file holding no state, only kernel-maintained OFD byte-range locks.
 //!
 //! | Offset | Meaning |
 //! |---|---|
@@ -12,10 +10,8 @@
 //! | bytes 16 + *i* | **Participant liveness** for slot *i*, held for the lifetime of the attachment. |
 //! | 4096 + 64·*i* | **Identity record** for slot *i*, written with `pwrite`. Advisory. |
 //!
-//! * **`F_OFD_GETLK` cannot name a holder** (`l_pid = -1`): the lock answers
-//!   "is anyone alive?", the identity records answer "who?".
-//! * **A description's own locks are invisible to its own `GETLK`.** Every query
-//!   is "does anyone **else** hold this".
+//! `F_OFD_GETLK` cannot name a holder, and a description's own locks are
+//! invisible to its own `GETLK`: every query is "does anyone **else** hold this".
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsFd;
@@ -30,8 +26,8 @@ pub use crate::ofd::LockProbe;
 
 /// Participant slots, and therefore participant lock bytes.
 ///
-/// Must equal `tf_tree_arena::DEFAULT_MAX_PARTICIPANTS`; separate only because
-/// this crate may not depend on the arena (`docs/PHASE2.md` §2).
+/// Must equal `tf_tree_arena::DEFAULT_MAX_PARTICIPANTS`; this crate may not
+/// depend on the arena (`docs/PHASE2.md` §2).
 pub const MAX_PARTICIPANTS: u32 = 64;
 
 /// Byte 0: ownership.
@@ -39,27 +35,24 @@ const OWNERSHIP_OFFSET: u64 = 0;
 /// Byte 1: A2's topology mutation lock
 /// ([`docs/decisions/0029`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0029-the-topology-lock-is-a-kernel-lock.md)).
 ///
-/// One byte, not one per participant: it answers "is anyone inside the critical
-/// section", not "is a participant alive".
+/// One byte, not one per participant: it guards a critical section.
 const TOPOLOGY_OFFSET: u64 = 1;
 /// Participant liveness starts at byte 16, leaving 2–15 reserved.
 const PARTICIPANT_BASE: u64 = 16;
 /// Identity records start on the second page.
 const IDENTITY_BASE: u64 = 4096;
 
-/// Base offset reserved for §6.1 claim locks (`CLAIM_BASE + edge_id`), 1 MiB
-/// past the identity records so a claim byte cannot collide with a participant
-/// byte.
+/// Base offset for §6.1 claim locks (`CLAIM_BASE + edge_id`), 1 MiB past the
+/// identity records.
 pub const CLAIM_BASE: u64 = 1 << 20;
 
-/// How many claim bytes the reserved region can address; bounds a corrupt
-/// `max_edges`.
+/// How many claim bytes the reserved region can address.
 pub const MAX_CLAIM_BYTES: u64 = 1 << 20;
 
 /// Handle on the lock file for one open file description.
 ///
-/// **Ownership of the `File` is the lock's lifetime.** OFD locks release when the
-/// last descriptor closes, on `Drop` or process death including `SIGKILL`.
+/// **Ownership of the `File` is the lock's lifetime**: locks release when the
+/// last descriptor closes, including on `SIGKILL`.
 #[derive(Debug)]
 pub struct LockFile {
     file: File,
@@ -122,10 +115,9 @@ impl LockFile {
     /// Try to take byte 1 — the right to mutate topology (`docs/PHASE2.md` §1,
     /// A2).
     ///
-    /// **An acquire, not a probe**: while held it excludes every other taker, so
-    /// a non-zero topology word observed afterwards names a holder that is dead
-    /// or has no lock file (`0029`). [`LockAttempt::Contended`] means a live peer
-    /// is mid-mutation; retry.
+    /// **An acquire, not a probe**: a non-zero topology word observed afterwards
+    /// names a dead holder or one with no lock file (`0029`).
+    /// [`LockAttempt::Contended`] means a live peer is mid-mutation; retry.
     ///
     /// # Errors
     ///
@@ -140,8 +132,7 @@ impl LockFile {
 
     /// Release byte 1.
     ///
-    /// Release the arena topology word *first*, then this byte; the reverse
-    /// reads as "holder dead" to `0029`'s T2.
+    /// Release the arena topology word *first*, then this byte (`0029`'s T2).
     ///
     /// # Errors
     ///
@@ -185,9 +176,8 @@ impl LockFile {
 
     /// Take the lowest free participant slot.
     ///
-    /// No production caller since #201: a participant's byte and arena record
-    /// share one index (`docs/PHASE2.md` §5.1), so it is never free to choose.
-    /// **Do not use it to assign a participant slot.**
+    /// No production caller: a participant's byte and arena record share one
+    /// index (`docs/PHASE2.md` §5.1). **Do not use it to assign a slot.**
     ///
     /// # Errors
     ///
@@ -224,8 +214,8 @@ impl LockFile {
 
     /// Take the lease on `edge`'s claim byte (`docs/PHASE2.md` §6.1).
     ///
-    /// The lease is not the claim: the arena's `ClaimRecord` CAS decides
-    /// (`docs/decisions/0005` §5); this makes death observable to §6.3's reaper.
+    /// The arena's `ClaimRecord` CAS decides the claim (`docs/decisions/0005`
+    /// §5); this lease makes death observable to §6.3's reaper.
     ///
     /// # Errors
     ///
@@ -241,8 +231,7 @@ impl LockFile {
 
     /// Drop the lease on `edge`'s claim byte.
     ///
-    /// Clear the arena record *first*, then unlock; the reverse reads as "holder
-    /// dead" to a reaper (`0005` §5).
+    /// Clear the arena record *first*, then unlock (`0005` §5).
     ///
     /// # Errors
     ///
@@ -252,8 +241,8 @@ impl LockFile {
             .map(|_| ())
     }
 
-    /// Whether `edge`'s claim byte is held by someone else. A holder does not see
-    /// its own lock (`a_holder_does_not_see_its_own_lock`).
+    /// Whether `edge`'s claim byte is held by someone else; a holder does not see
+    /// its own lock.
     ///
     /// # Errors
     ///
@@ -262,8 +251,7 @@ impl LockFile {
         self.probe(claim_range(edge)?, LockRole::Claim(edge))
     }
 
-    /// Bitmask of participant slots held by *other* open file descriptions
-    /// (§3.4 step 4); a full scan so callers can name every stuck slot.
+    /// Bitmask of participant slots held by *other* descriptions (§3.4 step 4).
     ///
     /// # Errors
     ///
@@ -293,8 +281,7 @@ impl LockFile {
         Ok(false)
     }
 
-    /// Write the identity record for `slot`, before the slot's lock is taken
-    /// (§3.3), so an observer of the lock can read a formed record.
+    /// Write the identity record for `slot`, before the slot's lock is taken (§3.3).
     ///
     /// # Errors
     ///
@@ -361,8 +348,7 @@ fn participant_range(slot: u32) -> Result<Range, IpcError> {
     Ok(Range::byte(PARTICIPANT_BASE + u64::from(slot)))
 }
 
-/// The claim-lease byte for `edge`, bounded so a corrupt id cannot address a
-/// byte outside the reserved region.
+/// The claim-lease byte for `edge`, bounded against a corrupt id.
 fn claim_range(edge: u32) -> Result<Range, IpcError> {
     if u64::from(edge) >= MAX_CLAIM_BYTES {
         return Err(IpcError::ClaimOutOfRange {
@@ -516,8 +502,8 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// `docs/PHASE2.md` §11.2 scenario 6: the 65th participant is refused, with a
-    /// message saying how to raise the limit.
+    /// `docs/PHASE2.md` §11.2 scenario 6: the 65th participant is refused with
+    /// a message saying how to raise the limit.
     #[test]
     fn the_sixty_fifth_participant_is_refused_and_told_why() {
         let path = scratch("full");

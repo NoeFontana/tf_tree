@@ -1,23 +1,14 @@
 //! Does the bracket-search cache cliff get *worse* when a writer is publishing?
 //!
-//! `docs/design/fast-path.md` §12 and §16 measured the bracket search's cache cliff and the
-//! query-to-query cursor's 25-29% recovery on a **quiescent** tree. A writer pushing into the ring
-//! writes the stamp lines a reader probes, so either the cliff gets **worse**, or the **cursor stops
-//! helping** because its line is no longer warm. This measures both.
+//! Extends `docs/design/fast-path.md` §12/§16 (quiescent cliff, cursor recovery) to a concurrent writer.
 //!
 //! # Shape
+//! One dynamic edge, one reader at a fixed lag behind the newest stamp, zero or one writer at the edge's
+//! nominal rate. Failed queries are counted.
 //!
-//! One dynamic edge, one reader, and zero or one writer publishing at the edge's nominal rate (a
-//! flat-out writer starves the reader; see `read_scaling.rs`). The reader queries at a fixed **lag
-//! behind the newest stamp**. Failures are counted: a query that falls out of the window is a
-//! measurement that did not happen.
+//! **Run pinned:** `taskset -c 2,3 cargo run --release -p tf_tree_bench --example contended_search`
 //!
-//! **Run pinned:**
-//! `taskset -c 2,3 cargo run --release -p tf_tree_bench --example contended_search`
-//!
-//! Two cores, so reader and writer run at the same time. Threads are not pinned individually:
-//! `docs/decisions/0007` rule 1 makes a thread-placement call a new OS-boundary site, and `taskset`
-//! places a process for free (`contended_scaling` and `load_child` are process-per-reader on the same argument).
+//! Two cores, so reader and writer overlap; threads are not pinned individually (`docs/decisions/0007` rule 1).
 #![allow(
     missing_docs,
     clippy::unwrap_used,
@@ -40,10 +31,9 @@ use tf_tree_core::sample::ExtrapPolicy;
 use tf_tree_core::EdgeId;
 use tf_tree_math::LerpSlerp;
 
-/// Sample period: 1 kHz puts a 10 s history on the 16384-slot ring at the far end of §12's cliff.
+/// Sample period: 1 kHz.
 const DT_NS: i64 = 1_000_000;
-/// Queries per timed round. Sized so the writer runs during the measurement: at ~10 ns a query,
-/// 4096 queries let a 1 kHz publisher land four pushes; a million give ~200 ms and ~200 pushes.
+/// Queries per timed round, sized so the writer runs during the measurement.
 const N: usize = 1_048_576;
 /// Timed rounds; the median is reported.
 const ROUNDS: usize = 21;
@@ -76,10 +66,7 @@ fn build(cap: u32) -> (Tree, EdgeId) {
     (tree, edge)
 }
 
-/// `(median ns/query, failures)` for one reader loop.
-///
-/// `cursor` selects the search: `false` restarts it every query (`Plan::at` before §16), `true`
-/// resumes from the previous answer.
+/// `(median ns/query, failures)`; `cursor` resumes the search from the previous answer instead of restarting.
 fn read_loop(ring: &SampleRing<'_>, cursor: bool, cap: u32) -> (f64, u64) {
     let lag = (f64::from(cap) * LAG_FRACTION) as i64 * DT_NS;
     let mut fails = 0u64;
@@ -90,7 +77,6 @@ fn read_loop(ring: &SampleRing<'_>, cursor: bool, cap: u32) -> (f64, u64) {
         let t0 = Instant::now();
         let mut acc = 0.0;
         for _ in 0..N {
-            // Re-read the newest stamp every query: under a writer it is a moving target.
             let Some(newest) = ring.newest_stamp() else {
                 fails += 1;
                 continue;
@@ -142,14 +128,11 @@ fn main() {
         let g = tree.guard();
         let (_, ring) = g.view().sampler(edge).unwrap();
 
-        // --- quiescent ---
         let (fresh_q, f1) = read_loop(&ring, false, cap);
         let (cursor_q, f2) = read_loop(&ring, true, cap);
 
-        // --- with one writer at the edge's nominal rate ---
         let stop = AtomicBool::new(false);
-        // **The vacuity guard.** A writer whose pushes are all rejected is indistinguishable from no
-        // writer, so count what landed and report the rate achieved (`sleep` overshoots).
+        // Vacuity guard: count landed pushes; a writer that publishes nothing looks like no writer.
         let pushed = AtomicU64::new(0);
         let refused = AtomicU64::new(0);
         let (fresh_w, cursor_w, f3, f4, hz) = std::thread::scope(|s| {
@@ -161,7 +144,6 @@ fn main() {
                 let map = tref.frame("map").unwrap();
                 let base = tref.frame("base").unwrap();
                 let w = tref.claim(base, map).unwrap();
-                // Continue the stamp sequence the fill left off at.
                 let mut k = i64::from(cap);
                 let period = Duration::from_nanos(DT_NS as u64);
                 while !stop_ref.load(Ordering::Relaxed) {
@@ -174,7 +156,6 @@ fn main() {
                     std::thread::sleep(period);
                 }
             });
-            // Snapshot the count *with* the clock: the writer already runs when the reader starts.
             let t0 = Instant::now();
             let base = pushed.load(Ordering::Relaxed);
             let a = read_loop(&ring, false, cap);
@@ -198,8 +179,7 @@ fn main() {
             fresh_w / fresh_q,
             cursor_w / cursor_q,
             format!("{hz:.0}"),
-            // Pushes per million reader queries, `hz * ns / 1000`: publisher and reader four orders of
-            // magnitude apart rarely contend for a cache line.
+            // Pushes per million reader queries.
             hz * ((fresh_w + cursor_w) / 2.0) / 1000.0
         );
         assert_eq!(

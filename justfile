@@ -13,10 +13,7 @@ test: test-rust test-doc ingest-check
 test-rust:
     cargo nextest run --workspace --no-tests=pass
     # `bridge` is default-off, so `--workspace` compiles none of `tf_tree_c/src/bridge.rs`; this line is its gate.
-    # bridge-without-shm is a shipped configuration (0015); `bridge,shm` is `shm-check`'s.
     cargo nextest run -p tf_tree_c --features bridge
-    # `crash-points` (PHASE2 §11.3): tests `--workspace` does not run.
-    # No `prlimit --core` here, unlike `shm-check` (0057 step 4): a dump cannot decide these tests and macOS has no `prlimit`.
     cargo nextest run -p tf_tree_core --features crash-points
 
 test-doc:
@@ -28,25 +25,18 @@ test-doc-error-codes:
     cargo +nightly test --doc -p tf_tree -p tf_tree_core
 
 # **`tf_tree` with `unstable` OFF: the configuration a published consumer gets.**
-#
-# `--workspace` unifies the feature on, so only `-p tf_tree` sees the stable tier (API.md §2.6). Clippy lines are `--lib`; test targets are not covered.
+# `--workspace` unifies `unstable` on, so only `-p tf_tree` sees the stable tier (API.md §2.6).
 stable-tier-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    # The default set (`counters`), which is what `cargo add tf_tree` gives.
     echo "==> the library, default features"
     cargo clippy -p tf_tree --lib -- -D warnings
-    # Catches `frozen.rs`/`open.rs`, which compile only under `shm` on Linux.
     echo "==> the library, default features + shm"
     cargo clippy -p tf_tree --lib --features shm -- -D warnings
-    # `tf_tree_ingest` and `tf_tree_bridge` link this configuration.
     echo "==> the library, no default features"
     cargo clippy -p tf_tree --lib --no-default-features -- -D warnings
-    # Rustdoc from the stable tier: under `--all-features` a link into `unstable` resolves.
     echo "==> the stable tier's own documentation"
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p tf_tree
-    # The consumer lists in `docs/API.md` §6 row 4 and the manifest's `unstable` comment are checked
-    # against the `[dependencies]` / `[dev-dependencies]` entries, counted separately.
     echo "==> the recorded consumers of the unstable tier are the actual ones"
     want="tf_tree_bench tf_tree_c tf_tree_cli tf_tree_py"
     want_dev="tf_tree_bridge"
@@ -70,7 +60,6 @@ stable-tier-check:
         echo "the documents say:                      $want_dev"
         rc=1
     fi
-    # Each document must name every shipped consumer in the passage that claims the list.
     row=$(grep -m1 '^| 4 |' docs/API.md)
     n=$(grep -n '^unstable = \[\]' crates/tf_tree/Cargo.toml | cut -d: -f1)
     blk=$(sed -n "1,$((n - 1))p" crates/tf_tree/Cargo.toml | tac | awk "/^#/ {print; next} {exit}")
@@ -85,12 +74,8 @@ stable-tier-check:
         esac
     done
     [ "$rc" = 0 ] || exit 1
-    # Runtime pass: `tf_tree_ingest` links the facade with no features; `tf_tree_bridge` dev-depends on
-    # `unstable`, so that line is a standalone-build check, not a stable-tier one.
     echo "==> the downstream suites, run under -p so nothing unifies for them"
     cargo nextest run -p tf_tree_ingest -p tf_tree_bridge
-    # Floor on each tier's test count: a `cfg` can silently drop a target, visible only to the runner.
-    # `2>/dev/null` turns a compile error into 0, which trips the floor.
     echo "==> the tier still lists the tests it is supposed to"
     have=$(cargo nextest list -p tf_tree 2>/dev/null | wc -l)
     [ "$have" -ge 70 ] || { echo "the stable tier lists $have tests, was 70 at 0.0.1"; exit 1; }
@@ -102,9 +87,7 @@ loom:
     cargo xtask loom
 
     # `miri-soft-float` is opt-in: Miri cannot execute libm's x86 `sqrt` asm.
-    # `tf_tree` has its own line for `OwnedWriter`'s lifetime extension (0017), with `-Zmiri-disable-isolation`
-    # (boot_id read). Only `--lib --test owned_writer`: other targets cost hours for no UB coverage; a second
-    # `unsafe` there adds its target. `shm` is unexecutable under Miri (`shm-check`). `MIRIFLAGS` is appended to.
+    # `tf_tree` has its own line for `OwnedWriter`'s lifetime extension (0017); `--lib --test owned_writer` only. `MIRIFLAGS` is appended to.
 
 # Miri over the arena, the core, and the facade's one lifetime extension.
 miri:
@@ -157,7 +140,6 @@ guard-cost:
       for feat in "--features shm" "--no-default-features --features shm"; do
         case "$feat" in *no-default*) c=off ;; *) c=on ;; esac
         cargo build --profile "$prof" -q $feat -p tf_tree_bench --bin arena_backing
-        # `--profile release` builds into target/release, not target/profile-release.
         dir=$([ "$prof" = release ] && echo release || echo "$prof")
         echo "--- profile=$prof counters=$c"
         taskset -c 2 "./target/$dir/arena_backing" 2>/dev/null | grep -E "^  (heap|memfd) arena"
@@ -227,8 +209,7 @@ gate2:
     rm -f target/gate2/index.tft target/gate2/small.tft
 
 # **PHASE5 §12 criterion 4: 16 workers sharing one `.tft`, total Pss within 1.2x of one worker.** `--gate`: `docs/PHASE5.md` §12 criterion 4.
-# The fixture is deleted first (`frozen_workers` reuses an existing `--tft`, so a stale file would PASS). It must be large
-# (S >= 74p) or the gate measures process overhead. Needs ~340 MiB disk and ~1 GiB RAM, no quiet host.
+# The fixture is deleted first (a stale `--tft` would PASS) and must be large (S >= 74p). Needs ~340 MiB disk and ~1 GiB RAM.
 gate4:
     cargo build --release -q --features shm -p tf_tree_bench --bin frozen_workers
     rm -f target/gate4/workers.tft
@@ -253,20 +234,17 @@ abi-cost:
     cargo build --release -q -p tf_tree_c --features test-hooks --example abi_cost
     cargo build --profile embedder -q -p tf_tree_c --features test-hooks --example abi_cost
     cargo build --release -q -p tf_tree_bench --bin quiet_check
-    # `0023` step 5: sample quiet outside the workload; exit 2 is INVALID, not FAIL.
     "$T/release/quiet_check" before
     echo
     echo "=== release profile (lto = \"thin\" — the boundary is ERASED; contrast only) ==="
     taskset -c 2 "$T/release/examples/abi_cost" release
     echo
     echo "=== embedder profile (lto = false — a REAL boundary; THIS one gates) ==="
-    # Not under `set -e`: a miss must not skip the closing quiet sample. Only the `embedder` arm can exit 1.
     set +e
     taskset -c 2 "$T/embedder/examples/abi_cost" embedder
     gate=$?
     set -e
     echo
-    # Closing half of the bracket; INVALID (2) outranks FAIL.
     if ! "$T/release/quiet_check" after; then
       exit 2
     fi
@@ -280,35 +258,29 @@ c-abi-check:
     MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test live
-    # Publish surface: a foreign write corrupts another process's tree.
     MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_core/miri-soft-float --test publish
-    # Ingest-bridge seam (§5) behind `bridge`; its borrowed `const char *` lifetime rule only Miri checks.
     MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation" cargo +nightly miri test \
         -p tf_tree_c -p tf_tree_core \
         --features tf_tree_c/test-hooks,tf_tree_c/bridge,tf_tree_core/miri-soft-float \
         --test bridge
-    # ASan with `shm`: Miri cannot run the `memfd`/socket/owner-thread path (0015), so ASan is the only sanitizer
-    # on the shared arm and on `struct_size` prefix overruns.
+    # ASan with `shm`: the only sanitizer on the shared arm (Miri cannot run the `memfd`/socket/owner-thread path, 0015).
     RUSTFLAGS=-Zsanitizer=address cargo +nightly test -p tf_tree_c \
         --features test-hooks,bridge,shm --target x86_64-unknown-linux-gnu -Zbuild-std
 
 # **The committed C headers: drift check, then compile and run them** (gcc/clang, C11/C++17, `-Werror`; PHASE4 §6.2).
-# Needs `cbindgen` on `$PATH` (MPL-2.0, not a workspace dependency): `cargo install cbindgen --locked --version 0.29.4`;
-# the pin keeps output byte-identical, so bump it with regenerated headers.
+# Needs `cbindgen` (`cargo install cbindgen --locked --version 0.29.4`); the pin keeps output byte-identical.
 c-header-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo xtask headers --check
-    # `bridge` and `-DTFT_HAVE_BRIDGE` together, or the §5 declarations are compiled by nothing.
     cargo build --release -q -p tf_tree_c --features test-hooks,bridge
     inc=crates/tf_tree_c/include
     lib=target/release/libtf_tree_c.a
     src=crates/tf_tree_c/tests/c/abi_smoke.c
     out=$(mktemp -d)
     trap 'rm -rf "$out"' EXIT
-    # `.cpp` copy for C++ rows: `-x c++` would feed the static archive to the C++ front end and spin.
     cp "$src" "$out/smoke.cpp"
     for cc in "gcc -std=c11" "clang -std=c11" "g++ -std=c++17" "clang++ -std=c++17"; do
         in="$src"
@@ -337,13 +309,11 @@ cpp-bench:
     sophus=""
     [ -f target/thirdparty/Sophus/sophus/se3.hpp ] && \
         sophus="-isystem target/thirdparty/Sophus -DSOPHUS_USE_BASIC_LOGGING"
-    # Same Eigen search as `cpp-check`.
     eigen=""
     for d in /usr/include/eigen3 /usr/local/include/eigen3 target/thirdparty/eigen; do
         [ -d "$d" ] && eigen="-isystem $d" && break
     done
     [ -n "$eigen" ] || { echo "cpp-bench: Eigen not found; run \`just cpp-deps\`" >&2; exit 1; }
-    # Both error modes: `-fno-exceptions` is a different wrapper (1.064x vs 1.002x once).
     for mode in "" "-fno-exceptions"; do
         g++ -O2 -std=c++17 $mode -Wall -Wextra -Werror -I crates/tf_tree_c/include \
             $eigen $sophus -o "$out/bench" \
@@ -354,7 +324,6 @@ cpp-bench:
     done
 
 # Fetch Eigen (if absent) and Sophus into target/thirdparty for `cpp-check`; not vendored.
-# Lives here, not in a workflow, so a developer without sudo can run it.
 cpp-deps:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -364,7 +333,6 @@ cpp-deps:
     elif [ -d target/thirdparty/eigen ]; then
         echo "cpp-deps: Eigen already fetched"
     else
-        # Pinned to the measured version (matches `libeigen3-dev`).
         git clone -q -c advice.detachedHead=false --depth 1 --branch 3.4.0 \
             https://gitlab.com/libeigen/eigen.git target/thirdparty/eigen
         echo "cpp-deps: fetched Eigen 3.4.0"
@@ -381,17 +349,13 @@ cpp-deps:
 ingest-check:
     cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
     cargo nextest run -p tf_tree_ingest --features fixture
-    # The codec-free build: `compression` is default-on, so `--workspace` compiles the `#[cfg(not(feature = "compression"))]` code nowhere.
     cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
     cargo nextest run -p tf_tree_ingest --no-default-features
-    # The CLI's `ingest_err` arms hold the remedy text and compile only where those errors occur.
     cargo clippy -p tf_tree_cli --all-targets -- -D warnings
     cargo nextest run -p tf_tree_cli
-    # CLI without defaults drops `counters` and `compression`; a missing feature edge would show as a CLI that cannot read a bag.
     cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
     cargo nextest run -p tf_tree_cli --no-default-features
-    # The shipped CLI links both codecs, asserted on the dependency graph: deleting `compression` from `[features] default`
-    # keeps every test green, because both sides of every `cfg!` go false together.
+    # The shipped CLI links both codecs, asserted on the dependency graph.
     cargo tree -q -p tf_tree_cli -e normal | grep -q ruzstd || \
         { echo "tf_tree_cli's default build has no zstd decoder: is 'compression' still in [features] default?"; exit 1; }
     cargo tree -q -p tf_tree_cli -e normal | grep -q lz4_flex || \
@@ -401,10 +365,7 @@ ingest-check:
         { echo "tf_tree_cli's default build carries tf_tree_ingest/fixture: a dependency-level feature is travelling the tf_tree_bench edge"; exit 1; } || true
 
 # **Rustdoc, with warnings denied — the docs.rs shop window.**
-#
-# docs.rs's configuration: the five publishable crates set `all-features` and `--cfg docsrs`; the `publish = false` crates are public API to a C caller, operator or ROS node.
-# `tf_tree_bench` names `shm,embed-probe` (`--all-features` enables `tf2`, which needs ROS 2; `shm` makes this Linux-only).
-# Not gated: `tf_tree_bench`'s `tf2` (`just tf2-check`), `tf_tree_py` (`just py-lint`), `tf_tree_tf2_sys` (no recipe). Default-feature `cargo doc -p tf_tree` reports 2 `shm` links that resolve on docs.rs.
+# docs.rs's configuration: the five publishable crates set `all-features` and `--cfg docsrs`; `tf_tree_bench` names `shm,embed-probe`. Not gated: `tf2` (`just tf2-check`), `tf_tree_py` (`just py-lint`), `tf_tree_tf2_sys`.
 doc:
     RUSTDOCFLAGS='-D warnings --cfg docsrs' cargo doc --no-deps --all-features \
         -p tf_tree -p tf_tree_core -p tf_tree_math -p tf_tree_arena \
@@ -419,20 +380,13 @@ doc:
 lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-versions sbom unsafe-budget
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
-    # `bridge` is default-off; see `test-rust`.
     cargo clippy -p tf_tree_c --features bridge --all-targets -- -D warnings
-    # `test-hooks` gates `tests/publish.rs` and `examples/abi_cost.rs`, which the workspace pass compiles to nothing.
     cargo clippy -p tf_tree_c --features test-hooks --all-targets -- -D warnings
-    # `fixture` is default-off; see `ingest-check`.
     cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
-    # `compression` is default-ON, so the workspace pass never compiles the codec-free half; also here because CI's lint job mirrors this recipe.
     cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
-    # The CLI's default-ON axis: `doctor --from-bag` paths must compile without the codecs.
     cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
-    # `pure-hash` is off by default; the cross-target check is `py-cross-check` and `ci.yml`'s `bindings-non-linux`.
     cargo clippy -p tf_tree_core --features pure-hash --all-targets -- -D warnings
     cargo clippy -p tf_tree --features pure-hash --all-targets -- -D warnings
-    # `crash-points` (PHASE2 §11.3) is default-off. Two passes: it takes `std` for itself, and `--no-default-features` catches edits needing a default feature.
     cargo clippy -p tf_tree_core --features crash-points --all-targets -- -D warnings
     cargo clippy -p tf_tree_core --no-default-features --features crash-points --all-targets -- -D warnings
 
@@ -456,7 +410,6 @@ py-compile:
 # Format and auto-fix safe lint issues.
 fmt:
     cargo fmt --all
-    # Keeps `just lint` (via `py-compile`) green; only fmt, since the clippy half needs an interpreter.
     cargo fmt --manifest-path crates/tf_tree_py/Cargo.toml
     cargo clippy --workspace --all-targets --fix --allow-dirty -- -D warnings
 
@@ -475,7 +428,6 @@ msrv:
         || { echo "the floor is $want; install it: rustup toolchain install $want"; exit 1; }
     echo "==> building the workspace on the declared floor, $want"
     cargo "+$want" build --workspace --lib --bins --locked
-    # Excluded crates (`tf_tree_py`, `tf_tree_tf2_sys`) spell `rust-version` by hand; compared, not compiled.
     echo "==> every hand-written rust-version agrees with the workspace"
     rc=0
     for m in crates/*/Cargo.toml xtask/Cargo.toml; do
@@ -486,7 +438,6 @@ msrv:
             rc=1
         fi
     done
-    # The prose too: `**$want**` must appear in every file a user reads. Presence, not absence: a stale second number passes.
     echo "==> the number is stated where a user reads it, and still agrees"
     for f in README.md SUPPORT.md CLAUDE.md crates/tf_tree/src/lib.rs \
              crates/tf_tree/README.md crates/tf_tree_core/README.md \
@@ -523,23 +474,17 @@ bench-report *ARGS:
 bench-report-shm *ARGS:
     cargo run --release -p tf_tree_bench --features shm --bin bench_report -- {{ARGS}}
 
-# **`docs/PHASE5.md` §9.2's two embedding measurements.** One is gated.
-# 1. GATED: two identical `#[inline(never)]` depth-3 lookups, one in `tf_tree_bench`, one in `tf_tree_core`; read off `[profile.embedder]`, with `[profile.release]` (`lto = "thin"`) as control.
-# 2. EXPLORATORY: the out-of-crate column across both profiles (API.md §2.3 item 2); printed to `target/embed-cost/`, never in `results.json`.
-# `taskset -c 2` (needs 3+ logical CPUs); the verdict is `unresolved` when the round-to-round band straddles 5%.
-# `bench-check` and `bench-baseline-update` depend on this and read `target/embed-cost`. `EMBED_COST_KNOWN_COLLAPSED=1` is a disclosed escape set by CI's `bench-gate`; see the self-check.
+# **`docs/PHASE5.md` §9.2's two embedding measurements.** One is gated: two identical `#[inline(never)]` depth-3 lookups read off `[profile.embedder]`; the other is exploratory (API.md §2.3 item 2).
+# `bench-check` and `bench-baseline-update` depend on this and read `target/embed-cost`; `EMBED_COST_KNOWN_COLLAPSED=1` is CI's disclosed escape.
 embed-cost:
     #!/usr/bin/env bash
     set -euo pipefail
     out=target/embed-cost
     mkdir -p "$out"
-    # Honour `CARGO_TARGET_DIR`: the binaries move with it.
     bin_dir="${CARGO_TARGET_DIR:-target}"
     cargo build -q --profile embedder -p tf_tree_bench --features embed-probe --bin embed_cost
     cargo build -q --release -p tf_tree_bench --features embed-probe --bin embed_cost
-    # STRUCTURAL SELF-CHECK: if both columns collapse to one out-of-line symbol the quotient is 1.0 by construction and
-    # `Verdict::Over` is unreachable (`Plan::at_tagged`, 2026-08-29). Compares symbol SIZES; an empty subject set REFUSES.
-    # The `awk` must read to the end: an early `exit` SIGPIPEs `nm` and `pipefail` reports 141.
+    # STRUCTURAL SELF-CHECK: if both columns collapse to one out-of-line symbol the quotient is 1.0 by construction; an empty subject set REFUSES.
     body_size() {
         nm --print-size --defined-only -C "$bin_dir/embedder/embed_cost" \
           | awk -v p="$1" '$4 == p { s = $2; found = 1 } END { if (!found) exit 1; print s }'
@@ -596,11 +541,8 @@ embed-cost-check:
     cargo clippy -p tf_tree_bench --features embed-probe --all-targets -- -D warnings
     cargo nextest run -p tf_tree_bench --features embed-probe -E 'test(/embed/)'
 
-# **`docs/PHASE5.md` §10's "benchmark artifact as a regression gate"**: regenerates the report and compares it to
-# `crates/tf_tree_bench/baseline/results.json`; fails on a withdrawn claim, dropped row, changed arena layout or a directional number past its slack.
-# The host (CPU, cores, kernel, governor, load, every `reason`) is not compared (`src/baseline.rs`). The recipe prints the count it compared and
-# `Comparison::compared_nothing` refuses zero. Gated: LerpSlerp's `max_deviation` and `arena_memory_floor.idle_arena_resident_bytes` (§9.3; `docs/decisions/0021` step 4).
-# `--out target/bench-report`, not `report/`, so a hand-made report survives. `--embed-cost` is passed here and in `bench-baseline-update`: the status comparison is one-directional, so both must take the same flags.
+# **`docs/PHASE5.md` §10's regression gate**: regenerates the report and compares it to `crates/tf_tree_bench/baseline/results.json`; fails on a withdrawn claim, dropped row, changed arena layout or a directional number past its slack.
+# `--embed-cost` must match `bench-baseline-update`'s flags (the status comparison is one-directional).
 bench-check: embed-cost
     cargo run --release -p tf_tree_bench --bin bench_report -- \
         --out target/bench-report \
@@ -708,8 +650,7 @@ profile-cachegrind workload="robot":
     cg_annotate --show=Ir,Bcm,D1mr --sort=Ir --auto=yes target/profile/cg.out
 
 # **The §9.2 artifact with the tf2 columns compiled in, and its own baseline** (`results-tf2.json`). Container-only.
-# Two baselines, not one: the status comparison is one-directional, so a `tf2`-cut baseline would fail `bench-check` on every host without ROS 2.
-# `lookup_ratio_vs_tf2` resolves only here (`Sensitivity::Ratio`, interleaved arms; band 1.3-16.7% per `docs/decisions/0025`).
+# `lookup_ratio_vs_tf2` resolves only here (`0025`); a `tf2`-cut baseline would fail `bench-check` on hosts without ROS 2.
 tf2-bench-report *ARGS:
     ./docker/tf2/run.sh 'cargo run --release -p tf_tree_bench --features tf2 --bin bench_report -- {{ARGS}}'
 
@@ -720,8 +661,7 @@ tf2-bench-check:
         --out target/tf2-bench-report \
         --check-baseline crates/tf_tree_bench/baseline/results-tf2.json'
 
-# Regenerate the tf2-side baseline. Same rule as `bench-baseline-update`: run it
-# deliberately, and put the diff in the commit that causes it.
+# Regenerate the tf2-side baseline; run deliberately, and commit the diff with its cause.
 tf2-bench-baseline-update:
     ./docker/tf2/run.sh 'cargo run --release -p tf_tree_bench --features tf2 --bin bench_report -- \
         --out target/tf2-bench-report'
@@ -759,7 +699,6 @@ ros-test:
     ./docker/tf2/run.sh './ros/build.sh --test'
 
 # **`docs/PHASE5.md` §9.1's end-to-end comparison over a real DDS**: N `tf2_ros::TransformListener` consumers against one publisher, and the same queries through the ingest bridge (four arms, 0015).
-# The only measurement that includes the transport; the bridge process reports `consumers 0` so its cost lands in the arm it serves (`tests/dds_report_aggregate.rs`).
 # Env: WORKLOAD, CONSUMERS, SECONDS_MEASURED, WARMUP, HZ, BRIDGE_LINGER, TF_TREE_NAME.
 dds-bench *ENV:
     ./docker/tf2/run.sh './ros/build.sh && {{ENV}} ./ros/dds_bench.sh'
@@ -768,8 +707,7 @@ dds-bench *ENV:
 tf2-differential:
     ./docker/tf2/run.sh 'cargo test -p tf_tree_bench --features tf2 --release --test differential -- --nocapture'
 
-# The same differential, but over a real recorded /tf stream (see
-# testdata/tfstream/ATTRIBUTION.md for provenance and licensing).
+# The same differential, over a real recorded /tf stream (`testdata/tfstream/ATTRIBUTION.md`).
 tf2-replay:
     ./docker/tf2/run.sh 'cargo test -p tf_tree_bench --features tf2 --release --test replay -- --nocapture'
 
@@ -843,12 +781,10 @@ tsan:
 
 # --- Phase 2: shared memory (Linux only; `shm` is off by default; no container needed) ---
 
-# Multi-process gate: a second process maps the same arena and must answer
-# bit-identically. Builds `shm_child` first — the test spawns it.
+# Multi-process gate: a second process maps the same arena and must answer bit-identically.
 shm-test:
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
-    # `owner_migration`'s unit tests and lint (`required-features = ["shm"]`, so `lint` skips it); the measurement is `just owner-migration`.
     cargo clippy -p tf_tree_bench --features shm --bin owner_migration --all-targets -- -D warnings
     cargo nextest run -p tf_tree_bench --features shm --bin owner_migration
 
@@ -873,88 +809,56 @@ mp-bench-tf2:
 shm-check:
     cargo clippy -p tf_tree_arena --features shm --all-targets -- -D warnings
     cargo clippy -p tf_tree --features shm --all-targets -- -D warnings
-    # `shm,unstable`: the shape two targets run in; their `#[cfg(feature = "unstable")]` tests are compiled out above and skipped by `--workspace` (`required-features`).
     cargo clippy -p tf_tree --features shm,unstable --all-targets -- -D warnings
-    # `shm,test-hooks,unstable`: the shape `shm-rendezvous` runs (`CLAIM_WINDOW_HOOK`'s call site needs `test-hooks`).
     cargo clippy -p tf_tree --features shm,test-hooks,unstable --all-targets -- -D warnings
     cargo clippy -p tf_tree_ipc --all-targets -- -D warnings
     cargo clippy -p tf_tree_bench --features shm --all-targets -- -D warnings
     cargo clippy -p tf_tree_cli --features shm --all-targets -- -D warnings
-    # `docs/decisions/0015`: `bridge,shm` together, which no other recipe builds (`tests/bridge_shared.rs` is `#![cfg]`-ed out elsewhere). Linux-only, so not `test-rust`.
+    # `bridge,shm` together, which no other recipe builds (`0015`). Linux-only, so not `test-rust`.
     cargo clippy -p tf_tree_c --features bridge,shm --all-targets -- -D warnings
     cargo nextest run -p tf_tree_c --features bridge,shm
     cargo build --features shm -p tf_tree_bench --bin shm_child
     cargo build --features shm -p tf_tree_bench --bin fork_child
     cargo nextest run -p tf_tree_bench --features shm --test multiprocess
-    # `src/backing.rs`'s unit tests (`shm`-gated; they stop `abi-split` reading a point estimate off a band containing the null). `--lib`: integration targets are named individually.
     cargo nextest run -p tf_tree_bench --features shm --lib
-    # `#[cfg(test)]` tests inside the `[[bin]]`s, which `--lib` and `--workspace` miss. Why: `docs/PHASE5.md` §12 criterion 4.
     cargo nextest run -p tf_tree_bench --features shm --bins
-    # PHASE5 §12 gate 4's exit status (`gate4` fails on FAIL, `gate4-python` does not), through the shipped binary.
     cargo nextest run -p tf_tree_bench --features shm --test gate4
-    # PHASE5 §12 gate 2's exit status and refusals (`--prefault` turns it red; an eviction that did not take, or a fixture under 233 MB, refuses).
-    # Fixtures go under the cargo target dir, not `$TMPDIR`, which is often tmpfs where pages cannot be evicted.
+    # PHASE5 §12 gates 2 and 4: exit status and refusals through the shipped binary; fixtures go under the cargo target dir, not tmpfs.
     cargo nextest run -p tf_tree_bench --features shm --test gate2
-    # `abi-probe` = `bridge` + `tf_tree_c/test-hooks`, the only configuration in which `abi_attached` compiles.
     cargo clippy -p tf_tree_bench --features abi-probe --all-targets -- -D warnings
-    # Fork poisoning (`docs/decisions/0005` step 9); the second process is a `fork` of the first.
     cargo nextest run -p tf_tree_bench --features shm --test fork
-    # `docs/decisions/0015` *Invariants to maintain*: the same `fork()` one layer up, with `bridge` on (it implies `shm`).
-    # Clippy is the only lint of `fork_child`'s fourth mode; the `cargo build` line adds only a clearer failure message.
     cargo clippy -p tf_tree_bench --features shm,bridge --all-targets -- -D warnings
     cargo build --features shm,bridge -p tf_tree_bench --bin fork_child
     cargo nextest run -p tf_tree_bench --features shm,bridge --test fork
-    # §7.1 page population: RSS and minor-fault deltas need a process per test, which nextest gives.
     cargo nextest run -p tf_tree_bench --features shm --test population
-    # `tf_tree_cli` unit tests under `shm` (e.g. `recorded_given`, the `/proc` classification under `TFT014`; `docs/decisions/0028` plan step 6).
     cargo nextest run -p tf_tree_cli --features shm --lib
-    # The shipped binary, through clap, joining somebody else's tree; `participants` against no arena.
     cargo nextest run -p tf_tree_cli --features shm --test attach
-    # §7's `--web` view under `shm`: `cmd_top_web` calls a `merge` closure that exists only under it.
     cargo nextest run -p tf_tree_cli --features shm --test web
-    # `doctor --from-file` (`docs/PHASE5.md` §6) needs the frozen backend; it carries the skip proving `TFT018`/`TFT019` are not vacuous on a `.tft`.
     cargo nextest run -p tf_tree_cli --features shm --test doctor_frozen
-    # `doctor`'s resolved runtime directory (`docs/PHASE2.md` §15); absent without `shm`.
     cargo nextest run -p tf_tree_cli --features shm --test doctor_runtime_dir
-    # `docs/PHASE2.md` §10's NORMATIVE test: one recording into a heap arena and a mapped one, bit-identical `f64`.
     cargo nextest run -p tf_tree_cli --features shm --test replay_bit_identity
-    # `docs/RUNBOOK.md`'s `HandshakeRejected` table (`0055` step 7); here because `HelloStatus`/`IpcError` re-export only under `shm` and `cargo package` omits RUNBOOK.md from `tf_tree_ipc`.
     cargo nextest run -p tf_tree_cli --features shm --test runbook
-    # The frozen `.tft` arena (`docs/PHASE5.md` §2) needs a real mapping; a new shm-only target belongs here in the commit that adds it.
     cargo nextest run -p tf_tree_arena --features shm
-    # `unstable` buys exactly one test, `freezing_carries_the_counter_regions` (reads via `Tree::arena_view`); this target has `required-features = ["shm"]`, so `--workspace` skips it.
-    # The clippy line at the top stays `--features shm` alone: the packager's shape.
     cargo nextest run -p tf_tree --features shm,unstable --test frozen
-    # `docs/PHASE2.md` §11.3's crash matrix (four rows). `shm` for the rendezvous, `unstable` for `join-rw-report`, `crash-points` or the armed child never dies and waits out nextest's 180 s.
-    # `prlimit --core=1:1 --` (`docs/decisions/0057` step 4): three tests reap an aborted child through `wait_within(20 s)`, which a pipe `core_pattern` dump could decide.
-    # A soft limit of 0 does not stop the dump; 1 does. It only lowers the hard limit, so needs no privilege.
+    # `docs/PHASE2.md` §11.3's crash matrix; needs `crash-points` or the armed child never dies. `prlimit --core=1:1 --` (`0057` step 4): a pipe `core_pattern` dump could decide the reaping tests.
     prlimit --core=1:1 -- cargo nextest run -p tf_tree --features shm,unstable,crash-points --test rendezvous
     cargo clippy -p tf_tree --features shm,unstable,crash-points --all-targets -- -D warnings
-    # `docs/decisions/0017` steps 2 and 3: the `shm`-gated half of `tests/owned_writer.rs` (the leaked claim lease); the other half runs under `just test`.
     cargo nextest run -p tf_tree --features shm --test owned_writer
-    # `docs/decisions/0059` part (c): `error_payloads.rs`'s `shm`-gated `shared_memory_wrappers_print_their_display`.
     cargo nextest run -p tf_tree --features shm --test error_payloads
-    # The facade's own `shm` unit tests (`--lib`), e.g. `cache::tests::two_handles_on_one_shared_arena_share_their_plans` (#196).
     cargo nextest run -p tf_tree --features shm --lib
-    # `docs/PHASE2.md` §11.4's torture-harness self-test (the nightly is `just shm-torture`): proves the detector still detects.
     cargo nextest run -p tf_tree_bench --features shm --release --test torture
-    # `docs/PHASE5.md` §3 into §2's container: `tests/frozen_bag.rs` has `required-features = ["shm"]`.
     cargo clippy -p tf_tree_ingest --features shm --all-targets -- -D warnings
     cargo nextest run -p tf_tree_ingest --features shm
     cargo nextest run -p tf_tree_ipc
 
-# **`docs/PHASE2.md` §11.4's `shm_torture`** (nightly per `docs/PHASE5.md` §10): N processes doing random attach/detach/claim/reap/push/lookup while the driver `SIGKILL`s one several times a second; a survivor then checks no claim or slot leaked.
-# 30 minutes and six children is §13's spelling; override e.g. `just shm-torture "--duration 60s --children 4"`. `--release` for real interleavings.
-# Not §11.3's crash points (`shm-torture-crash-points`; the binary refuses `--crash-points` on this build); §11.4's ASan half is `shm-torture-asan`.
-# `prlimit --core=1:1 --` on all three torture recipes (`docs/decisions/0057` Decision 6, step 4): a signalled child's crash helper runs before its files close, so a dumping owner or heir holds the role and blocks inheritance.
-# A soft limit of 0 does not stop a pipe dump; 1 does. It only lowers the hard limit (a host with hard 0 refuses it). The binary's `[diag] host:` line reads `hard=1` under the prefix.
+# **`docs/PHASE2.md` §11.4's `shm_torture`** (nightly per `docs/PHASE5.md` §10): N processes doing random attach/detach/claim/reap/push/lookup while the driver `SIGKILL`s one several times a second.
+# Override e.g. `just shm-torture "--duration 60s --children 4"`; `--release` for real interleavings. `prlimit --core=1:1 --` on all three torture recipes (`0057` step 4).
 shm-torture *ARGS="--duration 30m --children 6 --kill-hz 6":
     cargo build --release --features shm -p tf_tree_bench --bin shm_torture
     prlimit --core=1:1 -- ./target/release/shm_torture {{ARGS}}
 
 # **§11.4's "a random crash point armed in 10% of children"** (`docs/PHASE2.md` §11.3 x §11.4): arms a random site from `tf_tree_core::crash::SITES` and `tf_tree::CRASH_SITES`, so kills land at named instructions.
-# Needs the `crash-points` feature (children are the same executable). The binary refuses `armed 0` and `armed N, aborted 0`, so the exit status is the verdict. Runs nightly (`nightly.yml`'s `crash-points` job).
-# Longer and gentler than the plain soak: a high kill rate wins the race against the site. `prlimit` as in `shm-torture`.
+# Needs the `crash-points` feature; the binary refuses `armed 0` and `armed N, aborted 0`. Nightly (`nightly.yml`'s `crash-points` job); `prlimit` as in `shm-torture`.
 shm-torture-crash-points *ARGS="--duration 5m --children 10 --kill-hz 2":
     cargo build --release --features shm,crash-points -p tf_tree_bench --bin shm_torture
     prlimit --core=1:1 -- ./target/release/shm_torture --crash-points {{ARGS}}
@@ -975,8 +879,7 @@ no-network:
     ./scripts/no-network.sh
 
 # **§11.4's "run it under ASan"**, a short run: ASan follows `fork`/`exec`, so children are instrumented, and Miri cannot reach the multi-process `unsafe`.
-# `-Zbuild-std` so std is instrumented (hence minutes); `detect_leaks=0` because a `SIGKILL`ed child is defined to leak. The target is the host's (from `rustc -vV`), not hardcoded x86.
-# ASan's slower reap widens the owner-dead window; `--victim-ballast-mb` / `--stop-owner-ms` widen it on purpose (`tests/torture.rs::a_kill_window_wide_enough_to_drain_the_pool_does_not_wedge_the_arena`). `prlimit` as in `shm-torture`.
+# `-Zbuild-std` so std is instrumented (minutes); `detect_leaks=0` because a `SIGKILL`ed child is defined to leak. `prlimit` as in `shm-torture`.
 shm-torture-asan *ARGS="--duration 120s --children 4 --kill-hz 4":
     RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS=detect_leaks=0 \
     prlimit --core=1:1 -- \
@@ -986,8 +889,7 @@ shm-torture-asan *ARGS="--duration 120s --children 4 --kill-hz 4":
 # The zero-config rendezvous end to end: a foreign process calls
 # `tf_tree::open()`, joins a served arena, and reads the same transform.
 shm-rendezvous:
-    # `test-hooks` (`CLAIM_WINDOW_HOOK`, `reclamation_verdict_for_test`) stages states no outside process can reach; `unstable` gates the tests that read raw participant `state` via `Tree::arena_view` or stage records with no public producer (`0028` plan steps 3-5).
-    # Without them the recipe silently runs fewer tests: compare `cargo nextest list -p tf_tree --test rendezvous` per feature set. `prlimit --core=1:1 --` as in `shm-check` (0057 step 4): `an_owner_that_dies_mid_handshake_is_retried_until_the_heir_serves` reaps an aborted child through `wait_within(20 s)`.
+    # `test-hooks` and `unstable` stage states no outside process can reach; without them the recipe silently runs fewer tests. `prlimit` as in `shm-check`.
     prlimit --core=1:1 -- cargo nextest run -p tf_tree --features shm,test-hooks,unstable --test rendezvous
 
 # Interactive shell in the ROS 2 / tf2 build environment.
@@ -1024,7 +926,6 @@ abi-split:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -q --features shm -p tf_tree_bench --bin arena_backing --bin native_arena
-    # The cross-process rung needs an owner serving an arena; short runtime dir for `sun_path`'s 108 bytes.
     rt=$(mktemp -d /tmp/tft-abi-split.XXXXXX); trap 'rm -rf "$rt"' EXIT
     export TF_TREE_RUNTIME_DIR="$rt" TF_TREE_NAME=abi_split
     coproc OWNER { ./target/release/native_arena --name abi_split --stream "$rt/fx.tfstream"; }
@@ -1037,9 +938,7 @@ abi-split:
     wait "${OWNER_PID:-}" 2>/dev/null || true
     exit "$status"
 
-# ---------------------------------------------------------------------------
 # Python bindings (docs/PHASE3.md). `tf_tree_py` is workspace-excluded (libpython); interpreters come from uv (3.14 GIL, 3.14t free-threaded, §7.3).
-# ---------------------------------------------------------------------------
 
 # Clean clone -> a Python REPL with the extension installed, verified end to end.
 # The last step runs `README.md`'s own snippet and compares its output with the snippet's `# ->` marker. Depends on `py-setup`, not a lighter venv: later recipes assume its venvs.
@@ -1060,15 +959,12 @@ py-setup:
 # Build the extension into the GIL venv and run the suite. ~5 s of it is one test waiting out `DEFAULT_OPEN_TIMEOUT` in an `open` meant to fail.
 py-test:
     VIRTUAL_ENV=.venv .venv/bin/maturin develop --uv -q
-    # `test_shared.py` drives this helper's `join-reparent` (`docs/decisions/0058` step 2) and fails rather than skips without it.
     cargo build -p tf_tree --features shm --bin tf_tree_rendezvous_child
     .venv/bin/python -m pytest tests/python -q
 
-# The same on the free-threaded interpreter — §7.3's requirement, and the only
-# place the concurrency claims are actually exercised.
+# The same on the free-threaded interpreter — §7.3's requirement.
 py-test-freethreaded:
     VIRTUAL_ENV=.venv-t PYO3_PYTHON=$PWD/.venv-t/bin/python .venv-t/bin/maturin develop --uv -q
-    # `py-test`'s line, for the same test: both recipes run all of `tests/python`.
     cargo build -p tf_tree --features shm --bin tf_tree_rendezvous_child
     .venv-t/bin/python -m pytest tests/python -q
 
@@ -1087,27 +983,22 @@ py-thread-scaling-gil *ARGS:
 
 # fmt + lint for both languages of the binding, plus the Rust half's rustdoc.
 py-lint: py-compile
-    # Rustdoc of `tf_tree_py`, which `just doc` cannot name (workspace-excluded) and which needs the venv's interpreter: PyO3's build script runs one, and another `python3` would thrash one target directory between two configurations.
+    # Rustdoc of `tf_tree_py`, which `just doc` cannot name (workspace-excluded); the venv's interpreter avoids thrashing PyO3's target directory.
     PYO3_PYTHON=$PWD/.venv/bin/python RUSTDOCFLAGS="-D warnings" cargo doc \
         --manifest-path crates/tf_tree_py/Cargo.toml --no-deps
-    # `scripts/` is linted here (ruff only; `bag_to_tfstream.py` imports ROS 2 modules, so not pyright).
     .venv/bin/ruff check python tests/python crates/tf_tree_bench/python scripts
     .venv/bin/ruff format --check python tests/python crates/tf_tree_bench/python scripts
-    # `--strict` over the package and stubs (PHASE3 §9), not tests/: numpy's own stubs make strict report ~120 errors.
     .venv/bin/pyright python
-    # One tests/ file is checked as a caller's type checker sees it (stamps as `np.int64`).
     .venv/bin/pyright tests/python/typecheck_stamps.py
 
 # Build a release wheel (it does not install; `just quickstart` does that). `py-mp-bench` and `py-vs-tf2` unpack its output into a container.
 py-wheel:
-    # Clear old wheels first: the consumers index a glob (filesystem order); both now assert `len(w) == 1`.
     rm -f crates/tf_tree_py/target/wheels/transform_tree-*.whl
     VIRTUAL_ENV=.venv .venv/bin/maturin build --release
 
 # N Python consumer nodes on one shared arena against N private `tf2_ros` buffers (PHASE2 §12.4, PHASE3 §12.1): the deployment comparison. RUN THIS ON AN IDLE MACHINE.
 py-mp-bench:
     just py-wheel
-    # Asserts a single wheel; a second means one was built by hand (see `py-wheel`).
     ./docker/tf2/run.sh 'set -e; \
         rm -rf target/pywheel && mkdir -p target/pywheel; \
         python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
@@ -1116,7 +1007,6 @@ py-mp-bench:
 # tf_tree's Python API against tf2_ros's in the ROS container (PHASE3 §12.1): a host-built cp314 wheel, tf2 fed its BufferCore directly (no DDS).
 py-vs-tf2:
     just py-wheel
-    # The container has no pip; a wheel is a zip, unpacked onto PYTHONPATH.
     ./docker/tf2/run.sh 'set -e; \
         rm -rf target/pywheel && mkdir -p target/pywheel; \
         python3 -c "import zipfile,glob; w=sorted(glob.glob(\"crates/tf_tree_py/target/wheels/transform_tree-*-cp314-*.whl\")); assert len(w)==1, w; print(\"unpacking\", w[0]); zipfile.ZipFile(w[0]).extractall(\"target/pywheel\")"; \
@@ -1130,15 +1020,12 @@ release-archive TARGET:
     #!/usr/bin/env bash
     set -euo pipefail
     target="{{ TARGET }}"
-    # `${CARGO_TARGET_DIR:-target}`, not `target/`.
     out_dir="${CARGO_TARGET_DIR:-target}"
-    # `cargo pkgid`: no Python needed.
     version="$(cargo pkgid -p tf_tree_cli | sed 's/.*[@#]//')"
     name="tf_tree-v${version}-${target}"
     staging="${out_dir}/release-staging"
     stage="${staging}/${name}"
 
-    # `uname -m` against the triple: a `binfmt_misc`/qemu handler would run a cross-built binary under emulation and certify it.
     host_arch="$(uname -m)"
     want_arch="${target%%-*}"
     if [ "${host_arch}" != "${want_arch}" ]; then
@@ -1148,8 +1035,6 @@ release-archive TARGET:
         exit 1
     fi
 
-    # `--features shm`: `--attach`, `top` and `participants` need it; `compression` is why a zstd rosbag2 recording opens.
-    # `--bin tf_tree` only: `tft` is a symlink, so a second link would be discarded.
     rustup target add "${target}" >/dev/null 2>&1 || true
     cargo build --locked --release -p tf_tree_cli --bin tf_tree \
         --features shm --target "${target}"
@@ -1189,13 +1074,10 @@ release-archive TARGET:
         fi ;;
     esac
 
-    # Remove the whole staging directory: `release.yml` uploads `release-staging/*.tar.gz` by wildcard, and a stale archive would be published.
     rm -rf "${staging}"
     mkdir -p "${stage}"
     cp "${bin}" "${stage}/tf_tree"
-    # `tft` is a symlink: `src/bin/tft.rs` calls the same entry point (2.27 MB compressed as two binaries against 1.14 MB).
     ln -s tf_tree "${stage}/tft"
-    # Apache-2.0 §4(a) and MIT require licence text to travel with the binary; `-L` because crate-directory copies are symlinks.
     cp -L LICENSE-MIT LICENSE-APACHE NOTICE README.md "${stage}/"
     for f in LICENSE-MIT LICENSE-APACHE; do
         bytes=$(wc -c < "${stage}/${f}")
@@ -1213,13 +1095,11 @@ release-archive TARGET:
     pack "${staging}/${name}.tar.gz"
 
     # Two checks; packing twice and comparing is vacuous (same second, same timestamps).
-    # 1. gzip MTIME (bytes 4..8) must be zero; `-n` is belt-and-braces since a pipe already zeroes it.
     stamp="$(od -An -tu4 -j4 -N4 < "${staging}/${name}.tar.gz" | tr -d ' ')"
     if [ "${stamp}" != "0" ]; then
         echo "::error::gzip header carries MTIME ${stamp}; -n is not in effect" >&2
         exit 1
     fi
-    # 2. Re-stamp every staged file, widen its mode and repack: pinned, the bytes are identical.
     find "${stage}" -exec touch -h -d '2001-09-09T01:46:40Z' {} +
     chmod -R g+w "${stage}"
     pack "${staging}/${name}.repack"
@@ -1230,14 +1110,12 @@ release-archive TARGET:
         echo "::error::packaging is not deterministic: staged mtimes or modes reached the archive" >&2
         exit 1
     fi
-    # Ownership is checked by tar's own listing. `--sort=name` is deliberately not gated: removing it passes, since one filesystem returns a stable order.
     owners="$(tar tvzf "${staging}/${name}.tar.gz" | awk '{print $2}' | sort -u)"
     if [ "${owners}" != "0/0" ]; then
         echo "::error::archive records ownership '${owners}', expected 0/0" >&2
         exit 1
     fi
 
-    # Unpack what was packed and run it through the symlink: the archive is the artifact users get.
     check="${staging}/roundtrip"
     rm -rf "${check}" && mkdir -p "${check}"
     tar xzf "${staging}/${name}.tar.gz" -C "${check}"

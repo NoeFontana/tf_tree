@@ -1,15 +1,9 @@
-//! `(parent, child)` → a dense slot, in one hash and one comparison.
-//!
-//! Replaces two-level `BTreeMap` descents (a frame-name `memcmp` per node, four
-//! per `Ingest::offer`) for the declared edge set, which is fixed at
-//! construction. `just bridge-footprint` measures the cost. Open addressing at
-//! quarter load: a perfect hash needs a second array (a second cache miss) and
-//! cannot serve the growing case of [`crate::statics::StaticStore`]. The one
-//! table with an unfixed key set stays in [`crate::edgemap`].
+//! `(parent, child)` → a dense slot, in one hash and one comparison, for the
+//! declared edge set fixed at construction (measured by `just bridge-footprint`).
+//! The table with an unfixed key set stays in [`crate::edgemap`].
 
 /// A dense index into the declared-edge tables: the *first* declaration of a
-/// normalized `(parent, child)` in `TopologyConfig::edges`. Declarations that
-/// collapse onto one pair after §5.6's rewrite share a slot; the later wins.
+/// normalized `(parent, child)`; declarations that collapse onto one pair share a slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct EdgeSlot(pub(crate) u32);
 
@@ -20,10 +14,8 @@ impl EdgeSlot {
     }
 }
 
-/// The multiplier from rustc's `FxHasher`; odd, so the multiply is a bijection.
 const K: u64 = 0x517c_c1b7_2722_0a95;
 
-/// Marks an empty bucket; `u32::MAX` is not a representable slot.
 const EMPTY: u32 = u32::MAX;
 
 /// Fold `bytes` into `h`, length included so `"ab"` and `"ab\0"` differ.
@@ -41,22 +33,17 @@ pub(crate) fn mix(mut h: u64, bytes: &[u8]) -> u64 {
     (h ^ bytes.len() as u64).wrapping_mul(K)
 }
 
-/// A 64-bit hash of the pair. Hand-rolled to keep the crate's one-dependency
-/// rule. Unkeyed by design: keys come only from the declared topology, and every
-/// hit is confirmed against both stored names, so a forged collision can cost a
-/// probe step but never a wrong hit.
+/// A 64-bit hash of the pair. Unkeyed by design: keys come only from the declared
+/// topology and every hit is confirmed against both stored names.
 fn hash_pair(parent: &str, child: &str) -> u64 {
-    // Separator so `("ab", "c")` and `("a", "bc")` differ by construction.
     let h = mix(0xcbf2_9ce4_8422_2325, parent.as_bytes()) ^ 0x9e37_79b9_7f4a_7c15;
     let h = mix(h, child.as_bytes());
-    // Avalanche: the multiply leaves entropy high and the table masks off low.
     let h = (h ^ (h >> 32)).wrapping_mul(K);
     h ^ (h >> 29)
 }
 
-/// Bucket count for `n` entries: a power of two, at least `4n + 4`, never below
-/// 16. [`EdgeIndex::find`] has no bound of its own and terminates only because
-/// the table is never full; this is the single definition of "full", shared with
+/// Bucket count for `n` entries: a power of two, at least `4n + 4`, never below 16.
+/// [`EdgeIndex::find`] terminates only because the table is never full; shared with
 /// `crate::interner`.
 #[inline]
 pub(crate) fn buckets_for(n: usize) -> usize {
@@ -72,7 +59,6 @@ struct Bucket {
 /// A `(parent, child)` → `V` table probed by reference, without allocating.
 #[derive(Debug)]
 pub(crate) struct EdgeIndex<V> {
-    /// Sized by [`buckets_for`]: always an empty bucket for `find` to stop on.
     buckets: Vec<Bucket>,
     mask: usize,
     /// `keys[i]` is entry `i`'s key, owned so a hit is confirmed by name.
@@ -87,7 +73,7 @@ impl<V> Default for EdgeIndex<V> {
 }
 
 impl<V> EdgeIndex<V> {
-    /// A table sized for `n` entries up front, so a fixed key set never rehashes.
+    /// A table sized for `n` entries up front.
     pub(crate) fn with_capacity(n: usize) -> EdgeIndex<V> {
         let len = buckets_for(n);
         EdgeIndex {
@@ -124,8 +110,7 @@ impl<V> EdgeIndex<V> {
         }
     }
 
-    /// Insert, or overwrite an existing key's value. Returns the entry index.
-    /// Allocates the two keys: call at construction, and boundedly after.
+    /// Insert, or overwrite an existing key's value. Returns the entry index. Allocates.
     pub(crate) fn insert(&mut self, parent: &str, child: &str, v: V) -> usize {
         if let Some(e) = self.find(parent, child) {
             self.values[e] = v;
@@ -173,15 +158,13 @@ impl<V> EdgeIndex<V> {
 }
 
 impl<V: Copy> EdgeIndex<V> {
-    /// Probe. Allocates nothing. Returns by value so the borrow ends with the
-    /// probe (`Ingest::offer` mutates another table meanwhile).
+    /// Probe without allocating; returns by value so the borrow ends with the probe.
     pub(crate) fn get(&self, parent: &str, child: &str) -> Option<V> {
         self.find(parent, child).map(|e| self.values[e])
     }
 }
 
-/// Place `entry` at the first empty bucket at or after `h`'s home. Free so
-/// `rehash` can call it while borrowing `self.keys`.
+/// Place `entry` at the first empty bucket at or after `h`'s home.
 fn place(buckets: &mut [Bucket], mask: usize, h: u64, entry: u32) {
     let mut i = (h as usize) & mask;
     while buckets[i].entry != EMPTY {
@@ -195,9 +178,6 @@ fn place(buckets: &mut [Bucket], mask: usize, h: u64, entry: u32) {
 mod tests {
     use super::*;
 
-    /// A key round-trips, and a key that was never inserted misses.
-    ///
-    /// Mutant: return `Some(..)` from `find` on any non-empty bucket.
     #[test]
     fn a_key_round_trips_and_a_stranger_misses() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(4);
@@ -211,8 +191,6 @@ mod tests {
     }
 
     /// The pair is hashed as a pair: `("ab", "c")` and `("a", "bc")` differ.
-    ///
-    /// Mutant: drop the `hash_pair` separator; the hash assertion fails.
     #[test]
     fn the_pair_is_hashed_as_a_pair() {
         assert_ne!(hash_pair("ab", "c"), hash_pair("a", "bc"));
@@ -223,14 +201,10 @@ mod tests {
         assert_eq!(t.get("a", "bc"), Some(2));
     }
 
-    /// A bucket collision resolves to the right entry: every hit is confirmed
-    /// by name.
-    ///
-    /// Mutant: drop the name comparison in `find`.
+    /// A bucket collision resolves to the right entry.
     #[test]
     fn a_bucket_collision_resolves_to_the_right_entry() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(0);
-        // 16 buckets; insert enough distinct keys that some share a home bucket.
         for i in 0..3u32 {
             t.insert(&format!("p{i}"), &format!("c{i}"), i);
         }
@@ -243,9 +217,6 @@ mod tests {
         }
     }
 
-    /// Growth past the load factor rehashes and keeps every key findable.
-    ///
-    /// Mutant: rehash under a different hash than `find` probes with.
     #[test]
     fn rehashing_preserves_every_key() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(0);
@@ -257,7 +228,6 @@ mod tests {
         for i in 0..N {
             assert_eq!(t.get(&format!("parent{i}"), &format!("child{i}")), Some(i));
         }
-        // And the load factor held, which is what bounds the probe walk.
         assert!(
             t.buckets.len() >= 4 * t.len(),
             "load factor above a quarter: {} buckets for {} keys",
@@ -266,9 +236,6 @@ mod tests {
         );
     }
 
-    /// Re-inserting a key overwrites it (last write wins).
-    ///
-    /// Mutant: delete `insert`'s early return on an existing key.
     #[test]
     fn reinserting_a_key_overwrites_it() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(4);
@@ -278,16 +245,14 @@ mod tests {
         assert_eq!(t.get("map", "odom"), Some(2));
     }
 
-    /// An entry's key is recoverable from its slot.
     #[test]
     fn a_slot_names_its_edge() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(2);
         let e = t.insert("map", "odom", 0);
         assert_eq!(t.key(e), ("map", "odom"));
     }
-    /// The table is never full, at any size: `find` terminates only because of it.
-    ///
-    /// Mutant: `buckets_for` returning `(n + 1).next_power_of_two().max(16)`.
+
+    /// The table is never full, at any size.
     #[test]
     fn the_table_is_never_full() {
         for n in 0..600usize {
@@ -304,7 +269,6 @@ mod tests {
         }
     }
 
-    /// A probe for an absent key returns, at every size.
     #[test]
     fn a_stranger_misses_at_every_size() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(0);

@@ -1,19 +1,15 @@
 //! Compiled lookup plans, typed time, and the evaluation `Guard`.
 //!
 //! A [`Plan`] resolves `lookup(target, source)` through the topology once;
-//! evaluating it against a [`Guard`] is the hot temporal sampling
-//! (`docs/PHASE1.md` §7; `docs/PROJECT.md` §5 D3).
-//!
-//! `unsafe`-free, and `#[cfg(not(loom))]` because [`Guard`] and [`compile`] need
-//! the production-only [`ArenaView`]/[`TopologyView`].
+//! evaluating it against a [`Guard`] is the hot path (`docs/PHASE1.md` §7).
+//! `unsafe`-free, and `#[cfg(not(loom))]` because it needs [`ArenaView`].
 //!
 //! # Compilation direction
 //!
 //! `edge_of_child[c]` stores `T_parent(c)_c`, so
 //! `T_target_source = (T_lca_target)⁻¹ · T_lca_source`: walking up from `target`
 //! emits inverted steps in walk order, from `source` forward steps in reversed
-//! walk order. `lookup(base, map)` over `map → odom → base` emits
-//! `[Dyn(edge_base, inv), Dyn(edge_odom, inv)]`.
+//! walk order.
 
 use core::marker::PhantomData;
 
@@ -34,26 +30,16 @@ pub const MAX_KNOTS: usize = 4096;
 /// Maximum bisection recursion depth in [`Plan::at_adaptive`].
 pub const MAX_ADAPTIVE_DEPTH: u32 = 16;
 
-/// How many stamps one pass of the batch fold holds in flight.
-///
-/// `docs/decisions/0060` §10.3: level with 64 lanes from N = 63 up and ahead
-/// below, at 6 600 B of stack frame against 17 720 B.
+/// How many stamps one batch-fold pass holds in flight (`docs/decisions/0060` §10.3).
 const FOLD_LANES: usize = 16;
 
-/// The batch size below which the fold stays per-stamp.
-///
-/// Chunk bookkeeping costs +82.5% at N = 1 and +14.8% at N = 2 (`0060` §10.4).
-/// `at_many_small/at_many_2` and `at_many_small/at_many_3` are the bench rows
-/// either side.
+/// The batch size below which the fold stays per-stamp (`0060` §10.4).
 const FOLD_MIN_BATCH: usize = 3;
 
-// Pinned: `crates/tf_tree/tests/batch_phases.rs` copies both values to build its
-// lane shapes and cannot check them across the crate boundary.
+// Pinned: `crates/tf_tree/tests/batch_phases.rs` copies both values.
 const _: () = assert!(FOLD_LANES == 16 && FOLD_MIN_BATCH == 3);
 
-/// Phase 2 of the batch fold: interpolate a chunk's brackets and compose each
-/// into its accumulator. `inverted` is hoisted out of the loop; nothing here
-/// loads an atomic or searches a ring.
+/// Phase 2 of the batch fold: interpolate a chunk's brackets and compose each.
 #[inline]
 fn fold_lanes<I: Interp>(acc: &mut [Iso3], brackets: &[Bracket], inverted: bool) {
     if inverted {
@@ -67,20 +53,12 @@ fn fold_lanes<I: Interp>(acc: &mut [Iso3], brackets: &[Bracket], inverted: bool)
     }
 }
 
-/// A time domain: a compile-time marker carrying a runtime [`Domain::TAG`] byte.
-///
-/// A [`Stamp`] is parameterised by its domain, so a cross-domain lookup is a type
-/// error or a [`LookupError::TimeDomainMismatch`], never a silent misread
-/// (`docs/PROJECT.md` §5 D9; `docs/PHASE1.md` §8 *Time*).
+/// A time domain: a compile-time marker carrying a runtime [`Domain::TAG`] byte
+/// (`docs/PROJECT.md` §5 D9; `docs/PHASE1.md` §8).
 pub trait Domain: Copy {
-    /// The runtime tag stored on an edge's `domain` field and compared against a
-    /// query's domain. Must be unique per domain.
-    ///
-    /// Tags `0`–`3` are the built-ins ([`SystemDomain`], [`SensorDomain`],
-    /// [`SimDomain`], [`SteadyDomain`]); a user-declared domain picks a free tag
-    /// from `4` up (`docs/API.md` §2.5). **A tag is permanent**: it is written
-    /// into `EdgeRecord::domain`, and re-numbering re-interprets every arena and
-    /// recording on disk (`docs/API.md` §5.2).
+    /// The runtime tag stored on an edge's `domain` field; unique per domain.
+    /// `0`–`3` are built-in; user domains take `4` up. **A tag is permanent**
+    /// (`docs/API.md` §2.5, §5.2).
     const TAG: u8;
 }
 
@@ -91,31 +69,21 @@ impl Domain for SystemDomain {
     const TAG: u8 = 0;
 }
 
-/// A sensor's own clock (e.g. a lidar or camera timestamp), tag `1`. Distinct
-/// from [`SystemDomain`] so a stamp from one cannot be used to query the other.
+/// A sensor's own clock, tag `1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SensorDomain;
 impl Domain for SensorDomain {
     const TAG: u8 = 1;
 }
 
-/// Simulated time — a `/clock` publisher, a bag replay, or a physics engine —
-/// tag `2`.
-///
-/// Separate from [`SystemDomain`] so `TimeDomainMismatch` fires for sim versus
-/// steady clocks (`docs/API.md` §2.5, §5.2), and so `docs/PHASE5.md` §6's
-/// `TFT019` can tell a wall-clock step from a sim step.
+/// Simulated time (a `/clock` publisher, bag replay or physics engine), tag `2`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimDomain;
 impl Domain for SimDomain {
     const TAG: u8 = 2;
 }
 
-/// A steady, monotone clock (`CLOCK_MONOTONIC`-like), tag `3`.
-///
-/// It cannot step, so a run of `NonMonotonicStamp` rejections on it is a
-/// publisher defect, not an NTP step (`docs/PHASE5.md` §6, `TFT019`). It carries
-/// no epoch guarantee across reboots or processes (`docs/API.md` §5.3).
+/// A steady, monotone clock, tag `3` (`docs/PHASE5.md` §6, `TFT019`; `docs/API.md` §5.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SteadyDomain;
 impl Domain for SteadyDomain {
@@ -125,11 +93,7 @@ impl Domain for SteadyDomain {
 /// Nanoseconds in one second.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
-/// A nanosecond timestamp in domain `D`.
-///
-/// `Copy` and `Ord`; the phantom `D` carries the domain at the type level with no
-/// runtime cost (`size_of::<Stamp<D>>() == 8`). Construct with
-/// [`Stamp::from_nanos`] and read with [`Stamp::nanos`].
+/// A nanosecond timestamp in domain `D`; the phantom `D` costs nothing at runtime.
 pub struct Stamp<D: Domain = SystemDomain>(i64, PhantomData<D>);
 
 impl<D: Domain> Stamp<D> {
@@ -147,15 +111,9 @@ impl<D: Domain> Stamp<D> {
         self.0
     }
 
-    /// Assemble a stamp from a `(seconds, nanoseconds)` pair — the shape of
-    /// `builtin_interfaces/Time` and POSIX `struct timespec`. Exact, never a float
-    /// (`docs/API.md` §5.1, normative).
-    ///
-    /// Total: no panic, no wrap, no saturation. Returns `None` for
-    /// `nanos >= 1_000_000_000` (the field is a sub-second remainder; carrying the
-    /// excess would turn a malformed message into a plausible stamp, `docs/API.md`
-    /// R4, §5.2) and for `sec * 1e9 + nanos` outside `i64`. `None` does not say
-    /// which: no caller branches on it (`docs/PROJECT.md` §5 D11).
+    /// Assemble a stamp from a `(seconds, nanoseconds)` pair (`builtin_interfaces/Time`,
+    /// `struct timespec`), exactly (`docs/API.md` §5.1). Total: `None` for
+    /// `nanos >= 1_000_000_000` (§5.2) or a result outside `i64`.
     ///
     /// # Examples
     ///
@@ -165,16 +123,12 @@ impl<D: Domain> Stamp<D> {
     /// let t = Stamp::<SystemDomain>::from_parts(1, 500_000_000).unwrap();
     /// assert_eq!(t.nanos(), 1_500_000_000);
     ///
-    /// // Pre-epoch stamps are exact too — the seconds go negative, the
-    /// // nanoseconds stay a positive remainder, exactly as `timespec` says.
+    /// // Pre-epoch: negative seconds, positive nanosecond remainder.
     /// let before = Stamp::<SystemDomain>::from_parts(-1, 250_000_000).unwrap();
     /// assert_eq!(before.nanos(), -750_000_000);
     ///
-    /// // A nanosecond field that is not a sub-second remainder is refused
-    /// // rather than carried into the seconds.
+    /// // A nanosecond field past a second is refused, as is `i64` overflow.
     /// assert!(Stamp::<SystemDomain>::from_parts(1, 1_000_000_000).is_none());
-    ///
-    /// // ... and so is anything `i64` nanoseconds cannot hold.
     /// assert!(Stamp::<SystemDomain>::from_parts(i64::MAX, 0).is_none());
     /// ```
     #[inline]
@@ -183,9 +137,7 @@ impl<D: Domain> Stamp<D> {
         if nanos as i64 >= NANOS_PER_SEC {
             return None;
         }
-        // `i128`, not staged `checked_mul`/`checked_add`: the staged form refuses
-        // representable stamps at the negative end (`sec = -9_223_372_037`).
-        // Not `wrapping_*`: a release build must refuse what a debug build refuses.
+        // `i128`: staged `checked_*` refuses representable stamps at the negative end.
         let total = sec as i128 * NANOS_PER_SEC as i128 + nanos as i128;
         if total < i64::MIN as i128 || total > i64::MAX as i128 {
             return None;
@@ -195,17 +147,13 @@ impl<D: Domain> Stamp<D> {
 
     /// Assemble a stamp from the two fields of a POSIX `struct timespec`.
     ///
-    /// Takes fields, not the struct: `tf_tree_core` is `no_std` and its dependency
-    /// budget has no `libc` (`docs/PROJECT.md` §5). Refuses everything
-    /// [`Self::from_parts`] does, plus a negative `tv_nsec`, which POSIX allows
-    /// only in a relative interval.
+    /// Refuses everything [`Self::from_parts`] does, plus a negative `tv_nsec`.
     ///
     /// # Examples
     ///
     /// ```
     /// use tf_tree_core::{SensorDomain, Stamp};
     ///
-    /// // `clock_gettime(CLOCK_REALTIME, &ts)` gives exactly this pair.
     /// let t = Stamp::<SensorDomain>::from_timespec(1_700_000_000, 123_456_789).unwrap();
     /// assert_eq!(t.nanos(), 1_700_000_000_123_456_789);
     ///
@@ -218,12 +166,10 @@ impl<D: Domain> Stamp<D> {
         if tv_nsec < 0 || tv_nsec >= NANOS_PER_SEC {
             return None;
         }
-        // The range check above makes this cast lossless.
         Self::from_parts(tv_sec, tv_nsec as u32)
     }
 }
 
-// Manual impls so `Stamp<D>` is `Copy`/`Ord` without a bound on `D` for callers.
 impl<D: Domain> Clone for Stamp<D> {
     #[inline]
     fn clone(&self) -> Self {
@@ -270,15 +216,9 @@ pub enum Query<D: Domain = SystemDomain> {
     LatestCommon,
 }
 
-/// Selects an interpolation policy at runtime from an edge's stored discriminant.
-///
-/// The runtime selector stored in [`crate::edge::EdgeRecord::interp`] and
-/// dispatched when a [`Guard`] samples an edge.
-///
-/// Deliberately not `#[non_exhaustive]`: every consumer maps it onto something
-/// else and a catch-all arm has no honest body. An older binary reading a newer
-/// arena is handled by [`InterpPolicy::from_u8`] collapsing an unknown
-/// discriminant onto the default; the same holds for [`crate::edge::EdgeKind`].
+/// Selects an interpolation policy from an edge's stored discriminant
+/// ([`crate::edge::EdgeRecord::interp`]). Not `#[non_exhaustive]`; an unknown
+/// discriminant collapses to the default in [`InterpPolicy::from_u8`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum InterpPolicy {
@@ -308,35 +248,23 @@ impl InterpPolicy {
     }
 }
 
-/// A pose, and how far past the plan's newest common sample it was extrapolated.
-///
-/// Returned by [`Plan::at_extrapolating`]. There is deliberately no accessor that
-/// yields the pose alone ([`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)):
-/// the distance travels with the pose. Not an error type;
-/// [`ExtrapPolicy::Error`] is how a caller asks for a failure.
+/// A pose, and how far past the plan's newest common sample it was extrapolated
+/// ([`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)):
+/// no accessor yields the pose alone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Extrapolated {
     /// The pose.
     pub pose: Iso3,
-    /// Nanoseconds past the newest stamp that *every* dynamic edge on this plan
-    /// has data for; `0` means every edge bracketed the query.
-    ///
-    /// Errs toward over-reporting: it is measured just *before* the fold, so a
-    /// sample arriving mid-fold may leave a bracketed query reporting a positive
-    /// value, but `0` is never reported for an invented pose.
+    /// Nanoseconds past the newest stamp every dynamic edge has data for; `0` means
+    /// every edge bracketed the query. Measured before the fold, so it may over-report.
     pub by_ns: i64,
     /// The dynamic edge whose newest stamp is [`Self::by_ns`] behind the query;
-    /// meaningless when `by_ns == 0`. Data, not formatted
-    /// (`docs/PROJECT.md` §5 D11).
+    /// meaningless when `by_ns == 0` (`docs/PROJECT.md` §5 D11).
     pub edge: EdgeId,
 }
 
-/// A pose and its derivatives at one instant — `docs/PHASE4.md` §2.2.
-///
-/// Returned by [`Plan::at_with_derivatives`]. The twist is body-frame (right),
-/// expressed in the plan's **source** frame; see that method and
-/// [`tf_tree_math::twist`]. `#[non_exhaustive]`: engine-produced, read-only to
-/// callers, so growth cannot make a consumer wrong.
+/// A pose and its derivatives at one instant (`docs/PHASE4.md` §2.2); the twist is
+/// body-frame, in the plan's **source** frame ([`tf_tree_math::twist`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Sample {
@@ -344,23 +272,19 @@ pub struct Sample {
     pub pose: Iso3,
     /// First derivative, body frame, rad/s and m/s.
     pub twist: Twist,
-    /// Second derivative, when the interpolant has one. Always `None` today:
-    /// ScLerp's body twist is constant across a segment, so `Some(ZERO)` would
-    /// claim smoothness the path lacks.
+    /// Second derivative; always `None` today (ScLerp's body twist is constant
+    /// across a segment).
     pub accel: Option<Twist>,
 }
 
 /// One step of a compiled plan.
 ///
-/// Not `#[non_exhaustive]`, for [`InterpPolicy`]'s reason: consumers classify
-/// steps and a `_ =>` arm would silently under-count.
+/// Not `#[non_exhaustive]`, for [`InterpPolicy`]'s reason.
 #[derive(Clone, Copy, Debug)]
 pub enum Step {
-    /// A constant transform composed directly (a folded static edge or a run of
-    /// them). Pre-inverted at compile time when it came from an inverted edge.
+    /// A constant transform (a folded static run), pre-inverted when it came from an inverted edge.
     Static(Iso3),
-    /// A dynamic edge to be sampled at evaluation time. `inverted` composes the
-    /// inverse of the sampled pose (`acc.mul_inv(p)`); otherwise `acc * p`.
+    /// A dynamic edge sampled at evaluation time; `inverted` composes `acc.mul_inv(p)`, else `acc * p`.
     Dyn {
         /// The edge to sample.
         edge: EdgeId,
@@ -371,10 +295,8 @@ pub enum Step {
 
 /// A compiled `lookup(target, source)` path.
 ///
-/// `Copy`, `Send`, `Sync`, heap-free, dependency-free: a fixed `[Step; MAX_DEPTH]`
-/// array plus the topology generation it was compiled against. Evaluate it with
-/// [`Plan::at`] and friends against a [`Guard`]; a generation mismatch is
-/// [`LookupError::TopologyChanged`] ("re-plan"), never a silent stale read.
+/// `Copy`, `Send`, `Sync`, heap-free. A generation mismatch is
+/// [`LookupError::TopologyChanged`], never a silent stale read.
 #[derive(Clone, Copy, Debug)]
 pub struct Plan {
     generation: u64,
@@ -383,20 +305,13 @@ pub struct Plan {
     domain: u8,
     /// How many of `steps[..len]` are [`Step::Dyn`]; see [`fold_into`].
     dyn_count: u8,
-    /// The edge of the first [`Step::Dyn`], or [`EdgeId`]`(0)` when none; read it
-    /// through [`Plan::first_dynamic_edge`].
+    /// The edge of the first [`Step::Dyn`], else [`EdgeId`]`(0)`; read via [`Plan::first_dynamic_edge`].
     first_dyn: EdgeId,
 }
 
 impl Plan {
-    /// The identity plan for `generation`: zero steps, and the buffer
-    /// [`fold_into`] fills.
-    ///
-    /// The only constructor, so there is no half-built state a future arm can
-    /// forget to complete. One array written in place removed two by-value
-    /// copies from `Tree::plan` (#264). The identity array cannot be left
-    /// uninitialised: an invalid `Step` discriminant is UB under `Copy`/`Debug`,
-    /// and `MaybeUninit` is outside the unsafe budget (`docs/decisions/0007`).
+    /// The identity plan for `generation`: zero steps, the buffer [`fold_into`] fills.
+    /// The array cannot be left uninitialised (`MaybeUninit` is outside `0007`).
     fn identity(generation: u64) -> Plan {
         Plan {
             generation,
@@ -415,17 +330,14 @@ impl Plan {
         self.generation
     }
 
-    /// The plan's time-domain tag (the domain of its dynamic edges; `0` when the
-    /// plan is all-static or empty).
+    /// The plan's time-domain tag (`0` when all-static or empty).
     #[inline]
     #[must_use]
     pub fn domain(&self) -> u8 {
         self.domain
     }
 
-    /// What [`fold_into`] derived, next to what a fresh scan of the same steps
-    /// produces — `((stored_has_dynamic, stored_edge), (scanned, scanned))`.
-    /// Test-only; the fields are private to this module.
+    /// What [`fold_into`] derived next to a fresh scan of the same steps. Test-only.
     #[cfg(test)]
     pub(crate) fn derived_vs_scan_for_test(&self) -> ((bool, EdgeId), (bool, EdgeId)) {
         let scanned_has = self.steps().iter().any(|s| matches!(s, Step::Dyn { .. }));
@@ -480,7 +392,7 @@ impl Plan {
         if cur == self.generation {
             return Ok(());
         }
-        // A detached guard must not report `TopologyChanged`: no re-plan helps.
+        // A detached guard reports `ChildDetached`: no re-plan helps.
         if cur == DETACHED {
             return Err(LookupError::ChildDetached);
         }
@@ -501,9 +413,8 @@ impl Plan {
         Ok(())
     }
 
-    /// Evaluate the plan at nanosecond stamp `t`, sampling every dynamic edge at
-    /// `t`. Assumes generation and domain are already validated. `#[inline]` is
-    /// load-bearing (`docs/API.md` §2.3).
+    /// Evaluate the plan at `t`; generation and domain are already validated.
+    /// `#[inline]` is load-bearing (`docs/API.md` §2.3).
     #[inline]
     fn fold_at(&self, g: &Guard, t: i64) -> Result<Iso3, LookupError> {
         let mut acc = Iso3::IDENTITY;
@@ -523,14 +434,9 @@ impl Plan {
         Ok(acc)
     }
 
-    /// [`Self::fold_at`] under a caller-chosen extrapolation policy.
-    ///
-    /// A deliberate second copy: `fold_at` passes the `ExtrapPolicy::Error`
-    /// literal so LLVM prunes the `Hold`/`ConstantTwist` arms on [`Self::at`]'s hot
-    /// path, and a policy parameter would keep that match live. One path compiled
-    /// twice, not a second spelling (`docs/PROJECT.md` §6).
-    /// [`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)
-    /// §4.
+    /// [`Self::fold_at`] under a caller-chosen policy. A deliberate second copy: `fold_at`
+    /// passes the `Error` literal so LLVM prunes the other arms on [`Self::at`]'s hot
+    /// path (`0039` §4).
     fn fold_at_policy(&self, g: &Guard, t: i64, policy: ExtrapPolicy) -> Result<Iso3, LookupError> {
         let mut acc = Iso3::IDENTITY;
         for (k, step) in self.steps().iter().enumerate() {
@@ -549,11 +455,9 @@ impl Plan {
         Ok(acc)
     }
 
-    /// Like [`Self::fold_at`] but each dynamic step gallops from its own resumable
-    /// cursor (`cursors[step_index]`), for a monotone stamp sweep.
-    ///
-    /// Deliberately not `#[inline]` (`docs/API.md` §2.3). Reached only from
-    /// [`Self::fold_batch`]'s sub-chunk bypass (`docs/decisions/0060` step 2).
+    /// Like [`Self::fold_at`] but each dynamic step gallops from its own cursor.
+    /// Not `#[inline]` (`docs/API.md` §2.3); reached only from [`Self::fold_batch`]'s
+    /// sub-chunk bypass.
     fn fold_at_cursors(
         &self,
         g: &Guard,
@@ -577,38 +481,27 @@ impl Plan {
         Ok(acc)
     }
 
-    /// Evaluate the plan at stamp `t` (an `At(t)` query).
+    /// Evaluate the plan at stamp `t` (an `At(t)` query). `#[inline]`: `docs/API.md` §2.3.
     ///
     /// # Errors
     ///
     /// * [`LookupError::TopologyChanged`] — the topology changed since compilation.
     /// * [`LookupError::TimeDomainMismatch`] — `D` does not match the plan's edges.
-    /// * Any sampling error from an edge ([`LookupError::NoData`],
-    ///   [`LookupError::Extrapolation`], …).
-    ///
-    /// `#[inline]` is deliberate: `docs/API.md` §2.3.
+    /// * Any sampling error from an edge ([`LookupError::NoData`], …).
     #[inline]
     pub fn at<D: Domain>(&self, g: &Guard, t: Stamp<D>) -> Result<Iso3, LookupError> {
         self.at_tagged(g, t.nanos(), D::TAG)
     }
 
-    /// [`Self::at`], with the query's domain carried as a runtime tag.
-    ///
-    /// [`Domain`] is an open trait, so a foreign binding cannot dispatch to the
-    /// typed form and carries the tag as data ([`0038`]). Same check, same
-    /// [`LookupError::TimeDomainMismatch`]; Rust callers should use
-    /// [`Self::at`].
+    /// [`Self::at`], with the query's domain as a runtime tag, for bindings that cannot
+    /// name a [`Domain`] type ([`0038`]).
     ///
     /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
     ///
     /// # No `#[inline]`, on purpose
     ///
-    /// Every other link on the scalar path is inlined, so this is the one
-    /// cross-crate call `plan.at(&g, t)` emits (`docs/API.md` §2.3). Marking it
-    /// is not obviously a win, and a probe consuming only `iso.t.x` inverts the
-    /// sign; a re-measurement must consume all seven components, and
-    /// `just embed-cost`'s probes (`tf_tree_bench::embed::one`,
-    /// `bench_probe::depth3_lookup`) do not yet, so use `just bench-ab`.
+    /// The one cross-crate call `plan.at(&g, t)` emits (`docs/API.md` §2.3); re-measure
+    /// with `just bench-ab`.
     ///
     /// # Errors
     ///
@@ -616,18 +509,11 @@ impl Plan {
     pub fn at_tagged(&self, g: &Guard, nanos: i64, domain: u8) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;
         self.check_domain_tag(domain)?;
-        // The counter brackets the fold only: the two checks above fail on the
-        // query, name no edge, and would blame a working publisher
-        // (`docs/PHASE5.md` §5.2).
         self.note(g, self.first_dynamic_edge(), self.fold_at(g, nanos))
     }
 
-    /// Record one evaluation's outcome against the diagnostic counters.
-    ///
-    /// Every entry point that folds the plan goes through here:
-    /// `docs/PHASE5.md` §5.3 makes the error counters normative and they are the
-    /// basis of `TFT010`/`TFT011`. `edge` is [`Self::first_dynamic_edge`], passed
-    /// in because a batch caller resolves it once.
+    /// Record one evaluation's outcome against the diagnostic counters
+    /// (`docs/PHASE5.md` §5.3; the basis of `TFT010`/`TFT011`).
     #[inline]
     fn note<T>(
         &self,
@@ -647,10 +533,7 @@ impl Plan {
         }
     }
 
-    /// The single dynamic edge this plan traverses, for counter attribution.
-    ///
-    /// `EdgeId(0)` when the plan crosses several, which [`Guard::note_ok`] folds
-    /// into "credit no edge". Hence the stored count, not just a flag.
+    /// The single dynamic edge this plan traverses; `EdgeId(0)` when several.
     #[inline]
     fn first_dynamic_edge(&self) -> EdgeId {
         if self.dyn_count == 1 {
@@ -660,20 +543,9 @@ impl Plan {
         }
     }
 
-    /// Fold the plan at `t`, accumulating the body twist alongside the pose.
-    ///
-    /// For `T_ac = T_ab·T_bc` (`docs/PHASE4.md` §2.3):
-    ///
-    /// ```text
-    /// V_ac^c = Ad(T_bc⁻¹)·V_ab^b + V_bc^c
-    /// ```
-    ///
-    /// * A static step still costs an adjoint: its twist is zero but the frame
-    ///   changes.
-    /// * An inverted step folds to one adjoint: `V' = Ad(p)·(V_acc − V_p)`.
-    ///
-    /// The sampler is a parameter so the composition lives in one place; the
-    /// batch form differs only by resuming from a cursor.
+    /// Fold the plan at `t`, accumulating the body twist with the pose:
+    /// `V_ac^c = Ad(T_bc⁻¹)·V_ab^b + V_bc^c` (`docs/PHASE4.md` §2.3). The sampler is a
+    /// parameter so the composition lives in one place.
     #[inline]
     fn fold_with_derivatives<S>(&self, mut sample: S) -> Result<(Iso3, Twist), LookupError>
     where
@@ -684,7 +556,6 @@ impl Plan {
         for (k, step) in self.steps().iter().enumerate() {
             match step {
                 Step::Static(m) => {
-                    // No twist of its own, but the body frame moves.
                     vel = m.adjoint_inv(&vel);
                     acc = acc * *m;
                 }
@@ -703,16 +574,13 @@ impl Plan {
         Ok((acc, vel))
     }
 
-    /// [`Self::fold_with_derivatives`] restarting every bracket search at the
-    /// window midpoint — the scalar path.
+    /// [`Self::fold_with_derivatives`] restarting each search at the window midpoint.
     #[inline]
     fn fold_at_with_derivatives(&self, g: &Guard, t: i64) -> Result<(Iso3, Twist), LookupError> {
         self.fold_with_derivatives(|_, edge| g.sample_with_twist(edge, t, ExtrapPolicy::Error))
     }
 
-    /// [`Self::fold_with_derivatives`] resuming each step's bracket search from
-    /// its own cursor, a hint only (see [`Guard::cursor`]): a monotone
-    /// [`Layout::QuatTwist`] batch is `O(1)` amortized per stamp.
+    /// [`Self::fold_with_derivatives`] resuming each search from its own cursor.
     #[inline]
     fn fold_at_with_derivatives_cursors(
         &self,
@@ -725,32 +593,20 @@ impl Plan {
         })
     }
 
-    /// Evaluate the plan at `t`, returning the pose **and its derivatives** —
-    /// `docs/PHASE4.md` §2.2.
-    ///
-    /// The twist is body-frame (right), `V^b = (T⁻¹Ṫ)^∨`, expressed in the plan's
-    /// **source** frame, because `T_target_source` maps *from* the source. Use
-    /// [`tf_tree_math::Twist::to_spatial`] with the returned pose for the target
-    /// frame. For `plan(map, base)` with `base` rotated +90° about z moving along
-    /// **map**'s +x at 1 m/s:
+    /// Evaluate the plan at `t`, returning the pose **and its derivatives**
+    /// (`docs/PHASE4.md` §2.2). The twist is body-frame, `V^b = (T⁻¹Ṫ)^∨`, in the plan's
+    /// **source** frame; use [`tf_tree_math::Twist::to_spatial`] for the target frame.
+    /// For `base` rotated +90° about z moving along **map**'s +x at 1 m/s:
     ///
     /// ```text
     /// sample.twist.v              == (0, −1, 0)   // resolved in base axes
     /// sample.twist.to_spatial(&p) == (1,  0, 0)   // resolved in map axes
     /// ```
     ///
-    /// `‖v‖` is identical in both, so a magnitude check cannot catch a mix-up.
-    /// Costs roughly two plain lookups (see [`tf_tree_math::twist`]).
-    ///
     /// # Errors
     ///
-    /// Everything [`Self::at`] can return, plus:
-    ///
-    /// * [`LookupError::DerivativesUnavailable`] — some edge on the path is
-    ///   `LerpSlerp`, whose body twist is an artifact of the interpolant rather
-    ///   than of the motion. Refused rather than returned (§2.4).
-    /// * [`LookupError::NoSegment`] — an edge has a pose at `t` but no segment to
-    ///   differentiate (one retained sample, or two with equal stamps).
+    /// Everything [`Self::at`] can return, plus [`LookupError::DerivativesUnavailable`]
+    /// (an edge is `LerpSlerp`, §2.4) and [`LookupError::NoSegment`].
     pub fn at_with_derivatives<D: Domain>(
         &self,
         g: &Guard,
@@ -759,8 +615,7 @@ impl Plan {
         self.at_with_derivatives_tagged(g, t.nanos(), D::TAG)
     }
 
-    /// [`Self::at_with_derivatives`], with the query's domain as a runtime tag
-    /// ([`0038`]).
+    /// [`Self::at_with_derivatives`], with the query's domain as a runtime tag ([`0038`]).
     ///
     /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
     ///
@@ -800,8 +655,7 @@ impl Plan {
         }
     }
 
-    /// Sample every dynamic edge at *its own* newest stamp. Stamps may differ
-    /// between edges; use [`Self::latest_common`] for a consistent snapshot.
+    /// Sample every dynamic edge at *its own* newest stamp; see [`Self::latest_common`].
     ///
     /// # Errors
     ///
@@ -832,21 +686,14 @@ impl Plan {
         Ok(acc)
     }
 
-    /// [`Self::at`], permitting extrapolation past the newest sample under
-    /// `policy`, and reporting how far the answer was extrapolated
+    /// [`Self::at`], permitting extrapolation under `policy` and reporting how far
     /// ([`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)).
+    /// `by_ns` costs one `newest_stamp` load per dynamic edge, taken **before** the fold.
     ///
-    /// The policy is per query, not per edge: the caller who bears the
-    /// consequence chooses. [`ExtrapPolicy::Error`] is [`Self::at`] with a
-    /// distance attached on success.
-    ///
-    /// `by_ns` costs one `newest_stamp` load per dynamic edge, taken **before**
-    /// the fold and only here, so [`Self::at`]'s generated code is unmoved. The
-    /// order is a soundness guarantee; see the body.
     /// # Errors
     ///
-    /// As [`Self::at`]. Under [`ExtrapPolicy::Error`] a query past the newest
-    /// sample is [`LookupError::Extrapolation`]; under the other two it is not.
+    /// As [`Self::at`]; under [`ExtrapPolicy::Error`] a query past the newest sample is
+    /// [`LookupError::Extrapolation`].
     pub fn at_extrapolating<D: Domain>(
         &self,
         g: &Guard,
@@ -856,8 +703,9 @@ impl Plan {
         self.at_extrapolating_tagged(g, t.nanos(), D::TAG, policy)
     }
 
-    /// [`Self::at_extrapolating`], with the query's domain carried as a runtime
-    /// tag ([`0038`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md)).
+    /// [`Self::at_extrapolating`], with the query's domain as a runtime tag ([`0038`]).
+    ///
+    /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
     ///
     /// # Errors
     ///
@@ -872,19 +720,12 @@ impl Plan {
         self.check_generation(g)?;
         self.check_domain_tag(domain)?;
         let edge = self.first_dynamic_edge();
-        // Measure before the fold: `newest_stamp` is non-decreasing, so
-        // `common_before <= common_during`. `by_ns > 0` may over-report;
-        // `by_ns == 0` means every edge held data past `nanos` before the fold
-        // began. Measuring after let a mid-fold `push` report 0 for an invented
-        // pose. Not `note`d: the fold's `note` is this query's one counter event.
+        // Measured before the fold, so `by_ns == 0` is sound: measuring after let a mid-fold `push` report 0 for an invented pose.
         let common = self.newest_common(g);
         let pose = self.note(g, edge, self.fold_at_policy(g, nanos, policy))?;
         let (by_ns, which) = match common? {
-            // `saturating_sub`: a plain subtraction wraps in release, and a wrapped
-            // negative would report `by_ns == 0` for the most extrapolated answer
-            // (see `sample::span_ns`).
+            // `saturating_sub`: a wrapped negative would report 0 (see `sample::span_ns`).
             Some((common, which)) => (nanos.saturating_sub(common).max(0), which),
-            // Static-only: nothing can be extrapolated, so nothing was.
             None => (0, EdgeId(0)),
         };
         Ok(Extrapolated {
@@ -894,13 +735,10 @@ impl Plan {
         })
     }
 
-    /// Sample every dynamic edge at the newest stamp common to all of them —
-    /// tf2's `Time(0)` semantics.
-    /// # Errors
+    /// Sample every dynamic edge at the newest stamp common to all of them (tf2's
+    /// `Time(0)`).
     ///
-    /// [`LookupError::TopologyChanged`], [`LookupError::NoData`] if an edge is
-    /// empty, or [`LookupError::Extrapolation`] if an edge's retained window does
-    /// not reach the common stamp.
+    /// # Errors
     pub fn latest_common(&self, g: &Guard) -> Result<Iso3, LookupError> {
         self.check_generation(g)?;
         self.note(g, self.first_dynamic_edge(), self.fold_latest_common(g))
@@ -914,9 +752,7 @@ impl Plan {
         self.fold_at(g, common)
     }
 
-    /// The newest stamp every dynamic edge has data for, and the edge that
-    /// produced it — `None` when static-only. Shared by [`Self::latest_common`]
-    /// and [`Self::at_extrapolating`] ([`0039`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md)).
+    /// The newest stamp every dynamic edge has data for, and its edge; `None` when static-only.
     #[cfg(test)]
     pub(crate) fn newest_common_for_test(
         &self,
@@ -942,40 +778,20 @@ impl Plan {
         Ok(any.then_some((common, which)))
     }
 
-    /// The **outer bound outside which this plan certainly cannot answer**, or
-    /// `None` when it is unbounded (`docs/PHASE5.md` §4.2).
-    ///
-    /// It is an intersection of outer windows — the lower end a `max`, the upper
-    /// end a `min` (`latest_common`'s own stamp) — and says nothing about holes
-    /// inside them. Inside it, `at` answering is not evidence anything was
-    /// observed near the stamp; `tf_tree doctor`'s `TFT009` detects that.
-    ///
-    /// Not a shared helper with `latest_common`, which would pay a second atomic
-    /// load per edge; `span_answers_exactly_at_the_ends_it_reports`
-    /// (`tf_tree`'s `tests/behavior.rs`) pins the agreement. It lives beside
-    /// [`SampleRing::retained`](crate::buffer::SampleRing::retained) so the
-    /// window definition has one home.
-    ///
-    /// * `Some((t0, t1))`, `t0 <= t1` — answerable there, and nowhere else
-    ///   without extrapolating.
-    /// * `Some((t0, t1))`, `t0 > t1` — an empty intersection: a real answer, not
-    ///   an error.
-    /// * `None` — every step is static, so any stamp is answerable.
-    ///
-    /// On a live arena the answer ages as it is returned (the contract of
-    /// [`Self::latest`]); on a frozen `.tft` it is exact.
+    /// The **outer bound outside which this plan certainly cannot answer**, or `None`
+    /// when unbounded (`docs/PHASE5.md` §4.2); holes inside it are `TFT009`'s business.
+    /// `t0 > t1` is an empty intersection, a real answer. On a live arena the answer
+    /// ages as it is returned; on a frozen `.tft` it is exact.
     ///
     /// # Errors
     ///
-    /// [`LookupError::TopologyChanged`] (or [`LookupError::ChildDetached`] on a
-    /// fork-poisoned guard), [`LookupError::UnknownEdge`], or
-    /// [`LookupError::NoData`] naming the first edge that has never published.
+    /// [`LookupError::TopologyChanged`] (or [`LookupError::ChildDetached`]),
+    /// [`LookupError::UnknownEdge`], or [`LookupError::NoData`] for a never-published edge.
     pub fn span(&self, g: &Guard) -> Result<Option<(i64, i64)>, LookupError> {
         self.check_generation(g)?;
         let mut span: Option<(i64, i64)> = None;
         for step in self.steps() {
             let Step::Dyn { edge, .. } = step else {
-                // A static step constrains nothing in time.
                 continue;
             };
             let (oldest, newest) = g.window(*edge)?;
@@ -987,61 +803,23 @@ impl Plan {
         Ok(span)
     }
 
-    /// The **slowest** declared nominal publish rate among this plan's dynamic
-    /// edges, in milli-hertz, or `None` when none declares one
-    /// (`docs/decisions/0018`).
+    /// The **slowest** declared nominal publish rate among this plan's dynamic edges,
+    /// in milli-hertz, or `None` when none declares one (`docs/decisions/0018`).
     ///
-    /// With [`Self::span`], the whole engine-side input to a caller's blocking
-    /// wait; there is no blocking primitive in the arena (`0018`). The shim's wait:
-    ///
-    /// ```text
-    /// loop {
-    ///     let g = tree.guard();
-    ///     match plan.span(&g) {
-    ///         Ok(None)                                  => return plan.at(&g, wanted),
-    ///         Ok(Some((_, newest))) if newest >= wanted  => return plan.at(&g, wanted),
-    ///         Ok(Some((_, newest))) => sleep(min(deadline_remaining,
-    ///                                           (wanted - newest) + one_period)),
-    ///         // An edge that has never published raises NoData: "not started yet".
-    ///         Err(NoData { .. }) => sleep(min(deadline_remaining, one_period)),
-    ///         Err(e) => return Err(e),
-    ///     }
-    ///     if now >= deadline { return Err(Timeout) }
-    /// }
-    /// ```
-    ///
-    /// where `one_period` is `1e9 / (mhz / 1000)` nanoseconds from this method,
-    /// a prediction and not a poll interval.
-    ///
-    /// The answer is the slowest edge because a plan is answerable only when
-    /// every dynamic edge has reached the stamp. `EdgeRecord::nominal_rate_mhz == 0`
-    /// means *undeclared* and is skipped, not read as 0 Hz (`docs/PHASE5.md` §6,
-    /// `TFT007`). `None` is a real third answer: fall back to a conservative
-    /// period and say so once at startup (`0018` *Consequences*). A declared rate
-    /// may be an observed one (`tf_tree topology --discover`); here that costs one
-    /// extra wake.
-    ///
-    /// Generation-checked like [`Self::span`], so a waiter never spins against a
-    /// plan that cannot be satisfied; but it does **not** return
-    /// [`LookupError::NoData`] for a never-published edge, since a declaration
-    /// is a property of the topology and the caller asks before data exists.
+    /// With [`Self::span`], the engine-side input to a caller's blocking wait; the wait
+    /// loop is `0018`'s. `EdgeRecord::nominal_rate_mhz == 0` means *undeclared* and is
+    /// skipped (`docs/PHASE5.md` §6, `TFT007`). Unlike `span`, it does **not** return
+    /// [`LookupError::NoData`] for a never-published edge.
     ///
     /// # Errors
     ///
     /// [`LookupError::TopologyChanged`], [`LookupError::ChildDetached`], or
-    /// [`LookupError::UnknownEdge`] if a step names an edge this arena has no
-    /// record for.
-    /// # Errors
-    ///
-    /// [`LookupError::TopologyChanged`], [`LookupError::ChildDetached`], or
-    /// [`LookupError::UnknownEdge`] if a step names an edge this arena has no
-    /// record for.
+    /// [`LookupError::UnknownEdge`] if a step names an edge with no record.
     pub fn slowest_nominal_rate_mhz(&self, g: &Guard) -> Result<Option<u32>, LookupError> {
         self.check_generation(g)?;
         let mut slowest: Option<u32> = None;
         for step in self.steps() {
             let Step::Dyn { edge, .. } = step else {
-                // A static edge has no publisher and no period.
                 continue;
             };
             let mhz = g.nominal_rate_mhz(*edge)?;
@@ -1064,19 +842,13 @@ impl Plan {
         acc
     }
 
-    /// Evaluate the plan at each stamp in `stamps`, writing results into `out`.
-    ///
-    /// When `stamps` is monotone non-decreasing, each dynamic edge resumes its
-    /// bracket search from the previous stamp via an exponential (galloping) search
-    /// — `O(1)` amortized per stamp instead of `O(log n)`. Non-monotone input
-    /// falls back to an independent search per stamp.
+    /// Evaluate the plan at each stamp in `stamps`, writing results into `out`;
+    /// monotone input resumes each search from the previous stamp.
     ///
     /// # Errors
     ///
-    /// As [`Self::at`], plus [`LookupError::BufferTooSmall`] when
-    /// `out.len() < stamps.len()` — checked before anything is written, so a
-    /// refusal leaves `out` untouched. Extra `out` slots are left untouched on
-    /// success too.
+    /// As [`Self::at`], plus [`LookupError::BufferTooSmall`] when `out.len() < stamps.len()`,
+    /// checked before anything is written.
     pub fn at_many<D: Domain>(
         &self,
         g: &Guard,
@@ -1092,8 +864,6 @@ impl Plan {
         self.check_generation(g)?;
         self.check_domain_tag(D::TAG)?;
 
-        // Through [`Self::fold_batch`] (`docs/decisions/0060` step 2), with
-        // `elems == 1` and a move as the emitter.
         self.fold_batch(
             g,
             stamps,
@@ -1104,38 +874,19 @@ impl Plan {
         )
     }
 
-    /// Evaluate a batch **directly into a caller's buffer**, in `layout`.
-    ///
-    /// Unlike [`Self::at_many`], writes the layout a consumer wants (a 4x4 `f64`
-    /// matrix, say) once, in place, with no intermediate buffer. `Quat` shares
-    /// `Iso3`'s bytes exactly (see [`crate::layout`]). `out` is a flat `f64`
-    /// slice of at least `stamps.len() * layout.elems()`; use
-    /// [`Self::at_many_into_f32`] for [`Layout::Affine32`].
-    ///
-    /// [`Layout::QuatTwist`] folds through [`Self::at_with_derivatives`]'s path,
-    /// so its thirteen `f64` per stamp are bit-identical to the scalar call,
-    /// refusals included.
-    ///
-    /// `stamps` is raw nanoseconds with the domain as the type parameter:
-    /// `Stamp<D>` is not `repr(transparent)`, so `&[i64]` callers (FFI, NumPy)
-    /// would otherwise have to copy.
+    /// Evaluate a batch **directly into a caller's buffer**, in `layout`. `out` is a flat
+    /// `f64` slice of at least `stamps.len() * layout.elems()`; use
+    /// [`Self::at_many_into_f32`] for [`Layout::Affine32`]. [`Layout::QuatTwist`] is
+    /// bit-identical to [`Self::at_with_derivatives`]. `stamps` is raw nanoseconds, so
+    /// `&[i64]` callers (FFI, NumPy) need not copy.
     ///
     /// # Errors
     ///
-    /// [`LookupError::BufferTooSmall`] if `out` cannot hold the batch, or
-    /// [`LookupError::WrongElementType`] for an `f32` layout. Both are checked
-    /// **before any element is written** (`docs/PHASE3.md` §5.3).
-    ///
-    /// For [`Layout::QuatTwist`], additionally
-    /// [`LookupError::DerivativesUnavailable`] and [`LookupError::NoSegment`], as
-    /// [`Self::at_with_derivatives`].
-    ///
-    /// Only those two checks are all-or-nothing: every other error is a property
-    /// of a *stamp*, so `k` rows may already be written with nothing marking the
-    /// boundary. `DerivativesUnavailable` is per-edge and fires at element 0;
-    /// `NoSegment` is not.
-    ///
-    /// Otherwise as [`Self::at`].
+    /// [`LookupError::BufferTooSmall`] or [`LookupError::WrongElementType`], both checked
+    /// **before any element is written** (`docs/PHASE3.md` §5.3); for
+    /// [`Layout::QuatTwist`] also [`LookupError::DerivativesUnavailable`] and
+    /// [`LookupError::NoSegment`]. Every other error is per *stamp*: `k` rows may already
+    /// be written.
     pub fn at_many_into<D: Domain>(
         &self,
         g: &Guard,
@@ -1146,8 +897,7 @@ impl Plan {
         self.at_many_into_tagged(g, stamps, D::TAG, layout, out)
     }
 
-    /// [`Self::at_many_into`], with the query's domain as a runtime tag
-    /// ([`0038`]).
+    /// [`Self::at_many_into`], with the query's domain as a runtime tag ([`0038`]).
     ///
     /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
     ///
@@ -1176,14 +926,10 @@ impl Plan {
         self.check_domain_tag(domain)?;
 
         let n = layout.elems();
-        // Matched once: inside the loop it would add a branch per element.
         match layout {
             Layout::Mat4 => self.fold_batch(g, stamps, |s| s, write_mat4, n, out),
             Layout::Quat => self.fold_batch(g, stamps, |s| s, write_quat, n, out),
-            // Needs the twist, so it folds through `fold_batch_with_twist`.
             Layout::QuatTwist => self.fold_batch_with_twist(g, stamps, n, out),
-            // Unreachable (rejected above); an error, not a panic, keeps the
-            // panic-free lint posture.
             Layout::Affine32 => Err(LookupError::WrongElementType),
         }
     }
@@ -1204,8 +950,7 @@ impl Plan {
         self.at_many_into_f32_tagged(g, stamps, D::TAG, layout, out)
     }
 
-    /// [`Self::at_many_into_f32`], with the query's domain as a runtime tag
-    /// ([`0038`]).
+    /// [`Self::at_many_into_f32`], with the query's domain as a runtime tag ([`0038`]).
     ///
     /// [`0038`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0038-the-domain-a-binding-cannot-name.md
     ///
@@ -1237,29 +982,12 @@ impl Plan {
         self.fold_batch(g, stamps, |s| s, write_affine32, n, out)
     }
 
-    /// The shared batch loop: a chunk's brackets are read first, then folded.
-    ///
-    /// Generic over the element type so `f64` and `f32` share one copy of the
-    /// cursor logic (galloping search, seqlock retry), and over the stamp type so
-    /// [`Self::at_many`] shares the body.
-    ///
-    /// `docs/decisions/0060` Decision A: a monotone batch of at least
-    /// [`FOLD_MIN_BATCH`] stamps is walked in chunks of [`FOLD_LANES`], each
-    /// folded step by step. For every dynamic step, phase 1 reads every lane's
-    /// bracket through
-    /// [`SampleRing::read_from`](crate::buffer::SampleRing::read_from) and phase 2
-    /// calls `Interp::eval` per lane with no atomic load between elements; the
-    /// phase buffering carries the win (§10.1, §10.5). Every row is bit-identical
-    /// to [`Self::at`] on a quiescent ring
-    /// (`crates/tf_tree/tests/batch_phases.rs`).
-    ///
-    /// A non-monotone batch or one below [`FOLD_MIN_BATCH`] stays per-stamp
-    /// (§1, §10.4).
-    ///
-    /// On failure the rows before the first failing stamp are written, its error
-    /// is returned, and later rows are untouched. A chunk may have read brackets
-    /// past the failure, which only moves ring cursors: hints, never results
-    /// (see [`Guard::cursor`]).
+    /// The shared batch loop, generic over element and stamp type
+    /// (`docs/decisions/0060` Decision A): a monotone batch of at least
+    /// [`FOLD_MIN_BATCH`] stamps is walked in chunks of [`FOLD_LANES`], each dynamic step
+    /// reading every lane's bracket before interpolating. Rows are bit-identical to
+    /// [`Self::at`] on a quiescent ring (`crates/tf_tree/tests/batch_phases.rs`); on
+    /// failure rows before the failing stamp are written.
     #[inline]
     fn fold_batch<S, T, W, N>(
         &self,
@@ -1275,11 +1003,9 @@ impl Plan {
         W: Fn(&Iso3, &mut [T]),
         N: Fn(S) -> i64,
     {
-        // Hoisted: loop-invariant.
         let edge = self.first_dynamic_edge();
 
-        // `chunks_exact_mut` zipped with `stamps` bounds the walk by the batch and
-        // leaves a caller's over-long buffer untouched; not a speed choice.
+        // `chunks_exact_mut` zipped with `stamps` leaves an over-long buffer untouched.
         if !stamps.windows(2).all(|w| nanos(w[0]) <= nanos(w[1])) {
             for (s, dst) in stamps.iter().zip(out.chunks_exact_mut(elems)) {
                 let iso = self.note(g, edge, self.fold_at(g, nanos(*s)))?;
@@ -1299,15 +1025,8 @@ impl Plan {
         self.fold_chunked(g, edge, stamps, nanos, write, elems, out)
     }
 
-    /// [`Self::fold_batch`]'s chunked pass, in **its own stack frame**.
-    ///
-    /// `#[inline(never)]` is for the frame: the ~4 kB lane buffers are reserved
-    /// in the prologue before any branch, so inlining would charge every entry
-    /// point, bypassing calls included. Entry frames stay at `sub $0x378` /
-    /// `sub $0x158`; `fold_chunked` takes 4 056–4 088 B. It is not what fixed the
-    /// small-N rows; that was
-    /// [`SampleRing::read_from`](crate::buffer::SampleRing::read_from)'s
-    /// `#[inline(always)]`.
+    /// [`Self::fold_batch`]'s chunked pass, `#[inline(never)]` so its ~4 kB lane buffers
+    /// charge only this frame (`0060` §10.4).
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn fold_chunked<S, T, W, N>(
@@ -1325,7 +1044,6 @@ impl Plan {
         W: Fn(&Iso3, &mut [T]),
         N: Fn(S) -> i64,
     {
-        // Declared once per batch: per chunk is what made §10.4's small-N rows bad.
         let mut cursors = [0u64; MAX_DEPTH];
         let mut acc = [Iso3::IDENTITY; FOLD_LANES];
         let mut brackets = [Bracket::Exact(Iso3::IDENTITY); FOLD_LANES];
@@ -1334,8 +1052,6 @@ impl Plan {
             .chunks(FOLD_LANES)
             .zip(out.chunks_mut(FOLD_LANES * elems))
         {
-            // Shrinks to the lowest-numbered failed stamp: the one the per-stamp
-            // fold would have stopped at.
             let mut live = chunk.len();
             let mut failure: Option<LookupError> = None;
             acc[..live].fill(Iso3::IDENTITY);
@@ -1348,7 +1064,6 @@ impl Plan {
                         }
                     }
                     Step::Dyn { edge: e, inverted } => {
-                        // One bounds check and policy dispatch per chunk per step.
                         let Some((interp, ring)) = g.view().sampler(*e) else {
                             failure = Some(LookupError::UnknownEdge { edge: *e });
                             live = 0;
@@ -1356,7 +1071,6 @@ impl Plan {
                         };
                         let cursor = &mut cursors[k];
 
-                        // Phase 1: every bracket, no arithmetic.
                         let mut read = live;
                         for (lane, s) in chunk[..live].iter().enumerate() {
                             match ring.read_from::<Bracket>(nanos(*s), ExtrapPolicy::Error, cursor)
@@ -1371,7 +1085,6 @@ impl Plan {
                         }
                         live = read;
 
-                        // Phase 2: every fold, no atomics.
                         match InterpPolicy::from_u8(interp) {
                             InterpPolicy::LerpSlerp => {
                                 fold_lanes::<LerpSlerp>(
@@ -1398,7 +1111,6 @@ impl Plan {
             for (a, dst) in acc[..live].iter().zip(dsts.chunks_exact_mut(elems)) {
                 write(a, dst);
             }
-            // Per stamp: the counters count lookups, not chunks.
             for _ in 0..live {
                 g.note_ok(edge);
             }
@@ -1410,14 +1122,8 @@ impl Plan {
         Ok(())
     }
 
-    /// [`Layout::QuatTwist`]'s batch loop — [`Self::fold_batch`]'s sibling.
-    ///
-    /// A sibling, not a parameter: it needs [`Self::fold_at_with_derivatives`]'s
-    /// `(Iso3, Twist)` fold, and generalising `fold_batch` would put a closure or
-    /// a branch into the scalar batch path (`crate::layout` fixes the rule).
-    /// Ascending stamps ride a per-step cursor (`docs/API.md` §3.3); the cursor is
-    /// a hint, so both branches are bit-identical. It calls the same fold as
-    /// `at_with_derivatives` so the two can never disagree about a velocity.
+    /// [`Layout::QuatTwist`]'s batch loop, [`Self::fold_batch`]'s sibling for the
+    /// `(Iso3, Twist)` fold; the cursor is a hint, so both branches are bit-identical.
     #[inline]
     fn fold_batch_with_twist(
         &self,
@@ -1426,7 +1132,6 @@ impl Plan {
         elems: usize,
         out: &mut [f64],
     ) -> Result<(), LookupError> {
-        // Hoisted, as in `fold_batch`.
         let edge = self.first_dynamic_edge();
         if stamps.windows(2).all(|w| w[0] <= w[1]) {
             let mut cursors = [0u64; MAX_DEPTH];
@@ -1444,12 +1149,9 @@ impl Plan {
         Ok(())
     }
 
-    /// Emit the minimum set of knots such that [`LerpSlerp`] between adjacent knots
-    /// stays within `tol` of the exact plan evaluation across `span`.
-    ///
-    /// Recursive bisection, bounded by [`MAX_ADAPTIVE_DEPTH`] and [`MAX_KNOTS`];
-    /// all output lives in the caller's `scratch`. Returns parallel slices
-    /// `(stamps, poses)`, strictly increasing in stamp.
+    /// Emit the minimum set of knots such that [`LerpSlerp`] between adjacent knots stays
+    /// within `tol` of the exact evaluation across `span`, bounded by
+    /// [`MAX_ADAPTIVE_DEPTH`] and [`MAX_KNOTS`]. Returns parallel slices `(stamps, poses)`.
     ///
     /// # Errors
     ///
@@ -1464,12 +1166,8 @@ impl Plan {
         self.at_adaptive_tagged(g, span, D::TAG, tol, scratch)
     }
 
-    /// [`Self::at_adaptive`], with the query's domain carried as a runtime tag
+    /// [`Self::at_adaptive`], with the query's domain as a runtime tag
     /// (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`).
-    ///
-    /// `D` is storage only, fixing the element type of `scratch` and the returned
-    /// slice; `domain` is the query and is what is checked. A Rust caller wants
-    /// [`Self::at_adaptive`].
     ///
     /// # Errors
     ///
@@ -1484,8 +1182,6 @@ impl Plan {
     ) -> Result<(&'s [Stamp<D>], &'s [Iso3]), LookupError> {
         self.check_generation(g)?;
         self.check_domain_tag(domain)?;
-        // Counted once per call: `subdivide` folds up to `MAX_KNOTS` times and
-        // per-fold credit would swamp `lookups_ok`.
         self.note(
             g,
             self.first_dynamic_edge(),
@@ -1510,7 +1206,6 @@ impl Plan {
         scratch.poses.push(a_p);
 
         if b_s <= a_s {
-            // Degenerate span: a single knot.
             return Ok((&scratch.stamps[..], &scratch.poses[..]));
         }
         let b_p = self.fold_at(g, b_s)?;
@@ -1533,19 +1228,14 @@ fn subdivide<D: Domain>(
     tol: ErrBound,
     scratch: &mut AdaptiveScratch<D>,
 ) -> Result<(), LookupError> {
-    // Splittable: depth budget, a non-adjacent segment, and room for one more
-    // knot plus the up-to-`depth` ancestors that still emit one each on unwind.
-    // The width is taken in `u64`: `at_adaptive(i64::MIN, i64::MAX)` is a
-    // legitimate request, and a signed subtraction panics in a checked build and
-    // wraps in release, silently returning a two-knot line. `wrapping_sub` on the
-    // `u64` casts is the exact width for every ordered `i64` pair.
+    // Splittable: depth budget, a non-adjacent segment, and room for this knot plus
+    // the ancestors that still emit one on unwind. The width is taken in `u64`: a
+    // signed subtraction on `(i64::MIN, i64::MAX)` panics or wraps.
     let width = (b_s as u64).wrapping_sub(a_s as u64);
     let can_split = depth < MAX_ADAPTIVE_DEPTH
         && width > 1
         && scratch.stamps.len() + (MAX_ADAPTIVE_DEPTH as usize) + 1 < MAX_KNOTS;
     if can_split {
-        // `width / 2` fits an `i64` and so does the midpoint; `wrapping_add`
-        // documents that the add cannot overflow.
         let m_s = a_s.wrapping_add((width / 2) as i64);
         let m_p = plan.fold_at(g, m_s)?;
         let s = (m_s as u64).wrapping_sub(a_s as u64) as f64 / width as f64;
@@ -1556,7 +1246,6 @@ fn subdivide<D: Domain>(
             return Ok(());
         }
     }
-    // Accept segment a..b: emit its right endpoint.
     scratch.stamps.push(Stamp::from_nanos(b_s));
     scratch.poses.push(b_p);
     Ok(())
@@ -1564,17 +1253,13 @@ fn subdivide<D: Domain>(
 
 /// Whether `approx` is within `tol` of `exact` (rotation angle + translation).
 fn within(tol: ErrBound, approx: &Iso3, exact: &Iso3) -> bool {
-    // ‖log_so3(q_approx* · q_exact)‖
     let dq = approx.q.conjugate() * exact.q;
     let rot = log_so3(dq).norm();
     let trans = approx.t.sub(exact.t).norm();
     rot <= tol.rot_rad && trans <= tol.trans
 }
 
-/// The per-component error tolerance for [`Plan::at_adaptive`].
-///
-/// `#[non_exhaustive]`: build it with [`ErrBound::new`], like `tf_tree::EdgeCfg`;
-/// a tolerance is a shape that grows.
+/// The per-component error tolerance for [`Plan::at_adaptive`]; build with [`ErrBound::new`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct ErrBound {
@@ -1593,8 +1278,7 @@ impl ErrBound {
     }
 }
 
-/// Caller-provided scratch storage for [`Plan::at_adaptive`], sized for the
-/// maximum knot set; its allocation is not counted against `at_adaptive`.
+/// Caller-provided scratch for [`Plan::at_adaptive`], sized for the maximum knot set.
 pub struct AdaptiveScratch<D: Domain = SystemDomain> {
     stamps: alloc::vec::Vec<Stamp<D>>,
     poses: alloc::vec::Vec<Iso3>,
@@ -1629,63 +1313,37 @@ pub struct EdgeMeta {
 }
 
 /// A batch-evaluation handle: it borrows the arena and pins the topology
-/// generation once, so a run of lookups validates against one snapshot. Make one
-/// guard per batch of lookups.
+/// generation once, so a run of lookups validates against one snapshot.
 pub struct Guard<'a> {
     view: ArenaView<'a>,
     /// The pinned topology generation, or [`DETACHED`] for a guard built by
     /// [`Guard::detached`].
     generation: u64,
-    /// Successful lookups so far, flushed to the arena on drop.
-    ///
-    /// A plain `Cell<u32>`, not an atomic (`docs/PHASE5.md` §5.4): `Guard` is
-    /// `!Sync`, and a per-lookup `fetch_add` would be contended across readers.
-    /// The flush saturates.
+    /// Successful lookups so far, flushed to the arena on drop. A plain `Cell`
+    /// (`docs/PHASE5.md` §5.4): `Guard` is `!Sync`. The flush saturates.
     #[cfg(feature = "counters")]
     ok: core::cell::Cell<u32>,
-    /// Which edge's counters to credit, when every lookup in the batch went
-    /// Which edge's counters to credit, when every lookup in the batch went
-    /// through one plan. `None` before any lookup, and once two different edges
-    /// were seen: a multi-edge plan credits the participant total and no edge.
+    /// Which edge's counters to credit when every lookup went through one plan;
+    /// `None` before any lookup and once two edges were seen.
     #[cfg(feature = "counters")]
     ok_edge: core::cell::Cell<Option<EdgeId>>,
-    /// Per-step bracket-search hints, packed `(edge << 32) | index`, so a scalar
-    /// lookup resumes beside the previous answer instead of restarting at the
-    /// window midpoint (`docs/design/fast-path.md` §12; `step_cost`: 54.58 ->
-    /// 40.71 ns/sample at capacity 4096).
-    ///
-    /// A hint never changes a result:
-    /// [`SampleRing::sample_from`](crate::buffer::SampleRing::sample_from) returns
-    /// exactly what [`SampleRing::sample`](crate::buffer::SampleRing::sample)
-    /// does, so a stale or absent cursor is safe with no invalidation. An index
-    /// truncated past `u32::MAX` is lifted back onto the live window by
-    /// `sample::rebase_hint`; otherwise the clamp would pin it to the oldest
-    /// sample forever.
-    ///
-    /// A `Cell` because `Guard` is `!Sync`. One packed word per step halves the
-    /// stores in `Guard::new`. The edge tag self-invalidates the hint when one
-    /// guard evaluates several plans: a mismatch costs one comparison.
+    /// Per-step bracket-search hints, packed `(edge << 32) | index`
+    /// (`docs/design/fast-path.md` §12). A hint never changes a result, so a stale cursor
+    /// needs no invalidation; an index truncated past `u32::MAX` is lifted back by
+    /// `sample::rebase_hint`.
     cursor: [core::cell::Cell<u64>; MAX_DEPTH],
-    /// `(generation at creation, how to read it now)`, for the fork check.
-    ///
-    /// The flush writes into the arena from a destructor, and a shared mapping is
-    /// `MADV_DONTFORK`, so in a `fork` child it would fault (as `EdgeWriter::drop`
-    /// guards, `docs/decisions/0005` step 9). A function pointer because the core
-    /// is `no_std`; the facade supplies `tf_tree_ipc::fork::generation`. `None`
-    /// for a heap arena.
+    /// `(generation at creation, how to read it now)`, for the fork check: the flush
+    /// writes from a destructor and a shared mapping is `MADV_DONTFORK`
+    /// (`docs/decisions/0005` step 9). `None` for a heap arena.
     #[cfg(feature = "counters")]
     fork: Option<(u64, fn() -> u64)>,
 }
 
-/// The generation a [`Guard::detached`] guard carries.
-///
-/// Unreachable as a real generation: it starts at 0 and bumps once per
-/// mutation. Encoding the poison in an existing field adds no load to the hot
-/// path, since [`Plan::check_generation`] already compares it.
+/// The generation a [`Guard::detached`] guard carries: unreachable as a real one,
+/// and [`Plan::check_generation`] already compares it, so it adds no hot-path load.
 const DETACHED: u64 = u64::MAX;
 
 /// Which [`crate::counters::EdgeCounters`] field a lookup error belongs in.
-/// readable as a table.
 #[cfg(feature = "counters")]
 #[derive(Clone, Copy)]
 enum CounterField {
@@ -1711,9 +1369,8 @@ impl CounterField {
         f.fetch_add(1, Relaxed);
     }
 
-    /// The same classification against the participant mirror. Two `match`es,
-    /// not a generic: the two `#[repr(C)]` records must not be made
-    /// interchangeable (`counters.rs` pins their shared prefix).
+    /// The same classification against the participant mirror; the two `#[repr(C)]`
+    /// records must not become interchangeable (`counters.rs`).
     #[inline]
     fn bump_participant(self, p: &crate::counters::ParticipantCounters) {
         use crate::sync::Ordering::Relaxed;
@@ -1728,9 +1385,8 @@ impl CounterField {
     }
 }
 
-/// Classify a lookup error into `(edge, field)`, or `None` when it names no
-/// edge: `UnknownFrame`, `Disconnected` and `TopologyChanged` describe the query
-/// (D11), and filing them under an edge would blame a working publisher.
+/// Classify a lookup error into `(edge, field)`, or `None` when it names no edge:
+/// query-describing errors (D11) must not blame a working publisher.
 #[cfg(feature = "counters")]
 #[inline]
 fn counter_of(err: &LookupError) -> Option<(EdgeId, CounterField)> {
@@ -1742,8 +1398,7 @@ fn counter_of(err: &LookupError) -> Option<(EdgeId, CounterField)> {
             ..
         } => (
             edge,
-            // Split: past the newest usually means a publisher stopped, before
-            // the oldest a consumer running behind (`TFT010`/`TFT011`).
+            // Past the newest usually means a publisher stopped, before the oldest a consumer behind (`TFT010`/`TFT011`).
             if requested > newest {
                 CounterField::ExtrapAfter
             } else {
@@ -1761,24 +1416,22 @@ fn counter_of(err: &LookupError) -> Option<(EdgeId, CounterField)> {
 #[cfg(test)]
 pub(crate) const DETACHED_FOR_TEST: u64 = DETACHED;
 
-/// Flush the batch's success count into the arena — one relaxed atomic per
-/// guard, not per lookup (`docs/PHASE5.md` §5.4).
+/// Flush the batch's success count into the arena: one relaxed atomic per guard
+/// (`docs/PHASE5.md` §5.4).
 #[cfg(feature = "counters")]
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
         let n = self.ok.get();
-        // Read-only guard, as in `note_err`: a consumer's guard drops every batch.
+        // Read-only guards drop every batch and must not write.
         if n == 0 || !self.view.is_writable() {
             return;
         }
-        // Fork guard: in a child the arena is a hole and this write faults.
         if let Some((born, read)) = self.fork {
             if read() != born {
                 return;
             }
         }
         use crate::sync::Ordering::Relaxed;
-        // Credited to an edge only when the whole batch went through one.
         if let Some(edge) = self.ok_edge.get() {
             if let Some(c) = self.view.edge_counters(edge) {
                 c.lookups_ok.fetch_add(u64::from(n), Relaxed);
@@ -1794,15 +1447,13 @@ impl Drop for Guard<'_> {
 
 impl<'a> Guard<'a> {
     /// Pin the current topology generation and wrap the arena view for a batch of
-    /// lookups. The pinned value is always stable: A1 removed the odd
-    /// "write in progress" state.
+    /// lookups. The pinned value is always stable (A1: no odd state).
     #[must_use]
     pub fn new(view: ArenaView<'a>) -> Guard<'a> {
         let generation = view.topology().stable_generation();
         Guard {
             view,
             generation,
-            // `EdgeId(0)` is the sentinel: a fresh guard matches no edge.
             cursor: [const { core::cell::Cell::new(0) }; MAX_DEPTH],
             #[cfg(feature = "counters")]
             ok: core::cell::Cell::new(0),
@@ -1814,8 +1465,7 @@ impl<'a> Guard<'a> {
     }
 
     /// Attach a fork-generation check to this guard's counter flush. `read` must
-    /// return a value that changes when the process forks; a heap arena passes
-    /// nothing.
+    /// return a value that changes when the process forks.
     #[must_use]
     pub fn with_fork_check(self, read: fn() -> u64) -> Guard<'a> {
         #[cfg(feature = "counters")]
@@ -1831,16 +1481,14 @@ impl<'a> Guard<'a> {
         }
     }
 
-    /// Record a successful lookup through `edge` (`docs/PHASE5.md` §5.4): one
-    /// non-atomic increment, compiled away without the `counters` feature.
+    /// Record a successful lookup through `edge` (`docs/PHASE5.md` §5.4); compiled
+    /// away without the `counters` feature.
     #[inline]
     pub(crate) fn note_ok(&self, edge: EdgeId) {
         #[cfg(feature = "counters")]
         {
             self.ok.set(self.ok.get().saturating_add(1));
-            // `EdgeId(0)` is "no edge" (a multi-edge plan) and must not latch:
-            // it would funnel every reader's flush into the reserved edge-0 record,
-            // a phantom count and false sharing on one line.
+            // `EdgeId(0)` is "no edge" (a multi-edge plan) and must not latch: it would funnel every flush into edge 0's record.
             if edge == EdgeId(0) {
                 self.ok_edge.set(None);
                 return;
@@ -1855,30 +1503,26 @@ impl<'a> Guard<'a> {
         let _ = edge;
     }
 
-    /// Record a failed lookup. Unlike [`Self::note_ok`] this writes straight
-    /// through: failures are rare, and buffering would lose the evidence of a
-    /// process that dies mid-fault (`docs/PHASE5.md` §5.3).
+    /// Record a failed lookup, writing straight through so a process dying mid-fault
+    /// leaves evidence (`docs/PHASE5.md` §5.3).
     #[inline]
     pub(crate) fn note_err(&self, err: &LookupError) {
         #[cfg(feature = "counters")]
         {
             use crate::sync::Ordering::Relaxed;
-            // A read-only view (D18) must not write: it would SIGSEGV. A
-            // read-only participant keeps no counters.
+            // A read-only view (D18) must not write; it keeps no counters.
             if !self.view.is_writable() {
                 return;
             }
             let Some((edge, field)) = counter_of(err) else {
                 return;
             };
-            // The failure's own stamp when it has one (`no_std` has no clock);
-            // zero reads as "never".
+            // The failure's own stamp when it has one; zero reads as "never".
             let now = match *err {
                 LookupError::Extrapolation { requested, .. } => requested,
                 _ => 0,
             };
-            // Both halves: per-participant counters are what make a diagnostic
-            // actionable (`docs/PHASE5.md` §5.2).
+            // Both halves (`docs/PHASE5.md` §5.2).
             if let Some(slot) = self.view.interning_identity() {
                 if let Some(p) = self.view.participant_counters(slot) {
                     field.bump_participant(p);
@@ -1896,14 +1540,13 @@ impl<'a> Guard<'a> {
                     ..
                 } = *err
                 {
-                    // High-water mark: `TFT011` reads it against the ring's span.
+                    // High-water mark, read by `TFT011`.
                     let gap = if requested > newest {
                         requested.saturating_sub(newest)
                     } else {
                         oldest.saturating_sub(requested)
                     };
-                    // `fetch_max`, not load/compare/store: the latter lets the mark
-                    // regress under concurrent writers and inverts `TFT011`.
+                    // `fetch_max`: load/compare/store lets the mark regress under concurrent writers.
                     c.worst_extrap_gap_ns.fetch_max(gap, Relaxed);
                 }
             }
@@ -1912,22 +1555,14 @@ impl<'a> Guard<'a> {
         let _ = err;
     }
 
-    /// A guard that fails every evaluation with [`LookupError::ChildDetached`],
-    /// without reading `view`.
-    ///
-    /// For a facade that knows the arena is unreachable (a shared mapping lost
-    /// under `fork()`) where its API is infallible (`Tree::guard`). [`Self::new`]
-    /// reads the topology immediately, so it cannot serve. `view` must still be
-    /// over a valid arena, since [`Self::view`] hands it out; supply a throwaway.
-    /// There is no `poisoned(view, err)`: it would cost a 32-byte field on a
-    /// struct built per `at()` call. See `DETACHED`.
+    /// A guard that fails every evaluation with [`LookupError::ChildDetached`], for a
+    /// facade whose arena is unreachable (a mapping lost under `fork()`); `view` must
+    /// still be valid. See `DETACHED`.
     #[must_use]
     pub fn detached(view: ArenaView<'a>) -> Guard<'a> {
         Guard {
             view,
             generation: DETACHED,
-            // Never counts a success or reaches a search, so its destructor is a
-            // no-op; zeroed fields make that true.
             cursor: [const { core::cell::Cell::new(0) }; MAX_DEPTH],
             #[cfg(feature = "counters")]
             ok: core::cell::Cell::new(0),
@@ -1960,7 +1595,7 @@ impl<'a> Guard<'a> {
     }
 
     /// Sample edge `edge` at stamp `t`, dispatching on the edge's interp policy.
-    /// `#[inline]`, like its two siblings below (`docs/API.md` §2.3).
+    /// `#[inline]` (`docs/API.md` §2.3).
     #[inline]
     pub(crate) fn sample(
         &self,
@@ -1968,7 +1603,6 @@ impl<'a> Guard<'a> {
         t: i64,
         policy: ExtrapPolicy,
     ) -> Result<Iso3, LookupError> {
-        // One bounds check resolves both the interp discriminant and the ring.
         let (interp, ring) = self
             .view
             .sampler(edge)
@@ -1979,8 +1613,8 @@ impl<'a> Guard<'a> {
         }
     }
 
-    /// [`Self::sample`], resuming from this guard's cursor for step `k` — the
-    /// scalar fold's entry point. See [`Guard::cursor`].
+    /// [`Self::sample`], resuming from this guard's cursor for step `k`. See
+    /// [`Guard::cursor`].
     #[inline]
     pub(crate) fn sample_hinted(
         &self,
@@ -1989,7 +1623,6 @@ impl<'a> Guard<'a> {
         t: i64,
         policy: ExtrapPolicy,
     ) -> Result<Iso3, LookupError> {
-        // Always in range (plans are bounded by MAX_DEPTH); `get` keeps it provable.
         let Some(slot) = self.cursor.get(k) else {
             return self.sample(edge, t, policy);
         };
@@ -2000,16 +1633,15 @@ impl<'a> Guard<'a> {
             0
         };
         let out = self.sample_from(edge, t, policy, &mut cursor);
-        // Success only: a failed search leaves `cursor` at a position no
-        // successful search produced.
+        // Success only: a failed search leaves `cursor` at a position no success produced.
         if out.is_ok() {
             slot.set((u64::from(edge.0) << 32) | (cursor & 0xFFFF_FFFF));
         }
         out
     }
 
-    /// Sample edge `edge` at `t` and also return its body twist, in 1/second.
-    /// Refuses `LerpSlerp` ([`LookupError::DerivativesUnavailable`]).
+    /// Sample edge `edge` at `t` and also return its body twist. Refuses `LerpSlerp`
+    /// ([`LookupError::DerivativesUnavailable`]).
     pub(crate) fn sample_with_twist(
         &self,
         edge: EdgeId,
@@ -2026,9 +1658,8 @@ impl<'a> Guard<'a> {
         }
     }
 
-    /// [`Self::sample_with_twist`], resuming from `cursor`. The refusal is
-    /// checked before the ring is touched, so the batch layout's refusal matches
-    /// the scalar call's.
+    /// [`Self::sample_with_twist`], resuming from `cursor`. The refusal precedes any
+    /// ring access, so the batch refusal matches the scalar call's.
     pub(crate) fn sample_with_twist_from(
         &self,
         edge: EdgeId,
@@ -2074,10 +1705,9 @@ impl<'a> Guard<'a> {
             .ok_or(LookupError::NoData { edge })
     }
 
-    /// Both ends of a dynamic edge's retained window, `(oldest, newest)`.
-    ///
-    /// Two independent `head` loads, so a concurrent `push` on a live ring can
-    /// widen the pair: the staleness [`Plan::latest`] has (see [`Plan::span`]).
+    /// Both ends of a dynamic edge's retained window, `(oldest, newest)`. Two
+    /// independent `head` loads, so a concurrent `push` can widen the pair (see
+    /// [`Plan::span`]).
     pub(crate) fn window(&self, edge: EdgeId) -> Result<(i64, i64), LookupError> {
         let ring = self
             .view
@@ -2085,15 +1715,13 @@ impl<'a> Guard<'a> {
             .ok_or(LookupError::UnknownEdge { edge })?;
         match (ring.oldest_stamp(), ring.newest_stamp()) {
             (Some(oldest), Some(newest)) => Ok((oldest, newest)),
-            // Empty is `NoData`, never an empty interval.
             _ => Err(LookupError::NoData { edge }),
         }
     }
 
-    /// An edge's declared nominal publish rate, in milli-hertz, `0` meaning
-    /// *undeclared*. The sentinel is passed through: what it means is decided by
-    /// [`Plan::slowest_nominal_rate_mhz`] and `docs/PHASE5.md` §6's `TFT007`.
-    /// Reads the edge record, so it cannot return [`LookupError::NoData`].
+    /// An edge's declared nominal publish rate in milli-hertz, `0` meaning
+    /// *undeclared* and passed through (see [`Plan::slowest_nominal_rate_mhz`]). Reads
+    /// the edge record, so it cannot return [`LookupError::NoData`].
     pub(crate) fn nominal_rate_mhz(&self, edge: EdgeId) -> Result<u32, LookupError> {
         Ok(self
             .view
@@ -2105,21 +1733,19 @@ impl<'a> Guard<'a> {
 
 /// Compile a `lookup(target, source)` path into a [`Plan`].
 ///
-/// Walks up from both frames to their lowest common ancestor under the topology
-/// seqlock, retrying if a mutation lands mid-walk; the plan records that
-/// generation. `edge_meta` supplies each edge's kind/domain/static-pose for
-/// constant folding, and returns `None` for an edge id with no record.
+/// Walks both frames up to their lowest common ancestor under the topology seqlock,
+/// retrying if a mutation lands mid-walk. `edge_meta` supplies each edge's
+/// kind/domain/static-pose for constant folding, `None` for an id with no record.
 ///
 /// # Errors
 ///
 /// * [`LookupError::Disconnected`] — different connected components.
-/// * [`LookupError::TreeTooDeep`] — more than [`MAX_PATH_EDGES`] raw edges, or
-///   more than [`MAX_DEPTH`] folded steps (readable off `depth`).
+/// * [`LookupError::TreeTooDeep`] — more than [`MAX_PATH_EDGES`] raw edges, or more
+///   than [`MAX_DEPTH`] folded steps (readable off `depth`).
 /// * [`LookupError::FrameOutOfRange`] — a frame id is out of range for `topo`.
 /// * [`LookupError::MissingEdge`] — a parent link on the path records no edge.
-/// * [`LookupError::UnknownEdge`] / [`LookupError::MixedTimeDomains`] — raised
-///   by the constant fold, before the length refusal, so a defect on a too-long
-///   path is named.
+/// * [`LookupError::UnknownEdge`] / [`LookupError::MixedTimeDomains`] — raised by the
+///   constant fold, before the length refusal.
 pub fn compile(
     topo: &TopologyView,
     edge_meta: impl Fn(EdgeId) -> Option<EdgeMeta>,
@@ -2131,15 +1757,11 @@ pub fn compile(
         return Ok(Plan::identity(topo.stable_generation()));
     }
 
-    // Retry the whole walk if a mutation lands between reads (`docs/PHASE1.md`
-    // §5.2 reader protocol).
     'walk: loop {
-        // Every published generation is stable (A1); the retry only discards a
-        // walk that straddled a mutation.
+        // Every published generation is stable (A1); the retry discards a straddling walk.
         let start_gen = topo.generation();
 
-        // Read (parent, depth, edge_of_child) for `f`, restarting on a generation
-        // change.
+        // Read (parent, depth, edge_of_child) for `f`, restarting on a generation change.
         macro_rules! read {
             ($f:expr) => {{
                 let (parent, depth, edge, gen) = topo
@@ -2158,19 +1780,16 @@ pub fn compile(
         let (mut pa, mut da, mut ea) = read!(a);
         let (mut pb, mut db, mut eb) = read!(b);
 
-        // Edges walking up from target (emitted inverted, in order) and from
-        // source (emitted forward, reversed); 512 bytes of stack together.
+        // Edges walking up from target (emitted inverted) and from source (forward, reversed).
         let mut t_edges = [0u32; MAX_PATH_EDGES];
         let mut nt = 0usize;
         let mut s_edges = [0u32; MAX_PATH_EDGES];
         let mut ns = 0usize;
 
-        // Record the edge on the link from `$frame` up to its parent. Edge id `0`
-        // is the "no edge" sentinel and also a real slot, so it must never become
-        // a `Step::Dyn`. The bound is on `nt + ns` ("edges walked"), checked
-        // before the sentinel so a defect wins by position on the path. The walk
-        // stops at the bound (a cyclic parent chain would not terminate), so the
-        // reported depth is `MAX_PATH_EDGES + 1`: "more than the bound".
+        // Record the edge from `$frame` up to its parent. Edge id `0` is the "no edge"
+        // sentinel and must never become a `Step::Dyn`. The bound is checked before the
+        // sentinel so a defect wins by position; the walk stops there (a cyclic parent
+        // chain would not terminate), reporting depth `MAX_PATH_EDGES + 1`.
         macro_rules! push_edge {
             ($buf:expr, $n:expr, $edge:expr, $frame:expr) => {{
                 if nt + ns == MAX_PATH_EDGES {
@@ -2186,7 +1805,6 @@ pub fn compile(
             }};
         }
 
-        // Bring the deeper frame up until depths match.
         while da > db {
             push_edge!(t_edges, nt, ea, a);
             a = frame_or_disconnect(pa, target, source, a)?;
@@ -2204,10 +1822,8 @@ pub fn compile(
             eb = e;
         }
 
-        // Walk both up in lockstep until they meet at the LCA.
         while a != b {
             if pa == 0 || pb == 0 {
-                // Ran out of parents on one side without meeting: different trees.
                 return Err(LookupError::Disconnected {
                     target,
                     source,
@@ -2218,7 +1834,6 @@ pub fn compile(
             push_edge!(s_edges, ns, eb, b);
             a = frame_or_disconnect(pa, target, source, a)?;
             b = frame_or_disconnect(pb, target, source, b)?;
-            // Only parent and edge_of_child are needed past the lockstep phase.
             let (p, _d, e) = read!(a);
             pa = p;
             ea = e;
@@ -2227,14 +1842,12 @@ pub fn compile(
             eb = e;
         }
 
-        // Confirm the whole walk observed one generation.
         if topo.generation() != start_gen {
             spin();
             continue 'walk;
         }
 
-        // Folded into the plan about to be returned, not a by-value temporary
-        // (#264); a refusal drops the half-written local.
+        // Folded in place, not via a by-value temporary (#264).
         let mut plan = Plan::identity(start_gen);
         fold_into(&mut plan, &t_edges[..nt], &s_edges[..ns], &edge_meta)?;
         return Ok(plan);
@@ -2256,44 +1869,22 @@ fn frame_or_disconnect(
     })
 }
 
-/// Constant folding: replace static edges with constant steps (pre-inverting
-/// when the step is inverted), then collapse adjacent `Static` runs by composing
-/// them. Writes the folded steps into `plan` along with `len`, `domain`,
-/// `dyn_count` and `first_dyn`.
-///
-/// `dyn_count` and `first_dyn` are derived here, where the step is already in
-/// hand, so `Plan::at` does no O(`len`) scan. `Plan` is not an arena structure:
-/// no format version or layout hash is touched. This is the only writer;
-/// `plan_derived_fields_match_a_fresh_scan` pins it against a fresh scan.
-///
-/// `plan` may be left partially written on `Err`: every entry is a valid `Step`
-/// and the four fields are published at the end past every `?`, so it is still
-/// the identity plan.
+/// Constant folding: replace static edges with constant steps (pre-inverting when
+/// inverted), then collapse adjacent `Static` runs, writing `len`, `domain`,
+/// `dyn_count` and `first_dyn` into `plan` (so `Plan::at` does no O(`len`) scan;
+/// `plan_derived_fields_match_a_fresh_scan` pins this only writer). On `Err`, `plan`
+/// is still the identity plan.
 ///
 /// `t_edges` are in walk order, emitted inverted, then `s_edges` **reversed**,
 /// emitted forward. The reversal is load-bearing: `Iso3` composition is not
-/// associative under rounding, and a different order gives different bits that
-/// every tolerance-based test would accept.
+/// associative under rounding, and tolerance-based tests would accept other bits.
 ///
 /// # Running past the end of the output array
 ///
-/// A path can fold to more than `MAX_DEPTH` steps. The loop skips the write,
-/// keeps incrementing `n`, and keeps resolving every edge through `edge_meta`,
-/// so `n` is the true compiled length that [`LookupError::TreeTooDeep`] reports
-/// and a defect past the bound is still named (`0034`'s precedence). Returning
-/// early is cheaper (994 ns against 1778 ns on a refused 64-edge chain) but
-/// reports length instead of defect. The collapse decision reads a tracked
+/// A path can fold to more than `MAX_DEPTH` steps: the write is skipped but `n` and
+/// edge resolution continue, so [`LookupError::TreeTooDeep`] reports the true length
+/// and a later defect is still named (`0034`). The collapse reads a tracked
 /// `last_static`, not `out[n - 1]`.
-/// The collapse decision therefore reads a tracked `last_static` rather than
-/// `out[n - 1]`, which is the one thing that would not work past the array end.
-///
-/// # Errors
-///
-/// * [`LookupError::UnknownEdge`] — a step names an edge with no record.
-/// * [`LookupError::MixedTimeDomains`] — the dynamic edges do not share one
-///   time domain.
-/// * [`LookupError::TreeTooDeep`] — more than [`MAX_DEPTH`] steps; reports the
-///   exact folded count.
 fn fold_into(
     plan: &mut Plan,
     t_edges: &[u32],
@@ -2302,14 +1893,12 @@ fn fold_into(
 ) -> Result<(), LookupError> {
     let out = &mut plan.steps;
     let mut n = 0usize;
-    // Derived in the append arm; the collapse arm only rewrites a `Static`, so
-    // it cannot add or remove a `Dyn`.
+    // Derived in the append arm; the collapse arm cannot add or remove a `Dyn`.
     let mut dyn_count = 0u8;
     let mut first_dyn = EdgeId(0);
     // Tracked rather than read back, because `n` may be past the array.
     let mut last_static = false;
-    // `None` until the first dynamic step fixes the domain; every later one
-    // must agree, or one edge would be sampled with the wrong clock (D9).
+    // `None` until the first dynamic step fixes the domain; a mismatch would sample with the wrong clock (D9).
     let mut domain: Option<u8> = None;
 
     let path = t_edges
@@ -2319,7 +1908,6 @@ fn fold_into(
 
     for (edge, inverted) in path {
         let edge = EdgeId(edge);
-        // Resolve the edge to either a constant or a (still dynamic) sample.
         let meta = edge_meta(edge).ok_or(LookupError::UnknownEdge { edge })?;
         let resolved = match meta.kind {
             EdgeKind::Static => {
@@ -2347,8 +1935,7 @@ fn fold_into(
             }
         };
 
-        // Collapse into the previous step if both are Static, otherwise append.
-        // Past `MAX_DEPTH` the value has nowhere to live but counting continues.
+        // Collapse into a previous Static, else append; past `MAX_DEPTH` only count.
         match resolved {
             Step::Static(cur) if last_static => {
                 if n <= MAX_DEPTH {

@@ -1,20 +1,11 @@
 //! Where does a lookup's time actually go?
 //!
-//! Decomposes the hot path into its cost terms so a design can be aimed at the dominant one:
-//!
 //!   t(depth, capacity) ≈ fixed + depth × (search(capacity) + interp + compose)
 //!
-//! Each sweep varies one term: **capacity** (64 → 65536; search is `log2(capacity)` serially
-//! dependent loads, so the slope is the per-probe cost), **depth** (1 → 6; the marginal dynamic
-//! edge), **locality** (one stamp repeated vs swept; the cache and branch-predictor share) and
-//! **interp** (LerpSlerp vs ScLerp).
+//! Each sweep varies one term: capacity, depth, locality (one stamp vs swept), interp policy.
 //!
-//! **Run pinned, or do not run it at all:**
-//! `taskset -c 2 cargo run --release -p tf_tree_bench --example cost_model`
-//!
-//! Unpinned, this swings by >30%. Also, `sample::<LerpSlerp>` and `sample::<ScLerp>` share one hot
-//! function, so cross-policy comparisons within a build are sound but one policy across two builds
-//! is not; use `interp_cost` for that.
+//! **Run pinned:** `taskset -c 2 cargo run --release -p tf_tree_bench --example cost_model`. Unpinned it
+//! swings >30%; compare policies within a build only (`interp_cost` compares across builds).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use std::hint::black_box;
@@ -25,11 +16,9 @@ use tf_tree_bench::fixture::dynamic_pose;
 
 /// Lookups per timed round.
 const N: usize = 8192;
-/// Timed rounds; the median is reported.
 const ROUNDS: usize = 41;
 
-/// Build a chain `f0 -> f1 -> ... -> f{depth}` of dynamic edges, each with
-/// `capacity` slots filled to `fill` samples at 1 kHz.
+/// Build a chain `f0 -> ... -> f{depth}` of dynamic edges of `capacity` slots filled to `fill` samples at 1 kHz.
 fn chain(depth: usize, capacity: u32, fill: usize, interp: InterpPolicy) -> (Tree, Vec<String>) {
     let names: Vec<String> = (0..=depth).map(|i| format!("f{i}")).collect();
     let mut b = TreeBuilder::new().default_interp(interp);
@@ -89,7 +78,6 @@ fn time_lookups(tree: &Tree, target: &str, source: &str, stamps: &[i64]) -> f64 
     per_round[per_round.len() / 2]
 }
 
-/// Stamps sweeping the whole filled window — the search does real work.
 fn swept(fill: usize) -> Vec<i64> {
     let hi = (fill as i64 - 2) * 1_000_000;
     (0..N as i64)
@@ -97,7 +85,6 @@ fn swept(fill: usize) -> Vec<i64> {
         .collect()
 }
 
-/// The same stamp every time — maximal temporal locality.
 fn pinned(fill: usize) -> Vec<i64> {
     let mid = (fill as i64 / 2) * 1_000_000 + 500_000;
     std::vec![mid; N]
@@ -108,7 +95,6 @@ fn main() {
     println!("=========================");
     println!("{N} lookups/round, median of {ROUNDS} rounds, LerpSlerp unless stated\n");
 
-    // --- capacity sweep: isolates bracket-search cost -----------------------
     println!("## capacity sweep (depth 3, window fully filled, stamps swept)");
     println!(
         "{:>10} {:>7} {:>12} {:>14} {:>12}",
@@ -129,7 +115,6 @@ fn main() {
         prev = Some((l2, ns));
     }
 
-    // --- depth sweep: isolates per-step cost -------------------------------
     println!("\n## depth sweep (capacity 4096, stamps swept)");
     println!("{:>7} {:>12} {:>14}", "depth", "ns/lookup", "marginal/step");
     let mut last: Option<f64> = None;
@@ -141,7 +126,6 @@ fn main() {
         last = Some(ns);
     }
 
-    // --- locality sweep: how much of the cost is cache/branch behaviour ----
     println!("\n## locality sweep (depth 3, capacity 16384)");
     let (tree, names) = chain(3, 16384, 16383, InterpPolicy::LerpSlerp);
     let sw = time_lookups(&tree, &names[3], &names[0], &swept(16383));
@@ -155,7 +139,6 @@ fn main() {
         sw - pin
     );
 
-    // --- interp sweep -------------------------------------------------------
     println!("\n## interpolation policy (depth 3, capacity 4096, stamps swept)");
     println!("{:>12} {:>12} {:>14}", "policy", "ns/lookup", "ns/step");
     for (label, pol) in [
@@ -167,7 +150,6 @@ fn main() {
         println!("{label:>12} {ns:>12.1} {:>14.1}", ns / 3.0);
     }
 
-    // --- exact-hit vs interpolated -----------------------------------------
     println!("\n## exact-stamp hit vs interpolated (depth 3, capacity 4096)");
     let (tree, names) = chain(3, 4096, 4095, InterpPolicy::LerpSlerp);
     let exact: Vec<i64> = (0..N as i64).map(|k| (k % 4000 + 1) * 1_000_000).collect();

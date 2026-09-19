@@ -1,51 +1,12 @@
-//! `docs/PHASE2.md` §10's NORMATIVE test, and §15's box 11.
+//! `docs/PHASE2.md` §10's NORMATIVE test, and §15's box 11: replay one
+//! recording into a `HeapArena` and a `MappedArena`, run an identical query set,
+//! assert bit-identical `f64` results.
 //!
-//! §10: *"Replay one recording into a `HeapArena` and a `MappedArena`, run an
-//! identical query set against both, and assert **bit-identical `f64`
-//! results**, not approximate equality. Lookups are pure functions of `(plan,
-//! stamp, buffer contents)`, so any difference at all means the shared-memory
-//! path is not the same code, which is the central claim of this phase."*
+//! Both trees are filled by the same `replay` from the same in-memory
+//! `Vec<FixtureMessage>`; the file written to `run.mcap` is not read back, so
+//! serialisation is outside the assertion (§15's box 11 has the argument).
 //!
-//! # Why this is the missing test rather than a third one
-//!
-//! Two bit-identity tests already exist and neither is this pair.
-//! `a_frozen_lookup_is_bit_identical_to_the_live_one` compares **heap against
-//! frozen**; `another_process_reads_the_same_arena_bit_identically` compares
-//! **one mapped segment against itself, from another process**. Heap against
-//! mapped — the pair §10 names, and the one that would catch a shared-memory
-//! read path that had diverged from the in-process one — was covered by
-//! neither.
-//!
-//! # One variable
-//!
-//! Both trees are filled by the **same** `replay` function from the **same**
-//! `Vec<FixtureMessage>`, so the only difference between them is the backing
-//! store. Ingesting into one and hand-pushing into the other would have
-//! compared two code paths as well as two backends, and a difference could then
-//! be attributed to either.
-//!
-//! # What the recording is, and what it is not
-//!
-//! The fixture is written to `run.mcap` and the file is asserted to exist. It
-//! is **not** read back: both trees replay the same in-memory
-//! `Vec<FixtureMessage>`, and this file imports no reader. So CDR encode and
-//! decode of the pose bits, MCAP chunking and the reader's own path are all
-//! outside the assertion — *"written to MCAP and read back"* stood here until
-//! 2026-09-05 and was never true.
-//!
-//! The claim §10 asks for is unaffected, because it is about the two read paths
-//! and not about serialisation: one recording, two backends, bit-identical
-//! `f64`. Widening this to a real round trip is a change with a decision in it
-//! rather than a one-line addition — the fixture's `/tf_static` edges carry
-//! `stamp_ns == 0`, which `read_tf` consumers routinely skip, so reading the
-//! file back would change the query set. `docs/PHASE2.md` §15's box for this
-//! test carries the argument.
-//!
-//! # Where this test runs
-//!
-//! It is `shm`-gated, so `just test` does not reach it: `cargo nextest list -p
-//! tf_tree_cli` does not list it and the same command with `--features shm`
-//! does. `just shm-check` runs it, and CI runs `just shm-check`.
+//! `shm`-gated: `just shm-check` runs it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(all(feature = "shm", target_os = "linux"))]
@@ -73,12 +34,8 @@ impl Drop for Scratch {
     }
 }
 
-/// Every `(parent, child)` edge the recording declares, in first-seen order.
-///
-/// Order matters and is taken from the recording rather than sorted: edge ids
-/// are assigned at declaration time and append-only (D10), so declaring in a
-/// different order would give the two arenas different `EdgeId`s for the same
-/// edge — a difference that is not the one under test.
+/// Every `(parent, child)` edge the recording declares, in first-seen order
+/// (edge ids are append-only, D10, so order must match in both arenas).
 fn edges_of(msgs: &[FixtureMessage]) -> Vec<(String, String)> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -93,10 +50,8 @@ fn edges_of(msgs: &[FixtureMessage]) -> Vec<(String, String)> {
     out
 }
 
-/// Declare the recording's topology. Every edge is dynamic, including the ones
-/// the recording published on `/tf_static`: a static edge holds one inline pose
-/// and no ring, so replaying a static edge's samples is not possible and the
-/// comparison would be over a different quantity in each arena.
+/// Declare the recording's topology. Every edge is dynamic, including the
+/// `/tf_static` ones, since a static edge holds no ring to replay into.
 fn builder_for(msgs: &[FixtureMessage]) -> TreeBuilder {
     let mut b = TreeBuilder::new();
     for (parent, child) in edges_of(msgs) {
@@ -106,9 +61,6 @@ fn builder_for(msgs: &[FixtureMessage]) -> TreeBuilder {
 }
 
 /// Push every transform in `msgs` into `tree`, in recording order.
-///
-/// This is the "replay" half of §10, and it is deliberately one function used
-/// for both arenas.
 fn replay(tree: &Tree, msgs: &[FixtureMessage]) {
     let mut writers = std::collections::BTreeMap::new();
     for m in msgs {
@@ -125,18 +77,14 @@ fn replay(tree: &Tree, msgs: &[FixtureMessage]) {
                 }
                 bits
             });
-            // A recording can carry two transforms with one stamp on one edge;
-            // the ring refuses the second, identically in both arenas.
+            // A repeated stamp on one edge is refused identically in both arenas.
             let _ = w.push(t.stamp_ns, &iso);
         }
     }
 }
 
-/// The query set, run against both arenas.
-///
-/// Stamps straddle the recording rather than sitting on its samples: a query
-/// that lands exactly on a stored stamp returns that sample unchanged and would
-/// compare two memcpys, where an interpolated one compares the arithmetic.
+/// The query set, run against both arenas. Stamps straddle the recording so
+/// answers are interpolated, not stored samples.
 fn probe_stamps(msgs: &[FixtureMessage]) -> Vec<i64> {
     let mut stamps: Vec<i64> = msgs
         .iter()
@@ -181,8 +129,7 @@ fn a_replay_into_heap_and_mapped_arenas_is_bit_identical() {
     let scratch = Scratch::new("bitident");
     let msgs = small_recording();
 
-    // The recording is written and asserted to exist. It is deliberately not
-    // read back: both arenas below replay `msgs`, the same in-memory fixture.
+    // The recording is written but not read back; both arenas replay `msgs`.
     let bag = scratch.0.join("run.mcap");
     write_mcap(&bag, &msgs).expect("write the recording");
     assert!(
@@ -207,8 +154,7 @@ fn a_replay_into_heap_and_mapped_arenas_is_bit_identical() {
     let a = answers(&heap, &pairs, &stamps);
     let b = answers(&mapped, &pairs, &stamps);
 
-    // Two anti-vacuity guards, because a comparison of two empty vectors, or of
-    // two vectors of `None`, is satisfied by any pair of arenas at all.
+    // Anti-vacuity: empty or all-`None` vectors match any pair of arenas.
     assert!(!a.is_empty(), "the query set must not be empty");
     let hits = a.iter().filter(|x| x.is_some()).count();
     assert!(
@@ -223,48 +169,11 @@ fn a_replay_into_heap_and_mapped_arenas_is_bit_identical() {
     );
 }
 
-/// **`docs/PHASE5.md` §11's three-way bit-identity, and §12 criterion 1.**
-/// *"Replay one recording into `HeapArena`, `MappedArena`, and `FrozenArena`;
-/// identical query set; assert bit-identical `f64`."*
-///
-/// # Why this is a separate test and not a widening of the one above
-///
-/// The test above is `docs/PHASE2.md` §10's NORMATIVE pair, heap against
-/// mapped, and §15's box cites it by name. This is a different and larger
-/// claim, so it gets its own name rather than silently changing what that box
-/// points at.
-///
-/// # Why it is not composed from the two tests that already existed
-///
-/// §12 criterion 1 was, until this landed, held by transitivity across two
-/// tests that share neither input:
-///
-/// * `a_replay_into_heap_and_mapped_arenas_is_bit_identical` (above) —
-///   `heap == mapped`, over a **replayed recording**, 5 edge pairs x 300
-///   stamps.
-/// * `a_frozen_lookup_is_bit_identical_to_the_live_one`
-///   (`crates/tf_tree/tests/frozen.rs`) — `live == frozen`, over a
-///   **hand-built** `Tree`, 3 edge pairs x 5 stamps.
-///
-/// Both are genuine `to_bits()` comparisons and both are worth keeping. But
-/// `H == M` on one recording and `H == F` on a *different* one, built a
-/// different way and queried at different stamps, implies nothing whatever
-/// about `M == F` — there is no common input for transitivity to run through.
-/// §11 asks for **one** recording and an **identical** query set, and that is
-/// what this test is: all three arenas hold the same replayed samples and are
-/// asked the same questions.
-///
-/// # One variable
-///
-/// The frozen arena is frozen **from the heap arena**, after the same `replay`
-/// that filled it, so the only difference between the three answers is how the
-/// bytes are held: a heap allocation, a `memfd` mapping, and a `PROT_READ`
-/// file mapping. That is §2.1's NORMATIVE claim — *"the frozen read path uses
-/// the identical `Plan::at` code as the online path"* — stated as an assertion.
-///
-/// **Mutation-verified**: freezing before `replay` instead of after (so the
-/// file holds a declared-but-empty arena) makes the frozen arena answer `None`
-/// at every probe and fails the last assertion. Run, not reasoned about.
+/// `docs/PHASE5.md` §11's three-way bit-identity, §12 criterion 1: one recording
+/// replayed into `HeapArena`, `MappedArena` and `FrozenArena`, identical query
+/// set, bit-identical `f64`. The frozen arena is frozen from the heap arena
+/// after the replay, so only the backing store differs (§2.1: the frozen read
+/// path is the identical `Plan::at`).
 #[test]
 fn a_replay_into_heap_mapped_and_frozen_arenas_is_bit_identical() {
     let scratch = Scratch::new("bitident3");
@@ -282,8 +191,7 @@ fn a_replay_into_heap_mapped_and_frozen_arenas_is_bit_identical() {
     replay(&heap, &msgs);
     replay(&mapped, &msgs);
 
-    // The third backend: the same filled arena, written out and mapped back
-    // read-only. Frozen *after* the replay — see the mutant above.
+    // Frozen after the replay, written out and mapped back read-only.
     let tft = scratch.0.join("three-way.tft");
     heap.freeze_to(
         &tft,
@@ -300,9 +208,7 @@ fn a_replay_into_heap_mapped_and_frozen_arenas_is_bit_identical() {
     let b = answers(&mapped, &pairs, &stamps);
     let c = answers(&frozen, &pairs, &stamps);
 
-    // The same two anti-vacuity guards the pair test carries, for the same
-    // reason: three empty vectors, or three vectors of `None`, are equal for
-    // any three arenas at all.
+    // The same anti-vacuity guards as the pair test.
     assert!(!a.is_empty(), "the query set must not be empty");
     let hits = a.iter().filter(|x| x.is_some()).count();
     assert!(

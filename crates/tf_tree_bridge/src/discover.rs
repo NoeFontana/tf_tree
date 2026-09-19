@@ -1,16 +1,11 @@
 //! `--discover`: watch a `/tf` stream, print the config file it implies
-//! (`docs/PHASE4.md` §5.8). Runs against a live system or a recorded `.tfstream`.
+//! (`docs/PHASE4.md` §5.8). Defects in the observed system are reported, not encoded:
 //!
-//! Two findings are defects in the observed system and are reported, not encoded:
+//! * **A child with two parents** (D4/`0004`): first parent wins, the rest are counted and named.
+//! * **An edge on both `/tf` and `/tf_static`** (§5.7): first topic wins, the clash is counted.
 //!
-//! * **A child with two parents** (D4/`0004`): first parent wins, the rest are
-//!   counted and named; [`TopologyConfig::parse`] refuses a duplicate child.
-//! * **An edge on both `/tf` and `/tf_static`** (§5.7): first topic wins, the
-//!   clash is counted.
-//!
-//! A dynamic edge's ring is sized from the observed mean rate
-//! `(samples - 1) / span`, rounded **up** to two decimals; an edge with fewer
-//! than two samples gets an explicit slot count instead.
+//! A dynamic edge's ring is sized from the observed mean rate `(samples - 1) / span`,
+//! rounded **up** to two decimals; an edge with fewer than two samples gets a slot count.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,8 +45,7 @@ pub struct Discovery {
     default_interp: InterpPolicy,
 }
 
-/// The fallback ring for an edge with fewer than two samples: a placeholder
-/// loud enough to notice and small enough to ship unedited.
+/// The ring for an edge with fewer than two samples.
 pub const UNMEASURABLE_RATE_SLOTS: u32 = 64;
 
 impl Discovery {
@@ -70,8 +64,7 @@ impl Discovery {
         }
     }
 
-    /// Apply a `tf_prefix` while collecting (§5.6), so the printed config uses
-    /// the names the bridge will key on rather than the ones on the wire.
+    /// Apply a `tf_prefix` while collecting (§5.6).
     #[must_use]
     pub fn with_prefix(mut self, prefix: &str) -> Discovery {
         self.names = NameNormalizer::with_prefix(prefix);
@@ -85,8 +78,7 @@ impl Discovery {
         self
     }
 
-    /// Record one transform. Names are normalized as [`crate::Ingest`] does, so
-    /// the printed config is keyed the way the bridge looks edges up.
+    /// Record one transform, normalizing names as [`crate::Ingest`] does.
     pub fn observe(&mut self, topic: Topic, sample: &Sample) {
         let (Ok(parent), Ok(child)) = (
             self.names.normalize(&sample.frame_id),
@@ -100,15 +92,13 @@ impl Discovery {
             self.dropped_bad_name += 1;
             return;
         }
-        // `NameNormalizer` is the wire rule; only `frame_name_ok` decides that a
-        // name survives a write/read round trip through a config file.
+        // Only `frame_name_ok` decides that a name survives a config round trip.
         if !frame_name_ok(&parent) || !frame_name_ok(&child) {
             self.dropped_bad_name += 1;
             return;
         }
         match self.parent_of.get(&child) {
             Some(p) if *p != parent => {
-                // Recorded, not encoded: see the module docs.
                 self.dropped_multi_parent += 1;
                 self.rejected_parents
                     .entry(child)
@@ -177,7 +167,6 @@ impl Discovery {
     }
 
     /// Children seen with more than one parent, as `(child, rejected parent)`.
-    /// The caller must surface it; the printed config keeps the first parent.
     #[must_use]
     pub fn multi_parent(&self) -> Vec<(&str, &str)> {
         self.rejected_parents
@@ -202,14 +191,13 @@ impl Discovery {
             .collect()
     }
 
-    /// Transforms discarded for an unusable name (§5.6), a self-edge, or a name
-    /// that cannot round-trip through a config file.
+    /// Transforms discarded for an unusable name (§5.6), a self-edge, or an unwritable name.
     #[must_use]
     pub fn dropped_bad_name(&self) -> u64 {
         self.dropped_bad_name
     }
 
-    /// How many samples each discovered edge contributed, for the report.
+    /// How many samples each discovered edge contributed.
     #[must_use]
     pub fn sample_counts(&self) -> Vec<(&str, &str, u64)> {
         self.edges
@@ -221,11 +209,6 @@ impl Discovery {
 
 /// The mean rate over the observed span, rounded **up** to two decimals; `None`
 /// when fewer than two samples arrived or all share one stamp.
-///
-/// An observation that the emitted `rate_hz` reads back as an intention
-/// (`docs/PHASE5.md` §6, `TFT007`): a recording of a degraded publisher
-/// discovers the fault as the declaration. `--discover` prints sample counts so
-/// the operator can review.
 fn measured_rate(s: &Seen) -> Option<f64> {
     let span_ns = s.last_ns.checked_sub(s.first_ns)?;
     if s.count < 2 || span_ns <= 0 {
@@ -249,10 +232,7 @@ mod tests {
         Sample::identity(p, c, t)
     }
 
-    /// A discovered config parses back to itself; the fixture is irregular
-    /// (jitter, a static, a `/`-prefixed spelling of a bare frame).
-    ///
-    /// Mutant: emit the two spellings as two edges ⇒ `DuplicateChild`.
+    /// A discovered config parses back to itself.
     #[test]
     fn a_discovered_config_reparses_to_itself() {
         let mut d = Discovery::new(10.0);
@@ -264,7 +244,6 @@ mod tests {
             },
         );
         for k in 0..100i64 {
-            // 20 Hz nominal with ±1 ms jitter.
             d.observe(
                 Topic::Tf,
                 &dyn_sample(
@@ -274,7 +253,6 @@ mod tests {
                 ),
             );
             if k % 4 == 0 {
-                // 5 Hz, and spelled with a leading slash half the time.
                 let (p, c) = if k % 8 == 0 {
                     ("/base_footprint", "/base_link")
                 } else {
@@ -292,26 +270,19 @@ mod tests {
         let back = TopologyConfig::parse(&text).unwrap_or_else(|e| panic!("{e} in:\n{text}"));
         assert_eq!(cfg, back);
 
-        // The slash-prefixed spelling collapsed into the bare one rather than
-        // becoming a second edge.
         assert!(cfg.edge("base_footprint", "base_link").is_some());
         assert!(cfg.edge("/base_footprint", "/base_link").is_none());
 
-        // …and it builds a tree.
         let tree = cfg.builder().build().unwrap();
         let odom = tree.frame("odom").unwrap();
         let foot = tree.frame("base_footprint").unwrap();
         assert!(tree.claim(foot, odom).is_ok());
     }
 
-    /// The rate is measured and rounded up; 19.783001… Hz gives 19.79 under
-    /// `ceil` and 19.78 under `round`.
-    ///
-    /// Mutant: `.round()` instead of `.ceil()` in `measured_rate`.
+    /// The rate is measured and rounded up (19.783001… Hz gives 19.79, not 19.78).
     #[test]
     fn the_rate_is_measured_and_rounded_up() {
         let mut d = Discovery::new(10.0);
-        // 100 samples, 99 intervals of 50.548446 ms ⇒ 19.783001835… Hz.
         for k in 0..100i64 {
             d.observe(Topic::Tf, &dyn_sample("a", "b", k * 50_548_446));
         }
@@ -330,15 +301,11 @@ mod tests {
         }
     }
 
-    /// An edge with one sample has no rate: it gets a slot count, not an
-    /// invented frequency.
-    ///
-    /// Mutant: return `Some(1.0)` from `measured_rate` on the degenerate case.
+    /// An edge with one sample, or two sharing a stamp, gets a slot count, not an invented rate.
     #[test]
     fn an_unmeasurable_rate_is_not_invented() {
         let mut d = Discovery::new(10.0);
         d.observe(Topic::Tf, &dyn_sample("a", "b", 7));
-        // …and neither is one from two samples that share a stamp.
         d.observe(Topic::Tf, &dyn_sample("c", "e", 7));
         d.observe(Topic::Tf, &dyn_sample("c", "e", 7));
         let cfg = d.to_config();
@@ -356,8 +323,6 @@ mod tests {
     }
 
     /// A child with two parents is reported, not encoded (§5.4).
-    ///
-    /// Mutant: drop the `parent_of` check ⇒ reparse fails with `DuplicateChild`.
     #[test]
     fn a_second_parent_is_reported_and_the_config_still_reparses() {
         let mut d = Discovery::new(10.0);
@@ -378,22 +343,17 @@ mod tests {
     }
 
     /// An edge on both topics is reported (§5.7).
-    ///
-    /// Mutant: never set `kind_clash`.
     #[test]
     fn an_edge_on_both_topics_is_reported() {
         let mut d = Discovery::new(10.0);
         d.observe(Topic::TfStatic, &dyn_sample("base", "lidar", 0));
         d.observe(Topic::Tf, &dyn_sample("base", "lidar", 1_000_000));
         assert_eq!(d.kind_clashes(), [("base", "lidar")]);
-        // The first topic wins, so the edge is still declared — as static.
         let cfg = d.to_config();
         assert!(matches!(cfg.edges[0].shape, EdgeShape::Static { .. }));
     }
 
     /// An unusable frame name is dropped and counted.
-    ///
-    /// Mutant: drop the `parent == child` guard ⇒ a `SelfEdge` file.
     #[test]
     fn a_bad_name_never_reaches_the_config() {
         let mut d = Discovery::new(10.0);
@@ -403,11 +363,7 @@ mod tests {
         assert!(d.to_config().edges.is_empty());
     }
 
-    /// A name that cannot survive the config file is dropped, not discovered
-    /// into an unparseable file. The good edge keeps the config non-empty so the
-    /// test cannot pass vacuously.
-    ///
-    /// Mutant: delete the `frame_name_ok` guard in `observe`.
+    /// A name that cannot survive the config file is dropped, not discovered.
     #[test]
     fn a_name_that_cannot_be_written_to_a_config_is_not_discovered() {
         let mut d = Discovery::new(10.0);
@@ -420,7 +376,6 @@ mod tests {
             d.observe(Topic::Tf, &dyn_sample(p, c, 0));
             d.observe(Topic::Tf, &dyn_sample(p, c, 50_000_000));
         }
-        // …and one edge that is perfectly fine, so the config is not empty.
         d.observe(Topic::Tf, &dyn_sample("base", "wheel", 0));
         d.observe(Topic::Tf, &dyn_sample("base", "wheel", 50_000_000));
 
@@ -436,11 +391,7 @@ mod tests {
         );
     }
 
-    /// Every rejected parent is counted and named. Three parents, not two, so
-    /// "last only" and "all" are distinguishable.
-    ///
-    /// Mutant: `rejected_parents` back to a single `String` per child; or drop
-    /// `self.dropped_multi_parent += 1`.
+    /// Every rejected parent is counted and named.
     #[test]
     fn every_rejected_parent_is_counted_and_named() {
         let mut d = Discovery::new(10.0);
@@ -457,7 +408,6 @@ mod tests {
             3,
             "every sample for a second parent is counted, repeats included"
         );
-        // The first parent seen still wins, per §5.4 / the module docs.
         let config = d.to_config();
         assert_eq!(config.edges.len(), 1);
         assert_eq!(config.edges[0].parent, "odom");

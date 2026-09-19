@@ -1,16 +1,12 @@
 //! Body-frame twists and the SE(3) adjoint — `docs/PHASE4.md` §2.2.
 //!
-//! A [`Twist`] is a **body-frame (right) twist**, `V^b = (T⁻¹ Ṫ)^∨`, paired with
-//! the right-perturbation convention of [`log_se3`](crate::log_se3)
-//! (`lib.rs` convention 5). Order is `[ω, v]`, angular first, as
-//! [`log_se3`](crate::log_se3) returns and [`exp_se3`](crate::exp_se3) consumes.
+//! A [`Twist`] is a body-frame (right) twist, `V^b = (T⁻¹ Ṫ)^∨` (`lib.rs`
+//! convention 5), ordered `[ω, v]` as [`log_se3`](crate::log_se3) returns and
+//! [`exp_se3`](crate::exp_se3) consumes. The spatial twist is `Ad(T)·V^b`
+//! ([`Twist::to_spatial`]).
 //!
-//! * **Body, not spatial.** The spatial twist is `Ad(T)·V^b`
-//!   ([`Twist::to_spatial`]); a left-perturbation library disagrees by `Ad(T)`.
-//! * **No 6×6.** `docs/PHASE4.md` §2.3's "6×6 adjoint" is an identity, not a
-//!   representation; the closed forms below are checked against a dense 6×6 by
-//!   `adjoint_matches_a_dense_6x6` and
-//!   `adjoint_inv_matches_a_dense_6x6_of_the_inverse`:
+//! The adjoint is closed-form, not a 6×6 (`docs/PHASE4.md` §2.3); the tests check
+//! it against a dense 6×6:
 //!
 //! ```text
 //! Ad(T⁻¹)·[ω; v] = [ q*·ω ;  q*·(v − t × ω) ]
@@ -21,9 +17,7 @@ use crate::iso3::{Iso3, Vec3};
 use bytemuck::{Pod, Zeroable};
 
 /// A body-frame (right) twist: angular velocity `ω` (rad/s) and linear velocity
-/// `v` (m/s), both expressed in the **moving** frame.
-///
-/// See the [module docs](self). 48 bytes, `repr(C)`, no padding: [`Pod`].
+/// `v` (m/s), both in the moving frame. 48 bytes, `repr(C)`, no padding: [`Pod`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Twist {
@@ -114,8 +108,7 @@ impl Twist {
 
     /// The **spatial** (left) twist of the same motion: `Ad(T)·V^b`.
     ///
-    /// `t` is the pose the body twist was taken at; a wrong one gives a
-    /// valid-looking twist in the wrong frame.
+    /// `t` is the pose the body twist was taken at.
     #[inline]
     #[must_use]
     pub fn to_spatial(&self, t: &Iso3) -> Self {
@@ -173,8 +166,7 @@ mod tests {
     use super::*;
     use crate::{exp_se3, log_se3};
 
-    /// Dense 6×6 `Ad(T)` from the rotation matrix, sharing no code with
-    /// `Quat::rotate`.
+    /// Dense 6×6 `Ad(T)`, sharing no code with `Quat::rotate`.
     fn dense_adjoint(t: &Iso3) -> [[f64; 6]; 6] {
         let r = rot_matrix(t);
         let tx = [
@@ -250,8 +242,6 @@ mod tests {
     }
 
     /// The quaternion adjoint equals the dense 6×6 (`docs/PHASE4.md` §2.3).
-    ///
-    /// Mutant: drop the `t × (q·ω)` term from [`Iso3::adjoint`].
     #[test]
     fn adjoint_matches_a_dense_6x6() {
         let mut worst = 0.0f64;
@@ -265,8 +255,6 @@ mod tests {
     }
 
     /// `Ad(T⁻¹)` equals the dense adjoint of the inverse.
-    ///
-    /// Mutant: use `self.q` instead of `self.q.conjugate()` in [`Iso3::adjoint_inv`].
     #[test]
     fn adjoint_inv_matches_a_dense_6x6_of_the_inverse() {
         let mut worst = 0.0f64;
@@ -332,8 +320,7 @@ mod tests {
     }
 
     /// `neg` negates both parts: `V_{T⁻¹} = −Ad(T)·V_T` (`docs/PHASE4.md` §2.3).
-    ///
-    /// Mutant: negate only `omega` (or only `v`).
+
     #[test]
     fn neg_negates_both_parts_and_satisfies_the_inverse_identity() {
         for (t, x) in cases() {

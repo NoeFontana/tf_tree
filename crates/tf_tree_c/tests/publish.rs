@@ -1,16 +1,8 @@
-//! The publish surface of the C ABI — `docs/PHASE4.md` §3.2 and §6.1.
-//!
-//! `abi.rs` covers misuse with no handle; `live.rs` covers the read path against
-//! a live handle. This covers the *write* path, which is the half where a
-//! mistake corrupts a robot's transform tree rather than merely returning a bad
-//! answer to the process that made it.
+//! The write path of the C ABI (`docs/PHASE4.md` §3.2, §6.1).
 #![cfg(feature = "test-hooks")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
-// exercise or measure it** (`docs/decisions/0048`: a kind is a property, not a
-// crate name). The posture is declared here rather than inherited:
-// `crates/tf_tree_c/src/lib.rs` does not govern this file, because a test or
-// example is a **separate crate root**. `0048` step 4 is what this closes.
+// `docs/decisions/0007` rule 1, kind 5: our own C ABI called from Rust; a test
+// is a separate crate root, so the posture is declared here (`0048`).
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -102,23 +94,13 @@ fn read_f64(b: &[u8], i: usize) -> f64 {
     f64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap())
 }
 
-// ---------------------------------------------------------------------------
-// The working path
-// ---------------------------------------------------------------------------
-
-/// **What a C publisher actually does**: claim, push, and have a reader see it.
-///
-/// The assertion is against the *read* path, not against another write, so a
-/// matched pair of bugs in `layout::read`/`layout::write` cannot satisfy it —
-/// the read goes through `tft_plan_at`, which has its own hand-computed
-/// byte-pattern tests.
+/// Claim, push, and a reader sees it through `tft_plan_at`.
 #[test]
 fn a_published_transform_is_visible_to_a_reader() {
     let f = Fixture::new();
     let p = f.claim("robot", "world").expect("the edge is unclaimed");
 
-    // Rz(90°) at t=0 and t=1 s, so any stamp in between is exactly on the
-    // segment and the reader has something to interpolate.
+    // Rz(90°) at t=0 and t=1 s.
     let c = core::f64::consts::FRAC_1_SQRT_2;
     assert_eq!(
         p.push(
@@ -156,12 +138,8 @@ fn a_published_transform_is_visible_to_a_reader() {
     unsafe { tft_plan_free(plan) };
 }
 
-/// **Every readable layout publishes the same transform.**
-///
-/// Mutant: drop the `column_major` transposition in `read_mat4` ⇒ the two matrix
-/// layouts disagree and this fails. `every_readable_layout_round_trips` in the
-/// unit tests catches the same mutant, but only through `write`; this catches it
-/// through the shipped entry point, which is the one a C caller uses.
+/// Every readable layout publishes the same transform (through the shipped
+/// entry point, including `column_major` handling in `read_mat4`).
 #[test]
 fn all_four_readable_layouts_publish_identically() {
     let c = core::f64::consts::FRAC_1_SQRT_2;
@@ -175,10 +153,6 @@ fn all_four_readable_layouts_publish_identically() {
         let f = Fixture::new();
         let p = f.claim("robot", "world").unwrap();
 
-        // Build the payload by writing a known transform out in this layout,
-        // through the read path's inverse — `tft_plan_at` on a tree that already
-        // holds it. Simpler and just as independent: hand-build for QVEC7 and
-        // derive the matrices from Rz(90°)'s hand-computed pattern.
         let src: Vec<u8> = match layout {
             TFT_LAYOUT_QVEC7_WXYZ => quat7([c, 0.0, 0.0, c], [1.0, 2.0, 3.0]).to_vec(),
             TFT_LAYOUT_QVEC7_XYZW => quat7([0.0, 0.0, c, c], [1.0, 2.0, 3.0]).to_vec(),
@@ -231,9 +205,8 @@ fn pack(v: &[f64]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_ne_bytes()).collect()
 }
 
-// `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast is necessary
-// on one target and a no-op on the other; see `src/error.rs` for the full
-// note. The allow is the fix — deleting the cast breaks x86_64.
+// `c_char` is `i8` on x86_64 and `u8` on aarch64 (`src/error.rs`); the allow is
+// the fix.
 #[allow(clippy::unnecessary_cast)]
 fn message(e: &tft_error) -> String {
     let bytes: Vec<u8> = e
@@ -245,8 +218,7 @@ fn message(e: &tft_error) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// **A batch publishes, and a stride lets it read out of an array of caller
-/// structs** — §4.3's `Sophus::SE3d` case, in the publish direction.
+/// A batch honours a stride, reading from an array of caller structs (§4.3).
 #[test]
 fn push_many_honours_a_stride() {
     let f = Fixture::new();
@@ -260,7 +232,7 @@ fn push_many_honours_a_stride() {
         let tx = i as f64;
         let one = quat7([1.0, 0.0, 0.0, 0.0], [tx, 0.0, 0.0]);
         src[i * STRIDE..i * STRIDE + 56].copy_from_slice(&one);
-        // Poison the padding, so a stride bug reads garbage rather than zeros.
+        // Poison the padding.
         src[i * STRIDE + 56..(i + 1) * STRIDE].fill(0xAB);
     }
     // SAFETY: live handle; `stamps` has N elements and `src` is N*STRIDE bytes.
@@ -294,23 +266,8 @@ fn push_many_honours_a_stride() {
     unsafe { tft_plan_free(plan) };
 }
 
-// ---------------------------------------------------------------------------
-// Misuse
-// ---------------------------------------------------------------------------
-
-/// **One writer per edge (D7), enforced across the C boundary.**
-///
-/// Mutant: return the writer without going through `Tree::claim` ⇒ two live
-/// publishers on one edge, which is the invariant the whole engine is built on.
-///
-/// **And the refusal names the edge (D11).** `world -> robot` is the fixture's
-/// first declared edge, and the builder numbers edges from 1, so the refused
-/// edge is `1` — not `TFT_INVALID_ID`, which is what `tft_error.edge` read here
-/// until `ClaimApiError::AlreadyClaimed` carried the edge.
-///
-/// **Mutant:** delete `d.edge = edge.get();` from `map::claim`'s
-/// `AlreadyClaimed` arm. Applied: this test fails at the `edge` assertion —
-/// `left: 4294967295`, `right: 1`.
+/// One writer per edge (D7) across the C boundary, and the refusal names the
+/// edge (D11): `world -> robot` is edge `1`.
 #[test]
 fn a_second_claim_on_a_held_edge_is_refused() {
     let f = Fixture::new();
@@ -324,15 +281,14 @@ fn a_second_claim_on_a_held_edge_is_refused() {
     assert_eq!(e.edge, 1, "the refused edge is named");
 }
 
-/// **Releasing gives the edge back**, and the released handle refuses to
-/// publish rather than writing through a dropped claim.
+/// Releasing frees the edge and disarms the handle.
 #[test]
 fn release_frees_the_edge_and_disarms_the_handle() {
     let f = Fixture::new();
     let p = f.claim("robot", "world").unwrap();
     // SAFETY: live handle, on its creating thread.
     assert_eq!(unsafe { tft_publisher_release(p.0) }, TFT_OK);
-    // Releasing twice is a no-op, not an error.
+    // Idempotent.
     // SAFETY: as above.
     assert_eq!(unsafe { tft_publisher_release(p.0) }, TFT_OK);
 
@@ -357,13 +313,8 @@ fn claiming_a_static_edge_is_refused() {
     assert_eq!(f.claim("tool", "robot").unwrap_err(), TFT_ERR_NOT_DYNAMIC);
 }
 
-/// **Stamps are non-decreasing per edge**, and a violation is reported with
-/// both the offending stamp and the edge's newest — and the edge itself (D11;
-/// `world -> robot` is edge 1, see `a_second_claim_on_a_held_edge_is_refused`).
-///
-/// **Mutant:** delete `d.edge = edge.get();` from `map::push`'s
-/// `NonMonotonicStamp` arm. Applied: this test fails at the `edge` assertion —
-/// `left: 4294967295`, `right: 1`.
+/// Stamps are non-decreasing per edge; the refusal carries the offending stamp,
+/// the newest, and the edge (D11).
 #[test]
 fn a_backwards_stamp_is_refused_and_says_by_how_much() {
     let f = Fixture::new();
@@ -380,24 +331,12 @@ fn a_backwards_stamp_is_refused_and_says_by_how_much() {
     assert_eq!(e.edge, 1, "the refused edge is named");
 }
 
-/// **A left-handed matrix never reaches the arena**, through the shipped entry
-/// point rather than only through the unit-tested helper.
-///
-/// Mutant: delete the determinant check in `layout::read_mat4` ⇒ the reflection
-/// is published as a rotation and this returns `TFT_OK`.
+/// A left-handed matrix is refused at the shipped entry point.
 #[test]
 fn a_reflected_matrix_is_refused_at_the_boundary() {
     let f = Fixture::new();
     let p = f.claim("robot", "world").unwrap();
-    // Rz(90°) with its **first column** negated — elements (0,0), (1,0), (2,0)
-    // — giving det = −1. An earlier version of this fixture negated the third
-    // diagonal entry as well; two sign flips cancel and det came back to +1, so
-    // the test failed against correct code. Written out with the determinant
-    // stated so the next reader does not have to re-derive it:
-    //
-    //   [ 0 −1  0 ]
-    //   [−1  0  0 ]   det = 0·0 − (−1)·(−1·1) + 0 = −1
-    //   [ 0  0  1 ]
+    // Rz(90°) with its first column negated: det = -1.
     let src = pack(&[
         0.0, -1.0, 0.0, 1.0, //
         -1.0, 0.0, 0.0, 2.0, //
@@ -408,8 +347,7 @@ fn a_reflected_matrix_is_refused_at_the_boundary() {
     assert!(message(&last_error()).contains("det R"));
 }
 
-/// **The `f32` GPU layout is write-only.** Publishing through it would halve
-/// the precision of everything downstream, silently.
+/// The `f32` layout is write-only.
 #[test]
 fn the_f32_layout_cannot_be_published_through() {
     let f = Fixture::new();
@@ -420,8 +358,7 @@ fn the_f32_layout_cannot_be_published_through() {
     );
 }
 
-/// **NaN never reaches the arena.** One NaN pose poisons every interpolation
-/// that brackets it, forever, with no way to detect it after the fact.
+/// NaN never reaches the arena.
 #[test]
 fn a_nan_transform_is_refused() {
     let f = Fixture::new();
@@ -436,12 +373,8 @@ fn a_nan_transform_is_refused() {
     );
 }
 
-/// **A batch stops at the first rejection and says which element.**
-///
-/// Unlike `tft_plan_at_many`, the earlier elements stay published — there is no
-/// unpublishing a release-store a reader may already have observed. The
-/// contract is therefore "you know exactly where the stream stopped", and this
-/// is the test of that.
+/// A batch stops at the first rejection and names the element; earlier elements
+/// stay published.
 #[test]
 fn a_batch_reports_the_index_that_failed() {
     let f = Fixture::new();
@@ -470,8 +403,7 @@ fn a_batch_reports_the_index_that_failed() {
     let e = last_error();
     assert_eq!(e.frame_b, 3, "the failing index must be reported");
 
-    // Elements 0..3 are published and readable — the documented behaviour, not
-    // an accident: they are release-stores that already happened.
+    // Elements 0..3 are already published.
     let plan = f.plan("world", "robot");
     let mut out = [0u8; 56];
     assert_eq!(
@@ -491,7 +423,7 @@ fn a_batch_reports_the_index_that_failed() {
     unsafe { tft_plan_free(plan) };
 }
 
-/// **Handle-type confusion is caught on the publish surface too.**
+/// Handle-type confusion is caught on the publish surface.
 #[test]
 fn a_tree_is_not_a_publisher() {
     let f = Fixture::new();
@@ -517,34 +449,12 @@ fn a_tree_is_not_a_publisher() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Thread affinity — §3.2, NORMATIVE
-// ---------------------------------------------------------------------------
-
-/// **A publisher used from a thread that does not own it is stopped.**
+/// A publisher used from another thread is stopped (§3.2, NORMATIVE):
+/// `abort()` in debug builds, `TFT_ERR_WRONG_THREAD` in release.
 ///
-/// §3.2 is NORMATIVE: `tft_publisher` is `Send + !Sync`, C cannot say so, and
-/// the handle must therefore refuse cross-thread use — **`abort()` in debug
-/// builds**, with a message that names the mistake.
-///
-/// This runs in a **subprocess** because a passing debug build aborts, and a
-/// test that aborts the runner is not a test. The child is this same binary
-/// re-invoked with `TFT_CROSS_THREAD_CHILD=1`; `cross_thread_child` below is
-/// what it runs.
-///
-/// The assertion differs by profile, and both halves are real:
-///
-/// * **debug** — the child must die by `SIGABRT` (6). Mutant: delete the
-///   `check_thread` call in `tft_publisher_push` ⇒ the child exits 0 and this
-///   fails.
-/// * **release** — the child must exit 0 having observed `TFT_ERR_WRONG_THREAD`,
-///   which is the addition to §3.2 this crate makes and the reason that status
-///   code is not dead.
-// Miri cannot spawn a process (`extern static pidfd_spawnp is not supported`),
-// and this test's whole mechanism is a subprocess — there is no way to observe
-// an `abort()` from inside the process that performs it. Skipped there and run
-// everywhere else; the misuse it covers is a logic error, not a memory-model
-// one, so Miri is not the tool that would catch it anyway.
+/// Runs in a subprocess (this binary re-invoked with `TFT_CROSS_THREAD_CHILD=1`,
+/// see `cross_thread_child`) because a debug build aborts.
+// Miri cannot spawn a process.
 #[cfg_attr(miri, ignore = "needs a subprocess to observe abort()")]
 #[test]
 fn a_publisher_refuses_the_wrong_thread() {
@@ -588,12 +498,9 @@ fn a_publisher_refuses_the_wrong_thread() {
     }
 }
 
-/// The child arm of [`a_publisher_refuses_the_wrong_thread`]. Inert unless
-/// `TFT_CROSS_THREAD_CHILD` is set, so a normal run does not abort itself.
-///
-/// stdout is the channel the parent reads, so `print_stdout` — a `warn` in the
-/// workspace lints — is what this arm is *for*. Allowed here rather than at the
-/// file level so an accidental `println!` in an ordinary test still warns.
+/// Child arm of [`a_publisher_refuses_the_wrong_thread`]; inert unless
+/// `TFT_CROSS_THREAD_CHILD` is set. `print_stdout` is allowed here because stdout
+/// is the channel the parent reads.
 #[allow(clippy::print_stdout)]
 #[test]
 fn cross_thread_child() {
@@ -606,51 +513,22 @@ fn cross_thread_child() {
     let rc = std::thread::spawn(move || {
         let h = raw as *mut tft_publisher;
         let src = quat7([1.0, 0.0, 0.0, 0.0], [0.0; 3]);
-        // SAFETY: `h` is a live handle. Using it from this thread is exactly
-        // the misuse §3.2 requires the library to catch, and catching it is
-        // what this call is here to demonstrate.
+        // SAFETY: `h` is a live handle; cross-thread use is the misuse under test.
         unsafe { tft_publisher_push(h, 0, TFT_LAYOUT_QVEC7_WXYZ, src.as_ptr().cast()) }
     })
     .join()
     .expect("the pushing thread");
 
-    // Only reached in a release build; a debug build aborted inside the spawn.
     assert_eq!(rc, TFT_ERR_WRONG_THREAD);
     println!("WRONG_THREAD OK");
-    // Drop the publisher on its owning thread, or the destructor trips the same
-    // check — which is deliberate, and tested by that being true.
+    // Drop on the owning thread, or the destructor trips the same check.
     drop(p);
 }
 
-// ---------------------------------------------------------------------------
-// Introspection against a tree with headroom — the case review found
-// ---------------------------------------------------------------------------
-
-/// **A frame id inside the arena's headroom is not a frame.**
+/// A frame id inside the arena's headroom is not a frame.
 ///
-/// `ArenaView::frame_record` bounds an id against `max_frames`, which is
-/// `frame_count + 1 + frame_headroom` — *not* against `frame_count`. The slots
-/// between are zeroed arena memory, and `tft_tree_frame_name` used to read one,
-/// find `name_len == 0`, write a lone NUL and return `TFT_OK`. A diagnostic
-/// iterating ids would have rendered blank frames that do not exist.
-///
-/// `live.rs`'s equivalent assertion passed the whole time, because both C
-/// fixtures were built with **zero headroom**, which makes the two bounds
-/// coincide. That is what makes this fixture's `frame_headroom(4)` the point of
-/// the test rather than a detail of it — and why the fixture carries it now.
-///
-/// Mutant: **remove both filters** — that is, restore the original
-/// `FrameId::new(id).and_then(|f| view.frame_record(f))` — ⇒ ids 4..=7 return
-/// `TFT_OK` with an empty name.
-///
-/// Removing *either* filter alone leaves this passing, and that was checked
-/// rather than assumed. The two are redundant for this case and not for others:
-/// `id <= count` is the range check, while `name_hash != 0` additionally covers
-/// an id *within* the count whose record `FrameTable::finish` has not written
-/// yet (it bumps `frame_count` before `write_record`). That second case cannot
-/// be provoked deterministically from a test, so it is guarded rather than
-/// pinned, and this docstring says so instead of claiming a mutant it does not
-/// kill.
+/// The fixture's `frame_headroom(4)` is the point: with zero headroom the
+/// `max_frames` and `frame_count` bounds coincide.
 #[test]
 fn a_frame_id_in_the_headroom_is_refused_not_read() {
     let f = Fixture::new();
@@ -670,9 +548,8 @@ fn a_frame_id_in_the_headroom_is_refused_not_read() {
         assert!(buf[0] != 0, "frame {id} must not report an empty name");
     }
 
-    // Everything past the count is a hole in the arena, headroom included.
-    // Non-vacuity: at least one of these ids must be *inside* `max_frames`, or
-    // the loop is only re-testing the out-of-range path `live.rs` covers.
+    // Everything past the count is a hole; at least one id must lie inside
+    // `max_frames`.
     let mut in_range_holes = 0;
     for id in count + 1..=count + 5 {
         buf[0] = 0x7f;
@@ -689,10 +566,7 @@ fn a_frame_id_in_the_headroom_is_refused_not_read() {
         "the fixture must have headroom, or this test cannot fail"
     );
 
-    // **And the guard must not over-reject.** A frame interned at runtime lands
-    // in what was headroom a moment ago, and its name must be readable the
-    // instant `frame_count` covers it. Without this the test would pass just as
-    // well against a `tft_tree_frame_name` that refused every id.
+    // The guard must not over-reject a frame interned at runtime.
     let _ = f.claim("late_arrival", "world"); // interns, then fails on NoEdge
                                               // SAFETY: `f.0` is a live handle.
     let after = unsafe { tft_tree_frame_count(f.0) };
@@ -702,8 +576,7 @@ fn a_frame_id_in_the_headroom_is_refused_not_read() {
         unsafe { tft_tree_frame_name(f.0, after, buf.as_mut_ptr(), buf.len()) },
         TFT_OK
     );
-    // See `src/error.rs`: `c_char` is `i8` on x86_64 and `u8` on aarch64, so
-    // this cast is necessary on one target and a no-op on the other.
+    // `c_char` signedness: see `src/error.rs`.
     #[allow(clippy::unnecessary_cast)]
     let name: String = buf
         .iter()
@@ -713,16 +586,7 @@ fn a_frame_id_in_the_headroom_is_refused_not_read() {
     assert_eq!(name, "late_arrival");
 }
 
-/// **A wrong parent is not a wrong frame name.**
-///
-/// `ParentMismatch` was reported as `TFT_ERR_UNKNOWN_FRAME`, whose frozen
-/// definition is "a frame name that this tree never interned" — false for
-/// *every* instance of this case, because `tft_tree_claim` resolves both names
-/// before the mismatch can arise. A C caller reading that code would go and
-/// check its spelling, which is the wrong fix. Reported by review.
-///
-/// Mutant: map `ParentMismatch` back onto `TFT_ERR_UNKNOWN_FRAME` ⇒ this fails,
-/// and the caller can no longer tell a typo from a topology error.
+/// A wrong parent is `ParentMismatch`, not `TFT_ERR_UNKNOWN_FRAME`.
 #[test]
 fn claiming_the_wrong_parent_is_its_own_error() {
     let f = Fixture::new();
@@ -735,22 +599,11 @@ fn claiming_the_wrong_parent_is_its_own_error() {
     assert_eq!(e.frame_a, 2, "the child frame");
     assert_eq!(e.frame_b, 1, "its ACTUAL parent, world");
 
-    // **A name nobody has used before is *interned*, not rejected.**
-    //
-    // `Tree::frame` interns; it does not look up. So a typo'd child name becomes
-    // a real frame — which then has no incoming edge, and the claim fails with
-    // `TFT_ERR_NO_EDGE` rather than `TFT_ERR_UNKNOWN_FRAME`. This test asserted
-    // the latter and found out otherwise, which is worth pinning: it is the
-    // second reason `NoEdge` needed a code of its own, and it means a C caller
-    // that mistypes a frame name consumes a headroom slot permanently (ids are
-    // never recycled, D10). Documented on `tft_tree_claim` rather than changed
-    // here — `Tree::frame`'s semantics are Phase 2's and are shared with the
-    // Python binding and the CLI.
+    // An unseen name is interned, not rejected (`Tree::frame` interns), so the
+    // claim fails with `TFT_ERR_NO_EDGE` and consumes a headroom slot (D10).
     assert_eq!(f.claim("nonesuch", "world").unwrap_err(), TFT_ERR_NO_EDGE);
 
-    // With the headroom exhausted, interning fails and the name really is
-    // unknown — so the older code is still reachable, and still means what the
-    // header says it means.
+    // With headroom exhausted, interning fails and the name is unknown.
     for i in 0..8 {
         let _ = f.claim(&format!("filler{i}"), "world");
     }
@@ -761,29 +614,14 @@ fn claiming_the_wrong_parent_is_its_own_error() {
     );
 }
 
-/// **A publisher outlives the tree handle it was claimed from**, and the arena
-/// stays mapped underneath it — `docs/decisions/0017` step 7.
+/// A publisher outlives the tree handle it was claimed from (`0017` step 7).
 ///
-/// This handle no longer carries an `Arc<TreeShare>` of its own: the
-/// `OwnedWriter` it holds carries the `Arc<Tree>`, and *that* is what keeps the
-/// arena alive. Freeing the tree first is a reasonable thing for a C caller to
-/// do — there is no borrow checker to tell them otherwise — so the free order
-/// must not matter, exactly as it already does not for `tft_plan`.
-///
-/// **Where the gate is.** Nothing observable distinguishes a live arena from a
-/// freed one on this path, so a plain `cargo nextest` run of this test is not
-/// the check: `just c-abi-check`'s Miri and ASan rows are, and they build this
-/// target. Replacing `OwnedWriter`'s `tree: Arc<Tree>` field with a
-/// `PhantomData` and running the ASan row reports
-/// `AddressSanitizer: heap-use-after-free ... READ of size 8`. The same
-/// deletion is `0017` step 2's mutant under `just miri`, one crate over; this
-/// is the C surface's statement of it.
+/// The gate is `just c-abi-check`'s Miri and ASan rows, not a plain run.
 #[test]
 fn a_publisher_outlives_the_tree_handle_it_came_from() {
     let f = Fixture::new();
     let p = f.claim("robot", "world").expect("claim");
-    // Free the tree handle while the claim is live. `Fixture::drop` would do it
-    // too, but *after* the publisher — which is the order that proves nothing.
+    // Free the tree first; `Fixture::drop` would free it after the publisher.
     let raw = f.0;
     core::mem::forget(f);
     // SAFETY: a live handle from `Fixture::new`, freed exactly once here.

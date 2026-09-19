@@ -4,22 +4,17 @@
 //! connection, the segment fd riding as `SCM_RIGHTS` on the response.
 //! [`crate::server`] and [`crate::client`] are the transport.
 //!
-//! # Why this module knows nothing about arenas
+//! # No arena types
 //!
-//! `docs/PHASE2.md` §2 forbids depending on `tf_tree_arena`, so the handshake
-//! takes a [`SegmentDescriptor`] of plain integers plus a borrowed fd
-//! (`docs/decisions/0005`); the protocol is testable against a bare `memfd`.
-//!
-//! # Why the bytes are hand-rolled
-//!
-//! What is normative is the **byte layout**, pinned offset by offset by tests.
-//! Encoding by hand, as [`crate::identity`] does, avoids struct padding and
-//! `bytemuck`.
+//! `docs/PHASE2.md` §2 forbids depending on `tf_tree_arena`: the handshake takes
+//! a [`SegmentDescriptor`] of plain integers plus a borrowed fd
+//! (`docs/decisions/0005`).
 //!
 //! # Framing
 //!
-//! `SOCK_SEQPACKET` preserves boundaries, so `from_bytes` rejects any datagram
-//! whose length is not exactly the struct size **before** reading a field.
+//! The byte layout is normative, hand-encoded and pinned by tests.
+//! `from_bytes` rejects any datagram whose length is not exactly the struct size
+//! before reading a field.
 
 use crate::identity::AccessMode;
 
@@ -37,8 +32,7 @@ pub const MAX_SOCKET_PATH: usize = 108;
 
 /// Outcome of a handshake, as carried in [`HelloResponse::status`].
 ///
-/// The discriminants are a **wire contract**, assigned explicitly and pinned by
-/// a test.
+/// The discriminants are a wire contract, pinned by a test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HelloStatus {
@@ -54,8 +48,7 @@ pub enum HelloStatus {
     NoParticipantSlots = 4,
     /// The client asked for read-write on an arena it may not write.
     ModeNotPermitted = 5,
-    /// The datagram was the wrong length, had the wrong magic, or named a mode
-    /// that does not exist.
+    /// Wrong length, wrong magic, or an unknown mode.
     Malformed = 6,
 }
 
@@ -68,8 +61,7 @@ impl HelloStatus {
 
     /// Decode a wire value.
     ///
-    /// An unknown code becomes [`HelloStatus::Malformed`] rather than an error, so
-    /// a newer owner's rejection still reports *that* it was a rejection.
+    /// An unknown code becomes [`HelloStatus::Malformed`].
     #[must_use]
     pub fn from_u32(v: u32) -> HelloStatus {
         match v {
@@ -84,8 +76,7 @@ impl HelloStatus {
     }
 }
 
-/// Why a datagram could not be decoded: "these bytes are not a message",
-/// distinct from [`HelloStatus`]'s attach policy.
+/// Why a datagram could not be decoded, as distinct from attach policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WireError {
@@ -100,15 +91,14 @@ pub enum WireError {
     BadMagic,
     /// The mode byte named neither `ReadOnly` nor `ReadWrite`.
     ///
-    /// Strict, unlike [`crate::AccessMode`]'s lenient decode: access follows.
+    /// Strict, unlike [`crate::AccessMode`]'s lenient decode.
     BadMode {
         /// The byte received.
         got: u8,
     },
 }
 
-/// What the owner knows about its segment, and all the wire needs from it:
-/// integers only, no arena types.
+/// What the owner knows about its segment: integers only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentDescriptor {
     /// The arena's `FORMAT_VERSION`.
@@ -121,9 +111,8 @@ pub struct SegmentDescriptor {
     pub instance_uuid: [u8; 16],
     /// Boot id of the host that created the segment.
     ///
-    /// Not encoded into [`HelloResponse`] (§3.7 has no field for it); the server
-    /// compares it with [`HelloRequest::client_boot_id`] to emit
-    /// [`HelloStatus::BootIdMismatch`]. Every owner must populate it.
+    /// Not encoded into [`HelloResponse`]; the server compares it with
+    /// [`HelloRequest::client_boot_id`]. Every owner must populate it.
     pub boot_id: [u8; 16],
 }
 
@@ -164,9 +153,8 @@ impl HelloRequest {
         out
     }
 
-    /// Decode a datagram.
-    /// Checks length, then magic, **nothing else**: a version or layout
-    /// disagreement must decode so the owner can name both sides (§3.7).
+    /// Decode a datagram. Checks length and magic only, so a version or layout
+    /// disagreement still decodes (§3.7).
     ///
     /// # Errors
     ///
@@ -189,27 +177,21 @@ impl HelloRequest {
 ///
 /// # What a rejection can report
 ///
-/// §3.7 requires a rejection to "name both sides' values". Version and layout
-/// mismatches carry the owner's value here. **[`HelloStatus::BootIdMismatch`]
-/// cannot**: §3.7's response has no field for the owner's boot id, so a refused
-/// joiner is told the ids differ and cannot be shown the owner's. Two live peers
-/// can disagree ([`0055`] step 7): either read of `/proc/sys/kernel/random/boot_id`
-/// can fail into all-zeros, an overlay can present another value, and the two
-/// sides parse it differently (`tf_tree_ipc::procstat::boot_id` rejects trailing
-/// junk, `tf_tree::tree::boot_id` ignores it). `docs/RUNBOOK.md`'s
-/// `HandshakeRejected` row is the triage; a parser divergence is a bug to report.
+/// Version and layout mismatches carry the owner's value. [`HelloStatus::BootIdMismatch`]
+/// cannot: the response has no field for the owner's boot id ([`0055`] step 7).
+/// `docs/RUNBOOK.md`'s `HandshakeRejected` row is the triage.
 ///
 /// [`0055`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HelloResponse {
     /// Accepted, or why not.
     pub status: HelloStatus,
-    /// The **owner's** `FORMAT_VERSION`, so a rejection names both sides.
+    /// The owner's `FORMAT_VERSION`.
     pub format_version: u32,
-    /// The **owner's** `layout_hash`, likewise.
+    /// The owner's `layout_hash`.
     pub layout_hash: u32,
-    /// The slot the client must take — in the arena table *and* as its
-    /// lock-file byte. Meaningless unless `status` is [`HelloStatus::Ok`].
+    /// The slot the client must take, in the arena table and as its lock-file
+    /// byte. Meaningless unless `status` is [`HelloStatus::Ok`].
     pub participant_slot: u32,
     /// Segment size, checked by the client against `fstat` (§3.7 step 4).
     pub arena_size: u64,
@@ -235,16 +217,13 @@ impl HelloResponse {
     }
 
     /// A rejection carrying the owner's side of the comparison.
-    ///
-    /// A rejection carrying the owner's side of the comparison, so the client's
-    /// error can name both values.
     #[must_use]
     pub fn reject(status: HelloStatus, desc: &SegmentDescriptor, owner_pid: u32) -> HelloResponse {
         HelloResponse {
             status,
             format_version: desc.format_version,
             layout_hash: desc.layout_hash,
-            // No slot granted: `u32::MAX`, since 0 is a real slot.
+            // `u32::MAX`: 0 is a real slot.
             participant_slot: u32::MAX,
             arena_size: desc.arena_size,
             instance_uuid: desc.instance_uuid,
@@ -301,9 +280,8 @@ fn check(raw: &[u8], expected: usize) -> Result<&[u8], WireError> {
     Ok(raw)
 }
 
-// Fixed-offset readers. They index without their own bounds check, which is
-// sound because `check` runs first and returns `Err` unless the slice is
-// *exactly* the message length, and every `at` is a literal inside it.
+// Fixed-offset readers: sound because `check` guarantees the exact length and
+// every `at` is a literal inside it.
 fn le32(raw: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
 }
@@ -368,8 +346,7 @@ mod tests {
         assert_eq!(HelloResponse::from_bytes(&j.to_bytes()).unwrap(), j);
     }
 
-    /// Byte offsets cross a process boundary, so they are pinned; a round trip
-    /// alone passes for any self-consistent encoding.
+    /// Pins the byte offsets; a round trip passes for any consistent encoding.
     #[test]
     fn the_byte_layout_is_pinned() {
         let raw = request().to_bytes();
@@ -382,7 +359,6 @@ mod tests {
         assert_eq!(le64(&raw, 32), 0x0102_0304_0506_0708, "start_time at 32");
         assert_eq!(bytes16(&raw, 40), [0xCD; 16], "boot_id at 40");
         assert_eq!(&raw[56..88], &request().client_name[..], "name at 56");
-        // Padding stays zero.
         assert_eq!(&raw[17..24], &[0; 7], "padding 17..24");
         assert_eq!(&raw[28..32], &[0; 4], "padding 28..32");
 
@@ -399,8 +375,7 @@ mod tests {
         assert_eq!(&raw[52..56], &[0; 4], "padding 52..56");
     }
 
-    /// Status codes are a wire contract; reordering the enum must not renumber
-    /// them.
+    /// Status codes are a wire contract.
     #[test]
     fn status_codes_are_pinned() {
         for (status, code) in [
@@ -415,7 +390,6 @@ mod tests {
             assert_eq!(status.as_u32(), code, "{status:?}");
             assert_eq!(HelloStatus::from_u32(code), status, "code {code}");
         }
-        // An unknown code still reports a rejection.
         assert_eq!(HelloStatus::from_u32(9999), HelloStatus::Malformed);
     }
 
@@ -451,8 +425,7 @@ mod tests {
         assert_eq!(HelloRequest::from_bytes(&raw), Err(WireError::BadMagic));
     }
 
-    /// A mode byte we do not understand is `Malformed`, not a silent downgrade to
-    /// the lenient `ReadOnly` decode.
+    /// An unknown mode byte is rejected, not downgraded to `ReadOnly`.
     #[test]
     fn an_unknown_mode_is_malformed_rather_than_downgraded() {
         let mut raw = request().to_bytes();
@@ -463,14 +436,13 @@ mod tests {
         );
     }
 
-    /// A rejection must still carry the owner's side of every comparison.
+    /// A rejection carries the owner's values and grants no slot.
     #[test]
     fn a_rejection_names_the_owners_values() {
         let j = HelloResponse::reject(HelloStatus::VersionMismatch, &desc(), 7);
         assert_eq!(j.format_version, 2);
         assert_eq!(j.layout_hash, 0x9075_90F5);
         assert_eq!(j.instance_uuid, [0xAB; 16]);
-        // And it grants nothing: not slot 0, a real slot.
         assert_eq!(j.participant_slot, u32::MAX);
     }
 }

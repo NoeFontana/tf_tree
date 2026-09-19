@@ -1,15 +1,12 @@
 //! A minimal CBOR (RFC 8949) **writer** for the `.tft` manifest
 //! (`docs/PHASE5.md` §2.3).
 //!
-//! Hand-written because the format's value is external (`cbor2`, `jq`); it lives
-//! here because the arena crate takes the manifest as opaque bytes. There is no
-//! decoder: opening a `.tft` parses nothing (§2.1). Encoding is pinned against
-//! RFC 8949 Appendix A.
+//! There is no decoder: opening a `.tft` parses nothing (§2.1).
 
 /// Encoder for the definite-length CBOR subset the manifest uses.
 ///
-/// [`Writer::array`] / [`Writer::map`] announce a count and the caller writes
-/// exactly that many items (twice for a map). Nothing checks it.
+/// [`Writer::array`] / [`Writer::map`] announce a count; the caller writes that
+/// many items (twice for a map), unchecked.
 #[derive(Default)]
 pub(crate) struct Writer {
     out: Vec<u8>,
@@ -26,8 +23,7 @@ impl Writer {
         self.out
     }
 
-    /// Write a major type and its argument in the shortest legal form (RFC 8949
-    /// §4.2), so freezing the same arena twice yields the same bytes.
+    /// Major type and argument in the shortest form (RFC 8949 §4.2): deterministic bytes.
     fn head(&mut self, major: u8, arg: u64) {
         let m = major << 5;
         if arg < 24 {
@@ -69,8 +65,7 @@ impl Writer {
         self.out.extend_from_slice(s.as_bytes());
     }
 
-    /// `null` (major type 7, simple value 22): an edge that never published has
-    /// no span, and `0` would be indistinguishable from a real epoch-zero stamp.
+    /// `null` (simple value 22): no span, distinct from an epoch-zero stamp.
     pub(crate) fn null(&mut self) {
         self.out.push(0xF6);
     }
@@ -98,7 +93,7 @@ mod tests {
         w.finish()
     }
 
-    /// RFC 8949 Appendix A's vectors; each boundary pair pins one `head` branch.
+    /// RFC 8949 Appendix A vectors; each boundary pair pins one `head` branch.
     #[test]
     fn integers_match_the_rfc_vectors() {
         assert_eq!(enc(|w| w.u64(0)), [0x00]);
@@ -118,8 +113,7 @@ mod tests {
         );
     }
 
-    /// The negative branch, including `i64::MIN`. Mutant: `head(1, (-v) as u64)`
-    /// drops the `-1 -` offset and the first assertion fails.
+    /// The negative branch, including `i64::MIN`.
     #[test]
     fn negative_integers_match_the_rfc_vectors() {
         assert_eq!(enc(|w| w.i64(-1)), [0x20]);
@@ -130,8 +124,6 @@ mod tests {
             enc(|w| w.i64(i64::MIN)),
             [0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
         );
-        // And the non-negative branch of the same function, which must produce
-        // major type 0 and not a positive-looking major type 1.
         assert_eq!(enc(|w| w.i64(0)), [0x00]);
         assert_eq!(enc(|w| w.i64(1)), [0x01]);
     }
@@ -154,7 +146,6 @@ mod tests {
             }),
             [0xa1, 0x61, 0x61, 0x01]
         );
-        // "ü" is two bytes, one char.
         assert_eq!(enc(|w| w.text("ü")), [0x62, 0xc3, 0xbc]);
     }
 }

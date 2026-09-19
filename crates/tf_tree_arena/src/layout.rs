@@ -1,7 +1,7 @@
 //! Arena layout math — region sizes, offsets, and the layout hash.
 //!
-//! An [`ArenaLayout`] describes where every region lives in the flat arena; [`crate::heap`]
-//! and the mapped backend consume it. Every region is 64-byte aligned, in header-field order.
+//! An [`ArenaLayout`] describes where every region lives; every region is 64-byte
+//! aligned, in header-field order.
 
 use alloc::vec::Vec;
 
@@ -144,8 +144,7 @@ fn compute(
     let mp = max_participants as usize;
     let slots: usize = edge_capacities.iter().map(|&c| c as usize).sum();
 
-    // 12 B per frame (`docs/PHASE1.md` §4.3). Atomic fields: a non-atomic read racing another
-    // process's write is UB even if the value is discarded (`docs/PHASE2.md` §1 A1).
+    // 12 B per frame (`docs/PHASE1.md` §4.3), atomic (`docs/PHASE2.md` §1 A1).
     let topo_stride = align64(mf * 12);
     // Sizes in header order; each aligned so the running offset stays 64-aligned.
     let sizes = [
@@ -209,8 +208,7 @@ impl ArenaLayout {
 
         let max_participants = DEFAULT_MAX_PARTICIPANTS;
         let computed = compute(max_frames, max_edges, max_participants, &edge_capacities);
-        // The last region's end is `total_size`; if it fits `u32`, every offset and slot count does.
-        // Reject rather than truncate.
+        // Reject rather than truncate: the last region's end bounds every offset.
         let last = computed.regions[N_REGIONS - 1];
         let total_size = last.offset + last.size;
         if total_size > u32::MAX as usize {
@@ -247,7 +245,7 @@ impl ArenaLayout {
     /// The layout implied by totals alone, for validating a header: `compute` uses only the sum
     /// of the per-edge capacities, so `stamp_slots` reconstructs every region offset.
     ///
-    /// Carries an empty `edge_capacities`; compare geometry with it, never build an arena from it.
+    /// Carries an empty `edge_capacities`; compare geometry only.
     ///
     /// # Errors
     ///
@@ -321,8 +319,7 @@ impl ArenaLayout {
         self.computed.regions[R_TOPO]
     }
 
-    /// Byte stride between consecutive topology blocks (A1: there are
-    /// [`TOPO_BLOCKS`] of them, not two).
+    /// Byte stride between consecutive topology blocks.
     pub fn topo_block_stride(&self) -> usize {
         self.computed.topo_stride
     }
@@ -347,10 +344,7 @@ impl ArenaLayout {
         self.computed.regions[R_POSE]
     }
 
-    /// Total stamp slots across all edges (sum of ring capacities).
-    ///
-    /// Guaranteed to fit `u32`: [`ArenaLayout::new`] rejects any layout whose
-    /// `total_size` (>= `slots * 64`) exceeds `u32::MAX`.
+    /// Total stamp slots across all edges; fits `u32` ([`ArenaLayout::new`] rejects more).
     pub fn stamp_slots(&self) -> u32 {
         self.computed.slots as u32
     }
@@ -360,8 +354,7 @@ impl ArenaLayout {
         self.computed.slots as u32
     }
 
-    /// The per-edge counter region (`docs/PHASE5.md` §5.2). v3. Present whether or not
-    /// `counters` is compiled in (D34).
+    /// The per-edge counter region (`docs/PHASE5.md` §5.2), present with or without `counters` (D34).
     pub fn edge_counters(&self) -> Region {
         self.computed.regions[R_EDGE_COUNTERS]
     }
@@ -398,10 +391,8 @@ pub const fn layout_hash() -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     h = fnv1a_u32(h, core::mem::size_of::<ArenaHeader>() as u32);
     h = fnv1a_u32(h, core::mem::align_of::<ArenaHeader>() as u32);
-    // Strides in header order (`docs/PHASE1.md` §4.3, `docs/PHASE5.md` §1.2): header size, per-region
-    // byte widths, `FRAME_HASH_STRIDE`, topology per-frame width and block count, stamp width, then
-    // the two counter-region strides. The length is `N_REGIONS + 1` because `R_TOPO` folds two
-    // values; that makes a forgotten stride a compile error (0032 part 3). Cardinality check only.
+    // Strides in header order; `N_REGIONS + 1` because `R_TOPO` folds two values,
+    // so a forgotten stride is a compile error (0032 part 3).
     let strides: [u32; N_REGIONS + 1] = [
         320,
         64,

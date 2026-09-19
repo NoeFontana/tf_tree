@@ -1,29 +1,18 @@
-//! The Rust half of the end-to-end DDS comparison: generate its inputs, then
-//! aggregate its outputs. `ros/tf_tree_bench_ros` holds the `rclcpp` nodes.
+//! The Rust half of the end-to-end DDS comparison (`ros/tf_tree_bench_ros` holds the nodes): `emit-config`
+//! generates the publisher's plan, the bridge's topology TOML and the query set from one [`crate::workload`]
+//! entry ("identical data", `docs/PHASE5.md` §9.3); `aggregate` merges consumers' line protocol with
+//! [`tf_tree_bench::mp::Histogram`] into a table and a [`tf_tree_bench::runstore`] run file.
 //!
-//! * `emit-config`: the publisher's plan, the bridge's topology TOML and the query set,
-//!   all generated from one [`crate::workload`] entry, so "identical data"
-//!   (`docs/PHASE5.md` §9.3) holds by construction.
-//! * `aggregate`: merge every consumer's line protocol with
-//!   [`tf_tree_bench::mp::Histogram`], and emit the table and a
-//!   [`tf_tree_bench::runstore`] run file.
-//!
-//! The bridge arm runs N+1 processes to tf2's N (`docs/decisions/0015`), so
-//! [`aggregate`] groups processes by the arm label in the file name and sums `cpu_ns`
-//! and `pss_kib`, dividing CPU by the summed `consumers` (the bridge reports 0).
-//! `tests/dds_report_aggregate.rs` guards the arm and the absence of a "NOT MEASURED"
-//! disclosure.
+//! The bridge arm runs N+1 processes to tf2's N (`docs/decisions/0015`), so [`aggregate`] groups by arm label,
+//! sums `cpu_ns` and `pss_kib`, and divides CPU by the summed `consumers`. `tests/dds_report_aggregate.rs`
+//! guards it.
 //!
 //! # What this tool refuses to print
 //!
 //! * a `.out` truncated before its `cpu_ns` / `pss_kib` lines ([`parse_proc`]);
-//! * a `tf_tree.processes` arm with no `consumers 0` process, or whose bridge received
-//!   nothing ([`check_structure`]);
-//! * an arm with no lookups at all (`<-- FAILING` fires on `total == 0`; `NaN > 5.0` is
-//!   false).
-//!
-//! The bimodal-`svc` disclosure under the table is computed from the run being
-//! reported; worked examples belong in `docs/benchmarks/tf2.md`.
+//! * a `tf_tree.processes` arm with no `consumers 0` process, or whose bridge received nothing
+//!   ([`check_structure`]);
+//! * an arm with no lookups at all (`<-- FAILING` fires on `total == 0`).
 // This binary's output IS its result.
 #![allow(
     clippy::unwrap_used,
@@ -75,8 +64,6 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
-// emit-config
-
 fn emit_config(args: &[String]) -> Result<()> {
     let name = flag(args, "--workload").unwrap_or_else(|| "robot".to_owned());
     let out =
@@ -86,7 +73,6 @@ fn emit_config(args: &[String]) -> Result<()> {
     let pairs = w.query_pairs()?;
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
 
-    // --- the publisher's plan ------------------------------------------
     let mut plan = String::new();
     let _ = writeln!(
         plan,
@@ -117,7 +103,6 @@ fn emit_config(args: &[String]) -> Result<()> {
     }
     write(&out.join("plan.txt"), &plan)?;
 
-    // `interp = "lerpslerp"`: tf2's policy, as in every Rust harness here.
     let mut toml = String::new();
     let _ = writeln!(
         toml,
@@ -146,8 +131,7 @@ fn emit_config(args: &[String]) -> Result<()> {
                 rate_hz,
                 history_secs,
             } => {
-                // `rate_hz` + `history_secs`, not `capacity`: `EdgeRecord::nominal_rate_mhz` is
-                // the evidence TFT007 needs.
+                // `rate_hz` + `history_secs`, not `capacity`: TFT007 needs `nominal_rate_mhz`.
                 let _ = writeln!(
                     toml,
                     "\n[[edge]]\nparent = \"{parent}\"\nchild = \"{child}\"\n\
@@ -158,7 +142,6 @@ fn emit_config(args: &[String]) -> Result<()> {
     }
     write(&out.join("topology.toml"), &toml)?;
 
-    // --- the query set --------------------------------------------------
     let mut queries = String::new();
     let _ = writeln!(queries, "# target source");
     for (t, s) in pairs.iter().take(MAX_PAIRS) {
@@ -179,25 +162,18 @@ fn write(path: &Path, text: &str) -> Result<()> {
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
-// the build that produced the arms, not this binary
-
-/// How the programs whose `.out` files this tool reads were built. `aggregate` is a
-/// parser (run at `--release`), so `Run::begin`'s `build_profile`/`build_lto` describe
-/// it, not the arms. These three facts come from the CMake caches of the build of
-/// `$BIN/bench_consumer` and land in
-/// [`BUILD_CRITICAL_FACTS`](tf_tree_bench::runstore::BUILD_CRITICAL_FACTS).
+/// How the programs whose `.out` files this tool reads were built: three facts from the CMake caches of
+/// `$BIN/bench_consumer`, landing in [`BUILD_CRITICAL_FACTS`](tf_tree_bench::runstore::BUILD_CRITICAL_FACTS).
 struct MeasuredBuild {
     /// `CMAKE_BUILD_TYPE` of `tf_tree_bench_ros`: the query loop, histograms and the tf2 engine.
     cxx_build_type: String,
-    /// The cargo profile directory `libtf_tree_c.a` came from (the basename of
-    /// `TF_TREE_PREBUILT_DIR`); `CMAKE_BUILD_TYPE` says nothing about it.
+    /// The cargo profile directory `libtf_tree_c.a` came from (`TF_TREE_PREBUILT_DIR`'s basename).
     c_abi_profile: String,
     /// What that profile means today, from the workspace manifest.
     c_abi_lto: String,
 }
 
-/// Read one variable out of a `CMakeCache.txt` (`NAME:TYPE=VALUE`); the name is taken
-/// from before the `:` and compared whole.
+/// Read one variable out of a `CMakeCache.txt` (`NAME:TYPE=VALUE`), comparing the name whole.
 fn cmake_cache_var(path: &Path, key: &str) -> Result<String> {
     let text = std::fs::read_to_string(path).with_context(|| {
         format!(
@@ -234,8 +210,7 @@ fn cmake_cache_var(path: &Path, key: &str) -> Result<String> {
 }
 
 impl MeasuredBuild {
-    /// Read `ros/build.sh`'s two CMake caches under `$OUT`; they are configured
-    /// separately and can drift.
+    /// Read `ros/build.sh`'s two CMake caches under `$OUT`; they can drift.
     fn read(ros_out: &Path) -> Result<MeasuredBuild> {
         let cxx_build_type = cmake_cache_var(
             &ros_out.join("build/tf_tree_bench_ros/CMakeCache.txt"),
@@ -245,7 +220,6 @@ impl MeasuredBuild {
             &ros_out.join("tf_tree-build/CMakeCache.txt"),
             "TF_TREE_PREBUILT_DIR",
         )?;
-        // `<target>/<profile-dir>/libtf_tree_c.a`: the directory name is `build_profile`.
         let c_abi_profile = Path::new(&prebuilt)
             .file_name()
             .and_then(|s| s.to_str())
@@ -253,7 +227,6 @@ impl MeasuredBuild {
                 anyhow!("TF_TREE_PREBUILT_DIR is {prebuilt:?}, which names no profile directory")
             })?
             .to_owned();
-        // Read from the manifest: `[profile.*]` sections inherit.
         let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
         let manifest = std::fs::read_to_string(&manifest_path).with_context(|| {
             format!(
@@ -270,11 +243,8 @@ impl MeasuredBuild {
     }
 }
 
-// aggregate
-
-/// One consumer process's parsed output. `cpu_ns` and `pss_kib` are `Option` so a
-/// truncated `.out` is not read as a process that used nothing (a truncated bridge file
-/// once read 0.146 %/consumer against a true 0.847).
+/// One consumer process's parsed output. `cpu_ns` and `pss_kib` are `Option` so a truncated `.out` is not
+/// read as a process that used nothing.
 #[derive(Default)]
 struct Proc {
     service: Histogram,
@@ -290,8 +260,7 @@ struct Proc {
     bridge_dropped: u64,
 }
 
-/// Parse one process's `.out`, refusing one missing a cost field; takes the path so the
-/// refusal names the file.
+/// Parse one process's `.out`, refusing one missing a cost field.
 fn parse_proc(path: &Path, text: &str) -> Result<Proc> {
     let mut p = Proc {
         service: Histogram::new(),
@@ -302,7 +271,6 @@ fn parse_proc(path: &Path, text: &str) -> Result<Proc> {
         let mut it = line.split_whitespace();
         match it.next() {
             Some("consumer") => {
-                // `consumer <i> service <hist…>` / `cycle` / `ok <n> err <n>`
                 let _index = it.next();
                 match it.next() {
                     Some("service") => {
@@ -371,15 +339,13 @@ struct Arm {
 }
 
 impl Arm {
-    /// The `tf_tree.processes` shape: one bridge plus N attached consumers. Matched on
-    /// the label, which `check_structure` checks the contents against.
+    /// The `tf_tree.processes` shape: one bridge plus N attached consumers.
     fn is_bridge_and_attach(&self) -> bool {
         self.engine == "tf_tree" && self.label.ends_with(".processes")
     }
 }
 
 /// The two invariants the fairness argument rests on: the bridge ran and did the work.
-/// Neither shows in any column.
 fn check_structure(arms: &BTreeMap<String, Arm>) -> Result<()> {
     for arm in arms.values() {
         if !arm.is_bridge_and_attach() {
@@ -418,8 +384,6 @@ fn aggregate(args: &[String]) -> Result<()> {
     let json = flag(args, "--json").map(PathBuf::from);
     let workload = flag(args, "--workload").unwrap_or_else(|| "robot".to_owned());
 
-    // Required with `--json` only: the run file is compared months apart, so it must say
-    // what it measured.
     let measured = match (&json, flag(args, "--ros-out")) {
         (_, Some(dir)) => Some(MeasuredBuild::read(Path::new(&dir))?),
         (None, None) => None,
@@ -434,8 +398,7 @@ fn aggregate(args: &[String]) -> Result<()> {
         ),
     };
 
-    // Files are `<arm>.<index>.out`; the label is everything before the last `.` of the
-    // stem, which puts a bridge and its consumers in one row.
+    // Files are `<arm>.<index>.out`; the label is the stem before the last `.`.
     let mut arms: BTreeMap<String, Arm> = BTreeMap::new();
     let entries = std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?;
     for e in entries {
@@ -472,12 +435,10 @@ fn aggregate(args: &[String]) -> Result<()> {
         );
     }
 
-    // Before any row is printed, so nobody quotes good rows from a failed run.
     check_structure(&arms)?;
 
     println!("tf_tree vs tf2, end to end over a real DDS  [workload: {workload}]");
     println!("=====================================================================");
-    // Above the table: two runs are comparable only if this line matches.
     if let Some(m) = &measured {
         println!(
             "arms built: C++ {} | libtf_tree_c.a from target/{} (lto = {})",
@@ -504,8 +465,6 @@ fn aggregate(args: &[String]) -> Result<()> {
 
     let mut run = Run::begin(1);
     if let Some(m) = &measured {
-        // Pushed beside `build_profile` (still true: it is what parsed these files); these
-        // three are what `BUILD_CRITICAL_FACTS` refuses on.
         run.provenance.facts.push(Fact {
             key: "dds_cxx_build_type",
             value: m.cxx_build_type.clone(),
@@ -520,8 +479,7 @@ fn aggregate(args: &[String]) -> Result<()> {
         });
     }
 
-    /// Reference point for the wake-from-idle disclosure: composed arms sit under it,
-    /// wake-from-idle samples over it.
+    /// Reference point for the wake-from-idle disclosure.
     const FAST_MODE_NS: u64 = 1_000;
     // `(label, svc p50 ns, fraction of svc samples under FAST_MODE_NS)` for one-consumer-per-process arms.
     let mut idle_shape: Vec<(String, u64, f64)> = Vec::new();
@@ -535,7 +493,6 @@ fn aggregate(args: &[String]) -> Result<()> {
         let mut warmup_s = 0.0f64;
         let (mut bt, mut bd) = (0u64, 0u64);
         for p in &arm.procs {
-            // `parse_proc` refuses a file missing either, so this is never a silent zero.
             let (Some(p_cpu_ns), Some(p_pss_kib)) = (p.cpu_ns, p.pss_kib) else {
                 unreachable!("parse_proc returns no Proc with an absent cost field")
             };
@@ -544,8 +501,6 @@ fn aggregate(args: &[String]) -> Result<()> {
             ok += p.ok;
             err += p.err;
             cpu_ns += p_cpu_ns;
-            // Summing PSS is correct (shared pages are divided by mapper count); it is why a
-            // per-consumer PSS does not compare across arms with different process counts.
             pss_kib += p_pss_kib;
             consumers += p.consumers;
             measured_s = measured_s.max(p.measured_s);
@@ -567,8 +522,6 @@ fn aggregate(args: &[String]) -> Result<()> {
         };
         let us = |v: u64| v as f64 / 1000.0;
 
-        // A row where nearly every lookup failed is empty, not fast. `total == 0` gives
-        // `NaN`, so it is flagged explicitly.
         let flag = if total == 0 || fail_pct > 5.0 {
             " <-- FAILING"
         } else {

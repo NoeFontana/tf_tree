@@ -1,24 +1,11 @@
 //! The `--no-default-features` build: what a reader with no codecs does.
 //!
-//! # Why this is a file of its own
+//! `compression` is on by default, so `--workspace` never compiles this
+//! configuration; `just ingest-check` runs it with `--no-default-features`. The
+//! assertions are false with codecs compiled in.
 //!
-//! `compression` is **on by default**, so `cargo nextest run --workspace` compiles
-//! exactly one configuration and the codec-free build would be compiled by nothing.
-//! That is the shape of four defects this repository has already shipped — a
-//! default-off feature is invisible to `--workspace`, and a file nobody compiles is
-//! not a checked file — so `just ingest-check` runs
-//! `cargo nextest run -p tf_tree_ingest --no-default-features`, and this is what it
-//! finds there.
-//!
-//! Everything here is `#![cfg(not(feature = "compression"))]`, which means it
-//! compiles to nothing in the ordinary build. That is deliberate: the assertions
-//! below are *false* with codecs compiled in, because a zstd chunk then ingests.
-//!
-//! What must hold without them is narrow and specific. A compressed chunk is
-//! [`IngestError::CompressedChunk`] naming the codec — **not** a bad chunk, not
-//! truncation, and not a skip — because every chunk in a recording uses the same
-//! codec, so skipping them all yields "no transforms" about a file that is
-//! perfectly intact and needs one `mcap compress` command.
+//! A compressed chunk must be [`IngestError::CompressedChunk`] naming the codec,
+//! never a skip, or a fully compressed recording would report `NoTransforms`.
 
 #![cfg(not(feature = "compression"))]
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
@@ -26,8 +13,7 @@
 use tf_tree_ingest::fixture::{write_mcap_chunked, ChunkDamage, ChunkedSpec, FixtureMessage};
 use tf_tree_ingest::{ChunkCodec, Frames, IngestError, IngestOptions, OnBadChunk};
 
-/// Nine messages in three chunks, so there is a survivor either side of the chunk
-/// the fixture relabels.
+/// Nine messages in three chunks, a survivor either side of the relabelled one.
 fn corpus() -> Vec<FixtureMessage> {
     (0..9)
         .map(|i| {
@@ -42,38 +28,8 @@ fn corpus() -> Vec<FixtureMessage> {
         .collect()
 }
 
-/// **Without the `compression` feature a zstd chunk is `CompressedChunk`, under
-/// either bad-chunk policy.**
-///
-/// The policy is asserted both ways because the interesting failure is the *skip*:
-/// a build that treated a missing decoder as damage would, on a real recording
-/// where every chunk is compressed, skip all of them and report
-/// `IngestError::NoTransforms` — a diagnosis with no relation to the cause and no
-/// mention of the remedy.
-///
-/// lz4 is checked alongside zstd because they are compiled out by one feature and
-/// a `cfg` that covered only one of them would be invisible everywhere else.
-///
-/// Mutant: make `ChunkCodec::is_built_in` return `true` for `Zstd`/`Lz4`
-/// unconditionally, i.e. drop its `#[cfg]` — applied, and **the whole suite still
-/// passed**, this one included, in both feature configurations.
-/// `decompress_into`'s fallback arm returns `ChunkFault::Unsupported` for any codec
-/// it has no decoder for, so the answer is unchanged; the property is
-/// **structurally guarded** by that arm, which exists precisely so a `cfg` mistake
-/// cannot become a wrong answer.
-///
-/// Mutant 2, which does kill it: turn `chunk_records`'s
-/// `return Err(ChunkFault::Unsupported(head.codec))` into
-/// `ChunkFault::Bad(BadChunkKind::Decompress { codec })` — applied, and this failed
-/// with `a zstd chunk must not be skipped under Skip; got 6 of 9 transforms and 1
-/// bad chunk(s)`. That is the hazard in one line: a missing decoder reported as
-/// damage is skippable, so on a real recording — every chunk compressed — the answer
-/// would be `NoTransforms` about an intact file, with no mention of compression.
-///
-/// It killed three other tests with it, in both feature configurations:
-/// `decompress::tests::a_codec_free_build_reports_both_codecs_unsupported`,
-/// `fixture::tests::each_damage_variant_produces_its_documented_fault` and
-/// `ingest::an_unknown_codec_in_a_chunk_is_a_hard_error_not_a_skip`.
+/// Without the `compression` feature a zstd or lz4 chunk is `CompressedChunk`,
+/// under either bad-chunk policy.
 #[test]
 fn a_compressed_chunk_is_refused_by_name_in_a_codec_free_build() {
     let dir =
@@ -119,16 +75,7 @@ fn a_compressed_chunk_is_refused_by_name_in_a_codec_free_build() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **An uncompressed recording is unaffected**, which is the property that makes
-/// the codec-free build a build and not a broken one.
-///
-/// Mutant: `ChunkCodec::parse("")` → `Self::Other` — applied, and this failed with
-/// `the recording uses an unrecognised codec-compressed chunks, which this build
-/// cannot read` — **39 tests died with it** in this configuration (of 85) and 42 in
-/// the default build (of 99). That mutant is the reason this test is here rather than only
-/// in the default configuration: the uncompressed path is now one arm of a codec
-/// `match`, and this is the build where nothing else can reach the other arms at
-/// all.
+/// An uncompressed recording is unaffected.
 #[test]
 fn an_uncompressed_recording_still_ingests_in_a_codec_free_build() {
     let dir = std::env::temp_dir().join(format!(
@@ -150,22 +97,8 @@ fn an_uncompressed_recording_still_ingests_in_a_codec_free_build() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **`compression_compiled_in` reports the truth about *this* build.**
-///
-/// The predicate exists so a consumer can tell "the reader has no zstd decoder" from
-/// "the reader has one" across a crate boundary that `cfg!` cannot cross —
-/// `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader` is the
-/// consumer, and it compares its own `cfg!` against this. That comparison is only
-/// worth anything if the predicate is not simply a constant, and **this is the only
-/// configuration in which a constant `true` is wrong**. Its counterpart in the default
-/// build is `ingest::the_predicate_reports_a_build_with_codecs`.
-///
-/// Mutant: `compression_compiled_in` returning `true` unconditionally — applied, and
-/// this failed with "a --no-default-features build must report no codecs", taking
-/// `ingest::the_predicate_reports_a_build_with_codecs` with it: 85 tests run, 83
-/// passed, 2 failed. **The default build stayed entirely green with that mutant —
-/// which is exactly why the assertion has to live here**, in the configuration
-/// `cargo nextest run --workspace` does not compile.
+/// `compression_compiled_in` reports the truth about this build; the default
+/// build's counterpart is `ingest::the_predicate_reports_a_build_with_codecs`.
 #[test]
 fn the_predicate_reports_a_codec_free_build() {
     assert!(

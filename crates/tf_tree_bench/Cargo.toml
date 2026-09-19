@@ -18,31 +18,25 @@ workspace = true
 default = ["counters", "ingest-compression", "ingest-fixture"]
 # Passthrough, so `counter_cost` can measure both sides of §5.5's switch from one crate.
 counters = ["tf_tree/counters"]
-# The zstd decoder `docs/PHASE5.md` §12 gate 5's corpus needs (rosbag2 and Foxglove write zstd
-# chunks by default). A default-on feature, not a dependency feature, so `tf_tree_cli`'s edge
-# (declared `default-features = false`) does not switch the reader:
-# `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader`.
+# zstd decoder for `docs/PHASE5.md` §12 gate 5's corpus; default-on so `tf_tree_cli`'s edge
+# does not switch the reader (`tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader`).
 ingest-compression = ["tf_tree_ingest/compression"]
-# The corpus writer for gate 5, a passthrough for the same reason: `tf_tree_ingest`'s `fixture`
-# must not reach the shipped `tf_tree` binary's graph. `just ingest-check` asserts both directions.
+# Gate 5's corpus writer; `tf_tree_ingest`'s `fixture` must not reach the shipped binary
+# (`just ingest-check` asserts both directions).
 ingest-fixture = ["tf_tree_ingest/fixture"]
-# The `tf2::BufferCore` differential path. Needs ROS 2 and the FFI shim in `src/tf2.rs`; without
-# them it fails to link.
+# The `tf2::BufferCore` differential path; needs ROS 2 and the FFI shim in `src/tf2.rs`.
 tf2 = ["dep:tf_tree_tf2_sys"]
 # Shared memory: needs `tf_tree`'s `shm` feature for `build_shared`/`attach_shared`.
 shm = ["tf_tree/shm"]
-# `docs/PHASE2.md` §11.4's random crash point armed in 10% of children. The children are this
-# binary, so it must carry the sites; default-off like every fault-injection knob.
+# `docs/PHASE2.md` §11.4's random crash point in 10% of children; default-off.
 crash-points = ["tf_tree/crash-points", "tf_tree_core/crash-points"]
-# `docs/decisions/0015`'s *Invariants to maintain*: `fork_child`'s fourth mode drives
-# `tft_bridge_offer`, `tft_bridge_get_stats` and `tft_bridge_free` across `fork()`. The edge points
-# from this `publish = false` crate to the C ABI, so no shipped crate gains a dependency.
-# Implies `shm`: the property under test is a `MADV_DONTFORK` mapping.
+# `docs/decisions/0015`: `fork_child`'s fourth mode drives `tft_bridge_*` across `fork()`.
+# Implies `shm` (a `MADV_DONTFORK` mapping).
 bridge = ["shm", "dep:tf_tree_c"]
 # `docs/PHASE5.md` §9.2's in-crate column. Default-off; `just embed-cost-check` compiles and tests it.
 embed-probe = ["tf_tree_core/bench-probe"]
-# The C ABI boundary probe: `abi_attached` needs `tft_test_plan_at_unguarded`. Its own feature so
-# `bridge`, a shipped configuration (`docs/decisions/0015`), never carries test hooks.
+# The C ABI boundary probe (`abi_attached`); separate so `bridge` never carries test hooks
+# (`docs/decisions/0015`).
 abi-probe = ["bridge", "tf_tree_c/test-hooks"]
 
 [dependencies]
@@ -57,28 +51,25 @@ libc.workspace = true
 tf_tree_ipc.workspace = true
 # Optional, outside the workspace on purpose (see the root manifest); pulled in only by `--features tf2`.
 tf_tree_tf2_sys = { path = "../tf_tree_tf2_sys", optional = true }
-# Optional, behind `bridge`, for `fork_child`'s fourth mode. The features are on the dependency
-# because an unactivated optional dependency contributes none, so `--workspace` builds `tf_tree_c`
-# with its own defaults. A path dependency: `tf_tree_c` is not in `[workspace.dependencies]`.
+# Optional, behind `bridge`; features sit on the dependency so `--workspace` builds
+# `tf_tree_c` with its own defaults. A path dependency.
 tf_tree_c = { path = "../tf_tree_c", optional = true, features = ["bridge", "shm"] }
 
-# Reads the committed baseline (`src/baseline.rs`) only. A normal dependency because `[[bin]]`
-# targets do not see dev-dependencies and the gate lives in `bench_report`.
+# Reads the committed baseline (`src/baseline.rs`); a normal dependency because `[[bin]]`
+# targets do not see dev-dependencies.
 serde_json.workspace = true
 
 # `report::worse_entries` states the memory floor as arithmetic on the layout.
 tf_tree_arena.workspace = true
 
-# `docs/PHASE5.md` §12 gate 5 (`docs/decisions/0050`): `tf_tree_ingest::run` is timed on the corpus
-# `tf_tree_ingest::fixture` writes. No `features` here: `fixture` arrives through `ingest-fixture`.
-# A normal dependency because `[[bin]]` targets do not see dev-dependencies.
+# `docs/PHASE5.md` §12 gate 5 (`docs/decisions/0050`): `tf_tree_ingest::run` timed on the
+# `fixture` corpus; a normal dependency, as above.
 tf_tree_ingest.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 
-# Criterion benches (`harness = false`). Not the official go/no-go gate, which needs core-pinned
-# hardware (`docs/PHASE1.md` §11.3).
+# Criterion benches (`harness = false`); not the go/no-go gate (`docs/PHASE1.md` §11.3).
 [[bench]]
 name = "lookup"
 harness = false
@@ -134,28 +125,25 @@ name = "arena_backing"
 path = "src/bin/arena_backing.rs"
 required-features = ["shm"]
 
-# `docs/PHASE5.md` §12 gate 4: 16 workers sharing one `.tft`, total Pss within 1.2x of one worker.
-# `shm` because the frozen backend is `#[cfg]`-ed on it; re-execs itself as the worker.
+# `docs/PHASE5.md` §12 gate 4: 16 workers on one `.tft`, Pss within 1.2x of one worker;
+# `shm` because the frozen backend is `#[cfg]`-ed on it.
 [[bin]]
 name = "frozen_workers"
 path = "src/bin/frozen_workers.rs"
 required-features = ["shm"]
 
-# `docs/PHASE5.md` §12 gate criterion 2: `.tft` open under 10 ms for a 233 MB index. `shm` because
-# `Tree::open_frozen` needs it. Its own binary: `EVIDENCE.md`'s Gates table is one artifact per criterion.
+# `docs/PHASE5.md` §12 gate criterion 2: `.tft` open under 10 ms at 233 MB; needs `shm`.
 [[bin]]
 name = "frozen_open"
 path = "src/bin/frozen_open.rs"
 required-features = ["shm"]
 
-# `docs/PHASE5.md` §12 gate criterion 5: ingest throughput >= 10x real time. No `required-features`:
-# ingest needs no shared memory, so `just test` runs this and `tests/ingest_throughput.rs` per PR.
+# `docs/PHASE5.md` §12 gate criterion 5: ingest >= 10x real time; no `required-features`.
 [[bin]]
 name = "ingest_throughput"
 path = "src/bin/ingest_throughput.rs"
 
-# Is the C ABI's +101 ns on a shared arena the ABI or the C++ caller? Calls `tft_plan_at` from
-# Rust on the arena a C++ probe measures at 302 ns. Needs `bridge`.
+# Is the C ABI's overhead on a shared arena the ABI or the C++ caller? Needs `bridge`.
 [[bin]]
 name = "abi_attached"
 path = "src/bin/abi_attached.rs"
@@ -206,8 +194,8 @@ name = "shm_scaling"
 path = "src/bin/shm_scaling.rs"
 required-features = ["shm"]
 
-# `docs/PHASE2.md` §11.4's `shm_torture`, run nightly per `docs/PHASE5.md` §10. No
-# `required-features`: without `shm` it exits non-zero, and `just shm-torture-self-test` runs it.
+# `docs/PHASE2.md` §11.4's `shm_torture`, nightly per `docs/PHASE5.md` §10; no
+# `required-features` (`just shm-torture-self-test` runs it).
 [[bin]]
 name = "shm_torture"
 path = "src/bin/shm_torture.rs"
@@ -235,9 +223,8 @@ name = "counter_cost"
 name = "bench_report"
 path = "src/bin/bench_report.rs"
 
-# PHASE5 §9.2's embedding row. `required-features` because the in-crate column is
-# `tf_tree_core::bench_probe`, compiled only under `bench-probe`. A `bin`, not a criterion bench:
-# two columns are timed back to back in one round across two `[profile.*]` builds (`src/embed.rs`).
+# PHASE5 §9.2's embedding row; `required-features` because the in-crate column is
+# `tf_tree_core::bench_probe`. A `bin`: two columns timed back to back (`src/embed.rs`).
 [[bin]]
 name = "embed_cost"
 path = "src/bin/embed_cost.rs"
@@ -276,8 +263,8 @@ path = "src/bin/soak.rs"
 name = "dds_report"
 path = "src/bin/dds_report.rs"
 
-# Which consumer build does the gated headline ratio speak for? Same paired harness as `ratio.rs`,
-# built under `[profile.embedder]` by `just tf2-ratio-profiles`.
+# Which consumer build the gated headline ratio speaks for; built under
+# `[profile.embedder]` by `just tf2-ratio-profiles`.
 [[bin]]
 name = "tf2_ratio"
 path = "src/bin/tf2_ratio.rs"
@@ -289,8 +276,8 @@ name = "owner_migration"
 path = "src/bin/owner_migration.rs"
 required-features = ["shm"]
 
-# `docs/decisions/0023` step 5's instrument: `tf_tree_c`'s ABI gate cannot call
-# `mp::require_quiet_machine` without a dependency cycle, so `just abi-cost` brackets the run with this.
+# `docs/decisions/0023` step 5's instrument: `just abi-cost` brackets the run with this
+# (`tf_tree_c` cannot call `mp::require_quiet_machine` without a cycle).
 [[bin]]
 name = "quiet_check"
 path = "src/bin/quiet_check.rs"

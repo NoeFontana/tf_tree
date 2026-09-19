@@ -8,37 +8,21 @@
 //! | Bracket search | ~20 | measured (the `cost_model` capacity sweep) |
 //! | **Slot reads, composition, bounds checks** | **~25** | **a residual** |
 //!
-//! This harness measures each term directly and **checks that they add up** (§11: "the explanation
-//! for a cost needs its own measurement").
+//! This harness measures each term directly and checks that they add up.
 //!
-//! # What is measured, and how it maps onto `Plan::at`
+//! # What is measured
 //!
-//! `Plan::at` is, per dynamic step (`plan.rs`, `Guard::sample`):
-//!
-//! ```text
-//! view.sampler(edge)          -> resolve the edge record, the claim record and
-//!                                the two region sub-ranges into a `SampleRing`
-//! ring.sample::<I>(t, policy) -> bracket search + one or two `read_slot`s + interp
-//! acc * p   /  acc.mul_inv(p) -> compose
-//! ```
-//!
-//! plus, once per call: `check_generation`, `check_domain`, `first_dynamic_edge` and `note`. So:
+//! Per dynamic step `Plan::at` runs `view.sampler(edge)`, `ring.sample::<I>(t, policy)` and a compose:
 //!
 //! ```text
 //! lookup(d) ≈ fixed + d × (sampler + sample + compose)
 //! ```
 //!
-//! and the **residual** `measured − predicted` is what this harness produces. One that *grows with
-//! depth* is a per-step cost outside the three terms, e.g. `Plan::at`'s two O(depth) scans
-//! (`check_domain` → `has_dynamic`, and `first_dynamic_edge`).
+//! The **residual** `measured − predicted` is what this harness produces; one that grows with depth is a
+//! per-step cost outside the three terms (e.g. `check_domain`, `first_dynamic_edge`).
 //!
-//! **Run pinned, or do not run it at all:**
-//! `taskset -c 2 cargo run --release -p tf_tree_bench --example step_cost`
-//!
-//! Unpinned this swings by >30%, as in `cost_model`.
-//!
-//! `--json <path>` writes a `runstore` run so a lever can be evaluated with
-//! `bench_ab before.json after.json` rather than by eye.
+//! **Run pinned:** `taskset -c 2 cargo run --release -p tf_tree_bench --example step_cost`. Unpinned it
+//! swings >30%. `--json <path>` writes a `runstore` run for `bench_ab before.json after.json`.
 #![allow(
     missing_docs,
     clippy::unwrap_used,
@@ -64,19 +48,14 @@ use tf_tree_core::sample::ExtrapPolicy;
 use tf_tree_core::EdgeId;
 use tf_tree_math::{LerpSlerp, ScLerp};
 
-/// Ring capacity: 4096 is `fast-path.md`'s reference point, so numbers compare with its tables.
+/// Ring capacity: `fast-path.md`'s reference point.
 const CAP: u32 = 4096;
-/// Samples pushed. `retained() == capacity - 1`, so this fills without lapping.
 const FILL: usize = CAP as usize - 1;
-/// Iterations per timed round.
 const N: usize = 8192;
-/// Timed rounds; the median is reported.
 const ROUNDS: usize = 41;
-/// Depths swept: 1 isolates the fixed cost, 6 gives the residual leverage to show a slope.
 const DEPTHS: &[usize] = &[1, 2, 3, 4, 6];
 
-/// Median nanoseconds per iteration over [`ROUNDS`] rounds of `iters` iterations. The closure's `f64`
-/// is `black_box`ed; timing whole rounds keeps the clock under 0.004 ns per iteration.
+/// Median ns per iteration over [`ROUNDS`] rounds; the closure's `f64` is `black_box`ed.
 fn median_ns(iters: usize, mut f: impl FnMut() -> f64) -> f64 {
     for _ in 0..5 {
         black_box(f());
@@ -93,8 +72,7 @@ fn median_ns(iters: usize, mut f: impl FnMut() -> f64) -> f64 {
     per_round[per_round.len() / 2]
 }
 
-/// A chain `f0 -> ... -> f{depth}` of dynamic edges at ring capacity `cap`, filled to `cap - 1`
-/// samples at 1 kHz; identical to `cost_model::chain`.
+/// A chain `f0 -> ... -> f{depth}` of dynamic edges at capacity `cap`; identical to `cost_model::chain`.
 fn chain_cap(depth: usize, cap: u32) -> (Tree, Vec<String>) {
     let names: Vec<String> = (0..=depth).map(|i| format!("f{i}")).collect();
     let mut b = TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
@@ -119,16 +97,12 @@ fn chain_cap(depth: usize, cap: u32) -> (Tree, Vec<String>) {
     (tree, names)
 }
 
-/// [`chain_cap`] at the reference capacity.
 fn chain(depth: usize) -> (Tree, Vec<String>) {
     chain_cap(depth, CAP)
 }
 
-/// Stamps landing **on** sample stamps, sweeping the filled window, so `sample` takes its exact-hit
-/// path (search plus one `read_slot`, no interpolation).
-///
-/// These must be exact multiples of the 1 kHz period: generate the exact sequence first and derive
-/// the between sequence from it, or both interpolate and the derived cost goes negative.
+/// Stamps landing on sample stamps (the exact-hit path). Derive the between sequence from this one, or both
+/// interpolate.
 fn swept_exact_cap(cap: u32) -> Vec<i64> {
     let fill = i64::from(cap) - 1;
     (0..N as i64)
@@ -136,18 +110,15 @@ fn swept_exact_cap(cap: u32) -> Vec<i64> {
         .collect()
 }
 
-/// [`swept_exact_cap`] at the reference capacity.
 fn swept_exact() -> Vec<i64> {
     swept_exact_cap(CAP)
 }
 
-/// The same stamps, offset half a period so the search runs *and* the
-/// interpolation is performed — the case the fold pays.
+/// The same stamps offset half a period, so the search and the interpolation both run.
 fn swept_between() -> Vec<i64> {
     swept_exact().iter().map(|t| t + 500_000).collect()
 }
 
-/// Every dynamic edge the compiled plan traverses, in plan order.
 fn plan_edges(plan: &tf_tree_core::plan::Plan) -> Vec<EdgeId> {
     plan.steps()
         .iter()
@@ -158,13 +129,7 @@ fn plan_edges(plan: &tf_tree_core::plan::Plan) -> Vec<EdgeId> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// The five primitives
-// ---------------------------------------------------------------------------
-
-/// Term 1 — `ArenaView::sampler`: bounds check, edge record, claim record, the two region sub-range
-/// checks and the `SampleRing` construction. Every ring field is folded into the accumulator so the
-/// construction cannot be optimized away.
+/// Term 1 — `ArenaView::sampler`; every ring field is folded into the accumulator so it is kept.
 fn t_sampler(view: &ArenaView<'_>, edges: &[EdgeId]) -> f64 {
     let iters = N * edges.len();
     median_ns(iters, || {
@@ -182,8 +147,7 @@ fn t_sampler(view: &ArenaView<'_>, edges: &[EdgeId]) -> f64 {
     })
 }
 
-/// Term 2 — `SampleRing::read_slot`: the seqlock read of one 64-byte slot, over the same physical
-/// slots the swept search reaches so cache behaviour matches the fold's.
+/// Term 2 — `SampleRing::read_slot` over the slots the swept search reaches.
 fn t_read_slot(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
     let idx: Vec<usize> = stamps
         .iter()
@@ -198,8 +162,7 @@ fn t_read_slot(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
     })
 }
 
-/// Term 3 — `Iso3 * Iso3`, chained (`acc = acc * b`) because the fold's composition is a serial
-/// dependency chain and throughput would understate it.
+/// Term 3 — `Iso3 * Iso3` chained, since the fold's composition is a serial dependency chain.
 fn t_compose(poses: &[Iso3]) -> f64 {
     median_ns(poses.len(), || {
         let mut acc = Iso3::IDENTITY;
@@ -210,17 +173,14 @@ fn t_compose(poses: &[Iso3]) -> f64 {
     })
 }
 
-/// Terms 4 and 5 — `SampleRing::sample`, on its exact-hit and interpolating
-/// paths. The difference between them is the interpolation math *in context*,
-/// which is the number `interp_cost` measures out of context.
+/// Terms 4 and 5 — `SampleRing::sample` on its exact-hit and interpolating paths; the difference is the
+/// interpolation in context.
 fn t_sample(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
     t_sample_policy(ring, stamps, ExtrapPolicy::Error)
 }
 
-/// The ring **preamble**, isolated with no bracket search: a stamp newer than the newest sample under
-/// [`ExtrapPolicy::Hold`] runs the entry sequence and reads the newest slot without reaching
-/// `bracket`. So `sample_hold - read_slot` is the preamble and `sample_exact - sample_hold` is the
-/// search alone.
+/// The ring preamble without a bracket search (newest stamp under `ExtrapPolicy::Hold`):
+/// `sample_hold - read_slot` is the preamble, `sample_exact - sample_hold` the search.
 fn t_sample_hold(ring: &SampleRing<'_>, newer_than_window: &[i64]) -> f64 {
     t_sample_policy(ring, newer_than_window, ExtrapPolicy::Hold)
 }
@@ -237,9 +197,8 @@ fn t_sample_policy(ring: &SampleRing<'_>, stamps: &[i64], policy: ExtrapPolicy) 
     })
 }
 
-/// What the fold calls per dynamic step — a replica of `Guard::sample`: resolve the sampler,
-/// **dispatch on the interp discriminant**, then sample. The dispatch reproduces the code layout (two
-/// monomorphizations behind one `match`, per `cost_model`); the gap to [`t_sample`] is the price of it.
+/// A replica of `Guard::sample`: sampler, **dispatch on the interp discriminant**, then sample; the gap to
+/// [`t_sample`] is the dispatch's price.
 fn t_guard_sample(view: &ArenaView<'_>, edges: &[EdgeId], stamps: &[i64]) -> f64 {
     let iters = stamps.len() * edges.len();
     median_ns(iters, || {
@@ -264,8 +223,7 @@ fn t_guard_sample(view: &ArenaView<'_>, edges: &[EdgeId], stamps: &[i64]) -> f64
     })
 }
 
-/// `d` independent samples of **one** ring at `d` consecutive stamps: the ILP control, with the
-/// footprint of one ring (repeating one stamp would fold away).
+/// `d` independent samples of one ring: the ILP control.
 fn t_ilp_control(view: &ArenaView<'_>, edge: EdgeId, stamps: &[i64], d: usize) -> f64 {
     let groups = stamps.len() / d;
     median_ns(groups * d, || {
@@ -290,11 +248,8 @@ fn t_ilp_control(view: &ArenaView<'_>, edge: EdgeId, stamps: &[i64], d: usize) -
     })
 }
 
-/// `fold_at`, replicated in the harness: iterate the plan's `[Step; MAX_DEPTH]` array, match the
-/// discriminant, sample, propagate with `?`, compose.
-///
-/// This splits the residual: landing on `Plan::at`'s number means the residual **is** the step-array
-/// walk; landing on the prediction means it is codegen context inside `tf_tree_core`.
+/// `fold_at` replicated: walk the `[Step; MAX_DEPTH]` array, match, sample, `?`, compose. Landing on
+/// `Plan::at`'s number means the residual is the step-array walk.
 fn t_fold_replica(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps: &[i64]) -> f64 {
     median_ns(stamps.len(), || {
         let mut acc = 0.0;
@@ -341,8 +296,6 @@ fn t_fold_replica(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps:
     })
 }
 
-/// A **monotone** sweep across the retained window, one pass: the forward-polling consumer model,
-/// where [`swept_between`]'s wraps would make a cursor gallop backwards.
 fn monotone_between() -> Vec<i64> {
     let span = FILL as i64 - 3;
     (0..N as i64)
@@ -350,12 +303,8 @@ fn monotone_between() -> Vec<i64> {
         .collect()
 }
 
-/// `sample_from` — the galloping cursor — against `sample`, on a monotone sweep.
-///
-/// **This bounds the lever the measurements point at:** §12 found the search is 34% of a step, random
-/// probes into a stamp array too big for L1; a cursor makes them local. `sample_from` is wired into
-/// the batch path (`fold_at_cursors`); scalar `Plan::at` restarts the search every call, and a cursor
-/// there needs per-thread mutable state, a design question.
+/// `sample_from` (the galloping cursor) against `sample`, on a monotone sweep; bounds the win of a cursor
+/// in scalar `Plan::at` (`fold_at_cursors` already uses it).
 fn t_sample_cursor(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
     median_ns(stamps.len(), || {
         let mut acc = 0.0;
@@ -371,12 +320,8 @@ fn t_sample_cursor(ring: &SampleRing<'_>, stamps: &[i64]) -> f64 {
     })
 }
 
-/// The fold again, walking a **compact** step encoding (one `u32` per step; static poses in a side
-/// array) instead of the `[Step; MAX_DEPTH]` array. It bounds the remaining win of shrinking `Step`
-/// (now 64 bytes; `0042` removed `Iso3`'s padding, which this harness proposed). Everything else is
-/// identical to [`t_fold_replica`], so the difference is the walk alone.
-///
-/// Harness-only: the change alters what `Plan` is, and `Plan` is `pub`.
+/// The fold over a compact one-`u32`-per-step encoding, bounding the win of shrinking `Step`. Otherwise
+/// identical to [`t_fold_replica`]. Harness-only: it would change what `Plan` is.
 fn t_fold_compact(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps: &[i64]) -> f64 {
     const DYN: u32 = 1 << 31;
     const INV: u32 = 1 << 30;
@@ -437,7 +382,6 @@ fn t_fold_compact(view: &ArenaView<'_>, plan: &tf_tree_core::plan::Plan, stamps:
     })
 }
 
-/// The whole thing — `Plan::at`, which is what the terms above must sum to.
 fn t_plan_at(tree: &Tree, target: &str, source: &str, stamps: &[i64]) -> f64 {
     let t = tree.frame(target).unwrap();
     let s = tree.frame(source).unwrap();
@@ -473,7 +417,6 @@ fn main() {
     let between = swept_between();
     let exact = swept_exact();
 
-    // One depth-1 chain supplies the isolated primitives, on one arena and cache footprint.
     let (tree1, names1) = chain(1);
     let f0 = tree1.frame(&names1[0]).unwrap();
     let f1 = tree1.frame(&names1[1]).unwrap();
@@ -491,15 +434,11 @@ fn main() {
     let past_end = vec![FILL as i64 * 1_000_000; N];
     let sample_hold = t_sample_hold(&ring1, &past_end);
 
-    // Poses for the composition term, read out of the ring so they are the same
-    // values the fold composes.
     let poses: Vec<Iso3> = (0..N)
         .map(|k| ring1.read_slot(k & (ring1.mask() as usize)).unwrap())
         .collect();
     let compose = t_compose(&poses);
 
-    // The per-call floor: an identity plan (`lookup(x, x)`, zero steps) measures the *constant* part of
-    // the overhead, **not** the part that scales with plan length.
     let fixed = t_plan_at(&tree1, &names1[0], &names1[0], &between);
 
     println!("## primitives, measured directly");
@@ -535,11 +474,8 @@ fn main() {
         "interp-policy dispatch"
     );
 
-    // --- is there any instruction-level parallelism to win? ----------------
     //
-    // `t_guard_sample` samples `edges.len()` **independent** edges per stamp (no accumulator, no `?`),
-    // the shape Lever 2's "locate" phase would create. A cost that falls with `d` means the chains
-    // overlap; flat means the out-of-order engine already overlaps them in the fold.
+    // `t_guard_sample` samples `edges.len()` independent edges per stamp; a cost falling with `d` means overlap.
     println!("\n## available ILP: d independent samples per stamp (capacity {CAP})");
     println!("{:>10} {:>16} {:>14}", "d (edges)", "ns/sample", "vs d=1");
     let mut ilp_base = f64::NAN;
@@ -559,9 +495,7 @@ fn main() {
     println!("  flat  -> the OoO engine already overlaps them; Lever 2 has nothing to win");
     println!("  falls -> the serial fold is leaving that overlap on the table");
 
-    // **The control that makes the sweep conclusive.** A depth-`d` chain has `d` different rings, so
-    // raising `d` also grows the working set past L2; repeat against **one** ring sampled `d` times.
-    // Flat here means the absence of overlap is a property of the work, not the cache.
+    // Control: one ring sampled `d` times, so the working set does not grow with `d`.
     println!("\n## the control: d independent samples of ONE ring (footprint fixed)");
     println!("{:>10} {:>16} {:>14}", "d (repeats)", "ns/sample", "vs d=1");
     let mut ctl_base = f64::NAN;
@@ -573,7 +507,6 @@ fn main() {
         println!("{d:>10} {ns:>16.2} {:>13.2}x", ns / ctl_base);
     }
 
-    // --- what a query-to-query cursor is worth -----------------------------
     println!("\n## the galloping cursor vs a fresh search (depth 1, monotone sweep)");
     println!("{:>34} {:>12} {:>10}", "path", "ns/sample", "vs fresh");
     let mono = monotone_between();
@@ -588,8 +521,6 @@ fn main() {
         "sample_from (cursor)",
         cursor_mono / fresh_mono
     );
-    // The same pair at a capacity deep in the cliff, where a 1 kHz edge with 10 s of history sits
-    // (16384 slots, 128 KiB of stamps).
     let (trb, nmb) = chain_cap(1, 16_384);
     let plb = trb
         .plan(trb.frame(&nmb[1]).unwrap(), trb.frame(&nmb[0]).unwrap())
@@ -613,14 +544,11 @@ fn main() {
         cursor_b / fresh_b
     );
 
-    // --- the search versus capacity ----------------------------------------
+    // --- the search versus capacity ---
     //
-    // The search is not a straight line in `log2(capacity)`: it is nearly flat to 1024 and then steps
-    // hard where the ring stops fitting the cache (one probe is ~2 ns, the step ~20). Reported as
-    // measured, with no fit; `t_sample_hold` measures the preamble.
+    // Nearly flat to 1024, then steps where the ring stops fitting the cache; reported with no fit. `Hold`
+    // reads one slot with no search, `exact` searches: flat `Hold` with climbing `exact` puts the cost in the probes.
     println!("\n## search cost vs ring capacity (depth 1, exact hits, whole window swept)");
-    // The `Hold` column locates the cliff: it reads one pose slot with no search, `exact` searches and
-    // reads one. Flat `Hold` with climbing `exact` puts the cost in the stamp probes.
     println!(
         "{:>8} {:>7} {:>10} {:>10} {:>13} {:>12} {:>13}",
         "capacity", "log2", "stamps", "poses", "sample(exact)", "sample(Hold)", "marginal/log2"
@@ -646,7 +574,6 @@ fn main() {
         prev = Some((l2, ns));
     }
 
-    // --- the reconciliation ------------------------------------------------
     println!("\n## reconciliation: does the decomposition add up?");
     println!(
         "predicted(d) = fixed + d x (guard_sample + compose) = {fixed:.1} + d x {:.1}",
@@ -668,7 +595,6 @@ fn main() {
         let rps = residual / d as f64;
         resid_per_step.push(rps);
 
-        // The same plan, folded by the harness's own replica of `fold_at`.
         let t = tree.frame(&names[d]).unwrap();
         let s = tree.frame(&names[0]).unwrap();
         let pl = tree.plan(t, s).unwrap();
@@ -682,8 +608,6 @@ fn main() {
         rows.push((d, measured, predicted, residual, replica, compact));
     }
 
-    // A roughly constant residual per step is a per-step cost the primitives lack; per lookup, a per-call
-    // cost the identity plan could not see.
     let lo = resid_per_step.iter().cloned().fold(f64::MAX, f64::min);
     let hi = resid_per_step.iter().cloned().fold(f64::MIN, f64::max);
     println!(
@@ -699,8 +623,7 @@ fn main() {
     if let Some(path) = json {
         let mut run = Run::begin(1);
         let mut primitives = RunRow::new("step_cost", "chain", "tf_tree", "primitives");
-        // **Directional metrics only.** `dispatch_ns` is a derived difference near 0; a direction plus a 10%
-        // tolerance would flag a 0.5 ns wobble as a regression, so it is emitted below as informational.
+        // Directional metrics only: `dispatch_ns` is a difference near 0, emitted as informational.
         for (k, v) in [
             ("sampler_ns", sampler),
             ("read_slot_ns", read_slot),

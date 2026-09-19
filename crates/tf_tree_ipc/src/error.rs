@@ -1,16 +1,12 @@
-//! `Copy`, `String`-free errors that name what failed.
-//!
-//! Integers and enums, never an allocation (`docs/PROJECT.md` §5). Every variant
-//! names both sides of whatever disagreed, or the variable / slot / errno
-//! responsible (`docs/PHASE2.md` §3.7).
+//! `Copy`, `String`-free errors naming what failed: integers and enums, never
+//! an allocation (`docs/PROJECT.md` §5; `docs/PHASE2.md` §3.7).
 
 use crate::WireError;
 use core::fmt;
 
 use rustix::io::Errno;
 
-/// Which candidate of the `docs/PHASE2.md` §3.1 resolution order a directory
-/// came from, so an error can say *why* this path was even considered.
+/// Which candidate of the `docs/PHASE2.md` §3.1 resolution order a directory came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeDirSource {
     /// `$TF_TREE_RUNTIME_DIR`, set explicitly by the operator.
@@ -43,8 +39,7 @@ pub enum EnvVar {
     RuntimeDir,
     /// `$TF_TREE_DOMAIN`.
     Domain,
-    /// `$ROS_DOMAIN_ID` — inherited so `tf_tree` partitions the way the rest of
-    /// a ROS 2 stack already does (`docs/PHASE2.md` §3.2).
+    /// `$ROS_DOMAIN_ID`, inherited (`docs/PHASE2.md` §3.2).
     RosDomainId,
     /// `$TF_TREE_NAME`.
     Name,
@@ -89,8 +84,7 @@ pub enum LockRole {
     Claim(u32),
 }
 
-/// A `/proc/<pid>/stat` parse failure, split out from the read failure so a
-/// malformed line is never confused with an exited process.
+/// A `/proc/<pid>/stat` parse failure, distinct from a read failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcParseError {
     /// No `)`, so `comm` cannot be delimited (see [`crate::parse_start_time`]).
@@ -139,35 +133,31 @@ pub enum IpcError {
     },
     /// The runtime directory belongs to another user.
     ///
-    /// Only checked for [`RuntimeDirSource::Tmp`] (world-writable parent);
-    /// `docs/PHASE2.md` §3.10 scopes trust to same-user processes.
+    /// Only checked for [`RuntimeDirSource::Tmp`]; `docs/PHASE2.md` §3.10
+    /// scopes trust to same-user processes.
     RuntimeDirForeignOwner {
         /// The directory's owner.
         owner_uid: u32,
         /// This process's uid.
         our_uid: u32,
     },
-    /// `statfs` failed, so the NORMATIVE §3.1 network-filesystem check could not
-    /// be performed; refusing is the safe answer.
+    /// `statfs` failed, so the NORMATIVE §3.1 network-filesystem check could not run.
     StatFsFailed {
         /// Which candidate produced the directory.
         source: RuntimeDirSource,
         /// `errno`.
         raw_os_error: i32,
     },
-    /// The runtime directory is on NFS or CIFS.
-    ///
-    /// NORMATIVE refusal (`docs/PHASE2.md` §3.1): network file locks are not
-    /// released promptly on client death.
+    /// The runtime directory is on NFS or CIFS: NORMATIVE refusal
+    /// (`docs/PHASE2.md` §3.1), as their locks are not released promptly.
     NetworkFilesystem {
         /// Which candidate produced the directory.
         source: RuntimeDirSource,
         /// `statfs.f_type`, so the message can name the filesystem.
         magic: u64,
     },
-    /// A domain variable was set to something that is not a `u32`.
-    ///
-    /// Fatal, never a fallback to domain 0: a typo must not land on the wrong arena.
+    /// A domain variable was set to something that is not a `u32`; fatal, never
+    /// a fallback to domain 0.
     DomainNotAnInteger {
         /// Which variable.
         var: EnvVar,
@@ -198,10 +188,7 @@ pub enum IpcError {
         /// `errno`.
         errno: Errno,
     },
-    /// An edge id that cannot be addressed within the reserved claim region.
-    ///
-    /// Only reachable from a corrupt header. Bounded because a claim byte
-    /// colliding with an identity record would hand one edge to two writers.
+    /// An edge id outside the reserved claim region; only reachable from a corrupt header.
     ClaimOutOfRange {
         /// The edge asked for.
         edge: u32,
@@ -215,32 +202,24 @@ pub enum IpcError {
         /// The current limit.
         limit: u32,
     },
-    /// Nothing was serving, nothing was alive, and the caller asked for
-    /// [`crate::CreatePolicy::Never`].
-    ///
-    /// For a consumer that must not create an empty arena.
+    /// Nothing was serving or alive, and the caller asked for [`crate::CreatePolicy::Never`].
     ArenaAbsent,
-    /// The §3.7 socket path exceeds `sun_path`.
-    ///
-    /// Reachable from configuration; reported at construction, not as `EINVAL`.
+    /// The §3.7 socket path exceeds `sun_path`; reported at construction.
     SocketPathTooLong {
         /// Length of the path.
         len: usize,
         /// The kernel's limit.
         limit: usize,
     },
-    /// Nothing is listening on the §3.7 socket.
-    ///
-    /// Not a failure by itself: §3.9 makes a stale socket path expected, so
-    /// `open()` lets the ownership byte decide.
+    /// Nothing is listening on the §3.7 socket. Not a failure by itself: §3.9
+    /// expects stale socket paths, so `open()` lets the ownership byte decide.
     ServerUnreachable {
         /// `connect` errno.
         raw_os_error: i32,
     },
-    /// This process could not set up its own socket to attach with.
-    ///
-    /// **Distinct from [`IpcError::HandshakeIo`]**, which a probe reads as "no
-    /// server": `EMFILE` here must not create a second arena beside a live one.
+    /// This process could not set up its own attach socket. Distinct from
+    /// [`IpcError::HandshakeIo`], which a probe reads as "no server":
+    /// `EMFILE` here must not create a second arena.
     ClientSocketSetup {
         /// The errno.
         raw_os_error: i32,
@@ -250,31 +229,23 @@ pub enum IpcError {
         /// The errno.
         raw_os_error: i32,
     },
-    /// The owner accepted the connection and then closed it without replying.
+    /// The owner accepted the connection and closed it without replying
+    /// (`recvmsg` returned zero bytes).
     ///
-    /// `recvmsg` returned zero bytes: the owner was there at `accept(2)` and gone
-    /// before its `sendmsg`. (A never-accepted connection gives `ECONNRESET`, as
-    /// [`IpcError::HandshakeIo`]; [`crate::SocketProbe`] treats both as absent.)
-    ///
-    /// **Distinct from [`IpcError::HandshakeMalformed`]**: an empty datagram is
-    /// `BadLength { got: 0 }`, terminal in §3.4, but this must be retried
-    /// (`docs/decisions/0005`'s client-reachability table).
+    /// Distinct from [`IpcError::HandshakeMalformed`] (terminal in §3.4): this
+    /// is retried, and [`crate::SocketProbe`] treats it as absent
+    /// (`docs/decisions/0005`).
     HandshakeClosed,
-    /// The peer's datagram was not a well-formed handshake message.
-    ///
-    /// **A protocol violation, and therefore terminal.** An owner that merely
-    /// went away mid-handshake is [`IpcError::HandshakeClosed`] instead.
+    /// The peer's datagram was not a well-formed handshake message: a terminal
+    /// protocol violation.
     HandshakeMalformed(crate::wire::WireError),
     /// The owner refused this client, and named its own side of the comparison.
     ///
-    /// The message states the status and the owner's two numbers and prescribes
-    /// nothing (`0055` step 7); remedies are
-    /// [`docs/RUNBOOK.md`](https://github.com/NoeFontana/tf_tree/blob/main/docs/RUNBOOK.md)'s
-    /// `HandshakeRejected` section, reached by the trailing `(HandshakeRejected)`
-    /// key ([`0059`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md)
-    /// convention (g)).
-    ///
-    /// Why only the owner's numbers: `docs/PHASE2.md` §3.7, Erratum.
+    /// States facts and prescribes nothing (`0055` step 7); remedies are
+    /// [`docs/RUNBOOK.md`](https://github.com/NoeFontana/tf_tree/blob/main/docs/RUNBOOK.md)'s,
+    /// reached by the trailing `(HandshakeRejected)` key
+    /// ([`0059`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md)
+    /// convention (g)). Only the owner's numbers: `docs/PHASE2.md` §3.7, Erratum.
     HandshakeRejected {
         /// Why.
         status: crate::wire::HelloStatus,
@@ -284,36 +255,29 @@ pub enum IpcError {
         /// The **owner's** layout hash.
         owner_layout_hash: u32,
     },
-    /// The owner *rejected* the attach but sent a segment fd anyway.
-    ///
-    /// A protocol violation (§3.7: a rejection carries no fd), reported so a
-    /// client cannot map a segment it was refused.
+    /// The owner *rejected* the attach but sent a segment fd anyway (§3.7
+    /// forbids it).
     RejectionCarriedFd {
         /// The status the owner sent alongside the fd.
         status: crate::wire::HelloStatus,
     },
-    /// The owner accepted but sent no `SCM_RIGHTS` fd.
-    ///
-    /// A protocol violation, not an I/O failure; not retried as "no server".
+    /// The owner accepted but sent no `SCM_RIGHTS` fd; a protocol violation, not retried.
     NoFdReceived,
-    /// A live arena exists — some participant still holds its lock byte — but
-    /// nothing is serving it, and nobody took over before the deadline.
-    ///
-    /// The §3.4 timeout. Refusing is correct: creating a second arena beside one
-    /// in use diverges silently. Identity records: [`crate::LockFile::read_identity`].
+    /// A live arena exists — a participant holds its lock byte — but nothing
+    /// serves it and nobody took over before the §3.4 deadline; creating a
+    /// second arena would diverge silently. Identity records:
+    /// [`crate::LockFile::read_identity`].
     ArenaHeldButUnreachable {
-        /// Bitmask of held participant slots; zero means the *ownership* byte was
-        /// held by a process that never began serving.
+        /// Bitmask of held participant slots; zero means only the ownership byte
+        /// was held.
         holder_slots: u64,
         /// The lowest held slot, or `None` when no participant byte is held.
         first_slot: Option<u32>,
-        /// The pid in that slot's identity record, or `0` if it was never
-        /// written. Advisory (§5.1): the lock is the liveness, this is the name.
+        /// The pid in that slot's identity record, or `0`; advisory (§5.1).
         first_pid: u32,
         /// Whether the **ownership** byte was held by somebody else at the
-        /// deadline (one `F_OFD_GETLK`, so advisory). It separates the two
-        /// remedies: a forced create ([`crate::CreatePolicy::Always`]) must take
-        /// it first, so with `true` it cannot help (`docs/PHASE2.md` §3.4).
+        /// deadline (advisory); if so a forced create
+        /// ([`crate::CreatePolicy::Always`]) cannot help (`docs/PHASE2.md` §3.4).
         ownership_held: bool,
     },
     /// A `/proc` read needed for an identity record failed.
@@ -365,8 +329,7 @@ impl fmt::Display for IpcError {
                 "the arena owner accepted this attach and then closed the connection without \
                  replying, so it went away mid-handshake; retrying is the right response",
             ),
-            // Inline, not a `Display` on `WireError`: a trait impl on a published
-            // type is a commitment.
+            // Inline: a `Display` on `WireError` would be a published commitment.
             IpcError::HandshakeMalformed(e) => {
                 f.write_str("attach handshake reply was not well-formed: ")?;
                 match e {
@@ -471,12 +434,9 @@ impl fmt::Display for IpcError {
             IpcError::ArenaAbsent => f.write_str(
                 "no arena is serving and CreatePolicy::Never forbids creating one",
             ),
-            // These arms state facts and end with the variant name in parentheses
-            // as the runbook's search key (`0055` part 4, step 6; `0059` convention
-            // (g)); the remedy is `docs/RUNBOOK.md`'s because this type sees bytes,
-            // not processes. Convention (e) (120 bytes) is not met; `MESSAGE_BUDGET`
-            // binds instead. Keep them ASCII and short: the C boundary truncates at
-            // 255 bytes and substitutes `?` per non-ASCII byte.
+            // Facts only, ending in the variant name as the runbook's search key
+            // (`0055` part 4, step 6; `0059` convention (g)); ASCII and short,
+            // as the C boundary truncates at 255 bytes.
             IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0,
                 ownership_held: true,
@@ -485,8 +445,7 @@ impl fmt::Display for IpcError {
                 "nobody attached; the ownership byte was held for the whole open timeout \
                  by a process that never served; nothing created (ArenaHeldButUnreachable)",
             ),
-            // Empty mask but ownership free at the deadline: a holder let go
-            // between the two reads.
+            // Empty mask but ownership free: a holder let go between the two reads.
             IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0, ..
             } => f.write_str(
@@ -548,8 +507,7 @@ mod tests {
     use super::{IpcError, ProcError, ProcParseError};
     use crate::WireError;
 
-    /// Every `HelloStatus`; safe Rust cannot enumerate an enum, and
-    /// [`status_is_a_refusal`] is the compile error that flags an addition.
+    /// Every `HelloStatus`; [`status_is_a_refusal`] flags an addition.
     const ALL_STATUSES: [crate::wire::HelloStatus; 7] = {
         use crate::wire::HelloStatus as H;
         [
@@ -564,11 +522,8 @@ mod tests {
     };
 
     /// Is this status a refusal, i.e. does it need a `docs/RUNBOOK.md` row?
-    ///
-    /// Total by construction: a new `HelloStatus` fails to compile here (under
-    /// `--all-targets`), and its author owes an entry to [`ALL_STATUSES`] and a
-    /// runbook row. `tf_tree_cli`'s `tests/runbook.rs` derives the set from
-    /// `HelloStatus::from_u32` and fails until the row exists.
+    /// A new `HelloStatus` fails to compile here; `tf_tree_cli`'s
+    /// `tests/runbook.rs` fails until the row exists.
     fn status_is_a_refusal(status: crate::wire::HelloStatus) -> bool {
         use crate::wire::HelloStatus as H;
         match status {
@@ -583,18 +538,13 @@ mod tests {
         }
     }
 
-    /// Every [`IpcError`] variant, and every value its `Display` branches on,
-    /// for the length and ASCII gates.
-    ///
-    /// The exhaustive `match` at the end forces a new variant to be handled but
-    /// not pushed; `VARIANTS_SAMPLED` catches a deleted `push`. Neither forces
-    /// bumping `VARIANTS_SAMPLED` for a new variant, so that is a review rule.
+    /// Every [`IpcError`] variant and every value its `Display` branches on,
+    /// for the length and ASCII gates. `VARIANTS_SAMPLED` catches a deleted
+    /// `push`; bumping it for a new variant is a review rule.
     const VARIANTS_SAMPLED: usize = 24;
     ///
-    /// One sample per variant is not enough (mutants in unsampled
-    /// `ArenaHeldButUnreachable` branches passed), so each field the formatter
-    /// switches on is swept, and the ids are also sampled at their widest
-    /// (`u64::MAX`, `u32::MAX`), which the budget counts.
+    /// Each field the formatter switches on is swept, and ids are also sampled
+    /// at their widest, which the budget counts.
     fn samples() -> Vec<IpcError> {
         use crate::{EnvVar, LockRole, NameProblem, RuntimeDirSource as R};
         let sources = [R::Env, R::XdgRuntimeDir, R::Run, R::Tmp];
@@ -769,14 +719,10 @@ mod tests {
     }
 
     /// Every message must survive the C ABI's 256-byte `tft_error::message`
-    /// (`0055` step 6; `0059` convention (g)), which truncates at 255 bytes and
-    /// substitutes `?` per non-ASCII byte.
-    ///
-    /// 220 = 255 minus the 35-byte `shared arena could not be created: ` lead
-    /// (`tf_tree_c::bridge::generic_failure_message`); the trailing name suffix
-    /// is deliberately not subtracted. `tf_tree_c`'s
+    /// (`0055` step 6; `0059` convention (g)). 220 = 255 minus the 35-byte
+    /// `shared arena could not be created: ` lead; `tf_tree_c`'s
     /// `the_message_buffer_is_the_size_this_crates_budget_assumes` pins the
-    /// C-side numbers. Figures: `0055` step 6.
+    /// C-side numbers.
     const MESSAGE_BUDGET: usize = 220;
 
     #[test]
@@ -814,24 +760,16 @@ mod tests {
         );
     }
 
-    /// A rejection is facts, and facts have a width: [`0059`] convention (e) asks
-    /// for 120 bytes; these carry the owner's two numbers (up to ten digits each).
-    ///
-    /// `PHASE2.md` §3.7 asks for both sides' values and this arm prints one
-    /// (`0055` step 7): this crate cannot read `FORMAT_VERSION` or `layout_hash()`.
-    /// Slack runs from 7 bytes (`NoParticipantSlots`) to 16 (`Malformed`) over the
-    /// statuses a library can send; `Ok` is only reachable by hand-building the
-    /// variant and is excluded from this bound. A short clause on a short status
-    /// can still slip past; `tf_tree_cli`'s `runbook.rs` forbidden-word rule and
-    /// review catch that.
+    /// A rejection carries the owner's two numbers (up to ten digits each);
+    /// [`0059`] convention (e) asks for 120 bytes. `Ok` is excluded (only
+    /// reachable by hand-building the variant).
     ///
     /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
     const REJECTION_BUDGET: usize = 140;
 
     /// A rejection reports the status it got, prescribes nothing (`0055` step 7),
-    /// and **never names a status it did not get**. Covers both variants that
-    /// carry a `HelloStatus`; `RejectionCarriedFd` still lacks `0059` convention
-    /// (g)'s search key (owed, `0055` step 7).
+    /// and never names a status it did not get. `RejectionCarriedFd` still lacks
+    /// `0059` convention (g)'s search key (owed, `0055` step 7).
     #[test]
     fn both_rejection_arms_name_only_the_status_they_carry() {
         // Keeps `status_is_a_refusal` attached to something that runs.
@@ -850,8 +788,7 @@ mod tests {
         );
 
         for status in ALL_STATUSES {
-            // A leading-zero nibble, so `{:08X}` is distinguishable from `{:X}`;
-            // `tf_tree doctor --explain-version` prints `0x{h:08X}`.
+            // Leading-zero nibble, so `{:08X}` differs from `{:X}`.
             let text = IpcError::HandshakeRejected {
                 status,
                 owner_format_version: u32::MAX,
@@ -905,11 +842,8 @@ mod tests {
         }
     }
 
-    /// A status this build cannot receive needs no runbook row. `HelloStatus` is
-    /// `#[non_exhaustive]`, so downstream cannot have a compile error; the harm
-    /// is only when the codec can deliver it, because `from_u32` folds every
-    /// unnamed code onto `Malformed`. This guards that addition: the failure
-    /// names what is owed.
+    /// A status this build cannot receive needs no runbook row: `from_u32`
+    /// folds unnamed codes onto `Malformed`, so only codec-deliverable statuses owe one.
     #[test]
     fn a_status_this_build_cannot_receive_needs_no_row() {
         use crate::wire::HelloStatus as H;
@@ -920,9 +854,7 @@ mod tests {
             v += 1;
         }
 
-        // Nothing above forces `ALL_STATUSES` to be complete (a gapped value would
-        // pass), so walk the codec over every `u16`; a status beyond that would
-        // escape, and wire discriminants are far below it.
+        // Walk the codec over every `u16`: nothing forces `ALL_STATUSES` to be complete.
         let mut delivered: Vec<H> = Vec::new();
         for probe in 0..=u32::from(u16::MAX) {
             let status = H::from_u32(probe);
@@ -955,9 +887,7 @@ mod tests {
     }
 
     /// Each `ArenaHeldButUnreachable` state reports the facts that select the
-    /// runbook's row (mask, lowest slot and whether it is the creator's,
-    /// ownership byte) and **claims nothing about processes** (`0055` part 4,
-    /// step 6): this type sees bytes, not processes.
+    /// runbook's row and claims nothing about processes (`0055` part 4, step 6).
     #[test]
     fn every_unreachable_state_reports_the_facts_and_prescribes_nothing() {
         let held = |slots: u64, first: Option<u32>, owned: bool| {
@@ -980,8 +910,8 @@ mod tests {
             .to_string()
         };
 
-        // Every state the four arms can render. `first_slot: None` with a mask is
-        // unconstructible via the rendezvous but reachable by construction.
+        // Every state the four arms can render, including `first_slot: None`
+        // with a mask (reachable only by construction).
         let states = [
             ("slot 0 alone, ownership free", held(0b1, Some(0), false)),
             ("slot 0 alone, ownership held", held(0b1, Some(0), true)),
@@ -998,9 +928,8 @@ mod tests {
         ];
 
         for (state, message) in &states {
-            // Forbid a count of holders and a procedure, case-folded ("Stop the
-            // process ..." shipped in capitals). Not the word "process": the
-            // empty-mask arm's "a process that never served" is a fact.
+            // Forbid a count of holders and a procedure, case-folded; not the
+            // word "process", which the empty-mask arm states as fact.
             let lower = message.to_ascii_lowercase();
             for forbidden in [
                 "same process",
@@ -1025,8 +954,7 @@ mod tests {
             );
         }
 
-        // The facts, per state: the columns `RUNBOOK.md`'s table is indexed by,
-        // looked up by label rather than index.
+        // The facts per state, looked up by label rather than index.
         // `assert!`: the workspace denies `panic`/`expect_used`/`unwrap_used` in tests.
         let of = |label: &str| -> String {
             let found = states.iter().find(|(l, _)| *l == label);
@@ -1054,8 +982,7 @@ mod tests {
             "the first slot's pid is a fact, not an inference: {free_alone}"
         );
 
-        // Each widest id is checked on its own: one `contains` conjunction passes
-        // if either field is wide.
+        // Each widest id on its own: one conjunction passes if either is wide.
         let widest = of("widest ids");
         assert!(
             widest.contains("0xffffffffffffffff"),

@@ -1,25 +1,5 @@
-//! The pin `docs/decisions/0015` step 6 claimed existed and did not.
-//!
-//! Step 6 deletes `dds_report::MISSING_ARM` — the "NOT MEASURED — tf_tree across
-//! processes" paragraph the report printed above its own table on every run —
-//! and says the deletion is *"verified by the test that pins the report's
-//! required sections"*. There was no such test. `dds_report.rs` had no
-//! `mod tests`, nothing under `tests/` mentioned the constant, and the
-//! `REQUIRED_ROWS` machinery that sounds like it belongs here belongs to
-//! `bench_report`, a different binary. So the sentence was pinned by nothing and
-//! deleting it was unverified by construction — and, worse, so is the arm that
-//! replaced it: nothing would have noticed if `tf_tree.processes` silently
-//! stopped being emitted, which is the exact state the disclosure existed to
-//! rule out.
-//!
-//! This is that pin, and it is deliberately **two** assertions rather than one:
-//! the four arm labels are all in the rendered table, and no "NOT MEASURED"
-//! text is anywhere in the output — so the sentence cannot come back, in any
-//! spelling, without this failing.
-//!
-//! It runs the binary rather than calling `aggregate`, for the reason
-//! `bench_report_cli.rs` does the same: `aggregate` prints, and what is being
-//! pinned is what an operator reads.
+//! The pin `docs/decisions/0015` step 6 claimed existed: two assertions, the four arm labels are rendered as rows
+//! and no "NOT MEASURED" text appears in any spelling.
 
 // Assertions are the point of a test binary.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -58,10 +38,6 @@ impl Drop for Scratch {
 
 /// One consumer process's output, in the line protocol `bench_consumer` prints
 /// and `parse_proc` reads.
-///
-/// The histogram is `mp::Histogram::encode`'s wire format, hand-written here so
-/// the fixture does not depend on the C++ side being built: `hist <total> <max>`
-/// then `<bucket>:<count>` pairs.
 fn consumer_out(consumers: usize) -> String {
     let mut s = format!("warmup_s 3.0\nmeasured_s 15.0\nconsumers {consumers}\n");
     for i in 0..consumers {
@@ -138,22 +114,13 @@ fn refusal(dir: &Path) -> String {
 }
 
 /// **The pin.** All four arms are in the table, and nothing says NOT MEASURED.
-///
-/// Mutant: in `aggregate`, skip the fourth arm —
-/// `for arm in arms.values().filter(|a| a.label != "tf_tree.processes")`. The
-/// run still succeeds, still prints three plausible rows, and this fails naming
-/// the arm that vanished.
 #[test]
 fn the_report_states_all_four_arms_and_declares_none_unmeasurable() {
     let scratch = Scratch::new("four-arms");
     write_four_arms(scratch.path());
     let text = aggregate(scratch.path());
 
-    // **A row, not a mention.** `text.contains(arm)` is what this assertion said
-    // first, and the mutation below defeated it: the table's own footer explains
-    // `tf_tree.processes` in prose, so a report that dropped the *row* still
-    // contained the string and the test passed. The label is column 0 of a row
-    // (`{:<26}`), so a row is a line that starts with it.
+    // A row, not a mention: the footer explains `tf_tree.processes` in prose, so match a line starting with the label.
     for arm in [
         "tf2.processes",
         "tf2.composed",
@@ -173,15 +140,6 @@ fn the_report_states_all_four_arms_and_declares_none_unmeasurable() {
     // while the arm exists would be the report disclaiming a measurement it
     // made; reintroducing them because the arm broke is what the assertion
     // above catches first.
-    //
-    // **These are fragments the deleted constant actually contained**, checked
-    // against `git show origin/main:...dds_report.rs`. Two of the three this
-    // list started with (`"not measurable"`, `"no multi-process tf_tree arm"`)
-    // were prose from `docs/decisions/0015` and appeared nowhere in the tool's
-    // output, so they would not have fired against the code this test was
-    // written to pin — an assertion that passes before and after the change it
-    // guards is not a pin. Only `"NOT MEASURED"` was load-bearing; the other
-    // three below are its neighbours in the same string.
     for stale in [
         "NOT MEASURED",
         "TreeBuilder::build()",
@@ -197,32 +155,7 @@ fn the_report_states_all_four_arms_and_declares_none_unmeasurable() {
     }
 }
 
-/// The bridge process's cost is **in** the arm, not beside it.
-///
-/// This is the half of step 5 a label check cannot see. The bridge contributes
-/// `cpu_ns` and `pss_kib` while reporting `consumers 0`, so it raises the arm's
-/// CPU-per-consumer and its PSS; an aggregator that skipped `consumers 0`
-/// processes, or that divided by `procs` instead of by the summed consumer
-/// count, would print a `tf_tree.processes` row that got a whole bridge for
-/// free — the single most flattering mistake this table could make.
-///
-/// The fixture is arithmetic, not a measurement. Four consumer processes at
-/// 0.25 s of CPU each is 1.00 s; the bridge adds 0.90 s. Over 4 consumers and a
-/// 15 s window that is 1.90/4/15 = **3.167 %** with the bridge's cost and
-/// 1.00/4/15 = **1.667 %** without it. PSS is 4 x 16000 + 24000 = **85.94 MiB**
-/// against **62.50 MiB**.
-///
-/// **The control is a bridge that cost nothing, not a missing bridge**:
-/// `check_structure` now *refuses* a `tf_tree.processes` arm with no
-/// `consumers 0` process in it, so deleting the file — which is what this
-/// control did first — no longer produces a row to compare against. A zero-cost
-/// bridge is the better control anyway: it differs from the real fixture in
-/// exactly the quantity under test and in nothing else — same five processes,
-/// same four consumers, same `bridge_transforms`.
-///
-/// Mutant: in `aggregate`'s per-arm fold, `if p.consumers == 0 { continue; }`.
-/// The row then reads 1.667 % and 62.50 MiB and every other assertion in this
-/// file still passes.
+/// The bridge process's cost is **in** the arm: it contributes `cpu_ns` and `pss_kib` while reporting `consumers 0`.
 #[test]
 fn the_bridge_process_cost_lands_in_the_arm_it_serves() {
     let with_bridge = Scratch::new("with-bridge");
@@ -276,10 +209,6 @@ fn the_bridge_process_cost_lands_in_the_arm_it_serves() {
 
 /// A `.out` cut off after its histograms — the shape a killed process, a full
 /// disk or a driver that stopped waiting leaves behind.
-///
-/// It is a *consumer* file with everything except the two cost lines, so the
-/// only thing that distinguishes it from a healthy one is the thing the
-/// aggregator used to read as a zero.
 fn truncated_out() -> String {
     let full = consumer_out(1);
     full.lines()
@@ -290,18 +219,7 @@ fn truncated_out() -> String {
 
 /// **Gate.** A process file missing a cost line is refused, by name.
 ///
-/// `parse_proc` cannot tell "field absent" from "field zero": against this
-/// project's own raw run, a bridge `.out` truncated after its histograms
-/// aggregates to 0.146 %/consumer where the truth is 0.847, and to a PSS that
-/// puts `tf_tree.processes` on the winning side of the one comparison it loses.
-/// Nothing else in the output changes — `procs` still reads 5, `fail%` still
-/// reads 0.00, the exit status is still 0 — so the flattering row is
-/// indistinguishable from a real one.
-///
-/// Mutant: in `parse_proc`, drop the `bail!` loop over the two fields (return
-/// `Ok(p)` directly) and give the fold `p.cpu_ns.unwrap_or(0)` /
-/// `p.pss_kib.unwrap_or(0)`. That is the pre-fix behaviour exactly; this test
-/// fails because the run succeeds.
+/// Mutant: drop the `bail!` loop over the two cost fields in `parse_proc`; the run then succeeds.
 #[test]
 fn a_process_file_missing_its_cost_lines_is_refused_by_name() {
     let scratch = Scratch::new("truncated");
@@ -325,19 +243,8 @@ fn a_process_file_missing_its_cost_lines_is_refused_by_name() {
 
 /// **Gate.** A `tf_tree.processes` arm with no bridge process in it is refused.
 ///
-/// This is the structural invariant the whole fairness argument rests on: *one*
-/// process pays the deserialization for all of them, and reports `consumers 0`
-/// so its cost lands in the numerator and not the denominator. An arm that lost
-/// its bridge — a crash, a rendezvous it never published, a driver edited to
-/// stop launching it — prints a **better** row than the real one, with no
-/// column showing the difference.
-///
 /// `tf2.processes` ends in the same word and must NOT be subject to this: it
 /// has no bridge by construction, which is what the control below asserts.
-///
-/// Mutant: in `check_structure`, `if !arm.is_bridge_and_attach() { continue; }`
-/// → `if true { continue; }`. Both refusals in this file's gate tests stop
-/// firing and every other assertion here still passes.
 #[test]
 fn a_bridge_and_attach_arm_with_no_bridge_process_is_refused() {
     let scratch = Scratch::new("no-bridge");
@@ -369,14 +276,6 @@ fn a_bridge_and_attach_arm_with_no_bridge_process_is_refused() {
 
 /// **Gate.** A bridge that received nothing is refused.
 ///
-/// `bridge_transforms` has been parsed and written to `results.json` since this
-/// arm existed and gated *nothing*, while `bench_consumer`'s own comment beside
-/// the counter said it exists so that "a run whose bridge dropped everything
-/// would otherwise report beautiful latencies for an empty arena". This makes
-/// that comment true. It is not hypothetical: the authority-attribution defect
-/// in `docs/benchmarks/tf2.md` produced exactly this shape, and it was caught
-/// only because it also failed every lookup.
-///
 /// Mutant: in `check_structure`, `if transforms == 0` → `if false`. This test
 /// fails; nothing else does.
 #[test]
@@ -397,13 +296,6 @@ fn a_bridge_that_received_no_transforms_is_refused() {
 }
 
 /// **Gate.** An arm that performed no lookups at all is flagged, not praised.
-///
-/// The `<-- FAILING` flag's own comment says it exists so the table cannot
-/// print the best latencies for an empty row, and for the emptiest row possible
-/// it did not fire: with no lookups `fail_pct` is `NaN`. An arm whose consumers
-/// all timed out on `--attach-timeout` reaches that state — header-only `.out`
-/// files, zero everything, `service_p50_ns: 0` recorded under
-/// `lower_is_better` in `results.json`.
 ///
 /// Mutant: `let flag = if fail_pct > 5.0` in `aggregate` — the pre-fix
 /// spelling. The row prints `0.00` in every latency column with no flag and
@@ -438,14 +330,6 @@ fn an_arm_that_performed_no_lookups_is_flagged_failing() {
 // ---------------------------------------------------------------------------
 
 /// A `ros/build.sh` output tree, with the two CMake caches `--ros-out` reads.
-///
-/// Written by hand rather than by running `ros/build.sh`: that needs the
-/// container, and what is under test is the reading, not the building. The
-/// format is CMake's own (`NAME:TYPE=VALUE`) and was checked against the real
-/// `target/ros/build/tf_tree_bench_ros/CMakeCache.txt` this repository produces.
-/// The decoys are deliberate — an `-ADVANCED` twin and a comment line containing
-/// the variable's name are both present in a real cache, and a parser that split
-/// on `=` alone would return one of them.
 fn write_ros_out(dir: &Path, build_type: &str, prebuilt_profile: &str) {
     let bench = dir.join("build/tf_tree_bench_ros");
     let pkg = dir.join("tf_tree-build");
@@ -476,13 +360,6 @@ fn write_ros_out(dir: &Path, build_type: &str, prebuilt_profile: &str) {
 
 /// A cargo profile directory guaranteed to differ from the one *this* test
 /// binary was built into.
-///
-/// The same rule as `runstore.rs`'s `differing_value`, which this mirrors rather
-/// than imports (it is private to that crate's unit tests): **a test about build
-/// facts must not hardcode one.** Hardcoding `embedder` here would assert
-/// "the arms' profile is not the aggregator's" and pass — until somebody runs
-/// the suite under `--profile embedder`, where the two would agree and the
-/// assertion would be vacuous rather than failing.
 fn a_profile_this_build_is_not() -> &'static str {
     if tf_tree_bench::embed::PROFILE_DIR == "embedder" {
         "release"
@@ -501,18 +378,6 @@ fn run_with(dir: &Path, extra: &[&str]) -> std::process::Output {
 }
 
 /// **Gate.** `--json` without `--ros-out` writes nothing.
-///
-/// A dds run file is the schema `bench_ab` compares two of, and the
-/// `build_profile` `Run::begin` collects here is the *aggregator's* — this
-/// binary parses `.out` files, it measures nothing. Writing the file without the
-/// arms' build in it is what lets a Release run and a `-O0` run compare cleanly,
-/// and it is worse than a missing file because the missing fact reads as
-/// "predates the gate" forever after.
-///
-/// Mutant (applied, observed): change the `(Some(path), None)` arm of
-/// `aggregate`'s `match` to `(Some(_), None) => None`, i.e. write the file with
-/// no arms' build. This test fails on the exit-status assertion — the run
-/// succeeds and `results.json` appears.
 #[test]
 fn a_run_file_without_the_arms_build_is_refused_rather_than_written() {
     let scratch = Scratch::new("json-needs-ros-out");
@@ -538,15 +403,6 @@ fn a_run_file_without_the_arms_build_is_refused_rather_than_written() {
 
 /// **Gate.** The three `dds_*` facts describe the arms, and are read rather than
 /// assumed.
-///
-/// The fixture's profile directory is one this build is not, so a version of
-/// `MeasuredBuild::read` that reported the aggregator's own profile would fail
-/// here rather than coincidentally agree.
-///
-/// Mutant (applied, observed): in `MeasuredBuild::read`, replace `c_abi_profile`
-/// with `tf_tree_bench::embed::PROFILE_DIR.to_owned()` — the plausible
-/// "the archive is built beside us" assumption. This test fails with
-/// `left: "debug", right: "embedder"` under `just test`.
 #[test]
 fn the_run_file_records_the_arms_build_and_not_the_aggregators() {
     let scratch = Scratch::new("arms-build");
@@ -625,31 +481,7 @@ fn run_file_for(scratch: &Scratch, tag: &str, build_type: &str, profile: &str) -
 
 type RunFile = tf_tree_bench::runstore::Run;
 
-/// **Gate.** Two dds runs whose arms were built differently refuse each other.
-///
-/// This is the whole point of the two above: the facts exist so that
-/// `runstore::diff` — which `bench_ab` is a thin shell over — declines to print
-/// verdicts over arms built two ways. Before the `dds_*` keys existed this pair
-/// compared cleanly and printed a full per-row table, because the only build
-/// facts in the file described the parser, and the parser was `--release` in
-/// both.
-///
-/// **One axis at a time**, so each key carries its own weight rather than
-/// hiding behind another. The exception: `dds_c_abi_lto` is a function of
-/// `dds_c_abi_profile` and one manifest, so they cannot be varied independently
-/// here — that pair is exactly the `build_profile` / `build_lto` relationship,
-/// and `build_lto` earns its place against a *manifest* edit, which no fixture
-/// in this file can make.
-///
-/// Mutant (applied, observed): delete all three `dds_*` keys from
-/// `runstore::BUILD_CRITICAL_FACTS`. Both cases below fail on `!comparable()`
-/// and `render` prints the table.
-///
-/// Mutant (applied, observed, and the reason this test varies one axis at a
-/// time): delete only `"dds_cxx_build_type"` and `"dds_c_abi_profile"`, leaving
-/// `dds_c_abi_lto`. An earlier version of this test varied both axes together
-/// (`Release`/`release` against `Debug`/`debug`) and **passed** under that
-/// mutation, because the surviving key moved too. It now fails.
+/// **Gate.** Two dds runs whose arms were built differently refuse each other (`runstore::diff` over the `dds_*` facts).
 #[test]
 fn two_dds_runs_whose_arms_were_built_differently_do_not_compare() {
     let scratch = Scratch::new("cross-build");
@@ -693,8 +525,6 @@ struct Row {
 
 impl Row {
     /// Column order is `label procs cons | p50 p99 p99.9 | cyc | cpu pss fail`.
-    /// Split on whitespace rather than matched as a substring so a number
-    /// landing in the wrong column fails instead of being found somewhere.
     fn of(text: &str) -> Row {
         let line = text
             .lines()

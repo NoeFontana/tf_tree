@@ -1,30 +1,22 @@
 //! Shared machinery for the multi-process evaluation (`mp_bench`): what each of
-//! N consumers at its own rate experiences, and what it costs, rather than
-//! `shm_scaling`'s saturated roofline.
+//! N consumers at its own rate experiences and costs, not `shm_scaling`'s roofline.
 //!
-//! * **Open loop.** [`RateLoop`] fixes the schedule in advance and measures
-//!   against intended start times, so a stall shows as latency instead of
-//!   fewer samples (coordinated omission).
-//! * **A writer is running**, so the seqlock retry path and `tf2::BufferCore`'s
-//!   mutex are exercised.
-//! * **Per-consumer distributions** ([`Histogram`]): `docs/PHASE1.md` §11.2
-//!   wants p99.9, not the mean.
-//! * **CPU per consumer** ([`ProcStats`]): `docs/PHASE2.md` §12.4's claim that
-//!   cost is O(1) in the number of consumers.
+//! * **Open loop**: [`RateLoop`] measures against intended start times, so a stall
+//!   shows as latency (coordinated omission).
+//! * **A writer runs**, exercising the seqlock retry path and tf2's mutex.
+//! * **Per-consumer [`Histogram`]s**: `docs/PHASE1.md` §11.2 wants p99.9.
+//! * **CPU per consumer** ([`ProcStats`]): `docs/PHASE2.md` §12.4.
 //! * **PSS, not summed RSS**: RSS counts a shared page once per mapper.
 
 use std::time::{Duration, Instant};
 
-/// Sub-buckets per power of two. 128 gives ~0.8% worst-case quantisation error,
-/// which is far below the run-to-run spread of anything measured here.
+/// Sub-buckets per power of two; 128 gives ~0.8% worst-case quantisation error.
 const SUB_BITS: u32 = 7;
 const SUB: u64 = 1 << SUB_BITS;
-/// Values below `SUB` get their own bucket, so sub-128 ns resolution is exact.
+/// Values below `SUB` get their own bucket.
 const BUCKETS: usize = (64 - SUB_BITS as usize) * SUB as usize + SUB as usize;
 
-/// A log-linear latency histogram, in nanoseconds: one array, constant relative
-/// error, ~2 ns to record (it runs inside the measured loop). Hand-rolled to
-/// avoid a dependency.
+/// A log-linear latency histogram in nanoseconds; ~2 ns to record.
 #[derive(Clone)]
 pub struct Histogram {
     counts: Vec<u32>,
@@ -60,7 +52,7 @@ impl Histogram {
         (shift as usize + 1) * SUB as usize + sub as usize
     }
 
-    /// Lowest value that lands in `bucket` — the value a quantile reports.
+    /// Lowest value in `bucket`; what a quantile reports.
     fn bucket_floor(bucket: usize) -> u64 {
         if (bucket as u64) < SUB {
             return bucket as u64;
@@ -101,8 +93,7 @@ impl Histogram {
         self.max
     }
 
-    /// The value at quantile `q` (0.0..=1.0), in nanoseconds; the bucket floor,
-    /// so never rounded upward.
+    /// The value at quantile `q` (0.0..=1.0), in ns; the bucket floor.
     #[must_use]
     pub fn quantile(&self, q: f64) -> u64 {
         if self.total == 0 {
@@ -120,10 +111,8 @@ impl Histogram {
         self.max
     }
 
-    /// Fraction of observations strictly below `ns`, in `0.0..=1.0`; the inverse
-    /// of [`Histogram::quantile`], for bimodal distributions quantiles cannot
-    /// describe. A bucket counts whole when its floor is below `ns`, so it can
-    /// overstate by under 0.8%. `0.0` for an empty histogram.
+    /// Fraction of observations strictly below `ns`; a whole bucket counts when its
+    /// floor is below `ns`, so it can overstate by under 0.8%. `0.0` if empty.
     #[must_use]
     pub fn fraction_below(&self, ns: u64) -> f64 {
         if self.total == 0 {
@@ -174,10 +163,8 @@ impl Histogram {
     }
 }
 
-/// A fixed-rate loop that measures against the **intended** schedule
-/// (coordinated-omission fix): `next_due()` is computed from the start time and
-/// the period, and a loop that has fallen behind returns an already-past
-/// deadline without sleeping, so backlog shows up as latency.
+/// A fixed-rate loop measuring against the **intended** schedule: a loop that
+/// has fallen behind returns a past deadline without sleeping.
 pub struct RateLoop {
     start: Instant,
     period: Duration,
@@ -195,8 +182,7 @@ impl RateLoop {
         }
     }
 
-    /// Sleep until the next tick is due and return the instant it was *due*;
-    /// latency is `Instant::now() - due` after the work completes.
+    /// Sleep until the next tick and return the instant it was *due*.
     pub fn next_due(&mut self) -> Instant {
         let due = self.start + self.period * u32::try_from(self.tick).unwrap_or(u32::MAX);
         self.tick += 1;
@@ -213,8 +199,7 @@ impl RateLoop {
 pub struct ProcStats {
     /// User + system CPU time consumed, in nanoseconds.
     pub cpu_ns: u64,
-    /// Proportional set size, in KiB: private pages plus each shared page
-    /// divided by the number of processes mapping it.
+    /// Proportional set size in KiB: private pages plus shared pages divided by mappers.
     pub pss_kib: u64,
 }
 
@@ -233,7 +218,6 @@ impl ProcStats {
     pub fn since(&self, earlier: ProcStats) -> ProcStats {
         ProcStats {
             cpu_ns: self.cpu_ns.saturating_sub(earlier.cpu_ns),
-            // PSS is a level, not a counter: report the later reading.
             pss_kib: self.pss_kib,
         }
     }
@@ -241,42 +225,33 @@ impl ProcStats {
 
 /// CPU time of this process, in nanoseconds.
 ///
-/// Read from `schedstat` (nanoseconds), not `stat` (10 ms USER_HZ ticks): a
-/// consumer uses ~4 ms of CPU per window, under one tick, so `stat` would read
-/// `0.0`. Summed over `task/*` so threads are counted whole.
-///
-/// `task/*` lists live threads only, so a joined thread's CPU leaves the sum
-/// (`docs/benchmarks/tf2.md`). The two instruments are therefore cross-checked:
-/// when `stat` exceeds the task sum by more than two ticks, the coarse `stat`
-/// reading is returned. `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` needs
-/// `unsafe`, which this crate forbids. Tested by
-/// `a_joined_threads_cpu_is_not_lost` and the sub-tick test below.
+/// Read from `schedstat`, not `stat`: a consumer uses under one 10 ms tick per
+/// window. `task/*` lists live threads only, so when `stat` exceeds the task sum
+/// by more than two ticks the coarse `stat` reading is returned
+/// (`docs/benchmarks/tf2.md`). Tests: `a_joined_threads_cpu_is_not_lost` and the
+/// sub-tick test.
 fn self_cpu_ns() -> u64 {
-    // Always read: it is the completeness reference for the cross-check below.
+    // Completeness reference for the cross-check below.
     let stat_ns = stat_cpu_ns();
 
     if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
         let mut ns = 0u64;
         let mut any = false;
         for t in tasks.flatten() {
-            // A thread can exit between readdir and open; skip it rather than
-            // abandoning the sum, which would silently under-report.
+            // A thread can exit between readdir and open; skip it.
             if let Some(v) = schedstat_ns(&t.path().join("schedstat")) {
                 ns += v;
                 any = true;
             }
         }
-        // Two ticks of slack: `stat` rounds up to whole ticks.
         if any && stat_ns <= ns.saturating_add(2 * TICK_NS) {
             return ns;
         }
         if any {
-            // The task sum lost a thread. `stat` still has it.
             return stat_ns;
         }
     }
-    // CONFIG_SCHEDSTATS=n. Fall back to 10 ms ticks, which is worse but is not
-    // nothing, rather than reporting zero and looking like an answer.
+    // CONFIG_SCHEDSTATS=n: fall back to 10 ms ticks.
     stat_ns
 }
 
@@ -289,9 +264,8 @@ fn schedstat_ns(path: &std::path::Path) -> Option<u64> {
     s.split_whitespace().next()?.parse().ok()
 }
 
-/// User + system CPU time in nanoseconds, quantized to 10 ms. Fallback only.
-/// Parsed after the last `)` because `comm` may contain parentheses
-/// (`docs/PHASE2.md` §5.1).
+/// User + system CPU time in ns, quantized to 10 ms. Fallback only.
+/// Parsed after the last `)` because `comm` may contain parentheses (`docs/PHASE2.md` §5.1).
 fn stat_cpu_ns() -> u64 {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
         return 0;
@@ -300,7 +274,6 @@ fn stat_cpu_ns() -> u64 {
         return 0;
     };
     let f: Vec<&str> = after.split_whitespace().collect();
-    // After `)`: index 0 = state (field 3), so field 14 is index 11.
     let utime: u64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
     let stime: u64 = f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
     (utime + stime) * 10_000_000
@@ -324,8 +297,7 @@ pub fn self_pss_kib() -> u64 {
     0
 }
 
-// ---- machine-quiet accounting ------------------------------------------
-// A row taken while something else was running is a different experiment.
+// machine-quiet accounting
 
 /// System-wide busy fraction from `/proc/stat` over `window`: 0.0 is quiet,
 /// 1.0 is every core saturated.
@@ -360,8 +332,7 @@ fn cpu_jiffies() -> Option<(u64, u64)> {
     Some((idle, v.iter().sum()))
 }
 
-/// Busy fraction above which a measurement is not worth taking; the harness's
-/// own load is a fraction of one core.
+/// Busy fraction above which a measurement is refused.
 pub const QUIET_ENOUGH: f64 = 0.10;
 
 /// Refuse to measure on a busy machine, naming what is running. Overridable
@@ -436,19 +407,13 @@ mod tests {
 
     #[test]
     fn histogram_never_reports_above_the_truth() {
-        // Reporting the bucket *ceiling* would flatter nothing but would still
-        // be a number nobody measured; floors keep every reported tail honest.
         let mut h = Histogram::new();
         h.record(1_000_000);
         assert!(h.quantile(0.5) <= 1_000_000);
         assert_eq!(h.max(), 1_000_000);
     }
 
-    /// `fraction_below` sees bimodality (30% of samples at composed speed, 70% a
-    /// decade slower).
-    ///
-    /// Mutant: `>=` → `>` in `fraction_below`; the exact-boundary case then
-    /// reports 0.4 where 0.3 is true.
+    /// `fraction_below` sees bimodality (30% at composed speed, 70% a decade slower).
     #[test]
     fn fraction_below_reports_the_fast_mode_a_quantile_hides() {
         let mut h = Histogram::new();
@@ -458,15 +423,12 @@ mod tests {
         for _ in 0..700 {
             h.record(9_000);
         }
-        // The p50 lands in the slow mode and is silent about the other 30%.
         assert!(h.quantile(0.50) > 5_000, "p50 {}", h.quantile(0.50));
         assert!(
             (h.fraction_below(1_000) - 0.30).abs() < 0.001,
             "fraction below 1 us: {}",
             h.fraction_below(1_000)
         );
-        // Strictly below: 1000 is a bucket floor here, so the bucket holding
-        // the 1000s must not be counted.
         let mut exact = Histogram::new();
         for _ in 0..300 {
             exact.record(800);
@@ -517,13 +479,11 @@ mod tests {
         }
     }
 
-    /// The property the whole harness rests on: a slow tick must show up as
-    /// latency, not vanish into a reduced sample count.
+    /// A slow tick must show up as latency, not a reduced sample count.
     #[test]
     fn the_rate_loop_charges_overrun_to_latency() {
         let mut r = RateLoop::new(1000.0); // 1 ms period
         let first = r.next_due();
-        // Simulate a consumer that overruns its budget by ~5 periods.
         std::thread::sleep(Duration::from_millis(5));
         let second = r.next_due();
         assert!(
@@ -553,13 +513,11 @@ mod tests {
         );
     }
 
-    /// The counter must resolve less than one 10 ms clock tick (a counter that
-    /// is always zero satisfies monotonicity; see `self_cpu_ns`).
+    /// The counter must resolve less than one 10 ms clock tick.
     #[test]
     fn cpu_time_resolves_below_one_clock_tick() {
         if !std::path::Path::new("/proc/self/schedstat").exists() {
-            // CONFIG_SCHEDSTATS=n: the 10 ms fallback is all there is, and
-            // asserting sub-tick resolution against it would be a false alarm.
+            // CONFIG_SCHEDSTATS=n: only the 10 ms fallback exists.
             return;
         }
         let spin = Duration::from_millis(3);
@@ -584,18 +542,13 @@ mod tests {
         );
     }
 
-    /// A thread's CPU must not vanish from the reading when the thread is
-    /// joined (`self_cpu_ns` cross-check).
-    ///
-    /// Mutant: delete the `if any { return stat_ns; }` arm; the test then
-    /// reports ~0 s for ~0.4 s burned.
+    /// A thread's CPU must not vanish from the reading when the thread is joined.
     #[test]
     fn cpu_time_survives_a_thread_exiting() {
         if !std::path::Path::new("/proc/self/schedstat").exists() {
             return;
         }
-        // 200 ms wall per thread, asserted at 100 ms CPU total: a quota'd host
-        // does not give two threads 400 ms, and the mutant reports ~0.34 ms.
+        // 200 ms wall per thread, asserted at 100 ms CPU total, for quota'd hosts.
         let burn = Duration::from_millis(200);
         let before = ProcStats::read();
         let hs: Vec<_> = (0..2)

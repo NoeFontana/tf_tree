@@ -1,11 +1,7 @@
 //! Recording → `.tft` → query, and the provenance the container carries —
 //! `docs/PHASE5.md` §2 meeting §3.
 //!
-//! Needs `--features shm` because the frozen backend is Linux-only and behind
-//! that flag (it reuses the shared-memory mapping code). `just shm-check` runs
-//! this file; a plain `cargo nextest run --workspace` cannot.
-//!
-//! The recording is synthetic — `tf_tree_ingest::fixture` says so at length.
+//! Needs `--features shm` (`just shm-check`).
 
 #![cfg(all(feature = "shm", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -34,21 +30,9 @@ impl Drop for Scratch {
     }
 }
 
-/// A `.tft` built from a recording answers **bit-identically** to the in-memory
-/// tree the same ingest produced — which is §2.1's claim, reached from §3's
-/// source rather than from a live arena.
-///
-/// The comparison sweeps 200 stamps across the span and asserts `Ok`/`Err`
-/// agreement as well as value equality, so a frozen tree that answered
-/// *nothing* could not pass by having no answers to disagree about.
-///
-/// Mutant: in `ingest::fill`, halve every ring —
-/// `Capacity::slots(clamp_u32(e.samples) / 2)` — applied, and this test failed
-/// on the `answered > 150` guard, because half the span had been lapped away.
-/// The heap tree and the frozen file still agreed with each other, which is
-/// exactly why that guard is here and not just the equality assertion.
-/// Mutant 2: in `tft::freeze_bag`, pass `[0u8; 32]` instead of the computed
-/// digest — applied, and the `source_digest` assertion failed.
+/// A `.tft` built from a recording answers bit-identically to the in-memory
+/// tree the same ingest produced (§2.1), including `Ok`/`Err` agreement, so a
+/// frozen tree that answered nothing cannot pass.
 #[test]
 fn a_frozen_bag_answers_like_the_tree_it_came_from() {
     let dir = Scratch::new("roundtrip");
@@ -61,8 +45,7 @@ fn a_frozen_bag_answers_like_the_tree_it_came_from() {
     let (ingested, header) = tf_tree_ingest::tft::freeze_bag(&bag, &tft, &opts, &mut frames)
         .unwrap_or_else(|e| panic!("{}", tf_tree_ingest::describe(e, &frames)));
 
-    // §2.3: the digest is BLAKE3 of the *recording*, so it is reproducible from
-    // the file alone and is not all-zero the way `--from-live` leaves it.
+    // §2.3: the digest is BLAKE3 of the recording, not all-zero.
     let expect = blake3::hash(&std::fs::read(&bag).unwrap());
     assert_eq!(&header.source_digest, expect.as_bytes());
     assert_ne!(header.source_digest, [0u8; 32]);
@@ -84,13 +67,8 @@ fn a_frozen_bag_answers_like_the_tree_it_came_from() {
     );
 }
 
-/// The `.tft` is read-only, permanently — §2.4. Freezing a bag must not hand
-/// back something a caller can publish into.
-///
-/// Mutant: none applied; this is a restatement of a property `Tree::open_frozen`
-/// already owns and tests (`crates/tf_tree/tests/frozen.rs`). It is here because
-/// the *bag* path is a second way to produce one, and a future change that gave
-/// bag-frozen files a writable backing would not be caught by that file.
+/// The `.tft` is read-only, permanently (§2.4); the bag path is a second way to
+/// produce one, beyond `crates/tf_tree/tests/frozen.rs`.
 #[test]
 fn a_frozen_bag_is_not_writable() {
     let dir = Scratch::new("readonly");

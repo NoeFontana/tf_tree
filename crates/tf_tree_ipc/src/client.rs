@@ -1,15 +1,9 @@
 //! The client half of the §3.7 attach handshake.
 //!
 //! Connect, send a [`HelloRequest`], receive a [`HelloResponse`] with the
-//! segment fd riding as `SCM_RIGHTS`, and **keep the socket open**.
-//!
-//! **The socket is not a handshake channel.** A participant holds its connection
-//! for the lifetime of the attachment: that is how it learns the owner died
-//! (`docs/PHASE2.md` §3.7 step 9, §3.5 `owner_lost()`; `docs/PROJECT.md` D17).
-//! [`Attached`] owns the socket and the caller must keep it alive.
-//!
-//! No `unsafe`: rustix's ancillary API is safe end to end
-//! (`docs/decisions/0005`).
+//! segment fd as `SCM_RIGHTS`, and keep the socket open: its hangup is how a
+//! participant learns the owner died (`docs/PHASE2.md` §3.7 step 9, §3.5;
+//! `docs/PROJECT.md` D17). No `unsafe` (`docs/decisions/0005`).
 
 use std::path::Path;
 use std::time::Duration;
@@ -38,14 +32,10 @@ pub struct Attached {
 
 /// Whether the peer of `socket` has closed it — the owner's death signal (D17).
 ///
-/// The participant-side view of the D17 hangup: the owner is gone, which is
-/// §3.5's trigger. The kernel closes a dying process's files only at the end of
-/// its exit, after any core dump
+/// Non-blocking by contract, so §3.5 needs no background thread
+/// (`docs/decisions/0019`); a hangup is one-way, so `true` may be cached. The
+/// kernel closes a dying process's files after any core dump
 /// ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
-///
-/// **Non-blocking, and it must stay that way**: a zero-timeout predicate keeps
-/// §3.5 free of a background thread (`docs/decisions/0019`). A hangup is
-/// one-way, so `true` may be cached.
 ///
 /// # Errors
 ///
@@ -98,8 +88,7 @@ pub fn attach(
         raw_os_error: e.raw_os_error(),
     })?;
 
-    // Both directions: §3.7 has no timeout, and a SIGSTOPped owner would wedge
-    // this client past the §3.4 deadline.
+    // Both directions: a SIGSTOPped owner would wedge the client past §3.4's deadline.
     for dir in [
         rustix::net::sockopt::Timeout::Recv,
         rustix::net::sockopt::Timeout::Send,
@@ -151,11 +140,9 @@ pub fn attach(
         }
     }
 
-    // Zero bytes is the owner dying mid-handshake, not a malformed reply
-    // (`BadLength` is terminal in `verdict`; this must be retryable). `Absent`
-    // is safe: §3.4 step 2 still sees a live owner's byte 0, and step 4 refuses
-    // to create while any participant byte is held, except under
-    // `CreatePolicy::Always`, which skips that check by design.
+    // Zero bytes is an owner dying mid-handshake, not a malformed reply
+    // (`BadLength` is terminal in `verdict`). `Absent` is safe: §3.4 steps 2
+    // and 4 still see the owner's live bytes.
     if recv.bytes == 0 {
         return Err(IpcError::HandshakeClosed);
     }
@@ -184,9 +171,7 @@ pub fn attach(
     })
 }
 
-/// Build a `SocketAddrUnix`, rejecting an over-long path with a typed error.
-///
-/// `sun_path` is 108 bytes and `$TF_TREE_RUNTIME_DIR` is arbitrary.
+/// Build a `SocketAddrUnix`, rejecting a path over `sun_path`'s limit with a typed error.
 pub(crate) fn socket_addr(path: &Path) -> Result<SocketAddrUnix, IpcError> {
     let len = path.as_os_str().len();
     if len >= MAX_SOCKET_PATH {
@@ -201,10 +186,8 @@ pub(crate) fn socket_addr(path: &Path) -> Result<SocketAddrUnix, IpcError> {
     })
 }
 
-/// The real [`crate::ServerProbe`]: connect and complete the §3.7 handshake.
-///
-/// Attaching *is* the probe (a separate probe then attach would re-run the §3.4
-/// race), so a successful probe comes back holding the segment.
+/// The real [`crate::ServerProbe`]: attaching *is* the probe, so success comes
+/// back holding the segment (a separate probe would re-run the §3.4 race).
 pub struct SocketProbe {
     request: HelloRequest,
     timeout: Duration,
@@ -249,25 +232,20 @@ enum Verdict {
 
 /// Classify an attach failure.
 ///
-/// Pure, so it is testable without syscalls. **A wrong arm is not a small bug**:
-/// anything mapped to [`Verdict::Absent`] makes `open()` create an arena, so a
-/// local failure misfiled there produces a second arena beside a live one.
+/// Classify an attach failure. A wrong arm is not small: anything mapped to
+/// [`Verdict::Absent`] makes `open()` create a second arena beside a live one.
 fn verdict(e: &IpcError) -> Verdict {
     match e {
-        // Nobody listening, or an owner dying mid-handshake (`ECONNRESET` on an
-        // unaccepted connection, a 0-byte `recvmsg` on an accepted one; §3.9).
-        // Safe for the same reason as the zero-byte check in `attach`.
+        // Nobody listening, or an owner dying mid-handshake (§3.9).
         IpcError::ServerUnreachable { .. }
         | IpcError::HandshakeIo { .. }
         | IpcError::HandshakeClosed => Verdict::Absent,
-        // The owner answered; waiting cannot change it and would replace a precise
-        // message with a timeout.
+        // The owner answered; waiting cannot change it.
         IpcError::HandshakeRejected { .. }
         | IpcError::HandshakeMalformed(_)
         | IpcError::RejectionCarriedFd { .. }
         | IpcError::NoFdReceived => Verdict::Rejected,
-        // Everything else, notably `ClientSocketSetup` (this process out of
-        // descriptors): calling that "no server" would create a second arena.
+        // Everything else, notably `ClientSocketSetup` (out of descriptors).
         _ => Verdict::Fatal,
     }
 }
@@ -287,8 +265,7 @@ mod tests {
         );
     }
 
-    /// The three arms that mean "no server": `connect` found nothing, and the
-    /// two ways a dying owner reaches a client.
+    /// The three arms that mean "no server".
     #[test]
     fn the_no_server_arms_are_exactly_the_three_that_mean_no_server() {
         assert_eq!(
@@ -321,11 +298,9 @@ mod tests {
         }
     }
 
-    /// An owner that accepts, reads the request and closes without replying is
-    /// `Absent`, not malformed. Staged on real sockets, with the `accept(2)`
-    /// (without it the client sees `ECONNRESET`, an already-correct arm).
+    /// An owner that accepts, reads and closes without replying is `Absent`.
     /// Mutant: deleting the `recv.bytes == 0` guard in [`attach`] fails the first
-    /// assertion with `HandshakeMalformed(BadLength { got: 0, .. })`.
+    /// assertion.
     #[test]
     fn an_owner_that_closes_after_accepting_is_absent_not_malformed() {
         use crate::wire::HELLO_REQUEST_LEN;
@@ -337,7 +312,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("a.sock");
 
-        // Listening before the thread exists, so `connect` cannot hit `ServerUnreachable`.
+        // Listening before the thread exists, so `connect` cannot see `ServerUnreachable`.
         let listener = socket_with(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,

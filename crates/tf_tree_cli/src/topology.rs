@@ -1,17 +1,7 @@
 //! `tf_tree topology` — obtain, validate and explain a bridge topology file.
-//!
-//! `docs/PHASE4.md` §5.8's amendment: the bridge takes its topology from a config
-//! file, and `--discover` is how an operator obtains it.
-//!
-//! * `--discover <source>` — read a recorded `/tf` stream, print the config it
-//!   implies, and report what a config cannot express (a child with two parents;
-//!   an edge on both topics).
-//! * `--config <file.toml>` — parse it, build the arena, print what the bridge
-//!   will accept: a pre-flight for bridge startup.
-//!
-//! The source is a `.tfstream` because [`tf_tree_bridge::Discovery`] takes
-//! `(topic, sample)` pairs and needs no live ROS 2 graph; the corpus in
-//! `testdata/tfstream/` is a real robot's `/tf` (see its `ATTRIBUTION.md`).
+//! `docs/PHASE4.md` §5.8: `--discover <source>` prints the bridge config a
+//! recorded `.tfstream` implies and what a config cannot express; `--config
+//! <file.toml>` parses and builds it as a pre-flight for bridge startup.
 
 use std::path::Path;
 
@@ -22,11 +12,8 @@ use tf_tree_bench::replay::TfStream;
 use tf_tree_bridge::{Discovery, EdgeShape, Sample, Topic, TopologyConfig};
 
 /// Read a `.tfstream`, collect its topology, and return the config it implies.
-///
-/// Every sample's receipt time is [`tf_tree_bridge::SteadyNanos::UNKNOWN`]: a
-/// `.tfstream` carries no log time, and passing `stamp_nanos` instead would make
-/// every offset zero and re-enable inference over the signal under suspicion
-/// (§5.5). [`Discovery::observe`] never consults a clock, so nothing is lost here.
+/// Receipt times are [`tf_tree_bridge::SteadyNanos::UNKNOWN`]: a `.tfstream` has
+/// no log time, and `stamp_nanos` would zero every offset (§5.5).
 ///
 /// # Errors
 ///
@@ -39,17 +26,14 @@ pub fn discover_from_tfstream(
 ) -> Result<Discovery> {
     let stream = TfStream::load(path)?;
     let mut d = Discovery::new(history_secs);
-    // §5.6: the prefix must match the bridge's, or every edge is declared and none match.
     if let Some(p) = tf_prefix {
         d = d.with_prefix(p);
     }
     if let Some(i) = interp {
         d = d.with_interp(i);
     }
-    // Statics first, matching the wire (`/tf_static` is latched); the collector
-    // resolves a §5.7 kind clash to the first topic seen.
+    // Statics first, matching the wire (`/tf_static` is latched).
     for (parent, child, iso) in &stream.static_edges {
-        // `Sample::identity`, not a literal: `Sample` is not `#[non_exhaustive]`.
         let mut sample = Sample::identity(parent, child, 0);
         sample.pose = pose_of(iso);
         d.observe(Topic::TfStatic, &sample);
@@ -88,11 +72,9 @@ pub fn cmd_discover(
     let config = d.to_config();
     let text = config.to_toml();
 
-    // Boundary check that a discovered config reparses; should never fire.
     TopologyConfig::parse(&text)
         .map_err(|e| anyhow!("the discovered config does not reparse: {e}"))?;
 
-    // Findings go to stderr so `--discover > topology.toml` stays a usable file.
     for (child, rejected) in d.multi_parent() {
         eprintln!(
             "warning: frame {child:?} has more than one parent in this recording; \
@@ -118,7 +100,6 @@ pub fn cmd_discover(
             d.dropped_bad_name()
         );
     }
-    // The sample count tells an operator how far to trust each edge's ring size.
     for (parent, child, n) in d.sample_counts() {
         eprintln!("  {parent} -> {child}: {n} samples");
     }
@@ -147,7 +128,6 @@ pub fn cmd_discover(
 pub fn cmd_check(path: &Path, domain: Option<u8>) -> Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    // `ConfigError` borrows from `text`, so it is rendered here, not returned.
     let config = match TopologyConfig::parse(&text) {
         Ok(c) => c,
         Err(e) => bail!("{}: {e}", path.display()),
@@ -158,7 +138,6 @@ pub fn cmd_check(path: &Path, domain: Option<u8>) -> Result<()> {
             bail!("{}: {e}", path.display());
         }
     }
-    // Before the builder, which would name the cycle by an unmappable `FrameId`.
     if let Some(child) = config.cycle_child() {
         bail!(
             "{}: the declared topology has a cycle through frame {child:?} — \

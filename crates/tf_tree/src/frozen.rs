@@ -1,9 +1,7 @@
 //! Freezing a tree to a `.tft`, and opening one — `docs/PHASE5.md` §2.
 //!
-//! Not a read path: §2.1 is NORMATIVE that a frozen arena is read by the same
-//! `Plan::at` code as a live one, so [`Tree::open_frozen`] returns an ordinary
-//! [`Tree`]. The manifest is cold provenance and nothing reads it to decide
-//! anything; [`FrozenArena::open`](tf_tree_arena::FrozenArena::open) ignores it.
+//! §2.1: a frozen arena is read by the same `Plan::at` code as a live one, so
+//! [`Tree::open_frozen`] returns an ordinary [`Tree`]; the manifest is never read.
 
 use std::path::Path;
 
@@ -14,8 +12,7 @@ use crate::tree::Tree;
 
 /// Why a `.tft` could not be opened or written.
 ///
-/// `Copy` and `String`-free (`docs/PROJECT.md` §5): the I/O error is reduced to
-/// its errno.
+/// `Copy` and `String`-free (`docs/PROJECT.md` §5): I/O errors reduce to errno.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FrozenFileError {
@@ -43,10 +40,7 @@ fn path_err(e: &std::io::Error) -> FrozenFileError {
     }
 }
 
-/// The path the freeze writes to before it is renamed over the real one.
-///
-/// A dot-prefixed **sibling** (`rename` is atomic only within a filesystem),
-/// suffixed with pid plus a counter.
+/// Dot-prefixed sibling temporary (`rename` is atomic within a filesystem), with pid and counter.
 fn temp_sibling(path: &Path) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
@@ -76,9 +70,7 @@ fn tool_version() -> [u8; 32] {
 impl Tree {
     /// Open a `.tft` and read it through the ordinary [`Tree`] API (§2.1).
     ///
-    /// The returned tree is permanently read-only: the mapping is `PROT_READ`
-    /// (§2.4). There is no `populate_hot`: a `.tft` reader touches only the pages
-    /// its query needs (§2.2).
+    /// The returned tree is read-only (`PROT_READ`, §2.4).
     ///
     /// # Errors
     ///
@@ -93,24 +85,17 @@ impl Tree {
 
     /// Write this tree's arena to `path` as a `.tft` (§2.3).
     ///
-    /// Backs `tf_tree freeze --from-live`. §5.6's counter capture is structural:
-    /// the whole arena is copied.
+    /// Backs `tf_tree freeze --from-live`. The write goes to a sibling temporary
+    /// `rename`d over `path` once the header lands, so `path` is always the
+    /// previous or the new `.tft`.
     ///
-    /// # Replacing `path` is atomic
-    ///
-    /// Bytes go to a sibling temporary that is `rename`d over `path` once the
-    /// header has landed, so `path` is always the previous or the new `.tft`.
-    /// `write_frozen` sizes the file with `ftruncate` first, so an interrupted
-    /// freeze leaves a full-length file with a zeroed tail that no size check
-    /// would catch.
-    ///
-    /// `source_digest` is BLAKE3 of the source recording, or all-zero (the
-    /// `--from-live` case).
+    /// `source_digest` is BLAKE3 of the source recording, or all-zero.
     ///
     /// # Snapshot consistency
     ///
     /// A live freeze copies bytes while publishers store; see
     /// [`write_frozen`](tf_tree_arena::write_frozen).
+    ///
     /// # Errors
     ///
     /// [`FrozenFileError::Path`] if `path` cannot be created;
@@ -126,7 +111,6 @@ impl Tree {
         let tmp = temp_sibling(path);
         let file = std::fs::File::create(&tmp).map_err(|e| path_err(&e))?;
         let arena: &dyn Arena = self.backing();
-        // A closure so every failure reaches the cleanup arm.
         let written = (|| -> Result<FrozenHeader, FrozenFileError> {
             let header = tf_tree_arena::write_frozen(
                 std::os::fd::AsFd::as_fd(&file),
@@ -136,12 +120,10 @@ impl Tree {
                 created_unix_ns,
                 tool_version(),
             )?;
-            // The `rename` is the publish.
             std::fs::rename(&tmp, path).map_err(|e| path_err(&e))?;
             Ok(header)
         })();
         if written.is_err() {
-            // Best effort: a leftover temporary is litter.
             let _ = std::fs::remove_file(&tmp);
         }
         written
@@ -149,10 +131,8 @@ impl Tree {
 
     /// Build the CBOR manifest for this tree (§2.3).
     ///
-    /// The per-edge span is one-sided: `oldest_ns` is the oldest *retained*
-    /// sample (`SampleRing::oldest_stamp`), not the source's. `samples` is
-    /// `SampleRing::stored()` (what the file holds); `pushes_total` is
-    /// `EdgeRecord::head` (what the source produced); their ratio is the drop.
+    /// `oldest_ns` is the oldest *retained* sample; `samples` is what the file
+    /// holds, `pushes_total` what the source produced.
     fn manifest(&self, source: Option<&str>, created_unix_ns: i64) -> Vec<u8> {
         let view = self.view();
         let header = view.header();
@@ -174,12 +154,10 @@ impl Tree {
         w.text("source");
         match source {
             Some(s) => w.text(s),
-            // `null`, not `""`: no path is not an empty path.
             None => w.null(),
         }
 
-        // `frame_count` counts interned frames, ids `1..=frame_count`; index 0 is
-        // the root sentinel.
+        // Ids `1..=frame_count`; index 0 is the root sentinel.
         w.text("frames");
         w.array(frames as usize);
         for i in 1..=frames {
@@ -193,13 +171,12 @@ impl Tree {
             w.text(&name);
         }
 
-        // `edge_count` includes its sentinel: real ids are `1..edge_count`.
+        // `edge_count` includes its sentinel.
         w.text("edges");
         w.array(edges.saturating_sub(1) as usize);
         for i in 1..edges {
             let id = tf_tree_core::EdgeId(i);
-            // One observation of the record: re-reading per key would let a
-            // concurrent freeze interleave them.
+            // One observation: per-key re-reads could interleave with a writer.
             let e = view.edge(id);
             w.map(8);
             w.text("parent");
@@ -211,8 +188,6 @@ impl Tree {
             w.text("capacity");
             w.u64(u64::from(e.map_or(0, |e| e.capacity)));
             let ring = view.ring(id);
-            // `samples` is what the file holds; `pushes_total` what the source
-            // produced.
             w.text("samples");
             w.u64(ring.as_ref().map_or(0, |r| r.stored()));
             w.text("pushes_total");

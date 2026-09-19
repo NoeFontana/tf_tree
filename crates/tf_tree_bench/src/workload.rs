@@ -1,22 +1,4 @@
-//! The workload catalogue: one definition of *what load is being run*.
-//!
-//! A [`Workload`] is the whole description of a load (tree, query pairs, stamp
-//! window, live-publisher edges) and [`Workload::build`] the only way to turn it
-//! into a running tree, so no two harnesses label different loads alike.
-//!
-//! `docs/PHASE1.md` §11.3 is normative: every latency row must state its
-//! dynamic-step count, not only nominal depth. [`Shape`] carries it.
-//!
-//! Limits a scale sweep finds:
-//!
-//! * Two depth bounds (`0034`): `tf_tree_core::MAX_DEPTH` (**32**) caps a
-//!   *compiled* plan (after static folding), `MAX_PATH_EDGES` (**64**) the raw
-//!   walk. The raw one is checked in [`Workload::estimate`]; the compiled one
-//!   surfaces from [`Workload::build`]'s `Built::plans` and `tests/workload.rs`
-//!   asserts it over the catalogue.
-//! * `BuildError::TooManyFrames` / `TooManyEdges`: both counts are `u32`.
-//! * `LayoutError::ArenaTooLarge`: 4 GiB is a hard ceiling (largest entry 85
-//!   MiB); `scale_sweep` finds it deliberately.
+//! The workload catalogue: one definition of *what load is being run*, so no two harnesses label different loads alike.
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -26,37 +8,17 @@ use crate::fixture;
 use crate::replay::{Sample, TfStream};
 
 /// Where a workload's arena lives.
-///
-/// A parameter rather than two build functions, so both paths populate identically.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backing {
     /// An ordinary heap arena.
     Heap,
     /// A shared `memfd` arena under the given rendezvous name. Requires the
     /// `shm` feature and Linux.
-    ///
-    /// Readers only: since `docs/decisions/0028` step 0b a peer holding the fd can
-    /// attach `ReadOnly` only. Harnesses whose children *publish* want [`Backing::Served`].
     Shared(&'static str),
-    /// A shared arena created **through the rendezvous**, so peers can join it
-    /// read-write: this process owns the ownership byte, lock file and serving
-    /// thread. `just contended-scaling`'s writers need it. Costs a runtime
-    /// directory (`$TF_TREE_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/tf_tree`, else
-    /// `/run/tf_tree`, else `/tmp/tf_tree-<uid>`) holding a lock file and socket.
-    ///
-    /// # `require_create`
-    ///
-    /// A benchmark that silently *joined* a live arena would publish that arena's
-    /// numbers as its own, and `layout_hash` cannot catch a topology mismatch. So
-    /// this uses [`tf_tree::Open::require_create`]: `OpenOutcome::Joined` becomes
-    /// `OpenError::ArenaAlreadyLive`. Pinned by
-    /// `a_served_workload_refuses_an_arena_it_did_not_create`
-    /// (`crates/tf_tree_bench/tests/multiprocess.rs`).
-    ///
-    /// `IfAbsent` rather than `Always`: creating over a live but unreachable
-    /// arena leaves survivors publishing into a segment this process cannot see,
-    /// inside the measurement. `IfAbsent` reports `ArenaHeldButUnreachable` with
-    /// the holding pids instead.
+    /// A shared arena created **through the rendezvous**, so peers can join it read-write; this process
+    /// owns the ownership byte, lock file and serving thread (`just contended-scaling`'s writers). Uses
+    /// [`tf_tree::Open::require_create`], so a live arena is never silently joined
+    /// (`a_served_workload_refuses_an_arena_it_did_not_create`).
     Served(&'static str),
 }
 
@@ -70,11 +32,9 @@ pub enum Topology {
         /// Path relative to the repository root.
         path: &'static str,
     },
-    /// [`crate::replay::synth_robot`]: a dynamic spine with static sensor
-    /// subtrees, the shape a real URDF produces.
+    /// [`crate::replay::synth_robot`]: a dynamic spine with static sensor subtrees.
     Synth {
-        /// Spine length. Every spine edge is dynamic, so this *is* the
-        /// dynamic-step count.
+        /// Spine length; every spine edge is dynamic, so this is the dynamic-step count.
         depth: usize,
         /// Static children per spine link.
         branches: usize,
@@ -83,16 +43,11 @@ pub enum Topology {
         /// Publish rate of every spine edge.
         rate_hz: f64,
     },
-    /// `robots` copies of [`Topology::Fixture`] under one `world` root, each
-    /// under an `r<i>/` name prefix.
-    ///
-    ///
-    /// Many independent publishers on one wide tree, which no other fixture has.
+    /// `robots` copies of [`Topology::Fixture`] under one `world` root, each under an `r<i>/` prefix.
     Fleet {
         /// Number of robot subtrees.
         robots: usize,
-        /// Seconds of history each dynamic ring retains, separate from
-        /// [`fixture::HISTORY_SECS`] because fleet sample counts meet the arena ceiling.
+        /// Seconds of history each dynamic ring retains.
         history_secs: f64,
     },
 }
@@ -107,8 +62,7 @@ pub enum QuerySpec {
         /// Source frame.
         source: &'static str,
     },
-    /// The deepest resolvable pair: a leaf under the last spine link, back to
-    /// the root.
+    /// The deepest resolvable pair: a leaf under the last spine link, back to the root.
     Deepest,
     /// Seeded random pairs, for the recorded stream where no one pair is representative.
     Drawn {
@@ -134,8 +88,7 @@ pub struct Workload {
     pub note: &'static str,
 }
 
-/// What a workload actually costs, in the units a reader needs to interpret a
-/// latency row.
+/// What a workload actually costs, in the units a reader needs to interpret a latency row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shape {
     /// Frames in the tree.
@@ -150,15 +103,11 @@ pub struct Shape {
     pub slots: usize,
     /// The arena's size in bytes.
     pub arena_bytes: usize,
-    /// Post-folding `Step::Dyn` count of the deepest plan (`docs/PHASE1.md` §11.3);
-    /// `None` until the tree is built.
+    /// Post-folding `Step::Dyn` count of the deepest plan (`docs/PHASE1.md` §11.3); `None` until built.
     pub dyn_steps: Option<usize>,
 }
 
 /// The edges a live publisher writes to while a harness measures.
-///
-/// A reader benchmark on a quiescent tree exercises neither the seqlock retry
-/// path nor `tf2::BufferCore`'s writer/reader exclusion (see `crate::mp`).
 #[derive(Clone, Debug)]
 pub struct PubEdge {
     /// Parent frame name.
@@ -174,9 +123,6 @@ pub struct PubEdge {
 }
 
 /// One declared edge of a workload, as a consumer outside this crate sees it.
-///
-/// For the DDS comparison, whose publisher and bridge config are generated from
-/// a workload so both describe the same tree by construction.
 #[derive(Clone, Debug)]
 pub enum EdgeDecl {
     /// A static edge and its constant pose.
@@ -220,9 +166,7 @@ impl Built {
     ///
     /// # Errors
     ///
-    /// If a frame name is unknown or the path does not compile (disconnected,
-    /// longer than `MAX_PATH_EDGES` raw edges, or more than `MAX_DEPTH` steps
-    /// once folded).
+    /// If a frame name is unknown or the path does not compile.
     pub fn plans(&self) -> Result<Vec<Plan>> {
         let mut out = Vec::with_capacity(self.pairs.len());
         for (target, source) in &self.pairs {
@@ -243,8 +187,7 @@ impl Built {
         Ok(out)
     }
 
-    /// A stamp `frac` of the way through [`Self::window`], for `frac` in
-    /// `[0, 1]`.
+    /// A stamp `frac` of the way through [`Self::window`], for `frac` in `[0, 1]`.
     #[must_use]
     pub fn stamp_at(&self, frac: f64) -> i64 {
         let (lo, hi) = self.window;
@@ -253,8 +196,6 @@ impl Built {
 }
 
 /// The number of `Step::Dyn` entries in a compiled plan.
-///
-/// Free-standing: the scale sweep uses it on plans it compiled itself.
 #[must_use]
 pub fn dyn_steps(plan: &Plan) -> usize {
     plan.steps()
@@ -267,13 +208,10 @@ pub fn dyn_steps(plan: &Plan) -> usize {
 pub const DEFAULT_HISTORY_SECS: f64 = fixture::HISTORY_SECS;
 
 /// The named catalogue, ordered realistic → extreme.
-///
-/// `tests/workload.rs` builds every entry and asserts its query pairs resolve.
 pub const CATALOGUE: &[Workload] = &[
     Workload {
         name: "robot",
         topology: Topology::Fixture,
-        // `imu_link <- map`: three dynamic steps, the chain `docs/PHASE1.md` §11.3 pins the gate to.
         queries: QuerySpec::Fixed {
             target: "imu_link",
             source: "map",
@@ -335,7 +273,6 @@ pub const CATALOGUE: &[Workload] = &[
         name: "extreme_wide",
         topology: Topology::Fleet {
             robots: 512,
-            // 1 s, not 10: 10 s is 6.4M samples and 460 MB, and ring depth is `scale_sweep`'s axis.
             history_secs: 1.0,
         },
         queries: QuerySpec::CrossFleet,
@@ -364,12 +301,9 @@ pub fn names() -> Vec<&'static str> {
 impl Workload {
     /// What this workload would cost, without building it.
     ///
-    /// Arithmetic, except `Recorded`, which parses the file.
-    ///
     /// # Errors
     ///
-    /// If a recording cannot be read, or if the implied arena exceeds the `u32`
-    /// offset model (`LayoutError::ArenaTooLarge`).
+    /// If a recording cannot be read, or the arena exceeds the `u32` offset model.
     pub fn estimate(&self) -> Result<Shape> {
         let plan = self.plan()?;
         shape_of(&plan)
@@ -379,8 +313,7 @@ impl Workload {
     ///
     /// # Errors
     ///
-    /// If the topology cannot be built, a push is rejected, or a query pair
-    /// does not resolve.
+    /// If the topology cannot be built, a push is rejected, or a pair does not resolve.
     pub fn build(&self, interp: InterpPolicy, backing: Backing) -> Result<Built> {
         let plan = self.plan()?;
         let mut shape = shape_of(&plan)?;
@@ -397,7 +330,6 @@ impl Workload {
             publishers: plan.publishers,
         };
 
-        // The row is labelled with the deepest query: a max, not an average.
         let compiled = built.plans()?;
         shape.dyn_steps = compiled.iter().map(dyn_steps).max();
 
@@ -430,8 +362,7 @@ impl Workload {
         Ok(out)
     }
 
-    /// The `(target, source)` pairs this workload is queried on, without
-    /// building it.
+    /// The `(target, source)` pairs this workload is queried on.
     ///
     /// # Errors
     ///
@@ -440,8 +371,6 @@ impl Workload {
         Ok(self.plan()?.pairs)
     }
 
-    /// The topology, expanded into the intermediate form both `estimate` and
-    /// `build` work from.
     fn plan(&self) -> Result<BuildPlan> {
         match self.topology {
             Topology::Fixture => fixture_plan(self.queries),
@@ -464,14 +393,12 @@ impl Workload {
     }
 }
 
-/// A static edge, ready to declare.
 struct StaticEdge {
     parent: String,
     child: String,
     pose: Iso3,
 }
 
-/// A dynamic edge, its ring size, and the samples to publish into it.
 struct DynEdge {
     parent: String,
     child: String,
@@ -479,14 +406,10 @@ struct DynEdge {
     /// Seconds of history the ring is sized for; carried because `Capacity` rounds to a power of two.
     history_secs: f64,
     capacity: Capacity,
-    /// `(stamp_ns, pose)` in stamp order.
     samples: Vec<(i64, Iso3)>,
-    /// [`fixture::dynamic_pose`] seed, carried into [`PubEdge`] so a live
-    /// publisher continues the same trajectory.
     seed: f64,
 }
 
-/// Everything needed to build and populate a tree, plus what to ask it.
 struct BuildPlan {
     statics: Vec<StaticEdge>,
     dynamics: Vec<DynEdge>,
@@ -505,7 +428,6 @@ fn shape_of(plan: &BuildPlan) -> Result<Shape> {
         .map(|d| d.capacity.get() as usize)
         .sum();
 
-    // `ArenaLayout` decides whether this fits; asking here turns a 4 GiB overrun into a message.
     let max_frames = u32::try_from(frames + 1).map_err(|_| anyhow!("too many frames: {frames}"))?;
     let max_edges = u32::try_from(edges + 1).map_err(|_| anyhow!("too many edges: {edges}"))?;
     let total_slots = u32::try_from(slots).map_err(|_| anyhow!("too many ring slots: {slots}"))?;
@@ -566,7 +488,6 @@ fn build_tree(plan: &BuildPlan, interp: InterpPolicy, backing: Backing) -> Resul
             .and_then(|o| {
                 o.mode(tf_tree::AttachMode::ReadWrite)
                     .create(tf_tree::CreatePolicy::IfAbsent)
-                    // The refusal; see `Backing::Served`.
                     .require_create(true)
                     .layout_if_creating(b)
                     .open()
@@ -599,7 +520,6 @@ fn populate(tree: &Tree, plan: &BuildPlan) -> Result<()> {
                 .map_err(|err| anyhow!("push {}->{} @{stamp}: {err:?}", e.parent, e.child))?;
         }
     }
-    // Dropping the writers releases every claim; a live publisher re-claims its edges.
     drop(writers);
     Ok(())
 }
@@ -616,7 +536,6 @@ fn fixture_plan(queries: QuerySpec) -> Result<BuildPlan> {
                 pose: tf_tree::exp_se3(xi),
             }),
             fixture::EdgeDefKind::Dynamic { rate_hz } => {
-                // Must match `fixture::spin_up`'s seed (index in `DYNAMIC_EDGES`).
                 let seed = fixture::DYNAMIC_EDGES
                     .iter()
                     .position(|(p, c, _)| *p == e.parent && *c == e.child)
@@ -648,14 +567,9 @@ fn recorded_plan(rel_path: &str, queries: QuerySpec) -> Result<BuildPlan> {
         .join("../..")
         .join(rel_path);
     let stream = TfStream::load(&path).with_context(|| format!("loading {}", path.display()))?;
-    // The measured rate only paces a live publisher and fills `nominal_rate_hz`.
     stream_plan(&stream, queries, None)
 }
 
-/// Turn a [`TfStream`] into a [`BuildPlan`].
-///
-/// `rate_hz` is `None` for a recording (rate *measured*, [`median_rate_hz`]) and
-/// `Some` for a synthetic stream.
 fn stream_plan(stream: &TfStream, queries: QuerySpec, rate_hz: Option<f64>) -> Result<BuildPlan> {
     let mut per_edge: Vec<Vec<(i64, Iso3)>> = vec![Vec::new(); stream.dynamic_edges.len()];
     for Sample {
@@ -681,7 +595,6 @@ fn stream_plan(stream: &TfStream, queries: QuerySpec, rate_hz: Option<f64>) -> R
     for (i, (p, c)) in stream.dynamic_edges.iter().enumerate() {
         let samples = std::mem::take(&mut per_edge[i]);
         let rate = rate_hz.unwrap_or_else(|| median_rate_hz(&samples));
-        // Plus the one slot a ring cannot hand back (`SampleRing::retained`), or the oldest sample is lost.
         let want = u32::try_from(samples.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
@@ -705,7 +618,6 @@ fn stream_plan(stream: &TfStream, queries: QuerySpec, rate_hz: Option<f64>) -> R
     finish(statics, dynamics, pairs)
 }
 
-/// `robots` copies of the fixture under one `world` root.
 fn fleet_plan(robots: usize, history_secs: f64, queries: QuerySpec) -> Result<BuildPlan> {
     if robots == 0 {
         bail!("a fleet needs at least one robot");
@@ -715,7 +627,6 @@ fn fleet_plan(robots: usize, history_secs: f64, queries: QuerySpec) -> Result<Bu
 
     for i in 0..robots {
         let pfx = format!("r{i}/");
-        // Static: dynamic would add a step to every cross-fleet query for no modelling gain.
         statics.push(StaticEdge {
             parent: FLEET_ROOT.to_owned(),
             child: format!("{pfx}map"),
@@ -732,7 +643,6 @@ fn fleet_plan(robots: usize, history_secs: f64, queries: QuerySpec) -> Result<Bu
                     pose: tf_tree::exp_se3(xi),
                 }),
                 fixture::EdgeDefKind::Dynamic { rate_hz } => {
-                    // Per-robot seed, so robots do not share identical trajectories.
                     let seed = (i * fixture::DYNAMIC_EDGES.len()) as f64 + dynamics.len() as f64;
                     dynamics.push(dyn_edge(parent, child, rate_hz, history_secs, seed));
                 }
@@ -747,8 +657,6 @@ fn fleet_plan(robots: usize, history_secs: f64, queries: QuerySpec) -> Result<Bu
 /// The fleet's root frame name.
 pub const FLEET_ROOT: &str = "world";
 
-/// A dynamic edge holding `history_secs` of [`fixture::dynamic_pose`] at
-/// `rate_hz`.
 fn dyn_edge(parent: String, child: String, rate_hz: f64, history_secs: f64, seed: f64) -> DynEdge {
     let capacity = Capacity::history(rate_hz, history_secs);
     let period_ns = (1e9 / rate_hz) as i64;
@@ -790,8 +698,6 @@ fn finish(
 }
 
 /// The widest `[lo, hi]` every dynamic edge has data for.
-///
-/// The intersection, so no query is partly declined (an error path).
 fn common_window(dynamics: &[DynEdge]) -> Option<(i64, i64)> {
     let mut lo = i64::MIN;
     let mut hi = i64::MAX;
@@ -818,8 +724,6 @@ fn publishers_of(dynamics: &[DynEdge]) -> Vec<PubEdge> {
 }
 
 /// The median inter-sample interval, as a rate.
-///
-/// Median, since real recordings contain gaps (`docs/PHASE5.md` §3.2).
 fn median_rate_hz(samples: &[(i64, Iso3)]) -> f64 {
     if samples.len() < 2 {
         return 0.0;
@@ -845,7 +749,6 @@ fn resolve_pairs(
             Ok(vec![(leaf, root)])
         }
         QuerySpec::CrossFleet => {
-            // Within one robot would just measure the `robot` row.
             let robots = fleet_robot_count(statics);
             if robots < 2 {
                 bail!("CrossFleet needs at least two robots; found {robots}");
@@ -891,9 +794,6 @@ fn fleet_robot_count(statics: &[StaticEdge]) -> usize {
     statics.iter().filter(|e| e.parent == FLEET_ROOT).count()
 }
 
-/// The `(root, leaf)` of the longest parent chain in the topology.
-///
-/// Walked over the parent map, not assumed from naming.
 fn deepest_chain(statics: &[StaticEdge], dynamics: &[DynEdge]) -> Result<(String, String)> {
     let mut parent: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
     for e in statics {
@@ -906,7 +806,6 @@ fn deepest_chain(statics: &[StaticEdge], dynamics: &[DynEdge]) -> Result<(String
     for &child in parent.keys() {
         let mut depth = 0usize;
         let mut cur = child;
-        // Acyclic by construction; the bound guards a malformed hand-built plan.
         while let Some(&p) = parent.get(cur) {
             depth += 1;
             cur = p;
@@ -919,8 +818,6 @@ fn deepest_chain(statics: &[StaticEdge], dynamics: &[DynEdge]) -> Result<(String
         }
     }
     let (depth, root, leaf) = best.ok_or_else(|| anyhow!("topology has no edges"))?;
-    // Raw bound only (`0034`): `depth` counts edges, and `MAX_DEPTH` bounds the
-    // plan after static folding, which surfaces in `Built::plans`.
     if depth > tf_tree::MAX_PATH_EDGES {
         bail!(
             "deepest chain is {depth} edges ({leaf} <- {root}) and MAX_PATH_EDGES is {}; \
@@ -931,7 +828,6 @@ fn deepest_chain(statics: &[StaticEdge], dynamics: &[DynEdge]) -> Result<(String
     Ok((root.to_owned(), leaf.to_owned()))
 }
 
-/// SplitMix64, as in `crate::replay`: no `rand` dependency, reproducible draws.
 struct SplitMix(u64);
 
 impl SplitMix {
@@ -949,8 +845,6 @@ impl SplitMix {
 
 impl Shape {
     /// A one-line description for a harness header.
-    ///
-    /// Printed next to every harness's numbers (`docs/PHASE1.md` §11.3).
     #[must_use]
     pub fn describe(&self) -> String {
         let steps = self

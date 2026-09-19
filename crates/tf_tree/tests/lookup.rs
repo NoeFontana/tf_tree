@@ -23,14 +23,12 @@ fn runner(cases: u32, seed: u8) -> TestRunner {
     )
 }
 
-/// Hand-computed three-frame lookup (`map -> odom -> base`) equals the manual
-/// chain, verifying the compile direction is not inverted.
+/// A three-frame lookup equals the manual chain: the compile direction is right.
 #[test]
 fn three_frame_lookup_matches_manual_chain() {
     let c = Chain::new(4, 1000);
     let stamp = 0; // exact sample -> no interpolation
 
-    // Manual: T_map_base = T_map_odom · T_odom_base.
     let t_map_base = c.map_odom[0] * c.odom_base[0];
 
     let got = c.tree.lookup("base", "map", ns(stamp)).unwrap();
@@ -59,7 +57,6 @@ fn urdf_like_chain_folds_six_to_three() {
     let f: Vec<_> = (0..=6)
         .map(|i| tree.frame(&format!("f{i}")).unwrap())
         .collect();
-    // Publish so the dynamic edges have data (not needed for compilation).
     {
         let w5 = tree.claim(f[5], f[4]).unwrap();
         w5.push(0, &Iso3::IDENTITY).unwrap();
@@ -67,8 +64,7 @@ fn urdf_like_chain_folds_six_to_three() {
         w6.push(0, &Iso3::IDENTITY).unwrap();
     }
 
-    // lookup(f6, f0): steps emitted as [D(f6),D(f5),S(f4),S(f3),S(f2),S(f1)],
-    // folding the four trailing statics into one -> [D, D, S] = 3 steps.
+    // Steps [D,D,S,S,S,S]: the four trailing statics fold into one.
     let plan = tree.plan(f[6], f[0]).unwrap();
     assert_eq!(
         plan.len(),
@@ -132,10 +128,8 @@ fn lookup_composes_through_any_frame() {
                 let ab = r.tree.lookup(fa, fb, s).unwrap();
                 let bc = r.tree.lookup(fb, fc, s).unwrap();
                 let composed = ab * bc;
-                // Composing two independently-sampled interpolated chains through an
-                // arbitrary intermediate frame accumulates a few ulps × scale (the
-                // shared sub-path is sampled twice and cancels only to float
-                // precision). 5e-12 stays far tighter than any real topology bug.
+                // The shared sub-path is sampled twice and cancels only to float
+                // precision.
                 const COMPOSE_TOL: f64 = 5e-12;
                 prop_assert!(
                     max_err(ac, composed) <= COMPOSE_TOL,
@@ -148,9 +142,8 @@ fn lookup_composes_through_any_frame() {
         .unwrap();
 }
 
-/// #11 + #12: plan evaluation (which always folds static edges) equals the naive
-/// unfolded chain composition. Because the fixture mixes static and dynamic
-/// edges, agreement proves folding does not change the result.
+/// #11 + #12: plan evaluation (which folds static edges) equals the unfolded
+/// chain composition.
 #[test]
 fn plan_eval_matches_unfolded_chain() {
     let r = Robot::new(16, 1000);
@@ -159,8 +152,7 @@ fn plan_eval_matches_unfolded_chain() {
     runner(10_000, 0x43)
         .run(&(0..ids.len(), 0..ids.len(), 0..r.n), |(a, b, i)| {
             let (target, source) = (ids[a], ids[b]);
-            // Exact sample stamp so temporal sampling returns the pushed pose and
-            // the ground truth uses the same known poses.
+            // Exact sample stamp: the ground truth uses the pushed poses.
             let t = i as i64 * r.dt;
             let plan = r.tree.plan(target, source).unwrap();
             let g = r.tree.guard();
@@ -176,28 +168,14 @@ fn plan_eval_matches_unfolded_chain() {
         .unwrap();
 }
 
-/// **The two `TreeTooDeep` sentences, and the reason this test exists at all.**
+/// The two `TreeTooDeep` sentences (`0034`) name the bound that refused.
 ///
-/// The facade rendered `"path depth {depth} exceeds the maximum of {MAX_DEPTH}"`
-/// for the whole of Phases 1–5, and on every path that reached it that read
-/// **"path depth 16 exceeds the maximum of 16"** — a self-contradiction, because
-/// `depth` was the guard's own count at the moment it fired. Nothing asserted
-/// the text, which is how it shipped. `0034` made the field mean one thing per
-/// bound and this pins both renderings.
+/// The compiled-bound sentence names `TreeBuilder::static_edge` (`docs/API.md`
+/// R5: the remedy lives in the binding's prose layer; the Python side is pinned
+/// in `tests/python/test_errors.py`).
 ///
-/// The compiled-bound sentence names `TreeBuilder::static_edge`, and that is
-/// checked rather than assumed: `docs/API.md` R5 puts a binding-specific remedy
-/// in the binding's own prose layer, and Rust is the one binding that can reach
-/// a static edge. `tests/python/test_errors.py` is where the absence of that
-/// name on the Python side is pinned.
-///
-/// Mutant: collapse the arm back to HEAD's single
-/// `write!(f, "path depth {depth} exceeds the maximum of {MAX}", MAX = MAX_DEPTH)`.
-/// **Applied and run**: `7 tests run: 6 passed, 1 failed` — this test, on
-/// `path depth 40 exceeds the maximum of 32`. Note what that says: the sentence
-/// is no longer self-*contradictory*, because `0034` fixed the field as well —
-/// it is merely wrong about which number the caller needs, and silent about the
-/// remedy. The old sentence's worst property was the cheapest half to fix.
+/// Mutant: collapse the arm to a single `path depth {depth} exceeds the maximum`
+/// write ⇒ fails.
 #[test]
 fn the_two_too_deep_messages_name_the_bound_that_refused() {
     fn chain_of(links: usize) -> tf_tree::Tree {
@@ -209,8 +187,7 @@ fn the_two_too_deep_messages_name_the_bound_that_refused() {
         b.build().unwrap()
     }
 
-    // Past the compiled bound, short of the walk's: the exact folded count, and
-    // the remedy a Rust caller can act on.
+    // Past the compiled bound, short of the walk's.
     let tree = chain_of(tf_tree::MAX_DEPTH + 8);
     let err = tree
         .plan(
@@ -230,7 +207,7 @@ fn the_two_too_deep_messages_name_the_bound_that_refused() {
         "the Rust prose layer names the remedy a Rust caller can reach: {msg}"
     );
 
-    // Past the walk's bound: no step count is available, so none is quoted.
+    // Past the walk's bound: no step count is quoted.
     let tree = chain_of(tf_tree::MAX_PATH_EDGES + 8);
     let err = tree
         .plan(
@@ -253,13 +230,8 @@ fn the_two_too_deep_messages_name_the_bound_that_refused() {
         "nothing folded, so no step count may be quoted: {msg}"
     );
 
-    // **The seam, which is the row a `>=` would take and a `>` would not.**
-    // Exactly `MAX_PATH_EDGES` dynamic links: the walk *accepts* them, `fold`
-    // then reports `depth == MAX_PATH_EDGES`, and that value is the largest a
-    // compiled-bound refusal can carry. Without this row the comparison in
-    // `describe` is unpinned — `>=` leaves both this suite and the Python one
-    // green while telling a caller their path was too long to walk when it was
-    // walked in full.
+    // The seam: exactly `MAX_PATH_EDGES` links are walked and refused by the
+    // compiled bound; pins the `>` (not `>=`) comparison in `describe`.
     let tree = chain_of(tf_tree::MAX_PATH_EDGES);
     let err = tree
         .plan(
@@ -287,20 +259,11 @@ fn the_two_too_deep_messages_name_the_bound_that_refused() {
     );
 }
 
-/// **`Described` stops rendering as `Debug` for the variants it cannot name.**
+/// `Described` delegates to `core`'s `Display` rather than `Debug`-printing the
+/// variants that carry no frame or edge (`docs/decisions/0040` decision 3).
 ///
-/// `docs/decisions/0040` decision 3. `Described`'s fallback arm was
-/// `write!(f, "{other:?}")`, so the five `LookupError` variants that carry no
-/// frame and no edge — `BufferTooSmall`, `WrongElementType`, `ChildDetached`,
-/// `DerivativesUnavailable`, `NoSegment` — reached an operator as a struct
-/// literal. There is nothing for this wrapper to *add* to them, because it adds
-/// names and they have none; so the arm now delegates to `core`'s `Display` and
-/// the message is written once.
-///
-/// **Mutant:** restore `write!(f, "{other:?}")`. Applied: fails on the
-/// `assert!(!msg.contains("BufferTooSmall"))` below with
-/// `BufferTooSmall { need: 32, got: 4 }` — the Rust type name and field syntax
-/// in an operator-facing message, which is what the delegation removes.
+/// Mutant: restore `write!(f, "{other:?}")` ⇒ `BufferTooSmall { need: 32, got: 4 }`
+/// reaches the message.
 #[test]
 fn describe_delegates_rather_than_debug_printing_what_it_cannot_name() {
     let tree = TreeBuilder::new()
@@ -308,8 +271,6 @@ fn describe_delegates_rather_than_debug_printing_what_it_cannot_name() {
         .build()
         .unwrap();
 
-    // Reached through a real call, not constructed: the point is what a caller
-    // meets, and `at_many_into` is where a too-small buffer actually comes from.
     let g = tree.guard();
     let plan = tree
         .plan(tree.frame("map").unwrap(), tree.frame("base").unwrap())
@@ -328,6 +289,6 @@ fn describe_delegates_rather_than_debug_printing_what_it_cannot_name() {
         msg.contains("32") && msg.contains('4'),
         "the delegated message must keep the numbers the variant carries: {msg}"
     );
-    // And it is the same sentence `core` writes, because it is written once.
+    // Same sentence `core` writes.
     assert_eq!(msg, format!("{err}"));
 }

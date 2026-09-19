@@ -1,7 +1,6 @@
 //! C ABI overhead against native Rust — `docs/PHASE4.md` §7, gate criterion 1.
 //!
-//! Profile and pinned comparands: `docs/decisions/0023`. A ladder of five arms,
-//! interleaved within every round so drift is common-mode:
+//! Profile and comparands: `docs/decisions/0023`. Five arms, interleaved per round:
 //!
 //! | rung | what it adds |
 //! |---|---|
@@ -11,12 +10,9 @@
 //! | the ABI, no panic guard | the boundary, minus `catch_unwind` |
 //! | `tft_plan_at` | the shipped call |
 //!
-//! Three quotients are gated (R1 ABI, R2 panic guard, R3 signature); the
-//! allowances are `0023`'s, **draft**. Also reported, not gated: `catch_unwind`
-//! in isolation (§3.4), the batch paths incl. `Layout::QuatTwist`, and the
-//! publish-path ablation.
-//!
-//! Run through `just abi-cost`, which pins a core.
+//! Three quotients are gated (R1 ABI, R2 panic guard, R3 signature; allowances
+//! per `0023`, draft). The batch paths, `catch_unwind` in isolation and the
+//! publish path are reported only. Run through `just abi-cost`.
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::expect_used)]
 // 0007 rule 1, kind 5 (our own C ABI, called from Rust); 0048: an example is a
 // separate crate root, so the posture is declared here.
@@ -32,37 +28,23 @@ use tf_tree_c::*;
 const N: usize = 4096;
 const ROUNDS: usize = 41;
 
-// --- §7 gate criterion 1, rung by rung ----------------------------------
-//
-// These allowances are a proposal: `docs/decisions/0023` (draft) would replace
-// §7's single 1.05 with the three rungs below.
+// --- §7 gate criterion 1, rung by rung (allowances: `docs/decisions/0023`) ---
 
 /// **R1 — what the C ABI itself costs** over a native caller shaped as the C
-/// signature forces (a guard per lookup behind a non-inlinable call): magic-word
-/// and null checks, layout dispatch, output slice, `catch_unwind`.
-///
-/// Measured 1.025–1.038 at `[profile.embedder]`. 1.10 is loose on purpose so the
-/// row does not go red for noise, yet still catches a doubling of any one check.
+/// signature forces (a guard per lookup behind a non-inlinable call).
 const ABI_OVER_GUARDED: f64 = 1.10;
 
 /// **R2 — `catch_unwind` on the happy path**, by subtraction on a real call
-/// (`tft_test_plan_at_unguarded`). §3.4 asserts ~zero; measured 0.999–1.006.
+/// (`tft_test_plan_at_unguarded`); §3.4 asserts ~zero.
 const PANIC_GUARD: f64 = 1.05;
 
 /// **R3 — what a guard per lookup costs**, against one hoisted out of the loop:
-/// the *signature's* cost, `docs/decisions/0022`'s subject. Measured 1.059–1.075
-/// (~16 ns of ~245 ns) on this three-edge heap tree.
-///
-/// This tree has 256-slot rings, so it prices `Guard`'s constructor and little of
-/// the cold bracket search a §11.1 fixture pays (`docs/design/fast-path.md` §12;
-/// `just abi-split`'s *0023 q3* block); the rest of that gap is unattributed.
-/// R3 is reported, not gated, on the §11.1 fixture; this constant gates only the
-/// three-edge row and exists to catch a regression, not to be lowered.
+/// the signature's cost (`docs/decisions/0022`). Gates only this three-edge row,
+/// to catch a regression; reported, not gated, on the §11.1 fixture.
 const PER_CALL_GUARD: f64 = 1.25;
 
 /// **C — the control**: rung 1 and its twin must agree, or per-call-site
-/// specialisation is back. Symmetric band |ratio - 1| < 0.02: measured
-/// 0.992–1.002, while an unpinned comparand once moved 43%.
+/// specialisation is back. Symmetric band |ratio - 1| < 0.02.
 const CONTROL: f64 = 1.02;
 
 fn verdict(ok: bool) -> &'static str {
@@ -94,9 +76,7 @@ fn bench(mut run: impl FnMut() -> f64) -> f64 {
 }
 
 /// Measure every arm once per round, in the same order, and return per-round
-/// ns/lookup per arm, so drift is common-mode (`report.rs`'s
-/// `Sensitivity::Ratio`, repeated because an example cannot depend on that
-/// crate). Arms are `&mut dyn FnMut`: one indirect call per round.
+/// ns/lookup per arm, so drift is common-mode.
 fn ladder(arms: &mut [(&'static str, &mut dyn FnMut() -> f64)]) -> Vec<Vec<f64>> {
     for _ in 0..8 {
         for (_, run) in arms.iter_mut() {
@@ -114,19 +94,16 @@ fn ladder(arms: &mut [(&'static str, &mut dyn FnMut() -> f64)]) -> Vec<Vec<f64>>
     out
 }
 
-/// The median of the **per-round** quotients, not the quotient of the medians,
-/// which would compare a slow round of one arm against a fast round of the other.
+/// The median of the per-round quotients, not the quotient of the medians.
 fn ratio(num: &[f64], den: &[f64]) -> f64 {
     median(num.iter().zip(den).map(|(a, b)| a / b).collect())
 }
 
 // --- the pinned native comparands ---------------------------------------
 //
-// Each is `#[inline(never)]` with `black_box` on the stamp and the result, so
-// every call site shares one machine-code body and cannot be re-specialised
-// (`docs/PHASE4.md` §7). An opaque call is also the honest native shape at
-// `lto = false` (`PHASE5.md` §9.2). Bodies are duplicated, not factored: a
-// nested `#[inline(never)]` helper would charge the outer arm an extra call.
+// `#[inline(never)]` with `black_box` on stamp and result, so every call site
+// shares one body (`docs/PHASE4.md` §7). Bodies are duplicated, not factored:
+// a nested helper would charge the outer arm an extra call.
 
 /// Rung 0: a lookup through a guard the caller already holds.
 #[inline(never)]
@@ -187,9 +164,7 @@ fn native_per_call_guard_twin(
     black_box(buf[15])
 }
 
-/// The cargo profile directory this executable runs out of (`release`,
-/// `embedder`), found by searching for `examples` from the right; `None` for a
-/// copied binary.
+/// The cargo profile directory this executable runs out of; `None` for a copied binary.
 fn profile_dir_of_this_binary() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let parts: Vec<String> = exe
@@ -201,7 +176,6 @@ fn profile_dir_of_this_binary() -> Option<String> {
 }
 
 fn main() {
-    // The C-side handles.
     let mut tree: *mut tft_tree = ptr::null_mut();
     // SAFETY: `tree` is a live local.
     assert_eq!(unsafe { tft_test_tree_create(&mut tree) }, TFT_OK);
@@ -253,8 +227,7 @@ fn main() {
         .collect();
 
     // The profile decides whether this run gates, so argv[1] is checked against
-    // where cargo put this binary (a swapped `just abi-cost` line would otherwise
-    // gate the `lto = "thin"` run, where the boundary is erased).
+    // where cargo put this binary.
     let claimed = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "unstated".to_owned());
@@ -267,7 +240,7 @@ fn main() {
              ratios mean, so a wrong label here is worse than no measurement."
         );
     }
-    // A copied binary cannot vouch for its profile; an unvouched `embedder` must not gate.
+    // An unvouched `embedder` must not gate.
     let boundary_real = claimed == "embedder" && measured.is_some();
     let profile = claimed;
 
@@ -286,11 +259,7 @@ fn main() {
     );
     println!();
 
-    // --- the ladder ---------------------------------------------------------
-    //
-    // Every arm writes the same 128 bytes from the same plan at the same stamps.
-    // One buffer per arm: sharing `nbuf` between native arms forced it to memory
-    // for every arm and moved the baseline 133 -> 190 ns.
+    // --- the ladder: every arm writes the same 128 bytes; one buffer per arm ---
     let mut nbuf = [0.0f64; 16];
     let mut lbuf = [0.0f64; 16];
     let mut tbuf = [0.0f64; 16];
@@ -446,9 +415,7 @@ fn main() {
         );
     }
 
-    // The exit status gates only at the profile where the boundary exists
-    // (`release` is a contrast), and includes the control: a broken pin makes
-    // the ladder meaningless.
+    // Gates only where the boundary exists (`embedder`), and includes the control.
     let gate_failed = boundary_real
         && !(r_abi < ABI_OVER_GUARDED
             && r_panic < PANIC_GUARD
@@ -478,11 +445,8 @@ fn main() {
         batch_ns / native_ns
     );
 
-    // --- the twist layout's batch, where the monotone cursor is the point ---
-    //
-    // Ascending stamps, deliberately: `Layout::QuatTwist`'s batch fold has an
-    // O(1)-amortised monotone-cursor branch (`docs/API.md` §3.3). The strided row
-    // is the chunked path for a caller writing into its own structs.
+    // --- the twist layout's batch: ascending stamps hit `QuatTwist`'s monotone
+    // cursor (`docs/API.md` §3.3) ---
     let sorted: Vec<i64> = (0..N)
         .map(|i| 10_000_000 + (i as i64 * 600_000_000) / N as i64)
         .collect();
@@ -576,10 +540,7 @@ fn main() {
         guarded - unguarded
     );
 
-    // --- the publish path, and what the thread-affinity check costs ---
-    //
-    // §3.2's affinity check is a thread-local load and compare per publish. The
-    // native side pushes through `EdgeWriter::push`, as the ABI does.
+    // --- the publish path and §3.2's thread-affinity check ---
     let mut ptree: *mut tft_tree = ptr::null_mut();
     assert_eq!(
         // SAFETY: `ptree` is a live local.
@@ -595,11 +556,11 @@ fn main() {
         TFT_OK
     );
 
-    // Identity quaternion `[qw qx qy qz tx ty tz]`; QVEC7 is the cheapest layout read.
+    // Identity `[qw qx qy qz tx ty tz]`.
     let mut payload = [0u8; 56];
     payload[..8].copy_from_slice(&1.0f64.to_ne_bytes());
 
-    // Each push needs a non-decreasing stamp; the counter carries across rounds.
+    // Non-decreasing stamps; the counter carries across rounds.
     let mut stamp = 1i64;
     let abi_push_ns = bench(|| {
         for _ in 0..N {
@@ -643,9 +604,8 @@ fn main() {
         nstamp as f64
     });
 
-    // The same push decoding the pose from the same 56 bytes the C side reads:
-    // the row above hoists a constant `Iso3`, so alone it would charge the decode
-    // to "the boundary". Continues the monotone run (a backwards push is refused).
+    // The same push decoding the pose from the same 56 bytes the C side reads;
+    // continues the monotone run.
     let mut nstamp2 = nstamp + 1;
     let native_decode_ns = bench(|| {
         for _ in 0..N {
@@ -677,8 +637,7 @@ fn main() {
         ostamp as f64
     });
 
-    // The ABI's own body minus `guard`: the panic guard's cost on a real,
-    // non-inlinable call (`tft_guarded_noop` above is inlined).
+    // The ABI's own body minus `guard`, on a real non-inlinable call.
     let mut astamp = ostamp + 1;
     let unguarded_push_ns = bench(|| {
         for _ in 0..N {
@@ -754,7 +713,7 @@ fn main() {
         tft_tree_free(tree);
     }
 
-    // Freed before the gate exit so a failure does not look like a leak.
+    // Freed before the gate exit.
     if gate_failed {
         println!("\n§7 gate criterion 1: FAIL — see the rung marked FAIL above");
         std::process::exit(1);
