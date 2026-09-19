@@ -20,102 +20,12 @@
 //! discovering it at the first message means discovering it after the arena
 //! already contains a mixture.
 //!
-//! # Three rules were tried on `/tf` stamps alone, and all three were wrong
+//! # Inferring a reset from `/tf` stamps
 //!
-//! `docs/decisions/0011` narrowed one global [`ClockGuard`] to one per edge and
-//! promoted a regression to "the clock moved" by a quorum. Each successive
-//! refinement was caught with a reproduction:
-//!
-//! 1. **One global guard.** A publisher's `transform_tolerance` — AMCL and
-//!    `robot_localization` date `map -> odom` 0.1 to 1.0 s into the *future* —
-//!    is a steady offset of one edge relative to another, larger than any
-//!    threshold, and against one shared high-water mark it is indistinguishable
-//!    from a rewind. A correctly configured robot latched the bridge.
-//! 2. **Per-edge guards plus a quorum over distinct *edges*.** One node owning
-//!    two dynamic edges regresses both when it restarts, so a single process
-//!    hiccuping formed a quorum of edges — the false halt the quorum existed to
-//!    remove, reintroduced by the mechanism meant to remove it.
-//! 3. **A quorum floored by `Authority::distinct_owners()`.** Two defects. At
-//!    boot the second publisher has not published yet (AMCL waits for a map), so
-//!    the floor is 1 and the wheel driver's first regression latches a permanent
-//!    halt. And the then-`Publisher::UnknownGid` — since replaced by
-//!    [`crate::Publisher::Gid`], which compares on the GID rather than on the
-//!    name — and [`crate::Publisher::Unattributed`] were *unit* variants, so on
-//!    an RMW without endpoint introspection every publisher compared equal, the
-//!    floor was permanently 1, and every single-edge regression halted — which makes
-//!    attribution a **correctness dependency**, the one thing §5.3 forbids in as
-//!    many words.
-//!
-//! The common root is not any of the three rules. It is that all three infer a
-//! property of the **time source** from observations of the very signal under
-//! suspicion, anchored on proxies — an edge, an owner, a transform ordinal —
-//! that are not physical time.
-//!
-//! # The five principles this module is built on
-//!
-//! - **P1. Prefer the authoritative signal to inference.** ROS 2 *publishes*
-//!   clock jumps: `rcl_clock_add_jump_callback`, surfaced by rclcpp as
-//!   `Clock::create_jump_callback`. A `/clock` regression **is** the event,
-//!   observed once at its source. [`crate::Ingest::note_time_jump`] is the path for it,
-//!   and it needs no threshold, no window and no corroboration.
-//! - **P2. A detector's reference clock must be independent of the clock under
-//!   test.** `RCL_STEADY_TIME` is monotonic and is not affected by
-//!   `use_sim_time`; it is the reference. A publisher's stamp never is.
-//! - **P3. Windows are physical time, never event counts.** `0011` measured its
-//!   correlation window in transforms offered because "this crate does not have
-//!   a clock". It does now — [`SteadyNanos`], supplied by the caller — so the
-//!   window is nanoseconds and a stream's message rate no longer changes what
-//!   "at the same time" means.
-//! - **P4. Time is injected, never read ambiently.** Nothing in this crate calls
-//!   `Instant::now()`. The receipt clock is read **once per message** by the
-//!   caller and rides in on [`crate::Sample::received`], so the tests stay
-//!   deterministic and the hot path stays free of syscalls.
-//! - **P5. A diagnostic may never become a correctness dependency** (§5.3).
-//!   Attribution quality now changes only how well a clock event is *described*.
-//!   It cannot change whether the bridge halts.
-//!
-//! # The degradation ladder
-//!
-//! | Evidence | Action |
-//! | --- | --- |
-//! | An authoritative jump signal ([`crate::Ingest::note_time_jump`]) | [`OnClockReset`] — exact |
-//! | A common-mode step across **≥ 2** publishers ([`OffsetTable`]) | [`OnClockReset`] |
-//! | A single-source regression ([`ClockGuard`]) | **Drop, count, diagnose. Never halt.** |
-//!
-//! Because the bridge never halts on one witness, there is **no floor** and so
-//! nothing about a floor to get wrong. Defect 3 above is not fixed, it is
-//! unrepresentable. Phase 1 rejects those stamps anyway, so the arena is
-//! protected whatever the ladder concludes; what the ladder decides is only
-//! whether the *bridge* stops, and stopping is the expensive answer.
-//!
-//! # Inference, when it is still needed, is common-mode rejection
-//!
-//! The authoritative path is `rclcpp`-only. A non-ROS caller, a system-clock
-//! step (NTP), and defence in depth all still want a fallback — so [`OffsetTable`]
-//! keeps, per publisher,
-//!
-//! ```text
-//! offset = sample.stamp_nanos - sample.received.0
-//! ```
-//!
-//! against a smoothed baseline. **A publisher's `transform_tolerance` is exactly
-//! this offset**: it is measured and subtracted, so it stops looking like a jump
-//! at all. That dissolves defect 1 rather than working around it — there is no
-//! threshold to choose between "tolerance" and "rewind", because the tolerance
-//! is no longer in the residual.
-//!
-//! A *step* in one publisher's offset is still only one witness. What promotes
-//! it is **agreement**: a real `/clock` step moves every publisher by the *same*
-//! amount, and independent restarts do not. Two publishers stepping by
-//! −5.000 s and −5.001 s inside a second of each other share a cause; two
-//! stepping by −5 s and −0.4 s are two faults that happened to collide. That
-//! also makes **forward** jumps detectable, which a backward-regression watcher
-//! structurally cannot see at all.
-//!
-//! The per-edge [`ClockGuard`] survives all of this unchanged in what it
-//! measures — one publisher's regression against its own last accepted stamp,
-//! which is Phase 1 invariant 6 restated — and changed in what it may conclude:
-//! it makes the per-edge **drop** decision and nothing else.
+//! `docs/decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md`:
+//! §Context *The three rules, and what killed each* (the "defect 1" and
+//! "defect 3" cited in this file), §Decision *The five principles* and *L1*,
+//! *L2* and *L3*; "P1"-"P5" in this file are that record's five principles and "the ladder" is *L3*.
 
 use crate::interner::StrInterner;
 
@@ -537,7 +447,7 @@ pub struct CommonMode {
 
 /// Per-publisher stamp-to-receipt offsets, and the common-mode rule over them.
 ///
-/// This is the **fallback** rung of the ladder (see the module docs). It sits
+/// This is the **fallback** rung of the ladder (`docs/decisions/0012`, *L3*). It sits
 /// above [`ClockGuard`], never inside it — the guard answers an exact per-edge
 /// question and mixing a global judgment into it is the shape `0011` records as
 /// the original defect.

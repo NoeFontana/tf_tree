@@ -20,27 +20,14 @@
 //!
 //! # Two cache states, and only one of them is a claim about this code
 //!
-//! The evicted arm is measured with the file's page cache dropped, the resident
-//! arm with it warm. They differ by two orders of magnitude, and the difference
-//! is **the one major fault**, not the steps around it. This binary prints the
-//! fault counts: exactly one major fault when the cache was dropped and zero
-//! when it was not, *at both fixture sizes*. Under `strace -T` the syscalls are
-//! flat across a 2550x range of mapped length — `mmap` 21 us against 19,
-//! `madvise(MADV_HUGEPAGE)` 18 against 16, the 128-byte header `pread64` 193
-//! against 167 — so what the evicted arm's size dependence measures is how much
-//! the kernel reads to satisfy that single fault, which is a property of the
-//! file and the mapping rather than of a step `open_frozen` takes. A gate on
-//! the evicted number is a gate on the storage under the runner.
+//! Evicted = the file's page cache dropped, resident = warm; the binary prints
+//! each open's major-fault count (1 vs 0 at both sizes).
+//! `docs/PHASE5.md` §12 criterion 2, *Only the resident arm gates, and the reason
+//! is in the fault counts*.
 //!
 //! **The evicted arm is therefore REPORTED and the resident arm is GATED**, and
 //! the evicted numbers are printed with this host's CPU and the fixture's
 //! filesystem beside them so nobody quotes one without them.
-//!
-//! The words are `evicted`/`resident` rather than `cold`/`warm` on purpose:
-//! `src/bin/attach_bench.rs`, in this same crate and this same evidence
-//! register, defines *cold* as "the first attach in this process to a segment
-//! it has never mapped … **not** a cold page cache". Two columns of one
-//! register must not use one word for two things.
 //!
 //! # Why a gate here may publish an absolute duration when `bench_report` will
 //! not

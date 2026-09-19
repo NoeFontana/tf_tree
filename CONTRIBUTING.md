@@ -10,31 +10,16 @@ Cargo.toml                 workspace root: shared metadata, lints, deps
 rust-toolchain.toml        stable channel, pinned
 justfile                   single task surface
 deny.toml                  cargo-deny configuration
-crates/
-├── tf_tree_math/          no_std SE(3)/SO(3) + dual quaternions; forbid(unsafe_code)
-├── tf_tree_arena/         no_std+alloc pointer-free arena + layout math
-├── tf_tree_core/          no_std+alloc engine: interning, topology, buffers, plans
-├── tf_tree/               std facade: builder, plan-cached lookup, Display errors
-├── tf_tree_ipc/           rendezvous, lock file, fd passing
-├── tf_tree_bridge/        ROS-independent half of the /tf ingest bridge
-├── tf_tree_ingest/        MCAP bag ingestion
-├── tf_tree_py/            PyO3 bindings; excluded from the cargo workspace
-├── tf_tree_c/             C ABI + header-only C++ wrapper
-├── tf_tree_tf2_sys/       tf2 side of the differential harness; excluded
-├── tf_tree_bench/         criterion benches + tf2 differential harness
-└── tf_tree_cli/           binary `tf_tree` (alias `tft`)
-ros/                       ament_cmake packages; not cargo crates (`just ros-build`)
-xtask/                     loom / bench-gate / headers runners
+crates/ ros/ xtask/        the crate tree: README.md, Workspace
 docs/PROJECT.md            overview, roadmap, decision log D1–D22 (§5)
 docs/PHASE1.md             normative Phase 1 spec (implemented whole)
 docs/PHASE2.md             normative Phase 2 spec; §1 = Phase 1 amendments A1–A8
 docs/decisions/            architectural decision records (process, kept for new decisions)
 ```
 
-`CLAUDE.md`'s *Project shape* is the same tree annotated with each crate's
-unsafe and dependency budget. Five crates publish (`tf_tree`, `tf_tree_core`,
-`tf_tree_math`, `tf_tree_arena`, `tf_tree_ipc`); the rest carry
-`publish = false` with the reason in their manifest.
+The crate tree is in [`README.md`](./README.md#workspace); `CLAUDE.md`'s
+*Project shape* is the same tree annotated with each crate's
+unsafe and dependency budget.
 
 `docs/PROJECT.md` and `docs/PHASE1.md` are the contract — read them in that
 order before proposing a change. `docs/PHASE2.md` §1 lists amendments A1–A8 to

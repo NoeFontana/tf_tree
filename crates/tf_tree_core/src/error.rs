@@ -130,9 +130,8 @@ pub enum LookupError {
     /// [`crate::MAX_PATH_EDGES`] raw edges to walk, or more than
     /// [`crate::MAX_DEPTH`] steps once folded.
     ///
-    /// One variant covers both because the C ABI's `tft_status` table is frozen
-    /// and a second refusal would need a new code to describe a path nobody has
-    /// (`0034`). `depth` is what tells them apart.
+    /// `docs/PHASE1.md` §7.1 ("Two bounds, and they price different slots")
+    /// says why one variant covers both; `depth` is what tells them apart.
     TreeTooDeep {
         /// **The count that overran its bound**, and the two cases are disjoint
         /// by construction, so this one number says which bound refused:
@@ -145,11 +144,6 @@ pub enum LookupError {
         /// * `MAX_DEPTH + 1 ..= MAX_PATH_EDGES` — the folded step array, and
         ///   here the number is **exact**. `fold_into` keeps counting past the end of
         ///   the array precisely so it can report the real folded length.
-        ///
-        /// It was neither of those before `0034`: it was `nt + ns` at whichever
-        /// per-side guard happened to fire, which is the bound for a one-sided
-        /// chain, the truth for a balanced two-sided path, and neither for a
-        /// lopsided one.
         depth: u16,
     },
     /// The edge has no published samples yet.
@@ -412,9 +406,7 @@ pub enum TopologyError {
 // It has been in `core` since Rust 1.81 and the MSRV is 1.87; a floor below that
 // would break the crate rather than merely this convenience.
 //
-// The message text is not a compatibility promise (`docs/API.md` R5, NORMATIVE);
-// these strings are diagnostics and may change in any release, and the
-// discriminant is what an FFI caller matches on.
+// Message text: `docs/API.md` R5 (NORMATIVE).
 //
 // Every match below is exhaustive on purpose. These enums are `#[non_exhaustive]`
 // to the outside world, but inside the defining crate that grants no catch-all —

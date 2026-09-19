@@ -15,21 +15,9 @@
 //!
 //! # What the gate is actually asking, and why the `.tft` must be big
 //!
-//! Summed Pss over N processes is *total unique bytes*, because Pss divides each
-//! shared page by the number of mappers. So with `S` bytes of shared `.tft` that
-//! every worker touches and `p` bytes private to each process:
-//!
-//! ```text
-//!   total(N) = S + N·p
-//!   total(16) / total(1) = (S + 16p) / (S + p) <= 1.2   <=>   S >= 74·p
-//! ```
-//!
-//! A Rust process with a mapped arena costs roughly 3 MiB private, so the gate
-//! is only passable when `S` is on the order of **220 MiB** — which is exactly
-//! the "233 MB index" §12 gate 2 names. The gate is calibrated for a real
-//! dataloader corpus, and running it against the 24-frame fixture would report a
-//! failure that is arithmetic about process overhead rather than anything about
-//! the design. `--robots`/`--history` default to a shape that lands in range.
+//! `docs/PHASE5.md` §12 criterion 4, which defines `S` and `p`: *Three things
+//! about this measurement* and *Amendment — 1.024× is a statement about a Rust
+//! worker*. `--robots`/`--history` default to a shape that lands in range.
 //!
 //! # The vacuous pass this deliberately avoids
 //!
@@ -40,26 +28,14 @@
 //! reporting**, so the pages counted are pages actually read. `--no-touch`
 //! exists only to show the difference, and prints a warning saying so.
 //!
-//! # Two worker arms, because `S >= 74p` is arithmetic about the worker
-//!
-//! `p` is private bytes per process, and nothing about it belongs to `tf_tree`:
-//! it is the interpreter, its extension modules and the worker's own
-//! allocations. So the gate's verdict is a function of the worker's language,
-//! and the default arm — this binary, re-executed with `--worker` — is a Rust
-//! one. `--python <interpreter>` runs the same measurement with
-//! `python/gate4_worker.py` as the worker instead, which is the arm the wedge's
-//! audience actually runs. §12 gate 4's amendment carries the `p` table; the
-//! criterion itself is stated over the Rust arm and this binary does not move
-//! it.
+//! The default arm is this binary re-executed with `--worker`; `--python
+//! <interpreter>` runs the same measurement with `python/gate4_worker.py` as
+//! the worker instead.
 //!
 //! # `--gate` — the caller says whether this run is a gate
 //!
-//! Printing `FAIL` and exiting 0 is the shape `docs/benchmarks/EVIDENCE.md`
-//! exists to prevent: a criterion nothing re-derives, wired into a job that
-//! goes green on a regression. This binary drove `nightly.yml`'s `gate4` job in
-//! exactly that state — `verdict` was a string in a `println!` and every path
-//! out of `drive` was `Ok(())` — so criterion 4 could regress from 1.024x to
-//! anything at all and the job would pass.
+//! `docs/PHASE5.md` §12 criterion 4, *Correction — until 2026-09-04 this
+//! criterion was measured and not gated*.
 //!
 //! **The exit status is not the binary's to guess**, because §12 gate 4 is
 //! stated over the Rust arm and the Python arm deliberately reports without

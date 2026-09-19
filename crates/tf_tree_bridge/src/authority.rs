@@ -349,14 +349,8 @@ impl Authority {
 
     // **`distinct_owners()` was here, and it is deliberately gone.**
     //
-    // It existed to floor §5.5's quorum by how many publishers a deployment
-    // could supply, and it made a *diagnostic* — attribution — into a
-    // *correctness dependency*, which §5.3 forbids. `Publisher::UnknownGid` and
-    // `Publisher::Unattributed` are unit variants, so on an RMW without endpoint
-    // introspection every publisher compares equal, the count is permanently 1,
-    // the floor is permanently 1, and every single-edge regression halts the
-    // bridge. It also read 1 at boot for a deployment that had two publishers,
-    // because the second had not published yet.
+    // Why: `docs/decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md`,
+    // *The three rules, and what killed each*.
     //
     // The clock ladder no longer promotes on one witness at all, so there is
     // nothing left to floor. See `crate::clock`'s module docs.

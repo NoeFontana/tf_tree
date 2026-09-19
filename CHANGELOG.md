@@ -58,6 +58,22 @@ repaired before this landed.
 Out of scope and unchanged: the 28 `implemented` records, which are frozen;
 `CHANGELOG.md`'s released sections, which are a historical record;
 `crates/tf_tree/src/open.rs` and `tree.rs`, which many line citations point into.
+
+### Changed — one home per claim
+
+A claim stated in several places now has one authoritative statement and a
+citation from the rest. Seven finders swept the whole corpus by *claim*, not by
+file; 87 candidate clusters merged into 23, and 275 copies were replaced with a
+one-line citation to a symbol or section. 88 copies were kept on purpose: a
+copy carrying a qualifier or number its authority lacks, a copy a wheel or C
+user reads with no way to follow a citation, and anything in a frozen record.
+Authority text is untouched; nothing surviving was reworded.
+
+Not collapsed, because the copies disagree and a citation would pick a side:
+`abi_cost`'s R3 threshold (`PHASE4.md` §7 says reported, `0023` and `EVIDENCE.md`
+say gated), slerp's instruction counts (`API.md` §2.7 quotes them, row 16 says
+none is portable), and the push-sampler figures. Those need a decision.
+`tf_tree_unstable.h` was regenerated from the edited comments.
 `docs/decisions/0020` shed one citation and its budget row falls to match.
 
 ### Changed — a doc comment states the contract, not its own history
@@ -120,14 +136,8 @@ serving it is reaching back across. Three shipped sites described the shape and
 are reconciled rather than rewritten. `tf_tree doctor`'s `TFT014` said
 `build_shared` is "still supported" — true of the **call**, and not of serving
 its result, which is the only way anything ever asks that check about a
-byte-less record. `tft_tree_reap_dead`'s doc and `docs/RUNBOOK.md` each named
-two producers of a stale claim that no hangup collects, a dead **owner** and a
-byte-less `build_shared` participant, and now say which is which: the owner is
-in contract and is what the sweep is for; the other is reachable only in the
-composition this record refuses. The runbook adds what an operator does about
-it — **do not sweep**, because `Tree::reap_dead`, `tft_tree_reap_dead` and
-`Tree.reap_dead()` will take the claims of publishers that are running, while no
-`tf_tree` subcommand sweeps at all, so `doctor` is safe either way.
+byte-less record. `tft_tree_reap_dead`'s doc and `docs/RUNBOOK.md` are the other
+two; the claim they state is in `docs/PHASE2.md` §3.9, *A participant dies*.
 
 **The sentence being retracted had five copies, and the plan named one.**
 `TFT014`'s rustdoc said a byte-less record "reaches `slot_leak`'s `unknown`
@@ -278,15 +288,7 @@ makes: the handshake statuses are the *owner's* comparison against an attach
 request, decided before this process ever saw a segment.
 
 **`PHASE2.md` §3.7 asks a rejection to name *both* sides' values and this arm
-prints one.** The hash half is older than this change — `tf_tree_ipc` depends on
-`rustix` and `libc`, so it cannot read this build's `layout_hash()` to print
-beside the owner's — and closing it means new fields on a published crate's
-error type, so it is recorded in `0055` step 7 rather than fixed here. §3.7's
-other clause for `LayoutMismatch`, that the message "must say exactly that",
-*was* satisfied and moved to the runbook row in this change — which is the shape
-`0059` settled for the sibling `ShmError::LayoutMismatch`, and that record
-already calls this same §3.7 sentence stale for it. §3.7 has an erratum owed on
-both clauses.
+prints one.** See that section's *Erratum (2026-09-18, `0055` step 7)*.
 
 The remedy is unaffected either way; the runbook now says which build to read
 the second number from, since `tf_tree doctor` prints the CLI's own and that is

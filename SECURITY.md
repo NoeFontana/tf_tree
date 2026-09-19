@@ -93,27 +93,13 @@ or a seccomp filter and fails if `socket(2)` is called with anything but
 `.github/workflows/ci.yml`'s `shm` job runs it on both matrix rows.
 
 Read the scope with it, because it is narrower than "everything in this
-repository":
-
-- **What is asserted:** every `socket(2)` issued by the test binaries of the
-  five published crates — `tf_tree`, `tf_tree_core`, `tf_tree_math`,
-  `tf_tree_arena`, `tf_tree_ipc` — names `AF_UNIX`. That is §11's scoping and
-  §5.1's amendment, not a narrowing made to get a green run: the sentence above
-  is about the library.
-- **`tf_tree_cli` is the check's positive control, not a gap.** `tf_tree top
-  --web` binds an `AF_INET` listener by construction, on purpose, when an
-  operator asks for it. The recipe traces that target *separately* and
-  **refuses** unless it finds `AF_INET` there — so "the library opens no network
-  socket" and "this check is scoped so narrowly it could not see one" are
-  distinguishable outcomes.
-- **What it does not cover:** a code path no test takes, a socket the library
-  *inherits* rather than creates (`tf_tree_ipc` passes the rendezvous fd, and
-  `connect(2)`/`sendto(2)` on a received fd are not traced), a non-Linux target,
-  and **every package in this repository other than the five above and
-  `tf_tree_cli`** — including `crates/tf_tree_tf2_sys`, the ROS 2
-  `tf2::BufferCore` bridge, which is worth naming rather than deriving because
-  ROS 2 middleware is DDS over UDP. Those are traced by nothing.
-  `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header.
+repository": every `socket(2)` issued by the test binaries of the five published
+crates — `tf_tree`, `tf_tree_core`, `tf_tree_math`, `tf_tree_arena`,
+`tf_tree_ipc` — names `AF_UNIX`. It does not cover a code path no test takes, a
+socket the library *inherits* rather than creates, a non-Linux target, or any
+other package in this repository (`crates/tf_tree_tf2_sys` included; `tf_tree_cli`
+is the check's separately traced positive control). `scripts/no-network.sh`'s
+PROVES / DOES NOT PROVE header is the full scope.
 
 Verify it yourself if it matters to you: `just no-network` (it needs `strace`,
 and refuses rather than skips without it). Do not use

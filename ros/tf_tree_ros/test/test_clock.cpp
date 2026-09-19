@@ -7,10 +7,10 @@
 //   1. **The authoritative path.** ROS 2 *publishes* clock jumps. A bag that
 //      loops and a simulator that resets both call `rcl_set_ros_time_override`
 //      with a time behind the one before it, and rcl reports that to every
-//      registered jump callback. Inferring the same fact from the stamps of the
-//      publishers under suspicion is what three successive versions of this rule
-//      did, and all three were wrong; the engine keeps that inference as a
-//      fallback, and this file is about not needing it.
+//      registered jump callback. Why the bridge asks rather than infers:
+//      `docs/decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md`
+//      §Context *The three rules, and what killed each*; inference survives only
+//      as L2 common-mode rejection.
 //
 //   2. **Which clock the diagnostics are rate-limited on.** Every
 //      `RCLCPP_*_THROTTLE` in `bridge_handle.cpp` compares `clock.now()` against

@@ -334,8 +334,7 @@ class ArenaAbsentError(TfTreeError): ...
 >   and `push_many`. §8.1's amendment of the same date lists the two calls that
 >   did not refuse at all and the ones that still answer.
 > - **Two attributes the first block listed no longer match the Rust errors.** `.owner_pid`:
->   since amendment A3 a claim records a participant *slot*, not a pid, and an
->   attribute spelled `pid` would point an operator at an unrelated process.
+>   the reason is the `EdgeAlreadyClaimedError.owner_slot` bullet above.
 >   `.holders -> [(pid, name)]`: `IpcError::ArenaHeldButUnreachable` carries
 >   `holder_slots`, `first_slot`, `first_pid` and `ownership_held`.
 > - **`BufferError` was not in the first block and ships.** It is public as

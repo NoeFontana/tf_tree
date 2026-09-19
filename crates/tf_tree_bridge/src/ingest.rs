@@ -54,14 +54,11 @@
 //! **about a set of those facts**, and deriving either from a single fact is
 //! what that record found:
 //!
-//! - **The clock** (§5.5) had one [`ClockGuard`] for the whole stream, so a
-//!   publisher's `transform_tolerance` — a steady, correct offset of one edge
-//!   relative to another, larger than any threshold — read as a bag loop and
-//!   latched the bridge on a healthy robot. The guard is now per edge and
+//! - **The clock** (§5.5): see `docs/decisions/0012`, *The three rules, and
+//!   what killed each*. The [`ClockGuard`] is per edge and
 //!   decides one thing only: whether *this* sample is dropped. Promotion to
 //!   "the clock moved" is a separate ladder with its own evidence — see
-//!   `crate::clock`'s module docs, which record why `0011`'s quorum was itself
-//!   wrong three times over and what replaced it.
+//!   `crate::clock`'s module docs.
 //! - **`Strict`** (§5.4) is defined by §5.4's table as *"refuse to start if a
 //!   conflict is detected within a startup window"*, and there was no startup
 //!   window. There is one now: conflicts are accumulated while it is open and
@@ -2296,12 +2293,8 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     /// [`Publisher::Gid`], which compares on the GID — and
     /// [`Publisher::Unattributed`] were *unit* variants, so on an RMW without
     /// endpoint introspection every publisher on
-    /// the robot compared equal. Under the quorum that was fatal: the floor was
-    /// derived from `Authority::distinct_owners()`, which read 1, so a quorum of
-    /// 1 was demanded and the **first** single-edge regression latched the
-    /// bridge permanently. §5.3 says in as many words that attribution is
-    /// *"diagnostic value, never a correctness dependency"*, and that was a
-    /// correctness dependency.
+    /// the robot compared equal. `docs/decisions/0012`, *The three rules, and
+    /// what killed each* (Rule 3, part b), has why that was fatal under the quorum.
     ///
     /// Under the ladder the same collapse means one offset baseline, which means
     /// common mode can never reach two, which means every regression degrades to
@@ -2611,11 +2604,8 @@ pose = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     /// The inverse of what `docs/decisions/0011` shipped, and the reversal is
     /// the point. That record floored the quorum by `distinct_owners()` so a
     /// single-publisher deployment would halt on its first regression "because
-    /// nothing else could ever agree with it". Two failures followed: at boot
-    /// the floor reads 1 on a robot that *has* two publishers because the second
-    /// has not published yet (AMCL waits for a map), so the wheel driver's first
-    /// hiccup latches the bridge; and an unattributable RMW makes the floor
-    /// permanently 1 for everyone.
+    /// nothing else could ever agree with it". The two failures that followed are
+    /// in `docs/decisions/0012`, *The three rules, and what killed each* (Rule 3).
     ///
     /// So the answer is inverted. With one witness there is no evidence that
     /// separates "this node restarted" from "the clock moved", and the

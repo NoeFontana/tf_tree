@@ -39,12 +39,7 @@ pub(crate) const GIL_RELEASE_THRESHOLD_NS: u64 = 1_000;
 ///
 /// **64 ns/step, re-derived from a measurement rather than from a budget.**
 /// `docs/PHASE3.md` §6.1's amendment is the single account of where it comes
-/// from and what it moved; in one line, it is the median of nine pinned
-/// `benches/lookup.rs` runs of `lookup/depth3/sclerp` at the interpolating stamp
-/// `fixture::QUERY_NS` — 192.7 ns over three dynamic steps — taken in the commit
-/// that re-baselined that benchmark (`docs/decisions/0013`). The 55 it replaces
-/// came from `docs/PHASE1.md` §11.3's 150 ns *budget*, by way of a benchmark
-/// that queried on-grid stamps and never ran the interpolator.
+/// from and what it moved.
 const NS_PER_STEP_ESTIMATE: u64 = 64;
 
 /// §6.1's rule, in one place so the two callers cannot drift apart.
@@ -628,12 +623,6 @@ impl PyTree {
     /// Has the process that owns this arena gone away
     /// (`docs/PHASE2.md` §3.5)?
     ///
-    /// One non-blocking `poll` of the attach socket, plus — only once that
-    /// reports a hangup — one `F_OFD_GETLK` on the ownership byte. So it answers
-    /// *"the arena has no owner"* rather than *"my socket is dead"*, and a
-    /// survivor that did not inherit stops being told to try
-    /// ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
-    ///
     /// `False` for anything that is not a joined shared attachment: an
     /// in-process tree, a frozen `.tft`, or a tree this process already owns.
     /// None of them has an owner that can die out from under it.
@@ -643,19 +632,14 @@ impl PyTree {
     /// daemon, per `0019` — so an arena whose survivors never ask stays
     /// ownerless and wedges new joiners.
     ///
-    /// **A dying owner is seen at the end of its exit, not at its signal**
-    /// (`docs/PHASE2.md` §3.5, NORMATIVE): once the attach connection has hung
-    /// up and the last open file description holding the ownership byte has
-    /// closed. The kernel writes any core dump and tears down the address space
-    /// first, so an owner dumping core through a piped `core_pattern` can take
-    /// about a second to be seen, and nothing a survivor can take shortens it
-    /// (`docs/decisions/0057`).
+    /// What a hangup means, and when a dying owner is seen: `docs/PHASE2.md`
+    /// §3.5 (NORMATIVE), `docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md`
+    /// and `docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md`.
+    ///
+    /// Answers "the arena has no owner", not "my socket is dead".
     ///
     /// ```python
     /// if tree.owner_lost():
-    ///     # "Contended" or "OwnerAlive": another survivor won, or a fresh open
-    ///     # held the ownership byte in passing and will hand it back. Neither
-    ///     # is final while owner_lost() says True; the next pass asks again.
     ///     tree.inherit_ownership()
     /// ```
     #[cfg(target_os = "linux")]
@@ -665,12 +649,8 @@ impl PyTree {
 
     /// Inherit the owner role from a departed owner and begin serving (§3.5).
     ///
-    /// **This is the call a Python fleet did not have.** Until it existed, an
-    /// arena whose owner was `SIGKILL`ed could not be rejoined by anything
-    /// written in this language: the survivors keep their participant bytes,
-    /// §3.4's split-brain check refuses every new create, and the recovery was
-    /// to stop every attached process
-    /// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+    /// **This is the call a Python fleet did not have.** See
+    /// `docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md`.
     ///
     /// Returns the outcome's name, which is what a Python caller branches on:
     /// `"Inherited"`, `"OwnerAlive"`, `"Contended"`, `"ReadOnly"`,

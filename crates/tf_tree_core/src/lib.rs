@@ -202,9 +202,8 @@ pub use sample::ExtrapPolicy;
 ///
 /// Raised 16 → 32 by
 /// [`0034`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0034-the-depth-bound-priced-two-slots-the-same.md).
-/// A survey of 91 real robot descriptions put the worst *graph diameter* at 30
-/// joints (p95 24) — the quantity a lookup walks, up to the common ancestor and
-/// back down, which is not root-to-leaf depth. And the cost 16 was defended on,
+/// The survey behind 32 is `docs/PHASE1.md` §7.1, *Two bounds, and they price
+/// different slots*. And the cost 16 was defended on,
 /// "everyone pays, on the hot path", did not survive being taken: the criterion
 /// `lookup`, `query_mix` and `at_many` rows are flat within ±0.5% at 32, and no
 /// evaluate row measured since moves more than ±2% in either direction. What is
@@ -217,9 +216,9 @@ pub const MAX_DEPTH: usize = 32;
 /// across both sides of the lowest common ancestor before folding.
 ///
 /// A slot here is a `u32` edge id in `compile`'s stack frame: **4 bytes**, paid
-/// once, on a call D3 already places off the hot path. 64 bytes against 4 is
-/// why one number cannot price both slots — it was 128 against 4 before
-/// `0042`, and the argument is the same shape at either figure.
+/// once, on a call D3 already places off the hot path. Why one number cannot
+/// price both slots: `docs/PHASE1.md` §7.1, *Two bounds, and they price
+/// different slots*.
 ///
 /// Exceeding it is [`LookupError::TreeTooDeep`]; so is a path that *fits* the
 /// walk but still folds to more than [`MAX_DEPTH`] steps. The two are told apart

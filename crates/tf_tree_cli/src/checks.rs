@@ -1154,13 +1154,9 @@ fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&[&PushSample]>) -> RateE
 /// guarded against.
 ///
 /// There is a third way to have none, and it is the one a `pass` would be most
-/// wrong about: every declaring edge's publisher has **stopped**. Its ring is
-/// still full of stamps spaced at exactly the declared rate, so the comparison
-/// succeeds and reports a perfect match about a stream that is no longer
-/// arriving. [`stopped_publishers`] is the predicate — the same one `TFT009`
-/// fires on — and such an edge is withheld from the comparison rather than
-/// reported, because a second warn id for one fault is the duplicate spelling
-/// §6's `TFT017`/`TFT018` amendment forbids by name.
+/// wrong about: every declaring edge's publisher has **stopped**.
+/// [`stopped_publishers`] is the predicate, and such an edge is withheld from
+/// the comparison; `docs/PHASE5.md` §6, *`TFT007` and `TFT008` carried `TFT009`'s trailing blindness*.
 ///
 /// When *some* edges are comparable and others are not, the check runs on those
 /// and [`rate_coverage_note`] (which gap each uncompared edge fell into) and
@@ -1257,16 +1253,8 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
 ///
 /// # Why it takes the clock and the source
 ///
-/// `tft007` withholds every edge [`stopped_publishers`] names, so its
-/// `comparable` count is *not* the one `rate_evidence` alone produces.
-/// A note computed without that set counts a withheld edge as compared, and the
-/// first arena to show it is the one the withholding was built for: a live
-/// arena with one stopped declaring edge and one undeclared edge makes `TFT007`
-/// skip having compared nothing while the note claims it compared one of two.
-/// One report, two answers. The withheld count is stated as its own term rather
-/// than folded into `too_few`, because the remedy differs — wait for a ring to
-/// fill, or go and look at a dead publisher — and because
-/// [`stopped_publisher_note`] names the same edges from the other side.
+/// `docs/PHASE5.md` §6, *`TFT007` and `TFT008` carried `TFT009`'s trailing
+/// blindness* (its paragraph on the disclosure).
 #[must_use]
 pub fn rate_coverage_note(
     snap: &Snapshot,
@@ -1323,11 +1311,8 @@ pub fn rate_coverage_note(
 ///
 /// # A stopped publisher is withheld, not judged
 ///
-/// Its ring is a full set of perfectly spaced samples, so its coefficient of
-/// variation is ~0 and this check would print a healthy cadence beside `TFT009`
-/// reporting the same edge as silent. [`stopped_publishers`] is the predicate,
-/// shared with `TFT007` and `TFT009` rather than spelled again here, and
-/// [`stopped_publisher_note`] is the disclosure.
+/// [`stopped_publishers`] is the predicate and [`stopped_publisher_note`] the
+/// disclosure; `docs/PHASE5.md` §6, *`TFT007` and `TFT008` carried `TFT009`'s trailing blindness*.
 ///
 /// # And a run that judged nothing skips rather than passing
 ///
@@ -1574,19 +1559,8 @@ pub fn stopped_publishers(
 ///
 /// # And a run that judged nothing skips rather than passing
 ///
-/// `Pass` here is the active claim *no edge in this arena has a dropout*, and
-/// **both** halves run only over edges [`interval_shape`] accepted — so on an
-/// arena where every edge falls into a [`ShapeGap`] the subject set is empty
-/// and the empty finding list used to render as an all-clear. It is `TFT007`'s
-/// compared-nothing defect and `TFT008`'s judged-nothing defect a third time,
-/// and it reached further than either: the floor is
-/// [`GAP_MIN_INTERVALS`] + 1 retained samples, which is every arena for its
-/// first four pushes per edge, every publisher restart, and **permanently**
-/// every edge sized `RingSize::History { rate_hz, secs }` with
-/// `rate_hz * secs <= 4`, since `Capacity::history` rounds to a power of two
-/// and `SampleRing::retained` is `capacity - 1`. `TFT008` skips on exactly
-/// those arenas, so one document said *not run, nothing to measure* and
-/// *pass* about the same empty set.
+/// `docs/PHASE5.md` §6, *`TFT009` was the one check in this group with no skip
+/// arm*.
 ///
 /// [`gap_evidence_skip`] is the reason, and it names which [`ShapeGap`] rather
 /// than only that there was one.
@@ -1683,16 +1657,8 @@ fn live_wall_now(clock: Clock, stream: PushStream) -> Option<i64> {
 ///
 /// # It reads the outcome, because the two can contradict each other
 ///
-/// `TFT009` skips outright when `interval_shape` accepted no edge, and that
-/// skip reason already says there is *nothing to measure a trailing silence
-/// against*. A note next to it claiming the check "measured gaps between
-/// retained samples but not the gap since the newest one" describes work that
-/// did not happen, in the same document, about the same run. That is the rule
-/// `TFT011`'s two disclosures already follow one file over — when both halves
-/// are blind the check skips and the notes stay quiet rather than the report
-/// explaining itself twice — and the two conditions here are independent, so
-/// neither predicate could have caught it: the skip is about the arena's
-/// samples and the note is about the clock and the source.
+/// `docs/PHASE5.md` §6, *`TFT009` was the one check in this group with no skip
+/// arm* (its last paragraph, on `Meta.notes`).
 #[must_use]
 pub fn silence_coverage_note(
     tft009: &CheckOutcome,

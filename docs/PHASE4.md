@@ -86,16 +86,10 @@ regression", and the regression turned out to be in the instrument.
 
 **Two things had to be fixed before any of that meant anything.**
 
-**1. It was built at the workspace `release` profile, which is `lto = "thin"` —
-so `tft_plan_at` was inlined into its Rust caller and the C boundary the gate
-exists to price was not in the binary.** `report.rs`'s §9.2 embedding row already
-said this in those words; nothing had applied it here. `just abi-cost` now builds
-the example twice and gates only the `embedder` arm. **The erasure was worth
-about half the answer**: the same ABI prices at **1.016–1.019×** with the
-boundary gone and **1.025–1.038×** with it present.
+**1. The profile erased the boundary** — [`0023`](./decisions/0023-the-gate-that-could-not-gate.md) §Context, *The profile erased the boundary*.
 
-That is the smaller version of a difference `just abi-attached` measured on a
-shared arena, where it is much larger:
+The erasure is a difference `just abi-attached` also measured, much larger, on a
+shared arena:
 
 | profile | native Rust | Rust → ABI | C++ → ABI |
 |---|---|---|---|
@@ -106,14 +100,7 @@ shared arena, where it is much larger:
 settles two things at once: the ABI's cost is the *boundary*, not the language,
 and `docs/benchmarks/tf2.md`'s C++ figure was never a C++ artifact.
 
-**2. The denominator was at LLVM's discretion**, which is the defect recorded in
-the section below: an unrelated second `Tree::guard()` call site moved the native
-baseline 133 → 190 ns (43%) and the verdict FAIL → PASS while the ABI arm never
-moved. Every native comparand in `abi_cost.rs` is now `#[inline(never)]` with
-`black_box` on the stamp in and the scalar out, and the ladder carries a
-permanent **control row** — a structural twin of rung 1, separate symbol,
-separate call site — that goes red if a call site ever specialises a comparand
-again.
+**2. The denominator was at LLVM's discretion** — [`0023`](./decisions/0023-the-gate-that-could-not-gate.md) §Context, *The denominator was at LLVM's discretion*; the fix is its §Decision, *The comparands are pinned* and *The control is permanent*.
 
 **The pin was verified rather than assumed, by re-running the edit that broke the
 old gate.** An extra unrelated `Tree::guard()` call site was added, measured,
@@ -1526,103 +1513,15 @@ If `use_sim_time` is true, the bridge tags every edge it declares as `SimDomain`
 
 Also handle: `/clock` jumps backwards (bag loop, sim reset). On a detected backward jump beyond a threshold, the bridge **stops and reports** rather than pushing non-monotonic stamps that Phase 1 will reject one at a time. Offer `--on-clock-reset={halt,recreate}` where `recreate` builds a fresh arena instance.
 
-> **Amendment — SUPERSEDED IN PART, and only its first bullet survives.** The
-> threshold being per *edge* stands. Promotion "by a quorum of distinct
-> *publishers*, floored by what the deployment can supply" does **not**: it was
-> the second and third of **three** inference rules that all turned out wrong.
-> Do not implement it and do not cite it — read the amendment below instead.
->
-> `0011` §*Decision* 1 is history. `ResetQuorum`, `QUORUM_EDGES`, the correlation
-> window counted in transforms, the `Authority::distinct_owners()` corroboration
-> floor and the `correlated_edges` payload are all deleted. The block is not
-> reproduced here: [`0011`](./decisions/0011-the-bridge-clock-guard-and-the-static-conflict-disposition.md)
-> holds its full argument, unedited, including the two corrections adversarial
-> review forced on it, and
-> [`0012`](./decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)
-> §*Context* records what falsified each of the three rules in turn. The one
-> argument that survives — a shared high-water mark cannot tell a publisher's
-> `transform_tolerance` apart from a clock rewind, so the guard is per edge — is
-> restated below.
-
-> **Amendment — the bridge does not infer a clock reset from `/tf` stamps when
-> ROS 2 will tell it. The sentence above is wrong in three ways: the signal, the
-> disposition, and the direction.**
->
-> Settled by [`0012`](./decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md),
-> which supersedes `0011`'s clock half.
->
-> *"On a detected backward jump beyond a threshold, the bridge **stops and
-> reports**"* assumes that a jump is something to be **detected** from the traffic,
-> that the response to detecting one is always to **stop**, and that the jump worth
-> catching is **backward**. All three are false:
->
-> - **The signal.** ROS 2 *publishes* clock jumps. Verified in `docker/tf2` against
->   ROS 2 *lyrical*: `rcl/time.h` declares `rcl_jump_threshold_t`, `rcl_time_jump_t
->   { clock_change, delta }` and `rcl_clock_add_jump_callback(..)`, and
->   `rclcpp/clock.hpp` wraps them as `Clock::create_jump_callback(pre, post,
->   threshold)`. The platform supplies the delta, its sign, and whether the clock
->   type changed. Inferring all three from the signal under suspicion is what
->   produced three successive wrong rules.
-> - **The disposition.** Stopping on a *single* witness is what made §5.3's
->   attribution a correctness dependency — see §5.3's amendment. One source
->   regressing is one publisher's fact and is disposed of as one.
-> - **The direction.** A backward-regression watcher is structurally blind to
->   `/clock` jumping **forward**: every stamp stays monotone, every sample is
->   accepted, and a sim that skips ahead silently fills the arena with transforms
->   dated at times that never happened.
->
-> So, normatively:
->
-> - **The guard is per edge and makes a *drop* decision only.** It still enforces
->   Phase 1's per-edge monotonicity, and a past-threshold regression is still
->   charged to `dropped_non_monotonic`. It no longer promotes anything on its own.
-> - **The authoritative path is first.** The bridge exposes an entry point that
->   takes a *reported* jump — `Ingest::note_time_jump(delta_nanos, kind)` and its
->   ABI twin `tft_bridge_note_time_jump` — and applies `--on-clock-reset` directly,
->   with no threshold, no window and no corroboration. The `rclcpp` node registers a
->   jump **post**-callback on `node_->get_clock()` and drains it from the ingest
->   thread; the callback itself may only record, because it runs on the
->   `TimeSource`'s dedicated `/clock` thread and the ABI is thread-affine.
-> - **`delta_nanos` follows `rcl`'s convention** — new time minus the last time
->   before the jump, so a **rewind is negative**. This is a sign flip against
->   `0011`'s `by_nanos`, and every consumer of the field must agree or one family of
->   diagnostics prints its sign backwards.
-> - **Inference survives only as common-mode rejection**, for non-ROS callers,
->   system-clock steps and defence in depth. Per publisher, track
->   `offset = stamp_nanos - received`, where `received` is an **injected steady**
->   clock reading (`SteadyNanos`), read once per *message* and never derived from
->   `/clock` or from a publisher. A publisher's `transform_tolerance` **is** that
->   offset — measured and subtracted, so it stops looking like a jump, which
->   dissolves the original defect instead of tolerating it. A step is a departure
->   from a smoothed per-publisher baseline by more than the threshold.
-> - **Two publishers must *agree*, not merely coincide.** A promotion needs ≥ 2
->   distinct publishers stepping within `correlation_window_nanos` **and** step
->   magnitudes agreeing to within `max(floor, ratio · max(|d_a|, |d_b|))`. A real
->   clock step moves everyone by the same amount; independent restarts do not. This
->   is what catches forward jumps, and it is strictly stronger evidence than the
->   coincidence a quorum tested for.
-> - **Every window is physical time.** `SteadyNanos`, nanoseconds, never a count of
->   transforms — a count is moved by the very traffic under judgment, and a stalled
->   publisher can hold one open for the life of the process. §5.4's startup window
->   keeps its transform ordinal by **choice**; its closing line "the crate has no
->   clock at all" is now false, and the two windows no longer share a rationale.
-> - **A single source never halts, at any magnitude.** It is dropped, counted and
->   diagnosed. There is therefore no corroboration floor, and nothing about a floor
->   to get wrong. Phase 1 rejects the stamp on its own account, so the arena is
->   protected regardless of what this rule concludes.
-> - **`clock_resets` still counts promotions**, and `HaltReason::ClockReset` now
->   carries `{ delta_nanos, evidence }` with
->   `ClockEvidence::{ Reported { kind }, CommonMode { publishers } }` in place of
->   `correlated_edges` — the old field named the wrong unit and cannot describe a
->   reported jump at all.
-> - **`dropped_non_monotonic` widens** to "transforms the clock rules refused",
->   because a forward common-mode jump refuses a sample that is perfectly monotone.
->   The name is kept — renaming it crosses the C ABI for no diagnostic gain — and
->   the field's doc carries the widened meaning.
->
-> The residual limitations — the baseline's warm-up, a fast-drifting publisher
-> masking a small step, and a non-ROS caller with no steady clock getting no
-> detector at all — are recorded in `0012` §*Known limitations*.
+> **Amendment — the sentence above is superseded.** A jump is reported first, via
+> `Ingest::note_time_jump` / `tft_bridge_note_time_jump`; a single source is
+> dropped and never halts; forward jumps are covered.
+> [`0011`](./decisions/0011-the-bridge-clock-guard-and-the-static-conflict-disposition.md)
+> is superseded — do not cite its Decision 1. See
+> [`0012`](./decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md):
+> §*Context* (*The three rules, and what killed each*), §*Decision* (*The five
+> principles*, *L1 — the authoritative path*, *L2 — inference as common-mode
+> rejection*, *L3 — the degradation ladder*) and §*Known limitations*.
 
 ### 5.6 Frame names
 
@@ -2032,10 +1931,7 @@ Replay a recorded bag through the bridge, then compare `tf_tree` lookups against
    `0023`'s implementation step 5.
 
    *Rewritten from "C ABI within **5%** of native for depth-3 lookup" by
-   [`0023`](./decisions/0023-the-gate-that-could-not-gate.md). The old
-   line gated nothing for two compounding reasons, both recorded in §0.0: the
-   profile erased the boundary, and the single quotient's denominator moved 43%
-   on an unrelated edit to the same binary.*
+   [`0023`](./decisions/0023-the-gate-that-could-not-gate.md).*
 
    **What gates today, and where its numbers live.** `just abi-cost` runs the
    ladder at `[profile.embedder]`, and it is the only invocation of

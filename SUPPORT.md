@@ -42,9 +42,8 @@ closed if none arrives.
 - **The current release**, and only it. Pre-1.0 there are no backports and no
   long-term-support branch. Reports against an older version will be asked to
   reproduce on the current one. On the `0.0.x` line "the current release" is a
-  stronger statement than usual: cargo treats every `0.0.x` as incompatible with
-  every other (`^0.0.1` matches `0.0.1` alone), so nothing is promised to carry
-  across a release and `CHANGELOG.md` says so at the top.
+  stronger statement than usual: nothing is promised to carry across a release,
+  and `CHANGELOG.md` says so at the top.
 - **The public API of `tf_tree`, `tf_tree_core`, `tf_tree_math`,
   `tf_tree_arena` and `tf_tree_ipc`** — the five crates that are published — plus
   the Python bindings, at the maturity each is documented at. Crates marked

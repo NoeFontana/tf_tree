@@ -66,9 +66,9 @@ pub enum LayoutError {
 // variant added later fails to compile here.
 
 /// **The text is a diagnostic and not a compatibility promise**
-/// (`docs/API.md` R5): it may change in any release, and the discriminant is
-/// what a caller matches on. [`core::error::Error::source`] returns `None`,
-/// and that is not promised either.
+/// (`docs/API.md` R5); `source()` is `None`. The text rules and `source()` are
+/// `docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md`
+/// decisions 2 and 3.
 impl core::fmt::Display for LayoutError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
@@ -169,12 +169,7 @@ fn compute(
     let mp = max_participants as usize;
     let slots: usize = edge_capacities.iter().map(|&c| c as usize).sum();
 
-    // 12 B / frame: parent AtomicU32 + edge_of_child AtomicU32 + depth AtomicU16
-    // + 2 B pad. edge_of_child lives in the block (not a separate region) so plan
-    // compilation is an O(1) array walk and the (parent, depth, edge_of_child)
-    // triple is published together by the single topology store. (Resolves the
-    // inconsistency between the 6-byte stride in `docs/PHASE1.md` §4.3 and
-    // edge_of_child living in the topology block per §5.2.)
+    // 12 B per frame: `docs/PHASE1.md` §4.3.
     //
     // The fields are **atomics** (`docs/PHASE2.md` §1 A1): a reader racing a
     // writer on the same block reads garbage and discards it, but reading a
@@ -470,9 +465,8 @@ pub const fn layout_hash() -> u32 {
     h = fnv1a_u32(h, core::mem::align_of::<ArenaHeader>() as u32);
     // Region strides in header order: header size, frame/edge/claim/participant/
     // pose byte widths, frame-hash entry width ([`FRAME_HASH_STRIDE`], 16 since
-    // A8 added the `claiming` array), topology per-frame width (12 = parent
-    // AtomicU32 + edge_of_child AtomicU32 + depth AtomicU16 + pad), topology
-    // block count, stamp width.
+    // A8 added the `claiming` array), topology per-frame width (12 B per
+    // frame, `docs/PHASE1.md` §4.3), topology block count, stamp width.
     //
     // **The two counter-region strides are appended** (`docs/PHASE5.md` §1.2's
     // amendment). Note the tension that resolves: the amendment warns that a v3

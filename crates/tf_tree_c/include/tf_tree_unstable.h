@@ -1607,13 +1607,8 @@ tft_status tft_tree_open_named(const char *name,
  * `false` for anything that is not a joined rendezvous attachment.
  *
  * **A dying owner is seen at the end of its exit, not at its signal**
- * (`docs/PHASE2.md` §3.5, NORMATIVE): once the attach connection has hung up
- * and the last open file description holding the ownership byte has closed.
- * The kernel writes any core dump and tears down the address space first, so
- * an owner dumping core through a piped `core_pattern` can take about a second
- * to be seen, and nothing a survivor can take shortens it. tf_tree adds no
- * delay, heartbeat or timeout to that event
- * ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
+ * (`docs/PHASE2.md` §3.5 and §3.7 step 9, NORMATIVE). See
+ * [`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md).
  *
  * Pair it with [`tft_tree_inherit_ownership`] in your own loop — there is no
  * background thread and no daemon, per `0019`, so **nothing calls this for
@@ -1632,13 +1627,10 @@ tft_status tft_tree_owner_lost(const tft_tree *tree,
  * Inherit the owner role from a departed owner and begin serving
  * (`docs/PHASE2.md` §3.5).
  *
- * **This is the call an all-C++/Python fleet did not have.** Until it existed,
- * an arena whose owner was `SIGKILL`ed could not be rejoined by anything: the
- * survivors keep their participant bytes, §3.4's split-brain check refuses
- * every new create with `TFT_ERR_ARENA_UNAVAILABLE`, and the only thing that
- * ends that state was a Rust method. The documented recovery was to stop every
- * attached process
- * ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+ * **This is the call an all-C++/Python fleet did not have.** After an owner is
+ * killed and survivors remain attached, a fresh create is refused with
+ * `TFT_ERR_ARENA_UNAVAILABLE`; see
+ * [`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md).
  *
  * Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. **None of
  * them is a reason to stop reading** — lookups are unaffected by ownership in

@@ -25,14 +25,8 @@
 //!
 //! # Arena-layout resolution
 //!
-//! Each block reserves **12 bytes per frame** (`align64(max_frames * 12)`):
-//! `parent: u32` + `edge_of_child: u32` + `depth: u16` + 2 bytes of padding. The `edge_of_child[c]`
-//! side array (frame → the edge whose child is that frame) lives in the block, as
-//! `docs/PHASE1.md` §5.2 intends, so plan compilation is an O(1) array walk and
-//! the `(parent, depth, edge_of_child)` triple is double-buffered together under
-//! this seqlock — a reader always sees a consistent snapshot. (This resolves the
-//! inconsistency between "edge_of_child lives in the topology block" (§5.2) and
-//! the nominal 6-byte stride in the §4.3 layout table.)
+//! 12 B per frame: `docs/PHASE1.md` §4.3 ("Topology block stride is 12 bytes
+//! per frame, not 6").
 //!
 //! The two `u32` arrays are placed first (`parent`, then `edge_of_child`) and the
 //! `u16` `depth` last, so both `u32` arrays stay 4-byte aligned for any

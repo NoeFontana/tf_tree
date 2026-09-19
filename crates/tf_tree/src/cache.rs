@@ -189,8 +189,7 @@ fn index(key: Key) -> usize {
 /// * `MissingEdge` — a link carrying the `0` edge sentinel, which `set_parent`
 ///   accepts for a reparent "where only the parent link matters". Permanent,
 ///   and on every lookup that crosses it.
-/// * `TreeTooDeep` — a path at the ceiling; `0034` surveyed 91 descriptions and
-///   found diameters to 30 against a `MAX_DEPTH` of 32.
+/// * `TreeTooDeep` — a path at the ceiling; see `docs/PHASE1.md` §7.1.
 /// * `UnknownEdge` / `MixedTimeDomains` — a defect anywhere on the path, which
 ///   the fold resolves every edge to find.
 ///

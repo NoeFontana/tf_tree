@@ -786,7 +786,8 @@ impl Plan {
     /// Evaluate the plan at nanosecond stamp `t`, sampling every dynamic edge at
     /// `t`. Assumes the caller has already validated generation and domain.
     ///
-    /// **`#[inline]` here is the load-bearing one** — see [`Self::at`] for the
+    /// **`#[inline]` here is the load-bearing one** — see `docs/API.md` §2.3,
+    /// *Cross-crate inlining is part of the zero-cost claim*, for the
     /// measurement. This is the only cross-crate call a downstream caller
     /// emitted before the attribute existed, because `at` is generic and was
     /// already being inlined without it.
@@ -846,34 +847,13 @@ impl Plan {
     /// Like [`Self::fold_at`] but each dynamic step gallops from its own resumable
     /// cursor (`cursors[step_index]`), for a monotone stamp sweep.
     ///
-    /// **Deliberately not `#[inline]`, and that is a measurement.** It was
-    /// marked alongside [`Self::fold_at`] for symmetry and the probe behind
-    /// [`Self::at`]'s table never executed it — the measured path is
-    /// `at → fold_at`, while this one is reached only from [`Self::fold_batch`],
-    /// and since `docs/decisions/0060` step 2 only from its **sub-chunk
+    /// **Deliberately not `#[inline]`, and that is a measurement:** see
+    /// `docs/API.md` §2.3. It is reached only from [`Self::fold_batch`], and
+    /// since `docs/decisions/0060` step 2 only from its **sub-chunk
     /// bypass**: a batch of one or two stamps, where a chunk's setup costs more
     /// than it saves. Every larger batch folds step by step and never calls
     /// this. (Before that change it was also reached directly from `at_many`,
     /// `at_many_into` and `at_many_into_f32`, which now share one body.)
-    /// Extending
-    /// that probe with an `#[inline(never)]` caller doing
-    /// `at_many_into(.., Layout::Mat4, ..)` over 1024 monotone stamps at depth
-    /// 3, best of five, x86-64, isolating this one attribute:
-    ///
-    /// | downstream profile | with `#[inline]` | without |
-    /// | --- | --- | --- |
-    /// | `lto = false`, `codegen-units = 16` | 328 ns/elem | **285 ns/elem** |
-    /// | `lto = "thin"`, `codegen-units = 1` | 285 ns/elem | **278 ns/elem** |
-    ///
-    /// It is a pessimization in both, and `objdump` says why. At the default
-    /// profile the body is ~1.9 kB and LLVM **declines to inline it at either
-    /// `fold_batch` call site with or without the hint** — both builds leave a
-    /// real call — so all the attribute does is codegen a second copy of it into
-    /// the embedder's object instead of calling the one in this crate. Under
-    /// thin LTO it does inline, and still loses. The scalar caller is untouched
-    /// either way: [`Self::at`] cannot reach this function, and that probe's
-    /// `caller_scalar` is byte-identical (`0x9ca`, same disassembly) across the
-    /// two builds — so [`Self::at`]'s tables stand as measured.
     fn fold_at_cursors(
         &self,
         g: &Guard,
@@ -906,103 +886,8 @@ impl Plan {
     /// * Any sampling error from an edge ([`LookupError::NoData`],
     ///   [`LookupError::Extrapolation`], …).
     ///
-    /// # Why `#[inline]` — and what was actually measured
-    ///
-    /// `docs/API.md` §2.3 makes the attribute normative on this method, on the
-    /// fold, on `Guard::sample` and on the `Iso3` operators (the last already
-    /// carried it). Its stated reason — "Rust does not inline across crates
-    /// without `#[inline]` or LTO" — **is not why it helps here**, and the
-    /// generated code says so:
-    ///
-    /// | downstream profile | before | after |
-    /// | --- | --- | --- |
-    /// | `lto = false`, `codegen-units = 16` (cargo's `--release` default) | 313 ns | 256 ns |
-    /// | `lto = "thin"`, `codegen-units = 1` (this workspace's own) | 217 ns | 207 ns |
-    ///
-    /// Depth-3 interpolating lookup, external crate, 20 M iterations, best of
-    /// five. The `objdump` of that caller explains the shape:
-    ///
-    /// | attribute placed on | caller `.text` | calls left in the caller |
-    /// | --- | --- | --- |
-    /// | nothing (the state before) | 106 B | 1 → `Plan::fold_at` |
-    /// | `Plan::at` **alone** | 106 B — *byte-identical* | 1 → `Plan::fold_at` |
-    /// | `fold_at` alone | 62 B | 1 → `Plan::at` |
-    /// | `fold_at` + `Plan::at` | 1332 B | 1 → `Guard::sample_hinted` |
-    /// | all five on this path | 1565 B | 3 → `sampler`, 2× `SampleRing::sample_from` |
-    ///
-    /// **CORRECTION (2026-09-06): the last row was labelled *"as shipped"* and
-    /// is not.** The table was measured 2026-08-02. On 2026-08-29
-    /// [`Self::at_tagged`] was interposed between this method and `fold_at`
-    /// (`0038`, the runtime domain tag) carrying **no attribute**, so the chain
-    /// is cut in the middle: everything below `at_tagged` inlines into
-    /// `at_tagged`, and a downstream caller emits exactly **one** real
-    /// cross-crate call — to `at_tagged`, not to `fold_at`. Re-derive it rather
-    /// than reading the row: an external `#[inline(never)]` probe that consumes
-    /// all seven `Iso3` components, at `lto = "thin", codegen-units = 1`, is 16
-    /// instructions and one indirect `call` whose GOT slot `objdump -R` and
-    /// `nm -C` resolve to `<tf_tree_core::plan::Plan>::at_tagged`. Adding
-    /// `#[inline]` to `at_tagged` and changing nothing else takes that same
-    /// probe to 1403 instructions and 8 calls — the table's shape again.
-    ///
-    /// **The attribute is deliberately not added**, and the reason is a
-    /// measurement rather than a preference: see [`Self::at_tagged`]'s own doc
-    /// comment, including the trap in how to measure it.
-    ///
-    /// **Five, not six.** `Self::fold_at_cursors` was marked in the same
-    /// commit and is not on this path at all — no row above ever moved because
-    /// of it. It was measured separately, on the batch entry point that does
-    /// reach it, and removed: see its own doc comment for the numbers. Marking
-    /// it had been symmetry, not measurement.
-    ///
-    /// **`at` is generic, so its MIR crossed the crate boundary anyway and a
-    /// downstream caller was already inlining it.** On its own the attribute
-    /// changes nothing. What it buys is LLVM's `inlinehint` on the *non-generic*
-    /// links: `fold_at` first — which was, when this was written, the one real
-    /// cross-crate call there was — then this method again, to stop the cost
-    /// model halting at a now-larger `at`, then `Guard::sample*` to remove the
-    /// last one. Marking fewer leaves a call in the middle; that is the claim
-    /// the third and fourth rows above test rather than assert — **and it is
-    /// now demonstrated in the other direction, because there is a call in the
-    /// middle again and it is `at_tagged`, not `fold_at`.**
-    ///
-    /// **The price is the caller's code size: 106 B → 1565 B at every embedder
-    /// call site**, ~15×, and that is the *scalar* caller only. It is why
-    /// `fold_at_with_derivatives`, `fold_latest` and `fold_latest_common` are
-    /// deliberately not marked — and why `Self::fold_at_cursors`, whose price
-    /// on the batch path went unmeasured for a round, no longer is either.
-    ///
-    /// Note the second row of the first table: `lto = "thin"` does **not**
-    /// subsume the hint. This workspace's own profile still moves ~4.5%, so the
-    /// benchmark gate is not indifferent to this change — `just bench-ab` is
-    /// workspace-wide and was not run. `docs/API.md` §2.3 item 3 (a gated
-    /// cross-crate row) has since landed and does measure it continuously:
-    /// `just embed-cost`, and the `embedding_cross_crate` row of
-    /// `docs/PHASE5.md` §9.2's artifact.
-    ///
-    /// **That row reports a ratio over §9.2's 5% criterion, and it also reports
-    /// the control that says what does close it.** Both columns are the same
-    /// three lines behind `#[inline(never)]`, one compiled in `tf_tree_bench`
-    /// and one here; three consecutive runs, `taskset`-pinned, paired rounds:
-    ///
-    /// | downstream profile | out-of-crate | in-crate | ratio |
-    /// | --- | --- | --- | --- |
-    /// | `lto = false`, `codegen-units = 16` | 240.0–240.1 ns | 191.3–191.8 ns | **1.250–1.254** |
-    /// | `lto = "thin"`, `codegen-units = 1` | 193.0–195.0 ns | 194.2–196.2 ns | 0.994–0.996 |
-    ///
-    /// So the boundary costs about a quarter of a depth-3 lookup at cargo's
-    /// `--release` defaults, and `lto = "thin"` in the embedder's own profile
-    /// erases it.
-    ///
-    /// **An earlier revision of this paragraph added "which no `#[inline]`
-    /// placement closes". That is removed, because the row's own toggle refutes
-    /// it.** Dropping this attribute from `Plan::fold_at` and re-running the
-    /// recipe takes the ratio from 1.253 to **1.001** — inside the gate — by
-    /// making the in-crate column 6.7% slower (191.5 → 204.4 ns) and the
-    /// `lto = "thin"` control 6.9% slower (193.2 → 206.6 ns), while the
-    /// out-of-crate embedder column gets *faster* (239.9 → 203.9 ns). A
-    /// placement moves it; what no placement measured here does is improve
-    /// every column at once. Nothing is claimed about whether some other one
-    /// would.
+    /// `#[inline]` is deliberate: see `docs/API.md` §2.3, *Cross-crate inlining
+    /// is part of the zero-cost claim*.
     ///
     /// **Do not read 203.9 ns against the 256 ns in the first table.** Those are
     /// different probes — the first is a throwaway 20 M-iteration loop, this one
@@ -1036,7 +921,7 @@ impl Plan {
     /// `sample_from`. This one is not, and it sits in the middle of
     /// them, so **it is the one real cross-crate call a downstream
     /// `plan.at(&g, t)` emits**: everything below it inlines into this body and
-    /// the caller gets a 16-instruction stub. [`Self::at`]'s doc table describes
+    /// the caller gets a 16-instruction stub. `docs/API.md` §2.3's table describes
     /// the fully-inlined shape that existed before this method did, and carries
     /// the correction and the way to re-derive it.
     ///
@@ -3009,7 +2894,7 @@ impl<'a> Guard<'a> {
     /// `#[inline]`, and so are its two siblings below: they are the last
     /// non-generic links in the chain a downstream crate has to inline through
     /// to reach the generic `SampleRing::sample`, whose MIR is available to it
-    /// anyway. [`Plan::at`]'s table measures what that is worth — without these
+    /// anyway. `docs/API.md` §2.3's tables measure what that is worth — without these
     /// three the caller still emits one cross-crate call, to
     /// [`Self::sample_hinted`].
     #[inline]

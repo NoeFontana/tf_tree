@@ -183,18 +183,7 @@ impl From<ShmError> for FrozenError {
     }
 }
 
-// `Display` and `core::error::Error` follow `docs/decisions/0059`, as
-// `ShmError`'s do in `check.rs`, and that module's comment gives the text rules.
-// Two arms here carry a remedy, and only these two: `docs/PHASE5.md` §2.4 is
-// NORMATIVE that a layout-hash mismatch *states that the file must be
-// re-frozen*, and §2.4's read path checks the hash twice, in this container
-// header (`LayoutMismatch`) and in the arena header inside it (`Arena`, whose
-// one producer is `validate_arena_header` in `FrozenArena::open`, after the
-// container header validated). `Arena` states it *before* its payload, so that
-// the payload's own trailing variant name is still the last thing printed and
-// stays the search key. `ShmError::LayoutMismatch` itself says nothing about
-// re-freezing, because a `memfd` attach shares it and there it means a
-// different build (`docs/PHASE2.md` §3.7).
+// `Display` and `core::error::Error` follow `docs/decisions/0059`, decision 2 (rules (a)-(g)).
 //
 // The match is exhaustive and there is no catch-all.
 

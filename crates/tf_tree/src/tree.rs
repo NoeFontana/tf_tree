@@ -497,27 +497,9 @@ impl TreeBuilder {
     ///
     /// # Binding a rendezvous over this arena is out of contract
     ///
-    /// This tree registers a `LIVE` participant record and takes **no lock
-    /// byte**: an arena the fd reaches is outside the sharing boundary
-    /// (`docs/PHASE2.md` §3.1), and there is no lock file for it to take a byte
-    /// in. Handing the fd to a child — what this call is for — costs nothing:
-    /// nothing else can find the segment, so no peer carries a probe and no
-    /// peer ever has an opinion about the record.
-    ///
-    /// Publish it instead — bind a `tf_tree_ipc::OwnerServer` over the fd so
-    /// that peers can join by name — and the byte-less record is what crossing
-    /// back over that boundary costs. Every peer that joined normally judges
-    /// liveness by the byte (`docs/PHASE2.md` §5.1), reads this record as
-    /// **dead** while this process is publishing, and frees it with
-    /// [`Tree::reap_participants`]; the creator holds no claim lease either, so
-    /// [`Tree::reap_dead`] takes the edge it is publishing to.
-    /// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
-    /// 2026-09-18 that this composition is **out of contract**.
-    ///
-    /// Nothing refuses it, and no single call can: the defect belongs to a pair
-    /// of calls and neither member can see the other. The supported way to
-    /// serve a created arena is `tf_tree::Open`, whose `Created` arm is this
-    /// call **plus** the rendezvous, the lock byte and the claim leases.
+    /// `docs/PHASE2.md` §3.1 ("An arena no runtime directory names sits outside
+    /// this boundary") and §3.9 ("A participant dies"); decided in
+    /// `docs/decisions/0031-the-participant-record-with-no-byte.md`.
     ///
     /// # Errors
     ///
@@ -1612,15 +1594,9 @@ pub struct Tree {
     #[cfg(all(feature = "shm", target_os = "linux"))]
     /// The rendezvous attachment, behind a lock so recovery needs only `&self`.
     ///
-    /// **`Mutex` and not a bare `Option`, for one reason**
-    /// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)):
-    /// [`Tree::inherit_ownership`] takes the attachment out, mutates it and puts
-    /// it back, so it needed `&mut self` — and **both bindings hold the tree in
-    /// an `Arc`** (`tft_tree` an `Arc<TreeShare>`, `PyTree` the `Arc<Tree>`
-    /// `claim_owned` requires), where `Arc::get_mut` fails the moment any plan or
-    /// publisher holds a clone. That is always, in a binding. So §3.5's recovery
-    /// was unreachable from C, C++ and Python — the languages a robot's nodes are
-    /// written in — and the lock is what makes it reachable.
+    /// **`Mutex` and not a bare `Option`:**
+    /// [`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)
+    /// §1 and *Why a `Mutex` and not a `RefCell` or an atomic swap*.
     ///
     /// **It costs the read path nothing, and that is structural rather than
     /// measured-and-hoped.** `Plan::at` lives in `tf_tree_core`, folds over the
@@ -3143,64 +3119,19 @@ impl Tree {
     /// # It answers "the arena has no owner", and the socket is only the first
     /// half
     ///
-    /// A hangup says **this process's channel** is dead. It does not say the
-    /// role is vacant, and after any takeover every survivor but the winner is
-    /// in exactly that state: socket pointing at a corpse, a live owner serving,
-    /// nothing wrong. Until
+    /// `docs/PHASE2.md` §3.5 and §0.0's *Ownership migration (§3.5)* row carry
+    /// the three states, that a `false` (and an `OwnerAlive` or `Contended` from
+    /// [`Tree::inherit_ownership`]) is not final, and that a loser stays
+    /// eligible; decided in
     /// [`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)
-    /// this returned `true` there — permanently — so §3.5's recommended loop
-    /// re-attempted an `F_OFD_SETLK` on byte 0 every control cycle for the life
-    /// of the process, to be told each time that somebody else owns it.
-    ///
-    /// So a hangup is followed by `F_OFD_GETLK` on byte 0 of the lock file this
-    /// session already holds, and the three states separate:
-    ///
-    /// | | socket | byte 0 | this |
-    /// |---|---|---|---|
-    /// | owner alive | up | held | `false` — **one syscall**, no probe |
-    /// | owner dead, role vacant | hung up | free | `true` — inherit |
-    /// | owner dead, somebody took over or is mid-bind — or a fresh `open()` holds byte 0 in passing | hung up | held | `false` |
-    ///
-    /// **The third row is not always an heir, and a `false` there is not
-    /// final.** A fresh `open()` that finds nobody serving passes through
-    /// §3.4 steps 2–4: it takes byte 0, meets this survivor's participant byte
-    /// and gives byte 0 back. Caught in passing, the byte reads held, and the
-    /// next call may answer `true` again. For the same reason, while this keeps
-    /// answering `true`, no single [`crate::Inheritance::OwnerAlive`] or
-    /// [`crate::Inheritance::Contended`] from [`Tree::inherit_ownership`] is final:
-    /// `0057` saw one on the first call in 21 of 120 trials with a joiner
-    /// running, and `Inherited` on the next call every time. Keep calling both
-    /// from the loop.
-    ///
-    /// **And the loser stays eligible.** If the new owner dies too, the kernel
-    /// releases byte 0 with no cooperation, and the next call answers `true`
-    /// again. Inheritance chains with nothing latched and no backoff to tune,
-    /// which is what §3.5's `retry connect with backoff` was reaching for.
-    ///
-    /// The cost in a healthy deployment is unchanged: the `poll` is `false` and
-    /// the probe never runs.
-    ///
-    /// Lookups are unaffected either way — `Plan::at` touches the mapping and
-    /// nothing else, and this is entirely control plane.
+    /// and
+    /// [`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md).
     ///
     /// # When a dying owner is seen: at the end of its exit, not its signal
     ///
-    /// `docs/PHASE2.md` §3.5, NORMATIVE: this answers `true` once this
-    /// survivor's attach connection has hung up **and** the last open file
-    /// description holding byte 0 has closed. For a dying owner that is the
-    /// **end of its exit** — the kernel writes any core dump and tears down the
-    /// address space first, and closes the process's files after — and a `fork`
-    /// child sharing those descriptions holds them until it exits. tf_tree adds
-    /// no delay, heartbeat or timeout to that event (D17), and nothing a
-    /// survivor can take shortens it: until then byte 0 is held, and nobody can
-    /// inherit or join. On one host
-    /// ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md))
-    /// a small `SIGKILL`ed owner was seen in about a quarter of a millisecond, a
-    /// 1 GiB one in about 100 ms, and a small `abort()` whose core went to the
-    /// host's piped `core_pattern` in about 1.1 s. The duration is the host's —
-    /// its crash helper, its page size, the owner's resident memory — and no
-    /// figure here is a bound; `docs/RUNBOOK.md`'s *An owner is not dead until
-    /// its exit ends* has the per-process trade.
+    /// `docs/PHASE2.md` §3.5 (NORMATIVE) and §3.7 step 9;
+    /// `docs/RUNBOOK.md`'s *An owner is not dead until its exit ends* has the
+    /// per-process trade.
     #[cfg(all(feature = "shm", target_os = "linux"))]
     #[must_use]
     pub fn owner_lost(&self) -> bool {
@@ -3558,27 +3489,14 @@ impl Tree {
     /// byte are deliberately the same integer, so this is what a caller passes
     /// to [`Self::participant_alive`] to ask about itself.
     ///
-    /// **On a tree from `TreeBuilder::build_shared` it indexes one table**,
-    /// because there is no lock file for it to index the other of. That is not a
-    /// smaller version of the same thing: every reclaimer keys on the byte
-    /// (`docs/PHASE2.md` §5.1), so such a record reads *dead* to any peer
-    /// carrying a probe, and `Tree::reap_participants` will free it while this
-    /// process is still publishing.
+    /// **On a tree from `TreeBuilder::build_shared` it indexes one table**: see
+    /// `docs/PHASE2.md` §3.1 ("An arena no runtime directory names sits outside
+    /// this boundary") and §3.9 ("A participant dies"), and
+    /// `docs/decisions/0031-the-participant-record-with-no-byte.md`.
     ///
-    /// **A peer can only hold that opinion if the arena is served**, and
-    /// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
-    /// 2026-09-18 that serving a `build_shared` arena through a hand-bound
-    /// `tf_tree_ipc::OwnerServer` is **out of contract**. Unserved — the fd
-    /// passed to a child, which is what `TreeBuilder::build_shared` is for — no
-    /// observer carries a probe and the paragraph above describes nothing that
-    /// happens.
-    /// The supported way to serve a created arena is `tf_tree::Open`, which
-    /// takes the lock byte before it builds.
-    ///
-    /// `tf_tree::Open`, `Tree::reap_participants`, `TreeBuilder::build_shared`
-    /// and `tf_tree_ipc::OwnerServer` above are deliberately **not** intra-doc
-    /// links: this method is compiled into the default tier and all four are
-    /// `shm`-gated,
+    /// `tf_tree::Open` and `TreeBuilder::build_shared` above are deliberately
+    /// **not** intra-doc links: this method is compiled into the default tier
+    /// and both are `shm`-gated,
     /// so linking them breaks `just stable-tier-check`'s rustdoc pass — which is
     /// the tier a published consumer reads. **[`Self::participant_alive`] is
     /// linked above and must stay linked**: it carries no `cfg` and is in the
@@ -4452,14 +4370,8 @@ impl fmt::Display for Described<'_> {
                 tree.frame_name(source),
                 tree.frame_name(cut_at),
             ),
-            // **Two bounds, one variant, so this arm has to read `depth` before
-            // it can say anything true.** Rendering one sentence for both is
-            // what shipped "path depth 16 exceeds the maximum of 16" — a
-            // self-contradiction, because the old `depth` was the guard's own
-            // count at the moment it fired and so equalled the bound rather
-            // than exceeding it. `0034` made the two cases disjoint (see
-            // `LookupError::TreeTooDeep`'s field docs) and this is the arm that
-            // spends that.
+            // `docs/PHASE1.md` §7.1 ("Two bounds, and they price different
+            // slots") and `LookupError::TreeTooDeep`'s field docs.
             //
             // The compiled-bound sentence names `static_edge`, and that is a
             // Rust-specific remedy on purpose: `docs/API.md` R5 makes the prose
