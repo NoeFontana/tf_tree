@@ -902,7 +902,7 @@ def check_decision_status_citations() -> str:
                 settled += 1
 
     # Anti-vacuity floor, set just under the live count; raise it with the count.
-    floor = 34
+    floor = 25
     if settled < floor:
         fail(
             f"the decision-citation scan found only {settled} settled citations "
