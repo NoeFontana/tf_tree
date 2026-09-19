@@ -425,10 +425,13 @@ def check_publishable(authority: str) -> str:
 
 
 def check_changelog(authority: str) -> str:
+    archived = ROOT / "docs" / "changelog" / f"{authority}.md"
     text = (ROOT / "CHANGELOG.md").read_text()
+    if archived.is_file():
+        text += "\n" + archived.read_text()
     if not re.search(rf"^## \[{re.escape(authority)}\]", text, re.M):
         fail(
-            f"CHANGELOG.md has no `## [{authority}]` section.\n"
+            f"Neither CHANGELOG.md nor docs/changelog/{authority}.md has a `## [{authority}]` section.\n"
             f"    The version moved and the changelog did not. Keep a Changelog 1.1.0 "
             f"is the format the file declares."
         )
