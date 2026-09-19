@@ -1,8 +1,10 @@
 # 0045: the spin that can starve what it waits for
 
-**Status:** draft
+**Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** —
+**Implementation:** *Implementation plan* below — four steps. **Decided
+2026-09-19, on the owner's delegation**: both halves are taken, the yield is
+`wait_for_publish`'s alone, and A8's invariant is untouched by the bound.
 
 ## Context
 
@@ -127,15 +129,27 @@ is what this layer can express, and its calibration is the same kind of number
 
 ## Implementation plan
 
-1. `sync::spin` yields under the std-backed arm, pure-spins otherwise. Verified
-   by `just bench-check` against the committed baseline, reported rather than
-   assumed, and by the existing frame tests passing unchanged.
+1. **`spin` splits** (question 3). `sync::spin` is unchanged and stays pure for
+   the four store-waiters; a second function — yielding under the std-backed arm,
+   pure-spinning otherwise — is used by `frame::wait_for_publish` alone. Both
+   must keep yielding under `cfg(loom)`, or the models stop scheduling the thread
+   they wait on.
+   - **Verified by** `just bench-check` against the committed baseline, reported
+     rather than assumed; by `just loom`; and by the existing frame tests passing
+     unchanged.
+   - **Stop point:** if `bench-check` moves on a path that does *not* reach
+     `wait_for_publish`, the split did not happen — the yield leaked into
+     `spin`.
 2. Both roles count every liveness round; past the limit, `Wait::Contended` →
-   `FrameError::InternContended`. Verified by a test that stages a claimant which
-   reads alive and never publishes — the existing suite already stages exactly
-   that shape in `a_claimant_that_cannot_be_proven_dead_is_never_stolen_from`,
-   which currently asserts the *opposite* property and must keep passing with a
-   limit large enough not to fire.
+   `FrameError::InternContended`. **Report the measured worst-case intern
+   duration and derive N from question 2's rule** — the number is not to be
+   assumed.
+   - **Verified by** a test that stages a claimant which reads alive and never
+     publishes. The existing suite already stages exactly that shape in
+     `a_claimant_that_cannot_be_proven_dead_is_never_stolen_from`, which asserts
+     the *opposite* property and **must keep passing**: it is the control that
+     says the bound did not become a takeover. A8's invariant is that a slow
+     interner is never stolen from, and that test is what holds it.
 3. `docs/PHASE2.md` §1's A8 gains the amendment; `Tree::lookup`, the C entry
    point and the Python method document the new refusal.
 4. A `loom` model reaches the bound, with a control that fails when the bound is
@@ -143,20 +157,93 @@ is what this layer can express, and its calibration is the same kind of number
 
 ## Open questions
 
-1. **May A8's "without limit" be amended at all, or is unbounded waiting load
-   bearing for something this record has not found?** A8 is one of the eight
+**All three answered 2026-09-19, on the owner's delegation.** The questions are
+kept in full below rather than collapsed, because a reopening needs the framing;
+each answer says where the evidence is.
+
+1. **ANSWERED: yes — and the amendment does not touch A8's invariant, because
+   A8 constrains *takeover*, not *waiting*.**
+
+   A8 is titled *"Interning must not spin forever on a **dead** claimant"*, and
+   its body is entirely about a claimant that dies between the hash CAS and the
+   id store — the crash point `intern.after_hash_cas_before_id_store`. Its fix is
+   *record the claimant, bound the spin, take the entry over if the claimant is
+   dead*, and the safety property it states is about `is_alive` failing safe:
+   **"a slow interner is never stolen from."**
+
+   Returning `Wait::Contended` to the caller **steals nothing**. The entry stays
+   with its claimant, `claiming[i]` is not CASed, no record is written, and a
+   slow interner is still never stolen from. So A8's invariant survives the bound
+   exactly, and what changes is a caller-visible refusal A8 never spoke to.
+
+   **The "without limit" sentence is not A8's.** It is `INTERN_SPIN_LIMIT`'s doc
+   comment in `crates/tf_tree_core/src/frame.rs` — an implementation note
+   describing the code A8 produced, not normative amendment text. This record's
+   draft attributed it to A8 and then hedged that the reading was its own; the
+   hedge is withdrawn because the distinction is checkable in the two documents.
+
+   What §1 still owes is an **amendment recorded the way §3.5's was** — the note
+   that a claimant which is neither running nor dead is a class A8 did not
+   consider, and that the wait is now bounded while the takeover rule is not.
+   That is step 3 and it is a docs change, not a re-decision.
+
+   ~~May A8's "without limit" be amended at all, or is unbounded waiting load
+   bearing for something this record has not found?~~ A8 is one of the eight
    Phase 1 amendments `docs/PHASE2.md` §1 holds, and `CLAUDE.md` names that
    section as the reason several orderings look odd. The argument here is that
    the unbounded case was written for a claimant that is *running*, and a stopped
    one is a different class — but that is this record's reading of A8, not A8's
    own statement.
-2. **What is the limit?** `INTERN_SPIN_LIMIT` is 10 000 pure-spin iterations
+2. **ANSWERED as a rule, not as a number — and step 2 owes the measurement the
+   rule consumes.** Two constraints bound it from opposite sides, and between
+   them the number is not delicate:
+
+   - **Unreachable in health, by orders of magnitude.** A successful intern is a
+     hash-slot CAS, a record write and a release store — sub-microsecond. One
+     round of `INTERN_SPIN_LIMIT` is 10 000 pure spins, ~0.4 ms at 3 GHz, which
+     already exceeds a healthy intern by roughly three orders of magnitude. Any
+     N ≥ 2 is therefore unreachable by a claimant that is merely slow.
+   - **Actionable by a control loop.** A robot loop runs at 100–1000 Hz, so a
+     refusal has to arrive inside a period to be worth anything. That puts
+     N × `INTERN_SPIN_LIMIT` in **single-digit milliseconds** — N of about 8.
+
+   **The rule, which is what this record fixes:** N is the smallest value whose
+   product with `INTERN_SPIN_LIMIT` exceeds the measured worst-case intern by at
+   least two orders of magnitude *and* stays under 10 ms. **Step 2 must report
+   the measured intern duration** rather than assume the sub-microsecond figure
+   above — that measurement is the one thing this question asked for that the
+   repository still does not record, and a bound derived from an assumed
+   numerator is the shape `0060` and `0055` both had to correct.
+
+   ~~What is the limit?~~ `INTERN_SPIN_LIMIT` is 10 000 pure-spin iterations
    between liveness checks (~0.4 ms at 3 GHz). A round bound of *N* liveness
    checks is therefore *N* × that, and picking *N* means deciding how long a
    control loop should wait before being told it cannot proceed. It wants a
    measurement of how long a real intern takes, which nothing in the repository
    currently records.
-3. **Does the yield belong in `sync::spin` for every caller, or only here?** The
+3. **ANSWERED by counting the callers: only here, and `spin` splits.**
+   `sync::spin` has five production call sites in `tf_tree_core`, and they fall
+   into two classes with nothing in between:
+
+   | call site | waits on |
+   |---|---|
+   | `buffer::read_slot` (seqlock retry) | a writer's release store, a few instructions away |
+   | `plan.rs`'s two generation retries | a topology mutator's store |
+   | `topology.rs`'s A2 acquire | the lock word, bounded |
+   | **`frame::wait_for_publish`** | **a peer that may not be running at all** |
+
+   Four of the five wait on a store a *running* peer is about to make, and
+   yielding in those trades a sub-microsecond wait for a scheduler round trip.
+   `buffer::read_slot` is the hot read path, so that is not a theoretical cost.
+   Exactly one waits on a peer whose scheduling is the thing in question.
+
+   So `spin` stays pure for the four and a second function — yielding under the
+   std-backed arm — is `wait_for_publish`'s alone, with each call site naming
+   which it wants. **The `loom` arm is unaffected**: it already yields for all
+   five, for interleaving rather than starvation, and that must stay true of both
+   functions or the models stop scheduling the thread they wait on.
+
+   ~~Does the yield belong in `sync::spin` for every caller, or only here?~~ The
    seqlock retry in `buffer::read_slot` and A2's acquire spin both wait on a peer
    that is a few instructions from a store; yielding there would trade a
    sub-microsecond wait for a scheduler round trip. If the answer is "only here",
