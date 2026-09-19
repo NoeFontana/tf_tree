@@ -18,60 +18,22 @@ load-bearing and are not to be trimmed. A row for a record with no erratum is a
 sentence or two saying what it decided and what it cost; it is an index, and the
 record is the artifact.
 
-**One erratum applies to several rows at once, so it is stated here rather than
-copied into each.** On 2026-09-19 a twenty-four-line rustdoc was added to
-`TreeBuilder::build_shared`, near the top of `crates/tf_tree/src/tree.rs`
-([`0031`](./0031-the-participant-record-with-no-byte.md) step 1). **Every
-`crates/tf_tree/src/tree.rs:NNN` citation with `NNN` past that point moved by
-twenty-four lines**, in both spellings — the bare `tree.rs:NNN` too, which the
-`scripts/line-citation-budget.txt` gate does not see at all. Measured rather
-than listed from memory: **in tracked Markdown**, the displaced sites are in
-`0005`, `0028`, `0034`, `0055` and `0059`, all `implemented` and therefore not
-repaired, because a line-number erratum per site would bury this file's real
-ones. **`0028` alone holds most of them.**
+**One erratum applies to many rows at once, so it is stated here rather than
+copied into each: a `path.rs:NNN` citation in a frozen record is unreliable.**
+Rustdoc added above a cited item moves every citation below it, and a sweep on
+2026-09-19 found citations across a dozen documents landing on a blank line, a
+bare `///` or a closing brace. Several were wrong before any edit — `0019`'s was
+some six hundred lines out, naming `impl Drop for EdgeWriter` where its sentence
+was about `Tree::frame` — so subtracting a known shift from one is as likely to
+land somewhere else wrong as to repair it.
 
-*"In tracked Markdown" is a scope this sentence needed and did not have for two
-rounds.* The same citations are written in Rust doc comments, which neither the
-gate nor the census that produced this list ever looked at —
-`crates/tf_tree_bench`'s `backing.rs` and `attach_bench.rs` carried three into
-`tree.rs`, one of them the *same* `tree.rs:1984` that `docs/benchmarks/tf2.md`
-had de-numbered in this change while its twin in a `//!` block stayed. Those
-three are repaired; the Rust corpus as a whole is **not** measured and is not
-claimed to be.
-
-Every site that *may* be edited has been repaired instead: `docs/PHASE2.md`
-(two), `docs/PHASE3.md`, `docs/PHASE5.md`, `docs/benchmarks/tf2.md`, `0019` and
-`0057` (`ready`), `0027` and `0030` (`draft`), and three in Rust doc comments —
-`crates/tf_tree_bench`'s `backing.rs` twice and `attach_bench.rs`. Each now
-names the symbol its own surrounding prose already named. *The four specs were
-repaired first and were missing from this list for three rounds, which is the
-list-stated-once rule failing at the place it was written.*
-
-**That list is stated once, here**, and no count of the attempts it took
-is given, because the count was itself restated wrongly a round after it was
-written.
-
-Only `tree.rs` citations are in scope: those files' other line-number citations
-are untouched, and several of them are stale for reasons that predate this
-change — `backing.rs` alone still carries three into other files, two of them
-already pointing at the wrong item. Nothing gates a line citation in a Rust
-comment at all, which is the follow-up the budget's header names.
-
-A status is what decides whether a record may be edited, and restating one from
-memory is the mistake the paragraph below this is about — it is what made this
-erratum name two frozen records that were not, and then miss four editable ones
-that were.
-
-**"Moved by twenty-four" is not the same as "twenty-four lines early", and the
-repair is what showed it.** `0019`'s citation was pointing at the wrong item
-*before* this edit — `impl Drop for EdgeWriter`, some six hundred lines from the
-`Tree::frame` its sentence was about. The shift is twenty-four lines on top of
-whatever each site already was, and nothing has measured the frozen ones
-individually. Read them as *unreliable*, not as *off by twenty-four*: subtracting
-24 from one is as likely to land somewhere else wrong.
+They are not repaired in place, because an `implemented` record is frozen.
+**Read the symbol the record's own surrounding prose names.** Every site that
+*may* be edited has been converted to one; the same citations are also written
+in Rust doc comments, where nothing gates them at all.
 `scripts/line-citation-budget.txt` is the register of what remains and the gate
-that stops more being written; the rule those sites predate is `CLAUDE.md`'s
-*cite a symbol, never a line number*.
+that stops more being written, and `CLAUDE.md`'s *cite a symbol, never a line
+number* is the rule these sites predate.
 
 **This table does not restate a record's status, and it used to.** The status is
 the record's own first line, and a column that copies it is a second place to
@@ -162,6 +124,7 @@ record cannot take in place.
 | [`0058`](./0058-the-fields-a-python-exception-only-printed.md) | `PHASE3.md` §4.4 promises Python exceptions carrying structured attributes; none has ever carried one, and its 2026-09-14 amendment (#335) left the attributes, the `KeyError` base and four unbuilt classes to a record. **Decided 2026-09-14, on the owner's delegation.** Attributes are set on the raised instance's `__dict__` with `args` left `(message,)`, **measured on six interpreters to survive pickling**, where fields in `args`, a required keyword constructor or slot storage each break something. An id reaches Python as the arena's stored names, an edge as a plain `(parent, child)` tuple, or as `None`; `ExtrapolationError.domain` is the call site's tag; `.owner_slot` replaces §4.4's `.owner_pid` and is `None` exactly for the `CLAIMING` sentinel the facade already refuses as a number; `ArenaHeldButUnreachableError` carries `holder_slots` and `ownership_held` but not the namespace-local `first_pid`. The `KeyError` base is struck, and the stub stays precise, the attributes existing only on raised instances. A class is added only when a Python handler needs to branch on it and a Python test can make it raise: `TimeDomainMismatchError`, `EdgeAlreadyClaimedError`, `ArenaHeldButUnreachableError`, `NonMonotonicStampError` and `ArenaAbsentError` get classes, the last a leaf with no parent, because a parent's natural name would collide with C's `TFT_ERR_ARENA_UNAVAILABLE`; `ClaimRevokedError` waits for a Python-reachable trigger. `TopologyChangedError`'s generations are held by a Python test driving `tf_tree_rendezvous_child join-reparent`, which `just py-test` builds first; the ruling's fallback, deferring them like `ClaimRevokedError`, was not needed. `.owner_slot`'s `None`, the `ArenaAbsentError` leaf and the reparent test are rulings on three concerns review raised after the move to `ready`, made the same day under the same delegation. Argues from D11 that R5's *"not a field"* does not reach a Python exception, and from §7.1 that §7.2's singleton rule cannot mean type objects. Landed in #346, after `0059`'s implementation (#345), which edits the same mappers.  **Erratum (2026-09-18, `0055` step 6):** this record quotes `IpcError`'s `Display` as reading *"(slot {slot}, pid {first_pid})"* and *"Stop the process holding slot 0"*. That text is gone — the message now reads `lowest slot N (pid M, the creator's), ownership byte free (ArenaHeldButUnreachable)` and prescribes nothing, because a remedy needs to name processes and `Display` sees only bytes. **The record's conclusion is unaffected**: the pid is still printed, so `str(e)` still hands a Python supervisor the number this record declines to expose as an attribute, and R5 still forbids parsing it out. Recorded here because `0058` is `implemented` and frozen. **Second erratum (2026-09-18, on [`0031`](./0031-the-participant-record-with-no-byte.md)'s answer):** this record's plan step 1 prescribes the `PHASE3.md` §4.4 bullet that lists `ClaimRevokedError` as waiting for a Python-reachable trigger with *"draft `0031` named as what could create one, **marked `(draft)`**"*, and its verification is *"every bullet of the amendment is still true of `main`"*. That bullet has been rewritten, because the answer `0031` took — a served `build_shared` arena is out of contract — changes no code path and so cannot create the trigger. **Re-running or auditing step 1 must not restore the `(draft)` marking or the claim**; what still stands, and is the step's actual subject, is that `ClaimRevokedError` has no Python-reachable trigger and the failure reaches Python as the base `TfTreeError`. |
 | [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md) | `0040` for the four error types it did not reach. **Decided 2026-09-14, on the owner's delegation**, with the draft's four judgement calls accepted as written: `ShmError`, `FrozenError`, `LayoutError` and `ParticipantError` get hand-written `Display` and `core::error::Error`, so `BuildError::Layout`/`Shm`/`Participant`, `OpenError::Map` and `FrozenFileError::Frozen` stop printing struct literals, and `?` works from `Tree::attach_shared` (measured `E0277` before step 1 of its plan). The text is ASCII, one clause, at most 120 bytes, and ends with its variant name as the runbook's search key; errnos print as `errno N` and hashes as `0x{:08X}`; no `source()`. `FrozenError`'s layout mismatch states that the file must be re-frozen, because `PHASE5.md` §2.4 is NORMATIVE that it does, and `ShmError::ParticipantTableFull` stops claiming a full table, because on the `Open` path it is the erasure of `SlotTaken`/`SlotOutOfRange`. The impls existing is a commitment and their text is not (R5). #339 merged as `0761583` in the shape the record assumed, so its plan was one PR, #345, and it landed before `0058`'s, which rewrites the same Python mappers. |
 | [`0060`](./0060-the-batch-fold-that-reads-before-it-interpolates.md) | the SoA batch-SIMD lever `0016` called unreachable, measured on the real fold at `681e601` against a ~5% floor and a 1.3× kernel bar fixed before any engine number; the per-lever reading and an engine `-C no-vectorize-loops` control came after. A two-phase chunked `fold_batch` (read every bracket, then interpolate) with a branch-free, bit-identical kernel is −43% to −58% on `at_many` over synthetic series data, and an independent re-measurement reproduces it within ~1%. **Much of that is not SIMD**: the restructure alone, with scalar `eval`, is −17% to −51% on every `at_many` cell, stationary ones included, and the loop vectoriser is 12.5–58% of the saving. On stationary edges the kernel is +80–115% against the restructure, and the kernel's LerpSlerp half fails the 1.3× bar. Proposes measuring a recorded `/tf` mix first, then the restructure, then a ScLerp-only kernel if the mix wants it, and records that neither `bench-check` nor `embed-cost` has a batch row that could see either. **Step 0a has since been measured (§9, 2026-09-16), and it is the half that decides the kernel:** on the tree's one real recording four of five dynamic edges never move at all and the fifth is 99.2% series per bracket, its 13.7% large-arc under a 100 Hz sweep being two publication gaps rather than fast motion. Both policies share one series bound — `θ ≤ 0.15 rad` between samples — so the mix is a function of publish rate, and that bound, not the percentages, is what carries to another corpus. It also corrects §5: a motionless `ScLerp` edge takes the degenerate arm only when the quaternion's zero pattern makes `conj(q)·q` cancel exactly, and otherwise sits in the **series** region on ~5e-36 of rounding. The harness is committed (`bracket_mix`); the prototype still is not. **Step 1 has since been measured too (§10, 2026-09-17), on `main` because the fold is byte-identical to `681e601`, and it amends Decision A in three places.** The restructure's win is the **phase buffering** and nothing else: hoisting each step's sampler and policy out of the per-stamp loop — 3 072 arena lookups per batch where 3 would do — is +0.71% on the flagship, the loop order and the dropped out-of-line call are −1.3% to −3.4%, and deferring the `eval` carries the whole 23–25%. So step 1's escape hatch ("if one sub-change carries A's saving without phase buffering, land that") does not open. **Sixteen lanes beat sixty-four** — equal at N ≥ 63, ahead below, at 6 600 B of frame against 17 720 B, where the record had derived 4.8–5.0 kB unbuilt. **A batch under three stamps must bypass the chunked path**: it is +82% at N = 1 even at 16 lanes, because the lanes are initialised whatever the batch holds. And `into_mat4` is **not** the weak entry point the record built A's per-entry-point stop rule around — it is −22.7% to −23.8% against the flagship's −24.5% to −25.1%, so A lands as one fold body. On the recorded stream A is −19.7% to −35.7%, better than on the fixture. **Step 2 landed Decision A on 2026-09-18 (§11)**, and the record's status line now says *partially implemented*: `Plan::fold_batch` is a chunked two-phase fold at sixteen lanes, all four batch entry points share it, a batch under three stamps takes the per-stamp fold, and `SampleRing::sample_from` and the batch share **one** read body. It is −14.2% to −31.4% on every 1024-stamp row at `[profile.bench]` with the untouched `into_quat_twist_1024` control flat to two decimal places, −10.4% to −24.2% at `[profile.embedder]`, and no batch size loses. Three of the record's own predictions did not survive contact. **The entry frames do not grow at all** — 888 B and 344 B, the same two numbers *Consequences* quotes as the *before* state — because the lanes live one `#[inline(never)]` call in, so the `MaybeUninit` that bullet reached `unsafe` for was never needed. **The small-N regression the frame was blamed for had a different cause**, found only by splitting the frame, measuring no change, and reading the prologue. And **one read body costs 6–11% on the scalar `Plan::at` rows at `[profile.embedder]`** — isolated to the read split with `2524667`'s own `plan.rs`, disclosed with a reopen criterion rather than closed, and invisible to `just bench-check`, whose `lookup_latency` row its own fitness probe refuses on this host. Open question 3 is answered, and answered against the question as asked: the lap check never moved on the scalar path. **Decision B is still undecided** — step 0b needs kernels that went with the prototype's worktree. |
+| [`0061`](./0061-a-freeze-protects-the-argument-not-the-pointers.md) | a frozen record's `path.rs:NNN` citations rot without anyone touching it — rustdoc added above a cited item moves every citation below — and the freeze forbids the one repair. Two costs: the shared erratum above this table grew to fifty-four lines enumerating shifts it then called unreliable, and `just lint` can never **validate** the citations it counts, because a frozen record's broken pointer has no legal fix. Decides that a freeze protects the argument, not the pointers: a frozen record may be edited to convert a line citation into a symbol citation **and for nothing else**, a diff shape that is itself checkable. Unblocks a citation-target validator, which is what makes trimming an over-long doc comment safe. Three open questions, all about the validator's scope — the bare spelling, Rust doc comments, and whether a converted site keeps its old line number as a hint. |
 
 Cite `docs/PROJECT.md` and `docs/PHASE1.md`, never `0002`/`0003`; they are kept
 in place, unedited apart from their banners, as history.

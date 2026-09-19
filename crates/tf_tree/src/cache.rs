@@ -175,27 +175,14 @@ fn index(key: Key) -> usize {
 /// # A refusal is a result, and is cached like one
 ///
 /// `f` runs only when there is a `Plan` to run it against; a key whose compile
-/// was refused answers with the refusal and does not call `f`. That is the
-/// whole of issue #259, whose symptom is that a frame pair which cannot be
-/// planned used to recompile **on every lookup, forever** — the `?` returned
-/// before the store and nothing else on that path reached the cache.
+/// was refused answers with the refusal and does not call `f`. That is issue
+/// #259, whose symptom is that a frame pair which cannot be planned used to
+/// recompile **on every lookup, forever** — the `?` returned before the store.
 ///
-/// It was invisible while it was cheap. `MAX_DEPTH` was 16 and was checked
-/// *during* the walk, so a 40-edge path was refused after 16 edges at ~50-70 ns.
-/// `0034` separated the raw-walk bound from the compiled-plan bound, and a path
-/// that is going to be refused is now walked to its full length and — under the
-/// fold that gives `0034` its stated error precedence — folded in full as well:
-/// ~1.0 µs where the bound stops the walk early, ~1.8 µs where it does not. A
-/// consumer polling one mis-configured pair pays that per lookup.
-///
-/// **Which pairs those are is narrower than it first looks**, and the three
-/// examples that stood here — a typo'd frame name, a sensor that never came up,
-/// a URDF branch nobody publishes — were all wrong. The first two never reach
-/// this function: `Tree::lookup` resolves names through `find`, which is a
-/// lookup and not an intern, so an undeclared name is `UnknownFrame` before a
-/// compile is attempted. The third compiles perfectly and fails in `Plan::at`
-/// with `NoData`, which this deliberately does not cache. The pairs that
-/// actually pay are the ones whose *topology* refuses:
+/// The pairs that pay are the ones whose *topology* refuses — not a typo'd or
+/// absent frame name, which `Tree::lookup` rejects as `UnknownFrame` before any
+/// compile, and not a pair with no samples, which fails later in `Plan::at`
+/// with `NoData` and is deliberately not cached:
 ///
 /// * `Disconnected` — a declared frame whose parent link was never established,
 ///   or one `reparent`ed out of the queried subtree.
@@ -207,118 +194,53 @@ fn index(key: Key) -> usize {
 /// * `UnknownEdge` / `MixedTimeDomains` — a defect anywhere on the path, which
 ///   the fold resolves every edge to find.
 ///
-/// Measured through `Tree::lookup` on a 60-edge chain that walks inside
-/// `MAX_PATH_EDGES` and folds past `MAX_DEPTH` — the arm that pays the *whole*
-/// fold before refusing — medians of 5 rounds of 20 000 reps, `taskset -c 2`,
-/// builds interleaved: **579.0 ns → 291.5 ns, −49.6%**, ranges [576-585] against
-/// [291-297]. It lands on top of the *shallow* refusal's 290.9 ns, which is the
-/// point: what is left is resolving the two names, and the compile is gone
-/// whatever it would have cost. A third build carrying only #264's change moved
-/// this metric −0.9%, so the win is this change's and not that one's.
+/// Worth **−49.6%** on the arm that pays the whole fold before refusing (579.0
+/// → 291.5 ns, 60-edge chain), landing on top of the shallow refusal's 290.9 ns
+/// — what is left is resolving the two names. The successful-hit control moved
+/// +0.1%, inside its own range, so widening [`Entry`] to hold a `Result` cost
+/// the hit path nothing.
 ///
-/// The **control** is `lookup_ok_hit_ns` — a successful repeat lookup, the path
-/// the copy-count table above exists to protect. It moved +0.1% (504.5 → 505.1),
-/// inside its own run-to-run range. Widening [`Entry`] to hold a `Result` cost
-/// the hit path nothing, which is what the `&entry.result` match is for. A
-/// 4160-byte `memcpy` there would have cost ~40 ns against a 506 ns baseline —
-/// that being `Plan`'s size when this was measured; it is 2064 since `0042`, so
-/// the same argument now runs on half the bytes and holds by a wider margin —
-/// +8%, an order of magnitude outside the run-to-run range — so the control is
-/// not merely consistent with no copy, it excludes one.
-///
-/// The **miss** path did move, and it is written down here because it was
-/// measured rather than because it matters: the three `Plan` copies `Tree::lookup`
-/// makes on a miss are 4160 bytes each where they were 4120 — figures from when
-/// this was measured, 2064 and 2024 since `0042` — since the `Err`
-/// variant's niche lives inside `steps` and the leading bytes can no longer be
-/// treated as padding. 120 bytes added to a path that already moves twelve
-/// kilobytes, on the arm #264 cut by more than half.
-///
-/// # The slot it occupies is not a cost worth avoiding
-///
-/// The objection is that 16 direct-mapped slots have no notion of usefulness,
-/// so a permanently-broken pair can evict a working plan and the victim is the
-/// colliding entry rather than the least useful one. True, and it is the
-/// argument *for* treating the two alike rather than against it: a cache
-/// entry's worth is its hit rate times the work it avoids, and a refusal avoids
-/// **more** work per hit than a plan does — the refused path is the one that
-/// walks to the bound. Ranking refusals below plans would be the arbitrary
-/// choice here. A separate negative table was the alternative and buys nothing
-/// it would not also cost: at 32 bytes a refusal it lands at about the same
-/// footprint, in exchange for a second index, a second residency argument, and
-/// a working set split across two tables that the [`index`] measurements were
-/// never taken over.
+/// A permanently-broken pair can evict a working plan, since 16 direct-mapped
+/// slots have no notion of usefulness. That is the argument *for* treating the
+/// two alike: a refusal avoids **more** work per hit than a plan does, because
+/// the refused path is the one that walks to the bound.
 ///
 /// # Why a closure and not `-> Plan`
 ///
-/// `Plan` is `Copy` and **2064 bytes** (`size_of`, measured; `align_of` 8, so
-/// the 24-byte `Key` costs 24 rather than hiding in padding, making `Entry`
-/// 2088 and the 16-slot table **32.6 KiB per thread**). Those were 4160, 64,
-/// 4224 and 66.0 KiB until
-/// [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md):
-/// the key used to disappear into `Plan`'s cacheline padding, which is why the
-/// slot shrank by less than `Plan` did. Returning one hands the caller a copy,
-/// and the caller is `Tree::lookup`, which only wants to call `Plan::at` on it.
+/// `Plan` is `Copy` and 2064 bytes, making [`Entry`] 2088 and the 16-slot table
+/// 32.6 KiB per thread. Returning one hands the caller a copy, and the caller
+/// only wants to call `Plan::at` on it. Counted with a `memcpy` interposer over
+/// a hot-cache harness — two things had to change together, and either alone
+/// buys nothing:
 ///
-/// **Every byte count in the table below was measured at `MAX_DEPTH = 16`**,
-/// where `Plan` was 2112 and the slot 2176, and `0034` has since moved the
-/// constant to 32. The counts are not re-taken — the `LD_PRELOAD` interposer
-/// session is not reproducible from here — and they do not need to be: what the
-/// table establishes is *how many* copies each binding makes, which is a
-/// property of the code shape and not of the array's length. The doubling makes
-/// the argument stronger, since every copy the shipped form avoids is now twice
-/// the size.
+/// | probe binding | returns | copies per cache hit |
+/// |---|---|---|
+/// | `&slots[idx]` | `Plan` | 3 — the returned `Plan`, slot → temporary → caller |
+/// | `slots[idx]` | closure | 1 — the whole [`Entry`], lifted before the key is compared |
+/// | `&slots[idx]` | closure | **none** — what ships |
 ///
-/// **Counted, not read off a disassembly.** A `memcpy` interposer
-/// (`LD_PRELOAD`, versioned `memcpy@GLIBC_2.14`) over a hot-cache harness, with
-/// the totals differenced between 1000 and 2000 lookups so process start-up
-/// cancels exactly. Three builds of one harness, because **two things had to
-/// change together and either one alone buys nothing**:
+/// The table establishes *how many* copies each shape makes, which is a property
+/// of the code shape and not of the array's length. Its session's per-copy byte
+/// figures are deliberately not restated — they predate both `0034` doubling
+/// `MAX_DEPTH` and `0042` shrinking `Plan`, so the only sizes given here are the
+/// current ones above.
 ///
-/// | probe binding | returns | copies per cache hit | ns/lookup | vs. shipped, same session |
-/// |---|---|---|---|---|
-/// | `&slots[idx]` | `Plan` | 3 x 2072 B | 606.9-616.2 | 575.3-580.1 |
-/// | `slots[idx]` | closure | 1 x 2176 B | 616.4-623.4 | 580.5-589.6 |
-/// | `&slots[idx]` | closure | **none** | — | — |
+/// # The `&` is load-bearing
 ///
-/// Row 3 is what ships, so it has no row of its own: it is the right-hand
-/// column, re-measured against each rejected arm in that arm's own session. The
-/// 2072-byte copies in row 1 are the returned `Plan` travelling slot -> stack
-/// temporary -> caller; the single 2176-byte copy in row 2 is the whole `Entry`
-/// lifted out of the slot *before* the key is compared, to decide 24 bytes'
-/// worth of question. Only the shipped form has neither. What survives on the
-/// hit path is two 184-byte copies of the `Result` return, which were there
-/// before and are not the plan.
-///
-/// Timings are medians of 25 rounds of 200 000 calls, the two builds under
-/// comparison run alternately — 6 runs each for row 1, 5 for row 2 — and
-/// non-overlapping in both pairings. The shipped arm reads 575-580 in one
-/// session and 580-590 in the other, which is why every comparison is paired
-/// and alternating and why no cell here may be read against a cell from the
-/// other row: the paired difference is the claim, the absolute number is not
-/// (`PHASE5.md` §9.3).
-///
-/// # The `&` is load-bearing, and this comment used to say it was not
-///
-/// An earlier revision recorded that `slots[idx]` and `&slots[idx]` compile to
-/// byte-identical machine code because LLVM sinks the copy past the key
-/// comparison, and concluded the reference was cosmetic. That was measured on
-/// the `-> Plan` shape, where it is beside the point: a function returning
-/// `Plan` by value copies the entry regardless, so removing one copy changes
-/// nothing. Once the return became a closure the copy had nowhere else to go,
-/// and row 2 is what it costs — a full slot memcpy per hit and the entire win
-/// gone. Do not "simplify" the `&` away.
+/// Do not "simplify" it away. It looks cosmetic on the `-> Plan` shape, where a
+/// by-value return copies the entry regardless — and an earlier revision of this
+/// comment concluded exactly that. Once the return became a closure the copy had
+/// nowhere else to go: row 2 is what removing it costs, a full slot `memcpy` per
+/// hit and the entire win gone.
 ///
 /// # `f` cannot re-enter the cache
 ///
 /// On a hit it runs while the `RefCell` is immutably borrowed, so a re-entrant
-/// lookup that *missed* would panic in `borrow_mut`. Today that is not a
-/// convention to be careful about but a property of the crate graph: the one
-/// caller's closure does `Tree::guard` then `Plan::at`, and `Guard` and `Plan`
-/// live in `tf_tree_core`, which `tf_tree` depends on and which therefore cannot
-/// name this module. A `pub(crate)` with one caller is the other half — the
-/// thing to re-check is a **second** caller whose closure reaches back into
-/// `tf_tree`, because that one would compile.
+/// lookup that *missed* would panic in `borrow_mut`. Today that is a property of
+/// the crate graph rather than a convention: the one caller's closure does
+/// `Tree::guard` then `Plan::at`, and both live in `tf_tree_core`, which cannot
+/// name this module. The thing to re-check is a **second** caller whose closure
+/// reaches back into `tf_tree` — that one would compile.
 ///
 /// # Errors
 ///
