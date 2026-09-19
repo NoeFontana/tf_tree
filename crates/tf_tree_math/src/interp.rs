@@ -192,226 +192,87 @@ impl Iso3 {
 
 /// Shortest-arc spherical linear interpolation of two unit quaternions.
 ///
-/// This is the rotation kernel [`LerpSlerp`] evaluates, and it is public for
-/// the same reason [`screw_pow`] — [`ScLerp`]'s kernel — always was: a caller
-/// who holds two rotations and no translation should not have to build a pair
-/// of [`Iso3`] with throwaway zero translations to reach it. A caller whose
-/// quaternion type is not [`Quat`] still converts, because the types differ;
-/// what goes away is the pair of isometries.
+/// The rotation kernel [`LerpSlerp`] evaluates, public so that a caller holding
+/// two rotations need not build a pair of [`Iso3`] with throwaway zero
+/// translations to reach it. `docs/API.md` §2.7 authorises the tier and carries
+/// what the round trip cost; the `tf_tree` facade re-exports this as
+/// `tf_tree::slerp`, so an engine consumer takes no second dependency for it.
 ///
-/// **What the round trip costs is a shape, not a number.** Both arms end in the
-/// same out-of-line `slerp`; what the `Iso3` arm puts in front of it is 256
-/// bytes of stack, two 64-byte isometries written out field by field, and a
-/// lerp of one zero translation into another that LLVM does not fold away.
-/// Compiled as exported `extern "C"` arms at `opt-level = 3` on x86-64, that
-/// prologue is 45 instructions bare (7 against 52) and 28 through the
-/// consumer's own `nalgebra` adapter (41 against 69).
-///
-/// **Those two counts are a codegen artifact and are quoted as one.** Across
-/// four release profiles they moved to 48 and 31, and no build produced the
-/// same figure for both argument shapes — so there is no single number here to
-/// carry into a gate, and an earlier revision of this paragraph quoting one
-/// (`15` against `51`, then "36 either way") reproduced in no build measured.
-/// What is stable is the sign: the wrapper survived every configuration tried,
-/// and that is the whole of the benefit.
-///
-/// `docs/API.md` §2.7 is what authorises this being `pub` and carries the §7
-/// walk, item 8 — what a caller *loses* by taking it — included.
-///
-/// **The `tf_tree` facade re-exports this**, so a consumer of the engine
-/// reaches it as `tf_tree::slerp` and does not take a second direct dependency
-/// on this crate to do it. `tf_tree`'s `tests/math_reexports.rs` is what says
-/// the two names are one item.
-///
-/// # Angles
-///
-/// **Every angle here is a *quaternion* angle** — `acos(qa·qb)`, which is
-/// **half** the rotation the pair spans, because `qa·qb = cos(Δ/2)`. Read as
-/// rotations these numbers are out by a factor of two, in the direction that
-/// makes the fast path look wider than it is; a caller sizing a publish rate
-/// against them is who this section is for.
+/// Every angle below is a **quaternion** angle — `acos(qa·qb)`, which is half
+/// the rotation the pair spans. Read as rotations these are out by two.
 ///
 /// # Preconditions
 ///
-/// Both inputs must be unit, and nothing here checks. A norm test per call
-/// would be paid by every caller on the interpolation hot path to catch one
-/// who has already broken the only invariant [`Quat`] has, and this crate has
-/// no error type to report it through — see [`Quat::normalize`], which makes
-/// the same trade in the other direction for the one input (a zero
-/// quaternion) where the arithmetic would produce infinities rather than
-/// merely a wrong answer.
-///
-/// **Nor a `debug_assert!`, which is the version of that question worth
-/// answering**, since it would cost a release caller nothing and
-/// `iso3.rs`'s `vinv_c3` domain assertion is right there as a precedent.
-/// Three reasons it is not the same case:
-///
-/// * That precedent is a **private** function with exactly one caller in this
-///   crate, whose argument [`crate::log_se3`] derives from [`crate::log_so3`]
-///   and is therefore in range by construction — the assertion pins a contract
-///   the crate owns both ends of. This is a public entry point whose inputs come
-///   from outside, and in the engine from a pose another *process* wrote into
-///   a shared arena.
-/// * **Nothing upstream enforces the invariant**, so the assertion would fire
-///   on real data rather than on a bug: no push path in `tf_tree_core` or the
-///   facade normalizes a stored pose, and a quaternion that has drifted a few
-///   ulp off unit gives a slightly wrong answer here, not a wrong *kind* of
-///   answer. A `debug_assert` would make that a panic in every debug build —
-///   this crate's proptests, `just miri`, and every downstream `cargo test` —
-///   and not in release, which is a value that works or aborts depending on
-///   `-C debug-assertions`.
-/// * It would not catch the hazard this function actually has. The
-///   `# Storage order` transposition produces a **unit** quaternion that is the
-///   wrong rotation, and no norm test of any tolerance sees it.
+/// Both inputs must be unit, and nothing checks — not even a `debug_assert!`.
+/// No push path in the engine normalizes a stored pose, so an assertion would
+/// fire on drifted real data rather than on a bug, and it would miss the hazard
+/// this function actually has (`# Storage order`).
 ///
 /// `s` is a dimensionless fraction of the segment, **not** a stamp. A caller
 /// interpolating between two samples divides in integer nanoseconds and passes
 /// the ratio; nothing in this crate knows what time is.
 ///
-/// **`s` belongs to `[0, 1]`, and nothing clamps or refuses.** Out of range the
-/// function extrapolates, and *how well* is a property of the pair rather than
-/// of `s`, because the pair alone picks the branch — so an extrapolation's
-/// accuracy is set by the publish rate, which is the one thing the caller
-/// asking for it is least likely to be thinking about. Measured against the
-/// exact geodesic `qa·exp(s·Δ·axis)` over 40 rotations, worst case:
+/// # Range of `s`
 ///
-/// * **Closed form** (quaternion angle above `0.15` rad) — the formula is
-///   `sin((1−s)·θ)/sin θ` and holds off the segment as well as on it:
-///   `7.2e-15` at `|s| = 20`, part of which is the reference's own rounding.
-/// * **Series** (between the two thresholds) — **two mechanisms, and which one
-///   loses the bound depends on the angle, not on `s`.** Far out it is
-///   truncation: the weight series is calibrated for `|a| ≤ 1`, and outside it
-///   `k = 1 − a²` grows quadratically until six terms stop covering it — `6.0e-6`
-///   at `|s| = 20` (quaternion angle `0.1` rad), and `1.6e3` by `|s| = 100`,
-///   not a rotation at all. **Where the `1e-15` bound is first lost, though, the
-///   cause at the small-angle end is cancellation and not truncation**: `wa` and
-///   `wb` grow like `∓s` while their sum stays near 1, so the rounding floor is
-///   `(|wa| + |wb|)·ε` and the result cancels back down onto the sphere from
-///   there. Measured over 40 rotations, the bound goes at `|s| ≈ 2.3`–`2.9` for
-///   a quaternion angle of `0.1499` rad and at `|s| ≈ 3.2`–`5.0` for `0.02` rad
-///   — and at `0.02` rad the largest term the six-term series still *carries* is
-///   `5.9e-18` at `|s| = 5`, three orders under the bound, so the remainder it
-///   drops is smaller again, and the observed error there tracks the
-///   cancellation floor instead (`1.2e-15` measured against a floor of
-///   `2.0e-15`). At `0.1499` rad the two are the same size right where the
-///   bound goes: at `|s| = 2.3` the series' weights still match
-///   `sin(aθ)/sin θ` to within their own ulp while the floor is `7.9e-16`, and
-///   by `|s| = 3` the weights are `2.4e-15` off against a floor of `1.1e-15`.
-///   An edit adding a seventh term would therefore move the `0.1499` end and
-///   leave the `0.02` end exactly where it is.
-/// * **LERP fallback** (below `1e-6` rad) — a chord, extrapolated and
-///   renormalized. Mechanically the crudest of the three and numerically the
-///   most forgiving, because the arc it cuts is tiny: `1.2e-14` at `|s| = 100`,
-///   and it takes `|s| = 1e6` — a swept rotation of `0.2` rad — to reach
-///   `3.3e-4`.
-///
-/// **So extrapolation is not supported here**, and that is a statement about
-/// this entry point rather than about the habit: `tf_tree_core` answers a stamp
-/// outside an edge's sample window with `ExtrapPolicy` — `Error`, `Hold` or
-/// `ConstantTwist` — and never hands this function an `s` outside `(0, 1)`. A
-/// caller who wants the tf2 behaviour wants one of those three, not an `s` of
-/// `1.4`. `out_of_range_s_extrapolates_and_only_the_closed_form_holds` is what
-/// keeps the three bullets above honest.
-///
-/// **`NaN` is not rejected either**, and it does not always survive. A `NaN`
-/// `s` propagates through all three branches, with one exception: two
-/// numerically identical inputs return `qa` before `s` is read at all, so
-/// `slerp(qa, qa, f64::NAN)` and `slerp(qa, qa, f64::INFINITY)` are both `qa`.
-///
-/// **A `NaN` *component* takes one branch and one only, and the mechanism is
-/// worth writing down because the obvious hardening breaks it.** It makes `h`
-/// `NaN`, and `NaN <= x` is false for every `x` — so it clears the
-/// identical-input return *and* both branch tests, and the closed form is the
-/// only arm a `NaN` component can reach whatever the angle between the inputs.
-/// There the `NaN` is **destroyed and then recreated**: `dot` is `NaN`,
-/// `NaN.min(1.0)` is `1.0` (Rust's `f64::min` returns the non-`NaN` operand),
-/// so `angle` is `acos(1.0) = 0.0`, `sin_angle` is `0.0`, and the output is
-/// `NaN` only because both weights are `sin(a·0.0)/0.0`, which is `0.0/0.0`.
-/// A guard returning `qa` when `sin_angle == 0.0` — a reasonable-looking
-/// defence against that division — would therefore turn a `NaN` input into a
-/// plausible pose, and it is `nan_propagates_except_through_the_identical_input_return`
-/// that would fail. Replacing `.min(1.0)` with `dot.clamp(-1.0, 1.0)` is the
-/// other obvious edit and is *safe* — `clamp` returns `NaN` for a `NaN`
-/// receiver, so the `NaN` would then survive on its own terms rather than by
-/// coincidence — but it is not made here: the observable behaviour is
-/// identical on every input, so it would be a change to the hot path that no
-/// test could distinguish, and the reason `.min` looks like a bug is that the
-/// paragraph explaining it was missing, not that the line is wrong.
+/// `s` belongs to `[0, 1]`; nothing clamps or refuses. Outside it the function
+/// extrapolates, and how well is a property of the *pair* rather than of `s`,
+/// because the pair alone picks the branch. Only the closed form holds:
+/// `7.2e-15` at `|s| = 20`, against a series that loses `1e-15` somewhere
+/// between `|s| ≈ 2.3` and `≈ 5` depending on the angle. **So extrapolation is
+/// not supported here** — `tf_tree_core` answers an out-of-window stamp with
+/// `ExtrapPolicy` and never passes an `s` outside `(0, 1)`.
+/// `out_of_range_s_extrapolates_and_only_the_closed_form_holds` keeps those
+/// figures honest.
 ///
 /// # Storage order
 ///
 /// [`Quat`] is `[w, x, y, z]` — scalar **first**. Eigen and `nalgebra` store it
 /// last, and a transposed conversion compiles, type-checks, and returns a
-/// perfectly unit quaternion that is the wrong rotation. Convention 2 in the
-/// crate docs is this hazard; a boundary that crosses it needs a tested adapter
-/// rather than a careful reading.
+/// perfectly unit quaternion that is the wrong rotation. A boundary that
+/// crosses this convention needs a tested adapter, not a careful reading.
 ///
 /// # Endpoints and degenerate inputs
 ///
-/// On the series and closed-form branches the weights at `s = 0` and `s = 1`
-/// are exactly `(1, 0)` and `(0, 1)`, so both endpoints come back bit-for-bit.
-/// Four qualifications, all measured rather than reasoned:
+/// The weights at `s = 0` and `s = 1` are exactly `(1, 0)` and `(0, 1)`, so both
+/// endpoints come back bit-for-bit — with four qualifications, all measured:
 ///
-/// * **`s = 1` returns `-qb` whenever `qa·qb < 0`.** That is the sign fix
-///   arriving at the endpoint, not an endpoint failure: `-qb` is the same
-///   rotation, and returning `qb` there instead would put a jump in the
-///   returned *components* at exactly `s = 1` while the limit from below goes
-///   to `-qb` — which is worse than the asymmetry it would tidy up, and is why
-///   there is no `s == 1.0` shortcut. Compare rotations, or fix the sign first.
-/// * **Below the LERP fallback the endpoints hold to an ulp, not bit-for-bit.**
-///   Under a quaternion angle of `SLERP_LERP_FALLBACK` (`1e-6` rad, a rotation
-///   of `2e-6` rad) the two inputs carry no usable direction, so the result is
-///   a *renormalized* LERP:
-///   `slerp(qa, qb, 0.0)` is `qa/‖qa‖`, which differs from `qa` by ~2.7e-16
-///   whenever `qa`'s components do not happen to square to exactly `1.0`.
-///   `endpoints_lose_bit_exactness_only_in_the_lerp_fallback` pins both halves.
-/// * **A `-0.0` component is the one thing "bit-for-bit" does not cover, on
-///   every branch.** Exact weights mean the answer at `s = 0` is
-///   `qa·1.0 + qb·0.0` rather than `qa`, and `-0.0 + (+0.0)` is `+0.0` — so
-///   `slerp(Quat::new(1.0, -0.0, 0.0, 0.0), qb, 0.0)` returns `+0.0` in `x`
-///   for any `qb` whose `x` is positive, and a `-0.0` in `qb` flips the same
-///   way at `s = 1`. The fallback's `normalize` loses it too. **Stated
-///   rather than fixed**, because the fix is an `s == 0.0` shortcut and the
-///   first bullet rules out its `s == 1.0` twin on purpose: adding one end and
-///   not the other trades a sign of zero for an asymmetry between the two
-///   endpoints, which is the larger of the two surprises. Nothing in this crate
-///   manufactures a `-0.0` component — [`crate::exp_so3`] produces one only
-///   from an axis component that already carries the sign, and
-///   `sample_rotation`, which every sweep in `tests/slerp_public.rs` is built
-///   from, emits no zero component at all over `k` in `0..1000` — so this
-///   reaches a caller who built a [`Quat`] by hand.
-///   `signed_zero_components_are_the_endpoint_exception` pins it.
-/// * **Numerically identical inputs return `qa` for every `s`**, `s` included
-///   in neither weight. Two consecutive `/tf` samples from a stationary body
-///   are exactly this case, and it is an early return rather than an accident:
-///   `h` is `0`, so there is no direction to interpolate along and every later
-///   branch would divide by it.
+/// * **`s = 1` returns `-qb` whenever `qa·qb < 0`** — the sign fix arriving at
+///   the endpoint, not an endpoint failure. There is no `s == 1.0` shortcut
+///   because the limit from below goes to `-qb` as well. Compare rotations.
+/// * **Below the LERP fallback** (quaternion angle under `1e-6` rad) the result
+///   is a renormalized LERP, so the endpoints hold to an ulp rather than
+///   bit-for-bit (`endpoints_lose_bit_exactness_only_in_the_lerp_fallback`).
+/// * **A `-0.0` component survives none of the three weighted branches**, since
+///   the exact weights make `s = 0` return `qa·1.0 + qb·0.0` and `-0.0 + (+0.0)`
+///   is `+0.0`; the fallback's `normalize` loses it too. Stated rather than
+///   fixed: the fix is an `s == 0.0` shortcut whose `s == 1.0` twin the first
+///   bullet rules out on purpose
+///   (`signed_zero_components_are_the_endpoint_exception`). The identical-input
+///   return below is the exception — it hands back `qa` untouched.
+/// * **Numerically identical inputs return `qa` for every `s`**, `s` unread —
+///   an early return, because there is no direction to interpolate along. Two
+///   consecutive samples from a stationary body are exactly this case.
+///
+/// A `NaN` **`s`** propagates, with that identical-input return the one
+/// exception: it answers `qa` before `s` is read, for `NaN` and `±inf` alike. A
+/// `NaN` **component** is the other case and does not reach it — `h` is `NaN`
+/// and `NaN <= x` is false for every `x`, so it clears the early return *and*
+/// both branch tests and lands on the closed form whatever the angle. Do not add
+/// a `sin_angle == 0.0` guard there, which would turn it into a plausible pose.
+/// `nan_propagates_except_through_the_identical_input_return` pins both halves.
 ///
 /// The output is otherwise **not** renormalized — `qa·wa + qb·wb` is unit to
 /// within `f64`, not exactly. A caller whose type enforces unit norm should
 /// normalize on the way in to its own type.
 ///
-/// The first two bullets are also the *entire* difference between calling this
-/// and going through `LerpSlerp::eval` on a pair of zero-translation [`Iso3`],
-/// for any input a rotation can produce — `eval` answers `s = 0` and `s = 1`
-/// from a shortcut that never reaches here.
-/// `the_iso3_round_trip_it_replaces_agrees_as_a_rotation` sweeps both and
-/// classifies every bit difference; as rotations the two agree to 2.7e-16. The
-/// third bullet is a difference too, and is excluded from that sweep rather
-/// than absent from it: `eval`'s shortcut returns `*a` and keeps a `-0.0`,
-/// where this returns `+0.0`, and no rotation the sweep can build has a zero
-/// component to notice it with.
-///
 /// # Numerics
 ///
-/// The crossover to the closed `acos`/`sin` form is at a quaternion angle of
-/// `THETA_SLERP_SMALL` (`0.15` rad — a rotation of `0.30` rad, which for a
-/// body turning at 180 °/s is a 10.47 Hz edge); below it the weights are a
-/// six-term series with no transcendental and no division, and θ² comes from
-/// the *chord* rather than from `acos(dot)`. Both constants are calibrated,
-/// with the measurement in their own doc comments, and both are deliberately
-/// private: they are numbers a re-measurement is allowed to move, and a
-/// `pub const` is a promise not to.
+/// Above a quaternion angle of `THETA_SLERP_SMALL` (`0.15` rad) the weights are
+/// the closed `acos`/`sin` form; below it, a six-term series with no
+/// transcendental and no division, taking θ² from the *chord* rather than from
+/// `acos(dot)`. Both constants are calibrated, with the measurement in their own
+/// doc comments, and both are private: they are numbers a re-measurement may
+/// move, and a `pub const` is a promise not to.
 ///
 /// ```
 /// use tf_tree_math::{exp_so3, slerp, Quat, Vec3};

@@ -212,20 +212,26 @@ cannot see it — **`just ros-build` and `just ros-test` are its entire gate**;
 - Do not add a **second spelling** of an existing path (a `coverage` beside
   `span`, a `resample` beside `at(arange(...))`). Document the one that exists.
 - **Cite a symbol, never a line number.** `path.rs:123` in a Markdown file
-  breaks on the next edit to that file — measured: four such citations were
-  already stale on `main`, and one seven-line rustdoc edit moved twenty-two
-  more. `just lint` ratchets the ones that exist down per file
-  (`scripts/line-citation-budget.txt`), each row an equality with its file; a new
-  one fails. **The gate sees only the spelling that carries a
-  directory prefix** (`crates/`, `xtask/`, `scripts/`, `ros/`), not a bare
-  `tree.rs:123` — so its rows are a floor on the rot and not a census. **Both
-  totals are printed by the gate, on a failing run as well as a passing one**,
-  rather than either being written down here: the figure went stale in three
-  documents inside the PR that measured it, and it is wanted most by whoever is
-  reading a ratchet failure. `scripts/line-citation-budget.txt` is the register;
-  no total belongs in this file.
-  *Writing the prefixed form here as an example failed this very gate, which is
-  the shortest demonstration that it works.*
+  breaks on the next edit to that file, and a 2026-09-19 sweep found citations
+  already landing on blank lines, bare `///` markers and closing braces.
+  `just lint` ratchets the existing ones down per file
+  (`scripts/line-citation-budget.txt`), each row an equality; a new one fails.
+  **The gate sees only the prefixed spelling** (`crates/`, `xtask/`, `scripts/`,
+  `ros/`), not a bare `tree.rs:123`, so its rows are a floor on the rot and not
+  a census. It prints both totals on every run, which is why no figure is
+  written down here.
+  *Writing the prefixed form here as an example failed this very gate.*
+- **A comment states the decision and its load-bearing evidence, then stops.**
+  Rustdoc is the item's contract: what it does, what the caller must guarantee,
+  what they get, and any warning a future editor needs. Provenance is not
+  contract — a retracted measurement, what an earlier revision of the comment
+  said, why a hardening was rejected, and the history of the rule itself belong
+  in the record that owns them, cited by number. Keep a measurement only where
+  nothing else holds it, and prefer a named test, which cannot go stale quietly.
+  Measured 2026-09-19: a `pub` function in a published crate carried 236 lines
+  of rustdoc, a `pub(crate)` one carried 158, and `docs/API.md` §6 held a third
+  copy of the same retraction inside a single table cell. Length is not
+  thoroughness; it is where a corrected claim hides its other copies.
 - No blocking wait, futex, or notification primitive **in the arena**
   ([`0018`](./docs/decisions/0018-blocking-waits-belong-in-the-shim.md)).
 - **Cut, not deferred** ([`0009`](./docs/decisions/0009-descoping-phase-6.md)):

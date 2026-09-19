@@ -41,6 +41,34 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — a doc comment states the contract, not its own history
+
+`CLAUDE.md` gains a rule: a comment states the decision and its load-bearing
+evidence, then stops. Provenance — a retracted measurement, what an earlier
+revision of the comment said, why a hardening was rejected — belongs in the
+record that owns it, cited by number, and a measurement is kept only where
+nothing else holds it.
+
+Applied to the longest blocks first, with no contract statement dropped:
+`tf_tree_math::slerp` (236 rustdoc lines to 97), `ParticipantTable::reclaim`
+(110 to 91), `tf_tree`'s `cache::with_plan` (158 to 80), the shared
+line-citation erratum in `docs/decisions/README.md` (54 to 16), and
+`docs/API.md` §6 row 16, which held a third copy of `slerp`'s retracted
+instruction counts inside a single table cell. What was cut was already pinned
+by a named test or by the record that produced it. `slerp`'s ten tests are
+unchanged; four of the five its rustdoc cited are still cited there, and the
+fifth — `the_iso3_round_trip_it_replaces_agrees_as_a_rotation` — is named in
+`docs/API.md` §6 row 16, which is where the claim it pins now lives.
+
+`0061` (**draft**) proposes the missing half. Trimming a doc comment moves every
+line citation below it, including citations inside `implemented` records, which
+the freeze forbids repairing — the `with_plan` change above did exactly that to
+`0034`, and the erratum is the only response available today. The record argues
+a freeze protects the argument and not the pointers, which would also let the
+citation gate **validate** targets rather than only count them: a sweep on
+2026-09-19 found prefixed citations landing on blank lines, bare `///` markers
+and closing braces, and none of them is currently reportable.
+
 ### Documented — a served `build_shared` arena is out of contract (`0031`)
 
 `TreeBuilder::build_shared` registers a participant record and takes no lock
