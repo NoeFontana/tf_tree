@@ -215,6 +215,9 @@ typedef struct {
  */
 #define TFT_OK 0
 
+/**
+ * A required pointer argument was NULL.
+ */
 #define TFT_ERR_NULL_ARG -1
 
 /**
