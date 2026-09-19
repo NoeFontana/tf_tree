@@ -76,6 +76,22 @@ bare-metal target, where there is no scheduler to yield to — and a shipped
 `tf_tree` user gets the yield with no feature to enable and no `std` in the
 core's dependency graph.
 
+**Its cost, stated because step 3 costs the alternative on the same grounds.**
+`InternTable`, `intern_core` and `find_core` are all `pub` in `tf_tree_core`,
+which is one of the five publishing crates, so threading a hook to
+`wait_for_publish` is **new public surface** and owes `API.md` §7's checklist and
+a `0.0.x` break. Both routes cost surface; this one is chosen because the
+feature route's cost is *unsoundness* — a yield no shipped user reaches, or
+`extern crate std` unified into every `tf_tree_core` — while this one's is a
+reviewable API change. *An earlier version presented the seam as the cheap
+option and priced only the alternative.*
+
+*And one of the three arguments against the feature route was wrong:* "compiled
+by no gate" is false — `just test` runs
+`cargo nextest run -p tf_tree_core --features crash-points` and `just lint`
+carries two clippy passes over it. The `--workspace` parenthetical justifies one
+command, not the recipe. The other two legs stand and are what decide it.
+
 This changes nothing about *whether* the wait ends. It changes only whether the
 waiter is holding the CPU the claimant needs. **A `no_std` build keeps the pure
 spin**, which is correct there: a bare-metal target has no scheduler to yield to.
@@ -88,7 +104,13 @@ limit. `FrameError::InternContended` already exists and already reads *"another
 interner holds the name's slot and cannot be judged"*, which is exactly the
 state.
 
-**This amends A8's "without limit", and that is why this is a record.** The
+**This does not amend A8's text, and question 1 is where that is established.**
+A8 constrains *takeover* — "a slow interner is never stolen from" — and a
+refusal steals nothing; the "without limit" sentence is `INTERN_SPIN_LIMIT`'s
+doc comment, not amendment text. What §1 owes is an **added note** that a
+claimant which is neither running nor dead is a class A8 did not consider.
+*This read "This amends A8's 'without limit', and that is why this is a record",
+which question 1 now withdraws.* The
 trade it makes: a caller can now be told *"someone holds this name and I cannot
 say when they will finish"* instead of waiting for them. A control loop can act
 on that; it cannot act on a spin.
@@ -127,8 +149,11 @@ is what this layer can express, and its calibration is the same kind of number
   reaches a Rust caller disguised as an undeclared name. `Tree::lookup`'s
   `# Errors` now says so and names a write-free way to tell the cases apart; a
   distinct variant or a cause field would be a record of its own.
-- A8's text changes, so `docs/PHASE2.md` §1 needs an amendment recorded the way
-  §3.5's was rather than an edit.
+- **A8's text does not change** (question 1): the bound constrains waiting and
+  A8 constrains takeover. `docs/PHASE2.md` §1 gains a **note** recorded the way
+  §3.5's amendment was — that a claimant neither running nor dead is a class A8
+  did not consider — rather than an edit to A8. *This bullet read "A8's text
+  changes".*
 - The `loom` models that exercise interning gain a reachable `Contended` arm.
   `INTERN_SPIN_LIMIT` is already 2 under `loom` for interleaving reasons; the new
   bound needs the same treatment and its own control, because a model where the
@@ -147,9 +172,17 @@ is what this layer can express, and its calibration is the same kind of number
    none is installed. `tf_tree` installs it. Both functions keep yielding under
    `cfg(loom)`, or the models stop scheduling the thread they wait on.
    - **Verified by** `just bench-check` against the committed baseline, reported
-     rather than assumed; by `just loom`; by `just stable-tier-check` and the
-     `no_std` build, which must still compile with no hook; and by the existing
-     frame tests passing unchanged.
+     rather than assumed; by `just loom`; and by the existing frame tests passing
+     unchanged.
+   - **The no-hook build has no gate today, and step 1 owes one.**
+     `stable-tier-check` only compiles `-p tf_tree`, the std facade, and says
+     nothing about `tf_tree_core`; the closest existing pass is
+     `clippy -p tf_tree_core --no-default-features --features crash-points`,
+     which pulls `extern crate std` in through that very feature. There is no
+     `-p tf_tree_core --no-default-features` pass without it and no bare-metal
+     cross-compile anywhere in the justfile. *An earlier version of this step
+     named `stable-tier-check` and "the `no_std` build" as verification; neither
+     checks what it claimed.*
    - **Two stop points, because the first is only half a check.** If
      `bench-check` moves on a path that does *not* reach `wait_for_publish`, the
      yield leaked into `spin`. And **a test must prove the hook is actually
@@ -174,6 +207,16 @@ is what this layer can express, and its calibration is the same kind of number
      and no id was published — rather than inferred from continued blocking.
      Rewritten that way it holds under any N, which is what lets N be actionable
      instead of being forced above 250 ms.
+
+     **And the timeout is not the only assertion the bound kills.** After it, the
+     test hand-publishes on the claimant's behalf and asserts
+     `rx.recv().unwrap().unwrap_err() == FrameHashCollision`. Under the bound the
+     spawned interner has already returned `InternContended` and exited, so
+     `recv_timeout` consumed the only message and `tx` is dropped: that `recv()`
+     **panics on a disconnected channel** rather than failing an assertion. The
+     doc comment's claim that the unblocking "proves the waiter was still on the
+     normal publish path" describes a property the bound makes unobservable.
+     Fixing only the timeout leaves a panicking test.
 
      *The draft reconciled the two with "a limit large enough not to fire", which
      is a real constraint (N ≳ 625) and contradicts this record's ceiling. This
@@ -274,9 +317,33 @@ each answer says where the evidence is.
 
    - **Floor:** N > `READER_UNRECORDED_ROUNDS`, so the reader's abandon path
      still fires before the global bound.
-   - **Ceiling:** N × `INTERN_SPIN_LIMIT` inside one control-loop period.
-   - Both hold at **N = 8**, which is the value to implement unless the
-     measurement moves the ceiling.
+   - **Ceiling:** the refusal must arrive while a control loop can still act on
+     it. **Not "inside one period"** — at 1 kHz that is 1 ms, which the floor
+     alone (N ≥ 5, ~2 ms on x86) already exceeds, so the rule would be
+     unsatisfiable at the top of its own rate range. What the bound buys at any N
+     is that *one* cycle is lost instead of all of them; the ceiling is therefore
+     single-digit milliseconds on x86, and a 1 kHz loop is told plainly that a
+     refusal costs it more than one period.
+   - **N = 8** is the value to implement: the smallest multiple of the floor that
+     leaves room for the floor to move, at ~3.2 ms of spinning on x86.
+
+   **Two costs the first two versions of this answer did not price.**
+
+   - **The probes are syscalls and are not counted in N × `INTERN_SPIN_LIMIT`.**
+     Each round also calls `claimant_alive`, which on a `tf_tree` tree is an
+     `F_OFD_GETLK` and can fall back to reading `/proc/<pid>/stat`. At N = 8 that
+     is eight syscall-backed probes on top of the spinning, and on a loaded host
+     a `/proc` read runs to hundreds of microseconds. **Step 2 measures the round
+     cost, not only the intern duration** — the record's own standard is that the
+     number is not to be assumed, and the first two versions assumed the half
+     that is cheap.
+   - **`loom` cannot simply shrink N.** `INTERN_SPIN_LIMIT` is 2 under
+     `cfg(loom)`; `READER_UNRECORDED_ROUNDS` carries **no `cfg`** and stays 4. A
+     loom-shrunk N of 2 or 4 therefore sits at or below the floor, the reader's
+     `CLAIM_UNRECORDED` abandon path becomes unreachable in the model, and the
+     model stops covering the false negative that constant exists to prevent.
+     **Both constants shrink together or neither does**, and step 4 owes a
+     control that fails when the abandon path is unreachable.
 
    *An earlier version of this answer read "the smallest value whose product …
    exceeds the measured intern by two orders of magnitude and stays under 10 ms".
@@ -284,13 +351,21 @@ each answer says where the evidence is.
    `READER_UNRECORDED_ROUNDS`, which is the one value that must not be chosen. It
    stated the "N of about 8" conclusion beside a rule that contradicts it.*
 
-   **Step 2 must still report the measured worst-case intern**, on **both**
-   architectures this project gates — `spin_loop()` is a `pause` of ~140 cycles
-   on recent x86-64 and an `isb` of tens of cycles on aarch64, so the same
-   iteration count is several times shorter there and the "~0.4 ms at 3 GHz"
-   figure below is x86-specific. A ceiling expressed in milliseconds and derived
-   from an x86 count loses most of its headroom on the `ubuntu-24.04-arm` row and
-   on a Jetson.
+   **Step 2 must still report the measured round cost**, on **both**
+   architectures this project gates. `spin_loop()` is a `pause` of ~140 cycles on
+   recent x86-64 and an `isb` of tens of cycles on aarch64, so the same iteration
+   count is **several times shorter** there and the "~0.4 ms at 3 GHz" figure
+   below is x86-specific.
+
+   **Which constraint that pressures is the opposite of what an earlier version
+   of this paragraph said.** A shorter round makes N × `INTERN_SPIN_LIMIT` a
+   *smaller* duration, so the **ceiling gains** headroom on aarch64 — it is the
+   **floor's purpose** that erodes: "unreachable in health by orders of
+   magnitude" goes from roughly three orders to two as a round falls from ~0.4 ms
+   to ~0.05 ms. *The earlier text said the ceiling lost headroom on arm, which
+   would tell an implementer to lower N there — backwards for the constraint
+   actually under pressure, and toward the floor this same answer says must not
+   be crossed.*
 
    ~~What is the limit?~~ `INTERN_SPIN_LIMIT` is 10 000 pure-spin iterations
    between liveness checks (~0.4 ms at 3 GHz). A round bound of *N* liveness
@@ -314,9 +389,11 @@ each answer says where the evidence is.
    `buffer::read_slot` is the hot read path, so that is not a theoretical cost.
    Exactly one waits on a peer whose scheduling is the thing in question.
 
-   So `spin` stays pure for the four and a second function — yielding under the
-   std-backed arm — is `wait_for_publish`'s alone, with each call site naming
-   which it wants. **The `loom` arm is unaffected**: it already yields for all
+   So `spin` stays pure for the four and a second function — calling the
+   facade-installed yield hook of *Decision* §1, pure-spinning when none is
+   installed — is `wait_for_publish`'s alone, with each call site naming which it
+   wants. *This read "yielding under the std-backed arm", the mechanism §1 now
+   rejects; the mechanism is stated in three places and this was the third.* **The `loom` arm is unaffected**: it already yields for all
    five, for interleaving rather than starvation, and that must stay true of both
    functions or the models stop scheduling the thread they wait on.
 
