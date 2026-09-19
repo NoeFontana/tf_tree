@@ -2446,25 +2446,31 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 /// default writes none, and a `fork`ed Python worker holding its dead parent's
 /// byte is exactly a `FREE` row over a held byte.
 ///
-/// **`doctor --attach` cannot be pointed at all of those**, which is worth
-/// knowing before reading a quiet report as an all-clear, and the split is by
-/// whether an owner is still serving rather than by a count. Attaching goes
-/// through the rendezvous, so the shapes that leave the **owner dead** — its
-/// own slot, and an owner killed between the hangup's probe and its CAS —
-/// refuse a fresh join with `ArenaHeldButUnreachable`: the record is `LIVE`,
-/// the leak is real, and no new process can be told. The rest leave somebody
-/// serving and are reachable now — the `epoll::add` hole, a heir's inherited
-/// peers, and the out-of-contract `build_shared` arena, whose hand-bound server
-/// is what put it in front of this check in the first place.
+/// **What `doctor --attach` can be pointed at is a property of the arena at the
+/// moment you run it, not of the shape**, and that is worth knowing before
+/// reading a quiet report as an all-clear. Attaching goes through the
+/// rendezvous, so it needs *somebody serving*. An arena whose owner died and
+/// whose survivors have not inherited refuses a fresh join with
+/// `ArenaHeldButUnreachable` — the record is `LIVE`, the leak is real, and no
+/// new process can be told, which is the state that hides the owner's own slot
+/// and an owner killed between the hangup's probe and its CAS. Let a survivor
+/// call `Tree::inherit_ownership` and the same arena serves again: **those two
+/// shapes become visible to this check, on an arena that now also has a heir's
+/// unwatched peers in it.** So none of the shapes above is permanently out of
+/// reach, and a quiet report from an arena that *did* accept the join is not a
+/// report about every shape it could hold.
 ///
-/// *This sentence said "only two of those five" and named `attach_shared` as
-/// one of the two. It was wrong in both directions by 2026-09-19 — that shape
-/// no longer exists and takeover had shipped three weeks earlier — which is why
-/// it now names the shapes and counts none of them.*
+/// *This paragraph said "only two of those five" and named `attach_shared` as
+/// one of the two — wrong in both directions by 2026-09-19, since that shape no
+/// longer exists and takeover had shipped three weeks earlier. The rewrite then
+/// sorted the shapes into reachable and not, which is the same error one level
+/// up: takeover is exactly what moves a shape between those two lists. It names
+/// the condition now, and counts nothing.*
+///
 /// `crates/tf_tree/tests/rendezvous.rs`'s
 /// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` stages the
-/// reclaimed peer and the unreclaimable owner on one arena and asserts that
-/// refusal.
+/// reclaimed peer and the unreclaimable owner on one arena and asserts the
+/// `ArenaHeldButUnreachable` refusal above.
 ///
 /// # It needs a table, not a picture of one
 ///

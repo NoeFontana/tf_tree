@@ -907,7 +907,7 @@ child shares the owner's descriptions.
    the runbook, §3.7 step 9 and the new §3.5 sentence name the same event in the
    same words.
 3. **The release-visible prose and the pin** (one PR; after step 2).
-   - `Tree::owner_lost` (`tree.rs:3081`) and its three-state table.
+   - `Tree::owner_lost` (`crates/tf_tree/src/tree.rs`) and its three-state table.
    - `tf_tree_ipc`'s `client.rs` module doc (lines 8-11), `peer_hung_up`
      (`client.rs:52`) and the `server.rs` module doc.
    - `tf_tree_ipc`'s crate doc (`lib.rs:22`) and its crates.io page

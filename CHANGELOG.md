@@ -89,18 +89,27 @@ That rustdoc is twenty-four lines, so it moved every line-number citation into
 `impl Drop for Tree`, which is some two thousand lines away, at a benchmark
 note.
 
-**The rest are wrong by twenty-four lines each.** That is not a side effect to
-swallow quietly: it is the ratchet's grandfathered set decaying on schedule,
-which is the argument the ratchet was built on. `0019`'s and `0057`'s are
-repaired here, because those records are `ready` and so may be edited. `0028`'s,
-`0034`'s and `0055`'s stay where they are — those are `implemented` and frozen,
-and a line-number erratum per site would bury `decisions/README.md`'s real
-ones, so that file carries one erratum covering all of them.
+**`0028`'s, `0034`'s and `0055`'s are wrong by twenty-four lines each and stay
+that way** — those records are `implemented` and frozen, and a line-number
+erratum per site would bury `decisions/README.md`'s real ones, so that file
+carries one erratum covering all of them. That is not a side effect to swallow
+quietly: it is the ratchet's grandfathered set decaying on schedule, which is
+the argument the ratchet was built on.
 
-*A first version of this paragraph called all five frozen. Two are not, and a
-status quoted from memory rather than read is the failure `CLAUDE.md`'s
-decisions row exists to prevent — it cost those two records a repair they were
-eligible for.*
+`0019`'s and `0057`'s are repaired instead, because those records are `ready`
+and so may be edited. **Repairing `0019`'s is also what showed this paragraph
+was overstating**: its `tree.rs:1166-1181` was not displaced by twenty-four
+lines, it was *already* pointing at the wrong item on `main` — the tail of
+`impl Drop for EdgeWriter` and `impl Deref for EdgeWriter`, some six hundred
+lines from the `Tree::frame` the surrounding sentence is about. So the
+grandfathered set is not uniformly twenty-four lines out; it is
+twenty-four-lines-out *on top of* whatever it already was, which nothing has
+measured site by site.
+
+*Two earlier versions of this paragraph: the first called all five records
+frozen, and two are not; the second then stated a categorical over "the rest"
+from the arithmetic rather than from reading them. A status and a citation are
+both things to read, not to infer.*
 
 ### Fixed — the line-citation ratchet scanned the wrong half of two documents
 

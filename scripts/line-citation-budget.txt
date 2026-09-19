@@ -15,8 +15,13 @@
 # spans are not, because that is where these citations are written.
 #
 # `just lint` refuses any increase **and any decrease left unrecorded**: each
-# row is an equality with its file, so shedding a citation means lowering the
-# number here in the same commit. A row sitting above its file is headroom for a
+# row is an equality with what the scanner matches in its file, so shedding a
+# citation means lowering the number here in the same commit.
+#
+# **The scanner matches only the full-path form**, `crates/.../tree.rs:2182`
+# and not a bare `tree.rs:2182`, and the bare form is the one `CLAUDE.md`'s
+# rule names. Measured 2026-09-19: 154 counted, 404 with the prefix optional.
+# These numbers are therefore a floor on the rot, not a census of it. A row sitting above its file is headroom for a
 # citation nobody had to justify — and, until 2026-09-19, the way to raise a
 # budget without anyone noticing, because a drop was only a printed note.
 #

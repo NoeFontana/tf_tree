@@ -22,14 +22,21 @@ record is the artifact.
 copied into each.** On 2026-09-19 a twenty-four-line rustdoc was added to
 `TreeBuilder::build_shared`, near the top of `crates/tf_tree/src/tree.rs`
 ([`0031`](./0031-the-participant-record-with-no-byte.md) step 1). **Every
-`crates/tf_tree/src/tree.rs:NNN` citation with `NNN` past that point is now
-twenty-four lines early.** Those in `0028`, `0034` and `0055` are not repaired,
+`crates/tf_tree/src/tree.rs:NNN` citation with `NNN` past that point moved by
+twenty-four lines.** Those in `0028`, `0034` and `0055` are not repaired,
 because those records are `implemented` and a line-number erratum per site would
-bury this file's real ones. **`0019` and `0057` were in that list for one
-round and should not have been** — both are `ready`, so both are editable, and
-both have had their citation replaced by the symbol it named. A status is what
-decides whether a record may be edited, and restating one from memory is the
-mistake the paragraph below this is about.
+bury this file's real ones. **`0019` and `0057` were in that list for one round
+and should not have been** — both are `ready`, so both are editable, and every
+citation in them has been replaced by the symbol the surrounding prose already
+named. A status is what decides whether a record may be edited, and restating
+one from memory is the mistake the paragraph below this is about.
+
+**"Moved by twenty-four" is not the same as "twenty-four lines early", and the
+repair is what showed it.** `0019`'s citation was pointing at the wrong item
+*before* this edit — `impl Drop for EdgeWriter`, some six hundred lines from the
+`Tree::frame` its sentence was about. The shift is twenty-four lines on top of
+whatever each site already was, and nothing has measured the three frozen ones
+individually. Read them as *unreliable*, not as *off by twenty-four*.
 `scripts/line-citation-budget.txt` is the register of what remains and the gate
 that stops more being written; the rule those sites predate is `CLAUDE.md`'s
 *cite a symbol, never a line number*.

@@ -1266,7 +1266,7 @@ RELEASE_VISIBLE = (
 NO_CHANGELOG = "[no changelog]"
 
 
-def strip_fenced_blocks(text: str, rel: str) -> str:
+def strip_fenced_blocks(text: str) -> tuple[str, bool]:
     """Blank fenced code blocks, recognising a fence only at the start of a line.
 
     **The first spelling was a regex, and it was a silent false pass.** It read
@@ -1286,11 +1286,13 @@ def strip_fenced_blocks(text: str, rel: str) -> str:
     A fence inside a blockquote counts, because the documents use them; a
     triple backtick anywhere but the start of a line does not.
 
-    **An unclosed fence is reported, not absorbed.** Left to itself this
-    function would blank the whole tail of such a file and the caller would see
-    a lower count, which lands in the "shed" note rather than in a failure —
-    the same silent-false-pass shape the regex had, narrowed rather than closed.
-    So `rel` is taken only to name the file in that message.
+    **An unclosed fence is reported, not absorbed**, which is why the caller
+    gets a flag back rather than just the text. Left to itself this function
+    would blank the whole tail of such a file and the caller would see a lower
+    count — landing in the "shed" report rather than in a failure naming the
+    cause, the same silent-false-pass shape the regex had, narrowed rather than
+    closed. The flag also stops the caller reporting that file as having *shed*
+    citations, which it has not: they are merely unreadable.
     """
     out: list[str] = []
     fenced = False
@@ -1303,13 +1305,7 @@ def strip_fenced_blocks(text: str, rel: str) -> str:
             out.append("")
             continue
         out.append("" if fenced else line)
-    if fenced:
-        fail(
-            f"{rel} ends inside a fenced block — an unclosed ``` blanks the rest "
-            f"of the file, so every `path.rs:LINE` citation after it goes "
-            f"uncounted and the budget silently passes"
-        )
-    return "\n".join(out)
+    return "\n".join(out), fenced
 
 
 def check_line_citations() -> str:
@@ -1333,6 +1329,16 @@ def check_line_citations() -> str:
     justify, and it is also the only way to raise a budget without saying so: a
     row added at 50 for a file carrying 2 used to print "within budget" and a
     "48 shed" note, and exit 0.
+
+    **The equality is with what the pattern matches, and the pattern sees only
+    the full-path form.** `crates/tf_tree/src/tree.rs:2182` is counted;
+    `tree.rs:2182` is not, and `CLAUDE.md`'s rule names the bare form
+    explicitly. Measured 2026-09-19 over tracked Markdown: 154 counted against
+    404 once the prefix is optional — the gate covers well under half of what
+    it is named for, and it is the *later*-written half, since the bare spelling
+    is what a record reaching for brevity produces. Extending the pattern
+    grandfathers about 250 more sites across 27 files, which is its own change
+    and its own review; it is not folded in here.
 
     **Per file rather than in total**, because a total is not a ratchet: one
     document could shed five citations while another gained five and the sum
@@ -1359,9 +1365,16 @@ def check_line_citations() -> str:
     files = tracked("*.md")
     found: dict[str, int] = {}
     total = 0
+    unreadable: set[str] = set()
     for rel in files:
-        text = Path(rel).read_text(errors="replace")
-        prose = strip_fenced_blocks(text, rel)
+        prose, unclosed = strip_fenced_blocks(Path(rel).read_text(errors="replace"))
+        if unclosed:
+            unreadable.add(rel)
+            fail(
+                f"{rel} ends inside a fenced block — an unclosed ``` blanks the "
+                f"rest of the file, so every `path.rs:LINE` citation after it "
+                f"goes uncounted and the budget passes on a partial read"
+            )
         hits = len(pattern.findall(prose))
         if hits:
             found[rel] = hits
@@ -1378,11 +1391,15 @@ def check_line_citations() -> str:
                 f"message cannot give you."
             )
 
+    # A file whose fence is unclosed reports a partial count; it is already
+    # failing above, and calling it "shed" would name a second cause that is
+    # not there.
     dropped = sorted(
         (rel, budget[rel], found.get(rel, 0))
         for rel in budget
-        if found.get(rel, 0) < budget[rel]
+        if rel not in unreadable and found.get(rel, 0) < budget[rel]
     )
+    gone = sorted(rel for rel, _, _ in dropped if rel not in files)
 
     # An empty scan is not a pass: the pattern silently matching nothing would
     # print the same "within budget" as a clean tree.
@@ -1404,11 +1421,19 @@ def check_line_citations() -> str:
     if dropped:
         shed = sum(was - now for _, was, now in dropped)
         listed = ", ".join(f"{rel} {was}->{now}" for rel, was, now in dropped)
+        # Two remedies, because a row for a file that no longer exists cannot be
+        # "lowered" alongside citations that are not there to shed.
+        remedy = f"lower them in {budget_path} in the same commit"
+        if gone:
+            remedy += (
+                f" — and {', '.join(gone)} is no longer tracked, so its row is "
+                f"to be deleted rather than lowered"
+            )
         fail(
             f"{shed} `path.rs:LINE` citation(s) shed in {len(dropped)} file(s) "
-            f"whose budget still records the old count — lower them in "
-            f"{budget_path} in the same commit: {listed}. A row that sits above "
-            f"its file is headroom for a citation nobody had to justify."
+            f"whose budget still records the old count — {remedy}: {listed}. A "
+            f"row that sits above its file is headroom for a citation nobody "
+            f"had to justify."
         )
     return (
         f"{total} `path.rs:LINE` citations in {len(found)} documents, "
