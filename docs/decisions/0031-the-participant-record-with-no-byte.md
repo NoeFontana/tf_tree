@@ -155,9 +155,10 @@ supported path); **two** stand one up *without* one —
 `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes` and the
 `byteless_served_arena()` helper, both in `crates/tf_tree/tests/rendezvous.rs`,
 feeding the three tests that stage this record's measurement on purpose; and the remaining **sixteen** stand up
-no rendezvous at all — most passing the fd to a child, and four
-(`control_loop`, `hugepage_grant`, `replay_bit_identity` ×2) never calling
-`shared_fd`, using the arena in one process (`backing.rs`, `workload.rs`,
+no rendezvous at all — ten passing the fd to a child, and **six**
+(`backing.rs`, `workload.rs`, `control_loop`, `hugepage_grant`,
+`replay_bit_identity` ×2) never calling `shared_fd` at all, using the arena in
+one process (`backing.rs`, `workload.rs`,
 `cache.rs`, `tree.rs`, `mp_bench`, `attach_bench`, `shm_scaling`,
 `hugepage_grant`, `heap_vs_shared`, `control_loop`, `tests/population.rs` ×3,
 `tests/multiprocess.rs`, `replay_bit_identity.rs` ×2). **No shipped path composes
@@ -501,9 +502,9 @@ promotion by this record's own partition.
        So the doc keeps both and says which is which.
      - `docs/RUNBOOK.md` carries the same pair to operators and gains the same
        distinction.
-   - **Reconciled with the promotion, not by this step** — `PHASE2.md` §0.0, §5
-     and §6, `PHASE3.md`, `CHANGELOG.md`, `CLAUDE.md`, and the two shipped
-     rustdocs above. Each was falsified by the status flipping rather than by the
+   - **Reconciled with the promotion, not by this step** — `PHASE2.md` §0.0, §3.9
+     and §5.1, `PHASE3.md`, `CHANGELOG.md`, `CLAUDE.md`, and the three shipped
+     rustdocs and comments above. Each was falsified by the status flipping rather than by the
      boundary being written, which is this record's partition; they are listed so
      an engineer running step 1 knows what is already done.
    - **Verified by** `just doc` and `just lint`, and by
@@ -511,7 +512,8 @@ promotion by this record's own partition.
      is in that command because it was not**, and `CLAUDE.md`'s Status section
      carries the exact sentence this step reconciles — a check scoped to two
      directories could not have found it.
-2. **Keep it executed — three tests, not one. DONE with the promotion (#358).**
+2. **Keep it executed — three tests execute the boundary, two carried prose that
+   had to change. DONE with the promotion (#358).**
    `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes` says
    of itself *"It pins the defect, not the fix. When `0031` is answered this test
    flips, and each `PIN:` message says which way."* This is the answer, so it
@@ -520,12 +522,14 @@ promotion by this record's own partition.
    messages restated as what the boundary costs. The assertions do not change —
    the behaviour does not change — only what the test claims about it.
 
-   **And so do the other two, which a first version of this step missed.**
+   **And so does a second, which a first version of this step missed.**
    `a_byteless_publisher_is_evicted_from_the_edge_it_is_publishing_to` carries
    the same pending-decision framing in its doc comment and an in-test message
-   reading *"If this is now 0, 0031 has been answered — invert it"*, and its
-   control shares `byteless_served_arena()`. Left alone they would tell a reader
-   this record is still open, which is the defect `0055` step 7 spent four review
+   reading *"If this is now 0, 0031 has been answered — invert it"*. **The third,
+   `a_leased_publisher_keeps_its_edge_against_a_sweeper`, is the control and
+   needed nothing** — it shares only the `byteless_served_arena()` helper and its
+   doc carries no framing about this decision. Left alone the second would tell a
+   reader this record is still open, which is the defect `0055` step 7 spent four review
    rounds on: a claim corrected everywhere except where somebody reads it.
    - **Verified by** all three still passing unmodified in substance, and by the
      mutant the first already documents (`reap_participants` counting the verdict
@@ -567,10 +571,11 @@ it.
 - **The census was 20, then 19.** One `rg` hit is a `///` comment describing a
   mutant, and the number is reproducible only under `crates/` — at the repo root
   the same pattern gives 27.
-- **The shipped sites were three, then four, then five.** `checks.rs`,
+- **The shipped sites were three, then four, then five, then six.** `checks.rs`,
   `unstable.rs`, `RUNBOOK.md`, then `reclamation_verdict`'s rustdoc, then
-  `Tree::participant_slot`'s. Each correction restated a closed count and the
-  next round found one more.
+  `Tree::participant_slot`'s, then the comment inside `Tree::reap_participants`.
+  Each correction restated a closed count and the next round found one more; this
+  sentence is the fourth restatement and is not offered as the last.
 - **Line citations were invalidated by the commit that wrote them.** A rustdoc
   edit in this branch moved `open.rs`'s by seven lines (`git diff --numstat main...HEAD`); the sweep that de-numbered
   them left two, which a later edit moved as well. The section cites symbols now
@@ -585,15 +590,17 @@ it.
 
 - **This branch broke line citations *outside* the files it edited, and they are
   not fixed here.** The two rustdoc corrections add 7 lines to
-  `crates/tf_tree/src/open.rs` and 17 to `tree.rs`, and `docs/` carries **36
-  unique `path.rs:N` citations into those two files** across 13 documents. Four
-  already pointed at a blank or bare-`///` line on `main`; the rest were
-  plausibly correct and are now off by the shift — verified on two,
+  `crates/tf_tree/src/open.rs` and **22** to `tree.rs`, and `docs/` carries **36
+  unique `path.rs:N` citations into those two files** across 13 documents.
+  **Twenty-two of the 36 sit past an edit point and are now off by the shift** —
+  21 into `open.rs`, 1 into `tree.rs`; the other 14 are above both edits and are
+  untouched. Four already pointed at a blank or bare-`///` line on `main`.
+  Verified broken on two,
   [`0055`](./0055-the-recovery-capacity-a-fleet-cannot-add-later.md)'s
   `open.rs:1183` (`.take_attached()`) and
   [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md)'s `:1093`.
 
-  **Not swept, and the reason is structural rather than effort.** 23 of the 41
+  **Not swept, and the reason is structural rather than effort.** 23 of the **42**
   citation sites are in `implemented` records, which this project freezes:
   corrections to them go in `decisions/README.md`'s errata, and twenty-three
   line-number errata would bury that file's real ones. **This is a repository
@@ -610,10 +617,20 @@ it.
   sweeping peer is now an ordinary C or Python consumer. The conclusion survives
   because the *other* half of the composition is what is out of contract, but a
   `draft` promoted to `ready` inherits every fact it stopped checking.
-- **A fix reported as landed had not been written.** Round 4's commit message
-  says the nested emphasis in the §3.1 erratum was closed; the script that made
-  that edit threw before writing the file, and the nesting survived four more
-  rounds. A commit message is not a gate.
+- **Fixes reported as landed had not been written — five times, from one
+  scripting pattern.** Round 4's commit message says the nested emphasis in the
+  §3.1 erratum was closed; it was not, and the nesting survived four more rounds.
+  Round 11's claimed four more — `PHASE2.md`'s producer-pair qualification, the
+  reconciled-sites list, step 2's test count, and the shipped-site enumeration —
+  and **none of the four reached the file**.
+
+  The cause is mechanical and worth naming because it is invisible from the
+  output: each edit accumulated replacements into one string, asserted on each
+  pattern as it went, and wrote **once at the end**. A single failed assertion
+  discards every replacement before it, while the `print()` calls that already
+  ran make the run look partly successful. The fix is to write and **re-read**
+  each edit independently, which is what round 12 does. **A commit message is not
+  a gate, and neither is a script's stdout.**
 - **And a correction inverted the thing it corrected.** `Tree::participant_slot`'s
   rustdoc carries a guard naming the symbols that must *not* become intra-doc
   links, because linking a `shm`-gated name reddens `just stable-tier-check` on
