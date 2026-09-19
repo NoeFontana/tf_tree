@@ -2,7 +2,7 @@
 
 **Status:** ready
 **Owner:** @NoeFontana
-**Implementation:** *Implementation plan* below — four steps. **Decided
+**Implementation:** *Implementation plan* below — five steps. **Decided
 2026-09-19, on the owner's delegation**: both halves are taken, the yield is
 `wait_for_publish`'s alone, and A8's invariant is untouched by the bound.
 
@@ -46,11 +46,18 @@ that can produce it: every other spin in the engine waits on a **store** that a
 running peer is a few instructions from making, while this one waits on a peer
 that may not be running at all.
 
-**`Tree::reparent` faced the same class and answered it differently — at the
-facade, and only there.** A2's topology lock became a kernel lock at the
+**`Tree::reparent` faced the same class and this record's answer is already
+taken there.** A2's topology lock became a kernel lock at the
 `Tree::reparent` layer ([`0029`](./0029-the-topology-lock-is-a-kernel-lock.md)):
-it takes §3.3's byte 1 *before* the arena word, so a stopped holder blocks rather
-than being inferred about. **The in-arena `TopoLockView::acquire` still spins
+it takes §3.3's byte 1 *before* the arena word — and then
+`Tree::take_topology_lease` **polls that byte `TOPO_BYTE_ATTEMPTS` times and
+returns `ReparentError::LockContended`**. Its own doc names why: the bound "stops
+a holder that died — **or one that is `SIGSTOP`ped, which is alive and which D17
+forbids distinguishing by timeout** — from wedging every mutator behind it."
+
+**That is this record's Decision §2, already implemented, for the identical
+failure class, citing the same rule.** The interning path is the one place that
+did not get it. **The in-arena `TopoLockView::acquire` still spins
 `TOPO_LOCK_SPIN_LIMIT` and then calls `is_alive(owner_slot)` and steals** — the
 byte narrows what that inference may authorise, it does not remove it, and
 `PHASE2.md` §0.0 records the path as closed only for a tree that *has* a lock
@@ -65,41 +72,30 @@ first is not.**
 
 ### 1. The spin yields (not a protocol change)
 
-The waiter yields to the scheduler after a short pure-spin prefix. **How the
-yield reaches `tf_tree_core` is a seam, not a feature**, and the draft's answer —
-"the same shape `crash-points` already uses" — does not work: that shape is
-sound only because nothing shipped enables `crash-points`. A yield behind a
-default-off feature never reaches a `tf_tree` user; a yield behind a
-default-**on** one puts `extern crate std` into every `tf_tree_core` in the graph
-by unification, which is what `lib.rs`'s own comment argues against.
+The waiter yields to the scheduler after a short pure-spin prefix, and **how the
+yield reaches `tf_tree_core` is a passthrough feature — the shape this
+repository already uses three times.**
 
-**So the facade installs it, the way it already installs liveness.**
-`ArenaView::with_liveness` takes a predicate from `tf_tree`, which is `std`;
-the yield travels the same seam. `tf_tree_core` keeps `#![no_std]`
-unconditionally and pure-spins when no hook is installed — which is correct on a
-bare-metal target, where there is no scheduler to yield to — and a shipped
-`tf_tree` user gets the yield with no feature to enable and no `std` in the
-core's dependency graph.
+A feature `tf_tree_core` defaults **off** and nobody enables reaches no shipped
+user. One it defaults **on** puts `extern crate std` into every `tf_tree_core`
+in the graph by unification, which `lib.rs`'s own comment argues against. But one
+it defaults off **and `tf_tree` enables unconditionally in its own
+`[dependencies]`** does neither: every shipped `tf_tree` user gets the yield with
+nothing to turn on, and a bare-metal `tf_tree_core`-only consumer stays `no_std`,
+because unification reaches only graphs that already contain `tf_tree`. That is
+exactly how `counters`, `pure-hash` and `crash-points` are wired
+(`crates/tf_tree/Cargo.toml`).
 
-**Its cost, stated because step 3 costs the alternative on the same grounds.**
-`InternTable`, `intern_core` and `find_core` are all `pub` in `tf_tree_core`,
-which is one of the five publishing crates, so threading a hook to
-`wait_for_publish` is **new public surface** and owes `API.md` §7's checklist and
-a `0.0.x` break. Both routes cost surface; this one is chosen because the
-feature route's cost is *unsoundness* — a yield no shipped user reaches, or
-`extern crate std` unified into every `tf_tree_core` — while this one's is a
-reviewable API change. *An earlier version presented the seam as the cheap
-option and priced only the alternative.*
+**It costs no public surface**, which is the reason to prefer it to threading a
+hook through `ArenaView`: `InternTable`, `intern_core` and `find_core` are all
+`pub` in a publishing crate, so a hook parameter would be an `API.md` §7 change
+and a `0.0.x` break. *Two earlier versions of this section got here by a false
+dilemma — "default-off reaches nobody, default-on unifies `std`" — which omits
+the passthrough and made a surface-costing seam look like the only sound route.*
 
-*And one of the three arguments against the feature route was wrong:* "compiled
-by no gate" is false — `just test` runs
-`cargo nextest run -p tf_tree_core --features crash-points` and `just lint`
-carries two clippy passes over it. The `--workspace` parenthetical justifies one
-command, not the recipe. The other two legs stand and are what decide it.
-
-This changes nothing about *whether* the wait ends. It changes only whether the
-waiter is holding the CPU the claimant needs. **A `no_std` build keeps the pure
-spin**, which is correct there: a bare-metal target has no scheduler to yield to.
+`tf_tree_core` keeps `#![no_std]` unconditionally and pure-spins when the
+feature is off — correct on a bare-metal target, where there is no scheduler to
+yield to.
 
 ### 2. The wait is bounded (a protocol change — this is what needs deciding)
 
@@ -180,18 +176,31 @@ is what this layer can express, and its calibration is the same kind of number
   `INTERN_SPIN_LIMIT` is already 2 under `loom` for interleaving reasons; the new
   bound needs the same treatment and its own control, because a model where the
   bound is never reached tests nothing.
-- **A yielding spin is measurable and must be measured.** It is on the
-  name-resolution path, which `Tree::lookup` takes on a cache miss.
-  `just bench-check` is the gate, and a regression there is a reason to make the
-  pure-spin prefix longer rather than to drop the yield.
+- **A yielding spin is measurable — and `just bench-check` cannot measure it.**
+  No bench in the gated set reaches `wait_for_publish`: `benches/lookup.rs`
+  resolves its frames in *setup* and times `plan.at(...)` only, and the yield
+  fires solely after `INTERN_SPIN_LIMIT` iterations on a claimed-but-unpublished
+  slot, which needs cross-process intern contention no criterion bench stages.
+  So `bench-check` can indict a leak into `spin` and can never confirm the yield
+  costs nothing on the path that has it. **Step 1 owes a bench that reaches the
+  contended path**, or the "measure it" requirement is a sentence with no
+  instrument behind it.
 
 ## Implementation plan
 
 1. **`spin` splits, and the yield arrives through the facade's seam** (question
    3 and *Decision* §1). `sync::spin` is unchanged and stays pure for the four
    store-waiters; a second function, used by `frame::wait_for_publish` alone,
-   calls an installed yield hook after a pure-spin prefix and pure-spins when
-   none is installed. **The prefix is per liveness round, not per wait** —
+   yields after a pure-spin prefix under the passthrough
+   feature of *Decision* §1, and pure-spins with it off. **The prefix is per liveness round, and must be well under
+   `INTERN_SPIN_LIMIT`.** A prefix at or above it means the yield **never fires**:
+   `wait_for_publish` resets its spin counter every round, so the prefix is
+   re-spent and never exhausted, and lengthening it to chase a `bench-check`
+   regression would silently restore the priority inversion this record exists to
+   remove — with every gate green. Step 1's stop point proves the feature is on,
+   not that the yield runs; a test must observe one.
+
+   **Per round, not per wait** —
    `wait_for_publish` resets its spin counter at every round, so the per-round
    reading re-spends the prefix at each boundary and enters the scheduler **less**
    often, by up to `INTERN_SPIN_LIMIT`×, than a per-wait prefix spent once after
@@ -257,11 +266,7 @@ is what this layer can express, and its calibration is the same kind of number
      `rx.recv().unwrap().unwrap_err() == FrameHashCollision`. Under the bound the
      spawned interner has already returned `InternContended` and exited, so
      `recv_timeout` consumed the only message and nothing sends again: that `recv()`
-     **blocks forever and the test hangs** until nextest's timeout kills it.
-     *An earlier version said it panics on a disconnected channel; `tx` is bound
-     in the enclosing function and the `s.spawn` closure is not `move`, so the
-     sender outlives the scope and the channel never disconnects. A hang is
-     harder to recognise than a panic, which makes the understatement worse.* The
+     **blocks forever and the test hangs** until nextest's timeout kills it. The
      doc comment's claim that the unblocking "proves the waiter was still on the
      normal publish path" describes a property the bound makes unobservable.
      Fixing only the timeout leaves a panicking test.
@@ -317,12 +322,6 @@ is what this layer can express, and its calibration is the same kind of number
    `AwaitError::Frame`'s doc, whose rationale is that such an error "will not
    change on its own"; and `Tree::frame`'s `# Errors`. The header is generated,
    so `cargo xtask headers` regenerates it and `just c-header-check` gates it.
-
-   *An earlier version of this step listed
-   four and cited `detached_err`'s rustdoc for the Python site — that one is
-   `pub(crate)` and reaches no wheel user, so the fix would have landed on the
-   invisible copy while the message that actually sends a control loop into an
-   unbounded retry stayed put.*
 4. A `loom` model reaches the bound, with a control that fails when the bound is
    unreachable — and, per question 2, a second control that fails when the
    reader's `CLAIM_UNRECORDED` abandon path is unreachable, which is what a
@@ -477,19 +476,24 @@ each answer says where the evidence is.
    | `topology.rs`'s A2 acquire | the lock word, bounded |
    | **`frame::wait_for_publish`** | **a peer that may not be running at all** |
 
-   Four of the five are **bounded and return rather than waiting on a peer's
-   scheduling** — three wait on a store a running peer is about to make, and
-   A2's acquire spins `TOPO_LOCK_SPIN_LIMIT` and then decides, as the Context
-   above is at pains to say. Yielding in any of them trades a sub-microsecond
-   wait for a scheduler round trip. *An earlier version said all four wait on a
-   store a running peer is about to make, which is the claim the Context
-   paragraph exists to refute about A2.*
+   Four of the five wait on **a store a running peer is about to make, or a
+   decision they reach themselves** — `read_slot`'s seqlock is bounded by
+   `SEQ_RETRY_LIMIT`, A2's acquire by `TOPO_LOCK_SPIN_LIMIT` and then it decides,
+   and `plan.rs`'s two generation retries restart a walk that a *running*
+   mutator's store will end. Yielding in any of them trades a sub-microsecond
+   wait for a scheduler round trip, and `read_slot` is the hot read path.
+
+   *Two earlier spellings were wrong: "all four wait on a store" is false of A2,
+   which decides rather than waits; "all four are bounded" is false of
+   `plan.rs`'s `'walk: loop`, which carries no retry counter. What is true of all
+   four, and is the reason, is that none of them waits on whether a peer is
+   **scheduled**.*
    `buffer::read_slot` is the hot read path, so that is not a theoretical cost.
    Exactly one waits on a peer whose scheduling is the thing in question.
 
    So `spin` stays pure for the four and a second function — calling the
-   facade-installed yield hook of *Decision* §1, pure-spinning when none is
-   installed — is `wait_for_publish`'s alone, with each call site naming which it
+   passthrough feature of *Decision* §1, pure-spinning with it
+   off — is `wait_for_publish`'s alone, with each call site naming which it
    wants. *This read "yielding under the std-backed arm", the mechanism §1 now
    rejects; the mechanism is stated in three places and this was the third.* **The `loom` arm is unaffected**: it already yields for all
    five, for interleaving rather than starvation, and that must stay true of both
