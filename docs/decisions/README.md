@@ -18,6 +18,61 @@ load-bearing and are not to be trimmed. A row for a record with no erratum is a
 sentence or two saying what it decided and what it cost; it is an index, and the
 record is the artifact.
 
+**One erratum applies to several rows at once, so it is stated here rather than
+copied into each.** On 2026-09-19 a twenty-four-line rustdoc was added to
+`TreeBuilder::build_shared`, near the top of `crates/tf_tree/src/tree.rs`
+([`0031`](./0031-the-participant-record-with-no-byte.md) step 1). **Every
+`crates/tf_tree/src/tree.rs:NNN` citation with `NNN` past that point moved by
+twenty-four lines**, in both spellings — the bare `tree.rs:NNN` too, which the
+`scripts/line-citation-budget.txt` gate does not see at all. Measured rather
+than listed from memory: **in tracked Markdown**, the displaced sites are in
+`0005`, `0028`, `0034`, `0055` and `0059`, all `implemented` and therefore not
+repaired, because a line-number erratum per site would bury this file's real
+ones. **`0028` alone holds most of them.**
+
+*"In tracked Markdown" is a scope this sentence needed and did not have for two
+rounds.* The same citations are written in Rust doc comments, which neither the
+gate nor the census that produced this list ever looked at —
+`crates/tf_tree_bench`'s `backing.rs` and `attach_bench.rs` carried three into
+`tree.rs`, one of them the *same* `tree.rs:1984` that `docs/benchmarks/tf2.md`
+had de-numbered in this change while its twin in a `//!` block stayed. Those
+three are repaired; the Rust corpus as a whole is **not** measured and is not
+claimed to be.
+
+Every site that *may* be edited has been repaired instead: `docs/PHASE2.md`
+(two), `docs/PHASE3.md`, `docs/PHASE5.md`, `docs/benchmarks/tf2.md`, `0019` and
+`0057` (`ready`), `0027` and `0030` (`draft`), and three in Rust doc comments —
+`crates/tf_tree_bench`'s `backing.rs` twice and `attach_bench.rs`. Each now
+names the symbol its own surrounding prose already named. *The four specs were
+repaired first and were missing from this list for three rounds, which is the
+list-stated-once rule failing at the place it was written.*
+
+**That list is stated once, here**, and no count of the attempts it took
+is given, because the count was itself restated wrongly a round after it was
+written.
+
+Only `tree.rs` citations are in scope: those files' other line-number citations
+are untouched, and several of them are stale for reasons that predate this
+change — `backing.rs` alone still carries three into other files, two of them
+already pointing at the wrong item. Nothing gates a line citation in a Rust
+comment at all, which is the follow-up the budget's header names.
+
+A status is what decides whether a record may be edited, and restating one from
+memory is the mistake the paragraph below this is about — it is what made this
+erratum name two frozen records that were not, and then miss four editable ones
+that were.
+
+**"Moved by twenty-four" is not the same as "twenty-four lines early", and the
+repair is what showed it.** `0019`'s citation was pointing at the wrong item
+*before* this edit — `impl Drop for EdgeWriter`, some six hundred lines from the
+`Tree::frame` its sentence was about. The shift is twenty-four lines on top of
+whatever each site already was, and nothing has measured the frozen ones
+individually. Read them as *unreliable*, not as *off by twenty-four*: subtracting
+24 from one is as likely to land somewhere else wrong.
+`scripts/line-citation-budget.txt` is the register of what remains and the gate
+that stops more being written; the rule those sites predate is `CLAUDE.md`'s
+*cite a symbol, never a line number*.
+
 **This table does not restate a record's status, and it used to.** The status is
 the record's own first line, and a column that copies it is a second place to
 maintain — which is the same argument `CLAUDE.md`'s decisions row makes for not

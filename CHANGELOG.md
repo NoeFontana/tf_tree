@@ -65,6 +65,150 @@ the wrong opinion only exists in the composition that is out of contract. The
 advisory in 0.0.4's entry and in `PHASE2.md` §0.0 is **permanent, not lifted** —
 both said "until `0031` is answered", which after an answer reads as expired.
 
+**Where the boundary is written** (step 1). `TreeBuilder::build_shared`'s own
+rustdoc says it, because that is where the call is, and `PHASE2.md` §3.1 — *The
+sharing boundary is the runtime directory*, NORMATIVE — says it from the spec
+side: an arena no runtime directory names sits outside that boundary, and
+serving it is reaching back across. Three shipped sites described the shape and
+are reconciled rather than rewritten. `tf_tree doctor`'s `TFT014` said
+`build_shared` is "still supported" — true of the **call**, and not of serving
+its result, which is the only way anything ever asks that check about a
+byte-less record. `tft_tree_reap_dead`'s doc and `docs/RUNBOOK.md` each named
+two producers of a stale claim that no hangup collects, a dead **owner** and a
+byte-less `build_shared` participant, and now say which is which: the owner is
+in contract and is what the sweep is for; the other is reachable only in the
+composition this record refuses. The runbook adds what an operator does about
+it — **do not sweep**, because `Tree::reap_dead`, `tft_tree_reap_dead` and
+`Tree.reap_dead()` will take the claims of publishers that are running, while no
+`tf_tree` subcommand sweeps at all, so `doctor` is safe either way.
+
+**The sentence being retracted had five copies, and the plan named one.**
+`TFT014`'s rustdoc said a byte-less record "reaches `slot_leak`'s `unknown`
+byte row and is judged by `/proc` alone"; `docs/RUNBOOK.md` said it to
+operators and `docs/PHASE5.md` said it in the spec. The claim is false — that
+row is about **this run's** evidence, and a `--attach` run holds a lock file, so
+the record reads `(byte free, process unknown)` and is reported as an abandoned
+slot against a process that is publishing. The runbook copy was the one with
+teeth: an operator reading a real `TFT014` finding was told to interpret it as
+"the process is gone", three lines above the paragraph telling them not to
+sweep. Found by grepping the claim rather than by working the list, which is
+how the count went from three sites to five over four review rounds.
+
+That rustdoc is twenty-four lines, so it moved every line-number citation into
+`tree.rs` that pointed past it by exactly that much. The ones in `PHASE2.md`,
+`PHASE3.md` and `PHASE5.md` are symbol citations now. One had been stale on
+`main` since long before this change: `PHASE3.md` cited `tree.rs:918-933` for
+`impl Drop for Tree`, which is some two thousand lines away, at a benchmark
+note.
+
+**The ones in frozen records are now unreliable and stay that way** — the
+displaced sites are in `0005`, `0028`, `0034`, `0055` and `0059`, all
+`implemented`, and a line-number erratum per site would bury
+`decisions/README.md`'s real ones, so that file carries one erratum covering all
+of them. *Unreliable* rather than *off by twenty-four*, for the reason two
+paragraphs down. That is not a side effect to swallow quietly: it is the
+ratchet's grandfathered set decaying on schedule, which is the argument the
+ratchet was built on.
+
+Every site that may be edited is repaired instead — `0019` and `0057`
+(`ready`), `0027` and `0030` (`draft`), `docs/benchmarks/tf2.md`, and three in
+Rust doc comments that the Markdown-only census had never looked at
+(`crates/tf_tree_bench`'s `backing.rs` twice and `attach_bench.rs`). That list
+was assembled from memory twice and then measured over a corpus that stopped at
+tracked Markdown. It is stated once, in `decisions/README.md`, and no count of
+the attempts appears in either place — the count was itself restated wrongly a
+round after it was written.
+
+**Repairing `0019`'s is also what showed this paragraph was overstating**: its
+`tree.rs:1166-1181` was not displaced by twenty-four lines, it was *already*
+pointing at the wrong item on `main` — the tail of `impl Drop for EdgeWriter`
+and `impl Deref for EdgeWriter`, some six hundred lines from the `Tree::frame`
+the surrounding sentence is about. So the
+grandfathered set is not uniformly twenty-four lines out; it is
+twenty-four-lines-out *on top of* whatever it already was, which nothing has
+measured site by site.
+
+*Two earlier versions of this paragraph: the first called all five records
+frozen, and two are not; the second then stated a categorical over "the rest"
+from the arithmetic rather than from reading them. A status and a citation are
+both things to read, not to infer.*
+
+### Fixed — `TFT014` accused a live publisher, and named a syscall it had not made
+
+`tf_tree doctor --attach` reports `SlotLeak::Abandoned` against a `LIVE`
+participant record whose lock byte is free. A byte-less
+`TreeBuilder::build_shared` creator in a hand-served arena is exactly that
+shape while it is **running and publishing**, and the check's own rustdoc said
+such a record "reaches `slot_leak`'s `unknown` byte row and is judged by
+`/proc` alone" — a claim about a run that read *no lock file*, offered as
+though it were about the subject. `docs/RUNBOOK.md` and `docs/PHASE5.md` said
+it too.
+
+The verdict is unchanged, because it is the composition that `0031` refuses and
+not the check that is wrong. What changed is everything the operator is told
+about it:
+
+- the finding's cause list named `Tree::attach_shared`, deleted by `0028` step
+  0b, and did not name the live-publisher case. It names it now, and — **where
+  a process is named at all** — says *check the pid is gone before you reap*;
+- the evidence clause said *"/proc could not say what became of the process"*
+  where the lock file had named no process for `/proc` to be asked about. It
+  claims only that *this run* got no identity record, because a failed read and
+  an absent one are folded together upstream, and it says which pid the finding
+  is printing — the arena record's — so the remedy has something to point at;
+- the `byte not probed` rendering said it meant a run that opened **no lock
+  file**, in the check's rustdoc, in `PHASE5.md` §6 and in `docs/RUNBOOK.md`'s
+  `TFT014` table. An `--attach` run reaches it too, for any slot whose
+  `F_OFD_GETLK` returned an error — a failed probe is deliberately not reported
+  as *free*, because that would be an accusation. The runbook's remedy had been
+  telling such an operator to run the command they had just run;
+- **and where neither the lock file nor the arena record names a process**, the
+  finding prints no pid, no subject pid and no instruction to check one. A
+  `RESERVED` record whose registrant died inside `fill_slot` is that shape, and
+  a zero was reaching all three renderings — `slot_subject`'s own rustdoc had
+  described that defect since it was written, over a fallback arm that printed
+  the zero anyway. `named_pid` is the one predicate behind all of them;
+- `Tree.reap_dead()`'s Python docstring carried the pre-retraction framing while
+  the runbook was warning operators about that exact call — **and so did
+  `python/tf_tree/_core.pyi`**, which is the one a wheel user's editor shows.
+  The PyO3 docstring and the stub are a paired site that nothing gates, which
+  `0057` had already found the hard way.
+
+`a_byteless_record_in_a_served_arena_is_accused_of_leaking` executes the whole
+shape, and its mutant is recorded against the first note written about it, which
+predicted the wrong failure.
+
+### Fixed — the line-citation ratchet scanned the wrong half of two documents
+
+Found while writing the paragraph above, which first explained `docs/PHASE5.md`
+reporting **zero** citations as "its citations are inside fenced blocks". They
+are not. The fence-stripper is one day old — `ad22cef`, the commit directly
+beneath this one on the branch — and it read
+``re.sub(r"```.*?```", "", text, flags=re.S)``, which counts a triple backtick
+written inside an *inline* code span, as `docs/PHASE5.md` and this file each do
+once. That makes the marker count odd, and an odd count does not merely lose a
+block: it **inverts the pairing** for the rest of the file, so prose is blanked
+and the code blocks are scanned in its place.
+
+`docs/PHASE5.md` therefore had no row in `scripts/line-citation-budget.txt` at
+all, and **three** citations in prose that nothing gated — the row reads 2,
+because this same commit converted one of the three to a symbol, so it records
+what the file carries now rather than what it always did. The stripper is line-anchored
+now — a fence is a fence only at the start of a line, blockquote markers
+stripped — and the file gets the row it always should have had. **That row is an
+addition to a file whose rule is that numbers only fall**, so the reason is
+written in its header: the citations were always there, and the scanner could
+not see them.
+
+Two more silent passes in the same check are closed with it, both found by
+asking what else the gate would swallow rather than by hitting them. **An
+unclosed fence** now fails instead of blanking a file's tail. **A budget row
+above its file** now fails too: each row is an equality, not a ceiling, because
+a row added at 50 for a file carrying 2 used to print "within budget" plus a
+"48 shed" *note* and exit 0 — which is the whole rule "a budget may only fall"
+being enforced by prose. Both are proved by mutation: raising `PHASE5.md`'s row
+to 50 fails, and appending an unclosed fence to `RUNBOOK.md` fails.
+
 ### Fixed — attach refusals did not fit the C ABI's message buffer (`0055` step 7)
 
 `IpcError::HandshakeRejected` appended a per-status remedy to every rejection,

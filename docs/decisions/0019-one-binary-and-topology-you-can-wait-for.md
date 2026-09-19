@@ -225,7 +225,7 @@ the caller may not use until a second wait finished. Two absences, two names.
 handles outright.** `Tree::frame` is the wrong predicate in both modes, for opposite reasons:
 on a read-only arena it answers `FrameError::ReadOnly` for an absent name, and on
 a writable one it **interns and succeeds immediately**
-(`crates/tf_tree/src/tree.rs:1166-1181`) — so a wait built on it would return
+(`Tree::frame`, `crates/tf_tree/src/tree.rs`) — so a wait built on it would return
 instantly and wrongly on exactly the tree a publisher holds. `find_frame` never
 inserts. And because "does this name exist" has two defensible answers on a
 writable tree, `await_frames` refuses one rather than picking silently — §3's

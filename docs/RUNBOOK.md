@@ -450,14 +450,46 @@ the arena's own table is `tf_tree doctor --attach`**, whose `TFT014` walks the
 participant records, says how many slots are spent of how many, and names each
 pid — see its row in *Diagnostics* below for what reclaims one. Its own
 detection limits are written where it is implemented (`tft014`,
-`crates/tf_tree_cli/src/checks.rs`): a record with no lock byte reaches the
-`unknown` byte row and is judged by `/proc` alone, and a claim left by a dead
-owner or by a `build_shared` participant is invisible to it, because neither has
-a socket hangup anybody sees.
+`crates/tf_tree_cli/src/checks.rs`): a claim left by a dead owner or by a
+`build_shared` participant is invisible to it, because neither has a socket
+hangup anybody sees.
 
-*This paragraph read "a participant that exited without releasing its slot,
-which `tf_tree participants` names" until 2026-09-05 — one command, no scope, and
-the wrong table for the byte-less class.*
+**And a record with no lock byte is worse than invisible — it is accused.**
+The paragraph above used to end by saying such a record "reaches the `unknown`
+byte row and is judged by `/proc` alone", which is what the run does when it
+read *no lock file*. A `doctor --attach` reached the arena through the
+rendezvous, so it has
+one and it probes: the byte-less record reads free, no lock-file identity names
+it, and `TFT014` reports **`a record left behind — … the lock byte is free`**
+about a process that is running and publishing. If you are looking at that
+finding, do not read it as "the process is gone" — check whether the pid it
+names is alive before you act on it.
+
+**Those two blind spots are not the same kind of thing, and what you do about
+them differs.** A dead **owner** is in contract: it happens to every fleet, and
+`tf_tree doctor` simply cannot see what it left — a surviving read-write peer's
+sweep is the collector. A byte-less `build_shared` participant only becomes
+*anybody else's* problem if the arena it created was published into a rendezvous
+by hand, and
+[`0031`](./decisions/0031-the-participant-record-with-no-byte.md) decided that
+composition **out of contract** on 2026-09-18. So a byte-less record in a served
+arena is a report about the *application*, not about this tool: something called
+`TreeBuilder::build_shared` and then bound an `OwnerServer` over the fd, where
+`tf_tree::Open` is the supported way to create and serve. Until that is fixed,
+**do not sweep**: `Tree::reap_dead` / `Tree::reap_participants` in Rust,
+`tft_tree_reap_dead` in C and `Tree.reap_dead()` in Python will free the records
+and take the claims of publishers that are running. No `tf_tree` subcommand
+sweeps — `doctor` reports and reclaims nothing — so the tool is safe to run
+either way.
+
+*Two errata on the paragraphs above, kept because each records a wrong answer an
+operator could have acted on. The **`tf_tree participants` / `doctor --attach`**
+paragraph read "a participant that exited without releasing its slot, which
+`tf_tree participants` names" until 2026-09-05 — one command, no scope, and the
+wrong table for the byte-less class. It then ended by sending the byte-less
+class to the `unknown` byte row, which is a fact about a run that read no lock
+file and not about the record; corrected 2026-09-19, and what it had been
+telling you to do was treat a live publisher's slot as abandoned.*
 
 Capacity is fixed at
 construction by design ([`PROJECT.md`](./PROJECT.md) §5 D4): the value comes from
@@ -1114,9 +1146,10 @@ Almost certainly a bug — topology should be near-static after startup.
 | `TFT013` | An edge declared dynamic that nothing has ever published to | The publisher never started. It reports **not run** in three states rather than passing: inside a grace period measured against how long the arena's longest-running publisher has been going, so a `doctor` at bringup does not accuse every edge; on an arena where nothing has published at all, because that is bringup and a total outage at once; and on an arena whose publishers **exist** but from which no edge yields the two samples a median period needs. That last reason **names which arena it printed on**, because the remedy is not the same for all of them: a ring too small to hold two (`rate_hz * secs <= 2` rounds to a ring retaining one sample for the life of the arena) is a sizing fix; a large ring holding one — `doctor --attach` at bringup, or a recording carrying one dated record for the edge — needs only more data; and a full ring with no positive cadence is `TFT009`'s and `TFT018`'s subject, not this one's. `TFT017` is the id for an edge whose writer is gone |
 | `unreachable` | Frames not reachable from the main root | A subtree is detached — usually a missing static declaration or a publisher that has not started |
 | `out-of-order` (`TFT018`) | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
-| `TFT014` — *slot N pid P, byte free* | A participant record nothing will reassign: the process is gone and the kernel has released its lock byte, but its arena record still says `LIVE` (or `RESERVED`) | **Three things reclaim it, and none of them is `doctor`.** The owner's slot assigner collects it when a grant walks past that index; the owner's socket-hangup callback collects it when a participant's connection closes; and **any read-write participant can sweep the whole table with `Tree::reap_participants()`**, which is the only one that reaches the *owner's own* slot. So the usual response to this finding is to attach a read-write consumer and sweep — not to stop the fleet. Count how many the finding says are spent (`N of 64`); at 64 every further attach fails `NoParticipantSlots` until something collects. **Two cases still have no repair**: a slot whose byte is *held* by a fork inheritor (that is the separate fork finding, and the kernel's answer is *held* — see [`0030`](./decisions/0030-the-atfork-handler-and-inherited-descriptors.md)), and an arena whose owner has died **with no read-write survivor that calls `Tree::inherit_ownership`** — §3.5's inheritance shipped on 2026-08-28, but it is caller-driven and a read-only survivor is refused with `Inheritance::ReadOnly`, so an all-consumer fleet still cannot be joined (see *The arena's owner died*). For those, stopping every attached process so the segment is freed is still the recovery — and `SIGTERM` is not one, because nothing installs a handler and the default disposition skips every destructor. `tf_tree participants` shows the same slots as `stale`. See [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) |
+| `TFT014` — *slot N pid P, byte free* | A participant record nothing will reassign: the kernel has released its lock byte while the arena record still says `LIVE` (or `RESERVED`). **Usually the process is gone; check before you act on it.** A publisher that never took a byte reads identically while it is running — see *ParticipantTableFull* above, and [`0031`](./decisions/0031-the-participant-record-with-no-byte.md). The finding's own text says which pid to check | **Three things reclaim it, and none of them is `doctor`.** The owner's slot assigner collects it when a grant walks past that index; the owner's socket-hangup callback collects it when a participant's connection closes; and **any read-write participant can sweep the whole table with `Tree::reap_participants()`**, which is the only one that reaches the *owner's own* slot. So the usual response to this finding is to attach a read-write consumer and sweep — not to stop the fleet. Count how many the finding says are spent (`N of 64`); at 64 every further attach fails `NoParticipantSlots` until something collects. **Two cases still have no repair**: a slot whose byte is *held* by a fork inheritor (that is the separate fork finding, and the kernel's answer is *held* — see [`0030`](./decisions/0030-the-atfork-handler-and-inherited-descriptors.md)), and an arena whose owner has died **with no read-write survivor that calls `Tree::inherit_ownership`** — §3.5's inheritance shipped on 2026-08-28, but it is caller-driven and a read-only survivor is refused with `Inheritance::ReadOnly`, so an all-consumer fleet still cannot be joined (see *The arena's owner died*). For those, stopping every attached process so the segment is freed is still the recovery — and `SIGTERM` is not one, because nothing installs a handler and the default disposition skips every destructor. `tf_tree participants` shows the same slots as `stale`. See [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) |
 | `TFT014` — *slot N pid P, byte still HELD* | The **fork** case: a forked child inherited the parent's open file descriptions, so the lock byte is still held on behalf of a process that no longer exists. Reported for a read-only parent too, where there is no arena record at all — the finding then reads *the record is FREE (no arena record: a read-only participant, D18)*. **It is not reported for a participant in another PID namespace** ([`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md)): that used to render the identical sentence about a healthy process, so if a build predating `0033` shows you this for a containerised worker, check the namespace before acting on it | Different fault, different fix — **do not go looking for a reaper**, and nothing may run one: the kernel's own answer for this slot is *held*, and overruling it with a `/proc` guess is what would evict a running participant. Stop the child, and start workers with a start method that inherits no descriptors — `multiprocessing`'s `spawn` (Python defaults to `fork` on Linux), or fork+exec. The byte comes back on its own when the last inheritor exits. Same root cause as *The tree works in the parent and everything fails in a forked child*, above |
-| `TFT014` — *slot N pid P, byte not probed* | The same record-left-behind shape, seen by a run that read **no lock file**: `--from-bag`, or the built-in fixture. The verdict is a `/proc` inference alone | Read it as a weaker claim than the `byte free` row, not a different fault. To get the kernel's answer, run `doctor --attach` against the live domain — that is the only source that opens the rendezvous |
+| `TFT014` — *slot N, no pid recorded, byte free* | The same shape with **no process named at all**: the lock file yielded no identity record for the slot — none written, or none readable — and the arena record's pid field is still zero, which is what `fill_slot` leaves when a registrant dies between claiming the slot and publishing into it | There is nothing here to check and the finding says so: it prints no pid and no *check the pid* instruction. Reclaimed exactly as the `byte free` row above — a read-write peer's `Tree::reap_participants()`. If you are seeing these repeatedly, something is being killed inside registration |
+| `TFT014` — *slot N pid P, byte not probed* | The same record-left-behind shape, seen by a run with **no kernel answer about the byte**. Usually that is a run which opened no lock file — `--from-bag`, or the built-in fixture — and the verdict is an inference about the process alone. **An `--attach` run reaches it too**, for any slot whose `F_OFD_GETLK` returned an error: a failed probe is deliberately not reported as *free*, because that would be an accusation | Read it as a weaker claim than the `byte free` row, not a different fault. If you ran `--from-bag` or the fixture, run `doctor --attach` against the live domain — that is the only source that opens the rendezvous. **If you were already attached**, the probe failed rather than answered: check fd limits and the runtime directory's mount, and re-run before concluding anything about the slot |
 | `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena. **That is not the only outcome either of them has on a deployment, and this row said it was until 2026-09-05** — the clause read *"`doctor` having no recording source"*, which stopped being true when `--from-bag` landed, and the same document has told you to run `tf_tree doctor --from-bag run.mcap` since. Point it at the recording: both reach a verdict there |
 
 ---

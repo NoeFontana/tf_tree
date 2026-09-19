@@ -334,7 +334,7 @@ reading the source.
 
 **And §7 gate 1 turns out to be failing, which is the larger finding.** The
 tempting explanation was that the guard is expensive only on a shared arena —
-`Tree::guard` adds a fork check when `is_shared()` (`tree.rs:1984`) — making the
+`Tree::guard` adds a fork check when `is_shared()` (`crates/tf_tree/src/tree.rs`) — making the
 gate's 1.020× honest for heap trees and blind to shared ones. Measured, that
 branch is worth **+2.1 ns** (counters off) and **−8.4 ns** (counters on): noise.
 The per-call guard costs ~17 ns on *both* backings, and Phase 5's diagnostic
@@ -1314,8 +1314,8 @@ Each of the three, checked against the code:
   a deliberate, documented deviation from §2's "no `libc` crate" because
   `rustix` 1.1 has no OFD locking. This is what lets a `SIGSTOP`ped publisher
   keep its claims while a dead one is reclaimed.
-- **Reaping is wired.** `Tree::reap_dead` (`tree.rs:2349`) and
-  `Tree::reap_participant` (`:2362`) are public, and `edge::reap`
+- **Reaping is wired.** `Tree::reap_dead` and `Tree::reap_participant`
+  (`crates/tf_tree/src/tree.rs`) are public, and `edge::reap`
   (`tf_tree_core/src/edge.rs:399`) is reached through them rather than from
   tests alone.
 

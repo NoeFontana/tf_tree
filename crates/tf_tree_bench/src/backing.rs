@@ -64,7 +64,7 @@
 //!
 //! **The guard is not specific to a shared arena, and assuming it was cost a
 //! second wrong turn.** The obvious next move was to blame the fork check
-//! `Tree::guard` adds only when `is_shared()` (`tf_tree/src/tree.rs:1984`) —
+//! `Tree::guard` adds only when `is_shared()` (`crates/tf_tree/src/tree.rs`) —
 //! which would have meant `PHASE4.md` §7 gate 1's 1.020× was honest for a heap
 //! tree and blind to shared ones. [`guard_cost_both`] priced that branch at
 //! **+2.1 ns** (counters off) and **−8.4 ns** (counters on): noise. A per-call
@@ -551,7 +551,7 @@ pub fn measure_attached(
 /// it**, by running the identical `Plan::at` sweep twice: once with a hoisted
 /// guard and once acquiring one inside the loop. Run it on a heap tree and on a
 /// shared one and the difference between the two answers is the cost of the
-/// `is_shared()` branch in `Tree::guard` (`tf_tree/src/tree.rs:1984`) — which is
+/// `is_shared()` branch in `Tree::guard` (`crates/tf_tree/src/tree.rs`) — which is
 /// precisely what question 4 proposes to move per-tree.
 ///
 /// Returns `(hoisted_ns, per_call_ns)`. Paired and interleaved like everything

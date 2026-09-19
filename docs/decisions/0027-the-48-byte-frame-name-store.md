@@ -259,7 +259,11 @@ a weaker one, and is said here rather than smoothed over.
 
 **The refusal costs almost nothing structurally.** `intern` is already fallible
 and `FrameError` is already `Copy` and `#[non_exhaustive]`; `tf_tree`'s builder
-already maps it to `BuildError::Frame` at two call sites (`tree.rs:614`, `:627`).
+already maps it to `BuildError::Frame` at every `intern` call in
+`TreeBuilder::build_with` (`crates/tf_tree/src/tree.rs`) — the frame loop's, and
+the edge loop's `parent` and `child`. *This read "two call sites (`tree.rs:614`,
+`:627`)"; de-numbering it to a named function made the count checkable, and
+there are three.*
 No new error type, no new signature, no lifetime, no allocation, nothing on a
 hot path — interning happens at declaration.
 

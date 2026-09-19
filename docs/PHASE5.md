@@ -1647,11 +1647,26 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > the members that
 > leave a `LIVE` record over a free byte are the owner's own slot, an owner
 > killed between the hangup's probe and its CAS, a client the owner's
-> `epoll::add` failed for, a `ReadWrite` `Tree::attach_shared` participant, and —
-> once §3.5 is wired — a takeover heir's inherited peers. **Two of those five
-> leave the owner dead, so `doctor --attach` cannot be pointed at them:** the
-> rendezvous died with the owner and a fresh join is refused
-> `ArenaHeldButUnreachable`. That is a limit on the *source*, not on the check;
+> `epoll::add` failed for, a takeover heir's inherited peers, and a byte-less
+> `TreeBuilder::build_shared` creator in an arena somebody served by hand.
+>
+> **This list named a `ReadWrite` `Tree::attach_shared` participant and gated
+> the takeover entry on "once §3.5 is wired", and both were stale.** `0028`
+> step 0b made both fd-attach arms refuse `ReadWrite`, so that shape cannot be
+> constructed; §3.5 shipped 2026-08-28 (§0.0). The byte-less creator is the
+> entry that was never here: it is
+> [`0031`](./decisions/0031-the-participant-record-with-no-byte.md)'s subject,
+> *out of contract*, and the only member of this list that `TFT014` does not
+> merely miss but **accuses** — see the amendment below.
+>
+> **It also read "Two of those five leave the owner dead, so `doctor --attach`
+> cannot be pointed at them", and sorting the members that way is wrong.**
+> What `--attach` can reach is a property of the arena when you run it, not of
+> the member: a dead owner's rendezvous refuses a fresh join with
+> `ArenaHeldButUnreachable`, and a survivor calling `Tree::inherit_ownership`
+> makes the same arena serve again — with the owner's own leaked slot now
+> visible, beside the heir's unwatched peers. So it is a limit on the *source at
+> that moment*, not on the check and not on the member.
 > `crates/tf_tree/tests/rendezvous.rs`'s
 > `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` stages the
 > reclaimed peer and the unreclaimable owner on one real arena and asserts the
@@ -1673,10 +1688,15 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > set in #274 — because `TFT014` was already in it, and what changes here is how
 > much of its own row it covers.
 >
-> **It is detection, and stops there.** `0028` is `draft` and its header exists
-> so that no reclamation lands before its predicate is settled; a `doctor` check
-> that mutated the arena would be the exact thing that record is holding the
-> door against. What an operator gets is the count and the budget: a leaked slot
+> **It is detection, and stops there.** A `doctor` check that mutated a robot's
+> arena as a side effect of being asked a question would be the tool
+> overstepping; reclamation belongs to the participants, through
+> [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md)'s three
+> collectors. *This read "`0028` is `draft` and its header exists so that no
+> reclamation lands before its predicate is settled". That record has been
+> `implemented` and frozen since 2026-08-21, and two paragraphs above this one
+> the same blockquote now rests on its step 0b having **shipped** — so the
+> argument survives and its premise did not.* What an operator gets is the count and the budget: a leaked slot
 > is `1 of 64` permanently spent, and there is no way to get one back short of
 > stopping every participant so the segment is freed.
 >
@@ -1833,10 +1853,27 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > field is still zero (`fill_slot` writes it after the `FREE -> RESERVED` CAS)
 > and on a read-only slot there is no record at all, so a subject built from it
 > read *"slot 8 pid 0 … /proc has no running process for it"*. Where both exist
-> and differ, both are named. The subject also carries which of the two shapes
-> it is — `byte free`, `byte still HELD`, or `byte not probed` for a source that
-> opened no lock file — because the responses are opposite and the difference
-> has to survive being read at 3am.
+> and differ, both are named.
+>
+> **Where neither exists, the finding names no process and asks for none.** The
+> subject is *"slot N, no pid recorded"*, the message omits the clause naming a
+> pid, and it omits the instruction to check that the pid is gone — there is
+> nothing to check. That case is a `RESERVED` record whose registrant died
+> inside `fill_slot`'s publication and whose lock byte the kernel has since
+> released. *Added 2026-09-19: the zero reached three renderings in `doctor` and
+> the first repair caught one of them, so this paragraph now states the
+> no-process case rather than leaving it to the two that name one.*
+>
+> The subject also carries which of the shapes it is — `byte free`,
+> `byte still HELD`, or `byte not probed` when the run has no kernel answer
+> about the byte — because the responses are opposite and the difference has to
+> survive being read at 3am. **`byte not probed` is about the run, not the
+> source**: usually it means no lock file was opened (`--from-bag`, the
+> fixture), and an `--attach` run reaches it too for any slot whose
+> `F_OFD_GETLK` returned an error, which is why `slot_facts` is three-valued
+> rather than folding a failed probe into `free`. *This read "for a source that
+> opened no lock file" until 2026-09-19, forty lines above a paragraph in this
+> same section saying the opposite.*
 >
 > **The word-before-byte order is pinned by a signature, not by a comment.**
 > `0028` piece 2's third constraint requires the `state` word to be observed
@@ -1849,16 +1886,33 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > stable slot states can show which read went first, so no test in the CLI
 > claims to.
 >
-> **The false positive named above has had its producer removed.** `0028` step
-> 0b made both `Tree::attach_shared` and `Tree::attach_shared_at` refuse
-> `AttachMode::ReadWrite`, so a byte-less writer has no in-tree producer left.
-> `TreeBuilder::build_shared` called directly still registers without a byte and
-> is still supported, but such a tree has no lock file at all — it reaches the
-> *byte unknown* row of `slot_leak`'s table and is judged by `/proc` alone,
-> exactly as it was before. That row is also what `--from-bag` and the in-process
-> fixture take, so a source with no rendezvous keeps the predicate this check
-> shipped with rather than falling silent, and its message says so instead of
-> claiming a probe the run never made.
+> **The false positive named above has had *one of its two* producers
+> removed.** `0028` step 0b made both `Tree::attach_shared` and
+> `Tree::attach_shared_at` refuse `AttachMode::ReadWrite`, so that byte-less
+> writer has no in-tree producer left.
+>
+> **The second is still here, and the sentence that used to follow was wrong.**
+> It read: *"`TreeBuilder::build_shared` called directly still registers without
+> a byte and is still supported, but such a tree has no lock file at all — it
+> reaches the* byte unknown *row of `slot_leak`'s table and is judged by `/proc`
+> alone, exactly as it was before."* **The `byte unknown` row is about the
+> observer's evidence, not the subject's lock file.** A `doctor --attach` run
+> reached its arena through the rendezvous, so it holds a lock file and probes:
+> a byte-less record reads `(byte free, recorded process unknown)`, which is
+> `SlotLeak::Abandoned` — a leak reported against a process that is running and
+> publishing. `crates/tf_tree_cli/src/checks.rs`'s
+> `a_byteless_record_in_a_served_arena_is_accused_of_leaking` executes it, and
+> the retraction is written on `tft014` where the sentence lived. What bounds it
+> is [`0031`](./decisions/0031-the-participant-record-with-no-byte.md): serving
+> a `build_shared` arena is *out of contract*, and serving is the only way such
+> a record is ever put in front of this check.
+>
+> The `byte unknown` row is what `--from-bag` and the in-process fixture take —
+> a source with no rendezvous keeps the predicate this check shipped with rather
+> than falling silent, and its message says so instead of claiming a probe the
+> run never made. It is **also** where a probe that *errors* lands, on a run
+> that did read a lock file, which is why `slot_facts` is three-valued on
+> purpose.
 >
 > **Still detection, and still no new id.** Nothing here reclaims anything:
 > `0028` reclaims from the assigner (step 3) and from `Tree::reap_participants`
@@ -2628,8 +2682,8 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
    mapping. No offline variant of the lookup, no separate index." That is what
    the code does: `Tree::open_frozen` maps the file and hands a `FrozenArena` to
    the same `&dyn Arena` the heap and `memfd` backings go through
-   (`crates/tf_tree/src/frozen.rs:119`, `ArenaBacking` at
-   `crates/tf_tree/src/tree.rs:697`), so the three backings are, in §2.1's
+   (`crates/tf_tree/src/frozen.rs:119`, `ArenaBacking` in
+   `crates/tf_tree/src/tree.rs`), so the three backings are, in §2.1's
    words, three ways of holding the same bytes — which is what
    `a_frozen_lookup_is_bit_identical_to_the_live_one`
    (`crates/tf_tree/tests/frozen.rs:181`) asserts, gate 1's three-way

@@ -125,13 +125,22 @@ Both would fire an operator-visible warning about an arena with free capacity �
 the same class of wrong answer as A's silent `pass`, and harder to argue away,
 because a false alarm teaches people to ignore the check.
 
-**C's blind spot is stated rather than patched.** A `build_shared` or
-`attach_shared` participant is alive, holds a `LIVE` record with a permanently free
-byte, and C does not count it. That is not an inaccuracy this numerator
-introduces: the assigner does not count it either, and will reclaim that
-participant's record and grant its slot away. It is the protocol gap `CLAUDE.md`
-already records, and a numerator that quietly compensated for it would report a
+**C's blind spot is stated rather than patched.** A `TreeBuilder::build_shared`
+creator is alive, holds a `LIVE` record with a permanently free byte, and C does
+not count it. That is not an inaccuracy this numerator introduces: the assigner
+does not count it either, and will reclaim that participant's record and grant
+its slot away. A numerator that quietly compensated for it would report a
 capacity the protocol does not honour — and would hide the gap.
+
+*This paragraph said "a `build_shared` or `attach_shared` participant" until
+2026-09-19. The `ReadWrite` fd-attach arms have refused since
+[`0028`](./0028-the-slot-a-killed-participant-keeps.md) step 0b, so that half
+names no constructible shape. The half that remains is narrower than it was
+too: [`0031`](./0031-the-participant-record-with-no-byte.md) put the served
+`build_shared` arena **out of contract** on 2026-09-18, so this blind spot is
+one C shares with every reclaimer, over a population the project does not
+support — which strengthens the argument for stating it rather than
+compensating for it.*
 
 **C is also the cheapest and the hardest to drift.** It is one `F_OFD_GETLK` per
 slot over 64 slots, which `top`'s row producer and `doctor`'s `probe_lock_facts`

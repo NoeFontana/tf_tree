@@ -753,6 +753,23 @@ class Tree:
         a participant that never joined through the rendezvous — and this is
         their only collector.
 
+        **Only one of those is a shape this project supports, and the other
+        makes this call dangerous.** A dead owner is ordinary: nothing sees its
+        hangup, so something has to sweep what it left. It is wider than the
+        owner itself — once the owner is dead nobody watches any peer, so a
+        participant that dies after it leaves claims only a sweep collects.
+
+        A participant that never joined through the rendezvous holds no lock
+        byte, so nothing can tell it apart from a dead one, and calling this
+        frees the records and takes the claims of processes that are
+        **running**. Reaching that state needs an arena created with the Rust
+        `TreeBuilder.build_shared` and then published by hand, which decision
+        record 0031 put *out of contract* on 2026-09-18; no Python program can
+        build one, because `open_arena` always joins through the rendezvous. So:
+        safe from Python alone, and not safe in a process tree where some Rust
+        component served an arena that way. See `docs/RUNBOOK.md`,
+        *ParticipantTableFull*.
+
         `0` for a read-only tree, an in-process tree, or one with no rendezvous.
         """
 

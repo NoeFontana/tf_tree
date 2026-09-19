@@ -27,7 +27,7 @@
 //!
 //! **"population on vs off" needs a way to attach without populating, and there
 //! isn't one.** `populate_hot()` is called unconditionally inside
-//! `attach_shared_inner` (`tf_tree/src/tree.rs:2133`). Getting the "off" arm
+//! `attach_shared_inner` (`crates/tf_tree/src/tree.rs`). Getting the "off" arm
 //! would take one of:
 //!
 //! * `madvise(MADV_DONTNEED)` over the mapping between attach and first access,

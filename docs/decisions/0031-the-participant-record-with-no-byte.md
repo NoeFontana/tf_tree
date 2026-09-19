@@ -1,12 +1,15 @@
 # 0031: the participant record with no byte
 
-**Status:** ready
+**Status:** implemented
 **Owner:** @NoeFontana
-**Implementation:** steps 2, 3 and 4 landed with the promotion (#358);
-**step 1 is open** and is one PR. **Decided 2026-09-18, on the owner's
-delegation**: question 2 is answered *out of contract*, which selects the small
-branch this record predicted for that answer, and questions 3 and 4 are answered
-with it.
+**Implementation:** steps 2, 3 and 4 landed with the promotion (#358); step 1
+landed 2026-09-19. **Decided 2026-09-18, on the owner's delegation**: question 2
+is answered *out of contract*, which selects the small branch this record
+predicted for that answer, and questions 3 and 4 are answered with it.
+
+**Frozen.** Corrections go in [`README.md`](./README.md)'s row for this record,
+not in place — and this record is one that will attract them, because its
+evidence is a census a reader can re-run and the workspace moves under it.
 
 ## Context
 
@@ -456,10 +459,10 @@ will later be bound over it.
 
 ## Implementation plan
 
-**Step 1 is one PR; steps 2, 3 and 4 landed with the promotion (#358), because
-each is a consequence of the *status change itself* rather than of the boundary
-being written.** The answer changes no code path, so what the open step ships is
-where the boundary is written.
+**Steps 2, 3 and 4 landed with the promotion (#358), because each is a
+consequence of the *status change itself* rather than of the boundary being
+written; step 1 was the one PR after it and landed 2026-09-19.** The answer
+changes no code path, so all that step shipped is where the boundary is written.
 
 *Step 2 moved across that line during review, and the criterion is what moved
 it.* The three tests carried messages reading "`0031` has been answered — invert
@@ -468,7 +471,8 @@ inverts a passing assertion and breaks the suite. That trap is created by the
 status flipping, not by a rustdoc being written, so it belongs with the
 promotion by this record's own partition.
 
-1. **Say it where the call is.** `TreeBuilder::build_shared`'s rustdoc gains the
+1. **Say it where the call is. DONE 2026-09-19.**
+   `TreeBuilder::build_shared`'s rustdoc gains the
    boundary: this creates an arena whose fd is the capability, and **binding a
    rendezvous over it is out of contract**, with the reason (the byte-less record
    no observer can judge) and a pointer here. `PHASE2.md` **§3.1** — *The sharing
@@ -501,7 +505,17 @@ promotion by this record's own partition.
        rendezvous. The other producer, a dead owner, is in contract and unchanged.
        So the doc keeps both and says which is which.
      - `docs/RUNBOOK.md` carries the same pair to operators and gains the same
-       distinction.
+       distinction — and, because it is the operator-facing one, what to do:
+       **do not sweep**, since `Tree::reap_dead`, `tft_tree_reap_dead` and
+       `Tree.reap_dead()` will take the claims of publishers that are running.
+       **No `tf_tree` subcommand sweeps** — checked rather than assumed, because
+       a first draft of that sentence named `doctor` as one of them.
+     - **A second rustdoc in `checks.rs` carries the pair too**, on `TFT014`'s
+       claim-half bullet, and step 1 found it where the plan named only the
+       "still supported" sentence in the same file. It is reconciled with the
+       rest. This is the closed count this record spends a paragraph on,
+       arriving once more in the step written to fix it — so the list above is
+       what step 1 touched and is not a claim about what exists.
    - **Reconciled with the promotion, not by this step** — `PHASE2.md` §0.0, §3.9
      and §5.1, `PHASE3.md`, `CHANGELOG.md`, `CLAUDE.md`, and the three shipped
      rustdocs and comments above. Each was falsified by the status flipping rather than by the

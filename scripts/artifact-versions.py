@@ -118,9 +118,20 @@ PROJECT_VERSION_RE = re.compile(
 
 failures: list[str] = []
 
+# **Measurements, as opposed to verdicts.** A `check_*` returns a sentence that
+# *asserts* its rule, so that sentence must be withheld when the check failed —
+# otherwise the tool prints an all-clear above its own failure block. A number
+# that asserts nothing has the opposite need: the citation census is wanted most
+# by whoever is reading a ratchet failure. These print on every run.
+notes: list[str] = []
+
 
 def fail(message: str) -> None:
     failures.append(message)
+
+
+def note(message: str) -> None:
+    notes.append(message)
 
 
 # One spelling of the `subprocess.run` boilerplate that was written out five
@@ -1266,6 +1277,60 @@ RELEASE_VISIBLE = (
 NO_CHANGELOG = "[no changelog]"
 
 
+def strip_fenced_blocks(text: str) -> tuple[str, bool]:
+    """Blank fenced code blocks, recognising a fence only at the start of a line.
+
+    **The first spelling was a regex, and it was a silent false pass.** It read
+    ``re.sub(r"```.*?```", "", text, flags=re.S)``, which treats *any* triple
+    backtick as a fence — including one written inside an inline code span, as
+    `docs/PHASE5.md` and `CHANGELOG.md` each do. That makes the marker count
+    odd, and an odd count does not merely lose a block: it **inverts the
+    pairing** for the rest of the file, so prose is blanked and the code blocks
+    are scanned instead. `docs/PHASE5.md` reported 0 citations that way while
+    carrying two in prose, and was therefore ungated with no row in the budget
+    at all.
+
+    Found 2026-09-19 while writing a changelog sentence that would have
+    explained the zero as "its citations are inside fenced blocks". They were
+    not.
+
+    A fence inside a blockquote counts, because the documents use them; a
+    triple backtick anywhere but the start of a line does not.
+
+    **An unclosed fence is reported, not absorbed**, which is why the caller
+    gets a flag back rather than just the text. Left to itself this function
+    would blank the whole tail of such a file and the caller would see a lower
+    count — landing in the "shed" report rather than in a failure naming the
+    cause, the same silent-false-pass shape the regex had, narrowed rather than
+    closed. The flag also stops the caller reporting that file as having *shed*
+    citations, which it has not: they are merely unreadable.
+    """
+    out: list[str] = []
+    opened = 0
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        while stripped.startswith(">"):
+            stripped = stripped[1:].lstrip()
+        run = len(stripped) - len(stripped.lstrip("`"))
+        if run >= 3:
+            # CommonMark: a fence closes only on a run at least as long as the
+            # one that opened it, so a ``` line *inside* a ```` block is
+            # content. Toggling on any run of three inverts the pairing there,
+            # with the marker count still even — the same silent false pass as
+            # the regex, one nesting level down. Latent today; no tracked file
+            # opens a four-backtick fence.
+            if opened == 0:
+                opened = run
+                out.append("")
+                continue
+            if run >= opened:
+                opened = 0
+                out.append("")
+                continue
+        out.append("" if opened else line)
+    return "\n".join(out), opened != 0
+
+
 def check_line_citations() -> str:
     """`path.rs:LINE` citations in Markdown may not increase, per file.
 
@@ -1278,9 +1343,27 @@ def check_line_citations() -> str:
     belong in `decisions/README.md`'s errata, and twenty-three line-number
     errata would bury that file's real ones.
 
-    So this is a **ratchet, not a ban**: the 157 that exist are grandfathered per
-    file in `scripts/line-citation-budget.txt` and the count may only fall. Cite
-    a symbol instead; a symbol survives every edit that does not rename it.
+    So this is a **ratchet, not a ban**: the ones that exist are grandfathered
+    per file in `scripts/line-citation-budget.txt` and the count may only fall.
+    Cite a symbol instead; a symbol survives every edit that does not rename it.
+
+    **Each row is an equality, not a ceiling** — over budget fails, and so does
+    under. A row left above its file is headroom for a citation nobody had to
+    justify, and it is also the only way to raise a budget without saying so: a
+    row added at 50 for a file carrying 2 used to print "within budget" and a
+    "48 shed" note, and exit 0.
+
+    **The equality is with what the pattern matches, and the pattern sees only
+    the prefixed form.** A citation beginning `crates/`, `xtask/`, `scripts/` or
+    `ros/` is counted; a bare `tree.rs:2182` is not, and `CLAUDE.md`'s rule
+    names the bare form explicitly. The gate covers well under half of what it
+    is named for, and it is the *later*-written half, since the bare spelling is
+    what a record reaching for brevity produces. **Both totals are printed on
+    every run, failing ones included** rather than recorded in prose: the figure
+    went stale in three documents inside the change that first measured it,
+    because the same branch kept converting bare citations. Extending the
+    pattern grandfathers a few hundred more sites, which is its own change and
+    its own review; it is not folded in here.
 
     **Per file rather than in total**, because a total is not a ratchet: one
     document could shed five citations while another gained five and the sum
@@ -1288,7 +1371,7 @@ def check_line_citations() -> str:
     max-over-a-set bound.
 
     **Fenced blocks are excluded and code spans are not.** A `path:line` inside
-    a ``` fence is compiler output or a shell transcript; the citations this
+    a fenced block is compiler output or a shell transcript; the citations this
     gate is about are written inside single-backtick spans, and blanking those
     took the scan from 157 hits to 0 — which is how the first version of this
     check would have passed vacuously.
@@ -1306,11 +1389,25 @@ def check_line_citations() -> str:
     )
     files = tracked("*.md")
     found: dict[str, int] = {}
+    # The same citation with the directory prefix made optional — the form
+    # `CLAUDE.md`'s rule names and this gate does not hold. Counted in the same
+    # pass, so the two figures cannot be taken over different corpora.
+    bare = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|py):\d+")
+
     total = 0
+    wider = 0
+    unreadable: set[str] = set()
     for rel in files:
-        text = Path(rel).read_text(errors="replace")
-        prose = re.sub(r"```.*?```", "", text, flags=re.S)
+        prose, unclosed = strip_fenced_blocks(Path(rel).read_text(errors="replace"))
+        if unclosed:
+            unreadable.add(rel)
+            fail(
+                f"{rel} ends inside a fenced block — an unclosed ``` blanks the "
+                f"rest of the file, so every `path.rs:LINE` citation after it "
+                f"goes uncounted and the budget passes on a partial read"
+            )
         hits = len(pattern.findall(prose))
+        wider += len(bare.findall(prose))
         if hits:
             found[rel] = hits
             total += hits
@@ -1326,31 +1423,104 @@ def check_line_citations() -> str:
                 f"message cannot give you."
             )
 
+    # A file whose fence is unclosed reports a partial count; it is already
+    # failing above, and calling it "shed" would name a second cause that is
+    # not there.
     dropped = sorted(
         (rel, budget[rel], found.get(rel, 0))
         for rel in budget
-        if found.get(rel, 0) < budget[rel]
+        if rel not in unreadable and found.get(rel, 0) < budget[rel]
     )
+    gone = sorted(rel for rel, _, _ in dropped if rel not in files)
 
-    # An empty scan is not a pass: the pattern silently matching nothing would
-    # print the same "within budget" as a clean tree.
-    if total < 100:
+    # **An empty scan is not a pass**, and since 2026-09-19 the equality above
+    # is what says so: a pattern that stopped matching drops every row at once
+    # and fails loudly, naming each file. This used to be `if total < 100`,
+    # which was a floor on the corpus rather than on the pattern — and once a
+    # row became an equality that floor would have refused a commit which
+    # legitimately shed its way below 100 and lowered every row correctly, with
+    # a message blaming the regex.
+    #
+    # What is left to assert is the pattern's own shape, which no corpus size
+    # can show: that it still matches the form it is for, and still does not
+    # match the bare form, which is the documented scope limit rather than an
+    # accident.
+    if not pattern.search("see `crates/tf_tree/src/tree.rs:2182` for it"):
         fail(
-            f"the line-citation scan found only {total} citations where the "
-            f"budget records {sum(budget.values())}; the pattern has stopped "
-            f"matching and this gate is asserting nothing"
+            "the `path.rs:LINE` pattern no longer matches a full-path citation; "
+            "this gate is asserting nothing"
+        )
+    if pattern.search("see `tree.rs:2182` for it"):
+        fail(
+            "the `path.rs:LINE` pattern now matches the bare form; that is a "
+            "wider scope than every row in the budget was measured against, so "
+            "the rows must be re-derived in the same commit"
         )
 
-    note = ""
+    # **A drop is a failure, not a note, and that is what makes "a row may only
+    # fall" a rule rather than a preference.** It was a note until 2026-09-19,
+    # and the hole is arithmetic: a commit adding `50\tdocs/PHASE5.md` for a
+    # file carrying two prints "within budget" plus "48 shed" and exits 0, so
+    # the budget can be raised to any number as long as the same commit does not
+    # also add citations. Failing here means a row that no longer matches its
+    # file has to be brought down in the commit that shed it, which is the only
+    # moment anybody knows why.
     if dropped:
         shed = sum(was - now for _, was, now in dropped)
-        note = (
-            f"; {shed} shed in {len(dropped)} file(s) — lower them in "
-            f"{budget_path} in the same commit"
+        listed = ", ".join(f"{rel} {was}->{now}" for rel, was, now in dropped)
+        # Two remedies, because a row for a file that no longer exists cannot be
+        # "lowered" alongside citations that are not there to shed.
+        remedy = f"lower them in {budget_path} in the same commit"
+        if gone:
+            remedy += (
+                f" — and {', '.join(gone)} is no longer tracked, so its row is "
+                f"to be deleted rather than lowered"
+            )
+        fail(
+            f"{len(dropped)} budget row(s) sit above their file, by {shed} "
+            f"citation(s) in total — either the citations were removed and the "
+            f"rows were not, or a row was written too high; both read the same "
+            f"from here. {remedy}: {listed}. A row above its file is headroom "
+            f"for a citation nobody had to justify."
         )
+    # **The uncounted half went into three documents and went stale in all of
+    # them inside one branch**, so it is printed rather than written down — and
+    # a printed number nothing can contradict is the shape this gate keeps
+    # finding, so it gets the same anti-vacuity treatment as the pattern above.
+    # `bare` is a strict superset of `pattern` by construction: every prefixed
+    # citation is also a bare one.
+    if wider < total:
+        fail(
+            f"the wider citation census counted {wider} against the gated "
+            f"{total}, and it cannot be smaller — every prefixed citation is "
+            f"also a bare one, so the `bare` pattern has stopped matching"
+        )
+    if not bare.search("see `tree.rs:2182` for it"):
+        fail(
+            "the wider census pattern no longer matches a bare citation; the "
+            "figure it prints is asserting nothing"
+        )
+    # A file whose fence never closed was read to the point of the fence and no
+    # further, so both totals are partial on that run. The shed report already
+    # excludes it; a census printed beside the failure has to say so too, or the
+    # number offered *because* a run failed is the number that run could not
+    # take.
+    partial = (
+        f" — PARTIAL: {len(unreadable)} file(s) were read only as far as an "
+        f"unclosed fence, so both totals are short"
+        if unreadable
+        else ""
+    )
+    note(
+        f"citation census: {total} `path.rs:LINE` in {len(found)} documents with "
+        f"a directory prefix, {wider} with the prefix made optional — the gate "
+        f"holds the first number, so its rows are a floor on the rot and not a "
+        f"census of it{partial}. **Tracked Markdown only**: the same citations "
+        f"are written in Rust doc comments, which nothing here scans"
+    )
     return (
         f"{total} `path.rs:LINE` citations in {len(found)} documents, "
-        f"all within their per-file budget{note}"
+        f"each matching its row in {budget_path}"
     )
 
 
@@ -1459,21 +1629,50 @@ def check_changelog_freshness() -> str:
 
 def main() -> int:
     authority = load_toml("Cargo.toml")["workspace"]["package"]["version"]
-    lines = [
-        check_versions(),
-        check_publishable(authority),
-        check_changelog(authority),
-        check_recipe_references(),
-        check_markdown_tables(),
-        check_relative_links(),
-        check_front_page_versions(),
-        check_distribution_name(),
-        check_decision_status_citations(),
-        check_changelog_freshness(),
-        check_line_citations(),
-    ]
+
+    # **A check's summary sentence is unconditional, so it must not be printed
+    # for a check that failed.** Every `check_*` ends by *asserting* its rule —
+    # "all read 0.0.5", "each matching its row" — and `fail()` only appends
+    # elsewhere, so printing the summaries on a failing run (added 2026-09-19 so
+    # a ratchet failure would still carry the census) made the tool emit an
+    # all-clear about the very rule in the failure block beneath it. The
+    # snapshot of `failures` around each call is what tells them apart, and it
+    # is the whole mechanism: a check that added a message loses its sentence.
+    lines: list[str] = []
+    for call in (
+        check_versions,
+        lambda: check_publishable(authority),
+        lambda: check_changelog(authority),
+        check_recipe_references,
+        check_markdown_tables,
+        check_relative_links,
+        check_front_page_versions,
+        check_distribution_name,
+        check_decision_status_citations,
+        check_changelog_freshness,
+        check_line_citations,
+    ):
+        before = len(failures)
+        summary = call()
+        if len(failures) == before:
+            lines.append(summary)
 
     if failures:
+        # **What goes out on a failing run is the measurements and the surviving
+        # verdicts.** A check that failed loses its summary in the loop above,
+        # because every summary asserts its own rule; `notes` carries the
+        # numbers that assert nothing and prints regardless, which is what a
+        # person reading a ratchet failure actually wants. Both halves of that
+        # arrangement were wrong in turn: summaries were suppressed entirely
+        # until 2026-09-19, then printed unconditionally on the same day, which
+        # put an all-clear above its own failure block.
+        for line in [*lines, *notes]:
+            print(f"artifact-versions: {line}")
+        # stdout is block-buffered under a pipe — `just lint`, CI — so without
+        # this the failure block on stderr arrives first and the summaries land
+        # after it. The claim "printed before the failure block" held on a tty
+        # and nowhere else.
+        sys.stdout.flush()
         print(
             "artifact-versions: the repository disagrees with itself.\n",
             file=sys.stderr,
@@ -1488,7 +1687,7 @@ def main() -> int:
         )
         return 1
 
-    for line in lines:
+    for line in [*lines, *notes]:
         print(f"artifact-versions: {line}")
     return 0
 

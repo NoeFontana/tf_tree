@@ -214,8 +214,18 @@ cannot see it — **`just ros-build` and `just ros-test` are its entire gate**;
 - **Cite a symbol, never a line number.** `path.rs:123` in a Markdown file
   breaks on the next edit to that file — measured: four such citations were
   already stale on `main`, and one seven-line rustdoc edit moved twenty-two
-  more. `just lint` ratchets the 157 that exist down per file
-  (`scripts/line-citation-budget.txt`); a new one fails.
+  more. `just lint` ratchets the ones that exist down per file
+  (`scripts/line-citation-budget.txt`), each row an equality with its file; a new
+  one fails. **The gate sees only the spelling that carries a
+  directory prefix** (`crates/`, `xtask/`, `scripts/`, `ros/`), not a bare
+  `tree.rs:123` — so its rows are a floor on the rot and not a census. **Both
+  totals are printed by the gate, on a failing run as well as a passing one**,
+  rather than either being written down here: the figure went stale in three
+  documents inside the PR that measured it, and it is wanted most by whoever is
+  reading a ratchet failure. `scripts/line-citation-budget.txt` is the register;
+  no total belongs in this file.
+  *Writing the prefixed form here as an example failed this very gate, which is
+  the shortest demonstration that it works.*
 - No blocking wait, futex, or notification primitive **in the arena**
   ([`0018`](./docs/decisions/0018-blocking-waits-belong-in-the-shim.md)).
 - **Cut, not deferred** ([`0009`](./docs/decisions/0009-descoping-phase-6.md)):

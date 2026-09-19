@@ -495,6 +495,30 @@ impl TreeBuilder {
     /// fd is the capability, which is what keeps an unrelated process from
     /// attaching by guessing.
     ///
+    /// # Binding a rendezvous over this arena is out of contract
+    ///
+    /// This tree registers a `LIVE` participant record and takes **no lock
+    /// byte**: an arena the fd reaches is outside the sharing boundary
+    /// (`docs/PHASE2.md` §3.1), and there is no lock file for it to take a byte
+    /// in. Handing the fd to a child — what this call is for — costs nothing:
+    /// nothing else can find the segment, so no peer carries a probe and no
+    /// peer ever has an opinion about the record.
+    ///
+    /// Publish it instead — bind a `tf_tree_ipc::OwnerServer` over the fd so
+    /// that peers can join by name — and the byte-less record is what crossing
+    /// back over that boundary costs. Every peer that joined normally judges
+    /// liveness by the byte (`docs/PHASE2.md` §5.1), reads this record as
+    /// **dead** while this process is publishing, and frees it with
+    /// [`Tree::reap_participants`]; the creator holds no claim lease either, so
+    /// [`Tree::reap_dead`] takes the edge it is publishing to.
+    /// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
+    /// 2026-09-18 that this composition is **out of contract**.
+    ///
+    /// Nothing refuses it, and no single call can: the defect belongs to a pair
+    /// of calls and neither member can see the other. The supported way to
+    /// serve a created arena is `tf_tree::Open`, whose `Created` arm is this
+    /// call **plus** the rendezvous, the lock byte and the claim leases.
+    ///
     /// # Errors
     ///
     /// [`BuildError`] as for [`TreeBuilder::build`], plus
