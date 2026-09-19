@@ -2315,19 +2315,33 @@ pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
 /// would not say"* — and this function collapsed them into "/proc could not say
 /// what became of the process" until 2026-09-19. On the byte-less
 /// `build_shared` record that `a_byteless_record_in_a_served_arena_is_accused_of_leaking`
-/// pins, there is no identity record, so `/proc` was never asked about anybody:
-/// the message named a syscall the run did not make, beside a pid `/proc` would
-/// have answered for instantly. `recorded_pid` is what separates them, because
-/// it is `Some` exactly when a record was read.
+/// pins, the lock file yields no identity record, so `/proc` was never asked
+/// about anybody: the message named a syscall the run did not make, beside a
+/// pid `/proc` would have answered for instantly.
+///
+/// **`recorded_pid` separates the two *as far as this run can*, and the clause
+/// is written to claim no more than that.** `slot_facts`
+/// (`crates/tf_tree_cli/src/lib.rs`) builds it from
+/// `read_identity(slot).ok().flatten()`, which folds a read that **failed**
+/// into a read that found nothing — so `None` means *this run has no identity
+/// record*, never *the lock file holds none*. Saying the latter would be the
+/// same defect one level down: an absence asserted from a question that may not
+/// have been answered.
+///
+/// **And the pid in the finding is still real.** It is the arena record's,
+/// which `tft014` falls back to, so the remedy this check prints — *check the
+/// pid is gone before you reap* — has something to check. The clause says where
+/// that number comes from, because a reader who has just been told no process
+/// was named would otherwise read the pid beside it as contradicting it.
 fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
     match (p.byte, p.recorded) {
         (LockByte::Free, RecordedProcess::Gone) => {
             "the lock byte is free, and /proc has no running process for it"
         }
         (LockByte::Free, RecordedProcess::Unknown) if p.recorded_pid.is_none() => {
-            "the lock byte is free, and the lock file holds no identity record for this slot \
-             — so nothing names a process for /proc to be asked about, and the kernel's \
-             answer about the byte is the whole of the evidence"
+            "the lock byte is free, and this run got no identity record out of the lock file \
+             for this slot — so nothing there named a process, /proc was asked about none, \
+             and the pid below is the arena record's own"
         }
         (LockByte::Free, _) => {
             "the lock byte is free, and /proc could not say what became of the process — so \
@@ -5308,8 +5322,12 @@ mod tests {
             "the evidence must name the byte this run probed, which is what tells an `--attach` finding from a `--from-bag` one: {m}"
         );
         assert!(
-            m.contains("no identity record for this slot"),
-            "this slot has no lock-file record, so nothing named a process for /proc to be asked about: {m}"
+            m.contains("no identity record out of the lock file"),
+            "this run got no lock-file record for the slot, so nothing there named a process: {m}"
+        );
+        assert!(
+            m.contains("the pid below is the arena record's own") && m.contains("pid 4712"),
+            "the finding prints a pid and its remedy says to check it, so the evidence must say where that number came from: {m}"
         );
         assert!(
             !m.contains("/proc could not say"),

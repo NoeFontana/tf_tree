@@ -1331,14 +1331,16 @@ def check_line_citations() -> str:
     "48 shed" note, and exit 0.
 
     **The equality is with what the pattern matches, and the pattern sees only
-    the full-path form.** `crates/tf_tree/src/tree.rs:2182` is counted;
-    `tree.rs:2182` is not, and `CLAUDE.md`'s rule names the bare form
-    explicitly. Measured 2026-09-19 over tracked Markdown: 154 counted against
-    404 once the prefix is optional — the gate covers well under half of what
-    it is named for, and it is the *later*-written half, since the bare spelling
-    is what a record reaching for brevity produces. Extending the pattern
-    grandfathers about 250 more sites across 27 files, which is its own change
-    and its own review; it is not folded in here.
+    the prefixed form.** A citation beginning `crates/`, `xtask/`, `scripts/` or
+    `ros/` is counted; a bare `tree.rs:2182` is not, and `CLAUDE.md`'s rule
+    names the bare form explicitly. The gate covers well under half of what it
+    is named for, and it is the *later*-written half, since the bare spelling is
+    what a record reaching for brevity produces. **Both totals are printed on
+    every run** rather than recorded in prose: the figure went stale in three
+    documents inside the change that first measured it, because the same branch
+    kept converting bare citations. Extending the pattern grandfathers a few
+    hundred more sites, which is its own change and its own review; it is not
+    folded in here.
 
     **Per file rather than in total**, because a total is not a ratchet: one
     document could shed five citations while another gained five and the sum
@@ -1450,9 +1452,21 @@ def check_line_citations() -> str:
             f"row that sits above its file is headroom for a citation nobody "
             f"had to justify."
         )
+    # **The uncounted half, measured on every run rather than written down.**
+    # This number went stale three times in the PR that first wrote it — in
+    # `CLAUDE.md`, in the budget header and in this docstring — because the
+    # branch kept converting bare citations while the figure stayed put. It is
+    # printed instead of quoted, so no document has to carry it.
+    bare = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|py):\d+")
+    wider = 0
+    for rel in files:
+        prose, _ = strip_fenced_blocks(Path(rel).read_text(errors="replace"))
+        wider += len(bare.findall(prose))
     return (
         f"{total} `path.rs:LINE` citations in {len(found)} documents, "
-        f"each matching its row in {budget_path}"
+        f"each matching its row in {budget_path} "
+        f"({wider} with the directory prefix made optional — the gate's rows "
+        f"are a floor on the rot, not a census)"
     )
 
 

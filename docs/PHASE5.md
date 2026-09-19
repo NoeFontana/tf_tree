@@ -1688,10 +1688,15 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > set in #274 — because `TFT014` was already in it, and what changes here is how
 > much of its own row it covers.
 >
-> **It is detection, and stops there.** `0028` is `draft` and its header exists
-> so that no reclamation lands before its predicate is settled; a `doctor` check
-> that mutated the arena would be the exact thing that record is holding the
-> door against. What an operator gets is the count and the budget: a leaked slot
+> **It is detection, and stops there.** A `doctor` check that mutated a robot's
+> arena as a side effect of being asked a question would be the tool
+> overstepping; reclamation belongs to the participants, through
+> [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md)'s three
+> collectors. *This read "`0028` is `draft` and its header exists so that no
+> reclamation lands before its predicate is settled". That record has been
+> `implemented` and frozen since 2026-08-21, and two paragraphs above this one
+> the same blockquote now rests on its step 0b having **shipped** — so the
+> argument survives and its premise did not.* What an operator gets is the count and the budget: a leaked slot
 > is `1 of 64` permanently spent, and there is no way to get one back short of
 > stopping every participant so the segment is freed.
 >

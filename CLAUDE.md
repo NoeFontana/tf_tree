@@ -218,8 +218,9 @@ cannot see it — **`just ros-build` and `just ros-test` are its entire gate**;
   (`scripts/line-citation-budget.txt`), each row an equality with its file; a new
   one fails. **The gate sees only the spelling that carries a
   directory prefix** (`crates/`, `xtask/`, `scripts/`, `ros/`), not a bare
-  `tree.rs:123` — so its rows are a floor on the rot and not a census: 154
-  counted against 404 when the prefix is made optional (measured 2026-09-19).
+  `tree.rs:123` — so its rows are a floor on the rot and not a census. It prints
+  both totals on every run rather than either being written down here, because
+  the figure went stale in three documents inside the PR that measured it.
   *Writing the prefixed form here as an example failed this very gate, which is
   the shortest demonstration that it works.* No count is repeated here beyond that
   one measurement, because the budget file is the register.

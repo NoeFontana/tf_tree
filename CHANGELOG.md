@@ -129,6 +129,37 @@ frozen, and two are not; the second then stated a categorical over "the rest"
 from the arithmetic rather than from reading them. A status and a citation are
 both things to read, not to infer.*
 
+### Fixed — `TFT014` accused a live publisher, and named a syscall it had not made
+
+`tf_tree doctor --attach` reports `SlotLeak::Abandoned` against a `LIVE`
+participant record whose lock byte is free. A byte-less
+`TreeBuilder::build_shared` creator in a hand-served arena is exactly that
+shape while it is **running and publishing**, and the check's own rustdoc said
+such a record "reaches `slot_leak`'s `unknown` byte row and is judged by
+`/proc` alone" — a claim about a run that read *no lock file*, offered as
+though it were about the subject. `docs/RUNBOOK.md` and `docs/PHASE5.md` said
+it too.
+
+The verdict is unchanged, because it is the composition that `0031` refuses and
+not the check that is wrong. What changed is everything the operator is told
+about it:
+
+- the finding's cause list named `Tree::attach_shared`, deleted by `0028` step
+  0b, and did not name the live-publisher case. It now names it and says
+  **check the pid is gone before you reap**;
+- the evidence clause said *"/proc could not say what became of the process"*
+  where the lock file had named no process for `/proc` to be asked about. That
+  is a fourth rendering now, and it says which pid the finding is printing —
+  the arena record's — so the remedy has something to point at. It claims only
+  that *this run* got no identity record, because a failed read and an absent
+  one are folded together upstream;
+- `Tree.reap_dead()`'s Python docstring carried the pre-retraction framing while
+  the runbook was warning operators about that exact call.
+
+`a_byteless_record_in_a_served_arena_is_accused_of_leaking` executes the whole
+shape, and its mutant is recorded against the first note written about it, which
+predicted the wrong failure.
+
 ### Fixed — the line-citation ratchet scanned the wrong half of two documents
 
 Found while writing the paragraph above, which first explained `docs/PHASE5.md`

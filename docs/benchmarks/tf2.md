@@ -1314,8 +1314,8 @@ Each of the three, checked against the code:
   a deliberate, documented deviation from §2's "no `libc` crate" because
   `rustix` 1.1 has no OFD locking. This is what lets a `SIGSTOP`ped publisher
   keep its claims while a dead one is reclaimed.
-- **Reaping is wired.** `Tree::reap_dead` (`crates/tf_tree/src/tree.rs`) and
-  `Tree::reap_participant` (`:2362`) are public, and `edge::reap`
+- **Reaping is wired.** `Tree::reap_dead` and `Tree::reap_participant`
+  (`crates/tf_tree/src/tree.rs`) are public, and `edge::reap`
   (`tf_tree_core/src/edge.rs:399`) is reached through them rather than from
   tests alone.
 
