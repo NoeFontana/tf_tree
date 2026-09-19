@@ -1,15 +1,6 @@
-//! `shm_torture`'s own gate: the detector is tested, not trusted.
-//!
-//! A soak test is the easiest kind of test to get wrong, because the failure
-//! mode looks identical to the success: a harness that never reads anything, or
-//! that reads and never checks, prints "0 violations" and passes forever. This
-//! file is what stops that. It runs the real binary twice — once with a child
-//! that deliberately publishes a corrupt transform, once without — and asserts
-//! the two runs disagree.
-//!
-//! The runs here are seconds long. The **nightly** run (`just shm-torture`) is
-//! thirty minutes, per `docs/PHASE2.md` §13; this is the part that belongs in a
-//! gate somebody runs on a branch.
+//! `shm_torture`'s own gate: the detector is tested, not trusted. The runs here
+//! are seconds long; the nightly (`just shm-torture`) is thirty minutes per
+//! `docs/PHASE2.md` §13.
 //!
 //! Requires `--features shm` (Linux). Run: `just shm-torture-self-test`, which
 //! `just shm-check` calls.
@@ -18,9 +9,7 @@
 
 use std::process::{Command, Output};
 
-/// Run the shipped `shm_torture` binary. `CARGO_BIN_EXE_shm_torture` is set for
-/// integration tests, so this is the binary the recipes run, not a
-/// re-implementation of it.
+/// Run the shipped `shm_torture` binary.
 fn torture(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_shm_torture"))
         .args(args)
@@ -28,29 +17,14 @@ fn torture(args: &[&str]) -> Output {
         .expect("spawning shm_torture")
 }
 
-/// **The detector works across a process boundary.**
+/// The detector works across a process boundary: a child publishes a NaN
+/// translation and some other participant must read it and say so. NaN, not a
+/// denormalized quaternion, because `LerpSlerp` renormalizes what it
+/// interpolates. Seed 999, not the default, which was the only seed that ever
+/// detected anything.
 ///
-/// One child publishes a transform with a NaN translation. Some *other*
-/// participant — a sibling child, or the driver's own observer, which never
-/// writes anything — must read it and say so. If nothing does, every "0
-/// violations" this harness has ever printed is worth nothing.
-///
-/// The corruption is a NaN and not a denormalized quaternion on purpose:
-/// `LerpSlerp` renormalizes what it interpolates, so a non-unit quaternion
-/// pushed into the ring comes back unit and this test would pass while proving
-/// the opposite. `sample()` in the binary carries that note.
-///
-/// Mutant (applied, confirmed fatal): make `Invariant::check` return `Ok(())`
-/// unconditionally — the injected run then exits 0 and the first assertion
-/// fails. Also confirmed by the reverse: with the writer pacing in `work`
-/// removed, the observer manages 0 checked reads and the injected run passes —
-/// which is what that pacing is for.
-///
-/// **The seed is not the default.** The default was the only seed the shipped
-/// harness detected anything on: with the driver joining instead of owning the
-/// rendezvous, seeds 999, 7, 8, 1 and 123456789 all ran the injector for a full
-/// 15 s, read nothing, and exited 0. A self-test bound to one lucky seed is the
-/// thing this file exists to prevent, so it runs on a seed that used to fail.
+/// Mutants: `Invariant::check` returning `Ok(())` makes the injected run exit 0;
+/// removing the writer pacing in `work` leaves the observer 0 checked reads.
 #[test]
 fn a_corrupt_transform_is_caught_by_a_process_that_did_not_write_it() {
     let out = torture(&[
@@ -72,38 +46,22 @@ fn a_corrupt_transform_is_caught_by_a_process_that_did_not_write_it() {
         stderr.contains("invariant violation(s)"),
         "the run failed for some other reason.\n{stdout}\n{stderr}"
     );
-    // The observer is the driver's own attachment; it publishes nothing, so a
-    // violation it reports cannot have been self-inflicted. A run where only the
-    // injecting child noticed would prove nothing about cross-process reads, so
-    // this is the assertion that carries the test's name.
+    // The observer publishes nothing, so a violation it reports cannot be
+    // self-inflicted; this carries the test's name.
     assert!(
         stdout.contains("the observer read a bad transform"),
         "only the writer noticed; no reader in another process did.\n{stdout}"
     );
 }
 
-/// **A run that validates nothing fails, instead of printing `PASS`.**
+/// A run that validates nothing fails instead of printing `PASS`.
+/// `--readers-only` leaves every ring empty; every other test is the control.
 ///
-/// `--readers-only` starts children that attach and read but never claim or
-/// publish, so every ring stays empty and the observer validates exactly
-/// nothing. That is the state the shipped harness reported as a pass — on most
-/// seeds, for thirty minutes at a time, with a NaN in flight — and the whole
-/// value of a soak test is that its silence means something.
-///
-/// The control is every other test in this file: they all run without the flag
-/// and pass, so this cannot be satisfied by a binary that fails unconditionally.
-///
-/// Mutant (applied, confirmed fatal): delete the `if vacuous { bail!(...) }`
-/// arm in `drive` — the run then prints `PASS` and exits 0, and the first
-/// assertion fails.
+/// Mutant: delete the `if vacuous { bail!(...) }` arm in `drive`.
 #[test]
 fn a_run_that_validates_nothing_fails_instead_of_passing() {
-    // `--children 4`, not 2: the owner-kill arm is on by default and since
-    // 2026-09-10 refuses a fleet it cannot sustain
-    // (`MIN_ATTACHED_FOR_ORDINARY_KILL + 1`). At 2 the parse-time refusal landed
-    // first, the run never reached the vacuity guard, and the assertion below
-    // was reading the wrong failure. The child count is incidental;
-    // `--readers-only` is what makes the run validate nothing.
+    // `--children 4`: below `MIN_ATTACHED_FOR_ORDINARY_KILL + 1` the parse-time
+    // refusal of the owner-kill arm lands before the vacuity guard.
     let out = torture(&["--duration", "3s", "--children", "4", "--readers-only"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -121,25 +79,17 @@ fn a_run_that_validates_nothing_fails_instead_of_passing() {
     );
 }
 
-/// **An injected run that detects nothing fails naming the detector.**
+/// An injected run that detects nothing fails naming the detector;
+/// `--readers-only` is the only way to reach that state on purpose.
 ///
-/// `--inject-violation` means "this run is expected to FAIL". Reaching the end
-/// of it with zero violations is therefore a defect in the harness however
-/// healthy the rest of the output looks, and combining it with `--readers-only`
-/// is the only way to reach that state on purpose: the injector never gets to
-/// publish, so nothing can be detected.
-///
-/// Mutant (applied, confirmed fatal): delete the `if a.inject { bail!(...) }`
-/// arm — the run then fails on the read floor instead, and the second assertion
-/// fails because the message no longer mentions the detector.
+/// Mutant: delete the `if a.inject { bail!(...) }` arm; the run then fails on the
+/// read floor and the second assertion fails.
 #[test]
 fn an_injected_run_that_detects_nothing_says_so() {
     let out = torture(&[
         "--duration",
         "3s",
-        // 4, raised from 2 on 2026-09-10: below
-        // `MIN_ATTACHED_FOR_ORDINARY_KILL + 1` the owner-kill arm's parse-time
-        // refusal lands first and this test never reaches its own subject.
+        // 4: below `MIN_ATTACHED_FOR_ORDINARY_KILL + 1` the parse-time refusal lands first.
         "--children",
         "4",
         "--readers-only",
@@ -157,75 +107,17 @@ fn an_injected_run_that_detects_nothing_says_so() {
     );
 }
 
-/// **A clean run passes, and passes having actually looked.**
+/// A clean run passes having actually looked; the control for the injected test.
+/// Seed 999 at six children is the configuration the shipped harness once read
+/// nothing in.
 ///
-/// The control for the test above: without it, a harness that failed
-/// unconditionally would satisfy the injected half. The read count is asserted
-/// for the same reason the binary prints it.
+/// The 8 s duration is not load-bearing: the owner reaps a dead participant's
+/// record on hangup (`docs/PHASE2.md` §3.9), `shm_torture` checks each round for
+/// a live writer and a recent sample, and `check_recovery` names leaked slots.
 ///
-/// Mutant (applied, **survived**): removing the `std::thread::sleep` pacing in
-/// `work` leaves this green at 11 989 composed reads. It was fatal against the
-/// reader that asked at `now` — the rings then covered microseconds and every
-/// lookup fell outside them — and it is not against one that probes each ring
-/// for its window immediately before reading it. The pacing is kept for the
-/// other reason its comment gives (spreading the kills across the protocol
-/// rather than into one hot loop), and that reason has no mutant.
-///
-/// **Seed 999 at six children, deliberately.** That is the configuration the
-/// shipped harness read *nothing* in — 0 composed reads over 15 s, exit 0 —
-/// while the default seed is the one it happened to survive.
-///
-/// Mutant (applied, confirmed fatal): make `common_window` return `None`
-/// unconditionally — the composed count drops to 0 and the second assertion
-/// fails while the first still passes on the single-edge reads alone.
-///
-/// Mutant (applied, **survived**, and named because the surprise is the point):
-/// restoring `observe`'s old hill-climbing aim leaves this green at 12 967
-/// composed reads. The aiming was never what made the harness vacuous; the
-/// rendezvous was. See [`shm_torture`'s `attach_observer`].
-///
-/// # Why eight seconds used to be load-bearing, and is not any more
-///
-/// Until 2026-08-17 a `SIGKILL`ed participant left its record `LIVE` for ever
-/// and the arena's owner would never grant that slot again, so a run at
-/// `--kill-hz 6` with 6 children exhausted the 64-slot table after about 57
-/// kills — `t ≈ 9.5 s`. **This case runs for 8.** The margin was measured, not
-/// estimated: this exact invocation against the unfixed engine ends having made
-/// 50 kills with 47 slots leaked and 4 alive, so 52 of the 64 are gone and the
-/// wedge is **12 slots — two seconds — away**. What it would have done past
-/// that margin is not "fail on the read floor": four rings whose writers are all
-/// gone still answer every lookup inside the window they froze with, so the
-/// composed count stays at the full 256 a round and the run reports a perfect
-/// score over a dead arena. Measured on this host at `--duration 60s`, before
-/// the fix: `writers=0.0/4 freshest=25670ms composed=25600/25600`, with 8193
-/// `NoParticipantSlots` refusals on stderr. The 30-minute nightly is what
-/// finally showed it, and only because on that runner the four rings froze
-/// *without* overlapping — which is a coin flip and not a property of the
-/// runner: two nightlies at the same seed on identical code (`817ce70`,
-/// `a3bc7f2`) came back `2.02` and `256.00` composed reads a round, one red and
-/// one green over the same dead arena. See `RoundHealth`'s doc comment in the
-/// binary for both runs and for why a *perfect* score is the tell.
-///
-/// Two things changed, and neither is this test's duration. The owner now reaps
-/// a dead participant's record on hangup, which is what `docs/PHASE2.md` §3.9
-/// always said it did — measured after: 728 kills over 120 s with the
-/// registered-slot count flat at 5 of 64, and then the nightly itself, green on
-/// `ubuntu-latest` at `adeb158` with 10 756 kills, `slots=5reg/4alive` in every
-/// one of its 107 health lines and `live` never below 86%. And `shm_torture` now
-/// checks on every round that some chain edge has a *live* writer and that the
-/// freshest sample is recent, failing a run that spends most of itself
-/// quiescent, so a regression of the first cannot hide the way it hid before.
-/// `check_recovery` reports leaked slots by name on top of that.
-///
-/// The two are independent, and this case is the place that shows it. Run the
-/// current harness against the *unfixed* engine (measured, in a scratch copy of
-/// the tree with `open.rs` reverted): it exits 1 on `1 recovery failure(s)` —
-/// "47 of 64 participant slot(s) hold a LIVE record for a process the kernel
-/// says is dead" — while reporting `composed=13056/13056` and `live=96%`. So the
-/// harness half fails an engine that leaks even when the run was, for its whole
-/// eight seconds, genuinely healthy. That is the intended relationship: this
-/// test goes green again only when the engine stops leaking, not when the
-/// duration is tuned back under the margin.
+/// Mutants: `common_window` returning `None` drops the composed count to 0 and
+/// fails the second assertion; removing the `std::thread::sleep` pacing in `work`
+/// survives, and is kept to spread the kills across the protocol.
 #[test]
 fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
     let out = torture(&[
@@ -245,9 +137,7 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
         "a clean torture run failed.\n{stdout}\n{stderr}"
     );
 
-    // Every line of the driver's output starts `shm_torture: `, including the
-    // header, so the suffix is what identifies the line — `find_map` on the
-    // prefix alone picks up the banner and parses `4` out of "4 children".
+    // Every output line starts `shm_torture: `, so the suffix identifies the line.
     let reads: u64 = stdout
         .lines()
         .filter_map(|l| l.strip_prefix("shm_torture: "))
@@ -255,19 +145,15 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
         .unwrap_or("0")
         .parse()
         .unwrap_or(0);
-    // Thousands, not one. The observer reads in bursts of 256 between kills, so
-    // even a heavily contended 8-second run clears this by two orders of
-    // magnitude; a run that does not has stopped reading, not slowed down.
+    // Thousands, not one: a run that misses this has stopped reading.
     assert!(
         reads > 1_000,
         "the observer validated only {reads} transforms, so `0 violations` says \
          almost nothing.\n{stdout}"
     );
 
-    // **Composed reads specifically.** The single-edge reads alone would satisfy
-    // the total above, and they are the easy half: one ring, one window. §11.4's
-    // property is about a `map -> tool` that composes all four edges at one
-    // stamp, and that is the number that was zero.
+    // Composed reads specifically: §11.4 is about `map -> tool` composing all
+    // four edges at one stamp.
     let composed: u64 = stdout
         .lines()
         .filter_map(|l| l.trim().strip_prefix("shm_torture:   "))
@@ -295,18 +181,10 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
         "only {kills} children were killed, so no recovery path was exercised.\n{stdout}"
     );
 
-    // **§3.5, and eight seconds is chosen so exactly one owner kill lands.**
-    // The first is scheduled `OWNER_KILL_FIRST` (4 s) in, which is early enough
-    // that this case covers the arm and late enough that the 3 s
-    // `--readers-only` case above never reaches it and keeps meaning what it
-    // meant.
-    //
-    // Asserted on the *printed* line rather than on the exit status, for the
-    // reason the binary prints it: a run with the arm silently disabled exits 0
-    // too. `a_run_that_never_inherits_the_owner_role_fails_naming_it` is the
-    // red half — these three assertions all pass on a build where nothing
-    // inherits *if* that test does not exist, because a green run says nothing
-    // about a check that cannot fail.
+    // §3.5: 8 s lands exactly one owner kill (first at `OWNER_KILL_FIRST`, 4 s).
+    // Asserted on the printed line, not the exit status: a run with the arm
+    // silently disabled exits 0 too. `a_run_that_never_inherits_the_owner_role_fails_naming_it`
+    // is the red half.
     assert!(
         stdout.contains("§3.5 owner kill 1:"),
         "the run never killed the rendezvous owner, so PHASE2 §3.5 was not exercised \
@@ -318,12 +196,8 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
          did not check. An ownerless arena is exactly what refuses a new joiner, so this \
          is the assertion that says the role was inherited.\n{stdout}"
     );
-    // **Parsed, not matched as a substring.** This read
-    // `!stdout.contains("0 survivor(s) inherited")` until 2026-09-04, which also
-    // matches `10 survivor(s) inherited` — so a healthy run with ten
-    // inheritances in one window would have failed it. The count is read out of
-    // the §3.5 summary line the way `reads`, `composed` and `kills` are read
-    // above, and compared as a number.
+    // Parsed as a number: a substring match on `0 survivor(s) inherited` also
+    // matches `10 survivor(s) inherited`.
     let inherited: u64 = stdout
         .lines()
         .filter_map(|l| l.strip_prefix("shm_torture: §3.5: "))
@@ -341,39 +215,16 @@ fn a_clean_run_passes_and_validates_a_nontrivial_number_of_transforms() {
     );
 }
 
-/// **The strict half of the leak check, on a configuration that reaches it.**
+/// The strict half of the leak check. `check_recovery` sweeps and requires
+/// collection of records `docs/decisions/0043` says no hangup callback can reach,
+/// and fails the run on any other leaked `LIVE` record; this case exercises the
+/// second. `--no-kill-owner` keeps the owner child parked, so every worker record
+/// is reachable by its hangup callback. A migrating run downgrades that verdict
+/// to a note, so the run prints which verdict applied and this test asserts it.
 ///
-/// `check_recovery` splits the participant records it finds still `LIVE` for a
-/// dead process into two: the ones `docs/decisions/0043` says no hangup callback
-/// can reach — a process that held the rendezvous, or a child whose own owner
-/// has since died — which are swept and then *required* to have been collected,
-/// and everything else, which fails the run outright. This case exercises the
-/// second. It is `--no-kill-owner` because that is the configuration in which
-/// the owner's hangup callback is a real collector for the whole teardown: the
-/// owner is the parked owner child, which runs no operations and cannot detach,
-/// so every worker's record is reachable by it and only the owner's own record
-/// is in the swept partition.
-///
-/// **A migrating run does not reach that verdict, and this doc previously said
-/// it did — with a seed tally, which was wrong twice over.** After a migration
-/// the owner is an ordinary worker; its `work` loop ends on a detach arm or on
-/// its operation cap, and with every other child already dead nothing remains to
-/// inherit, so the arena spends most of the teardown with **no owner**. Blaming
-/// a hangup callback there blames a process that was not running. `drive`
-/// decides this from the inheritance ledger and downgrades the verdict for that
-/// arm to a note; the sweep-and-require half applies either way. Which verdict
-/// was in force is printed by the run and asserted below, so the downgrade
-/// cannot reach this case quietly and leave it green with nothing to say.
-///
-/// Mutant (applied, confirmed fatal, then reverted): delete the
-/// `table.reclaim(slot, observed)` in the owner's hangup callback
-/// (`crates/tf_tree/src/open.rs`, `docs/decisions/0028` plan step 4), rebuild
-/// `shm_torture --release --features shm`, and run this case's own arguments at
-/// a few seeds, idle and under load. It exits 1 naming the slots on every seed
-/// it has been tried at. **The counts that stood here are removed** — one of
-/// them was re-measured by a reviewer and by this file's author and came out
-/// different both times, which is what a tally of a scheduling outcome does.
-/// Run the mutant rather than reading a number.
+/// Mutant: delete the `table.reclaim(slot, observed)` in the owner's hangup
+/// callback (`crates/tf_tree/src/open.rs`, `docs/decisions/0028` plan step 4);
+/// the run exits 1 naming the slots.
 #[test]
 fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
     let out = torture(&[
@@ -394,9 +245,8 @@ fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
         "a run with one owner for its whole life failed; every worker record here is \
          reachable by that owner's hangup callback.\n{stdout}\n{stderr}"
     );
-    // The negative half: this configuration must not be reaching the *swept*
-    // partition for anything but the owner's own record. If it were, the run
-    // above would pass on a build whose hangup collector does nothing.
+    // The run must not reach the swept partition for anything but the owner's
+    // own record, or it passes on a hangup collector that does nothing.
     assert!(
         !stdout.contains("§3.5 owner kill 1:"),
         "`--no-kill-owner` killed the owner, so this case is not the no-migration \
@@ -407,10 +257,8 @@ fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
         "the recovery check did not run, so nothing here judged a participant \
          record.\n{stdout}"
     );
-    // **The positive control for this whole case.** Without this assertion a
-    // change that downgraded every run to the migrating arm's sweep-and-note
-    // verdict would leave this test green and vacuous, which is the failure mode
-    // the file's own history is full of.
+    // Positive control: a downgrade to the sweep-and-note verdict would leave
+    // this test green and vacuous.
     assert!(
         stdout.contains("judged on the STRICT path"),
         "this run did not put the leak check on its strict path, so passing says \
@@ -418,39 +266,18 @@ fn a_run_that_never_migrates_holds_every_worker_record_to_the_strict_path() {
     );
 }
 
-/// **A run in which nothing inherits the owner role FAILS, naming §3.5.**
+/// A run in which nothing inherits the owner role fails naming §3.5. `--no-inherit`
+/// makes every child skip `Tree::owner_lost`, so the arena goes ownerless
+/// (`docs/decisions/0037`); this is the red half of the §3.5 assertions above.
+/// The run waits the full ten-second recovery deadline.
 ///
-/// The red half of the three §3.5 assertions in the test above, and the
-/// counterpart of `--readers-only` one level down: `--no-inherit` makes every
-/// child skip `Tree::owner_lost`, which is the one thing §3.5 requires a
-/// survivor to do. Nothing inherits, the arena goes ownerless the moment the
-/// owner is killed, and no fresh process can join it again — which is precisely
-/// the state that existed between 2026-08-27 and 2026-08-28 and that
-/// `docs/decisions/0037` exists to end.
-///
-/// **What it is written against is a green run, not a red one.** Every
-/// assertion about a migration in this file is satisfiable by a harness that
-/// stopped killing the owner, or that reports a migration it never checked; this
-/// case is what makes those assertions falsifiable.
-///
-/// Measured (2026-09-04): the run prints `NO fresh process joined within 10s`
-/// for the first kill and exits 1. It costs the recovery deadline — the harness
-/// waits the full ten seconds before concluding, because a migration that has
-/// not happened is indistinguishable from a slow one until the deadline passes,
-/// and shortening the deadline to shorten the test would trade a real property
-/// for a fast one.
-///
-/// Mutant (applied, confirmed fatal): delete the `if !failed.is_empty()` bail in
-/// `drive` — the run then reports the failure in its output and exits 0, and the
-/// first assertion fails.
+/// Mutant: delete the `if !failed.is_empty()` bail in `drive`.
 #[test]
 fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
     let out = torture(&[
         "--duration",
         "6s",
-        // 4, raised from 3 on 2026-09-10: below
-        // `MIN_ATTACHED_FOR_ORDINARY_KILL + 1` the owner-kill arm's parse-time
-        // refusal lands first and this test never reaches its own subject.
+        // 4: below `MIN_ATTACHED_FOR_ORDINARY_KILL + 1` the parse-time refusal lands first.
         "--children",
         "4",
         "--kill-hz",
@@ -466,17 +293,9 @@ fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
         "a run in which no survivor ever called `owner_lost` passed, so this run proved \
          nothing about §3.5.\n{stdout}\n{stderr}"
     );
-    // **The message must not assert a kill that may not have happened.** This
-    // assertion read *"The owner was killed and the arena is ownerless"* until
-    // 2026-09-17, and on the 2026-09-16 nightly it printed that over a run whose
-    // own output said `§3.5: 0 owner kill(s)`: every attempt had been deferred
-    // because the fleet's replacements were still paging their binaries in, and
-    // the harness's floor could not see a single-attempt run. Both halves are
-    // fixed — the floor counts attempts now, and the arm retries in
-    // milliseconds rather than at the next tenure — so a deferred-out run
-    // reaches here as a *failure* rather than a pass. It is still not this
-    // test's subject, so it is named separately instead of being reported as a
-    // migration that did not recover.
+    // The message must not assert a kill that may not have happened: a run whose
+    // every attempt deferred is named separately, not reported as a migration
+    // that did not recover.
     assert!(
         !stderr.contains("produced 0 migration(s)"),
         "the owner-kill arm never fired on this host, so `--no-inherit` tested nothing: every \
@@ -488,10 +307,8 @@ fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
         stderr.contains("ownership migration did not happen"),
         "the run failed for some other reason; the failure must name §3.5.\n{stdout}\n{stderr}"
     );
-    // The specific diagnosis, not just the verdict. A run that failed on the
-    // read floor instead would satisfy the assertion above while saying nothing
-    // about the owner, and the read floor *does* trip on this configuration —
-    // which is why the migration check bails first.
+    // The specific diagnosis, not just the verdict: the read floor also trips
+    // here, but the migration check bails first.
     assert!(
         stdout.contains("NO fresh process joined"),
         "the failure must say that no fresh process could join, which is the property \
@@ -499,30 +316,12 @@ fn a_run_that_never_inherits_the_owner_role_fails_naming_it() {
     );
 }
 
-/// **A run whose owner-kill arm fired and never landed FAILS, however short it
-/// is.**
+/// A run whose owner-kill arm fired and never landed fails, however short. The
+/// floor once counted the schedule's second attempt, so a short run whose one
+/// attempt deferred printed `PASS` over `§3.5: 0 owner kill(s)`.
+/// `--defer-owner-kills` is the positive control; nothing else reaches the path.
 ///
-/// The floor for "the arm is on but never fires" counted the schedule's
-/// *second* attempt (`duration >= OWNER_KILL_FIRST + every`, 12 s at the
-/// defaults), so a shorter run got one attempt in its whole life and, if that
-/// attempt deferred, printed `PASS` over `§3.5: 0 owner kill(s)`. Measured
-/// 2026-09-16 by mutating the deferral test to defer everything: `--duration
-/// 6s` exited **0**, `--duration 13s` exited 1.
-///
-/// That is what the 2026-09-16 nightly hit — three children still in `D` state
-/// paging their own binaries in, a census of 1, one deferral, a vacuous pass —
-/// and what made `a_run_that_never_inherits_the_owner_role_fails_naming_it`
-/// report a kill that had not happened.
-///
-/// `--defer-owner-kills` is the positive control for the path. It is a flag
-/// because nothing else reaches it: `--children` is refused below the pool
-/// floor, and on an unloaded host a replacement's handshake is over in about a
-/// millisecond, so `--kill-hz 40` and six busy loops pinned to one core both
-/// leave every kill landing.
-///
-/// Mutant (applied, confirmed fatal): restore the condition to
-/// `a.duration >= OWNER_KILL_FIRST + every` — this run exits 0 and the first
-/// assertion fails.
+/// Mutant: restore the condition to `a.duration >= OWNER_KILL_FIRST + every`.
 #[test]
 fn a_short_run_whose_owner_kills_all_defer_fails_instead_of_passing() {
     let out = torture(&[
@@ -534,7 +333,7 @@ fn a_short_run_whose_owner_kills_all_defer_fails_instead_of_passing() {
         "4",
         "--seed",
         "999",
-        // Far more than the run can attempt, so every one of them defers.
+        // More than the run can attempt, so every one defers.
         "--defer-owner-kills",
         "999",
     ]);
@@ -551,30 +350,19 @@ fn a_short_run_whose_owner_kills_all_defer_fails_instead_of_passing() {
          a run that failed on the read floor instead would satisfy the assertion above while \
          saying nothing about the owner.\n{stdout}\n{stderr}"
     );
-    // The run's own tally has to agree with the verdict, or the verdict is
-    // reading something other than what happened.
+    // The run's own tally must agree with the verdict.
     assert!(
         stdout.contains("shm_torture: §3.5: 0 owner kill(s)"),
         "the run reported a migration it was not supposed to be able to make.\n{stdout}"
     );
 }
 
-/// **A deferral that clears costs the run nothing.**
+/// A deferral that clears costs the run nothing: it retries at
+/// `OWNER_KILL_DEFERRAL_RETRY` rather than re-arming a whole
+/// `--owner-kill-every` later. Two forced deferrals, then the run must migrate
+/// and pass.
 ///
-/// The other half of the same change, and the one that keeps the fix from being
-/// a harness that fails on its own scheduling. A deferral used to re-arm the
-/// kill a whole `--owner-kill-every` later, so two of them pushed the first kill
-/// from 4 s to 20 s — past the end of any short run. Retrying at
-/// `OWNER_KILL_DEFERRAL_RETRY` instead means the fleet gets another chance as
-/// soon as a replacement has finished its handshake, which is what a deferral is
-/// waiting for.
-///
-/// Two forced deferrals, then the arm is left alone: the run must migrate and
-/// pass. Under the old cadence this configuration had zero migrations by its
-/// deadline and would now fail the floor above.
-///
-/// Mutant (applied, confirmed fatal): re-arm with `every` on the deferred
-/// branch — the run reaches its deadline with no migration and fails.
+/// Mutant: re-arm with `every` on the deferred branch.
 #[test]
 fn a_deferral_that_clears_still_leaves_time_for_the_kill() {
     let out = torture(&[
@@ -606,21 +394,11 @@ fn a_deferral_that_clears_still_leaves_time_for_the_kill() {
     );
 }
 
-/// **The deferral budget has a floor, because it is derived from a caller's
-/// number.**
+/// The deferral budget has a floor: it is `3 × --owner-kill-every`, which is
+/// zero at `--owner-kill-every 0s` and would make the first deferral fatal.
+/// With the floor the run reports a `1.0s budget`.
 ///
-/// The budget is `3 × --owner-kill-every`, which is 24 s at the defaults and
-/// **zero** at `--owner-kill-every 0s` — an accepted input meaning "kill the
-/// owner every round". A zero budget makes the *first* deferral fatal, which is
-/// stricter than the three this harness has always allowed and for a reason
-/// about the caller's schedule rather than about the fleet.
-///
-/// Measured: with the floor the run reports a `1.0s budget` and tolerates six
-/// deferrals; without it, one.
-///
-/// Mutant (applied, confirmed fatal): drop the `.max(MIN_OWNER_KILL_DEFERRAL_
-/// BUDGET)` — the run wedges at `Deferrals so far: 1` and the last assertion
-/// fails.
+/// Mutant: drop the `.max(MIN_OWNER_KILL_DEFERRAL_BUDGET)`.
 #[test]
 fn the_deferral_budget_does_not_collapse_on_a_zero_interval() {
     let out = torture(&[
@@ -639,8 +417,7 @@ fn the_deferral_budget_does_not_collapse_on_a_zero_interval() {
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // It still fails — every kill was forced to defer — but on the budget, not
-    // on the first attempt.
+    // Still fails, but on the budget, not on the first attempt.
     assert!(
         !out.status.success(),
         "a run whose every owner kill deferred printed PASS.\n{stdout}\n{stderr}"
@@ -650,7 +427,7 @@ fn the_deferral_budget_does_not_collapse_on_a_zero_interval() {
         "the budget did not take its floor, so a zero interval derived a zero \
          budget.\n{stdout}"
     );
-    // The floor's whole purpose: a single deferral must not be fatal.
+    // A single deferral must not be fatal.
     let deferrals: usize = stderr
         .split("Deferrals so far: ")
         .nth(1)
@@ -668,11 +445,8 @@ fn the_deferral_budget_does_not_collapse_on_a_zero_interval() {
     );
 }
 
-/// **`--defer-owner-kills` is refused when there is no arm to defer.**
-///
-/// The rule `--crash-points` already follows for a flag whose sites are
-/// compiled out: a control that silently does nothing is worse than one that
-/// says it cannot.
+/// `--defer-owner-kills` is refused when there is no arm to defer, as
+/// `--crash-points` is for a flag whose sites are compiled out.
 #[test]
 fn deferring_owner_kills_without_the_arm_is_refused() {
     let out = torture(&[
@@ -695,64 +469,33 @@ fn deferring_owner_kills_without_the_arm_is_refused() {
     );
 }
 
-/// **The kill-window class, held open on purpose and required to survive it.**
+/// The kill-window class, held open on purpose and required to survive it. In
+/// the `kill()`-to-`wait()` interval the owner is dead and undetectable, so
+/// nothing can inherit and a leaving survivor cannot return (§3.4 step 4); if
+/// all leave, the arena is ownerless with nobody attached.
 ///
-/// The driver's `kill()`-to-`wait()` interval is exactly the interval in which
-/// the owner is dead and *undetectably* dead — `Tree::owner_lost` is a socket
-/// hangup, and a `SIGKILL`ed process releases its socket and its participant
-/// lock byte in `exit_files()`, which `do_exit` runs after `exit_mm()`. For that
-/// whole interval nothing can inherit, every survivor keeps drawing its
-/// 2 %-per-operation detach arm, and a survivor that leaves cannot return: §3.4
-/// step 4 refuses `CreatePolicy::Never` against held participant bytes. If every
-/// survivor leaves inside it, the arena is ownerless with nobody attached, which
-/// is absorbing rather than slow.
+/// `--stop-owner-ms` (`SIGSTOP`) widens the window on any host; the
+/// `--victim-ballast-mb` alternative depends on 4 KiB pages and is vacuous under
+/// `transparent_hugepage=always`, as on CI.
 ///
-/// # Why `--stop-owner-ms` and not `--victim-ballast-mb`
-///
-/// Both widen that window. The ballast does it by making the victim's teardown
-/// slow, which is what ASan does by accident at 43-49 MB resident per child —
-/// and it is **not portable**: it depends on the victim's pages being 4 KiB. The
-/// first revision of this test used it and **failed on CI**, because GitHub's
-/// runners set `transparent_hugepage=always`, 256 MiB becomes 128 huge pages
-/// instead of 65 536 small ones, and the reap dropped from ~25 ms here to
-/// 1.2-1.8 ms there. Chunking the allocation does not help: glibc serves 1 MiB
-/// requests out of one ~64 MiB arena heap, which is huge-page eligible, with or
-/// without `MALLOC_MMAP_THRESHOLD_` (both measured). So a test built on the
-/// ballast is vacuous on exactly the host it has to run on.
-///
-/// `SIGSTOP` reaches the same state with no memory physics in it. A stopped owner
-/// holds its rendezvous socket open, so nothing can inherit; it has stopped
-/// serving, so nothing can join; survivors keep churning. The window is as long
-/// as the flag says, on any host.
-///
-/// **Mutant, measured rather than asserted (2026-09-12):** remove the
-/// `kill_window_open` check from the detach arm and this configuration wedges at
-/// **owner kill 1** with `4 heir(s) attached before the kill, 0 after it` —
-/// every survivor gone inside one window. With the check, 20 of 20 owner kills
-/// recovered and 251 detaches were suppressed.
+/// Mutant: remove the `kill_window_open` check from the detach arm; the run
+/// wedges at owner kill 1 with `4 heir(s) attached before the kill, 0 after it`.
 #[test]
 fn a_kill_window_wide_enough_to_drain_the_pool_does_not_wedge_the_arena() {
     let out = torture(&[
         "--duration",
         "20s",
-        // `MIN_ATTACHED_FOR_ORDINARY_KILL + 1`, i.e. the thinnest fleet the
-        // owner-kill arm accepts — which is the configuration the nightly ASan
-        // job runs and the one this class actually bit.
+        // `MIN_ATTACHED_FOR_ORDINARY_KILL + 1`: the thinnest fleet the arm accepts.
         "--children",
         "4",
         "--kill-hz",
         "4",
         "--seed",
         "424242",
-        // Four seconds rather than eight, so a 20-second run still contains
-        // several owner kills. The unfixed harness wedges on the first one, so
-        // the count is margin rather than a requirement.
+        // A 20 s run still contains several owner kills.
         "--owner-kill-every",
         "4s",
-        // Two orders of magnitude past the ~0.3 ms a plain reap takes here, so
-        // the detach arm (one draw per ~50 operations, ~1.2 ms each) fires
-        // several times inside every window. That is what makes the suppression
-        // assertion below reliable rather than probabilistic.
+        // Far past a plain reap, so the detach arm fires several times per window.
         "--stop-owner-ms",
         "300",
     ]);
@@ -767,19 +510,14 @@ fn a_kill_window_wide_enough_to_drain_the_pool_does_not_wedge_the_arena() {
         !stdout.contains("UNRECOVERABLE"),
         "the arena reached the absorbing state.\n{stdout}"
     );
-    // The control has to be *seen* to have fired. A `/bin/kill` that is absent or
-    // refuses prints a line saying the control did not fire, and a run that
-    // reports it proves nothing about the window.
+    // The control must be seen to have fired.
     assert!(
         !stdout.contains("could not stop pid"),
         "the positive control did not fire, so this run says nothing about the kill \
          window.\n{stdout}"
     );
-    // **The anti-vacuity half, and this test is worth nothing without it.** A
-    // window that was never actually held open, or a marker that was never
-    // written, would both leave a green run that proved nothing. A non-zero
-    // suppression count is the evidence that the window was wide and that the
-    // exemption is what carried the run.
+    // Anti-vacuity: a non-zero suppression count is the evidence that the window
+    // was held open and the exemption carried the run.
     let suppressed = stdout
         .lines()
         .find_map(|l| {
@@ -795,17 +533,11 @@ fn a_kill_window_wide_enough_to_drain_the_pool_does_not_wedge_the_arena() {
     );
 }
 
-/// `--crash-site` is refused without `--crash-points`.
+/// `--crash-site` is refused without `--crash-points`: accepting it in a build
+/// with the sites compiled out would report every site unreachable while arming
+/// none.
 ///
-/// The probe forces one §11.3 site in every child so a person can answer "can
-/// this workload reach site X at all", which is what the binary's reachability
-/// table states as a measurement. Accepting it in a build that compiled the
-/// sites out would report every site unreachable while arming none of them —
-/// the same flag-that-arms-nothing failure `--crash-points` already refuses one
-/// level up, in the shape that would be *read as evidence*.
-///
-/// **Mutant:** drop the `crash_site.is_some() && !crash_points` guard. The run
-/// then reaches `--help`, exits 0, and the first assertion fails.
+/// Mutant: drop the `crash_site.is_some() && !crash_points` guard.
 #[test]
 fn a_forced_crash_site_is_refused_without_the_flag_that_arms_it() {
     let out = torture(&["--crash-site", "claim.after_cas", "--help"]);
@@ -821,24 +553,14 @@ fn a_forced_crash_site_is_refused_without_the_flag_that_arms_it() {
     );
 }
 
-/// **The arguments `just shm-torture` passes by default actually parse.**
+/// The arguments `just shm-torture` passes by default parse: the recipe's
+/// `--duration 30m` (`docs/PHASE2.md` §13) is the one command every seconds-only
+/// test would miss. `--help` trails the duration so the parse is all that runs.
 ///
-/// This is not hypothetical. `docs/PHASE2.md` §13 spells the nightly as "30
-/// minutes" and the recipe's default is `--duration 30m`, while every test above
-/// passes a duration in *seconds*. A parser that handles only `s` and `ms`
-/// therefore passes the entire suite while making the one command this binary
-/// exists for exit instantly with `invalid float literal`.
-///
-/// `--help` trails the duration so the parse is all that runs: arguments are
-/// processed in order, so a value that fails to parse still fails first.
-///
-/// Mutant (applied, confirmed fatal): drop the `("m", 60.0)` row from
-/// `parse_duration`'s table — `--duration 30m` then exits non-zero and the
-/// `30m` case fails.
+/// Mutant: drop the `("m", 60.0)` row from `parse_duration`'s table.
 #[test]
 fn the_nightly_recipes_default_duration_parses() {
-    // The spellings the justfile and the workflow actually use, plus the two
-    // the help text advertises.
+    // The spellings the justfile and workflow use, plus the help text's.
     for spelling in ["30m", "120s", "500ms", "1h", "45"] {
         let out = torture(&["--duration", spelling, "--help"]);
         assert!(
@@ -847,33 +569,17 @@ fn the_nightly_recipes_default_duration_parses() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    // The control: a duration that is genuinely not a duration must still be
-    // refused, or the assertions above would pass on a parser that accepted
-    // everything.
+    // Control: a non-duration must still be refused.
     let bad = torture(&["--duration", "soon", "--help"]);
     assert!(!bad.status.success(), "`--duration soon` was accepted");
 }
 
-/// `--crash-points` is refused **by a build that cannot honour it**, and the
-/// refusal names why.
+/// `--crash-points` is refused by a build that cannot honour it, and the refusal
+/// names why: the children are this same executable, so a compiled-out site is
+/// compiled out everywhere. This test binary is built without `crash-points`;
+/// `just shm-torture-crash-points` is the accepting path.
 ///
-/// This test used to assert an *unconditional* refusal, on the grounds that
-/// "§0.0 records the `crash-points` feature as not implemented". That was true
-/// when written; the feature and the sites have since shipped, and the §0.0 row
-/// it cited had gone stale with it. What survives is the part that was never
-/// about implementation status: **the children are this same executable**, so a
-/// site compiled out here is compiled out in every child, and accepting the flag
-/// would arm nothing while looking like it had. That is the same class of quiet
-/// dishonesty `bench_report`'s `--duration` refusal exists for.
-///
-/// This test binary is built **without** `crash-points` (`just
-/// shm-torture-self-test` does not pass it), so the refusal is what it can
-/// observe. The accepting path is `just shm-torture-crash-points`, which builds
-/// with the feature and prints how many children were armed and how many
-/// actually aborted — two numbers, because they differ.
-///
-/// **Mutant:** replace the `--crash-points` arm with `"--crash-points" => {}`.
-/// The run then reaches `--help`, exits 0, and the first assertion fails.
+/// Mutant: replace the `--crash-points` arm with `"--crash-points" => {}`.
 #[test]
 fn crash_point_injection_is_refused_by_a_build_that_cannot_arm_it() {
     let control = torture(&["--help"]);

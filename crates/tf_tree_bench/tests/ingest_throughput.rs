@@ -1,59 +1,25 @@
-//! **`ingest_throughput`'s exit status and its two refusals — the difference
-//! between PHASE5 §12 gate 5 being a gate and being a report.**
+//! `ingest_throughput`'s exit status and refusals — what makes PHASE5 §12
+//! gate 5 a gate.
 //!
-//! **Unfenced, so this runs in `just test` on every pull request.** Ingesting
-//! into an in-process `Tree` needs no `shm` and no frozen backend, so unlike
-//! `tests/gate4.rs` and `tests/gate2.rs` this one is reached by
-//! `cargo nextest run --workspace`. `crates/tf_tree_bench/Cargo.toml`'s `[[bin]]`
-//! stanza for the binary carries the same note.
-//!
-//! # What each case proves
+//! Unfenced: ingest into an in-process `Tree` needs no `shm`, so `just test`
+//! runs this on every PR.
 //!
 //! | invocation | what it proves |
 //! |---|---|
-//! | a corpus **denser** than the criterion's own, with `--gate` | the verdict goes red on a real corpus, editing no threshold — and it is the same fact the density floor states: "10x real time" is corpus-relative |
-//! | the same, without `--gate` | it exits 0 while printing FAIL; the caller says whether a run is a gate |
-//! | `--floor` far above the measured ratio | the comparison itself is wired, which is the weaker falsifier |
-//! | a corpus **sparser** than the criterion's own, with `--gate` | REFUSED, not passed: a sparse corpus reads arbitrarily higher and would pass without checking anything |
-//! | a **single-edge** corpus, with `--gate` | REFUSED: one edge over the cap spills rather than grouping, so the grouped arm did not take the pass count it declares, and an arm in the wrong regime is a different claim |
-//! | `--floor` **below** the criterion's own, with `--gate`, on a run that would pass against it | REFUSED, publishing no verdict line: the floor is the whole of the gated comparison, so one flag would otherwise turn any FAIL into `PASS (gated)` at exit 0 |
-//! | the same, without `--gate` | it prints `PASS (reported)` at exit 0 — what is closed is the gate, not the flag |
-//! | `--reuse-corpus` on a missing path | REFUSED, rather than fabricating a corpus there and labelling it as one this process wrote |
-//! | `--reuse-corpus` on a corpus this process did not write | the file survives the run, twice, and is never reported as `WARM (written by this process)` |
+//! | a corpus denser than the criterion's, with `--gate` | the verdict goes red with no threshold edited |
+//! | the same, without `--gate` | exits 0 while printing FAIL |
+//! | `--floor` far above the measured ratio | the comparison is wired |
+//! | a sparser corpus, with `--gate` | REFUSED: it would pass without checking anything |
+//! | a single-edge corpus, with `--gate` | REFUSED: the grouped arm did not take its declared pass count |
+//! | `--floor` below the criterion's, with `--gate` | REFUSED, no verdict line |
+//! | the same, without `--gate` | `PASS (reported)` at exit 0 |
+//! | `--reuse-corpus` on a missing path | REFUSED, not fabricated |
+//! | `--reuse-corpus` on a foreign corpus | file survives, never reported as `WARM (written by this process)` |
 //!
-//! # What this deliberately does NOT assert: that the gate is green
-//!
-//! `just test` builds debug, and the same measurement reads far lower there
-//! than at `--release` — close enough to the floor on the development host
-//! that a loaded runner could genuinely take it under.
-//! A flaky gate is a gate somebody disables. So the green direction is asserted
-//! by `just gate5` (release, nightly), and what this file asserts about the
-//! declared-density corpus is **profile-independent**: that both arms took the
-//! pass counts they declare, that the corpus is at the declared density, and
-//! that its ratio is far above the dense corpus's — i.e. that the number
-//! responds to the corpus rather than being a constant.
-//!
-//! # The mutants, seeded and observed
-//!
-//! Each was applied to `src/bin/ingest_throughput.rs`, run, and reverted:
-//!
-//! * `if false && d.gate && !ok` around the exit — caught by the dense-corpus
-//!   case;
-//! * `if false && d.gate && density < GATE_DENSITY_FLOOR` — caught by the
-//!   sparse-corpus test;
-//! * `if false && grouped.passes != CRITERION_PASSES` — caught by the
-//!   single-edge test;
-//! * `if false && d.gate && ok && d.floor < FLOOR` around the threshold
-//!   refusal — caught by `a_loosened_floor_may_not_produce_a_gated_pass`, which
-//!   then observes the `PASS (gated)` at exit 0 the refusal exists to prevent;
-//! * the two arms' **labels swapped** at their `measure` call sites, so the
-//!   default-cap arm prints as `grouped` and the lowered-cap arm as
-//!   `in-memory` — caught by the per-arm pass-count assertions in the
-//!   declared-density case. It is seeded at the labels rather than at the caps
-//!   on purpose: swapping the caps trips the binary's own per-arm refusals,
-//!   which are not the thing under test here. Asserted over the whole of
-//!   stdout — which is how they were first written — both assertions pass on
-//!   this mutant, because both strings appear whichever arm printed them.
+//! The green direction is not asserted here: debug reads far lower than
+//! `--release`, so `just gate5` owns it. The declared-density case asserts only
+//! profile-independent facts: per-arm pass counts, declared density, and a ratio
+//! far above the dense corpus's.
 //!
 //! Run: `just test`, or `cargo nextest run -p tf_tree_bench --test
 //! ingest_throughput`.
@@ -68,8 +34,7 @@ fn scratch(name: &str) -> PathBuf {
     dir.join("corpus.mcap")
 }
 
-/// Run the shipped driver — `CARGO_BIN_EXE_ingest_throughput` is the binary the
-/// recipe runs, not a re-implementation of it.
+/// Run the shipped `ingest_throughput` binary.
 fn drive(args: &[&str]) -> Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_ingest_throughput"))
         .args(args)
@@ -85,8 +50,7 @@ fn err(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-/// The density the binary **measured** off its own survey — not the one the
-/// arguments declared, which is the point of the check it feeds.
+/// The density the binary measured off its own survey, not the declared one.
 fn measured_density(stdout: &str) -> f64 {
     let line = stdout
         .lines()
@@ -103,16 +67,8 @@ fn measured_density(stdout: &str) -> f64 {
         .unwrap_or_else(|e| panic!("parsing `{n}` from `{line}`: {e}"))
 }
 
-/// One arm's own line, found by the label it starts with.
-///
-/// **Not a substring search over the whole of stdout, which is what this
-/// replaced.** Both arms print `fill passes N,` on their own lines, so
-/// `stdout.contains("fill passes 1,")` and `stdout.contains("fill passes 2,")`
-/// are both satisfied by the *swapped* assignment — the one arrangement in
-/// which the gated number comes from the wrong regime, and the one a reader
-/// comes to this file to see excluded. The shipped binary does hold the
-/// property, in two separate per-arm refusals; this is the test catching up
-/// with it.
+/// One arm's own line by its label; a substring search over all of stdout passes
+/// on swapped arms, since both print `fill passes N,`.
 fn arm_line<'a>(stdout: &'a str, label: &str) -> &'a str {
     stdout
         .lines()
@@ -136,10 +92,8 @@ fn gated_ratio(stdout: &str) -> f64 {
 
 #[test]
 fn the_verdict_goes_red_on_a_denser_corpus_and_the_two_premises_refuse() {
-    // The declared corpus: §12 gate 5's own 100 Hz x 50 transforms. Eight
-    // seconds rather than a four-hour bag — the ratio is a rate, so its length
-    // is not what makes it representative; its density is, and that is what the
-    // gate floors.
+    // §12 gate 5's own 100 Hz x 50 transforms; the ratio is a rate, so density
+    // rather than length makes it representative.
     let declared = scratch("declared");
     let clean = drive(&[
         "--corpus",
@@ -161,11 +115,7 @@ fn the_verdict_goes_red_on_a_denser_corpus_and_the_two_premises_refuse() {
          below is against nothing; got:\n{clean_out}{}",
         err(&clean)
     );
-    // **Per arm, on that arm's own line.** The assignment is the property:
-    // one fill pass on the in-memory arm and two on the grouped one. Asserted
-    // over the whole of stdout these two pass on the swap as well, which is
-    // exactly the arrangement that would put the gated number in the wrong
-    // regime.
+    // Per arm, on that arm's own line: one fill pass in-memory, two grouped.
     let in_memory_line = arm_line(&clean_out, "in-memory");
     let grouped_line = arm_line(&clean_out, "grouped");
     assert!(
@@ -179,9 +129,7 @@ fn the_verdict_goes_red_on_a_denser_corpus_and_the_two_premises_refuse() {
     );
     let clean_ratio = gated_ratio(&clean_out);
 
-    // **The falsifier, and it edits no threshold**: a corpus forty times denser
-    // than the criterion's own. This is the same fact the density floor states
-    // from the other side — the ratio is a statement about the corpus.
+    // The falsifier, no threshold edited: a corpus forty times denser.
     let dense_path = scratch("dense");
     let dense_args = [
         "--corpus",
@@ -211,9 +159,7 @@ fn the_verdict_goes_red_on_a_denser_corpus_and_the_two_premises_refuse() {
     );
     let dense_ratio = gated_ratio(&dense_out);
 
-    // **Profile-independent, and the header says why the green direction is not
-    // asserted here.** What is asserted is that the number responds to the
-    // corpus: a constant-valued ratio would fail this whatever it was.
+    // Profile-independent: the number must respond to the corpus.
     assert!(
         clean_ratio >= dense_ratio * 4.0,
         "the declared corpus read {clean_ratio}x and a 40x denser one read {dense_ratio}x; \
@@ -229,9 +175,7 @@ fn the_verdict_goes_red_on_a_denser_corpus_and_the_two_premises_refuse() {
         err(&reported)
     );
 
-    // **The weaker falsifier**: the comparison is wired. Kept because it fails
-    // for a different reason than the corpus does, and a union of two paths is
-    // where one of them stops being read.
+    // The comparison is wired; fails for a different reason than the corpus does.
     let floor_path = scratch("floor");
     let floored = drive(&[
         "--corpus",
@@ -260,17 +204,8 @@ fn the_verdict_goes_red_on_a_denser_corpus_and_the_two_premises_refuse() {
     }
 }
 
-/// **`--reuse-corpus` reads a corpus this process did not write, so it neither
-/// deletes it nor invents one.**
-///
-/// Two halves of the same defect. The end-of-run cleanup was guarded on
-/// `--keep-corpus` alone, so a reused corpus — the flag's entire purpose, "one
-/// day a real recording" — was unlinked at exit 0. And `generated` was
-/// recomputed from `corpus.exists()`, so the *next* `--reuse-corpus` run at that
-/// path silently regenerated a synthetic corpus from
-/// `--edges`/`--rate-hz`/`--seconds` and printed "page cache WARM (written by
-/// this process)" over it: the operator believes they are re-measuring one
-/// recording and are measuring another.
+/// `--reuse-corpus` neither deletes a corpus it did not write nor fabricates one
+/// at a missing path.
 #[test]
 fn reuse_corpus_neither_deletes_the_corpus_nor_fabricates_one() {
     let path = scratch("reuse");
@@ -363,27 +298,11 @@ fn reuse_corpus_neither_deletes_the_corpus_nor_fabricates_one() {
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
-/// **The threshold floor: a loosened `--floor` may not produce a gated PASS.**
-///
-/// `--floor` is the whole of gate 5's gated comparison, so a caller who may
-/// move it downwards under `--gate` can turn any FAIL into
-/// `§12 gate 5 — PASS (gated)` at exit 0 — a verdict about the argument rather
-/// than about the code. `frozen_workers`'s `--gate` is the precedent: its
-/// threshold is a constant and not a flag.
-///
-/// The corpus here is the criterion's own declared density, and the floor is
-/// `0.5` — far under the ratio this corpus measures in either profile, and the
-/// run prints that ratio on its own verdict line rather than leaving a reader
-/// to trust a figure written here. That matters: the PASS this refuses has to
-/// be a PASS the binary really would have printed, and a *dense* corpus reads
-/// under 0.5x in debug, where the refusal would never fire and the test would
-/// be green for the wrong reason.
-///
-/// Three directions in one test, because what matters is that exactly one of
-/// them is closed: loosening under `--gate` REFUSES and publishes no verdict;
-/// the identical loosening **without** `--gate` still reports a PASS at exit 0;
-/// and tightening under `--gate` is untouched (that one is asserted by the
-/// `--floor 1000000` case above).
+/// A loosened `--floor` may not produce a gated PASS: loosening under `--gate`
+/// refuses with no verdict, without `--gate` still reports PASS, and tightening
+/// is covered by the `--floor 1000000` case above. The corpus is the declared
+/// density and the floor `0.5`, so the refused PASS is one the binary would have
+/// printed.
 #[test]
 fn a_loosened_floor_may_not_produce_a_gated_pass() {
     let path = scratch("loosened");
@@ -417,17 +336,14 @@ fn a_loosened_floor_may_not_produce_a_gated_pass() {
         out(&refused),
         err(&refused)
     );
-    // **A refusal publishes no verdict.** An exit status nobody reads plus a
-    // PASS line somebody quotes is the failure `docs/benchmarks/EVIDENCE.md`
-    // exists to prevent.
+    // A refusal publishes no verdict.
     assert!(
         !out(&refused).contains("GATED") && !out(&refused).contains("— PASS"),
         "a refusal must print neither the gated comparison nor a verdict; got:\n{}",
         out(&refused)
     );
 
-    // The same loosened floor, ungated, is a report and still passes — so what
-    // the refusal above closes is the *gate*, not the flag.
+    // Ungated, the loosened floor is a report: the refusal closes the gate only.
     let reported = drive(&args);
     assert!(
         reported.status.success() && out(&reported).contains("§12 gate 5 — PASS (reported)"),
@@ -439,11 +355,8 @@ fn a_loosened_floor_may_not_produce_a_gated_pass() {
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
-/// **The density floor.** §12 gate 5's representative recording is 100 Hz x 50
-/// transforms; at an identical per-transform cost a sparser corpus reads
-/// arbitrarily higher, so a gated run on one would pass without checking
-/// anything. It refuses rather than passing, and reports rather than refusing
-/// when nobody claimed it was a gate.
+/// The density floor: a sparser corpus would read arbitrarily higher and pass
+/// vacuously, so gated it refuses and ungated it reports.
 #[test]
 fn a_corpus_sparser_than_the_criterions_own_is_refused_rather_than_passed() {
     let path = scratch("sparse");
@@ -480,11 +393,8 @@ fn a_corpus_sparser_than_the_criterions_own_is_refused_rather_than_passed() {
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
-/// **The pass-count premise, red-tested with a corpus shape rather than a
-/// flag.** One edge whose samples exceed the cap is `Group::Spilled`, not two
-/// groups — so the grouped arm takes one fill pass and is not the regime the
-/// gated number is stated over. It refuses; a run that reported anyway would be
-/// comparing different amounts of work.
+/// One edge whose samples exceed the cap is `Group::Spilled`, so the grouped arm
+/// takes one fill pass, not the declared regime; it refuses.
 #[test]
 fn an_arm_that_did_not_take_its_declared_pass_count_refuses() {
     let path = scratch("onedge");

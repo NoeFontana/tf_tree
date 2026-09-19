@@ -1,18 +1,10 @@
 //! The ROS-independent half of the `tf_tree` ingest bridge — `docs/PHASE4.md` §5.
 //!
-//! The `rclcpp` half (subscriptions, QoS, GIDs) builds only where ROS 2 is
-//! installed and lives outside the workspace. This crate holds the **decisions**
-//! — publisher authority (§5.4), clock guard (§5.5), name normalization (§5.6),
-//! static verification (§5.7) — as pure functions testable on every host
-//! (§0.0 sanctions the `TransformStamped`-shaped [`Sample`]).
+//! The decisions — authority (§5.4), clock guard (§5.5), names (§5.6), statics
+//! (§5.7) — as pure functions. Topology comes from a [`TopologyConfig`] file
+//! (§5.8, `docs/decisions/0004`), which [`Discovery`] produces.
 //!
-//! Topology comes from a file, not the wire (§5.8's amendment): the engine has
-//! no runtime edge declaration (`docs/decisions/0004`), so [`Ingest`] takes a
-//! [`TopologyConfig`]; an undeclared edge is dropped and diagnosed once
-//! ([`Action::UndeclaredEdge`]) and `/tf_static` is verified against the
-//! declared constant ([`Action::StaticVerified`]). [`Discovery`] produces the file.
-//!
-//! **It does not publish.** §5.1 is NORMATIVE: the bridge is ingress only.
+//! **It does not publish** (§5.1, NORMATIVE): ingress only.
 
 #![forbid(unsafe_code)]
 
@@ -42,31 +34,24 @@ pub use names::{NameError, NameNormalizer, Normalized};
 pub use statics::{StaticKind, StaticStore, StaticVerdict};
 pub use stats::BridgeStats;
 
-/// A `geometry_msgs/TransformStamped`-shaped plain struct owing nothing to ROS
-/// (§0.0). The ROS half converts.
+/// A `geometry_msgs/TransformStamped`-shaped plain struct (§0.0).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
-    /// The parent frame, exactly as it arrived — **not** normalized, so
-    /// [`names::NameNormalizer`] can be tested on raw input.
+    /// The parent frame, as it arrived (not normalized).
     pub frame_id: String,
     /// The child frame, likewise raw.
     pub child_frame_id: String,
-    /// Stamp, nanoseconds: the publisher's number, in the domain under
-    /// suspicion. §5.5 judges it against [`Sample::received`], never against
-    /// another publisher's stamp.
+    /// Stamp, nanoseconds, in the publisher's domain. §5.5 judges it against
+    /// [`Sample::received`].
     pub stamp_nanos: i64,
-    /// When the *local steady clock* said this message arrived. A distinct type
-    /// from [`Sample::stamp_nanos`] (see [`SteadyNanos`]); one reading per
-    /// **message**, shared by every transform it expands into.
+    /// Local steady-clock arrival time; one reading per message.
     pub received: SteadyNanos,
     /// `[qw qx qy qz tx ty tz]`, the canonical order (`docs/PHASE1.md` §3.1).
     pub pose: [f64; 7],
 }
 
 impl Sample {
-    /// A sample with an identity rotation at `t`. [`Sample::received`] is left
-    /// at [`SteadyNanos::UNKNOWN`] (the common-mode layer is then absent for it);
-    /// chain [`Sample::received_at`] to supply one.
+    /// An identity-rotation sample; [`Sample::received`] is [`SteadyNanos::UNKNOWN`].
     #[must_use]
     pub fn identity(frame_id: &str, child_frame_id: &str, stamp_nanos: i64) -> Sample {
         Sample {
@@ -78,15 +63,14 @@ impl Sample {
         }
     }
 
-    /// The same sample, with the steady-clock reading of its message's arrival.
+    /// The same sample with its arrival reading.
     #[must_use]
     pub fn received_at(mut self, received: SteadyNanos) -> Sample {
         self.received = received;
         self
     }
 
-    /// The `(parent, child)` pair this sample addresses; the bridge keys every
-    /// table on it.
+    /// The `(parent, child)` pair this sample addresses.
     #[must_use]
     pub fn edge(&self) -> (&str, &str) {
         (self.frame_id.as_str(), self.child_frame_id.as_str())
@@ -95,40 +79,34 @@ impl Sample {
 
 /// Who published a sample, as far as the middleware could tell (§5.3).
 ///
-/// Attribution degrades across RMWs and is diagnostic, never a correctness
-/// dependency. **The identity is the GID; the name is decoration**:
-/// [`Publisher::Gid`] carries both, and `PartialEq`, `Ord` and `Hash` read `id`
-/// alone. `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` and later the real name;
-/// keying on the name made one publisher two and, under
-/// [`AuthorityPolicy::FirstWriterWins`], rejected the corrected name forever.
+/// Attribution is diagnostic, never a correctness dependency. **The identity is
+/// the GID; the name is decoration**: `PartialEq`, `Ord` and `Hash` read `id`
+/// alone, because a name can change under [`AuthorityPolicy::FirstWriterWins`].
 ///
-/// A GID with no name is still a distinct publisher. [`Publisher::Unattributed`]
-/// (no GID reported) collapses to one identity by design: fewer identifiable
-/// publishers must mean less detection, never more stopping
+/// [`Publisher::Unattributed`] collapses to one identity by design: less
+/// attribution means less detection, never more stopping
 /// ([`0012`](../../../docs/decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md)).
 #[derive(Clone, Debug)]
 pub enum Publisher {
-    /// A middleware publisher, identified by the GID the RMW reported for it.
+    /// A middleware publisher, identified by its GID.
     Gid {
-        /// The stable identity: the GID rendered as `<gid:…>` once, so
-        /// `crate::ingest::owner_key` can return a borrow per sample.
+        /// The GID rendered as `<gid:…>` once, so `owner_key` can borrow it.
         id: Box<str>,
         /// The node name once the graph resolved one. Presentation only.
         name: Option<String>,
     },
-    /// A publisher identified by the **topic** it published on: offline ingest
-    /// has no GID, and a topic is stable for a recording. Cannot collide with a
+    /// Identified by topic (offline ingest has no GID). Cannot collide with a
     /// bracketed key: a ROS topic name cannot contain `<`.
     Topic(String),
     /// The middleware reported no GID at all.
     Unattributed,
-    /// **The topology config file**, the incumbent owner of every static edge's
-    /// value (§5.8's amendment); not a publisher.
+    /// The topology config file, incumbent owner of every static edge's value
+    /// (§5.8); not a publisher.
     Declared,
 }
 
 impl Publisher {
-    /// A publisher known by its GID and nothing else.
+    /// A publisher known by its GID.
     #[must_use]
     pub fn from_gid(gid: &[u8; 16]) -> Publisher {
         Publisher::Gid {
@@ -153,31 +131,22 @@ impl Publisher {
         }
     }
 
-    /// The stable identity, as the string `crate::ingest::owner_key` returns.
+    /// The stable identity.
     #[must_use]
     pub fn key(&self) -> &str {
         match self {
             Publisher::Gid { id, .. } => id,
             Publisher::Topic(t) => t,
-            // Bracketed: a ROS name cannot contain `<`.
             Publisher::Unattributed => "<unattributed>",
             Publisher::Declared => "<declared>",
         }
     }
 }
 
-/// A deterministic GID derived from a name — **test scaffolding**, `pub` because
-/// integration tests and examples are separate crates. Real GIDs come from
-/// `rmw_message_info_t::publisher_gid`.
-///
-/// Real code never calls this. A real GID comes from
-/// `rmw_message_info_t::publisher_gid`, and the point of [`Publisher`]'s shape
-/// is that the GID is what the middleware said, not something derived from a
-/// name that can change.
+/// A deterministic GID derived from a name — test scaffolding only.
 #[doc(hidden)]
 #[must_use]
 pub fn gid_for_name(name: &str) -> [u8; 16] {
-    // FNV-1a, splatted across 16 bytes.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in name.as_bytes() {
         h ^= u64::from(*b);
@@ -202,7 +171,7 @@ fn render_gid(gid: &[u8; 16]) -> Box<str> {
     s.into_boxed_str()
 }
 
-// By identity ONLY, hand-written so a derive cannot silently include `name`.
+// Identity only; hand-written so a derive cannot include `name`.
 impl PartialEq for Publisher {
     fn eq(&self, other: &Publisher) -> bool {
         self.key() == other.key()
@@ -235,7 +204,6 @@ impl core::fmt::Display for Publisher {
             Publisher::Gid {
                 name: Some(name), ..
             } => write!(f, "{name}"),
-            // The full key: endpoint GIDs from one process share a prefix.
             Publisher::Gid { id, .. } => write!(f, "{id}"),
             Publisher::Topic(t) => write!(f, "{t}"),
             Publisher::Unattributed => write!(f, "<unattributed>"),

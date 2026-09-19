@@ -5,26 +5,21 @@
 **Implementation:** #PR-numbers (filled in as work lands)
 
 ## Context
-The situation that prompted this. What's true today, what's missing, what
-forces this decision now rather than later.
+What is true today, what is missing, what forces this decision now.
 
 ## Decision
-What we're going to do. The shape: types, module boundaries, key algorithms,
-public API surface. Concrete enough that an implementer doesn't need to invent.
+The shape: types, module boundaries, key algorithms, public API surface.
+Concrete enough that an implementer invents nothing.
 
 ## Rationale
-Why this over the alternatives. Briefly name the alternatives considered and
-why they lost.
+Why this over the alternatives, which lost and why.
 
 ## Consequences
-What this commits us to. What becomes easier, what becomes harder, what
-invariants we now have to maintain.
+What this commits us to; what invariants we now maintain.
 
 ## Implementation plan
-Ordered steps, each small enough to land as one PR. Each with a verification
-step (test name, command output, type-check).
+Ordered steps, each one PR, each with a verification (test name, command).
 1. <step> — verified by <check>
-2. ...
 
 ## Open questions
-Resolved before status moves from `draft` to `ready`. A `ready` doc has none.
+Resolved before `draft` becomes `ready`; a `ready` doc has none.

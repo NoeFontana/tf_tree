@@ -1,16 +1,11 @@
 //! Output layouts — folding a plan straight into the caller's buffer.
 //!
-//! [`crate::Plan::at_many`] writes `Iso3`, which matches no caller layout except
-//! [`Layout::Quat`](crate::layout::Layout) (56 bytes, `[qw qx qy qz tx ty tz]`
-//! since [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)).
-//! These kernels fold **directly into the destination** (`docs/PHASE3.md` §5.2,
-//! "zero copies"): no intermediate buffer, and no allocation for `at_many_into`.
+//! [`crate::Plan::at_many`] writes `Iso3`; these kernels fold **directly into the
+//! caller's buffer** (`docs/PHASE3.md` §5.2), with no intermediate buffer. The
+//! layout is matched once outside the loop; emitters are `#[inline]`, branch-free.
 //!
-//! The layout is matched **once**, outside the loop, so no branch sits between
-//! elements; emitters are `#[inline]` and branch-free.
-//!
-//! `Affine32` is an output *encoding* for GPU upload, not engine arithmetic
-//! (`docs/PROJECT.md` §5 D6, `f64` only, still holds); nothing reads it back.
+//! `Affine32` is an output *encoding* for GPU upload; `f64`-only arithmetic
+//! (`docs/PROJECT.md` §5 D6) still holds.
 
 use tf_tree_math::{Iso3, Twist};
 
@@ -22,22 +17,18 @@ pub enum Layout {
     Mat4,
     /// `[qw, qx, qy, qz, tx, ty, tz]`, `f64`. 7 elements.
     ///
-    /// Byte-for-byte the engine's own `Iso3` (`0042`); the cheapest to emit.
+    /// Byte-for-byte the engine's own `Iso3` ([`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)).
     Quat,
     /// Row-major 3x4 affine, `f32`. 12 elements.
     ///
-    /// Omits the constant `[0 0 0 1]` bottom row. GPU-facing.
+    /// Omits the constant `[0 0 0 1]` row. GPU-facing.
     Affine32,
     /// `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`, `f64`. 13 elements.
     ///
-    /// [`Layout::Quat`] with the body twist appended, angular first (`[ω, v]`, as
-    /// [`tf_tree_math::twist`]). It is how `at_with_derivatives` reaches a batch
-    /// caller (`docs/API.md` §3.3, `docs/PHASE5.md` §4.4): one variant rides the
-    /// existing dispatch into every binding.
-    ///
-    /// The one layout whose emission can *fail*: `LerpSlerp` has no exact body
-    /// twist, so its edges yield [`LookupError::DerivativesUnavailable`] here as
-    /// from `at_with_derivatives`.
+    /// [`Layout::Quat`] plus the body twist, angular first (`[ω, v]`, as
+    /// [`tf_tree_math::twist`]); carries `at_with_derivatives` to batch callers
+    /// (`docs/API.md` §3.3, `docs/PHASE5.md` §4.4). The one layout whose emission
+    /// can fail: `LerpSlerp` edges yield [`LookupError::DerivativesUnavailable`].
     ///
     /// [`LookupError::DerivativesUnavailable`]: crate::LookupError::DerivativesUnavailable
     QuatTwist,
@@ -66,8 +57,7 @@ impl Layout {
 
 /// Write `iso` as a row-major 4x4 `f64` matrix.
 ///
-/// Public so a binding can emit a *single* transform without a batch
-/// (`docs/PHASE3.md` §4.2).
+/// Public so a binding can emit a single transform (`docs/PHASE3.md` §4.2).
 #[inline]
 pub fn write_mat4(iso: &Iso3, out: &mut [f64]) {
     let q = iso.q;
@@ -91,7 +81,7 @@ pub fn write_mat4(iso: &Iso3, out: &mut [f64]) {
     out[10] = 1.0 - 2.0 * (xx + yy);
     out[11] = iso.t.z;
 
-    // Written, not assumed: the caller's buffer may be reused.
+    // Written, not assumed: the buffer may be reused.
     out[12] = 0.0;
     out[13] = 0.0;
     out[14] = 0.0;
@@ -112,10 +102,8 @@ pub fn write_quat(iso: &Iso3, out: &mut [f64]) {
 
 /// Write `iso` and `twist` as `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`.
 ///
-/// The first seven elements are [`write_quat`]'s. The tail is `[ω, v]`, **angular
-/// first**, as `tf_tree_math::twist` and the C ABI's `TFT_TWIST_BYTES`. The twist
-/// is body-frame, in the plan's **source** frame (see
-/// `Plan::at_with_derivatives`).
+/// The first seven elements are [`write_quat`]'s; the tail is `[ω, v]`, **angular
+/// first**, body-frame in the plan's **source** frame (`Plan::at_with_derivatives`).
 #[inline]
 pub fn write_quat_twist(iso: &Iso3, twist: &Twist, out: &mut [f64]) {
     write_quat(iso, out);
@@ -266,8 +254,7 @@ mod tests {
         }
     }
 
-    /// The tail is `[ω, v]`, angular first; no norm check can see a swap, so the
-    /// fixture uses same-magnitude components.
+    /// The tail is `[ω, v]`, angular first; fixture uses same-magnitude components.
     #[test]
     fn quat_twist_tail_is_omega_then_v() {
         let twist = Twist::new(

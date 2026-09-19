@@ -1,10 +1,6 @@
 //! Publisher names → dense `u32` ids, with a hard cap.
 //!
-//! Publisher names arrive on the wire, so the table is **capped**: past the cap
-//! [`StrInterner::intern`] returns `None`, which callers treat as "no row"
-//! (`crate::clock::OffsetTable` cannot corroborate a step; `crate::authority::Authority`
-//! counts conflicts without a per-pair breakdown). Both make an outcome harder to
-//! reach, never easier.
+//! Past the cap [`StrInterner::intern`] returns `None` ("no row").
 
 use crate::edgeindex::{buckets_for, mix};
 
@@ -68,7 +64,6 @@ impl StrInterner {
             if b.entry == EMPTY {
                 return None;
             }
-            // Confirmed against the stored name, never on the hash alone.
             if b.hash == h && &*self.names[b.entry as usize] == s {
                 return Some(b.entry as usize);
             }
@@ -83,8 +78,7 @@ impl StrInterner {
             .map(PublisherId)
     }
 
-    /// The id of `s`, interning it if the cap allows. Allocates once per new
-    /// name and nothing thereafter.
+    /// The id of `s`, interning it if the cap allows. Allocates once per new name.
     pub(crate) fn intern(&mut self, s: &str) -> Option<PublisherId> {
         if let Some(id) = self.id_of(s) {
             return Some(id);
@@ -110,8 +104,6 @@ mod tests {
     use super::*;
 
     /// A name round-trips to its own id.
-    ///
-    /// Mutant: skip the stored-name comparison in `find` — fails on `id_of("/other")`.
     #[test]
     fn a_name_round_trips() {
         let mut t = StrInterner::with_cap(8);
@@ -125,8 +117,6 @@ mod tests {
     }
 
     /// Past the cap a new name gets no id; an interned one still resolves.
-    ///
-    /// Mutant: drop the `self.names.len() >= self.cap` guard.
     #[test]
     fn the_cap_refuses_new_names_and_keeps_old_ones() {
         let mut t = StrInterner::with_cap(4);
@@ -138,7 +128,7 @@ mod tests {
         assert_eq!(t.id_of("p0"), Some(first), "a known name still resolves");
     }
 
-    /// Names that walk the probe sequence still resolve to themselves.
+    /// Colliding names still resolve to themselves.
     #[test]
     fn every_name_under_the_cap_resolves_to_itself() {
         let mut t = StrInterner::with_cap(64);

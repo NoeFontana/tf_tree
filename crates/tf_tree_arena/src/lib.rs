@@ -5,17 +5,15 @@
 #![deny(missing_docs)]
 //! `no_std + alloc` pointer-free arena abstraction and layout math for `tf_tree`.
 //!
-//! The arena is a single flat allocation holding every record and ring buffer.
-//! It contains **no pointers** — only `u32` element indices and byte offsets
-//! relative to the arena base — so it is relocatable by `memcpy` and, in
-//! Phase 2, mappable into another process unchanged.
+//! A single flat allocation with **no pointers** — only `u32` indices and byte
+//! offsets from the base — so it is relocatable by `memcpy` and mappable into
+//! another process unchanged.
 //!
 //! Backends: `HeapArena` (aligned heap allocation) and `MappedArena` (`memfd` + `mmap`).
 //!
 //! # Unsafe
 //!
-//! `unsafe` is permitted in this crate (raw arena access). Every `unsafe` block
-//! carries a `// SAFETY:` comment naming the invariant it relies on.
+//! `unsafe` is permitted (raw arena access); every block carries a `// SAFETY:` comment.
 
 extern crate alloc;
 

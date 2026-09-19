@@ -1,13 +1,5 @@
 //! The **committed** baseline, checked by the everyday suite.
 //!
-//! `just bench-check` is the real gate, and it needs a release build and a few
-//! minutes. This file is the cheap half that runs in `cargo nextest run
-//! --workspace`, and it exists because of one specific way the gate dies:
-//! somebody bumps `report::SCHEMA`, every unit test still passes (they build
-//! their own baselines from the live writer), and `just bench-check` — which
-//! nobody runs on that PR — starts failing on the *next* branch for a reason
-//! that looks unrelated.
-//!
 //! So this asserts the committed file is still a document this build could have
 //! written: right schema, every §9.2 row present, and every metric carrying the
 //! `drift` field the comparison needs. It does not compare any *value*; that is
@@ -35,15 +27,6 @@ fn baseline() -> Value {
 
 /// The committed baseline is a document *this* build's writer could have
 /// produced.
-///
-/// The schema assertion is the load-bearing one: a bump without a
-/// `just bench-baseline-update` leaves a baseline that `compare` refuses
-/// outright, and the refusal would first be seen by whoever next ran the gate,
-/// on a branch that did not cause it.
-///
-/// Mutant (applied, confirmed fatal): bump `report::SCHEMA` to
-/// `tf_tree.bench-report/3` without regenerating the baseline — this test fails
-/// naming both spellings.
 #[test]
 fn the_committed_baseline_matches_this_builds_schema_and_row_set() {
     let b = baseline();
@@ -79,15 +62,6 @@ fn the_committed_baseline_matches_this_builds_schema_and_row_set() {
 
 /// Every metric in the committed baseline carries a `drift` this build knows,
 /// and at least one of them is directional.
-///
-/// A baseline whose metrics are all `informational` parses, compares cleanly and
-/// gates nothing — the exact green-but-empty state `bench_report`'s
-/// `checked == 0` guard also refuses at runtime. This is the same rule enforced
-/// where it is cheap.
-///
-/// Mutant (applied, confirmed fatal): edit the committed
-/// `differential_agreement.max_deviation.drift` to `"informational"` — the
-/// second assertion fails.
 #[test]
 fn the_committed_baseline_still_gates_at_least_one_number() {
     let b = baseline();
@@ -123,29 +97,8 @@ fn the_committed_baseline_still_gates_at_least_one_number() {
     );
 }
 
-/// **The committed baseline gates the residency figure, at the tolerance this
-/// build names.**
-///
-/// This is the cheap guard against the way `docs/decisions/0021` step 4 can come
-/// undone, and both halves have already happened once:
-///
-/// * the code emitting a direction the committed baseline records as
-///   `informational`, so the metric is not gated at all — the state the artifact
-///   was in for the whole life of the `arena_memory_floor` entry; and
-/// * the constant and the committed file drifting apart, which is what a
-///   file-level revert during a falsifier experiment did to this very PR:
-///   `RESIDENCY_SLACK` went back to `1.0` while every document explaining it said
-///   300%, and nothing failed.
-///
-/// `just bench-check` cannot catch either. It compares a *fresh report* against
-/// the committed file, and both of those states compare cleanly — the first
-/// because a direction the baseline does not carry is only a direction mismatch
-/// if the baseline carries one, the second because the tolerance the gate reads
-/// is the baseline's own by design (`baseline`'s module docs say why). This test
-/// reads the file and the constant and asserts they agree.
-///
-/// Mutant (applied, confirmed fatal): change `RESIDENCY_SLACK` without running
-/// `just bench-baseline-update` — this fails naming both numbers.
+/// **The committed baseline gates the residency figure at this build's tolerance** (`docs/decisions/0021` step 4).
+/// Changing `RESIDENCY_SLACK` without `just bench-baseline-update` fails this, naming both numbers.
 #[test]
 fn the_committed_baseline_gates_the_idle_arena_residency_at_this_builds_tolerance() {
     let b = baseline();

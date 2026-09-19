@@ -1,21 +1,10 @@
 //! The rendezvous against real processes.
 //!
-//! Everything this crate claims is a claim about what the **kernel** does across
-//! a process boundary: that exactly one of two contenders gets a byte, that a
-//! `SIGKILL`ed holder's lock is released immediately and without its
-//! cooperation, and that a live participant's byte is visible to a process that
-//! knows nothing about it. None of that is testable with threads — a thread
-//! cannot be `SIGKILL`ed out from under its locks, and (unlike classic POSIX
-//! locks) the interesting failure is not one a single process can stage.
+//! Tests spawn `src/bin/ipc_child.rs`, which opens the lock file **by path**
+//! (OFD locks belong to an open file description, so an inherited fd would
+//! conflict with nobody) and parks holding a lock until killed.
 //!
-//! So these tests spawn `src/bin/ipc_child.rs`, which opens the lock file **by
-//! path** and parks holding a lock until it is killed. Opening by path rather
-//! than inheriting a descriptor is load-bearing: OFD locks belong to an open
-//! file description, so a child holding the parent's inherited fd would conflict
-//! with nobody and every assertion here would pass vacuously.
-//!
-//! `docs/PHASE2.md` §11.2 scenario 9 — split-brain — is the important one, and
-//! per Appendix A it exists before the code it tests is finished.
+//! `docs/PHASE2.md` §11.2 scenario 9 (split-brain) is the important one.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -55,8 +44,7 @@ impl Drop for Scratch {
     }
 }
 
-/// An environment with only `TF_TREE_RUNTIME_DIR` set, so a test never depends
-/// on the runner's own environment.
+/// An environment with only `TF_TREE_RUNTIME_DIR` set.
 struct Fixed(PathBuf);
 
 impl EnvLookup for Fixed {
@@ -65,16 +53,11 @@ impl EnvLookup for Fixed {
     }
 }
 
-/// A spawned helper, killed on drop so a failing assertion cannot leave a
-/// process holding a lock in `/tmp` forever.
+/// A spawned helper, killed on drop.
 struct Kid(Child, Option<BufReader<std::process::ChildStdout>>);
 
 impl Kid {
     fn spawn(args: &[&str]) -> Kid {
-        // The bin target carries the crate's name, not the file's: this crate is
-        // published, and `ipc_child` in someone's `~/.cargo/bin` is a collision
-        // waiting to happen. The manifest argues it; the source stays
-        // `src/bin/ipc_child.rs`.
         let exe = env!("CARGO_BIN_EXE_tf_tree_ipc_child");
         let child = Command::new(exe)
             .args(args)
@@ -86,14 +69,9 @@ impl Kid {
         Kid(child, None)
     }
 
-    /// The child's next line. The child flushes before it parks, so this
-    /// returning is proof the lock has actually been taken — no sleeps, no
-    /// polling, no "probably by now".
-    ///
-    /// The reader is kept across calls. Building a fresh `BufReader` each time
-    /// discards whatever it buffered beyond the newline, which is invisible
-    /// while a child emits exactly one line and silently drops the second when
-    /// one emits two.
+    /// The child's next line; it flushes before parking, so this returning proves
+    /// the lock is taken. The reader is kept across calls so buffered lines
+    /// are not dropped.
     fn line(&mut self) -> String {
         let reader = self
             .1
@@ -103,9 +81,7 @@ impl Kid {
         line.trim_end().to_string()
     }
 
-    /// `SIGKILL`, then reap. After `wait` returns, the kernel has torn down the
-    /// process's descriptors, so its locks are gone — with no cooperation from
-    /// the child, which is the entire point.
+    /// `SIGKILL`, then reap; after `wait` the kernel has released its locks.
     fn kill(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -120,10 +96,7 @@ impl Drop for Kid {
 }
 
 /// Two (here: eight) processes contend for the ownership byte. Exactly one wins.
-///
-/// Each child retries for five seconds before reporting "lost", so the result
-/// does not depend on scheduling order: the loser is the one that could not get
-/// the byte while somebody held it, not the one that started second.
+
 #[test]
 fn exactly_one_process_wins_the_ownership_byte() {
     let scratch = Scratch::new("ownership");
@@ -143,11 +116,7 @@ fn exactly_one_process_wins_the_ownership_byte() {
 
 /// `F_OFD_GETLK` on a held byte reports `l_pid = -1`.
 ///
-/// `docs/PHASE2.md` §3.3 states this as verified behaviour on Linux 6.18, and
-/// the whole reason identity records exist as separate `pwrite` data is that it
-/// is true. Verify it on *this* kernel rather than trusting the table: if some
-/// kernel ever did name the holder, the identity records would be redundant, and
-/// if it named the wrong one they would be actively misleading.
+/// Pins `docs/PHASE2.md` §3.3 on this kernel; it is why identity records exist.
 #[test]
 fn getlk_on_a_held_byte_cannot_name_the_holder() {
     let scratch = Scratch::new("getlk-pid");
@@ -173,10 +142,7 @@ fn getlk_on_a_held_byte_cannot_name_the_holder() {
 
 /// A `SIGKILL`ed holder's lock is released by the kernel, immediately.
 ///
-/// This is the property that replaces every heartbeat, timeout and reaping
-/// heuristic in the previous draft of §6. The child is killed with a signal it
-/// cannot handle, runs no destructor, and unlinks nothing — and the byte is free
-/// the moment it is reaped.
+/// The kernel frees the byte with no cooperation from the child.
 #[test]
 fn a_sigkilled_holder_releases_its_locks() {
     let scratch = Scratch::new("sigkill");
@@ -189,7 +155,6 @@ fn a_sigkilled_holder_releases_its_locks() {
     let observer = LockFile::open(rv.lock_path()).unwrap();
     assert!(observer.probe_participant(4).unwrap().held);
     assert_eq!(observer.held_participants().unwrap(), 1 << 4);
-    // The identity record names who it was, which GETLK cannot.
     let id = observer.read_identity(4).unwrap().expect("identity record");
     assert_eq!(id.pid, holder.0.id());
     assert!(id.start_time > 0);
@@ -205,27 +170,16 @@ fn a_sigkilled_holder_releases_its_locks() {
         observer.try_take_participant(4).unwrap(),
         LockAttempt::Acquired
     );
-    // The record outlives the process: it is advisory (§5.1), and this is
-    // exactly why it must never be consulted for liveness.
+    // The record outlives the process: advisory (§5.1), never a liveness signal.
     assert_eq!(
         observer.read_identity(4).unwrap().map(|i| i.pid),
         Some(id.pid)
     );
 }
 
-/// **§11.2 scenario 9 — split-brain.** The single most important race in the
-/// phase.
-///
-/// A participant is alive (its lock byte is held) and nothing is serving: the
-/// state immediately after an owner dies, before any survivor has noticed the
-/// `HUP`. A fresh `open()` must **not** create a second arena. It must fail,
-/// naming the slot that is holding things up.
-///
-/// Run in a loop, because the failure this prevents is a race. The spec asks for
-/// a thousand consecutive runs; that is what `$TF_TREE_SPLIT_BRAIN_ITERS` is
-/// for, and the default of 128 keeps `just test` quick without letting the loop
-/// disappear. Every iteration re-opens the lock file, so nothing carries over
-/// except the child's held byte.
+/// §11.2 scenario 9, split-brain: with a live participant and nothing serving,
+/// `open()` must fail naming the holding slot, never create a second arena.
+/// `$TF_TREE_SPLIT_BRAIN_ITERS` sets the iteration count (default 128).
 #[test]
 fn a_live_participant_prevents_a_second_arena() {
     let scratch = Scratch::new("split-brain");
@@ -258,10 +212,7 @@ fn a_live_participant_prevents_a_second_arena() {
                     survivor.0.id(),
                     "the error must name the process an operator has to kill"
                 );
-                // The child holds a participant byte and nothing else, and every
-                // refusal above gave the ownership byte back — so this is the
-                // one state §3.4's escape hatch can actually resolve, and the
-                // error has to say so rather than read like the byte-0 wedge.
+                // Only a participant byte is held: the error must not read as the byte-0 wedge.
                 assert!(
                     !ownership_held,
                     "iteration {i}: nothing holds the ownership byte in this scenario"
@@ -269,8 +220,7 @@ fn a_live_participant_prevents_a_second_arena() {
             }
             other => panic!("iteration {i}: expected ArenaHeldButUnreachable, got {other}"),
         }
-        // Every refusal must have released byte 0 again, or the survivor could
-        // never take over and the refusal would become permanent.
+        // Every refusal must release byte 0 again.
         let heir = LockFile::open(rv.lock_path()).unwrap();
         assert_eq!(
             heir.try_take_ownership().unwrap(),
@@ -279,8 +229,7 @@ fn a_live_participant_prevents_a_second_arena() {
         );
     }
 
-    // The positive control. Without it this test would still pass if `open()`
-    // simply never created anything.
+    // Positive control: open() does create once nothing is alive.
     survivor.kill();
     let session = Open::new(rv.clone())
         .timeout(Duration::from_millis(500))
@@ -289,14 +238,8 @@ fn a_live_participant_prevents_a_second_arena() {
     assert_eq!(session.outcome(), OpenOutcome::Created);
 }
 
-/// The same race from the child's side: the child runs the real `open()`, wins,
-/// and holds both bytes; the parent's `open()` must refuse rather than create.
-///
-/// This is the shape of `docs/PHASE2.md` §11.3's `open.after_create_before_bind`
-/// crash point — an arena exists with nothing serving it — and the recovery it
-/// requires: once the creator is gone and no participant byte is held, a fresh
-/// `open()` is free to create, and the orphan segment dies with its last
-/// mapping.
+/// A child that created the arena blocks a second creator; once it dies a fresh
+/// `open()` creates (`docs/PHASE2.md` §11.3 `open.after_create_before_bind`).
 #[test]
 fn a_child_that_created_the_arena_blocks_a_second_creator() {
     let scratch = Scratch::new("child-open");
@@ -331,8 +274,7 @@ fn a_child_that_created_the_arena_blocks_a_second_creator() {
     assert_eq!(session.slot(), 0, "the dead creator's slot is reusable");
 }
 
-/// `CreatePolicy::Never` fails fast rather than waiting out the timeout, and
-/// leaves no lock behind for the next process.
+/// `CreatePolicy::Never` fails fast and leaves no lock behind.
 #[test]
 fn a_consumer_that_refuses_to_create_fails_fast() {
     let scratch = Scratch::new("never");
@@ -373,7 +315,6 @@ fn different_domains_and_directories_never_meet() {
     for rv in cases {
         rv.ensure_dir().unwrap();
         let s = Open::new(rv).open(&mut NoServer).unwrap();
-        // Every one of them creates: none of them can see the others.
         assert_eq!(s.outcome(), OpenOutcome::Created);
         assert_eq!(s.slot(), 0);
         sessions.push(s);
@@ -381,8 +322,7 @@ fn different_domains_and_directories_never_meet() {
     assert_eq!(sessions.len(), 3);
 }
 
-/// The lock file path is the one §3.1 specifies, verified against the filesystem
-/// rather than against the code that built it.
+/// The on-disk paths are the ones §3.1 specifies.
 #[test]
 fn the_paths_on_disk_are_the_specified_ones() {
     let scratch = Scratch::new("paths");
@@ -418,13 +358,8 @@ fn serve(sock: &Path, size: u64) -> Kid {
     kid
 }
 
-/// **The whole point of §3.7: a real descriptor crosses a process boundary.**
-///
-/// The assertion is on `fstat(received_fd).st_size`, not on the response — the
-/// response is just bytes this process could have fabricated, whereas a size the
-/// kernel reports for a descriptor is only obtainable if a descriptor actually
-/// arrived. Omit the `ScmRights` push on the server and the client gets
-/// `NoFdReceived` rather than a plausible-looking success.
+/// A real descriptor crosses the process boundary; asserted on
+/// `fstat(received_fd)`, not on the response bytes.
 #[test]
 fn a_segment_fd_crosses_the_process_boundary() {
     let scratch = Scratch::new("scm-rights");
@@ -438,7 +373,6 @@ fn a_segment_fd_crosses_the_process_boundary() {
     assert_eq!(attached.response.arena_size, 8192);
     assert_eq!(attached.response.instance_uuid, [0x5A; 16]);
 
-    // The kernel's view of the received fd. This is the evidence.
     let st = rustix::fs::fstat(&attached.segment).expect("fstat the received fd");
     assert_eq!(
         st.st_size, 8192,
@@ -461,11 +395,7 @@ fn each_client_gets_its_own_slot() {
     assert_eq!(rustix::fs::fstat(&b.segment).unwrap().st_size, 4096);
 }
 
-/// A rejection names both sides and carries no fd.
-///
-/// §3.7 singles out `LayoutMismatch` because its raw symptom is "attach fails on
-/// a machine where everything looks fine". The error must therefore carry the
-/// *owner's* hash — the client already knows its own — or the message is useless.
+/// A `LayoutMismatch` rejection names the owner's hash and carries no fd (§3.7).
 #[test]
 fn a_layout_mismatch_names_the_owners_hash_and_sends_no_fd() {
     let scratch = Scratch::new("layout-mismatch");
@@ -484,9 +414,6 @@ fn a_layout_mismatch_names_the_owners_hash_and_sends_no_fd() {
             assert_eq!(status, tf_tree_ipc::HelloStatus::LayoutMismatch);
             assert_eq!(owner_layout_hash, 0xDEAD_BEEF, "must name the owner's hash");
         }
-        // Not merely "some error": a rejection that carried a segment is its
-        // own named failure, and collapsing the two would let the server hand
-        // over the arena to a peer it just refused while this test still passed.
         Err(IpcError::RejectionCarriedFd { .. }) => {
             panic!("the owner sent a segment fd with a rejection")
         }
@@ -501,9 +428,7 @@ fn a_version_mismatch_outranks_a_layout_mismatch() {
     let sock = scratch.0.join("a.sock");
     let _server = serve(&sock, 4096);
 
-    // Both wrong. A peer that lays its records out differently will also hash
-    // differently, so reporting the layout first would send the operator after
-    // the wrong problem.
+    // Both wrong: version is reported first.
     let mut req = good_request();
     req.format_version = 99;
     req.layout_hash = 0x0BAD_0BAD;
@@ -521,12 +446,7 @@ fn a_version_mismatch_outranks_a_layout_mismatch() {
     }
 }
 
-/// **D17: the socket is the liveness signal.**
-///
-/// A participant that is `SIGKILL`ed — no unwinding, no destructor, no message —
-/// must be visible to the owner immediately, because the kernel closes its fd.
-/// This is what makes reaping prompt and timeout-free, and it is the property
-/// `docs/PROJECT.md` §5 D17 forbids replacing with a heartbeat.
+/// D17: a `SIGKILL`ed participant's socket close is visible to the owner.
 #[test]
 fn the_owner_sees_a_hangup_when_a_participant_is_killed() {
     let scratch = Scratch::new("hangup");
@@ -537,7 +457,6 @@ fn the_owner_sees_a_hangup_when_a_participant_is_killed() {
     let attached = client.line();
     assert!(attached.starts_with("attached 0 4096"), "got {attached}");
 
-    // No cooperation from the client, and no timeout on either side.
     client.kill();
 
     assert_eq!(
@@ -547,11 +466,7 @@ fn the_owner_sees_a_hangup_when_a_participant_is_killed() {
     );
 }
 
-/// An absent server is distinguishable from a refusing one.
-///
-/// §3.9 makes a stale socket path an expected state, so "nothing is listening"
-/// has to be its own error — `open()` reads it as "no server" and lets the
-/// ownership byte decide, whereas a rejection is terminal.
+/// An absent server is `ServerUnreachable`, not a rejection (§3.9).
 #[test]
 fn an_absent_server_is_not_a_rejection() {
     let scratch = Scratch::new("absent");
@@ -576,25 +491,16 @@ fn an_overlong_socket_path_is_refused_with_its_length() {
     }
 }
 
-/// A client that connects and never speaks must not wedge the owner.
-///
-/// The handshake `recvmsg` is blocking and the server loop is single-threaded,
-/// so without a receive timeout one silent peer — hung, `SIGSTOP`ped, or simply
-/// hostile — stalls every other participant's attach *and* the shutdown path,
-/// for as long as it cares to hold the connection. §3.7 specifies no timeout on
-/// either side.
-///
-/// The assertion is that a *second, well-behaved* client still gets through.
-/// Removing the server's `SO_RCVTIMEO` makes this hang until nextest's 180 s
-/// `terminate-after` rather than fail on its own, which is exactly the
-/// production symptom: an arena that stops accepting nodes and says nothing.
+/// A client that connects and never speaks must not wedge the owner: a second
+/// client still attaches. Without the server's `SO_RCVTIMEO` this hangs until
+/// nextest's `terminate-after`.
 #[test]
 fn a_silent_client_cannot_wedge_the_owner() {
     let scratch = Scratch::new("silent-client");
     let sock = scratch.0.join("a.sock");
     let _server = serve(&sock, 4096);
 
-    // Connect, send nothing, and hold the connection open for the whole test.
+    // Connect, send nothing.
     let addr = rustix::net::SocketAddrUnix::new(&sock).unwrap();
     let mute = rustix::net::socket_with(
         rustix::net::AddressFamily::UNIX,
@@ -605,7 +511,6 @@ fn a_silent_client_cannot_wedge_the_owner() {
     .unwrap();
     rustix::net::connect(&mute, &addr).unwrap();
 
-    // The owner spends its per-client budget on the mute peer, then carries on.
     let attached = tf_tree_ipc::attach(&sock, &good_request(), Duration::from_secs(10))
         .expect("a well-behaved client must still be served");
     assert_eq!(attached.response.arena_size, 4096);
@@ -613,12 +518,7 @@ fn a_silent_client_cannot_wedge_the_owner() {
     drop(mute);
 }
 
-/// **`Joined` is reachable for the first time.**
-///
-/// Until §3.7 existed, `NoServer` was the only probe and every `open()` in this
-/// file resolved to `Created` or timed out — `CreatePolicy::Never` could not
-/// succeed at all, because nothing could hand a second process the segment.
-/// This is the path the whole milestone was for.
+/// `Joined` through a real `SocketProbe`.
 #[test]
 fn a_second_process_joins_a_served_arena() {
     let scratch = Scratch::new("real-join");
@@ -626,13 +526,10 @@ fn a_second_process_joins_a_served_arena() {
         RuntimeDir::resolve_with(&Fixed(scratch.0.clone()), tf_tree_ipc::current_uid()).unwrap();
     let rv = Rendezvous::new(rd, 0, ArenaName::new("default", EnvVar::Name).unwrap());
 
-    // An owner takes the lock file, then serves the socket the rendezvous names.
     let mut creator = Open::new(rv.clone()).open(&mut NoServer).unwrap();
     assert_eq!(creator.outcome(), OpenOutcome::Created);
     let _server = serve(rv.sock_path(), 4096);
 
-    // A joiner with `create = Never` — it must find the arena or fail. Before
-    // this PR that combination could only ever fail.
     let mut probe = tf_tree_ipc::SocketProbe::new(good_request(), Duration::from_secs(5));
     let mut joiner = Open::new(rv)
         .create(CreatePolicy::Never)
@@ -645,8 +542,6 @@ fn a_second_process_joins_a_served_arena() {
         "a joiner must not hold the ownership byte"
     );
 
-    // It came back holding the segment, and the slot it locked is the one the
-    // owner named.
     let attached = joiner
         .take_attached()
         .expect("Joined carries an attachment");
@@ -660,12 +555,7 @@ fn a_second_process_joins_a_served_arena() {
     let _ = creator.release_ownership();
 }
 
-/// A rejection is terminal and must not consume the open deadline.
-///
-/// §3.4's loop retries until `open_timeout`. A `LayoutMismatch` cannot be fixed
-/// by waiting, so retrying it would replace the one message §3.7 says exists to
-/// prevent a multi-hour debugging session with a generic timeout error — and
-/// would take the full five seconds to do it.
+/// A rejection is terminal: `open()` returns it rather than retrying to the deadline.
 #[test]
 fn a_rejection_is_terminal_and_does_not_burn_the_deadline() {
     let scratch = Scratch::new("terminal-reject");
@@ -708,16 +598,8 @@ fn a_rejection_is_terminal_and_does_not_burn_the_deadline() {
 // §6.1 claim leases
 // ---------------------------------------------------------------------------
 
-/// **A killed claim holder's lease is released by the kernel, immediately.**
-///
-/// This is what the lease buys over the arena's `ClaimRecord` alone: the record
-/// is a word in shared memory that a `SIGKILL`ed process leaves set forever,
-/// while the byte is released with no cooperation and no timeout. That
-/// distinction is the whole predicate §6.3's reaper runs on.
-///
-/// Asserted with **no sleep**: `wait()` returning means the kernel has torn the
-/// process's descriptors down, so if the byte were not free by then, no amount
-/// of waiting would help and the test would be measuring a race instead.
+/// A killed claim holder's lease is released at once (the predicate §6.3's
+/// reaper runs on); no sleep is needed after `wait()`.
 #[test]
 fn a_killed_holder_releases_its_claim_lease_at_once() {
     let scratch = Scratch::new("claim-lease");
@@ -731,7 +613,7 @@ fn a_killed_holder_releases_its_claim_lease_at_once() {
         observer.probe_claim(7).unwrap().held,
         "the child's lease is not visible to another description"
     );
-    // A different edge is independent — byte-range locks, not a whole-file one.
+    // Byte-range locks: a different edge is independent.
     assert!(!observer.probe_claim(8).unwrap().held);
 
     kid.kill();
@@ -754,11 +636,7 @@ fn only_one_process_holds_an_edge_lease() {
     assert_eq!(second.line(), "lost", "two processes took one edge's lease");
 }
 
-/// An edge id past the reserved region is refused, not silently wrapped.
-///
-/// Only reachable from a corrupt header — but a byte outside the region would
-/// collide with an identity record, hand one edge to two writers, and present
-/// as impossible numbers rather than as an error.
+/// An edge id past the reserved region is refused, not wrapped.
 #[test]
 fn an_edge_beyond_the_reserved_region_is_refused() {
     let scratch = Scratch::new("claim-range");
@@ -769,27 +647,18 @@ fn an_edge_beyond_the_reserved_region_is_refused() {
     }
 }
 
-/// **A claim byte and a participant byte with the same index must not collide.**
-///
-/// This is what `CLAIM_BASE` is for, and the reason it is worth a test rather
-/// than a comment: a collision would make edge *n*'s lease indistinguishable
-/// from participant *n*'s registration, so one edge would be handed to two
-/// writers — and the symptom is impossible numerical results, not an error.
-///
-/// Removing the offset leaves every other test in this file passing, which is
-/// how the gap was found.
+/// A claim byte and a participant byte with the same index must not collide
+/// (`CLAIM_BASE`).
 #[test]
 fn claim_bytes_and_participant_bytes_do_not_overlap() {
     let scratch = Scratch::new("claim-vs-participant");
     let lock_path = scratch.0.join("both.lock");
     let observer = LockFile::open(&lock_path).unwrap();
 
-    // A child holds *participant* slot 3.
     let mut kid = Kid::spawn(&["hold-participant", lock_path.to_str().unwrap(), "3"]);
     assert_eq!(kid.line(), "held 3");
     assert!(observer.probe_participant(3).unwrap().held);
 
-    // *Edge* 3's lease must still be free, and takeable.
     assert!(
         !observer.probe_claim(3).unwrap().held,
         "edge 3's claim byte aliases participant slot 3's byte"
@@ -802,27 +671,8 @@ fn claim_bytes_and_participant_bytes_do_not_overlap() {
     observer.release_claim(3).unwrap();
 }
 
-/// **A creator takes participant slot 0 or it does not create** — #201.
-///
-/// The arena's first `FREE` record is 0, so a creator that holds any other lock
-/// byte hands the facade a tree whose liveness predicates index two different
-/// integers with one number. §3.4 step 4's scan and step 5's acquire used to be
-/// two passes over the same bytes, and `any_participant_held` probes byte 0
-/// *first* and then 63 more before returning — so the gap in which byte 0 could
-/// change hands was the rest of that scan.
-///
-/// The racer is a second open file description toggling byte 0, which is
-/// published API (`LockFile::try_take_participant`): a downstream consumer of
-/// this crate can do it whether or not anything in this workspace does.
-///
-/// **Mutant, no longer applicable:** it was *replace `register_creator` with `register_any` in step 5*, and `register_any` was deleted with the takeover arm (`docs/decisions/0037`). A replacement recipe — `try_take_participant(0)` to `take_any_participant()` in `register_creator` — is the same shape and has not been run — i.e.
-/// the code before the fix — and this fails with a non-zero slot within the
-/// first few dozen iterations. Measured at that revision, 4000 iterations of the
-/// two calls in isolation: 2242 took a non-zero byte.
-///
-/// It is a stress test, not a deterministic one; the assertion it makes is not
-/// statistical, though. **Every** create must be slot 0, so one bad iteration
-/// fails it, and the control below stops it passing vacuously.
+/// A creator takes participant slot 0 or does not create (#201). A racing lock
+/// description toggles byte 0; every create must still be slot 0.
 #[test]
 fn a_creator_takes_slot_zero_or_does_not_create() {
     let scratch = Scratch::new("creator_slot_zero");
@@ -831,7 +681,6 @@ fn a_creator_takes_slot_zero_or_does_not_create() {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let racer_stop = std::sync::Arc::clone(&stop);
     let racer_path = rv.lock_path().to_path_buf();
-    // Materialise the file first: the racer must not race the creation itself.
     drop(LockFile::open(rv.lock_path()).unwrap());
     let racer = std::thread::spawn(move || {
         let lock = LockFile::open(&racer_path).unwrap();
@@ -865,8 +714,7 @@ fn a_creator_takes_slot_zero_or_does_not_create() {
                 );
                 created += 1;
             }
-            // Losing the byte-0 race is a yield, not a failure: the condition is
-            // transient and the loop re-enters until the timeout.
+            // Losing the byte-0 race is a yield, not a failure.
             Err(IpcError::ArenaHeldButUnreachable { .. }) => yielded += 1,
             Err(other) => panic!("iteration {i}: unexpected {other:?}"),
         }
@@ -875,8 +723,7 @@ fn a_creator_takes_slot_zero_or_does_not_create() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     racer.join().unwrap();
 
-    // The positive control. Without it this passes trivially if every open
-    // yielded and none ever created.
+    // Positive control: some create succeeded.
     assert!(
         created > 0,
         "no create succeeded in 400 attempts ({yielded} yields) — the test proved nothing"

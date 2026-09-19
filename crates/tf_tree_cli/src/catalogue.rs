@@ -1,9 +1,9 @@
 //! The diagnostics catalogue (`docs/PHASE5.md` §6): identifiers, severities and
-//! the two output renderers. Detection lives in [`crate::checks`].
+//! the two renderers. Detection lives in [`crate::checks`].
 //!
-//! Identifiers are a **wire contract**: an id never changes meaning, is never
-//! recycled, and is what `--json`, `--suppress` and every document refer to.
-//! The catalogue is `TFT001`-`TFT019`.
+//! Identifiers are a wire contract: an id never changes meaning and is never
+//! recycled. The catalogue is `TFT001`-`TFT019`; `docs/PHASE5.md` §0.0 owns which
+//! ids detect what.
 //!
 //! | Phase 1 check | Catalogue id |
 //! |---|---|
@@ -14,18 +14,10 @@
 //! | `unclaimed-dynamic` | `TFT017` |
 //! | `out-of-order` | `TFT018` |
 //!
-//! `TFT019` maps onto no Phase 1 check: it attributes `TFT018`'s evidence to a
-//! stepped wall clock (`EdgeRecord::domain`) rather than a misbehaving publisher.
-//!
-//! [`Uncatalogued`] has no producer today; the `uncatalogued` key is part of the
-//! stable `--json` schema.
-//!
-//! A check that cannot run is reported [`Status::Skipped`] with the reason
-//! stated in [`crate::checks`], never silently passed. `docs/PHASE5.md` §0.0
-//! owns which ids detect what.
-//!
-//! Severity is a property of the check, not of the finding (§6's table), so the
-//! ids that can fail `--exit-code` are knowable before running anything.
+//! `TFT019` maps onto no Phase 1 check. [`Uncatalogued`] has no producer today;
+//! its `--json` key is stable. A check that cannot run is [`Status::Skipped`]
+//! with a reason, never silently passed. Severity belongs to the check, not the
+//! finding.
 
 use core::fmt::Write as _;
 
@@ -63,12 +55,10 @@ impl Severity {
     }
 }
 
-/// The catalogue, declared once: variants, `ALL`, `id`, `title` and `severity`
-/// are all generated from one row, so a check cannot be declared and never run.
+/// The catalogue, declared once: every accessor is generated from one row.
 macro_rules! catalogue {
     ($( $(#[$m:meta])* $variant:ident => { id: $id:literal, title: $title:literal, severity: $sev:ident } ),+ $(,)?) => {
-        /// A stable diagnostic identifier (`docs/PHASE5.md` §6). The numbering is
-        /// the specification's and does not change.
+        /// A stable diagnostic identifier (`docs/PHASE5.md` §6).
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
         pub enum Tft {
             $( $(#[$m])* $variant, )+
@@ -142,9 +132,8 @@ catalogue! {
 }
 
 impl Tft {
-    /// Parse an identifier for `--suppress`. Case-insensitive; `"TFT10"` and
-    /// `"10"` are **not** accepted, because a near-miss that silently suppresses
-    /// nothing is worse than an error.
+    /// Parse an identifier for `--suppress`. Case-insensitive; near-misses like
+    /// `"TFT10"` and `"10"` are rejected.
     #[must_use]
     pub fn parse(s: &str) -> Option<Tft> {
         let up = s.trim().to_ascii_uppercase();
@@ -157,11 +146,9 @@ impl Tft {
 pub struct Finding {
     /// Which check raised it.
     pub check: Tft,
-    /// The edge this finding is about, if it is about one. Named in JSON so a
-    /// consumer can key on it without parsing the message.
+    /// The edge this finding is about, if any.
     pub edge: Option<u32>,
-    /// A short label for what the finding is about (`"map->odom (edge#3)"`,
-    /// `"slot 2 pid 4711"`, `"arena"`).
+    /// A short label for the subject (`"map->odom (edge#3)"`, `"arena"`).
     pub subject: String,
     /// A human-readable explanation.
     pub message: String,
@@ -202,9 +189,8 @@ impl Finding {
     }
 }
 
-/// A finding from a Phase 1 check that `docs/PHASE5.md` §6 assigns no
-/// identifier. It carries a label rather than a [`Tft`], so `--suppress` cannot
-/// name it, but it still gates `--exit-code` at its severity.
+/// A Phase 1 finding `docs/PHASE5.md` §6 gives no identifier: `--suppress` cannot
+/// name it, but it still gates `--exit-code`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Uncatalogued {
     /// The Phase 1 check's label, e.g. `"out-of-order"`.
@@ -224,7 +210,7 @@ pub enum Status {
     Pass,
     /// It ran and found something; see [`CheckOutcome::findings`].
     Fired,
-    /// It could not run. **The reason is mandatory**: a silent skip reads as a pass.
+    /// It could not run. The reason is mandatory.
     Skipped(String),
 }
 
@@ -239,8 +225,7 @@ pub struct CheckOutcome {
     pub findings: Vec<Finding>,
     /// Whether `--suppress` named this id.
     ///
-    /// **A suppressed check still runs and still reports**; suppression removes
-    /// it from the `--exit-code` gate only.
+    /// A suppressed check still runs and reports; it leaves the `--exit-code` gate only.
     pub suppressed: bool,
 }
 
@@ -300,16 +285,13 @@ impl Report {
                 .count()
     }
 
-    /// Whether any **unsuppressed** error-severity check fired — the
-    /// `--exit-code` condition.
+    /// Whether any unsuppressed error-severity check fired (`--exit-code`).
     #[must_use]
     pub fn has_error(&self) -> bool {
         self.count_at(Severity::Error) > 0
     }
 
-    /// Whether the tree is clean: no unsuppressed warnings or errors.
-    ///
-    /// Info findings do not count.
+    /// Whether no unsuppressed warnings or errors exist; info does not count.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.count_at(Severity::Error) == 0 && self.count_at(Severity::Warn) == 0
@@ -350,18 +332,14 @@ pub struct Meta {
     pub layout_hash: u32,
     /// Instance uuid, hex, when the source is a shared arena.
     pub instance: Option<String>,
-    /// The rendezvous runtime directory this host resolves to, and how.
-    ///
-    /// Reported whatever the source is (`docs/PHASE2.md` §15); `None` only when
-    /// resolution fails, which does not fail the command.
+    /// The rendezvous runtime directory (`docs/PHASE2.md` §15); `None` if
+    /// resolution fails.
     pub runtime_dir: Option<String>,
     /// Frame count, for the one-line summary.
     pub frames: usize,
     /// Edge count.
     pub edges: usize,
-    /// Wall-clock time the report was produced, nanoseconds since the epoch.
-    ///
-    /// §5.6 requires `doctor --json` output to be timestamped.
+    /// Wall-clock time of the report, nanoseconds since the epoch.
     pub generated_unix_nanos: i64,
     /// The reference clock the time-based checks used, and where it came from.
     pub now_nanos: i64,
@@ -369,22 +347,13 @@ pub struct Meta {
     pub clock_source: &'static str,
     /// Whether the **engine** compiled `docs/PHASE5.md` §5's counters in.
     pub counters_compiled_in: bool,
-    /// Disclosures that are not findings and not whole-check skips: a check
-    /// that ran but with one of its evidence sources missing.
-    ///
-    /// [`Status`] has no "ran, but half blind" value.
+    /// Disclosures for a check that ran with an evidence source missing.
     pub notes: Vec<String>,
-    /// What the declared ring capacities reserve, in slots and in bytes.
-    ///
-    /// A display, not a check: over-declaring costs no resident memory
-    /// ([`0021`](../../../docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md)).
+    /// What the declared ring capacities reserve (display only; `0021`).
     pub rings: crate::sizing::Rings,
 }
 
-/// Render the human-readable report — the default output.
-///
-/// Grouped by severity, worst first. Skipped checks come last **and are always
-/// printed**, so `doctor` never claims a clean bill of health it did not earn.
+/// Render the human-readable report. Skipped checks are always printed.
 #[must_use]
 pub fn render_human(report: &Report, meta: &Meta) -> String {
     let mut s = String::new();
@@ -465,14 +434,10 @@ pub fn render_human(report: &Report, meta: &Meta) -> String {
     s
 }
 
-/// The `--json` schema identifier. **Bump only for an incompatible change**;
-/// adding a check, or a field, is compatible by construction.
+/// The `--json` schema identifier; bump only for an incompatible change.
 pub const JSON_SCHEMA: &str = "tf_tree.doctor/1";
 
-/// Render the machine-readable report.
-///
-/// Hand-written rather than via `serde_json` (`docs/PROJECT.md`'s dependency
-/// budget); [`json_escape`] is the tested part.
+/// Render the machine-readable report (hand-written; no `serde_json`).
 ///
 /// # Schema — stable
 ///
@@ -506,9 +471,7 @@ pub const JSON_SCHEMA: &str = "tf_tree.doctor/1";
 /// }
 /// ```
 ///
-/// `checks` always carries **every** id in the catalogue.
-/// `summary.error`/`warn`/`info` count `uncatalogued` findings too, so they
-/// agree with the exit status.
+/// `checks` carries every catalogue id; `summary` counts `uncatalogued` too.
 #[must_use]
 pub fn render_json(report: &Report, meta: &Meta) -> String {
     let mut s = String::new();
@@ -669,10 +632,7 @@ pub fn render_json(report: &Report, meta: &Meta) -> String {
     s
 }
 
-/// Escape a string for a JSON double-quoted scalar.
-///
-/// Frame names are untrusted. Everything below `0x20`, `"` and `\` is escaped;
-/// other UTF-8 passes through.
+/// Escape a string for a JSON double-quoted scalar (frame names are untrusted).
 #[must_use]
 pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -702,11 +662,7 @@ mod tests {
         CheckOutcome::ran(check, findings)
     }
 
-    /// **Every identifier is distinct, parses back to itself, and appears in
-    /// the catalogue exactly once.**
-    ///
-    /// Mutant: give `Tft::Tft011` the id `"TFT010"`; the uniqueness and
-    /// round-trip assertions fire.
+    /// Ids are distinct and round-trip through `parse`.
     #[test]
     fn identifiers_are_unique_and_round_trip() {
         let mut ids: Vec<&str> = Tft::ALL.iter().map(|c| c.id()).collect();
@@ -720,14 +676,10 @@ mod tests {
         }
         assert_eq!(Tft::parse("TFT10"), None);
         assert_eq!(Tft::parse("10"), None);
-        // One past the end: moves whenever the catalogue is appended to.
         assert_eq!(Tft::parse("TFT020"), None);
     }
 
-    /// **A hostile frame name must not be able to break the JSON document.**
-    ///
-    /// Mutant: make `json_escape` the identity; the `assert_eq!` and both
-    /// `render_json` assertions fail.
+    /// A hostile frame name cannot break the JSON document.
     #[test]
     fn json_escaping_survives_a_hostile_frame_name() {
         let nasty = "he said \"hi\"\\ then\nleft\u{1}";
@@ -757,15 +709,10 @@ mod tests {
             !json.contains("then\nleft"),
             "a raw newline reached the output"
         );
-        // Non-ASCII passes through.
         assert!(json_escape("naïve/frame").contains('ï'));
     }
 
-    /// **`--suppress` removes a check from the gate, not from the report.**
-    ///
-    /// Mutant A: drop the `!o.suppressed` filter from `Report::at`; `has_error`
-    /// fails. Mutant B: skip suppressed outcomes in `render_human`; the
-    /// `two islands` assertion fails.
+    /// `--suppress` removes a check from the gate, not the report.
     #[test]
     fn a_suppressed_check_is_still_reported_but_does_not_gate() {
         let mut report = Report::default();
@@ -789,15 +736,11 @@ mod tests {
         let json = render_json(&report, &Meta::default());
         assert!(json.contains("\"suppressed\": true"));
 
-        // Non-vacuity: the same finding unsuppressed does gate.
         report.outcomes[0].suppressed = false;
         assert!(report.has_error());
     }
 
-    /// **The report always lists what it did not check.**
-    ///
-    /// Mutant: delete the `if skipped > 0 { ... }` block from `render_human`;
-    /// the `TFT004` and reason-text assertions fail.
+    /// Skipped checks are always listed with their reason.
     #[test]
     fn the_human_report_names_every_check_it_could_not_run() {
         let mut report = Report::default();
@@ -819,11 +762,7 @@ mod tests {
         );
     }
 
-    /// **An id-less Phase 1 finding is visible, is marked as id-less, and still
-    /// gates.**
-    ///
-    /// Mutant: make `Report::count_at` ignore `self.uncatalogued`; `has_error`
-    /// and `is_healthy` assertions fail.
+    /// An id-less finding is visible, marked, and gates.
     #[test]
     fn an_id_less_finding_is_visible_marked_and_still_gates() {
         let mut report = Report::default();
@@ -851,7 +790,6 @@ mod tests {
             json.contains("\"error\": 1"),
             "the summary must count it, or it disagrees with the exit status:\n{json}"
         );
-        // Non-vacuity: a warn-severity id-less finding does not gate.
         let mut warn_only = Report::default();
         warn_only.uncatalogued.push(Uncatalogued {
             check: "unclaimed-dynamic",
@@ -863,10 +801,7 @@ mod tests {
         assert!(!warn_only.is_healthy());
     }
 
-    /// Info findings are printed but do not make a tree unhealthy.
-    ///
-    /// Mutant: add `|| self.count_at(Severity::Info) > 0` to `is_healthy`; the
-    /// first assertion fails.
+    /// Info findings print but do not make a tree unhealthy.
     #[test]
     fn info_findings_do_not_make_a_tree_unhealthy() {
         let mut report = Report::default();
@@ -878,7 +813,6 @@ mod tests {
         assert!(!report.has_error());
         assert!(render_human(&report, &Meta::default()).contains("THP is 'never'"));
 
-        // Non-vacuity: a warn-severity finding *does* make it unhealthy.
         report.outcomes.push(fired(
             Tft::Tft010,
             vec![Finding::on_edge(Tft::Tft010, 1, "edge#1", "hot")],

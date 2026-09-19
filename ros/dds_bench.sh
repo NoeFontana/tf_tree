@@ -1,20 +1,11 @@
 #!/usr/bin/env bash
-# The `docs/PHASE5.md` §9.1 end-to-end comparison. Runs inside `docker/tf2`
-# (`just dds-bench`). One publisher, four arms, everything else identical:
+# The `docs/PHASE5.md` §9.1 end-to-end comparison; runs inside `docker/tf2` (`just dds-bench`).
+# One publisher, four arms: `tf2.processes` (N listener processes), `tf2.composed` (one
+# listener, N threads), `tf_tree.composed` (ingest bridge with N threads, §5.8 form 3),
+# `tf_tree.processes` (bridge publishing a shared arena plus N read-only consumers, `0015`).
 #
-#   tf2.processes     N processes, each a `TransformListener` + `Buffer` over DDS
-#   tf2.composed      one process, one listener, N query threads (tf2's best case)
-#   tf_tree.composed  one process hosting the ingest bridge (§5.8 form 3) with
-#                     N query threads
-#   tf_tree.processes one bridge process publishing a shared arena under
-#                     $TF_TREE_NAME plus N read-only attached consumers
-#                     (`docs/decisions/0015`)
-#
-# The bridge runs only during its own arm, and `cleanup` kills every launched
-# process on exit, so no arm's CPU contends with another's (§9.3). Arm order is
-# fixed and a disclosed confound; `dds_report` prints it. §9.3's other rules are
-# mechanical: one publisher/workload, §5.2's QoS, one executable with `--mode`,
-# `--warmup` reported, RMW/distro recorded by `runstore::Run::begin`.
+# `cleanup` kills every launched process on exit so no arm contends with another (§9.3); arm
+# order is fixed and a disclosed confound.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -33,16 +24,13 @@ RUNDIR=$OUT/run
 rm -rf "$RES" "$RUNDIR"
 mkdir -p "$CFG" "$RES" "$RUNDIR"
 
-# The `tf_tree.processes` arm's rendezvous coordinates, shared by both halves
-# through the environment. A private runtime directory and a pinned domain keep
-# it unreachable from a developer's `tf_tree serve` or a stale run
-# (`$TF_TREE_DOMAIN` would otherwise fall back to `$ROS_DOMAIN_ID`).
+# The `tf_tree.processes` arm's rendezvous coordinates: a private runtime directory and a
+# pinned domain keep it unreachable from a developer's `tf_tree serve` or a stale run.
 export TF_TREE_RUNTIME_DIR=$RUNDIR
 export TF_TREE_DOMAIN=0
 export TF_TREE_NAME=${TF_TREE_NAME:-ddsbench}
 
-# `sockaddr_un.sun_path` holds 108 bytes, so a deep checkout makes the socket
-# path unusable; fail here rather than after three arms.
+# `sockaddr_un.sun_path` holds 108 bytes: fail here rather than after three arms.
 SOCKET_PATH="$TF_TREE_RUNTIME_DIR/$TF_TREE_DOMAIN/$TF_TREE_NAME.sock"
 if [ "${#SOCKET_PATH}" -ge 108 ]; then
     echo "dds_bench: the rendezvous socket path is ${#SOCKET_PATH} bytes and sun_path holds" >&2
@@ -52,8 +40,7 @@ if [ "${#SOCKET_PATH}" -ge 108 ]; then
     exit 1
 fi
 
-# The bridge outlives its own window: its consumers start warming up only once
-# the rendezvous exists, so their window ends later.
+# The bridge outlives its own window: its consumers start once the rendezvous exists.
 BRIDGE_LINGER=${BRIDGE_LINGER:-6}
 
 BIN=$ROOT/target/ros/install/tf_tree_bench_ros/lib/tf_tree_bench_ros
@@ -66,8 +53,7 @@ echo "==> generating the workload's publisher plan, bridge config and query set"
 cargo run --release -q -p tf_tree_bench --bin dds_report -- \
     emit-config --workload "$WORKLOAD" --out "$CFG"
 
-# The publisher must outlive every arm and the bridge's linger, or the tail of a
-# run measures an idle topic (both engines answer from cache, silently).
+# The publisher must outlive every arm and the bridge's linger, or the tail measures an idle topic.
 ARMS=4
 PUB_SECONDS=$(python3 -c \
     "print(($WARMUP + $SECONDS_MEASURED + 4) * $ARMS + $BRIDGE_LINGER + 5)")
@@ -80,8 +66,7 @@ set -u
 
 echo "==> ROS ${ROS_DISTRO:-unknown}, RMW ${RMW_IMPLEMENTATION:-<rmw default>}"
 
-# Processes launched and not yet reaped; an orphaned bridge would confound the
-# next run.
+# Processes launched and not yet reaped; an orphaned bridge would confound the next run.
 ARM_PIDS=()
 
 cleanup() {
@@ -122,10 +107,9 @@ run_arm() {
     fi
 }
 
-# One bridge process plus N attached consumers, all writing
-# `tf_tree.processes.<i>.out` so `dds_report` charges the bridge's cost to this
-# arm (it reports `consumers 0`). All N+1 launch together: consumers poll for
-# the rendezvous (`--attach-timeout`) and `$BRIDGE_LINGER` covers the offset.
+# One bridge process plus N attached consumers, all writing `tf_tree.processes.<i>.out` so
+# `dds_report` charges the bridge's cost to this arm. All N+1 launch together (`--attach-timeout`,
+# `$BRIDGE_LINGER`).
 run_processes_arm() {
     local label=$1 procs=$2
     echo "==> arm $label: 1 bridge process + $procs attached consumer process(es)"

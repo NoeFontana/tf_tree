@@ -1,39 +1,23 @@
 //! The depth-3 lookup ratio against `tf2::BufferCore`, measured **paired**.
 //!
 //! `docs/PHASE5.md` §9.2's absolute-duration rows are `unavailable` on a host
-//! `Fitness::probe` rejects. A quotient of two engines timed inside one round is
-//! a different statistic: governor and SMT effects move both arms and divide out
-//! ([`Sensitivity::Ratio`](crate::report::Sensitivity::Ratio)). Load is not
-//! divided out (`tf2` takes a mutex, `tf_tree` none, so a busy host inflates the
-//! quotient); `Fitness::fair_for_ratios` carries that.
+//! `Fitness::probe` rejects. A quotient of two engines timed in one round divides
+//! out governor and SMT effects ([`Sensitivity::Ratio`](crate::report::Sensitivity::Ratio));
+//! load is not divided out, which `Fitness::fair_for_ratios` carries.
 //!
 //! # What this number is not
 //!
-//! The tf2 column goes through `tf_tree_tf2_sys`, so it flatters `tf_tree`: the
-//! residual FFI boundary is worth 45.3 ns (10%) to tf2 (`docs/benchmarks/tf2.md`).
-//! The honest headline (2.7×) comes from `docker/tf2/native_scaling.cpp`. This
-//! row is a regression detector, so [`FLOOR`] sits well under the measured
-//! value. It is also single-threaded and warm, the best case for both engines;
-//! the contended rows are `contended_scaling` and `tf2_scaling`.
+//! The tf2 column goes through `tf_tree_tf2_sys`, which flatters `tf_tree` by the
+//! FFI boundary (`docs/benchmarks/tf2.md`); the headline comes from
+//! `docker/tf2/native_scaling.cpp`. This row is a regression detector, single-threaded
+//! and warm; contended rows are `contended_scaling` and `tf2_scaling`.
 //!
-//! # Which consumer build this row speaks for: this workspace's, not yours
+//! # Which consumer build this row speaks for
 //!
-//! The row is built under the workspace `[profile.release]` (`lto = "thin"`). A
-//! consumer gets cargo's release defaults (`[profile.embedder]`, no LTO), where
-//! `Plan::at` is not inlined across the crate boundary (`docs/API.md` §2.3
-//! item 3). Measured in `docker/tf2`, `taskset -c 2`, 2026-08-15
-//! (`just tf2-ratio-profiles`):
-//!
-//! | build | `lto` | tf_tree | tf2 (via binding) | **paired ratio** | band |
-//! |---|---|---|---|---|---|
-//! | workspace `[profile.release]` — what this row gates | `"thin"` | 201.6 ns | 504.4 ns | **2.490×** | 2.452–2.547 |
-//! | `[profile.embedder]` — cargo's release defaults, i.e. a consumer | `false` | 244.2 ns | 506.1 ns | **2.075×** | 2.063–2.080 |
-//!
-//! The tf2 column is the control (+0.34%, an `extern "C"` arm no Rust LTO can
-//! inline); the tf_tree column moves +21.1%. `[profile.profiling]` (debuginfo
-//! only) measures 200.4 ns / 2.468×, so the number tracks `lto`.
-//!
-//! The consequence for [`FLOOR`] is stated there.
+//! This workspace's `[profile.release]` (`lto = "thin"`), not a consumer's cargo
+//! defaults (`[profile.embedder]`, no LTO), where `Plan::at` is not inlined across
+//! the crate boundary (`docs/API.md` §2.3 item 3). `just tf2-ratio-profiles`
+//! measures both; see [`FLOOR`] and `docs/decisions/0025`.
 
 use anyhow::{anyhow, bail, Result};
 
@@ -42,48 +26,34 @@ use tf_tree::{InterpPolicy, Stamp};
 use crate::tf2::Tf2Fixture;
 
 /// The floor this row gates: `tf_tree` at least this many times faster than
-/// `tf2` on a depth-3 hot lookup, **built as this workspace builds it**
-/// (`lto = "thin"`). The row measures 2.49×; the floor sits under
-/// [`UNBIASED_ESTIMATE`] so the binding's ~10% bias alone cannot pass it.
+/// `tf2` on a depth-3 hot lookup, built with `lto = "thin"`; it sits under
+/// [`UNBIASED_ESTIMATE`] so the binding's bias alone cannot pass it.
 ///
 /// # Not defensible for a consumer's default `--release`
 ///
-/// At `[profile.embedder]` the tf_tree arm is 244.2 ns, or
-/// [`UNBIASED_ESTIMATE_DEFAULT_RELEASE`] ≈ **1.80×** against native C++ tf2,
-/// which is under 2.0. The floor is not lowered (that would weaken the gate for
-/// the build it measures); the claim is scoped to a regression detector for this
-/// workspace's build. The consumer headline remains `tf2.md`'s ~2.7×. Gating the
-/// consumer build is a decision record, not an edit here.
+/// At `[profile.embedder]` the ratio is [`UNBIASED_ESTIMATE_DEFAULT_RELEASE`]
+/// (≈ 1.80×), under 2.0. The floor is not lowered; the claim is a regression
+/// detector for this workspace's build. Gating the consumer build is a decision
+/// record (`docs/decisions/0025`).
 pub const FLOOR: f64 = 2.0;
 
 /// The same fixture with no binding on either arm at `[profile.release]`:
-/// `tf_tree` native Rust (201.5 ns) against `tf2` native C++ (452.9 ns), from
-/// `docker/tf2/native_ratio.sh`. Unpaired, so a point estimate that bounds
-/// [`FLOOR`], not a gate. A 2026-08-15 re-measure gave 2.18×; the constant is
-/// not chased to it.
+/// native Rust against native C++ tf2 (`docker/tf2/native_ratio.sh`). Unpaired,
+/// so a point estimate that bounds [`FLOOR`], not a gate.
 const UNBIASED_ESTIMATE: f64 = 2.25;
 
-/// The same quantity at cargo's release defaults (`[profile.embedder]`, what a
-/// consumer compiles): 439.2 ns native C++ tf2 against 244.2 ns tf_tree,
-/// 2026-08-15. Recorded at the pessimistic end of a 1.80–1.86 spread; nothing
-/// in it reaches 2.0.
-///
-/// No gate reads it; it makes [`FLOOR`]'s prose checkable via
-/// `the_floor_is_bounded_at_one_profile_and_not_the_other`. `pub` so the caveat
-/// is reachable from [`FLOOR`] in rendered docs.
+/// The same quantity at `[profile.embedder]`, at the pessimistic end of the
+/// observed spread. No gate reads it; `the_floor_is_bounded_at_one_profile_and_not_the_other`
+/// checks it, and it is `pub` so [`FLOOR`]'s docs can link it.
 ///
 /// # Why there is no second gated row at this profile
 ///
-/// `docs/decisions/0025`: across three repeats the consumer row's band straddles
-/// [`FLOOR`] in two (medians 2.088 / 2.083 / 2.047; bands 2.080–2.137,
-/// 1.975–2.563, 1.923–2.340), and [`Run::verdict`] compares the band, so it
-/// answers `Unresolved`. A threshold cannot be derived from a band that contains
-/// it. Revisit when a host resolves this row across repeats.
+/// `docs/decisions/0025`: the consumer row's band straddles [`FLOOR`] across
+/// repeats, so [`Run::verdict`] answers `Unresolved`.
 pub const UNBIASED_ESTIMATE_DEFAULT_RELEASE: f64 = 1.80;
 
-/// [`FLOOR`] must stay under the unbiased estimate, or the binding's bias could
-/// pass this row. A compile-time check; it holds for this workspace's
-/// `lto = "thin"` build only (see the test below).
+/// [`FLOOR`] must stay under the unbiased estimate. Compile-time check; holds
+/// for the `lto = "thin"` build only.
 const _: () = assert!(FLOOR < UNBIASED_ESTIMATE);
 
 /// Rounds of the interleaved pair. Odd, so the median is an observation.
@@ -92,19 +62,17 @@ pub const ROUNDS: usize = 9;
 /// Sweeps of the stamp table per arm per round.
 const SWEEPS: usize = 40;
 
-/// Stamps swept, all off every dynamic grid — `0013`'s subject.
+/// Stamps swept, all off every dynamic grid (`0013`).
 const STAMPS: usize = 256;
 
 /// Lookups per arm before any round is timed.
 const WARMUP: usize = 20_000;
 
-/// The pair this fixture is measured on: three dynamic steps after folding,
-/// which is what `PHASE1.md` §11.3 means by "depth-3" — NORMATIVE there.
+/// The pair measured: three dynamic steps after folding (`PHASE1.md` §11.3, NORMATIVE).
 const TARGET: &str = "imu_link";
 const SOURCE: &str = "map";
 
-/// Stamps off every dynamic grid, so `I::eval` actually runs
-/// (`docs/decisions/0013`).
+/// Stamps off every dynamic grid, so `I::eval` runs (`docs/decisions/0013`).
 const fn stamp_ns(i: i64) -> i64 {
     crate::fixture::NOW_NS - 3_700_000 - i * 9_631
 }
@@ -116,8 +84,7 @@ pub enum Verdict {
     Above,
     /// The whole observed band is below it.
     Below,
-    /// The band straddles the floor, so this run cannot answer; reported rather
-    /// than resolved by the median.
+    /// The band straddles the floor; reported, not resolved by the median.
     Unresolved,
 }
 
@@ -136,15 +103,13 @@ impl Verdict {
 /// One interleaved run: both arms, one process, `ROUNDS` rounds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
-    /// Median per-round `tf2_ns / tf_tree_ns`: paired, not the quotient of the
-    /// two medians below.
+    /// Median per-round `tf2_ns / tf_tree_ns`: paired, not a quotient of medians.
     pub ratio: f64,
     /// Smallest per-round ratio observed.
     pub ratio_lo: f64,
     /// Largest per-round ratio observed.
     pub ratio_hi: f64,
-    /// Median `tf_tree` nanoseconds per lookup. Reported, never gated: it is an
-    /// absolute duration, and this host cannot claim one.
+    /// Median `tf_tree` nanoseconds per lookup. Reported, never gated.
     pub tf_tree_ns: f64,
     /// Median `tf2` nanoseconds per lookup, through `tf_tree_tf2_sys`.
     pub tf2_ns: f64,
@@ -152,7 +117,7 @@ pub struct Run {
     pub rounds: usize,
     /// Lookups per arm per round.
     pub lookups_per_round: u64,
-    /// Queries on which the two engines were checked to agree before timing.
+    /// Queries on which the engines were checked to agree before timing.
     pub agreed: usize,
 }
 
@@ -208,14 +173,13 @@ pub fn measure() -> Result<Run> {
     measure_with(ROUNDS, SWEEPS, WARMUP)
 }
 
-/// [`measure`] with the loop counts as parameters, so a unit test can run it
-/// cheaply.
+/// [`measure`] with the loop counts as parameters, for cheap unit tests.
 ///
 /// # Errors
 ///
 /// As [`measure`].
 pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> {
-    // `LerpSlerp` on both sides: it is tf2's policy (`PROJECT.md` §5 D5).
+    // `LerpSlerp` on both sides: tf2's policy (`PROJECT.md` §5 D5).
     let tree = crate::fixture::build_tree_with(InterpPolicy::LerpSlerp)?;
     let (_writers, _pushed) = crate::fixture::spin_up(&tree)?;
     let target = tree
@@ -232,11 +196,9 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
     let tf2 = Tf2Fixture::load()?;
 
     let stamps: Vec<i64> = (0..STAMPS as i64).map(stamp_ns).collect();
-    // Converted once, outside every timed loop.
     let ours_stamps: Vec<Stamp> = stamps.iter().map(|&s| Stamp::from_nanos(s)).collect();
 
-    // The engines must agree before either is timed: an arm answering a
-    // different question (or a tf2 horizon miss) would move the ratio silently.
+    // Engines must agree before timing, or the ratio moves silently.
     let mut agreed = 0usize;
     for (i, &s) in stamps.iter().enumerate() {
         let ours = plan
@@ -263,8 +225,6 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
         let mut acc = 0.0f64;
         for _ in 0..sweeps {
             for &s in &ours_stamps {
-                // Symmetric with the other arm's `if let`, so it cancels out of
-                // the quotient; agreement was established above.
                 if let Ok(v) = plan.at(&guard, std::hint::black_box(s)) {
                     acc += v.t.x;
                 }
@@ -284,8 +244,6 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
         std::hint::black_box(acc)
     };
 
-    // Warm both arms; `sweeps * per_sweep`, since one `sweep_ours` call is
-    // `sweeps` passes over the table.
     let per_sweep = stamps.len();
     let per_call = sweeps.saturating_mul(per_sweep).max(1);
     for _ in 0..warmup.div_ceil(per_call) {
@@ -298,7 +256,7 @@ pub fn measure_with(rounds: usize, sweeps: usize, warmup: usize) -> Result<Run> 
     let mut ours_ns = Vec::with_capacity(rounds);
     let mut theirs_ns = Vec::with_capacity(rounds);
     for r in 0..rounds {
-        // Alternate which arm goes first, or one arm gets the colder cache.
+        // Alternate which arm goes first to balance cache warmth.
         let (a, b) = if r % 2 == 0 {
             let t0 = std::time::Instant::now();
             let _ = sweep_ours();
@@ -350,9 +308,6 @@ mod tests {
     use super::*;
 
     /// The verdict is read off the band, not the median.
-    ///
-    /// Mutant: compare `self.ratio` against `FLOOR` in `verdict`; the
-    /// straddling case then reports `Above`.
     #[test]
     fn a_band_straddling_the_floor_is_unresolved_not_a_pass() {
         let base = Run {
@@ -383,18 +338,11 @@ mod tests {
         assert_eq!(bad.verdict(), Verdict::Below);
     }
 
-    /// [`FLOOR`]'s scope as arithmetic: at cargo's release defaults the
-    /// relationship the compile-time `assert!` pins is **false**. A test, not a
-    /// second `const` assertion, because it is a measurement expected to move;
-    /// when an engine change closes the crate-boundary cost, this failing is the
-    /// prompt to promote [`FLOOR`] to a consumer-build claim. No build facts in
-    /// here.
+    /// [`FLOOR`]'s scope as arithmetic: at cargo's release defaults the relationship
+    /// the compile-time `assert!` pins is **false**. Its failing is the prompt to
+    /// promote [`FLOOR`] to a consumer-build claim.
     ///
-    /// Mutant (observed): `UNBIASED_ESTIMATE_DEFAULT_RELEASE = 2.30` fails the
-    /// second assertion while the compile-time one keeps holding.
-    ///
-    /// `assertions_on_constants` is expected: two of the three constants are
-    /// measurements, and asserting on them forces a re-read when one moves.
+    /// `assertions_on_constants` is expected: the constants are measurements.
     #[expect(
         clippy::assertions_on_constants,
         reason = "the constants are measurements that are expected to move; pinning their \

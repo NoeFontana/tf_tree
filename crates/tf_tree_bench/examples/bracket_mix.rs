@@ -6,15 +6,10 @@
 //! cargo run --release -p tf_tree_bench --example bracket_mix -- <stream> [sweep_hz]
 //! ```
 //!
-//! # Why this exists
-//!
-//! `0060`'s SoA kernel is for `slerp`'s **series region** and loses elsewhere (`0060` §5: 80% on an
-//! all-fallback cell), so its headline is a function of the data. This example classifies the
-//! brackets an `at_many` sweep would read and says nothing about speed; it has no engine code.
+//! `0060`'s SoA kernel wins only in `slerp`'s series region, so its headline depends on the data; this classifies
+//! the brackets an `at_many` sweep would read and measures no speed.
 //!
 //! # The five classes
-//!
-//! They are the arms of [`tf_tree::slerp`] and of `dualquat`'s `screw_parts` / `ScrewParts::pow`:
 //!
 //! | class | `LerpSlerp` | `ScLerp` |
 //! |---|---|---|
@@ -24,18 +19,12 @@
 //! | **series** | `1e-12 ≤ θ² ≤ 0.0225`: the polynomial weights — **the kernel's regime** | `1e-290 ≤ sin²(θ/2) ≤ 0.02233…`: same |
 //! | **large arc** | `θ² > 0.0225`: `acos` / `sin`, the exact form | `sin²(θ/2) > 0.02233…`: the exact form |
 //!
-//! The series fraction is set by publish rate against how fast the body turns.
-//!
 //! # Three sweeps
 //!
-//! - **`rate`** (the headline): a 100 Hz grid offset 1 ns off the window origin, so nothing lands on
-//!   a knot; weights each bracket by its **duration**.
-//! - **`interval`**: one query at the midpoint of every sample interval; each bracket counts once.
-//! - **`ongrid`**: a query at every recorded stamp; 100% exact hits, the exact-hit ceiling.
+//! `rate` (the headline): a 100 Hz grid offset 1 ns off the window origin, each bracket weighted by duration;
+//! `interval`: one query at each interval's midpoint; `ongrid`: a query at every recorded stamp (all exact hits).
 //!
 //! # Four controls, so that every column can be non-zero
-//!
-//! `0060` asked for two; two more found something, so every column can be non-zero:
 //!
 //! | control | `LerpSlerp` | `ScLerp` |
 //! |---|---|---|
@@ -43,16 +32,6 @@
 //! | one pose repeated, the recorded wheel edges' quaternion | 100% stationary | 100% stationary |
 //! | one pose repeated, four non-zero components | 100% stationary | **100% series** |
 //! | ~1e-7 rad of jitter a sample | **100% LERP fallback** | 100% series |
-//!
-//! The third exists because the stationary control **as specified fails**: a motionless `ScLerp`
-//! edge is degenerate only when the quaternion's zero pattern makes `conj(q) ⊗ q` cancel exactly
-//! ([`control_stationary`]). The fourth keeps the LERP-fallback column from being always zero.
-//!
-//! # The bracket search is checked against the engine, per stamp
-//!
-//! This example mirrors `SampleRing::sample_from` under `ExtrapPolicy::Error` (the bracket is not a
-//! public return), so every swept stamp is also put through `Plan::at` and the two must agree
-//! **bit-identically**. The count of checked stamps is printed.
 #![allow(clippy::print_stdout)]
 
 use std::collections::BTreeMap;
@@ -65,37 +44,27 @@ use tf_tree::{
 };
 use tf_tree_bench::{fixture, replay::TfStream};
 
-/// The chunk a batch fold would classify and bail out on, as prototyped.
 const CHUNK: usize = 64;
 
-/// `SLERP_LERP_FALLBACK`, `tf_tree_math::interp`'s private constant, pinned there by a `const` assert.
+/// `tf_tree_math::interp`'s private `SLERP_LERP_FALLBACK`.
 const SLERP_LERP_FALLBACK: f64 = 1e-6;
 
-/// `THETA_SLERP_SMALL`, pinned the same way (`assert!(THETA_SLERP_SMALL == 0.15)`).
 const THETA_SLERP_SMALL: f64 = 0.15;
 
-/// `SIN_HALF_THETA_SMALL_SQ`, `tf_tree_math::dualquat`'s private constant, pinned there by a unit test.
+/// `tf_tree_math::dualquat`'s private `SIN_HALF_THETA_SMALL_SQ`.
 const SIN_HALF_THETA_SMALL_SQ: f64 = 0.022_331_755_437_196_99;
 
-/// `SCREW_DEGENERATE_SQ`, `tf_tree_math::dualquat`'s degenerate-screw floor.
 const SCREW_DEGENERATE_SQ: f64 = 1e-290;
 
-/// How close to a class boundary a bracket has to be before the route this
-/// example takes to `θ²` could change its bucket. See [`Counts::near_boundary`].
 const BOUNDARY_BAND: f64 = 1e-9;
 
 /// Which arm of the interpolant a bracket lands in.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Class {
-    /// The kernel's regime: the polynomial weights.
     Series,
-    /// `h == 0` under `LerpSlerp`, a degenerate screw under `ScLerp`.
     Stationary,
-    /// Near-parallel: LERP and renormalise. `LerpSlerp` only.
     LerpFallback,
-    /// Past the small-angle threshold: the exact `acos` / `sin` form.
     LargeArc,
-    /// The stamp is a knot; no interpolation happens.
     ExactHit,
 }
 
@@ -119,17 +88,13 @@ impl Class {
     }
 }
 
-/// `θ²` for a quaternion pair, from the chord rather than from `acos`. Deliberately not
-/// `tf_tree_math`'s eight-term series, so the classifier does not inherit that series' errors;
-/// [`Counts::near_boundary`] counts the brackets where the two routes could disagree.
+/// `θ²` from the chord rather than `acos`, so the classifier does not inherit `tf_tree_math`'s series errors.
 fn theta_sq_from_chord(h: f64) -> f64 {
     let theta = 2.0 * (h * 0.5).sqrt().min(1.0).asin();
     theta * theta
 }
 
-/// How far a bracket sits from the nearest class boundary, in relative terms.
-///
-/// `f64::INFINITY` when the bracket is not near one.
+/// How far a bracket sits from the nearest class boundary, relative; `f64::INFINITY` if not near one.
 fn boundary_distance(x: f64, edges: &[f64]) -> f64 {
     edges
         .iter()
@@ -137,8 +102,7 @@ fn boundary_distance(x: f64, edges: &[f64]) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-/// Classify one bracket, returning the class and its distance from the nearest
-/// boundary.
+/// Classify one bracket: its class and its distance from the nearest boundary.
 fn classify(policy: InterpPolicy, a: &Iso3, b: &Iso3) -> (Class, f64) {
     match policy {
         InterpPolicy::LerpSlerp => {
@@ -161,8 +125,6 @@ fn classify(policy: InterpPolicy, a: &Iso3, b: &Iso3) -> (Class, f64) {
             }
         }
         InterpPolicy::ScLerp => {
-            // `inv_mul`'s rotation part, which is what the kernel's safe-region
-            // predicate computes.
             let rel = a.q.conjugate() * b.q;
             let rel = if rel.w < 0.0 { rel.neg() } else { rel };
             let sh2 = rel.vector().norm_squared();
@@ -180,16 +142,12 @@ fn classify(policy: InterpPolicy, a: &Iso3, b: &Iso3) -> (Class, f64) {
 
 /// What a read of one edge at one stamp resolves to.
 enum Read {
-    /// Outside `[oldest, newest]`: `ExtrapPolicy::Error` declines.
     Declined,
-    /// The stamp is a knot; the sample is returned unchanged.
     Hit(Iso3),
-    /// `t_i < t < t_j`, with `s` the fraction.
     Bracket(Iso3, Iso3, f64),
 }
 
-/// `SampleRing::sample_from` under `ExtrapPolicy::Error`, mirrored over the recorded sample list;
-/// every caller checks it against `Plan::at`.
+/// `SampleRing::sample_from` under `ExtrapPolicy::Error`, mirrored over the recorded samples; checked against `Plan::at`.
 fn read(samples: &[(i64, Iso3)], t: i64) -> Read {
     let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
         return Read::Declined;
@@ -201,8 +159,6 @@ fn read(samples: &[(i64, Iso3)], t: i64) -> Read {
     if t == t_new {
         return Read::Hit(last.1);
     }
-    // `bracket_from`: the last index whose stamp is `<= t`. The preconditions
-    // `stamp[lo] <= t < stamp[hi]` hold from the two tests above.
     let (mut lo, mut hi) = (0usize, samples.len() - 1);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
@@ -216,7 +172,6 @@ fn read(samples: &[(i64, Iso3)], t: i64) -> Read {
         return Read::Hit(samples[lo].1);
     }
     let (t_i, t_j) = (samples[lo].0, samples[lo + 1].0);
-    // `span_ns` as `sample.rs` spells it: a wrapping `u64` difference.
     let span = |from: i64, to: i64| (to as u64).wrapping_sub(from as u64) as f64;
     let s = span(t_i, t) / span(t_i, t_j);
     Read::Bracket(samples[lo].1, samples[lo + 1].1, s)
@@ -226,12 +181,8 @@ fn read(samples: &[(i64, Iso3)], t: i64) -> Read {
 #[derive(Default, Clone)]
 struct Counts {
     per_class: BTreeMap<Class, usize>,
-    /// Stamps the sweep asked for that the edge declined. Not a class.
     declined: usize,
-    /// Brackets within [`BOUNDARY_BAND`] of a class boundary, whose bucket could depend on the route
-    /// taken to `θ²`; a non-zero count means a footnote.
     near_boundary: usize,
-    /// Stamps put through `Plan::at` and required to agree bit-for-bit.
     checked: usize,
 }
 
@@ -279,8 +230,7 @@ fn header(what: &str) -> String {
     )
 }
 
-/// The per-chunk view a bail-out would see: for every 64-stamp chunk, the
-/// fraction of its elements the kernel's classifier admits.
+/// The per-chunk view a bail-out would see: the fraction of each 64-stamp chunk the classifier admits.
 struct ChunkStats {
     fracs: Vec<f64>,
 }
@@ -307,14 +257,10 @@ impl ChunkStats {
     }
 }
 
-/// Which stamps to ask for.
 #[derive(Clone, Copy)]
 enum Sweep {
-    /// A fixed-rate grid, offset 1 ns so nothing lands on a knot.
     Rate(f64),
-    /// One query at the midpoint of every sample interval.
     Interval,
-    /// A query at every recorded stamp.
     OnGrid,
 }
 
@@ -353,7 +299,6 @@ impl Sweep {
     }
 }
 
-/// Sweep one edge and tally it, checking every stamp against the engine.
 fn sweep_edge(
     tree: &Tree,
     parent: &str,
@@ -368,8 +313,6 @@ fn sweep_edge(
     let c = tree
         .frame(child)
         .map_err(|e| anyhow!("frame {child}: {e}"))?;
-    // `plan(target, source)` is `lookup(target, source)`, so a `T_parent_child` edge returns the sample
-    // unchanged from `plan(parent, child)`; the bit-identity check below fails on the wrong direction.
     let plan = tree
         .plan(p, c)
         .map_err(|e| anyhow!("plan {parent}->{child}: {e}"))?;
@@ -400,9 +343,7 @@ fn sweep_edge(
                 Class::ExactHit
             }
             Read::Bracket(a, b, s) => {
-                // `s` is in `(0, 1)` mathematically but can round **up** to `1.0` for a multi-day span (2e16 ns
-                // queried 1 ns short of its end); it cannot round to `0.0`. The kernel answers both by selecting
-                // an endpoint, as for a knot, so they share a bucket.
+                // `s` can round **up** to `1.0` (not to `0.0`); the kernel picks an endpoint for both, as for a knot.
                 let got = got.map_err(|e| anyhow!("engine declined a bracket at {t}: {e}"))?;
                 let want = match policy {
                     InterpPolicy::LerpSlerp => LerpSlerp::eval(&a, &b, s),
@@ -439,23 +380,15 @@ fn sweep_edge(
     Ok((counts, ChunkStats { fracs }))
 }
 
-/// The publish rate at which each recorded interval would fall inside the series region.
+/// The publish rate at which each recorded interval would fall in the series region: `f ≥ θ/(0.15·Δt)`.
 ///
-/// Both policies reduce to `θ ≤ 0.15 rad` (`LerpSlerp`: `θ² ≤ THETA_SLERP_SMALL²`; `ScLerp`:
-/// `sin²(θ) ≤ SIN_HALF_THETA_SMALL_SQ = sin(0.15)²`), so an interval of length `Δt` with endpoints
-/// `θ` apart is series for every `f ≥ θ/(0.15·Δt)`: its *series rate*.
-///
-/// **This is an extrapolation** assuming constant turn rate across the interval, as the interpolant
-/// does; publish rate is the variable the fraction is most sensitive to.
+/// An extrapolation assuming constant turn rate across the interval.
 struct SeriesRate {
-    /// Per interval, the publish rate above which it is series, in Hz; only intervals that rotate.
     hz: Vec<f64>,
-    /// Intervals whose endpoints are bit-identical rotations (`θ == 0`).
     motionless: usize,
     /// Intervals that are *large arc at the rate they were published at*, with the longest one's duration.
     large_arc: usize,
     longest_large_arc_s: f64,
-    /// The recording's own median interval, in Hz.
     actual_hz: f64,
 }
 
@@ -529,7 +462,6 @@ impl SeriesRate {
     }
 }
 
-/// Per-edge sample lists, in the stream's edge order.
 fn samples_by_edge(stream: &TfStream) -> Vec<Vec<(i64, Iso3)>> {
     let mut out = vec![Vec::new(); stream.dynamic_edges.len()];
     for s in &stream.samples {
@@ -572,8 +504,7 @@ fn report_stream(name: &str, stream: &TfStream, sweeps: &[Sweep]) -> Result<()> 
     Ok(())
 }
 
-/// Control 1: the synthetic fixture, whose 50–1000 Hz edges must read ~100%
-/// series.
+/// Control 1: the synthetic fixture, whose 50–1000 Hz edges must read ~100% series.
 fn control_fixture(sweeps: &[Sweep]) -> Result<()> {
     report_stream(
         "CONTROL fixture (expect ~100% series)",
@@ -582,8 +513,6 @@ fn control_fixture(sweeps: &[Sweep]) -> Result<()> {
     )
 }
 
-/// The fixture's dynamic history, as a [`TfStream`] so it goes through exactly
-/// the same path as the recording.
 fn fixture_stream() -> TfStream {
     let mut stream = TfStream::default();
     for (i, (p, c, rate)) in fixture::DYNAMIC_EDGES.iter().enumerate() {
@@ -606,22 +535,15 @@ fn fixture_stream() -> TfStream {
     stream
 }
 
-/// Control 2: one dynamic edge pushed the **same pose** every time, in two quaternion shapes; the
-/// two do not agree, which is the point.
+/// Control 2: one dynamic edge pushed the same pose every time, in two quaternion shapes.
 ///
-/// `LerpSlerp` reads a repeated pose as `h == 0` whatever the quaternion; this pins the all-fallback
-/// regime `0060` §5 measured the prototype losing 80% on.
+/// `LerpSlerp` reads it as `h == 0` whatever the quaternion (`0060` §5's all-fallback regime). `ScLerp` is
+/// degenerate only when `conj(q) ⊗ q` cancels exactly:
 ///
-/// `ScLerp` is degenerate only when `conj(q) ⊗ q`'s vector components cancel exactly:
-///
-/// - `axis`, the recorded wheel edges' shape (`w = z = 0`), cancels exactly: degenerate;
-/// - `generic`, all four components non-zero, keeps rounding (`sin²(θ/2) ≈ 5e-36`, far above
-///   `SCREW_DEGENERATE_SQ`), so a motionless edge lands in the **series region**.
-///
-/// That is not a defect (`screw_pow_is_accurate_down_to_the_degenerate_threshold`); "not moving" and
-/// "takes the degenerate arm" differ under `ScLerp` and coincide under `LerpSlerp`.
+/// - `axis`, the recorded wheel edges' shape (`w = z = 0`): degenerate;
+/// - `generic`, all four components non-zero: rounding keeps it in the **series region**
+///   (`screw_pow_is_accurate_down_to_the_degenerate_threshold`).
 fn control_stationary(sweeps: &[Sweep]) -> Result<()> {
-    // The recorded wheel edges' quaternion, w-first: a pure axis rotation with two zero components.
     let axis = Quat::new(0.0, 0.707_388_269_167_199_8, 0.706_825_181_105_366, 0.0);
     let repeated = |q: Quat| {
         let mut stream = TfStream::default();
@@ -658,7 +580,6 @@ fn control_jitter(sweeps: &[Sweep]) -> Result<()> {
         .dynamic_edges
         .push(("map".to_owned(), "base_link".to_owned()));
     for k in 0..2048i64 {
-        // A yaw of a few 1e-8 rad, alternating: below `SLERP_LERP_FALLBACK` (1e-6), above a repeated pose's `h == 0`.
         let yaw = 5e-8 * f64::from(i32::try_from(k % 3).unwrap_or(0));
         stream.samples.push(tf_tree_bench::replay::Sample {
             edge: 0,

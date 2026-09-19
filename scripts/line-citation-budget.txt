@@ -21,19 +21,3 @@
 # counted a triple backtick written inside an inline code span, and an odd
 # marker count inverts the pairing for the rest of a file — prose blanked, code
 # blocks scanned. The stripper is line-anchored now (`strip_fenced_blocks`).
-2	docs/changelog/0.0.5.md
-3	docs/PHASE3.md
-5	docs/PHASE4.md
-2	docs/PHASE5.md
-1	docs/RUNBOOK.md
-2	docs/benchmarks/tf2.md
-1	docs/decisions/0005-the-shared-memory-seam.md
-3	docs/decisions/0015-the-bridge-fills-a-shared-arena.md
-6	docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md
-3	docs/decisions/0020-the-consumer-side-of-the-arena-refusal.md
-1	docs/decisions/0026-the-corpus-shape-of-a-frozen-index.md
-1	docs/decisions/0030-the-atfork-handler-and-inherited-descriptors.md
-1	docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md
-12	docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md
-6	docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md
-1	testdata/frozen/README.md

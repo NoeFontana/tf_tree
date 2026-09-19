@@ -1,24 +1,6 @@
 #!/usr/bin/env bash
-# The CMake package, end to end — docs/PHASE4.md §4.4.
-#
-# Configure, build, install, then build a **separate downstream project** that
-# reaches tf_tree only through `find_package(tf_tree CONFIG)`. The consumer sets
-# no include path, links no system library and names no C++ standard: all three
-# have to arrive through the imported target's INTERFACE properties, which is
-# the entire claim §4.4 makes.
-#
-# Building the package alone would not test any of that. Three real defects here
-# were invisible until a consumer existed:
-#
-#   * `add_custom_target` without `ALL` — the imported targets are IMPORTED, so
-#     `add_dependencies` on them fires only when something in the same project
-#     links them, and nothing does. `cmake --build` built nothing and the
-#     install shipped three headers and no library.
-#   * `install(FILES ... )` guarded by `EXISTS` — evaluated at configure time,
-#     before cargo has run, so it was always false.
-#   * `configure_package_config_file` without `PATH_VARS` — `@PACKAGE_<var>@`
-#     is only rewritten for variables named there, so the shipped config had an
-#     empty include directory and failed in the *consumer*.
+# The CMake package, end to end (docs/PHASE4.md §4.4): install, then build a
+# separate downstream project that reaches tf_tree only via find_package.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../../.."   # workspace root
@@ -43,9 +25,7 @@ for f in include/tf_tree.h include/tf_tree.hpp include/tf_tree_unstable.h \
 done
 echo "  installed 6/6 expected artifacts"
 
-# The .so must carry a SONAME, or a consumer records the absolute build-time
-# path in DT_NEEDED and the prefix cannot be moved or packaged. A rustc cdylib
-# has none by default; the build passes `-Wl,-soname` for exactly this.
+# The .so must carry a SONAME so the prefix is relocatable.
 if command -v readelf >/dev/null; then
     if ! readelf -d "$WORK/prefix/lib/libtf_tree_c.so" | grep -q SONAME; then
         echo "  FAIL: the installed .so has no SONAME; the prefix is not relocatable" >&2
@@ -59,11 +39,7 @@ cmake -S "$ROOT/crates/tf_tree_c/tests/cmake_consumer" -B "$WORK/consumer" \
       -DCMAKE_PREFIX_PATH="$WORK/prefix" >>"$WORK/log" 2>&1
 cmake --build "$WORK/consumer" >>"$WORK/log" 2>&1
 "$WORK/consumer/consumer"
-# The consumer above links the STATIC target. Link the SHARED one too — they
-# are separate imported targets resolved by separate find_library calls, and
-# a config that gets one right can get the other wrong. It did: both calls
-# used `NAMES tf_tree_c`, which on Linux matches the .so first, so the
-# "static" target was a shared library wearing a static label.
+# The SHARED target is resolved by its own find_library call; link it too.
 echo "  downstream, shared target"
 sed 's/tf_tree::tf_tree_static/tf_tree::tf_tree/' \
     "$ROOT/crates/tf_tree_c/tests/cmake_consumer/CMakeLists.txt" >"$WORK/shared_CMakeLists.txt"
@@ -76,35 +52,9 @@ cmake --build "$WORK/shared_build" >>"$WORK/log" 2>&1
 LD_LIBRARY_PATH="$WORK/prefix/lib" "$WORK/shared_build/consumer"
 
 # --- TFT_HAVE_SHM, both branches --------------------------------------------
-#
-# `tf_tree.h` hides `tft_tree_open` behind `#if defined(TFT_HAVE_SHM)`, and the
-# package decides that macro by probing the resolved library with `nm`
-# (`crates/tf_tree_c/CMakeLists.txt`). Until this arm existed **no host recipe
-# exercised the probe's positive branch at all** — everything above takes the
-# source-build path, which is a plain `cargo build --release` with default
-# features, so `shm` is off and the answer is always 0. The only place the
-# `=1` case ran was `ros/build.sh`, in the container, where a failure surfaces
-# as a `#error` in a ctest two minutes into a colcon build.
-#
-# **The prebuilt directory is deliberately MIXED**, and that is what makes this
-# arm test the probe rather than test that a file was absent. The source-build
-# path cannot do it: `_tf_tree_static` there is a path under the build tree that
-# does not exist at configure time, so `tf_tree_probe_shm` returns at its
-# `NOT EXISTS` guard and `nm` is never run at all —
-#
-#     tf_tree: .../build/cargo/release/libtf_tree_c.a does not exist at
-#              configure time; TFT_HAVE_SHM off for it
-#
-# — so asserting 0 against that prefix pins "there was no library to look at",
-# not "nm looked and found no tft_tree_open". An earlier revision of this arm
-# did exactly that and claimed the stronger thing.
-#
-# One directory holding an **shm `.a` beside a default-features `.so`** fixes
-# both halves at once: `nm` runs on each, has to answer 1 for one and 0 for the
-# other, and the two answers must land on their own targets. That is also the
-# only shape that catches a regression to #142's reviewed defect — one probe
-# applied to both targets — which a directory built from a single `cargo build`
-# cannot see, because there both answers are 1 either way.
+# The package sets the macro by probing each library with `nm`. The prebuilt
+# directory is deliberately MIXED (shm .a beside a default-features .so), so the
+# probe must answer 1 and 0 on their own targets.
 echo "  TFT_HAVE_SHM: nm answers per artifact, on a mixed prebuilt"
 MIX=$WORK/mixed
 mkdir -p "$MIX"
@@ -118,9 +68,7 @@ cmake -S "$ROOT/crates/tf_tree_c" -B "$WORK/shm_build" \
       -DCMAKE_BUILD_TYPE=Release >>"$WORK/log" 2>&1
 cmake --install "$WORK/shm_build" >>"$WORK/log" 2>&1
 CFG=$WORK/shm_prefix/lib/cmake/tf_tree/tf_treeConfig.cmake
-# STATIC 1 and SHARED 0, from one directory: the `1` proves `nm` found the
-# symbol in a real archive, the `0` proves it *looked* and did not find it in a
-# real shared library, and the pair proves the answers are per artifact.
+# STATIC 1 and SHARED 0 from one directory: the answers are per artifact.
 for want in "TF_TREE_HAVE_SHM_STATIC 1" "TF_TREE_HAVE_SHM_SHARED 0"; do
     if ! grep -q "^set($want)" "$CFG"; then
         echo "  FAIL: expected 'set($want)' from the mixed prebuilt" >&2
@@ -130,24 +78,9 @@ for want in "TF_TREE_HAVE_SHM_STATIC 1" "TF_TREE_HAVE_SHM_SHARED 0"; do
     fi
 done
 
-# And the ordinary case, where both artifacts come from one build: both 1.
+# The ordinary case, both 1, in its own prefix: install(FILES) skips a
+# same-size copy, so reusing shm_prefix would re-read the mixed config.
 echo "  TFT_HAVE_SHM=1 from a --features bridge,shm prebuilt"
-#
-# **Its own prefix, and that is load-bearing rather than tidiness.** This block
-# used to install over `$WORK/shm_prefix`, the prefix the mixed build above had
-# just written, and `install(FILES)` skips a copy when the destination is not
-# older than the source *and* the sizes match. The two configs differ in exactly
-# one character — `set(TF_TREE_HAVE_SHM_SHARED 0)` against `... 1)` — so they
-# are the same size, and CMake printed `-- Up-to-date:` and copied nothing. The
-# loop below then re-read the *mixed* build's config and asserted `0` where it
-# wanted `1`.
-#
-# It failed by the clock rather than by the code: with enough elapsed time
-# between the two installs the source wins the timestamp comparison and the copy
-# happens, so this passed on a warm developer machine and failed on a cold CI
-# runner. Worse than the flake, while it was passing it was asserting against a
-# file this block had not produced, so it could not have caught a regression in
-# the probe it exists to check.
 cmake -S "$ROOT/crates/tf_tree_c" -B "$WORK/shm_build2" \
       -DTF_TREE_PREBUILT_DIR="$WORK/cargo-shm/release" \
       -DCMAKE_INSTALL_PREFIX="$WORK/shm_prefix2" \
@@ -162,9 +95,7 @@ for v in STATIC SHARED; do
     fi
 done
 
-# The macro has to reach a *consumer*, which is the whole point: it is an
-# INTERFACE property on the imported targets, and an earlier revision set it in
-# the build tree only, where no `find_package` consumer could ever see it.
+# The macro must reach a consumer as an INTERFACE property.
 mkdir -p "$WORK/shm_src"
 cat >"$WORK/shm_src/main.cpp" <<'EOF'
 #include <tf_tree.h>

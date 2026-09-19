@@ -1,14 +1,11 @@
-// Batch sampling: `at_many` with 1024 monotone stamps (`docs/PHASE1.md` §11.2
-// *Measurements* — reported as ns/sample). Monotone input lets each dynamic edge
-// gallop from a resumable cursor, so this is the O(1)-amortized path.
+// Batch sampling: `at_many` with 1024 monotone stamps (`docs/PHASE1.md` §11.2),
+// reported as ns/sample; each dynamic edge gallops from a resumable cursor.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     missing_docs,
-    // `at_many_recorded` prints one line on the path where it produces no rows.
-    // A group that skips silently reads exactly like one whose rows were never
-    // added, and these are the rows `docs/decisions/0060` §10.5 applies
-    // Decision A's stop rule to.
+    // Prints one line where it produces no rows, so a skip is not silent
+    // (`docs/decisions/0060` §10.5).
     clippy::print_stderr
 )]
 
@@ -48,19 +45,10 @@ fn at_many(c: &mut Criterion) {
         });
     });
 
-    // The layout kernels (`docs/decisions/0005` Milestone B). The comparison
-    // that matters is not kernel-vs-kernel but **kernel vs. the two-pass
-    // alternative** a consumer is otherwise forced into: evaluate into an
-    // `Iso3` buffer, then convert. `Iso3` is 56 B since `0042`, and `Mat4`
-    // (128 B) and `Affine32` (48 B) share neither its stride nor its element
-    // type, so for those two the second pass is not avoidable by any amount of
-    // care on the caller's side. **`Quat` is the exception and was not before**:
-    // it is now exactly `Iso3`'s bytes, so `into_quat_1024` below measures a
-    // two-pass alternative a caller is no longer forced into. The row is kept
-    // as the kernel's own cost; making the `Quat` kernel a copy is a separate
-    // change with its own measurement.
-    // Raw nanoseconds: `at_many_into` takes `&[i64]` so an FFI caller does not
-    // have to allocate a `Vec<Stamp>` to use it.
+    // The layout kernels (`docs/decisions/0005` Milestone B): compared against the
+    // two-pass alternative (evaluate into `Iso3`, then convert). `Quat` is exactly
+    // `Iso3`'s bytes since `0042`, so `into_quat_1024` is the kernel's own cost.
+    // Raw nanoseconds: `at_many_into` takes `&[i64]` so FFI callers need no `Vec<Stamp>`.
     let nanos: Vec<i64> = stamps.iter().map(|s| s.nanos()).collect();
     let mut mat = vec![0.0f64; N * Layout::Mat4.elems()];
     group.bench_function("into_mat4_1024", |b| {
@@ -80,14 +68,9 @@ fn at_many(c: &mut Criterion) {
         });
     });
 
-    // `Layout::QuatTwist` — the pose *and* its body twist, thirteen `f64` a row.
-    //
-    // It is the only layout here whose fold, sampler and monotone-cursor branch
-    // are all its own (`fold_batch_with_twist` / `sample_with_twist_from`), so it
-    // is the only one an A/B can regress without any row above noticing. The
-    // stamps are the same monotone 1024, so this row against `into_quat_1024` is
-    // what the derivatives cost: the same sampling work plus one adjoint per
-    // plan step, and no second bracket search.
+    // `Layout::QuatTwist`: pose and body twist, thirteen `f64` a row. Its fold,
+    // sampler and cursor branch are its own; against `into_quat_1024` it shows the
+    // cost of the derivatives.
     let mut qt = vec![0.0f64; N * Layout::QuatTwist.elems()];
     group.bench_function("into_quat_twist_1024", |b| {
         b.iter(|| {
@@ -116,9 +99,7 @@ fn at_many(c: &mut Criterion) {
         });
     });
 
-    // The alternative, measured rather than asserted: `at_many` into an `Iso3`
-    // buffer followed by a conversion pass. This is what every consumer that
-    // wants a matrix pays today.
+    // The alternative, measured: `at_many` into an `Iso3` buffer, then a conversion pass.
     group.bench_function("two_pass_mat4_1024", |b| {
         b.iter(|| {
             plan.at_many(&guard, black_box(&stamps), &mut out)
@@ -154,17 +135,10 @@ fn at_many(c: &mut Criterion) {
     group.finish();
 }
 
-/// Batches **smaller than one chunk**, which no campaign had ever run.
-///
-/// `docs/decisions/0060` Decision A folds a batch in chunks, so every row above
-/// — all of them 1024 stamps — measures the steady state and none of them
-/// measures the prologue. A chunked fold reserves and zeroes its lane buffers
-/// whether the batch fills them or not, so the cost a caller asking for **one**
-/// stamp pays is exactly the cost these rows exist to expose. Step 1's stop
-/// point is written against them: no chunk size goes to step 2 whose `N < 64`
+/// Batches smaller than one chunk (`docs/decisions/0060` Decision A): every row
+/// above is 1024 stamps and measures the steady state, not the chunked fold's
+/// prologue. Step 1's stop point: no chunk size goes to step 2 whose `N < 64`
 /// rows lose to the per-stamp fold by more than noise.
-///
-/// The plan and the stamps are the flagship's, so the only variable is `N`.
 fn at_many_small(c: &mut Criterion) {
     let tree = fixture::build_tree().expect("build fixture");
     let (_writers, _samples) = fixture::spin_up(&tree).expect("populate history");
@@ -178,9 +152,7 @@ fn at_many_small(c: &mut Criterion) {
     let lo = now - 100_000_000;
 
     let mut group = c.benchmark_group("at_many_small");
-    // Not `Throughput::Elements`: at N = 1 the per-batch cost *is* the answer,
-    // and dividing it by one element would hide that these rows are about the
-    // prologue rather than about the per-stamp rate.
+    // Not `Throughput::Elements`: at N = 1 the per-batch cost is the answer.
     for n in [1usize, 2, 3, 4, 8, 16, 63] {
         let stamps: Vec<Stamp> = (0..n)
             .map(|i| Stamp::from_nanos(lo + (now - lo) * i as i64 / n as i64))
@@ -212,29 +184,15 @@ fn at_many_small(c: &mut Criterion) {
     group.finish();
 }
 
-/// The plan and data shapes `docs/decisions/0060` step 2 owes: **one dynamic
-/// step**, stamps **off the publication grid**, and a **stationary** edge.
+/// The plan and data shapes `docs/decisions/0060` step 2 owes: one dynamic step,
+/// stamps off the publication grid, and a stationary edge.
 ///
-/// Every other group in this file runs the 3-step fixture plan on 1024 stamps
-/// that are neither deliberately on nor deliberately off its 50–1000 Hz grids.
-/// Three things that changes hide:
-///
-/// * **One dynamic step** is the shape the audited plan was first scoped to and
-///   the shape `py_parity`'s batch actually has. It is also the shape with the
-///   least arithmetic per stamp to amortise a chunk's bookkeeping over, so if
-///   the chunked fold has a plan shape it loses on, this is it.
-/// * **On the grid** every bracket is an exact stamp hit and `Interp::eval`
-///   never runs at all; **off it** every bracket interpolates. The two are
-///   different code paths through the same fold, and a change that moved work
-///   between them would be invisible to a row that mixes them.
-/// * **A stationary edge** is §5's all-fallback regime and — since step 0a —
-///   the regime *four of the five* dynamic edges of the one real recording in
-///   this tree are in for its whole duration. `py_parity`'s rows are in it too.
-///
-/// The two policies are kept apart because they disagree here: `LerpSlerp`
-/// reads a motionless edge as `h == 0` and `ScLerp` reads it as a degenerate
-/// screw, and §9.3 measured that the second of those happens by luck rather
-/// than by construction.
+/// * One dynamic step has the least arithmetic per stamp to amortise a chunk's
+///   bookkeeping, and is `py_parity`'s batch shape.
+/// * On the grid every bracket is an exact hit and `Interp::eval` never runs; off
+///   it every bracket interpolates: different code paths.
+/// * A stationary edge is §5's all-fallback regime, which `LerpSlerp` reads as
+///   `h == 0` and `ScLerp` as a degenerate screw (§9.3), so the policies are kept apart.
 fn at_many_shapes(c: &mut Criterion) {
     /// Samples per edge, and the stamp spacing.
     const SAMPLES: usize = 2048;
@@ -262,8 +220,7 @@ fn at_many_shapes(c: &mut Criterion) {
         {
             let w = tree.claim(base, map).expect("claim");
             for i in 0..SAMPLES as i64 {
-                // Moving: a smooth screw. Stationary: literally one pose,
-                // republished — which is what a `/tf` wheel-link edge does.
+                // Moving: a smooth screw. Stationary: one pose, republished.
                 let f = if moving { i as f64 } else { 1.0 };
                 w.push(
                     i * DT,
@@ -282,8 +239,7 @@ fn at_many_shapes(c: &mut Criterion) {
         let plan = tree.plan(base, map).expect("plan");
         let guard = tree.guard();
 
-        // On the grid: every query is an exact published stamp, so no bracket
-        // interpolates. Off it: every query falls strictly inside a segment.
+        // On the grid: every query is an exact hit. Off it: strictly inside a segment.
         let step = (SAMPLES as i64 - 2) / N as i64;
         let on: Vec<Stamp> = (0..N)
             .map(|i| Stamp::from_nanos(i as i64 * step * DT))
@@ -326,32 +282,19 @@ fn at_many_shapes(c: &mut Criterion) {
     group.finish();
 }
 
-/// The same two entry points over a **recorded** `/tf` stream.
+/// The same two entry points over a recorded `/tf` stream (`docs/decisions/0060`
+/// §9): on the one real recording in the tree, four of five dynamic edges never
+/// move, and Decision A's stop rule applies to this data.
 ///
-/// Every other row in this file runs on the synthetic fixture, whose four
-/// dynamic edges publish at 50–1000 Hz on a smooth analytic screw. Step 0a
-/// measured what that costs in realism (`docs/decisions/0060` §9): on the one
-/// real recording in the tree, **four of five dynamic edges never move at all**
-/// and the fifth is 99.2% series per bracket. Decision A's stop rule is applied
-/// to *this* data, not to the fixture's, so the rows have to exist.
-///
-/// Two plans, chosen for what they cross rather than for their depth:
-///
-/// - `laser → odom_combined` is one static step and the one **moving** dynamic
-///   edge;
-/// - `left_wheel_link → odom_combined` adds a second dynamic step that is
-///   motionless for the whole recording — §9.1's regime, and the mix a real
-///   consumer gets rather than the one a fixture arranges.
+/// - `laser → odom_combined`: one static step and the one moving dynamic edge;
+/// - `left_wheel_link → odom_combined`: adds a motionless dynamic step (§9.1).
 fn at_many_recorded(c: &mut Criterion) {
     let path = std::path::Path::new("testdata/tfstream/indoor_atelier.tfstream");
     let stream = match TfStream::load(path) {
         Ok(s) => s,
         Err(e) => {
-            // The bench runs from the workspace root; a caller who runs the
-            // binary from elsewhere gets the other groups rather than a panic.
-            // **Said out loud**, because a group that silently produces no rows
-            // reads exactly like one whose rows were never added, and these are
-            // the rows `0060` §10.5 applies Decision A's stop rule to.
+            // Run from the workspace root; elsewhere the other groups run, and
+            // this prints instead of silently producing no rows (`0060` §10.5).
             eprintln!(
                 "at_many_recorded: SKIPPED — {} unreadable: {e}",
                 path.display()
@@ -364,8 +307,7 @@ fn at_many_recorded(c: &mut Criterion) {
         .expect("replay tree");
     let (lo, hi) = stream.common_window().expect("common window");
 
-    // 1024 monotone stamps across the window, offset 1 ns so none lands on a
-    // knot — §9's `rate` sweep, which is the consumer shape.
+    // 1024 monotone stamps, offset 1 ns so none lands on a knot (§9's `rate` sweep).
     let stamps: Vec<Stamp> = (0..N)
         .map(|i| Stamp::from_nanos(lo + 1 + (hi - lo - 2) * i as i64 / N as i64))
         .collect();

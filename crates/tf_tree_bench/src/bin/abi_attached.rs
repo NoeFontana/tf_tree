@@ -1,38 +1,25 @@
-//! Is the C ABI's +101 ns on a shared arena the ABI or the C++ caller?
-//! (`docs/benchmarks/tf2.md`: C++ 302 ns against native Rust 200.6.)
+//! Is the C ABI's +101 ns on a shared arena the ABI or the C++ caller (`docs/benchmarks/tf2.md`)?
 //!
-//! This binary calls `tft_plan_at` from Rust on the same arena and stamps under two
-//! profiles:
+//! Calls `tft_plan_at` from Rust on the same arena and stamps, under two profiles:
 //!
 //! | profile | native Rust | Rust -> ABI | C++ -> ABI |
 //! |---|---|---|---|
 //! | `release` (`lto = "thin"`) | 200.5 | 225.8 (+25) | 302.0 |
 //! | **`embedder` (`lto = false`)** | 241.3 | **298.4 (+57)** | **302.0 (+61)** |
 //!
-//! A Rust and a C++ caller agree to within 4 ns at a real boundary: the cost is the
-//! boundary, not the language. `abi_cost` sees only +2.3 ns because thin LTO inlines
-//! `tft_plan_at` into its Rust caller, which makes `PHASE4` §7 gate criterion 1
-//! unmeasurable in its own build (`report.rs`'s §9.2 embedding row says the same).
 //!
-//! The arms also decompose the per-call `Guard` (`0022` amendment 3) at
-//! `[profile.embedder]`: `fork::generation()` +0.2 ns, `Tree::view()` +3.7,
-//! `Guard::new` +4.8, the rest of `Tree::guard` +6.7 (15.1 isolated build+drop, ~22 on
-//! `Plan::at`'s critical path, arm `E`), the cold cursor ~4.8 (arm `B` - `A`), and
-//! ~16 ns left unattributed on purpose. `#[inline]` on `Tree::guard` and halving
-//! `MAX_DEPTH` moved nothing.
-//!
-//! Needs an arena served by `native_arena --name <n>`; run it through
-//! `just abi-attached`.
+//! A Rust and a C++ caller agree to within 4 ns at a real boundary, so the cost is the boundary, not the
+//! language; `abi_cost` sees +2.3 ns only because thin LTO inlines `tft_plan_at` (`PHASE4` §7 gate criterion 1).
+//! The arms also decompose the per-call `Guard` (`0022` amendment 3). Needs an arena served by
+//! `native_arena --name <n>`; run it through `just abi-attached`.
 
 #![allow(clippy::print_stdout)]
-// `docs/decisions/0007` rule 1, kind 5 (our own C ABI, called from Rust to measure it),
-// per `0048`; a bin is a separate crate root.
+// `docs/decisions/0007` rule 1, kind 5 (our own C ABI), per `0048`; a bin is a separate crate root.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// SAFETY (module invariant): every `unsafe` block calls a `tft_*` entry point of
-// `tf_tree_c` on a handle this process created and has not freed, from its creating
-// thread (the documented affinity). The two arms attach independently.
+// SAFETY (module invariant): every `unsafe` block calls a `tft_*` entry point on a handle this process created
+// and has not freed, from its creating thread (the documented affinity).
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -49,14 +36,13 @@ const SWEEPS: usize = 40;
 const ROUNDS: usize = 9;
 const WARMUP: usize = 60_000;
 
-/// Byte-identical to `backing::stamp_ns` and `ratio::stamp_ns`: off every dynamic grid (`0013`).
+/// Byte-identical to `backing::stamp_ns`: off every dynamic grid (`0013`).
 fn stamp_ns(i: i64) -> i64 {
     tf_tree_bench::fixture::NOW_NS - 3_700_000 - i * 9_631
 }
 
 fn main() -> Result<()> {
-    // The profile is measured (`build.rs` + `embed::lto_for_profile_dir`), not asserted
-    // by the caller; `--boundary-real` is a claim that is checked against it.
+    // The profile is measured (`embed::lto_for_profile_dir`); `--boundary-real` is checked against it.
     let mut name = "abi_attached".to_owned();
     let mut claimed_real = false;
     for a in std::env::args().skip(1) {
@@ -72,7 +58,6 @@ fn main() -> Result<()> {
     .context("reading the workspace manifest to find out what profile this binary is")?;
     let lto =
         tf_tree_bench::embed::lto_for_profile_dir(&manifest, tf_tree_bench::embed::PROFILE_DIR);
-    // Anything but a declared `false` leaves LTO able to inline across the boundary.
     let boundary_real = lto.starts_with("false");
     if claimed_real != boundary_real {
         bail!(
@@ -89,7 +74,6 @@ fn main() -> Result<()> {
         );
     }
 
-    // --- the Rust arm: attach through the facade, hoist a guard -------------
     let tree = Open::new()
         .name(&name)
         .map_err(|e| anyhow!("`{name}` is not a usable arena name: {e:?}"))?
@@ -107,8 +91,6 @@ fn main() -> Result<()> {
         .plan(t, s)
         .map_err(|e| anyhow!("compiling {SOURCE} <- {TARGET}: {e:?}"))?;
 
-    // --- the ABI arm: attach again, through the C entry points --------------
-    // A second attach of the same segment via `TF_TREE_NAME`/`TF_TREE_RUNTIME_DIR`.
     let mut ctree = core::ptr::null_mut();
     // SAFETY: `out` is a writable pointer to a null-initialised handle slot.
     let rc = unsafe { tft_tree_open(&mut ctree) };
@@ -127,8 +109,6 @@ fn main() -> Result<()> {
     let raw: Vec<i64> = (0..STAMPS as i64).map(stamp_ns).collect();
     let stamps: Vec<Stamp<SystemDomain>> = raw.iter().map(|&n| Stamp::from_nanos(n)).collect();
 
-    // Agreement before timing: an arm answering a different question would move
-    // the gap and nothing in the timing would say so.
     let guard = tree.guard();
     let mut out = [0.0f64; 7];
     for (i, &st) in stamps.iter().enumerate() {
@@ -186,10 +166,6 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // --- the rungs between them ------------------------------------------
-    // The rungs `abi_cost` prices at ~3 ns under thin LTO; `0022` question 5 leaves ~35 ns open.
-
-    // 1. The guard, per call — what the C signature cannot hoist.
     let sweep_guard = || {
         let mut acc = 0.0f64;
         for _ in 0..SWEEPS {
@@ -203,7 +179,6 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // 2. The same, plus the 56-byte `QVEC7_WXYZ` store a native caller never makes.
     let mut wbuf = [0.0f64; 7];
     let mut sweep_write = || {
         let mut acc = 0.0f64;
@@ -219,8 +194,7 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // 3. The ABI's own body without `catch_unwind`, so the panic guard is a
-    //    subtraction on a real, non-inlinable call.
+    // 3. The ABI's own body without `catch_unwind`, so the panic guard is a subtraction.
     let mut ubuf = [0.0f64; 7];
     let mut sweep_unguarded = || {
         let mut acc = 0.0f64;
@@ -243,10 +217,6 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // Decomposing rung 1: (a) building and dropping a `Guard`, and (b) what a fresh
-    // guard does to `Plan::at` (its cursor starts cold at every step). Arms: `empty`
-    // (loop), `forkgen` (`fork::generation`), `view` (`Tree::view`), `gnew`
-    // (`Guard::new`), `gfull` (`Tree::guard()`); each carries the same `black_box(n)` fold.
     let sweep_empty = || {
         let mut acc = 0u64;
         for _ in 0..SWEEPS {
@@ -299,10 +269,7 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // The cursor residue is tested by varying visit order (stamps walk monotonically
-    // backwards; a fixed odd-stride permutation leaves the cursor cold). 2x2:
-    // hoisted/per-call x in-order/shuffled = A B / C D. All arms walk an index slice
-    // so the indirection cancels.
+    // The cursor residue: monotone-backwards vs shuffled visit order; 2x2 hoisted/per-call x in-order/shuffled.
     let idx_seq: Vec<usize> = (0..STAMPS).collect();
     let idx_shuf: Vec<usize> = (0..STAMPS).map(|i| (i * 97 + 13) % STAMPS).collect();
     debug_assert_eq!(
@@ -337,8 +304,7 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // Arm `E`: build a guard per call, `black_box` it, evaluate through the hoisted one.
-    // `E - A` is the guard object on the critical path; `C - E` is using a fresh one.
+    // Arm `E`: a guard built per call and `black_box`ed; `E - A` is the guard on the critical path.
     let sweep_build_only = || {
         let mut acc = 0.0f64;
         for _ in 0..SWEEPS {
@@ -404,7 +370,6 @@ fn main() -> Result<()> {
         };
         r_ns.push(a);
         a_ns.push(b);
-        // Intermediate rungs only appear as differences, so fixed order is harmless.
         let t = std::time::Instant::now();
         let _ = sweep_guard();
         g_ns.push(t.elapsed().as_nanos() as f64 / per_round);
@@ -414,7 +379,6 @@ fn main() -> Result<()> {
         let t = std::time::Instant::now();
         let _ = sweep_unguarded();
         u_ns.push(t.elapsed().as_nanos() as f64 / per_round);
-        // The five decomposition arms, same fixed-order argument as above.
         let t = std::time::Instant::now();
         let _ = sweep_empty();
         e_ns.push(t.elapsed().as_nanos() as f64 / per_round);
@@ -430,7 +394,6 @@ fn main() -> Result<()> {
         let t = std::time::Instant::now();
         let _ = sweep_gfull();
         gf_ns.push(t.elapsed().as_nanos() as f64 / per_round);
-        // The 2x2, in A B C D order every round.
         let t = std::time::Instant::now();
         let _ = sweep_hoist_ix(&idx_seq);
         cell_ns[0].push(t.elapsed().as_nanos() as f64 / per_round);
@@ -570,7 +533,6 @@ fn main() -> Result<()> {
         cell[2] - build_only
     );
     println!();
-    // The profile travels with the numbers (`docs/PHASE4.md` §0.0).
     println!(
         "  build: target/{}/  (the workspace manifest declares lto = {lto} for it)",
         tf_tree_bench::embed::PROFILE_DIR

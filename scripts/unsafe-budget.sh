@@ -2,31 +2,23 @@
 # Every file carrying `unsafe` is one `docs/decisions/0007` rule 1 authorises
 # (`just unsafe-budget`; see also `0048`).
 #
-# Pins a FILE SET under `crates/` and `xtask/`: a new file cannot start carrying
-# `unsafe` without a register row, and a row cannot outlive its file. The census
-# uses `RUSTFLAGS="--force-warn unsafe_code"` (overrides `forbid`), whose output
-# carries no kind, so the register's `kind` column is human bookkeeping. The
-# feature matrix is read out of the justfile's one-line `cargo clippy ...
-# --all-targets` passes so it cannot drift; `continuation_blind_spots` reports a
-# pass the extractor cannot see.
+# Pins a FILE SET under `crates/` and `xtask/`: a new file cannot carry `unsafe`
+# without a register row, and a row cannot outlive its file. The census uses
+# `RUSTFLAGS="--force-warn unsafe_code"`; the `kind` column is human bookkeeping.
+# The feature matrix is read from the justfile's one-line clippy passes.
 #
 # ## What it does NOT prove
 #
-# * Anything about kinds: a kind-2 file acquiring a kind-4 block stays green.
-# * `crates/tf_tree_py` and `crates/tf_tree_tf2_sys` (outside the workspace; rows
-#   are `out-of-reach`; covered by `just py-compile` and `just tf2-check`).
-# * Paths outside `crates/` and `xtask/`.
+# * Kinds: a kind-2 file acquiring a kind-4 block stays green.
+# * `crates/tf_tree_py` and `crates/tf_tree_tf2_sys` (`out-of-reach` rows; see
+#   `just py-compile` and `just tf2-check`), or paths outside `crates/` and `xtask/`.
 # * Feature combinations no justfile clippy line builds.
-# * `// SAFETY:` comments or module blocks (0007 rules 3-4). Clippy's
-#   `undocumented_unsafe_blocks` (deny) checks placement only, and only on code
-#   some clippy line compiles; whether a comment names its invariant is review.
+# * `// SAFETY:` comments or module blocks (0007 rules 3-4): review, not this script.
 #
 # ## The empty-subject question
 #
-# A collapsed census (wrong feature set, renamed recipe, filter typo) makes
-# `census - register` empty and a naive comparison green, so both floors run
-# before any comparison and an empty census FAILS. `--self-test` drives the
-# comparison over synthetic inputs.
+# A collapsed census would make `census - register` empty and green, so an empty
+# census FAILS before any comparison. `--self-test` drives synthetic inputs.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -69,10 +61,8 @@ compare() {
     [ "$bad" -eq 0 ]
 }
 
-# The matrix is extracted line by line, so a pass whose `--all-targets` sits past
-# a `\` continuation would silently contribute nothing. This reports, by name, a
-# clippy pass whose joined form carries `--all-targets` and whose physical line
-# does not (and which no exclusion would drop). `$1` = justfile; returns 1 if any.
+# A clippy pass whose `--all-targets` sits past a `\` continuation would
+# contribute nothing; report it by name. `$1` = justfile; returns 1 if any.
 continuation_blind_spots() {
     awk '
         { sub(/#.*/, "") }

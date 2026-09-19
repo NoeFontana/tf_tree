@@ -1,29 +1,9 @@
-//! Serve the §11.1 fixture from a **named, rendezvous-discoverable** arena and
-//! dump the identical sample stream, so a C++ process can measure both engines
-//! with no Rust binding on either side.
+//! Serve the §11.1 fixture from a named, rendezvous-discoverable arena and dump
+//! the identical sample stream, so one C++ process can measure both engines
+//! (`docs/benchmarks/tf2.md`, `PHASE4.md` §7 gate 1, `just abi-split`).
 //!
-//! # Why this binary exists
-//!
-//! `docs/benchmarks/tf2.md` prices four measurement biases; the one an in-process
-//! Rust harness cannot remove is the FFI boundary between `tf_tree_tf2_sys` and
-//! `tf2::BufferCore`, charged to tf2 so every such ratio *flatters* `tf_tree`
-//! (figure in that document's bracket table). Putting both engines in one **C++**
-//! process (tf2 natively, `tf_tree` through its C ABI) charges the residual to
-//! *us*, so the ratio is a lower bound. `PHASE4.md` §7 gate 1 and `tf2.md` state
-//! the bracket; `just abi-split` ([`tf_tree_bench::backing`]) splits the C++ cost:
-//! the mapping, read-only attach and linkage are near zero and the remainder is the
-//! C ABI's per-call `Guard` (`tft_plan_at_many` amortises it per batch).
-//!
-//! **Both arms must be in one process**: interleaving within a round is what makes
-//! the ratio resolvable on a host whose absolute latencies are unusable.
-//!
-//! # Why a separate process from the C++ one
-//!
-//! `tft_tree_open` **attaches**, it cannot create (D18: a C ABI consumer joins
-//! read-only and the MMU protects the tree). `Tree::build_shared` segments are
-//! "not discoverable by name", so a non-child cannot find one. The rendezvous
-//! (`Open` with [`CreatePolicy::IfAbsent`]) is the discoverable path and this
-//! binary is the owner that serves it.
+//! The C++ side only attaches (`tft_tree_open`, D18), so this binary owns the
+//! arena through the rendezvous (`Open` with [`CreatePolicy::IfAbsent`]).
 //!
 //! # Usage
 //!
@@ -69,9 +49,8 @@ fn layout() -> TreeBuilder {
 /// D <parent> <child> <stamp_ns> qw qx qy qz tx ty tz
 /// ```
 ///
-/// **This loop must stay identical to `fixture::spin_up`'s and
-/// `Tf2Fixture::load`'s**, including the `dyn_seed` increment, or the engines are
-/// compared on different data.
+/// This loop must stay identical to `fixture::spin_up`'s and `Tf2Fixture::load`'s,
+/// including the `dyn_seed` increment.
 fn dump_stream(path: &PathBuf) -> Result<usize> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -110,8 +89,7 @@ fn dump_stream(path: &PathBuf) -> Result<usize> {
     Ok(wrote)
 }
 
-/// `qw qx qy qz tx ty tz` at full `f64` precision (`{:.17e}`): the C++ side
-/// checks agreement to 1e-9, which a shortened decimal would spend.
+/// `qw qx qy qz tx ty tz` at full `f64` precision; the C++ side checks 1e-9.
 fn pose(p: &Iso3) -> String {
     format!(
         "{:.17e} {:.17e} {:.17e} {:.17e} {:.17e} {:.17e} {:.17e}",
@@ -128,9 +106,7 @@ fn main() -> Result<()> {
         match a.as_str() {
             "--name" => name = args.next().context("--name wants a value")?,
             "--stream" => stream = PathBuf::from(args.next().context("--stream wants a value")?),
-            // Write the `.tfstream` and exit, serving no arena: `native_footprint.cpp`
-            // needs the data only, and `dump_stream` regenerates poses from
-            // `fixture::dynamic_pose` without reading the tree.
+            // Write the `.tfstream` and exit, serving no arena.
             "--dump-only" => dump_only = true,
             other => anyhow::bail!("unknown argument `{other}`"),
         }
@@ -142,7 +118,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `require_create(true)`: an already-served arena would be somebody else's data.
+    // An already-served arena would be somebody else's data.
     let tree = Open::new()
         .name(&name)?
         .mode(AttachMode::ReadWrite)
@@ -158,8 +134,7 @@ fn main() -> Result<()> {
     println!("ready {name} {} {}", stream.display(), wrote);
     std::io::stdout().flush()?;
 
-    // Hold the arena (and the writers' claims) until stdin closes; dropping `tree`
-    // unmaps the segment and the C++ side would fault.
+    // Hold the arena until stdin closes; dropping `tree` would fault the C++ side.
     let mut sink = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut sink);
     drop(writers);

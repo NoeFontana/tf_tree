@@ -1,7 +1,5 @@
-// `docs/PHASE4.md` §5.3 and §5.4 — publisher attribution and the diagnostic it
-// enables. The Rust half is tested in `crates/tf_tree_bridge` and
-// `crates/tf_tree_c/tests/bridge.rs`; what only a real RMW can show is that
-// `publisher_gid` and `endpoint_gid()` are the same 16 bytes.
+// `docs/PHASE4.md` §5.3 and §5.4: publisher attribution. The Rust half is in
+// `crates/tf_tree_bridge`; here, that `publisher_gid` equals `endpoint_gid()`.
 
 #include <atomic>
 #include <chrono>
@@ -43,8 +41,7 @@ tf2_msgs::msg::TFMessage message_at(int64_t stamp_ns)
   return msg;
 }
 
-/// One monotonically increasing stamp source for every broadcaster in the
-/// process. 10 ms apart, comfortably inside §5.5's 100 ms reset threshold.
+/// One increasing stamp source, 10 ms apart (inside §5.5's reset threshold).
 int64_t next_stamp()
 {
   static std::atomic<int64_t> stamp{1'000'000'000};
@@ -64,11 +61,8 @@ bool wait_for(F predicate, std::chrono::milliseconds timeout)
   return predicate();
 }
 
-/// A node that publishes one transform repeatedly until told to stop.
-///
-/// Repeating rather than publishing once: DDS discovery is not instant and a
-/// single publish into an undiscovered subscription is simply lost, so a
-/// one-shot version of this test would be measuring discovery latency.
+/// Publishes one transform repeatedly: a single publish into an undiscovered
+/// subscription is lost.
 class Broadcaster
 {
 public:
@@ -79,9 +73,7 @@ public:
   {
   }
 
-  /// Publish with a stamp from a clock shared by every broadcaster, so the only
-  /// reason to drop is §5.4's authority (a per-broadcaster stamp is refused as
-  /// non-monotonic, §5.5, first).
+  /// Stamps come from one shared clock so only §5.4's authority can drop.
   void publish_once() {pub_->publish(message_at(next_stamp()));}
 
   std::string qualified_name() const
@@ -107,14 +99,8 @@ tf_tree_ros::BridgeOptions options_on(const std::string & topic)
   return o;
 }
 
-/// Two publishers on one edge: `FirstWriterWins` keeps the first, and the
-/// diagnostic names **both** nodes and the edge (§5.4, §6.3). One test because a
-/// lookup that always missed would see one publisher and never detect a conflict.
-///
-/// Mutant A: `continue` before `tft_bridge_attribute` in
-/// `BridgeHandle::attribute_from_graph`; `dropped_authority` never moves.
-/// Mutant B: delete the `conflict_` assignment in `BridgeHandle::report`'s
-/// `NOT_THE_OWNER` branch; `observed` stays false.
+/// `FirstWriterWins` drops the second publisher on an edge and the diagnostic
+/// names both nodes and the edge (§5.4, §6.3).
 TEST(Attribution, a_second_publisher_on_one_edge_is_dropped_and_both_nodes_are_named)
 {
   const std::string topic = "/tf_authority";
@@ -131,8 +117,7 @@ TEST(Attribution, a_second_publisher_on_one_edge_is_dropped_and_both_nodes_are_n
       },
       20s)) << "the first publisher never reached the arena";
 
-  // Only now does the second one appear, so which of them wins is determined
-  // rather than raced.
+  // The second appears only now, so the winner is determined.
   Broadcaster intruder("impostor_ekf", topic);
   ASSERT_TRUE(
     wait_for(
@@ -147,8 +132,7 @@ TEST(Attribution, a_second_publisher_on_one_edge_is_dropped_and_both_nodes_are_n
             << " dropped_non_monotonic=" << bridge.stats().dropped_non_monotonic
             << " dropped_undeclared=" << bridge.stats().dropped_undeclared;
 
-  // The record settles once the intruder's GID is walked; an early conflict may
-  // legitimately name `<unknown publisher>` (§5.3). There is no periodic refresh.
+  // An early conflict may name `<unknown publisher>` (§5.3); wait for it to settle.
   const std::string want_owner = owner.qualified_name();
   const std::string want_intruder = intruder.qualified_name();
   ASSERT_TRUE(

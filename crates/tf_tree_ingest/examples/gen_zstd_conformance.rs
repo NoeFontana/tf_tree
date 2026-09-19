@@ -1,20 +1,12 @@
-//! Regenerate `testdata/zstd_conformance.mcap`: an MCAP whose chunk payloads are
-//! compressed by the real `zstd` CLI (libzstd), so `tests/ingest.rs`'s
-//! `a_real_libzstd_recording_ingests` checks conformance and not just an
-//! `ruzstd` round-trip.
+//! Regenerate `testdata/zstd_conformance.mcap`: chunk payloads compressed by the
+//! real `zstd` CLI, for `tests/ingest.rs`'s `a_real_libzstd_recording_ingests`.
 //!
-//! An example, not a test: it shells out to `zstd`, which no gate may depend on.
-//! Run it only when `fixture::conformance_recording` changes:
+//! An example, not a test: no gate may depend on `zstd`. Run it when
+//! `fixture::conformance_recording` changes:
 //!
 //! ```text
 //! cargo run -p tf_tree_ingest --features fixture --example gen_zstd_conformance
 //! ```
-//!
-//! The MCAP framing is ours: this walks `fixture::chunked_mcap_bytes`' records,
-//! replaces each chunk's records field with `zstd`'s output and rewrites
-//! `compression` and `compressed_size`. `uncompressed_size` and
-//! `uncompressed_crc` are carried across untouched, so the chunk CRC checks
-//! libzstd's output against our hash of its input.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -23,13 +15,10 @@ use tf_tree_ingest::fixture::{
     chunked_mcap_bytes, conformance_recording, ChunkedSpec, CONFORMANCE_MESSAGES_PER_CHUNK,
 };
 
-/// MCAP's `Chunk` opcode.
 const OP_CHUNK: u8 = 0x06;
 /// A record's framing: `opcode: u8` then `len: u64` little-endian.
 const RECORD_HEADER: usize = 1 + 8;
-/// Bytes of a chunk body before the `compression` string's length prefix:
-/// `message_start_time`, `message_end_time`, `uncompressed_size`,
-/// `uncompressed_crc`.
+/// Bytes of a chunk body before the `compression` string's length prefix.
 const CHUNK_FIXED: usize = 8 + 8 + 8 + 4;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     out.extend_from_slice(&plain[plain.len() - magic..]);
 
-    // No chunk means a fixture that conforms to nothing, invisibly.
+    // No chunk means a fixture that conforms to nothing.
     if chunks == 0 {
         return Err("the corpus produced no chunk records; nothing was compressed".into());
     }
@@ -69,7 +58,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/zstd_conformance.mcap");
     std::fs::write(&path, &out)?;
-    // A hand-run generator must say what it wrote.
     #[allow(clippy::print_stdout)]
     {
         println!(
@@ -83,9 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Replace one chunk body's records field with libzstd's compression of it.
-/// The first four header fields are copied as one slice, so `uncompressed_size`
-/// and `uncompressed_crc` carry across by construction.
 fn recompress_chunk(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let name_len = usize::try_from(u32::from_le_bytes(
         body[CHUNK_FIXED..CHUNK_FIXED + 4].try_into()?,
@@ -108,11 +93,8 @@ fn recompress_chunk(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
     Ok(out)
 }
 
-/// Pipe `bytes` through the host's `zstd -19` (more of the format than the default).
-///
-/// `--no-check` omits zstd's content checksum: `decompress` verifies none, and the
-/// chunk CRC32 is the check that runs. The write runs on its own thread so
-/// something always drains stdout; a single-threaded write deadlocks on large input.
+/// Pipe `bytes` through the host's `zstd -19 --no-check` (the chunk CRC32 is the
+/// check that runs). The write is on its own thread so stdout is always drained.
 fn zstd_compress(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut child = Command::new("zstd")
         .args(["-19", "--no-check", "-c", "-q"])
@@ -121,11 +103,10 @@ fn zstd_compress(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .spawn()
         .map_err(|e| format!("could not run the `zstd` CLI, which this generator needs: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("the zstd child has no stdin")?;
-    // Owned by the thread so the child sees EOF even if the write fails.
     let input = bytes.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&input));
     let done = child.wait_with_output()?;
-    // Joined after exit so an early-closing `zstd` reports its exit status, not `BrokenPipe`.
+    // Joined after exit so an early-closing `zstd` reports its exit status.
     let wrote = writer
         .join()
         .map_err(|_| "the stdin writer thread panicked")?;

@@ -1,19 +1,12 @@
 // Both engines in one C++ process, with no Rust binding on either arm.
 //
 // `crates/tf_tree_bench/src/ratio.rs` measures the same quotient with tf2 behind
-// `tf_tree_tf2_sys`, which charges tf2 the FFI boundary and flatters `tf_tree`.
-// Here tf2 is native (`BufferCore::lookupTransform` called directly) and tf_tree
-// goes through its C ABI, linked as a shared library, so the ratio is a lower
-// bound. Neither this ratio nor the Rust one is "the" answer; they bracket it
-// (`docs/benchmarks/tf2.md`). The residual C ABI cost is measured by
-// `just abi-split` (`crates/tf_tree_bench/src/backing.rs`).
+// `tf_tree_tf2_sys`. Here tf2 is native and tf_tree goes through its C ABI, so the ratio is a
+// lower bound; the two bracket the answer (`docs/benchmarks/tf2.md`, `just abi-split`).
 //
-// Both arms share one process: they are interleaved within every round and the
-// leading arm alternates, so drift common to both divides out of each quotient.
-//
-// `tft_tree_open` attaches and cannot create (D18). `native_arena` is the Rust
-// owner that serves the arena and dumps the `.tfstream` this program feeds to
-// tf2, so both engines hold the same data.
+// Arms are interleaved within every round and the leading arm alternates, so common drift
+// divides out. `tft_tree_open` attaches and cannot create (D18): `native_arena` serves the
+// arena and dumps the `.tfstream` fed to tf2, so both engines hold the same data.
 
 
 #include <tf2/buffer_core.hpp>
@@ -48,7 +41,7 @@ struct Stream {
   std::vector<Sample> dynamics;
 };
 
-// The same parser `native_scaling.cpp` uses, on the same format.
+// The same parser `native_scaling.cpp` uses.
 Stream load(const std::string &path) {
   Stream s;
   std::ifstream in(path);
@@ -90,7 +83,7 @@ geometry_msgs::msg::TransformStamped to_msg(const Sample &x) {
 // Stored once: a literal past the 15-byte SSO limit would allocate per call.
 const std::string kAuthority = "tf_tree_native_ratio";
 
-// `tft_last_error` fills a caller-owned struct; the ABI holds no global string.
+// `tft_last_error` fills a caller-owned struct.
 const char *last_error() {
   static tft_error e;
   if (tft_last_error(&e) != TFT_OK) return "(no error recorded)";
@@ -103,12 +96,9 @@ double median(std::vector<double> v) {
   return v[v.size() / 2];
 }
 
-// max(rotation-angle error in rad, translation error in m) — the same metric the
-// Rust differential scores with, so "agree" means the same thing on both sides.
-//
-// The angle comes from the chord, `sin(theta/2) = |qa - qb| / 2`, not `acos` of
-// the dot product, which is ill-conditioned near identity.
-// `q` and `-q` are the same rotation, so the shorter of the two chords wins.
+// max(rotation-angle error in rad, translation error in m), as the Rust differential scores.
+// The angle comes from the chord, `sin(theta/2) = |qa - qb| / 2`, not `acos` (ill-conditioned
+// near identity); the shorter of the `q`/`-q` chords wins.
 double pose_error(const double *qa, const double *ta,
                   const tf2::Quaternion &qb, const tf2::Vector3 &tb) {
   const double b[4] = {qb.w(), qb.x(), qb.y(), qb.z()};
@@ -134,8 +124,7 @@ int main(int argc, char **argv) {
   const int rounds = argc > 4 ? std::atoi(argv[4]) : 9;
   const int sweeps = argc > 5 ? std::atoi(argv[5]) : 40;
 
-  // `atoi` maps garbage to 0; `rounds <= 0` or `sweeps <= 0` would dereference
-  // `end()` or divide by zero. Refuse rather than clamp.
+  // `atoi` maps garbage to 0: refuse `rounds <= 0` or `sweeps <= 0`, don't clamp.
   if (rounds <= 0 || sweeps <= 0) {
     std::fprintf(stderr,
                  "rounds and sweeps must both be positive (got %d and %d); "

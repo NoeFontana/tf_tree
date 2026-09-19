@@ -1,16 +1,8 @@
-//! Long-duration steady state: does anything **drift**?
+//! Long-duration steady state: does anything drift? (`docs/PHASE5.md` §9.2)
 //!
-//! Watches a healthy system over minutes to hours for latency drift (last
-//! interval's p99.9 vs the first's), memory growth (the arena is fixed-capacity,
-//! so any growth is outside it), ring wraparound (only exercised by a run that
-//! laps the rings), and publish-to-visible latency (`docs/PHASE5.md` §9.2).
-//!
-//! Not `shm_torture` (`docs/PHASE2.md` §11.4): nothing is killed and nothing
-//! is asserted about consistency.
-//!
-//! It can fail: the last interval's p99.9 may not exceed the first's by more
-//! than [`DRIFT_FACTOR`], and RSS may not grow by more than [`RSS_GROWTH_KIB`];
-//! either exits non-zero and says which.
+//! Exits non-zero, saying which, if the last interval's p99.9 exceeds the first's
+//! by more than [`DRIFT_FACTOR`] or RSS grows by more than [`RSS_GROWTH_KIB`].
+//! Not `shm_torture` (`docs/PHASE2.md` §11.4): nothing is killed.
 //!
 //! Usage: `just soak`, `just soak-long`, or
 //! `soak --workload fleet_16 --duration 30m --interval 60s --json out.json`.
@@ -36,22 +28,15 @@ use tf_tree_bench::report::Metric;
 use tf_tree_bench::runstore::{Run, RunRow};
 use tf_tree_bench::workload::{self, Backing, Built};
 
-/// How much the last interval's p99.9 may exceed the first's before the soak
-/// fails. Loose on purpose: the target is unbounded drift, not a 20% step on a
-/// shared machine.
+/// Max ratio of the last interval's p99.9 to the first's; loose for shared machines.
 const DRIFT_FACTOR: f64 = 3.0;
 
-/// How much resident memory may grow between the first and last interval, in
-/// KiB. Measured as Pss; the `rss` names are kept because they are serialised
-/// join keys in `tf_tree.bench-run/1`. 8 MiB covers this harness's own
-/// bookkeeping and allocator retention.
+/// Max resident growth in KiB (Pss; `rss` names are serialised keys in `tf_tree.bench-run/1`).
 const RSS_GROWTH_KIB: u64 = 8 * 1024;
 
-/// Reader threads. Kept below the core count so the soak does not spend hours
-/// measuring the scheduler.
+/// Reader threads, kept below the core count.
 const READERS: usize = 2;
-/// Writer threads, capped: past a handful the question stops being "does it
-/// drift" and starts being "does it scale", which is `contended_scaling`'s.
+/// Writer threads, capped; scaling is `contended_scaling`'s question.
 const MAX_WRITERS: usize = 4;
 /// Distinct stamps a reader sweeps within the current window.
 const STAMP_STEPS: usize = 512;
@@ -146,8 +131,7 @@ struct Snapshot {
     visible_p999_ns: u64,
     wraps: f64,
     rss_kib: u64,
-    /// Arena error counters accrued during this interval (differenced; a
-    /// cumulative column rises by construction).
+    /// Arena error counters accrued during this interval (differenced).
     err_delta: u64,
 }
 
@@ -234,7 +218,6 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
     let pushes = AtomicU64::new(0);
     let latency = Mutex::new(Histogram::new());
     let visible = Mutex::new(Histogram::new());
-    // Probe writer's latest (stamp, publish instant) as atomics.
     let probe_stamp = AtomicI64::new(i64::MIN);
     let probe_at_ns = AtomicU64::new(0);
     let origin = Instant::now();
@@ -247,7 +230,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
         let (probe_stamp, probe_at_ns) = (&probe_stamp, &probe_at_ns);
         let tree = &built.tree;
 
-        // --- writers -----------------------------------------------------
+        // writers
         for i in 0..n_writers {
             let p = built.publishers[i].clone();
             let is_probe = i == 0;
@@ -265,8 +248,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
                     if w.push(stamp, &fixture::dynamic_pose(p.seed, stamp)).is_ok() {
                         pushes.fetch_add(1, Ordering::Relaxed);
                         if is_probe {
-                            // Store the instant before the stamp the reader keys
-                            // on; `Release` on the stamp publishes both.
+                            // Instant stored before the stamp; `Release` on the stamp publishes both.
                             probe_at_ns
                                 .store(origin.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             probe_stamp.store(stamp, Ordering::Release);
@@ -278,7 +260,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
             });
         }
 
-        // --- probe reader: publish-to-visible ----------------------------
+        // probe reader
         {
             let pairs = built.pairs.clone();
             let probe = built.publishers[0].clone();
@@ -288,8 +270,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
                 else {
                     return;
                 };
-                // A one-edge plan, so `span` reports this edge's newest stamp
-                // and nothing else's.
+                // One-edge plan: `span` reports this edge only.
                 let Ok(plan) = tree.plan(child, parent) else {
                     return;
                 };
@@ -315,7 +296,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
             });
         }
 
-        // --- readers -----------------------------------------------------
+        // readers
         for _ in 0..READERS {
             scope.spawn(move || {
                 let mut plans = Vec::new();
@@ -333,8 +314,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
 
                 while !stop.load(Ordering::Relaxed) {
                     let guard = tree.guard();
-                    // Re-probe the retained window periodically: writers slide
-                    // it, and a fixed one would time only the error path.
+                    // Re-probe the window: writers slide it; a fixed one times the error path.
                     if refresh == 0 {
                         let mut w: Option<(i64, i64)> = None;
                         for p in &plans {
@@ -377,9 +357,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
             });
         }
 
-        // --- coordinator -------------------------------------------------
-        // Ring laps per interval come from the retained span read off the
-        // arena, not from a per-workload constant.
+        // coordinator
         let probe_plan = built
             .tree
             .frame(&built.publishers[0].parent)
@@ -423,7 +401,6 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
                 pushes: pu,
                 visible_p50_ns: vis.quantile(0.50),
                 visible_p999_ns: vis.quantile(0.999),
-                // Laps of the probe edge's ring during this interval.
                 wraps: args.interval.as_secs_f64() / retained_secs(),
                 rss_kib: ProcStats::read().pss_kib,
                 err_delta: {
@@ -469,8 +446,7 @@ fn print_snapshot(s: &Snapshot, interval: Duration) {
     );
 }
 
-/// Sum of every error counter over every edge — the arena's own account of what
-/// went wrong, which is the thing that should stay flat.
+/// Sum of every error counter over every edge; should stay flat.
 fn errors(tree: &tf_tree::Tree) -> u64 {
     let view = tree.arena_view();
     let mut total = 0u64;
@@ -536,8 +512,7 @@ fn verdict(s: &[Snapshot]) -> bool {
 
     let total_wraps: f64 = s.iter().map(|x| x.wraps).sum();
     if total_wraps < 1.0 {
-        // A failure of the experiment, not the engine: a soak that never
-        // lapped a ring is not a pass (`docs/PHASE2.md` §11.4).
+        // A soak that never lapped a ring is not a pass (`docs/PHASE2.md` §11.4).
         println!(
             "FAIL coverage: the rings lapped {total_wraps:.2} times, so wraparound was \
              never exercised — run longer, or pick a workload with shorter history"
@@ -550,8 +525,7 @@ fn verdict(s: &[Snapshot]) -> bool {
     ok
 }
 
-/// Slack on a per-interval metric in the A/B differ; a single interval's tail
-/// is noisy and the verdict judges the trend.
+/// Slack on a per-interval metric in the A/B differ.
 const SOAK_SLACK: f64 = 0.50;
 
 fn json_row(workload: &str, built: &Built, s: &Snapshot) -> RunRow {
@@ -575,8 +549,7 @@ fn json_row(workload: &str, built: &Built, s: &Snapshot) -> RunRow {
         .metric(Metric::new("err_delta", s.err_delta as f64, "errors"))
 }
 
-/// The row the A/B differ should actually be read on: the drift itself, rather
-/// than any single interval's value.
+/// The row the A/B differ reads: the drift itself.
 fn summary_row(workload: &str, built: &Built, s: &[Snapshot]) -> RunRow {
     let (first, last) = (s.first(), s.last());
     let ratio = match (first, last) {

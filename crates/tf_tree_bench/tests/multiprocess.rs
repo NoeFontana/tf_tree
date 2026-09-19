@@ -2,15 +2,9 @@
 //! the same answers.
 //!
 //! `crates/tf_tree_bench/tests/relocation.rs` proves the arena survives a move
-//! to a different address within one process. This proves the whole thing across
-//! a real process boundary — separate address space, separate page tables,
-//! separate `exec` — which is what `docs/PHASE2.md` exists to deliver and what
-//! `HeapArena` structurally cannot do.
-//!
-//! The reader in the child is the **unmodified Phase 1 reader**. Nothing in
-//! `Plan::at`, the bracket search, slot reads or interning knows which backend
-//! it has; that is `docs/PHASE2.md` §4's "zero lines in the read path", tested
-//! rather than asserted.
+//! within one process; this proves it across a process boundary. The child runs
+//! the unmodified Phase 1 reader (`docs/PHASE2.md` §4, "zero lines in the read
+//! path").
 //!
 //! Requires `--features shm` (Linux). Run: `just shm-test`.
 #![cfg(all(feature = "shm", target_os = "linux"))]
@@ -23,12 +17,8 @@ use tf_tree_bench::fixture;
 use tf_tree_bench::shm_util::{sibling_binary, spawn_attached};
 use tf_tree_bench::workload::Backing;
 
-/// The §11.1 fixture topology, declared but not built.
-///
-/// Split out of [`shared_fixture`] because [`served_fixture`] declares the same
-/// edges through a different constructor. Two copies of this loop would let the
-/// two harnesses drift into different topologies, which is a difference that
-/// shows up as a test result.
+/// The §11.1 fixture topology, declared but not built; shared by both harnesses
+/// so their topologies cannot drift.
 fn fixture_builder() -> TreeBuilder {
     let mut b = TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
     for e in fixture::EDGES {
@@ -46,8 +36,7 @@ fn fixture_builder() -> TreeBuilder {
     b
 }
 
-/// Fill a freshly built fixture tree with the history every reader below asks
-/// about.
+/// Fill a freshly built fixture tree with the history the readers ask about.
 fn populate(tree: &Tree) {
     let (writers, samples) = fixture::spin_up(tree).expect("spin up");
     drop(writers);
@@ -145,12 +134,8 @@ fn another_process_reads_the_same_arena_bit_identically() {
     );
 }
 
-/// A read-only attachment must be exactly that: the MMU, not politeness, is what
-/// stops a consumer corrupting the arena.
-///
-/// Verified in-process because the fault a `PROT_READ` write takes is awkward
-/// to assert on; what is cheap to assert is that the mode is carried through
-/// and that a read-only tree still answers queries.
+/// A read-only attachment still answers queries; the fault a `PROT_READ` write
+/// takes is awkward to assert, so only the mode and reads are checked.
 #[test]
 fn read_only_attachment_still_answers() {
     let tree = shared_fixture();
@@ -174,11 +159,8 @@ fn read_only_attachment_still_answers() {
     assert_eq!(got.to_bits(), want, "read-only mapping disagreed");
 }
 
-/// Samples published *after* a peer attached must be visible to it.
-///
-/// The bit-identity test above could pass against a snapshot. This one cannot:
-/// the reader attaches first, then the writer publishes, and the reader has to
-/// see it.
+/// Samples published after a peer attached are visible to it; a snapshot would
+/// fail this.
 #[test]
 fn writes_are_visible_to_an_already_attached_peer() {
     let tree = shared_fixture();
@@ -240,17 +222,8 @@ fn writes_are_visible_to_an_already_attached_peer() {
     );
 }
 
-/// A read-only attachment must **refuse** mutations, not fault on them.
-///
-/// This is the test that makes `AttachMode::ReadOnly` a safety boundary rather
-/// than a loaded gun. Every one of these calls reaches a `compare_exchange` in
-/// the arena, and a `PROT_READ` mapping does not report that politely — the
-/// process takes `SIGSEGV`. A consumer that merely misspells a frame name would
-/// have died instead of getting an `Err`.
-///
-/// Verified against the real failure: before the guards, `ro.claim(..)` exited
-/// with `signal: 11`, and so did `ro.frame("never-declared")` once the frame
-/// table had headroom for the intern to get past its capacity pre-check.
+/// A read-only attachment refuses mutations rather than taking `SIGSEGV` from a
+/// `compare_exchange` into a `PROT_READ` mapping.
 #[test]
 fn read_only_refuses_mutation_instead_of_faulting() {
     let tree = shared_fixture();
@@ -297,20 +270,9 @@ fn read_only_refuses_mutation_instead_of_faulting() {
     );
 }
 
-/// Runtime re-parenting **works** on a shared arena, and another process sees
-/// the result (`docs/PHASE2.md` §1, A2).
-///
-/// This replaces `reparent_is_refused_on_a_shared_arena`. That test asserted a
-/// placeholder: `Tree::reparent` was serialized only by a *process-local* mutex,
-/// which serializes nothing against a peer that mapped the same segment, so the
-/// operation was refused rather than raced. A1 removed the wedge a crashed
-/// mutator caused; A2 put the mutation lock in the arena header where every
-/// participant contends on it.
-///
-/// The reparent is non-trivial on purpose: moving `imu_link` from `base_link` to
-/// `odom` drops the `odom → base_link` leg out of every `map → imu_link` path,
-/// so the answers *must* change. Asserting they changed is what stops the test
-/// passing vacuously against a reparent that silently did nothing.
+/// Runtime re-parenting works on a shared arena and another process sees the
+/// result (`docs/PHASE2.md` §1, A2). The reparent changes every `map →
+/// imu_link` path, so a no-op reparent fails.
 #[test]
 fn reparent_on_a_shared_arena_is_visible_to_another_process() {
     let tree = shared_fixture();
@@ -340,9 +302,8 @@ fn reparent_on_a_shared_arena_is_visible_to_another_process() {
         "the reparented topology answers almost nothing; the comparison is vacuous"
     );
 
-    // Now a *second process* maps the same segment and is asked the same
-    // questions. It compiles its own plan from the topology block, so it can
-    // only agree if the reparent reached the shared bytes.
+    // A second process compiles its own plan from the topology block, so it
+    // agrees only if the reparent reached the shared bytes.
     let child_bin = sibling_binary("shm_child").expect("shm_child binary");
     let fd = tree.shared_fd().expect("shared tree exposes its fd");
     let args: Vec<String> = [
@@ -388,20 +349,10 @@ fn reparent_on_a_shared_arena_is_visible_to_another_process() {
     );
 }
 
-/// A scratch runtime directory for the tests below that need a rendezvous,
-/// removed when it ends.
+/// A scratch runtime directory for the rendezvous tests, removed on drop.
 ///
-/// **`set_var` is process-wide, and that is safe here only because `nextest`
-/// gives every test its own process** — `just shm-check` runs this target as
-/// `cargo nextest run -p tf_tree_bench --features shm --test multiprocess`.
-/// Under plain `cargo test` the tests in this file share one process and one
-/// environment; a `cargo test` invocation of this target is not supported. The
-/// same caveat is written out at greater length on `tf_tree`'s
-/// `tests/rendezvous.rs`, which this is modelled on.
-///
-/// Every other test in this file goes through `build_shared`, which reaches no
-/// lock file and no socket and needs none of this. Three use it now, under two
-/// different arena names.
+/// `set_var` is process-wide: safe only because nextest gives every test its own
+/// process (`just shm-check`); plain `cargo test` is unsupported.
 struct Scratch(std::path::PathBuf);
 
 impl Scratch {
@@ -413,18 +364,9 @@ impl Scratch {
         Scratch(p)
     }
 
-    /// The lock file the rendezvous puts `arena`'s participant bytes in.
-    ///
-    /// `<runtime dir>/<domain>/<name>.lock`, with the default domain 0 — the
-    /// layout `tf_tree_ipc::Rendezvous` resolves and the one
-    /// `tests/rendezvous.rs` reads the same way.
-    ///
-    /// **`arena` is a parameter and used to be [`RACE_ARENA`] inlined.** One
-    /// scratch directory now serves two rendezvous names, and a hardcoded one
-    /// would have opened `<dir>/0/tf_tree_reparent_race.lock` for a test whose
-    /// arena is [`SERVED_WORKLOAD_ARENA`] — a lock file describing nothing, whose
-    /// every `probe_participant(..).held` reads `false` and whose every
-    /// `assert!(!..held)` therefore passes vacuously.
+    /// The lock file the rendezvous puts `arena`'s participant bytes in:
+    /// `<runtime dir>/<domain>/<name>.lock`, domain 0. `arena` is a parameter
+    /// so a wrong name cannot make every `!held` assertion pass vacuously.
     fn lock_path(&self, arena: &str) -> std::path::PathBuf {
         self.0.join(format!("0/{arena}.lock"))
     }
@@ -436,53 +378,21 @@ impl Drop for Scratch {
     }
 }
 
-/// The rendezvous name the reparent race creates its arena under. Distinct from
-/// every other name in the workspace so a stray runtime directory cannot make
-/// two harnesses share an arena.
+/// The rendezvous name the reparent race creates its arena under.
 const RACE_ARENA: &str = "tf_tree_reparent_race";
 
-/// The rendezvous name [`a_served_workload_refuses_an_arena_it_did_not_create`]
-/// uses. Distinct from [`RACE_ARENA`] for the same reason that one is distinct
-/// from every other name here.
+/// The rendezvous name of the served-workload refusal test.
 const SERVED_WORKLOAD_ARENA: &str = "tf_tree_served_workload";
 
-/// **`Backing::Served` refuses an arena it did not create — including one of a
-/// different shape.** (#258, at the site the ticket is named after.)
+/// `Backing::Served` refuses an arena it did not create, including one of a
+/// different shape (#258).
 ///
-/// The ticket's five-arm table: against a healthy served arena,
-/// `CreatePolicy::Always` and `CreatePolicy::IfAbsent` were indistinguishable
-/// and *both* handed the caller the owner's arena. The second arm below is the
-/// one that makes it a wrong number rather than a shared one — `humanoid` is a
-/// ~117-frame synthetic spine and `robot` is the 24-frame fixture, so they
-/// share not one frame name, and the rendezvous still resolved to `Joined`.
-/// §3.7 cannot catch it: `layout_hash` is a *struct-layout* constant,
-/// byte-identical between two processes that disagree about every frame in the
-/// tree.
-///
-/// Both arms refuse in `build_tree`, before `Workload::build` populates
-/// anything, so the second one costs its arithmetic `plan()` and nothing else.
-///
-/// **Mutant: restore `.create(Always)` and delete `.require_create(true)` from
-/// `build_tree`** — HEAD before this change — and the two arms fail
-/// *differently*, which is worth writing down because the second one is not
-/// what was predicted:
-///
-/// * *same shape* returns `Ok`. The join is silent and total: a `Built` over
-///   somebody else's arena, and nothing downstream can tell.
-/// * *different shape* returns `Err`, but from two layers further on and about
-///   the wrong thing — `populating workload humanoid: frame link_0:
-///   CapacityExceeded`. The open succeeded; the 24-frame arena it was handed
-///   simply had no room for the 117th frame. So the shape mismatch is caught
-///   here only by accident, and only because these two shapes are far apart:
-///   the ticket's own ALT arm asked for one extra edge and more slots, which
-///   the owner's arena absorbed, and it reported success with the frame it
-///   asked for absent.
-///
-/// The assertion is therefore on the *message*, not merely on failure — a test
-/// that accepted any `Err` would pass against the defect for this pair.
-///
-/// **Mutant: keep `require_create` and set `Always`** ⇒ still passes. The
-/// policy is not what refuses, which is the whole of the ticket.
+/// Both arms refuse in `build_tree`, before the workload is populated.
+/// `layout_hash` is a struct-layout constant, so §3.7 cannot catch a shape
+/// mismatch. The assertion is on the message, not merely on failure: without
+/// `require_create(true)` the different-shape arm still errs, but as
+/// `CapacityExceeded` from further on. Setting `Always` with `require_create`
+/// kept still passes; the policy is not what refuses.
 #[test]
 fn a_served_workload_refuses_an_arena_it_did_not_create() {
     let _scratch = Scratch::new("served-workload");
@@ -518,17 +428,12 @@ fn a_served_workload_refuses_an_arena_it_did_not_create() {
     drop(owner);
 }
 
-/// The fixture topology, created **through the rendezvous** so that peers can
-/// join it and be given a participant slot with a lock byte behind it.
+/// The fixture topology created through the rendezvous, so peers can join and
+/// be given a participant slot.
 ///
-/// `require_create(true)` rather than `CreatePolicy::Always`: the scratch
-/// directory is this process's own and empty, so there is nothing to join, and
-/// the point of saying so in code is to make that an assertion rather than a
-/// hope. **`Always` was not making it one** (#258) — it skips §3.4's
-/// split-brain check and nothing else, so step 1 still joins a server that
-/// answers, and a stray arena under this name would have been joined in
-/// silence. `require_create` is the setting that turns that outcome into
-/// [`tf_tree::OpenError::ArenaAlreadyLive`], which is what
+/// `require_create(true)`, not `CreatePolicy::Always` (#258): `Always` still
+/// joins a live server, while `require_create` yields
+/// [`tf_tree::OpenError::ArenaAlreadyLive`], which
 /// [`a_second_served_fixture_refuses_rather_than_joining_the_first`] measures.
 fn served_fixture() -> Tree {
     let tree = try_served_fixture().expect("create and serve the fixture arena");
@@ -538,8 +443,7 @@ fn served_fixture() -> Tree {
     tree
 }
 
-/// [`served_fixture`]'s open, without the `expect` and without populating —
-/// so a test can look at the *refusal* rather than only at the success.
+/// [`served_fixture`]'s open without populating, so a test can inspect the refusal.
 fn try_served_fixture() -> Result<Tree, tf_tree::OpenError> {
     tf_tree::Open::new()
         .name(RACE_ARENA)
@@ -551,13 +455,9 @@ fn try_served_fixture() -> Result<Tree, tf_tree::OpenError> {
         .open()
 }
 
-/// One read-write peer, joined through the rendezvous.
-///
-/// This is the *only* way to get a read-write attachment since
-/// `docs/decisions/0028` plan step 0b: `Tree::attach_shared(fd, ReadWrite)`
-/// returns `ShmError::ReadWriteNeedsRendezvous`, because a bare descriptor has
-/// no lock file to take a participant byte in. Every `Tree` this returns holds
-/// one.
+/// One read-write peer joined through the rendezvous, the only read-write
+/// attachment since `docs/decisions/0028` plan step 0b
+/// (`ShmError::ReadWriteNeedsRendezvous` otherwise).
 fn join_read_write() -> Tree {
     tf_tree::Open::new()
         .name(RACE_ARENA)
@@ -568,27 +468,12 @@ fn join_read_write() -> Tree {
         .expect("join the served fixture arena read-write")
 }
 
-/// **A second `Backing::Served`-shaped open refuses instead of joining.**
+/// A second `Backing::Served`-shaped open refuses instead of joining (#258).
+/// The second open is in this process; the owner's serving thread answers, so
+/// the rendezvous resolves to `Joined` as it would across processes.
 ///
-/// The defect #258 reports, at the smaller of its two call sites: the harness
-/// asks to *create and serve* an arena it sized, and gets somebody else's
-/// instead, with no error and no way to tell from the returned `Tree`. Both
-/// sites reached for a "create, and refuse to join" policy;
-/// [`tf_tree::CreatePolicy`] has no such variant, and both settled for `Always`
-/// under the belief that it was one.
-///
-/// The second open here is in this process rather than a child, which is the
-/// same shape [`join_read_write`] already relies on: the owner's serving thread
-/// answers its own socket, so step 1 connects and the rendezvous resolves to
-/// `Joined` exactly as it would across a process boundary. What the test pins
-/// is the arm after that resolution.
-///
-/// **Mutant: drop `.require_create(true)` from [`try_served_fixture`]** ⇒ the
-/// second open returns `Ok`, and this test fails on `expect_err`. That is the
-/// pre-fix behaviour verbatim.
-///
-/// **Mutant: `CreatePolicy::Always` instead of `IfAbsent`** ⇒ still passes, and
-/// that is the point of the ticket: the policy is not what refuses.
+/// Mutant: dropping `.require_create(true)` from [`try_served_fixture`] makes
+/// the second open return `Ok`; `CreatePolicy::Always` still passes.
 #[test]
 fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
     let scratch = Scratch::new("served-refuses-to-join");
@@ -606,13 +491,9 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
         "expected ArenaAlreadyLive, got {refused:?}"
     );
 
-    // **The refusal left nothing behind**, which is the half of the promise that
-    // is not about the error value. The owner holds byte 0, so a refused attach
-    // that kept its session would show as a held byte 1.
-    //
-    // Deterministic: `Open::open` drops the session — and with it the OFD
-    // lock — *before* it returns `ArenaAlreadyLive`, in this process, on this
-    // thread, inside the call above. There is nothing to wait for.
+    // The refusal left nothing behind: the owner holds byte 0, so a kept
+    // session would show as a held byte 1. `Open::open` drops the session (and
+    // its OFD lock) before returning `ArenaAlreadyLive`.
     {
         let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path(RACE_ARENA))
             .expect("the rendezvous created a lock file");
@@ -625,19 +506,10 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
         );
     }
 
-    // And the rendezvous is not wedged: a genuine joiner is still granted a
-    // read-write attachment. `join_read_write` panics on failure, so reaching
-    // the assertion is most of the claim.
-    //
-    // **Not an assertion about *which* slot**, and it was one until CI said
-    // otherwise. Participant *indices* are assigned by the owner's serving
-    // thread, which frees a departed client's index from `on_hangup` when epoll
-    // reports `RDHUP`/`HUP` (`tf_tree_ipc::OwnerServer::serve`). Whether the
-    // refused attach's index has been freed by the time the next joiner is
-    // accepted is therefore a race between that loop and this thread — the lock
-    // *byte* is released synchronously above, the *index* is not. It read 1 in
-    // 30 of 30 local runs and something else on a shared CI runner, which is the
-    // race resolving both ways rather than a defect either way.
+    // The rendezvous is not wedged: a genuine joiner is still granted a
+    // read-write attachment. Not an assertion about which slot: the index is
+    // freed on the owner's epoll (`on_hangup`), racing this thread, while the
+    // lock byte is released synchronously.
     let peer = join_read_write();
     assert!(peer.is_writable(), "the peer joined read-only");
 
@@ -645,52 +517,16 @@ fn a_second_served_fixture_refuses_rather_than_joining_the_first() {
     drop(owner);
 }
 
-/// Two independent attachments race `reparent`, and the process-local mutex is
-/// not what stops them colliding.
+/// Two independent attachments race `reparent`; the process-local mutex is not
+/// what stops them colliding.
 ///
-/// Each `Tree` here is its own attachment: its own participant slot, its own
-/// process-local `decl` mutex, **and its own open file description on the lock
-/// file**. That mutex is precisely the thing that does not generalise across a
-/// boundary, so it serializes nothing between these two — exactly the situation
-/// a second process is in. What is left is A2, and if A2 did not work these
-/// threads would race the topology block copy and lose or corrupt mutations.
-///
-/// **A2 is two locks since `docs/decisions/0029`, and this test exercises both.**
-/// The lock file's topology byte excludes the two attachments from each other —
-/// they hold two descriptions, and `tf_tree_ipc`'s
-/// `two_descriptions_in_one_process_still_conflict` is why that is not a
-/// loophole — and the in-arena word is what a byte-holder and a byte-less
-/// mutator would still contend on. The generation count below falsifies a
-/// failure of either: it cannot tell them apart, and does not need to.
-///
-/// Verified in-process rather than across a `fork` because the failure being
-/// tested is a *data race on the shared bytes*, which needs both mutators alive
-/// and interleaved; the process-boundary half is covered by the test above.
-///
-/// # Why this test needs a rendezvous
-///
-/// It used to take its two attachments from `Tree::attach_shared(fd,
-/// ReadWrite)` on a duplicated descriptor. `docs/decisions/0028` plan step 0b
-/// removed that: a read-write attach registers a participant record, and over
-/// a bare descriptor there is no lock file to take the byte that decides
-/// whether the record may be reclaimed. So the arena is created through
-/// [`served_fixture`] and the peers join through [`join_read_write`].
-///
-/// **The port preserves each property the test was written for, and the
-/// assertions below say which line preserves which:**
-///
-/// * *Separate participant slots.* Each joiner is granted its own by the
-///   owner's assigner, and the byte assertion below proves three distinct ones
-///   are held — the strongest form this property has ever had here, because
-///   `attach_shared`'s self-assignment left nothing outside the arena to check.
-/// * *Separate process-local `decl` mutexes.* Still three distinct `Tree`
-///   values, so still three distinct `Mutex<()>` fields; nothing about the
-///   transport changes that, and a rewrite that shared one attachment would
-///   have deleted the test rather than ported it.
-/// * *Only A2 can serialize them.* The racing block is unchanged, and so is the
-///   generation count that falsifies it. This bullet said "A2's **in-arena**
-///   lock" until `0029` made the byte the first of the two.
-/// * *A third view of the segment.* The owner tree, exactly as before.
+/// Each `Tree` has its own slot, `decl` mutex and open file description. A2 is
+/// two locks since `docs/decisions/0029`: the lock file's topology byte
+/// (`tf_tree_ipc`'s `two_descriptions_in_one_process_still_conflict`) and the
+/// in-arena word; the generation count falsifies a failure of either. In-process
+/// rather than across a `fork`, because a data race needs both mutators alive;
+/// the process boundary is covered above. Peers join through [`join_read_write`]
+/// per `docs/decisions/0028` plan step 0b.
 #[test]
 fn concurrent_reparents_from_separate_attachments_are_serialized() {
     let scratch = Scratch::new("reparent-race");
@@ -699,10 +535,9 @@ fn concurrent_reparents_from_separate_attachments_are_serialized() {
     let a = join_read_write();
     let b = join_read_write();
 
-    // **Three participants, three bytes.** The owner took byte 0 when it
-    // created the arena and each joiner took its own during the handshake,
-    // before its arena record was written. Byte 3 is asserted free so this
-    // cannot pass against a build that reports every byte held.
+    // Three participants, three bytes: the owner took byte 0 at creation and
+    // each joiner its own. Byte 3 is asserted free so a build reporting every
+    // byte held fails.
     {
         let lock = tf_tree_ipc::LockFile::open(&scratch.lock_path(RACE_ARENA))
             .expect("the rendezvous created a lock file");
@@ -724,8 +559,7 @@ fn concurrent_reparents_from_separate_attachments_are_serialized() {
         );
     }
 
-    // Two frames with their own edges, moved between two parents that are
-    // themselves unrelated, so neither mutation can create a cycle.
+    // Two frames moved between two unrelated parents, so no mutation can cycle.
     const ROUNDS: u32 = 64;
     let start = tree.guard().generation();
 
@@ -753,8 +587,8 @@ fn concurrent_reparents_from_separate_attachments_are_serialized() {
         }
     });
 
-    // Every mutation published exactly once. A lost generation means two writers
-    // shared one scratch block; there is no way to gain one.
+    // Every mutation published exactly once; a lost generation means two
+    // writers shared one scratch block.
     assert_eq!(
         tree.guard().generation() - start,
         u64::from(2 * ROUNDS),
@@ -770,8 +604,7 @@ fn concurrent_reparents_from_separate_attachments_are_serialized() {
             .expect("plan against a live tree");
         let guard = tree.guard();
         let stamp: Stamp = Stamp::from_nanos(fixture::NOW_NS);
-        // `lidar`'s ring is the 10 Hz edge and `imu_link`'s the 1 kHz one; both
-        // cover NOW_NS, so a well-formed topology must resolve.
+        // Both edges cover NOW_NS, so a well-formed topology must resolve.
         plan.at(&guard, stamp)
             .unwrap_or_else(|e| panic!("{name} unresolvable after the race: {e:?}"));
     }

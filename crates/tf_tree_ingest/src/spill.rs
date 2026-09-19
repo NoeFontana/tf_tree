@@ -1,27 +1,20 @@
 //! §3.1's spill-to-run-file and k-way merge.
 //!
-//! [`crate::ingest::fill`] groups edges so each group fits `--max-memory`; that
-//! fails only when one edge alone exceeds the cap, which this module serves
-//! (§3.1's "spill to a temporary run-file with a k-way merge").
-//!
-//! External merge sort:
+//! [`crate::ingest::fill`] groups edges so each group fits `--max-memory`; an
+//! edge that alone exceeds the cap is served here by an external merge sort:
 //!
 //! 1. **Spill.** Read only the oversized edge into a cap-sized buffer; each time
-//!    it fills, **stable**-sort it and append it as one *run*.
+//!    it fills, stable-sort it and append it as one *run*.
 //! 2. **Reduce.** While runs exceed [`fan_in`], merge [`fan_in`] at a time into a
-//!    fresh file and drop (delete) the old one, so disk use is two files. A
-//!    single-pass merge holds one sample per run and would exceed the cap by
-//!    construction (600 samples at a 1 KiB cap already do).
+//!    fresh file and delete the old one.
 //! 3. **Merge** what is left into the arena in stamp order.
 //!
-//! **Ties break by run index**, keeping §3.2's "last occurrence wins": each run is
-//! stable-sorted, runs are written and merged in recording order, the heap orders
-//! by `(stamp, run index)`, and a reduce merges a *contiguous* window of runs, so
-//! the merged stream equals one stable sort of the whole edge. The reduce half is
-//! gated by `tests/ingest.rs::a_reduce_pass_keeps_the_last_occurrence`.
+//! Ties break by run index, keeping §3.2's "last occurrence wins": the merged
+//! stream equals one stable sort of the whole edge
+//! (`tests/ingest.rs::a_reduce_pass_keeps_the_last_occurrence`).
 //!
-//! **The file is unlinked as soon as it exists** (Unix), so `SIGKILL` leaves
-//! nothing behind; where the unlink fails, [`Drop`] removes the path.
+//! The file is unlinked as soon as it exists (Unix), so `SIGKILL` leaves nothing
+//! behind; where the unlink fails, [`Drop`] removes the path.
 
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
@@ -32,43 +25,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::IngestError;
 
 /// One buffered sample: an `i64` stamp beside the canonical `[f64; 7]` pose.
-///
-/// Structurally identical to what `ingest::fill` buffers, so
-/// `ingest::SAMPLE_BYTES` describes both paths.
+/// Structurally identical to what `ingest::fill` buffers.
 pub(crate) type Sample = (i64, [f64; 7]);
 
 /// Encoded width of one [`Sample`] on disk: `i64` + 7 × `f64`, little-endian.
-///
 /// A constant, not `size_of::<Sample>()`, so the layout does not follow compiler
-/// padding (as `FROZEN_HEADER_SIZE`); a test asserts they agree.
+/// padding; a test asserts they agree.
 pub(crate) const ENCODED: usize = 8 + 7 * 8;
 
-/// The smallest cap this path can honour; a smaller request is raised to it,
-/// because the merge and reduce floors would otherwise exceed it. The report
-/// prints the *planned* bound, not a measured peak (no counting allocator
-/// without `unsafe`); see `ingest::plan_groups`.
+/// The smallest cap this path can honour; a smaller request is raised to it.
+/// The report prints the *planned* bound (`ingest::plan_groups`).
 ///
-/// The cap covers every buffer that holds samples, including the stable sort's
-/// scratch. It does **not** cover the run index ([`RunFile::index_bytes`], 16
-/// bytes per run), which crosses the cap at roughly `cap² / 2048` samples;
-/// [`crate::ingest::FillStats::peak_run_index_bytes`] reports it separately.
+/// The cap covers every sample buffer, including the sort's scratch, but not the
+/// run index ([`RunFile::index_bytes`]), which
+/// [`crate::ingest::FillStats::peak_run_index_bytes`] reports separately.
 const MIN_CAP: u64 = 16 * ENCODED as u64;
 
 /// Ceiling on one encode/decode staging buffer.
 const MAX_STAGING: u64 = 64 * 1024;
 
 /// The share of the cap the merge sample windows may use; the rest pays for
-/// staging (no `unsafe` conversion between the memory and disk views). With
-/// `2 × staging ≤ cap / 4` from [`staging_of`], `windows + staging ≤ cap` holds
-/// for every cap at or above [`MIN_CAP`] and every run count up to [`fan_in`];
-/// `budget_fits_the_cap` checks the grid.
+/// staging. `budget_fits_the_cap` checks `windows + staging ≤ cap` over a grid.
 const WINDOW_SHARE_NUM: u64 = 3;
 const WINDOW_SHARE_DEN: u64 = 4;
 
 /// The cap actually in force for a requested one.
-///
-/// Crate-visible so [`crate::ingest::plan_groups`] decides "does this edge fit?"
-/// against the number the spill path honours.
+/// Crate-visible so [`crate::ingest::plan_groups`] uses the number the spill
+/// path honours.
 pub(crate) fn cap_of(user: u64) -> u64 {
     user.max(MIN_CAP)
 }
@@ -82,10 +65,8 @@ fn clamp_usize(v: u64) -> usize {
 }
 
 /// `(samples per run, staging bytes)` for the spill phase.
-///
 /// `2 * ENCODED`: [`sort_run`] is stable and allocates up to one extra copy of
-/// the buffer, live beside it and the staging buffer. It costs twice the runs;
-/// see `ingest::plan_groups` for the reserve and reported peak.
+/// the buffer (`ingest::plan_groups` holds the reserve).
 pub(crate) fn spill_budget(user_cap: u64) -> (usize, usize) {
     let cap = cap_of(user_cap);
     let staging = staging_of(cap);
@@ -95,19 +76,17 @@ pub(crate) fn spill_budget(user_cap: u64) -> (usize, usize) {
 
 /// How many runs one merge may consume at once.
 ///
-/// Chosen so [`merge_window_samples`] never floors at one sample; above it a
-/// reduce pass is required.
+/// Chosen so [`merge_window_samples`] never floors at one sample.
 pub(crate) fn fan_in(user_cap: u64) -> usize {
     let cap = cap_of(user_cap);
     let windows = cap * WINDOW_SHARE_NUM / WINDOW_SHARE_DEN / ENCODED as u64;
-    // `- 1`: the decode staging is one window wide (see `merge_window_samples`).
+    // The decode staging is one window wide.
     clamp_usize(windows.saturating_sub(1).max(2))
 }
 
 /// Samples each run's read window may hold when merging `runs` of them.
 ///
-/// Divided by `runs + 1`: the shared decode staging is one window wide and
-/// resident with every window during a refill.
+/// Divided by `runs + 1`: the shared decode staging is one window wide.
 pub(crate) fn merge_window_samples(user_cap: u64, runs: usize) -> usize {
     let cap = cap_of(user_cap);
     let divisor = (runs as u64).saturating_add(1);
@@ -115,12 +94,9 @@ pub(crate) fn merge_window_samples(user_cap: u64, runs: usize) -> usize {
 }
 
 /// Sort one run's samples by stamp, **stably**.
-///
-/// Two equal stamps must leave this call in arrival order, because the merge's
-/// duplicate collapse keeps the last (§3.2); an unstable sort would make one
-/// recording ingest to different `.tft` files. One name gives the rule one test,
-/// `tests/ingest.rs::the_per_run_sort_is_stable_so_last_wins_inside_a_run`, over
-/// runs long enough that stable and unstable sorts differ.
+/// Two equal stamps keep arrival order, because the merge's duplicate collapse
+/// keeps the last (§3.2);
+/// `tests/ingest.rs::the_per_run_sort_is_stable_so_last_wins_inside_a_run`.
 pub(crate) fn sort_run(buf: &mut [Sample]) {
     buf.sort_by_key(|(s, _)| *s);
 }
@@ -132,9 +108,7 @@ fn io(e: &std::io::Error) -> IngestError {
 }
 
 /// Encode one sample into exactly [`ENCODED`] little-endian bytes.
-///
-/// Built on the stack and appended in one `extend_from_slice`: the per-sample
-/// path must be cheap.
+/// Built on the stack and appended in one `extend_from_slice`.
 fn encode(s: Sample) -> [u8; ENCODED] {
     let mut b = [0u8; ENCODED];
     b[..8].copy_from_slice(&s.0.to_le_bytes());
@@ -145,9 +119,7 @@ fn encode(s: Sample) -> [u8; ENCODED] {
 }
 
 /// Decode one sample from exactly [`ENCODED`] bytes — the inverse of [`encode`].
-///
-/// Every caller feeds it a `chunks_exact(ENCODED)` element, so the fixed-width
-/// copies cannot mismatch; a slice, not `&[u8; ENCODED]`, which would need a
+/// Every caller feeds it a `chunks_exact(ENCODED)` element; a slice avoids a
 /// fallible `try_into`.
 fn decode(b: &[u8]) -> Sample {
     let mut w = [0u8; 8];
@@ -162,11 +134,8 @@ fn decode(b: &[u8]) -> Sample {
 }
 
 /// Distinguishes one spill file from every other one this process opens.
-///
-/// Process-wide, not slot-derived: a slot-derived tag collides across two
-/// concurrent [`crate::ingest::fill`]s (or deterministically where the unlink
-/// cannot run), and `truncate(true)` would empty the other's inode, giving wrong
-/// poses with no error.
+/// Process-wide, not slot-derived: a slot-derived tag collides across concurrent
+/// [`crate::ingest::fill`]s, and `truncate(true)` would empty the other's inode.
 static NEXT_TAG: AtomicU64 = AtomicU64::new(0);
 
 /// The name for one spill file: this process, and a tag no other [`RunFile`]
@@ -193,9 +162,7 @@ impl Drop for TempPath {
 pub(crate) type RunSpan = (u64, u64);
 
 /// A temporary file holding sorted runs, back to back.
-///
-/// One file per pass, not per run: the merge seeks anyway, and N files cost N
-/// descriptors and unlink races.
+/// One file per pass, not per run: N files cost N descriptors and unlink races.
 pub(crate) struct RunFile {
     file: File,
     /// Kept for its `Drop`, which removes the file where the unlink failed.
@@ -210,9 +177,7 @@ pub(crate) struct RunFile {
 
 impl RunFile {
     /// Create a run file in `dir`, unlinking it immediately where possible.
-    ///
-    /// Opened for reading as well as writing: the merge reads back through this
-    /// descriptor. Names come from [`spill_path`].
+    /// Opened for reading as well as writing; names come from [`spill_path`].
     pub(crate) fn create(dir: &Path, staging: usize) -> Result<RunFile, IngestError> {
         let path = spill_path(dir);
         let file = OpenOptions::new()
@@ -222,7 +187,6 @@ impl RunFile {
             .truncate(true)
             .open(&path)
             .map_err(|e| io(&e))?;
-        // Best-effort; `TempPath` is the fallback.
         let path = TempPath(if std::fs::remove_file(&path).is_ok() {
             None
         } else {
@@ -242,7 +206,7 @@ impl RunFile {
     ///
     /// [`end_run`]: RunFile::end_run
     pub(crate) fn begin_run(&mut self) {
-        // `written + staging.len()`: unflushed staged bytes precede this run.
+        // Unflushed staged bytes precede this run.
         self.open_run = Some((self.written + self.staging.len() as u64, 0));
     }
 
@@ -258,8 +222,8 @@ impl RunFile {
         Ok(())
     }
 
-    /// Close the open run, recording it. An empty run is dropped rather than
-    /// recorded, so the merge never sees a run it cannot seed.
+    /// Close the open run. An empty run is dropped so the merge never sees a run
+    /// it cannot seed.
     pub(crate) fn end_run(&mut self) -> Result<(), IngestError> {
         self.flush()?;
         if let Some(span) = self.open_run.take() {
@@ -304,9 +268,8 @@ impl RunFile {
         self.written
     }
 
-    /// Bytes the run index (`Vec<RunSpan>`) holds resident, by `capacity`. The
-    /// one allocation `--max-memory` does not bound (see [`MIN_CAP`]), so it is
-    /// reported apart from `peak_buffer_bytes`.
+    /// Bytes the run index holds resident, by `capacity`; not bounded by
+    /// `--max-memory` (see [`MIN_CAP`]).
     pub(crate) fn index_bytes(&self) -> u64 {
         self.runs.capacity() as u64 * core::mem::size_of::<RunSpan>() as u64
     }
@@ -314,8 +277,8 @@ impl RunFile {
     /// A merged, ascending stream over `spans`, `window` samples resident per
     /// run.
     ///
-    /// Takes spans as a parameter (the merger borrows the descriptor mutably, and
-    /// a reduce merges a subset); snapshot with [`spans`](RunFile::spans).
+    /// Takes spans as a parameter (a reduce merges a subset); snapshot with
+    /// [`spans`](RunFile::spans).
     pub(crate) fn merge_runs(
         &mut self,
         spans: &[RunSpan],
@@ -358,7 +321,7 @@ impl RunReader {
         self.buf.get(self.pos).copied()
     }
 
-    /// The head stamp without copying the pose; [`Merger::seed`] needs only that.
+    /// The head stamp without copying the pose.
     fn peek_stamp(&self) -> Option<i64> {
         self.buf.get(self.pos).map(|s| s.0)
     }
@@ -390,15 +353,13 @@ impl RunReader {
 
 /// The merged, ascending stream over a set of runs.
 ///
-/// Ties break by run index, which is what preserves "last occurrence in the
-/// recording wins" across the cut into runs — see the module docs.
+/// Ties break by run index, which preserves "last occurrence wins".
 pub(crate) struct Merger<'a> {
     file: &'a mut File,
     readers: Vec<RunReader>,
     staging: Vec<u8>,
     window: usize,
-    /// `(stamp, run index)`, min-first. `Reverse` because `BinaryHeap` is a
-    /// max-heap and the merge wants the smallest stamp.
+    /// `(stamp, run index)`, min-first (`Reverse`: `BinaryHeap` is a max-heap).
     heap: BinaryHeap<core::cmp::Reverse<(i64, usize)>>,
 }
 
@@ -454,16 +415,12 @@ mod tests {
     }
 
     /// The on-disk width equals the in-memory width.
-    ///
-    /// Mutant: `ENCODED = 8 + 6 * 8` fails here at `56 != 64`.
     #[test]
     fn encoded_width_matches_the_buffered_width() {
         assert_eq!(ENCODED, core::mem::size_of::<Sample>());
     }
 
     /// A run round-trips bit for bit, including a negative stamp and extreme poses.
-    ///
-    /// Mutant: encode the pose with `to_be_bytes` fails on the first component.
     #[test]
     fn a_run_round_trips_exactly() {
         let dir = scratch("roundtrip");
@@ -484,8 +441,6 @@ mod tests {
     }
 
     /// Runs merge ascending, equal stamps in run order (§3.2's "last wins").
-    ///
-    /// Mutant: build readers from `spans.iter().rev()` fails with `[2.0, 1.0]`.
     #[test]
     fn runs_merge_ascending_with_ties_in_run_order() {
         let dir = scratch("merge");
@@ -508,8 +463,6 @@ mod tests {
     }
 
     /// An empty run is not recorded.
-    ///
-    /// Mutant: record the span unconditionally fails `runs() == 1` at 2.
     #[test]
     fn an_empty_run_is_not_recorded() {
         let dir = scratch("empty");
@@ -521,10 +474,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Two spill files in one process never share a name, across threads too
-    /// ([`NEXT_TAG`]).
-    ///
-    /// Mutant: `fetch_add(0, …)` fails at `1 unique path(s), wanted 256`.
+    /// Two spill files in one process never share a name, across threads too.
     #[test]
     fn spill_paths_are_unique_within_the_process() {
         use std::collections::BTreeSet;
@@ -550,10 +500,6 @@ mod tests {
     }
 
     /// A run opened while staging holds unflushed bytes starts after them.
-    /// Pins an invariant no caller violates today.
-    ///
-    /// Mutant: `Some((self.written, 0))` fails the span assertion,
-    /// `[(0, 1)]` vs `[(64, 1)]`.
     #[test]
     fn a_run_opened_over_unflushed_bytes_starts_after_them() {
         let dir = scratch("unflushed");
@@ -574,11 +520,7 @@ mod tests {
     }
 
     /// The budget fits the cap, spill and merge phases, over a grid of caps and
-    /// run counts up to [`fan_in`]. This assertion *is* `--max-memory`.
-    ///
-    /// Mutant 1: divide by `runs` in `merge_window_samples` fails at cap 1024,
-    /// runs 1 (1 664 B). Mutant 2: `staging_of` returning `cap / 4` fails at
-    /// 1 280 B; with `1 × staging` it survives, hiding the second buffer.
+    /// run counts. This assertion *is* `--max-memory`.
     #[test]
     fn budget_fits_the_cap() {
         for user_cap in [1u64, 200, 1024, 4096, 1 << 20, 4 << 30] {

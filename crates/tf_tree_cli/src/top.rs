@@ -1,34 +1,17 @@
 //! `tf_tree top` — `docs/PHASE5.md` §7's live view of a running arena.
 //!
-//! No `ratatui`: plain ANSI escapes and a redraw loop (`ESC[H`, `ESC[K`,
-//! `ESC[J`), no new dependency (`CLAUDE.md` budget). The cost: no raw mode, so
-//! no key handling (raw mode means `libc` and an `unsafe` boundary this crate
-//! forbids) and the detail view is chosen with `--edge <id|name>`; interactive
-//! selection would be a decision record. The alternate screen is not used
-//! either, since restoring it on `SIGINT` needs a signal handler.
+//! Plain ANSI escapes and a redraw loop, no `ratatui`: no raw mode (this crate
+//! forbids `unsafe`), so no key handling; the detail view is `--edge <id|name>`.
 //!
-//! It observes without perturbing:
+//! It observes without perturbing: read-only attach (D18, `--rw` refused), no
+//! participant record (`Tree::participant_slot` is `u32::MAX`; a lock-file byte is
+//! still taken) and no lookups (`tests::capturing_the_arena_moves_no_counter`).
 //!
-//! * It attaches read-only (D18) and refuses `--rw`.
-//! * A read-only attachment writes no participant record
-//!   (`Tree::participant_slot` is `u32::MAX`), so `TFT015`'s table is not
-//!   inflated; it does take a lock-file byte, visible to `tf_tree participants`.
-//! * It performs no lookups; `tests::capturing_the_arena_moves_no_counter`
-//!   requires every counter to stand still.
-//!
-//! Unbuilt: the clock-drift rule `TFT004` cannot have (`docs/PHASE5.md` §6). A
-//! recorded `ClaimRecord::clock_offset_nanos`
+//! No clock-drift rule: `ClaimRecord::clock_offset_nanos`
 //! ([`0036`](../../../docs/decisions/0036-the-receipt-time-the-format-already-reserved.md))
-//! is clock error plus stamp-to-push latency, and one sample cannot separate
-//! them; drift can, and needs a per-publisher series, which only this view
-//! collects. Sampling is per edge, so de-duplicate against the value, not the
-//! poll, and do not add a column that flickers.
+//! cannot separate clock error from latency, and drift needs a per-publisher series.
 //!
-//! Everything this view did not author goes through `sanitize` before reaching
-//! an ANSI frame.
-//!
-//! Rates are observed, never a deviation from `nominal_rate_mhz` (that is
-//! `doctor`'s `TFT007`; a flickering column teaches operators to ignore it):
+//! Rates are observed, never a deviation from `nominal_rate_mhz` (`doctor`'s `TFT007`):
 //!
 //! * `rate(Hz)` is the median inter-arrival of the retained stamps, in the
 //!   publisher's stamp domain.
@@ -45,15 +28,11 @@ use tf_tree::unstable::EdgeKind;
 use tf_tree::{EdgeId, Tree};
 
 use crate::catalogue::{Severity, Tft};
-// Import `OCCUPANCY_LIMIT` rather than restating `0.80`: one constant, one comparator (`>`).
 use crate::checks::{Clock, OCCUPANCY_LIMIT};
 use crate::doctor::Snapshot;
 
 /// The counter values read from one [`tf_tree_core::counters::EdgeCounters`] or
-/// [`tf_tree_core::counters::ParticipantCounters`].
-///
-/// A plain-data copy, not a borrow: differencing live atomics never reconciles
-/// with the printed totals.
+/// [`tf_tree_core::counters::ParticipantCounters`], as a plain-data copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CounterSample {
     /// Successful lookups — the denominator (§5.4).
@@ -95,7 +74,6 @@ impl CounterSample {
             no_data: self.no_data.saturating_sub(prev.no_data),
             recycled: self.recycled.saturating_sub(prev.recycled),
             contended: self.contended.saturating_sub(prev.contended),
-            // A timestamp and a high-water mark: not differences.
             last_err_nanos: self.last_err_nanos,
             worst_extrap_gap_ns: self.worst_extrap_gap_ns,
         }
@@ -119,13 +97,11 @@ pub struct EdgeSample {
     pub claimed: bool,
     /// The claim owner's pid (`0` when unclaimed or unresolvable).
     pub owner_pid: u32,
-    /// The first retained stamp in push order, not `min(stamps)`: a `min` would
-    /// repair an out-of-order publisher ([`IntervalStats::non_monotonic`] shows it).
+    /// The first retained stamp in push order, not `min(stamps)`.
     pub oldest_stamp: Option<i64>,
     /// Newest stamp the ring holds — the last in push order.
     pub newest_stamp: Option<i64>,
-    /// How many stamps the ring retains; `intervals.len() + 1` reads `0` for a
-    /// ring holding one sample.
+    /// How many stamps the ring retains.
     pub retained: usize,
     /// Successive differences of the retained stamps, in push order.
     pub intervals: Vec<i64>,
@@ -148,21 +124,18 @@ impl EdgeSample {
 /// One participant as of one tick.
 #[derive(Clone, Debug)]
 pub struct ParticipantSample {
-    /// Slot index — the one integer that indexes both the arena table and the
-    /// lock file (`docs/PHASE2.md` §3.7).
+    /// Slot index, shared by the arena table and the lock file (`docs/PHASE2.md` §3.7).
     pub slot: u32,
     /// Process id (`0` when only a lock byte is held and no record exists yet).
     pub pid: u32,
-    /// `"ro"`/`"rw"` from the lock file, `None` when there is no lock file to
-    /// read (an in-process arena, or a build without `shm`).
+    /// `"ro"`/`"rw"` from the lock file, `None` when there is none.
     pub mode: Option<&'static str>,
     /// `comm` from the lock-file identity record.
     pub comm: String,
-    /// Whether the arena record says `LIVE` **and** the kernel still holds the
-    /// byte.
+    /// Whether the arena record says `LIVE` and the kernel still holds the byte.
     pub alive: bool,
     /// Whether the participant table has a record for this slot; `false` for a
-    /// read-only participant (`PROT_READ`, D18), like `top` itself.
+    /// read-only participant (D18).
     pub in_arena: bool,
     /// Attach time in arena-domain nanoseconds (`0` when unknown).
     pub attached_at_nanos: i64,
@@ -175,7 +148,7 @@ pub struct ParticipantSample {
 /// Everything one tick read out of the arena.
 #[derive(Clone, Debug)]
 pub struct Capture {
-    /// Where this came from, for the banner ("live arena" / "in-process fixture").
+    /// Where this came from, for the banner.
     pub source: &'static str,
     /// Arena size in bytes.
     pub arena_bytes: u64,
@@ -188,11 +161,9 @@ pub struct Capture {
     pub edges: Vec<EdgeSample>,
     /// Every participant with a record or a held lock byte, slot order.
     pub participants: Vec<ParticipantSample>,
-    /// This observer's own arena slot, `None` for a read-only attachment (which
-    /// writes no record) and for a non-shared tree.
+    /// This observer's own arena slot; `None` for a read-only or non-shared tree.
     pub self_slot: Option<u32>,
-    /// Whether this is somebody else's shared arena, the only case where the
-    /// perturbation disclosure applies.
+    /// Whether this is somebody else's shared arena (the perturbation disclosure applies).
     pub shared: bool,
     /// Whether the engine was built with §5's `counters` feature.
     pub counters_compiled_in: bool,
@@ -202,8 +173,7 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// Read the whole arena once, read-only. A smear, not an instant: `head` is
-    /// used only for tick-to-tick differences, never to index the stamp array.
+    /// Read the whole arena once, read-only.
     #[must_use]
     pub fn from_tree(tree: &Tree, source: &'static str) -> Capture {
         use core::sync::atomic::Ordering;
@@ -219,7 +189,6 @@ impl Capture {
             let mut retained_count = 0usize;
             if let Some(ring) = view.ring(eid) {
                 let head = ring.head.load(Ordering::Acquire);
-                // `retained()` excludes the slot being overwritten.
                 let retained = ring.retained().min(head);
                 retained_count = usize::try_from(retained).unwrap_or(usize::MAX);
                 let mut prev: Option<i64> = None;
@@ -323,9 +292,8 @@ impl Capture {
         }
     }
 
-    /// The reference instant for every age, by [`Clock::decide`] and not
-    /// `newest_stamp.max()`, which one units-overshooting publisher would capture
-    /// (`checks::a_single_units_error_cannot_capture_the_reference_clock`).
+    /// The reference instant for every age, by [`Clock::decide`] (not
+    /// `newest_stamp.max()`, which one units-overshooting publisher would capture).
     /// `None` only when no ring holds a stamp.
     #[must_use]
     pub fn decide_clock(edges: &[EdgeSample], system_unix_nanos: i64) -> Option<Clock> {
@@ -342,15 +310,13 @@ impl Capture {
         self.clock.map(Clock::nanos)
     }
 
-    /// Merge lock-file facts (mode, `comm`, held-ness) into the participant rows,
-    /// adding rows for read-only participants (a lock byte, no arena record).
+    /// Merge lock-file facts into the participant rows, adding read-only participants.
     pub fn merge_lock_rows(&mut self, lock_rows: &[(u32, u32, &'static str, String, bool)]) {
         for (slot, pid, mode, comm, held) in lock_rows {
             match self.participants.iter_mut().find(|p| p.slot == *slot) {
                 Some(existing) => {
                     existing.mode = Some(mode);
                     existing.comm.clone_from(comm);
-                    // The kernel's answer wins: a record with a released byte is a leaked slot.
                     existing.alive = *held;
                 }
                 None => self.participants.push(ParticipantSample {
@@ -377,14 +343,13 @@ pub struct IntervalStats {
     pub n: usize,
     /// Smallest interval.
     pub min_ns: i64,
-    /// Median interval — what the rate is derived from.
+    /// Median interval; the rate derives from it.
     pub median_ns: i64,
-    /// p99 interval, which is what `TFT008`'s jitter question asks about.
+    /// p99 interval (`TFT008`).
     pub p99_ns: i64,
-    /// Largest interval, which is what `TFT009`'s dropout question asks about.
+    /// Largest interval (`TFT009`).
     pub max_ns: i64,
-    /// How many intervals were not strictly positive — a stamp that did not
-    /// advance, or went backwards, between two consecutive pushes.
+    /// How many intervals were not strictly positive.
     pub non_monotonic: usize,
 }
 
@@ -402,8 +367,7 @@ impl IntervalStats {
 }
 
 /// Order statistics over `intervals`, or `None` if there are none.
-///
-/// Sorts a copy; the histogram needs push order.
+/// Order statistics over `intervals` (sorts a copy), or `None` if there are none.
 #[must_use]
 pub fn interval_stats(intervals: &[i64]) -> Option<IntervalStats> {
     if intervals.is_empty() {
@@ -412,7 +376,6 @@ pub fn interval_stats(intervals: &[i64]) -> Option<IntervalStats> {
     let mut sorted = intervals.to_vec();
     sorted.sort_unstable();
     let n = sorted.len();
-    // `(n - 1) * 99 / 100`: `n * 99 / 100` is the maximum at every multiple of 100.
     let p99 = sorted[(n - 1) * 99 / 100];
     Some(IntervalStats {
         n,
@@ -436,8 +399,8 @@ pub struct Bucket {
 }
 
 /// A linear histogram of `intervals` over `buckets` bins spanning min..=max.
-///
-/// Linear: a lone dropout is one lonely bar. One bucket when all intervals are equal.
+/// A linear histogram of `intervals` over `buckets` bins spanning min..=max; one
+/// bucket when all intervals are equal.
 #[must_use]
 pub fn histogram(intervals: &[i64], buckets: usize) -> Vec<Bucket> {
     if intervals.is_empty() || buckets == 0 {
@@ -456,11 +419,9 @@ pub fn histogram(intervals: &[i64], buckets: usize) -> Vec<Bucket> {
     let n = buckets as i64;
     let mut counts = vec![0usize; buckets];
     for v in intervals {
-        // `.min(buckets - 1)` is load-bearing: `v == max` gives `n`, past the last bucket.
         let idx = ((v.saturating_sub(min)) as i128 * n as i128 / span as i128) as usize;
         counts[idx.min(buckets - 1)] += 1;
     }
-    // `i128` edges: `span * i` overflows `i64` for a wall-clock stamp in a boot-relative ring.
     let span128 = i128::from(span);
     let clamp = |v: i128| i64::try_from(v).unwrap_or(i64::MAX);
     (0..buckets)
@@ -472,9 +433,7 @@ pub fn histogram(intervals: &[i64], buckets: usize) -> Vec<Bucket> {
         .collect()
 }
 
-/// Pick the edge a `--edge <needle>` detail view is about.
-///
-/// An exact id first, then the first label containing `needle`.
+/// Pick the `--edge <needle>` edge: an exact id, else the first label containing `needle`.
 #[must_use]
 pub fn select_edge<'a>(edges: &'a [EdgeSample], needle: &str) -> Option<&'a EdgeSample> {
     select_edge_index(edges, needle).map(|i| &edges[i])
@@ -498,9 +457,7 @@ pub struct FeedEvent {
     pub tick: u64,
     /// How serious it is, in the catalogue's vocabulary.
     pub severity: Severity,
-    /// The catalogue id this corresponds to, where one does.
-    ///
-    /// `None` for events that are not `TFT` findings (a claim changing hands).
+    /// The catalogue id, or `None` for non-`TFT` events (a claim changing hands).
     pub id: Option<Tft>,
     /// What it is about (an edge label, usually).
     pub subject: String,
@@ -519,15 +476,11 @@ struct PrevEdge {
     silence_reported: bool,
 }
 
-/// How many ticks an edge that *was* publishing must stay still before the feed
-/// calls it silent.
-///
-/// Three, not one: a slow publisher can straddle a tick boundary.
+/// How many ticks a publishing edge must stay still before the feed calls it silent.
 const SILENCE_TICKS: u64 = 3;
 
 /// Turns a stream of [`Capture`]s into per-tick rows and feed events.
-///
-/// The view's only mutable state; testable with hand-built captures.
+/// Turns a stream of [`Capture`]s into per-tick rows and feed events.
 #[derive(Debug, Default)]
 pub struct Sampler {
     tick: u64,
@@ -535,17 +488,14 @@ pub struct Sampler {
     feed: VecDeque<FeedEvent>,
 }
 
-/// One edge's row in the rendered table.
-///
-/// Positional: `rows[i]` describes `capture.edges[i]`.
+/// One edge's row; `rows[i]` describes `capture.edges[i]`.
 #[derive(Clone, Debug)]
 pub struct EdgeRow {
     /// Order statistics over the retained intervals.
     pub stats: Option<IntervalStats>,
     /// Samples published since the previous tick.
     pub delta_head: u64,
-    /// `delta_head` over the observer's own elapsed wall time — the rate that
-    /// does not depend on the publisher's clock epoch.
+    /// `delta_head` over the observer's elapsed wall time.
     pub observed_hz: Option<f64>,
     /// Age of the newest stamp against [`Capture::arena_now`], nanoseconds.
     pub age_ns: Option<i64>,
@@ -565,8 +515,7 @@ pub struct Tick {
     /// One row per edge, id order.
     pub rows: Vec<EdgeRow>,
     /// The whole retained feed, oldest first.
-    ///
-    /// The whole retained feed (bounded by `FEED_CAPACITY`), not just the visible tail.
+    /// The whole retained feed (bounded by `FEED_CAPACITY`), oldest first.
     pub feed: Vec<FeedEvent>,
 }
 
@@ -582,10 +531,7 @@ impl Sampler {
     }
 
     /// Fold one capture in, producing this tick's rows and appending to the feed.
-    ///
-    /// `elapsed` is the observer's wall time since the previous capture; the
-    /// first tick should pass whatever it likes, because `delta_head` is zero
-    /// there and no rate is derived from it.
+    /// `elapsed` is the observer's wall time since the previous capture.
     #[must_use]
     pub fn observe(&mut self, capture: Capture, elapsed: Duration) -> Tick {
         self.tick += 1;
@@ -652,7 +598,6 @@ impl Sampler {
                 } else {
                     None
                 },
-                // Saturating: the stamp and reference can be in different domains.
                 age_ns: match (now, e.newest_stamp) {
                     (Some(n), Some(s)) => Some(n.saturating_sub(s)),
                     _ => None,
@@ -697,7 +642,6 @@ impl Sampler {
             self.push_event(FeedEvent {
                 tick,
                 severity: Severity::Warn,
-                // `TFT011`'s question, observed directly.
                 id: Some(Tft::Tft011),
                 subject: e.label.clone(),
                 message: format!("+{} reader lapped by the writer", delta.recycled),
@@ -806,10 +750,7 @@ pub struct RenderOpts {
     pub interval: Duration,
 }
 
-/// Render one tick as a screenful of text.
-///
-/// Returns a `String`, so the view is a pure function of the tick (testable
-/// without a terminal) and one `write_all` per frame avoids a half-drawn flicker.
+/// Render one tick as a screenful of text; a pure function of the tick.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
@@ -838,7 +779,6 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
         },
     );
 
-    // The perturbation disclosure, on screen because it is asked while running.
     let _ = writeln!(
         s,
         "  {}{}{}",
@@ -882,13 +822,11 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
         p.reset
     );
 
-    // The same two lines `doctor` prints, from the same code.
     let rings =
         crate::sizing::Rings::from_edges(cap.edges.iter().map(|e| (e.capacity, e.occupancy())));
     let _ = writeln!(s, "  {}", rings.line());
     let _ = writeln!(s, "  {}{}{}", p.dim, crate::sizing::FORMULA, p.reset);
 
-    // `doctor` prints the same `Clock::label`, so the two tools' references compare.
     match cap.clock {
         None => {
             let _ = writeln!(
@@ -900,7 +838,6 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
         Some(clock) => {
             let _ = writeln!(
                 s,
-                // `Clock::label` already says whether the epochs agree.
                 "  {}ages are against the {} ({} ns){}",
                 p.dim,
                 clock.label(),
@@ -911,13 +848,11 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
     }
     s.push('\n');
 
-    // `rate(Hz)` is stamp-derived and `d/s` wall-derived.
     let _ = writeln!(
         s,
         "  {:<30} {:<9} {:>9} {:>8} {:>11} {:>10} {:>11} {:>10} {:>7}",
         "edge", "kind", "rate(Hz)", "d/s", "occupancy", "age(ms)", "writer", "ok", "err"
     );
-    // `rows[i]` describes `edges[i]` (see [`EdgeRow`]).
     for (row, e) in tick.rows.iter().zip(&cap.edges) {
         let kind = match e.kind {
             EdgeKind::Static => "static",
@@ -928,7 +863,6 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
             .stats
             .and_then(|st| st.rate_hz())
             .map_or_else(String::new, |hz| format!("{hz:.1}"));
-        // Blank for a static edge: its head cannot advance.
         let dps = if e.capacity == 0 {
             String::new()
         } else {
@@ -950,7 +884,6 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
         } else {
             String::new()
         };
-        // A recent failure and an unwritten dynamic edge are both "look here".
         let colour = if row.delta_errors > 0 || (e.kind == EdgeKind::Dynamic && !e.claimed) {
             p.warn
         } else {
@@ -988,8 +921,6 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
     }
     let now = cap.arena_now();
     for pa in &cap.participants {
-        // `attached_at_nanos` (arena clock) and ring stamps (publisher clock)
-        // routinely disagree; `epoch?` replaces a negative age.
         let attached = match (now, pa.attached_at_nanos) {
             (Some(n), a) if a > 0 && n >= a => format!("{:.1}", (n - a) as f64 / 1e9),
             (_, a) if a > 0 => "epoch?".to_owned(),
@@ -1051,8 +982,7 @@ pub fn render(tick: &Tick, opts: &RenderOpts) -> String {
     s
 }
 
-/// The `--edge` pane: window, order statistics, counters and the inter-arrival
-/// histogram.
+/// The `--edge` pane: window, order statistics, counters and histogram.
 fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
     use core::fmt::Write as _;
     let Some(i) = select_edge_index(&tick.capture.edges, needle) else {
@@ -1060,7 +990,6 @@ fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
         return;
     };
     let e = &tick.capture.edges[i];
-    // Sanitized, not truncated: the full name is the point.
     let _ = writeln!(
         s,
         "  {}edge detail{} — {}",
@@ -1073,7 +1002,6 @@ fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
         "  kind {:?}  capacity {}  head {}  retained {} samples",
         e.kind, e.capacity, e.head, e.retained,
     );
-    // The header's arithmetic narrowed to this edge, by the same code.
     let _ = writeln!(
         s,
         "  {}",
@@ -1105,7 +1033,6 @@ fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
             let _ = writeln!(s, "  retained window: empty");
         }
     }
-    // Already computed in `observe`; do not re-sort per frame.
     let Some(st) = tick.rows[i].stats else {
         let _ = writeln!(
             s,
@@ -1131,7 +1058,6 @@ fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
     let buckets = histogram(&e.intervals, 10);
     let peak = buckets.iter().map(|b| b.count).max().unwrap_or(1).max(1);
     for b in &buckets {
-        // 40 columns, scaled to the peak: the shape is the point.
         let width = b.count * 40 / peak;
         let _ = writeln!(
             s,
@@ -1144,8 +1070,7 @@ fn render_detail(s: &mut String, tick: &Tick, needle: &str, p: Palette) {
     }
 }
 
-/// A refresh interval in the unit it was probably typed in (`{:.1}s` alone would
-/// render `--interval 60` as `0.1s`).
+/// A refresh interval in the unit it was probably typed in.
 #[must_use]
 pub fn fmt_interval(d: Duration) -> String {
     if d < Duration::from_secs(1) {
@@ -1171,14 +1096,10 @@ pub fn fmt_ns(ns: i64) -> String {
     }
 }
 
-/// Replace every control character with `?`.
+/// Replace every control character (including C1) with `?`.
 ///
-/// Frame names (arbitrary UTF-8) and the lock file's `comm` are bytes another
-/// process wrote, and a frame named `"\x1b[2Jowned"` would repaint the operator's
-/// terminal and break `--color never` output. `catalogue::json_escape` is the
-/// JSON path's half. It also fixes alignment (`{:<30}` counts a control
-/// character as zero columns). C1 (`0x80..=0x9F`) is included: an 8-bit terminal
-/// reads `U+009B` as CSI.
+/// Frame names and `comm` are bytes another process wrote; unsanitized, an escape
+/// sequence would repaint the terminal. `catalogue::json_escape` is the JSON half.
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -1191,10 +1112,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// Sanitize, then truncate to `n` characters with an ellipsis when it bites.
-///
-/// Counts `char`s, not bytes (a byte slice would panic mid-codepoint), and
-/// sanitizes first so truncation cannot cut an escape in half.
+/// Sanitize, then truncate to `n` characters (not bytes) with an ellipsis.
 fn truncate(s: &str, n: usize) -> String {
     let s = sanitize(s);
     if s.chars().count() <= n {
@@ -1203,9 +1121,7 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
 }
 
-/// Terminal control for the redraw, or nothing at all when stdout is not a tty.
-///
-/// Piped output must be plain text, free of escape sequences.
+/// Terminal control for the redraw, or nothing when stdout is not a tty.
 struct Screen {
     tty: bool,
     first: bool,
@@ -1222,7 +1138,6 @@ impl Screen {
             return "";
         }
         if core::mem::take(&mut self.first) {
-            // Clear once, then overwrite: clearing every frame flickers.
             "\x1b[2J\x1b[H"
         } else {
             "\x1b[H"
@@ -1239,13 +1154,11 @@ impl Screen {
     }
 }
 
-/// Run the view.
-///
-/// `iterations == 0` means "until interrupted"; no sleep follows the last frame.
+/// Run the view; `iterations == 0` means "until interrupted".
 ///
 /// # Errors
 ///
-/// Only stdout failures; a closed pipe (`head -n 20`) exits quietly.
+/// Only stdout failures; a closed pipe exits quietly.
 pub fn run(
     tree: &Tree,
     source: &'static str,
@@ -1337,10 +1250,6 @@ mod tests {
     }
 
     /// A 100 Hz stream with one 500 ms dropout: the median is the period.
-    ///
-    /// Mutant: make `interval_stats` fill `median_ns` with the *mean*
-    /// (`intervals.iter().sum::<i64>() / n as i64`), which is what
-    /// [`IntervalStats::rate_hz`] then divides into.
     #[test]
     fn median_rate_survives_a_dropout() {
         let mut stamps: Vec<i64> = (0..40).map(|i| i * 10_000_000).collect();
@@ -1361,9 +1270,6 @@ mod tests {
     }
 
     /// A stamp that goes backwards is counted, not silently absorbed.
-    ///
-    /// Mutant: change `filter(|v| **v <= 0)` to `filter(|v| **v < 0)` in
-    /// `interval_stats`.
     #[test]
     fn non_monotonic_intervals_are_counted() {
         let stamps = [0i64, 10, 10, 30, 20, 40];
@@ -1372,10 +1278,7 @@ mod tests {
         assert_eq!(st.min_ns, -10);
     }
 
-    /// The slowest interval — the dropout, the thing being looked for — must
-    /// land in the last bucket rather than one past it.
-    ///
-    /// Mutant: drop the `.min(buckets - 1)` clamp in `histogram`.
+    /// The slowest interval lands in the last bucket, not one past it.
     #[test]
     fn histogram_puts_the_maximum_in_the_last_bucket() {
         let intervals = [10i64, 20, 30, 40, 100];
@@ -1386,10 +1289,7 @@ mod tests {
         assert_eq!(h[0].count, 3, "10, 20 and 30 are all in the bottom decile");
     }
 
-    /// A perfectly regular publisher has a zero-width span; that is normal, not
-    /// a division by zero.
-    ///
-    /// Mutant: delete the `span == 0` early return.
+    /// A zero-width span is normal, not a division by zero.
     #[test]
     fn histogram_handles_a_perfectly_regular_stream() {
         let h = histogram(&[10_000_000; 32], 10);
@@ -1398,11 +1298,7 @@ mod tests {
         assert_eq!(h[0].lo_ns, 10_000_000);
     }
 
-    /// Counter *deltas* drive the feed, so a counter that was already high when
-    /// `top` attached does not produce a phantom burst on the first frame.
-    ///
-    /// Mutant: in `observe`, replace the `prev`-guarded delta with `e.counters`
-    /// itself (i.e. treat the absolute value as the delta).
+    /// Counter deltas drive the feed: no phantom burst on the first frame.
     #[test]
     fn a_preexisting_counter_value_is_not_a_first_frame_event() {
         let mut e = edge(1, &[0, 10_000_000, 20_000_000]);
@@ -1418,10 +1314,7 @@ mod tests {
         assert!(t2.feed[0].message.contains("+2"), "{:?}", t2.feed[0]);
     }
 
-    /// An edge that stops advancing is reported once, not once per tick, and
-    /// only after `SILENCE_TICKS`.
-    ///
-    /// Mutant: delete the `silence_reported = true` assignment.
+    /// A stopped edge is reported once, after `SILENCE_TICKS`.
     #[test]
     fn silence_is_reported_once_and_only_after_the_grace_period() {
         let mut s = Sampler::new();
@@ -1450,8 +1343,6 @@ mod tests {
     }
 
     /// Silence is forgiven: an edge that resumes and stops again reports again.
-    ///
-    /// Mutant: delete the `if advanced { silence_reported = false; }` branch.
     #[test]
     fn silence_rearms_after_the_edge_resumes() {
         let stamps = [0i64, 10_000_000];
@@ -1470,11 +1361,7 @@ mod tests {
         assert_eq!(silences.len(), 2, "{feed:?}");
     }
 
-    /// Ages are relative to the arena's newest stamp, not to the host clock —
-    /// an arena whose stamps are boot-relative must not read as 56 years stale.
-    ///
-    /// Mutant: make `EdgeRow::age_ns` use `SystemTime::now()` nanos as the reference
-    /// instead of `Capture::arena_now`.
+    /// Ages are relative to the arena's newest stamp, not the host clock.
     #[test]
     fn ages_are_measured_against_the_arena_clock() {
         let fresh = edge(1, &[1_000_000_000, 1_010_000_000, 1_020_000_000]);
@@ -1487,9 +1374,6 @@ mod tests {
     }
 
     /// `--edge 1` means edge 1, even though "1" is a substring of "edge#11".
-    ///
-    /// Mutant: swap the two arms of `select_edge` so the substring match is tried
-    /// first.
     #[test]
     fn edge_selection_prefers_an_exact_id() {
         let edges = vec![edge(11, &[0, 1]), edge(1, &[0, 1])];
@@ -1498,11 +1382,7 @@ mod tests {
         assert!(select_edge(&edges, "nope").is_none());
     }
 
-    /// The rendered frame states that it observes without perturbing, names the
-    /// clock its ages are against, and carries no escape sequence when colour
-    /// is off.
-    ///
-    /// Mutant: make `Palette::plain` return `Palette::colour`.
+    /// The frame states it observes without perturbing, names its clock, and has no escapes when colour is off.
     #[test]
     fn a_plain_frame_discloses_the_observer_and_has_no_escapes() {
         let mut s = Sampler::new();
@@ -1528,11 +1408,7 @@ mod tests {
         assert!(out.contains("100.0"), "{out}");
     }
 
-    /// A read-only participant has no arena record, and the pane says so
-    /// instead of dropping it.
-    ///
-    /// Mutant: in `merge_lock_rows`, skip slots with no arena record (i.e. drop the
-    /// `None` arm's `push`).
+    /// A read-only participant has no arena record; the pane shows it anyway.
     #[test]
     fn lock_only_participants_appear_with_record_no() {
         let mut c = capture(vec![edge(1, &[0, 1])]);
@@ -1572,8 +1448,6 @@ mod tests {
     }
 
     /// The lock file's liveness answer overrides the arena record's.
-    ///
-    /// Mutant: delete the `existing.alive = *held;` line.
     #[test]
     fn a_released_lock_byte_makes_an_arena_record_stale() {
         let mut c = capture(Vec::new());
@@ -1593,8 +1467,6 @@ mod tests {
     }
 
     /// The non-tty path emits no cursor control at all.
-    ///
-    /// Mutant: make `Screen::home` return the escape unconditionally.
     #[test]
     fn a_pipe_gets_no_cursor_control() {
         let mut piped = Screen::new(false);
@@ -1606,8 +1478,6 @@ mod tests {
     }
 
     /// A counter that appears to go backwards saturates to zero.
-    ///
-    /// Mutant: change `saturating_sub` to `wrapping_sub` in `CounterSample::since`.
     #[test]
     fn counters_that_go_backwards_saturate() {
         let hi = CounterSample {
@@ -1623,19 +1493,14 @@ mod tests {
     }
 
     /// Multi-byte frame names must not be sliced across a UTF-8 boundary.
-    ///
-    /// Mutant: implement `truncate` as `s[..n].to_owned()`.
     #[test]
     fn truncation_is_char_wise() {
         assert_eq!(truncate("ééééé", 3), "éé…");
         assert_eq!(truncate("abc", 3), "abc");
     }
 
-    /// One publisher with a units error must not define "now" for the whole view
-    /// (`checks::a_single_units_error_cannot_capture_the_reference_clock`): five
-    /// distinct Unix stamps plus one at `UNIX_NOW * 2`.
-    ///
-    /// Mutant: `decide_clock` returning `NewestStamp(max)` makes the healthy ages ~1.7e18 ns.
+    /// One units-error publisher must not define "now"
+    /// (`checks::a_single_units_error_cannot_capture_the_reference_clock`).
     #[test]
     fn one_broken_publisher_cannot_define_the_reference_clock() {
         let mut edges: Vec<EdgeSample> = (0..5)
@@ -1674,13 +1539,9 @@ mod tests {
         );
     }
 
-    /// A boot-relative arena falls back to the median newest stamp, and the
-    /// header names the clock.
-    ///
-    /// Mutant: printing a literal instead of `clock.label()`.
+    /// A boot-relative arena falls back to the median newest stamp; the header names the clock.
     #[test]
     fn a_boot_relative_arena_names_the_median_stamp_as_its_clock() {
-        // Seconds-since-boot stamps; three distinct newest, so the median is neither extreme.
         let edges = vec![
             edge(1, &[1_000_000_000, 1_100_000_000]),
             edge(2, &[1_000_000_000, 1_500_000_000]),
@@ -1695,10 +1556,7 @@ mod tests {
         assert!(out.contains("1500000000 ns"), "{out}");
     }
 
-    /// A stamp near `i64::MIN` must not panic the age column (a wall-clock stamp
-    /// in a boot-relative arena or the reverse).
-    ///
-    /// Mutant: `Some(n - s)` instead of `n.saturating_sub(s)`.
+    /// A stamp near `i64::MIN` must not panic the age column.
     #[test]
     fn an_extreme_stamp_saturates_rather_than_panicking() {
         let mut extreme = edge(2, &[i64::MIN, i64::MIN]);
@@ -1710,10 +1568,7 @@ mod tests {
         assert_eq!(t.rows[1].age_ns, Some(i64::MAX));
     }
 
-    /// Bucket edges, not just the index, survive a span wider than `i64::MAX /
-    /// buckets` (one wall-clock stamp in a boot-relative ring gives +-1.75e18).
-    ///
-    /// Mutant: computing the edges in `i64` overflows in the redraw loop.
+    /// Bucket edges survive a span wider than `i64::MAX / buckets`.
     #[test]
     fn histogram_bucket_edges_survive_a_full_range_span() {
         let intervals = [
@@ -1732,8 +1587,6 @@ mod tests {
     }
 
     /// `p99` is the 99th of 100, not the maximum.
-    ///
-    /// Mutant: index with `sorted[n * 99 / 100]`.
     #[test]
     fn p99_is_not_the_maximum_on_a_round_sample_count() {
         let mut intervals = vec![10_000_000i64; 99];
@@ -1745,8 +1598,6 @@ mod tests {
     }
 
     /// A ring holding exactly one sample says so (`intervals.len()` reads `0`).
-    ///
-    /// Mutant: printing `intervals.len() + usize::from(!is_empty())` again.
     #[test]
     fn a_ring_holding_one_sample_reports_one_retained() {
         let one = edge(1, &[12_345]);
@@ -1760,8 +1611,6 @@ mod tests {
     }
 
     /// A frame name must not reach the terminal as an escape sequence.
-    ///
-    /// Mutant: dropping `sanitize` from `truncate` and `render_detail`.
     #[test]
     fn a_hostile_frame_name_cannot_reach_the_terminal() {
         let mut e = edge(1, &[0, 10_000_000]);
@@ -1779,8 +1628,6 @@ mod tests {
     }
 
     /// `top`'s occupancy colour fires on exactly the rule `TFT015` fires on.
-    ///
-    /// Mutant: compare with `frac >= OCCUPANCY_LIMIT`.
     #[test]
     fn occupancy_colours_on_the_same_rule_tft015_fires_on() {
         let render_with = |used: u32| {
@@ -1815,15 +1662,9 @@ mod tests {
         }
     }
 
-    /// `top` reads the arena and performs no lookup (banner claim; `docs/PHASE5.md`
-    /// §7's amendment): counter activity in total, since a failing lookup moves
-    /// an error counter.
-    ///
-    /// An in-process writable tree on purpose: on a read-only attachment
-    /// `Guard::drop` returns early, so the property holds structurally and a live
-    /// assertion would be vacuous.
-    ///
-    /// Mutant: a `tree.lookup("map", "odom", newest)` in `Capture::from_tree`.
+    /// `top` performs no lookup (`docs/PHASE5.md` §7's amendment): total counter
+    /// activity is unchanged. In-process writable tree on purpose; a read-only
+    /// attachment would hold structurally and the assertion would be vacuous.
     #[cfg(feature = "counters")]
     #[test]
     fn capturing_the_arena_moves_no_counter() {
@@ -1847,8 +1688,7 @@ mod tests {
             );
         }
 
-        // Non-vacuity: these counters do move. `map <- odom`, not a longer chain:
-        // `Guard::drop` credits `lookups_ok` only for a single-edge batch.
+        // Non-vacuity: `Guard::drop` credits `lookups_ok` only for a single-edge batch.
         let one_edge = Capture::from_tree(&tree, "test")
             .edges
             .into_iter()

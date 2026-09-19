@@ -1,23 +1,9 @@
-//! **Recovery from C — `docs/decisions/0044`.**
-//!
-//! Until these three entry points existed, an all-C++/Python fleet whose arena
-//! owner was `SIGKILL`ed **could not rejoin it**. The survivors keep their
-//! participant bytes, so `docs/PHASE2.md` §3.4 step 4 refuses every new create
-//! with `ArenaHeldButUnreachable`; the one call that ends that state —
-//! `Tree::inherit_ownership` — was Rust-only, and worse, took `&mut self` while
-//! both bindings hold the tree in an `Arc`. The documented recovery was to stop
-//! every attached process. ROS 2 nodes are written in C++ and Python.
-//!
-//! So this test is the scenario, run through the C ABI: own, join, kill, and
-//! recover. It fails on every revision before `0044`, at the point where the
-//! symbol does not exist.
+//! Recovery from C (`docs/decisions/0044`): own, join, kill, recover, through
+//! the C ABI.
 #![cfg(all(feature = "shm", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
-// exercise or measure it** (`docs/decisions/0048`: a kind is a property, not a
-// crate name). The posture is declared here rather than inherited:
-// `crates/tf_tree_c/src/lib.rs` does not govern this file, because a test or
-// example is a **separate crate root**. `0048` step 4 is what this closes.
+// `docs/decisions/0007` rule 1, kind 5: our own C ABI called from Rust; a test
+// is a separate crate root, so the posture is declared here (`0048`).
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -31,8 +17,7 @@ use tf_tree_c::{
     TFT_OWNER_ALIVE,
 };
 
-/// One runtime directory for the file, for `bridge_shared.rs`'s reason: `set_var`
-/// is process-wide, so per-test directories would race.
+/// One runtime directory for the file: `set_var` is process-wide.
 fn scratch_dir() -> &'static PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
@@ -44,8 +29,7 @@ fn scratch_dir() -> &'static PathBuf {
     })
 }
 
-/// The owner, as a **process**: only the kernel can take its locks away without
-/// its cooperation, which is the whole state under test.
+/// The owner as a process: only the kernel can release its locks uncooperatively.
 fn spawn_owner(name: &str) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_arena_owner"))
         .arg(name)
@@ -73,27 +57,12 @@ fn open_rw(name: &str) -> *mut tft_tree {
     tree
 }
 
-/// **The scenario `0044` is about: owner dies, and a C consumer recovers the
-/// arena by itself.**
+/// Owner dies; a C consumer recovers the arena itself.
 ///
-/// Four claims, in the order a node would meet them:
-///
-/// 1. With the owner alive, `tft_tree_owner_lost` is `false` and inheriting
-///    reports `TFT_OWNER_ALIVE` — so the loop is cheap and does nothing.
-/// 2. With the owner dead, `owner_lost` is `true`.
-/// 3. Inheriting then reports `TFT_INHERITED`: **this** process is the owner.
-/// 4. And it stops saying the owner is gone, so the loop settles rather than
-///    re-attempting the ownership lock every cycle
-///    (`docs/decisions/0043`).
-/// 5. `tft_tree_reap_dead` then collects **one** record — the dead owner's.
-///    Nothing hangs up on an owner, so its `LIVE` record over a kernel-released
-///    byte is one of the exactly two states the hangup callback cannot reach,
-///    and a C process had no way to collect it. Written as `1` and then `0`
-///    rather than "some number": the count is the evidence.
-///
-/// **Mutant:** none is offered for the symbols themselves — deleting any of the
-/// three stops this file compiling, which is the strongest form of the
-/// assertion and is exactly the state every revision before `0044` was in.
+/// Pins: owner alive gives `owner_lost == false` and `TFT_OWNER_ALIVE`; owner dead
+/// gives `true` and `TFT_INHERITED`; afterwards `owner_lost` settles to `false`
+/// (`0043`); `tft_tree_reap_dead` collects exactly the dead owner's record (`1`,
+/// then `0`).
 #[test]
 fn a_c_consumer_recovers_an_arena_whose_owner_died() {
     let name = "c_recovery";
@@ -117,8 +86,7 @@ fn a_c_consumer_recovers_an_arena_whose_owner_died() {
         );
     }
 
-    // `wait` after `kill`, so the kernel has torn the descriptors down — its
-    // ownership byte and its participant byte are released with no cooperation.
+    // `wait` after `kill`, so the kernel has released the owner's bytes.
     owner.kill().expect("kill the owner");
     owner.wait().expect("reap the owner");
 
@@ -136,21 +104,14 @@ fn a_c_consumer_recovers_an_arena_whose_owner_died() {
              (got {how}; TFT_CONTENDED is {TFT_CONTENDED})"
         );
 
-        // And it settles: this process is the owner now, so there is nothing to
-        // report and nothing to retry.
+        // Settled: this process is the owner now.
         assert_eq!(tf_tree_c::tft_tree_owner_lost(tree, &mut lost), TFT_OK);
         assert!(
             !lost,
             "an owner that reads its own death would retry the lock forever"
         );
 
-        // **And the dead owner's own record is collected, which is one of the
-        // exactly two states with no hangup for anybody to observe.** The
-        // owner's socket-hangup callback frees a dead *joiner*; nothing hangs up
-        // on the owner itself, so its `LIVE` record over a byte the kernel has
-        // released outlives it until some survivor sweeps. That survivor could
-        // not be a C process before this. The count is asserted rather than
-        // ignored because it is the whole reason the entry point exists.
+        // Nothing hangs up on an owner, so its record survives until a sweep.
         let mut reaped = u32::MAX;
         assert_eq!(tf_tree_c::tft_tree_reap_dead(tree, &mut reaped), TFT_OK);
         assert_eq!(
@@ -158,8 +119,7 @@ fn a_c_consumer_recovers_an_arena_whose_owner_died() {
             "the dead owner's participant record should have been collected"
         );
 
-        // Idempotent: a second sweep finds nothing, so a supervisor may call it
-        // on a timer without the count meaning something different each time.
+        // Idempotent.
         assert_eq!(tf_tree_c::tft_tree_reap_dead(tree, &mut reaped), TFT_OK);
         assert_eq!(reaped, 0, "nothing is left, and sweeping again must say so");
 
@@ -167,9 +127,7 @@ fn a_c_consumer_recovers_an_arena_whose_owner_died() {
     }
 }
 
-/// The three entry points refuse a NULL handle and a NULL out-parameter rather
-/// than dereferencing either, which is `docs/PHASE4.md` §3.2's rule for every
-/// function in the header.
+/// NULL handles and out-parameters are refused (`docs/PHASE4.md` §3.2).
 #[test]
 fn the_recovery_entry_points_validate_their_arguments() {
     let mut b = false;

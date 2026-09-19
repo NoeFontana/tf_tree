@@ -1,18 +1,7 @@
 //! What one [`Ingest::offer`] costs, in instructions — `docs/PHASE4.md` §7.
 //!
-//! Instructions, not time: this host fails `Fitness::probe` (SMT, unreadable
-//! governor, `perf_event_paranoid` 4). `cachegrind`'s simulated `Ir` is exact
-//! under load but is not a latency figure.
-//!
-//! As in `tf_tree_bench::bin::footprint`: `N = 0` does setup only, so
-//! `Ir(N) - Ir(0)` isolates the offers; no clock reads in the loop (receipt
-//! stamps are synthesised); one mode per process.
-//!
-//! The edge count is swept because a one-key `BTreeMap` never compares
-//! anything: `ByEdge` cost is `O(log E)` descents times the shared name prefix,
-//! so `Ir` per offer should rise with edges before an index exists and be flat
-//! after. Both `short` (4 shared bytes) and `ros` (15) names are reported.
-//!
+//! `N = 0` does setup only, so `Ir(N) - Ir(0)` isolates the offers; one mode per process.
+//! The edge count is swept, with `short` (4 shared bytes) and `ros` (15) names.
 //! Run: `just bridge-footprint` (container; needs `valgrind`).
 // This binary's entire output *is* its result.
 #![allow(
@@ -27,7 +16,7 @@ use std::time::Instant;
 
 use tf_tree_bridge::{Action, Ingest, Publisher, Sample, SteadyNanos, Topic, TopologyConfig};
 
-/// `docs/PHASE4.md` §7's row is "1 kHz × 20 edges", so 20 is the headline.
+/// `docs/PHASE4.md` §7's row is "1 kHz × 20 edges".
 const EDGES_DEFAULT: usize = 20;
 /// Never zero: `SteadyNanos(0)` is the "no receipt clock" sentinel.
 const T0: i64 = 5_000_000_000_000;
@@ -67,11 +56,11 @@ fn topology(edges: usize, style: Names) -> String {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
-    /// The accepted `/tf` transform. The path a healthy robot spends its life on.
+    /// The accepted `/tf` transform.
     Declared,
     /// An edge the config does not declare.
     Undeclared,
-    /// A publisher replaying stamps from five seconds ago: refused every time, never latching.
+    /// A publisher replaying stamps from five seconds ago: refused every time.
     Regressing,
 }
 
@@ -82,18 +71,17 @@ fn run(mode: Mode, edges: usize, style: Names, n: usize) -> u64 {
     let mut ingest = Ingest::new(&cfg);
     let publisher = Publisher::named(&tf_tree_bridge::gid_for_name("/ekf"), "/ekf");
 
-    // Built before the loop: a per-iteration `String` clone would be charged to `offer`.
+    // Built before the loop so no clone is charged to `offer`.
     let mut samples: Vec<Sample> = Vec::with_capacity(edges);
     for i in 0..edges {
         let (p, c) = match mode {
-            // Absent from the config, distinct per index.
             Mode::Undeclared => (format!("ghost{i}"), format!("ghost{}", i + 1)),
             _ => edge_names(style, i),
         };
         samples.push(Sample::identity(&p, &c, STAMP0).received_at(SteadyNanos(T0)));
     }
 
-    // Warm-up outside the counted window: first sightings intern and allocate.
+    // Warm-up outside the counted window: first sightings allocate.
     let mut stamp = STAMP0;
     let mut received = T0;
     for k in 0..(edges * 4) {
@@ -108,7 +96,6 @@ fn run(mode: Mode, edges: usize, style: Names, n: usize) -> u64 {
         let _ = ingest.offer(Topic::Tf, &s, &publisher);
     }
 
-    // Regressing: rewind five seconds and stay there.
     let base_stamp = if mode == Mode::Regressing {
         stamp - 5_000 * MS
     } else {
@@ -142,10 +129,7 @@ fn run(mode: Mode, edges: usize, style: Names, n: usize) -> u64 {
     black_box(accepted)
 }
 
-/// Wall-clock ns per offer per thread, over `threads` **independent** bridges
-/// (`Ingest::offer` is `&mut self` and thread-affine, so none share one).
-/// Measures allocator and bandwidth effects, not lock contention. Min of
-/// `ROUNDS` rounds, since noise only adds time.
+/// Wall-clock ns per offer per thread over `threads` independent bridges; min of `ROUNDS`.
 fn time(mode: Mode, edges: usize, style: Names, n: usize, threads: usize) {
     const ROUNDS: usize = 7;
     let mut best = f64::INFINITY;
@@ -187,12 +171,10 @@ fn main() {
         _ => Names::Short,
     };
 
-    // A `threads` argument switches to the timed mode.
     if let Some(threads) = a.get(5).and_then(|s| s.parse::<usize>().ok()) {
         time(mode, edges, style, n, threads.max(1));
         return;
     }
     let accepted = run(mode, edges, style, n);
-    // One line for `just bridge-footprint`; `accepted` shows the run did work.
     println!("offer_cost n={n} edges={edges} accepted={accepted}");
 }

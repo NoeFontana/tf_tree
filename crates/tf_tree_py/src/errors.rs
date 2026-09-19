@@ -1,16 +1,14 @@
 //! The exception hierarchy (`docs/PHASE3.md` §4.4).
 //!
-//! Python errors carry a class, a message, and the fields a handler branches on
-//! as attributes (`docs/decisions/0058`), set by [`with_attrs`] into the
-//! instance `__dict__` with `args` left `(message,)`, so pickling works. Mappers
-//! that attach one take `py: Python<'_>` and are called after `py.detach`
-//! returns. Every class is declared under the module path `tf_tree`, so it can
-//! be pickled out of a `multiprocessing` worker; [`ChildProcessDetachedError`]
-//! is `PHASE3.md` §8.1, NORMATIVE.
+//! Errors carry a class, a message, and handler-facing fields as attributes
+//! (`docs/decisions/0058`), set by [`with_attrs`] with `args` left `(message,)`
+//! so pickling works. Mappers that attach one take `py` and run after
+//! `py.detach` returns. [`ChildProcessDetachedError`] is `PHASE3.md` §8.1,
+//! NORMATIVE.
 //!
 //! This module is `docs/API.md` R5's "separate layer": a message never carries
-//! an `EdgeId`, which a Python caller cannot invert. Ids go through
-//! [`edge_label_in`] / [`frame_label`], except `FrameOutOfRange` and the
+//! an `EdgeId`. Ids go through [`edge_label_in`] / [`frame_label`], except where
+//! resolution can only fail.
 //! out-of-range half of `UnknownEdge`, where resolution can only fail.
 
 use pyo3::prelude::*;
@@ -194,8 +192,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Set attributes on `err`'s instance and hand the exception back
-/// (`docs/decisions/0058` §5); a failing `setattr` replaces the error.
+/// Set attributes on `err`'s instance (`0058` §5); a failing `setattr` replaces the error.
 fn with_attrs<'py>(
     py: Python<'py>,
     err: PyErr,
@@ -207,26 +204,17 @@ fn with_attrs<'py>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Naming things
-// ---------------------------------------------------------------------------
-
-/// The one spelling of an edge, `edge "parent" -> "child"`; `span`'s no-data path
-/// pins it in `tests/python/test_frozen.py`.
+/// The one spelling of an edge; pinned in `tests/python/test_frozen.py`.
 pub(crate) fn edge_label_of(parent: &str, child: &str) -> String {
     format!("edge {parent:?} -> {child:?}")
 }
 
-/// [`edge_label_of`] for an id, resolved against a view the caller holds.
-///
-/// Unresolvable ids print `#7` with the reason ([`nameless`]), never `EdgeId(7)`.
-/// One view serves a whole message; there is no `&Tree` spelling.
+/// [`edge_label_of`] for an id; unresolvable ids print `#7` ([`nameless`]).
 pub(crate) fn edge_label_in(tree: &Tree, view: &ArenaView<'_>, edge: EdgeId) -> String {
     resolved_edge(tree, view, edge).0
 }
 
-/// An edge resolved once: the label the sentence reads and the stored pair
-/// `.edge` carries (`docs/decisions/0058` §1).
+/// An edge resolved once: the label and the stored pair `.edge` carries (`0058` §1).
 pub(crate) fn resolved_edge(
     tree: &Tree,
     view: &ArenaView<'_>,
@@ -240,8 +228,7 @@ pub(crate) fn resolved_edge(
     (label, named)
 }
 
-/// A frame id as the caller's own quoted name, bare so it reads inside a
-/// sentence with its own noun; [`frame_phrase_in`] supplies the noun.
+/// A frame id as the caller's quoted name; [`frame_phrase_in`] adds the noun.
 pub(crate) fn frame_label(tree: &Tree, frame: FrameId) -> String {
     frame_label_in(tree, &tree.arena_view(), frame)
 }
@@ -254,8 +241,7 @@ fn frame_label_in(tree: &Tree, view: &ArenaView<'_>, frame: FrameId) -> String {
     }
 }
 
-/// [`frame_label_in`] with the noun; the fallback already begins `frame #7`, so
-/// a caller-side `format!("frame {}")` would double it.
+/// [`frame_label_in`] with the noun (the fallback already begins `frame #7`).
 fn frame_phrase_in(tree: &Tree, view: &ArenaView<'_>, frame: FrameId) -> String {
     match named_frame_in(view, frame) {
         Some(name) => format!("frame {name:?}"),
@@ -263,9 +249,7 @@ fn frame_phrase_in(tree: &Tree, view: &ArenaView<'_>, frame: FrameId) -> String 
     }
 }
 
-/// The one refusal for a name this arena has never interned; `.name` is the name
-/// typed (`docs/decisions/0058` §1). The remedy is in the message because a
-/// traceback shows it and not the class docstring.
+/// The refusal for a name this arena has never interned; `.name` is the name typed (`0058` §1).
 fn frame_not_declared(py: Python<'_>, name: &str) -> PyErr {
     let err = FrameNotDeclaredError::new_err(format!(
         "no frame named {name:?} in this arena; if the name is spelled right, \
@@ -275,11 +259,7 @@ fn frame_not_declared(py: Python<'_>, name: &str) -> PyErr {
     with_attrs(py, err, |e| e.setattr("name", name))
 }
 
-/// Resolve a frame name **without interning**.
-///
-/// [`Tree::frame`] interns on a writable tree, so a typo would spend a frame
-/// slot permanently (`docs/PROJECT.md` §5 D10) and a loop of them could exhaust
-/// the headroom every participant shares. `find_frame` is the read-only probe.
+/// Resolve a frame name **without interning** (`docs/PROJECT.md` §5 D10).
 ///
 /// # Errors
 ///
@@ -296,13 +276,8 @@ pub(crate) fn resolve_frame(py: Python<'_>, tree: &Tree, name: &str) -> PyResult
     }
 }
 
-/// Attribute a `LookupError::UnknownFrame` to one of the names the caller typed.
-///
-/// `UnknownFrame` carries a hash that does not invert, so `Tree.lookup` probes
-/// each name. The engine collapsed three outcomes that want different remedies:
-/// never interned (wait or declare), a hash collision (rename; waiting is wrong)
-/// and a mid-intern publisher (retry). Both names resolving means a peer interned
-/// one in between; [`lookup_err_untagged`] then reports the hash.
+/// Attribute a `LookupError::UnknownFrame` to a name the caller typed, by probing each;
+/// if both resolve, [`lookup_err_untagged`] reports the hash.
 pub(crate) fn unknown_frame_err(
     py: Python<'_>,
     tree: &Tree,
@@ -320,8 +295,7 @@ pub(crate) fn unknown_frame_err(
     lookup_err_untagged(py, tree, e)
 }
 
-/// The two ways a name fails to resolve that are not "never declared": they
-/// raise the base `TfTreeError` (`docs/API.md` R5: the type is the contract).
+/// Name failures other than "never declared": base `TfTreeError` (`docs/API.md` R5).
 fn unresolvable_name(py: Python<'_>, name: &str, e: FrameError) -> PyErr {
     match e {
         FrameError::FrameHashCollision { hash } => TfTreeError::new_err(format!(
@@ -336,7 +310,6 @@ fn unresolvable_name(py: Python<'_>, name: &str, e: FrameError) -> PyErr {
              cannot identify, so no id can be read for it yet and no reader can \
              judge whether that publisher is still alive. Retry"
         )),
-        // `find_frame` never inserts; these two both mean the name cannot be declared here.
         FrameError::ReadOnly | FrameError::CapacityExceeded => frame_not_declared(py, name),
         FrameError::ChildDetached => detached_err(),
         other => TfTreeError::new_err(format!(
@@ -347,24 +320,13 @@ fn unresolvable_name(py: Python<'_>, name: &str, e: FrameError) -> PyErr {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Creating an arena
-// ---------------------------------------------------------------------------
-
-/// Map a failed `tf_tree.build(...)` onto Python, in the caller's own names.
+/// Map a failed `tf_tree.build(...)` onto Python in the caller's own names.
 ///
-/// No arena exists to resolve ids against, so duplicates and cycles are found
-/// in the caller's edge list rather than read from the error (a hash does not
-/// invert; the builder's id order is internal). `Layout` and `Participant` carry
-/// this binding's remedies; `Shm` forwards `ShmError`'s `Display`, whose text
-/// is the search key of `docs/RUNBOOK.md` (`docs/decisions/0059`).
+/// `Shm` forwards `ShmError`'s `Display`, the search key of `docs/RUNBOOK.md` (`0059`).
 pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError) -> PyErr {
     TfTreeError::new_err(match e {
         // Named from the list; both parents are shown so the colliding pair can be found.
         BuildError::DuplicateEdge { child } => match duplicate_child(edges) {
-            // Both parents, not just the child: the caller has to find *which
-            // two pairs* collide, and in a list of forty edges the child's name
-            // alone appears in both of them.
             Some((name, first, second)) => format!(
                 "two edges declare {name:?} as their child — {} and {}. A frame \
                  has exactly one parent, which is what makes this a tree, so \
@@ -381,7 +343,6 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
             "this edge list is too large for the u32 id space: {} pairs",
             edges.len()
         ),
-        // `WouldCreateCycle` is the only provocable variant; the caller's own list answers which.
         BuildError::Topology(_) => match cycle_through(edges) {
             Some(chain) => format!(
                 "this edge list is not a tree: {chain}. Every frame has exactly \
@@ -406,7 +367,6 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
              collision is the only cause a caller can produce; anything else is \
              a bug in tf_tree"
             .to_owned(),
-        // Size only; the other `LayoutError` members are unreachable.
         BuildError::Layout(_) => format!(
             "{} edges at capacity={capacity} do not form a valid arena layout. \
              Every region offset in an arena header is a u32, so the whole \
@@ -433,10 +393,8 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
 
 /// Map a failed `tf_tree.open(...)` onto Python — [`build_err`]'s other half.
 ///
-/// Arms that are already sentences forward their `Display`. `ArenaAbsent` raises
-/// the attribute-free [`ArenaAbsentError`]; `ArenaHeldButUnreachable` raises
-/// [`ArenaHeldButUnreachableError`] with `.holder_slots` and `.ownership_held`
-/// (`docs/decisions/0058` §4), and no pid, which is namespace-local (`0033`).
+/// `ArenaHeldButUnreachable` carries `.holder_slots` and `.ownership_held`, no pid
+/// (`0058` §4, `0033`).
 #[cfg(target_os = "linux")]
 pub(crate) fn open_err(
     py: Python<'_>,
@@ -476,8 +434,7 @@ pub(crate) fn open_err(
     }
 }
 
-/// The first child two edges declare, as `(child, first parent, second parent)`,
-/// in `TreeBuilder::build`'s order.
+/// The first child two edges declare, as `(child, first parent, second parent)`.
 fn duplicate_child(edges: &[(String, String)]) -> Option<(&str, &str, &str)> {
     let mut first: std::collections::HashMap<&str, &str> =
         std::collections::HashMap::with_capacity(edges.len());
@@ -490,8 +447,7 @@ fn duplicate_child(edges: &[(String, String)]) -> Option<(&str, &str, &str)> {
     None
 }
 
-/// A cycle in the caller's edge list, spelled as a chain (`"b" is under "a",
-/// which is under "b"`). Assumes `build` has already rejected duplicate children.
+/// A cycle in the caller's edge list, spelled as a chain; assumes duplicate children rejected.
 fn cycle_through(edges: &[(String, String)]) -> Option<String> {
     let parent: std::collections::HashMap<&str, &str> = edges
         .iter()
@@ -525,14 +481,8 @@ fn nameless(tree: &Tree) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The errors themselves
-// ---------------------------------------------------------------------------
-
-/// A failed `inherit_ownership`. Every error path restores the attachment and
-/// gives back the ownership byte, and the message says so, so a caller does not
-/// restart a healthy fleet
-/// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
+/// A failed `inherit_ownership`. Every error path restores the attachment and the
+/// ownership byte, and the message says so (`0044`).
 #[cfg(target_os = "linux")]
 pub(crate) fn inherit_err(e: &tf_tree::OpenError) -> PyErr {
     TfTreeError::new_err(format!(
@@ -545,10 +495,7 @@ pub(crate) fn inherit_err(e: &tf_tree::OpenError) -> PyErr {
 }
 
 /// The error every entry point raises on a tree inherited across a `fork()`:
-/// [`ChildProcessDetachedError`] (`docs/PHASE3.md` §8.1, NORMATIVE), so a retry
-/// loop catching `TfTreeError` can stop on it by class. It subclasses
-/// `TfTreeError`. The message names the remedy because `multiprocessing` forked,
-/// not the caller.
+/// [`ChildProcessDetachedError`] (`docs/PHASE3.md` §8.1, NORMATIVE); the message names the remedy.
 pub(crate) fn detached_err() -> PyErr {
     ChildProcessDetachedError::new_err(DETACHED)
 }
@@ -559,16 +506,10 @@ const DETACHED: &str = "this tree was inherited across a fork(); the child's map
      (tf_tree.open(...)), or use multiprocessing's 'spawn' or 'forkserver' \
      start method";
 
-/// Map a `LookupError` to its Python exception: a class, a sentence, and the
-/// attributes `docs/decisions/0058` §1 gives that class.
+/// Map a `LookupError` to its Python exception (`0058` §1).
 ///
-/// `domain` is the **query's** tag for `ExtrapolationError.domain` (`0058` §3);
-/// call sites that hold none use [`lookup_err_untagged`]. One [`ArenaView`]
-/// serves the whole message. Variants are enumerated so each failure has one
-/// place to look; the wildcard is `#[non_exhaustive]`'s.
-///
-/// `#[cold]` + `#[inline(never)]` were measured on scalar `plan.at` (`0058`
-/// step 2); the other mappers show no regression and carry neither.
+/// `domain` is the query's tag for `ExtrapolationError.domain` (`0058` §3); call sites
+/// holding none use [`lookup_err_untagged`]. `#[cold]`/`#[inline(never)]`: `0058` step 2.
 #[cold]
 #[inline(never)]
 pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError) -> PyErr {
@@ -635,10 +576,7 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
         LookupError::BufferTooSmall { need, got } => BufferError::new_err(format!(
             "output buffer holds {got} elements; this batch needs {need}"
         )),
-        // `DerivativesUnavailable` is a property of an edge (`docs/PHASE5.md` §4.4
-        // item 1) and permanent; `NoSegment` is of a stamp and transient. Distinct
-        // types because R5 forbids telling them apart by text; a batch fails at
-        // element 0 for the first, possibly later for the second.
+        // `DerivativesUnavailable` is a property of an edge, `NoSegment` of a stamp; distinct types (R5).
         LookupError::DerivativesUnavailable { edge, interp } => {
             let (label, named) = resolved_edge(tree, &view, edge);
             let err = DerivativesUnavailableError::new_err(format!(
@@ -648,15 +586,8 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
             ));
             with_attrs(py, err, |e| e.setattr("edge", named))
         }
-        // `NoSegment` is a property of a **stamp**, and is transient: the ring
-        // retains one sample, or the two bracketing `t` carry equal stamps —
-        // which invariant 6 permits — so there is a pose but no interval to
-        // differentiate over. The fix is to publish another sample or ask again
-        // later, which is the opposite response to the arm above — and telling
-        // the two apart by message text is what R5 forbids. `Plan::at_many_into`
-        // documents the consequence for a batch: the arm above always fires at
-        // element 0 and leaves `out` untouched, this one can fire after `k` rows
-        // are written.
+        // `NoSegment`: a pose but no interval (transient); in a batch it can fire after `k` rows
+        // (`Plan::at_many_into`).
         LookupError::NoSegment { edge } => {
             let (label, named) = resolved_edge(tree, &view, edge);
             let err = NoSegmentError::new_err(format!(
@@ -672,9 +603,7 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
         // Below: base `TfTreeError` by preservation (R5: the type is the
         // contract); only `TimeDomainMismatch` has a leaf (`0058`).
 
-        // Above `MAX_PATH_EDGES` the depth is a floor, so the message says
-        // "longer than"; at or below it is the exact folded step count. No remedy
-        // naming static edges: `tf_tree.build` declares every edge dynamic.
+        // Above `MAX_PATH_EDGES` the depth is a floor, so the message says "longer than".
         LookupError::TreeTooDeep { depth } => {
             TfTreeError::new_err(if usize::from(depth) > tf_tree::MAX_PATH_EDGES {
                 format!(
@@ -704,8 +633,7 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
              consistent sample could be read. Retry",
             edge_label_in(tree, &view, edge)
         )),
-        // Time-domain refusals (D9). The message quotes the integer tag and names
-        // the `domain=` keyword as the remedy (`0038` §3).
+        // Time-domain refusals (D9, `0038` §3).
         LookupError::TimeDomainMismatch { expected, got } => {
             let err = TimeDomainMismatchError::new_err(format!(
                 "this plan was compiled for time domain {expected}; the query \
@@ -748,7 +676,6 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
             "frame id {} is out of range for this arena's frame table",
             frame.get()
         )),
-        // [`frame_phrase_in`], not `format!("frame {}", ..)`, which doubles the noun.
         LookupError::MissingEdge { child } => TfTreeError::new_err(format!(
             "{} has a parent in the topology but no edge records the link, so \
              the path through it cannot be evaluated",
@@ -771,12 +698,8 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
 /// The tag [`lookup_err_untagged`] hands on; nothing reads it.
 const UNTAGGED_TAG: u8 = 0;
 
-/// [`lookup_err`] for the three call sites holding no time-domain tag
-/// (`span_impl`'s two and [`unknown_frame_err`]'s).
-///
-/// Their `Extrapolation` arm is unreachable and reports a bug, so a reachable
-/// raise can never silently get the base class instead of
-/// [`ExtrapolationError`] (R5).
+/// [`lookup_err`] for call sites holding no time-domain tag; its `Extrapolation` arm is
+/// unreachable and reports a bug.
 pub(crate) fn lookup_err_untagged(py: Python<'_>, tree: &Tree, e: LookupError) -> PyErr {
     match e {
         LookupError::Extrapolation {
@@ -798,16 +721,12 @@ pub(crate) fn lookup_err_untagged(py: Python<'_>, tree: &Tree, e: LookupError) -
     }
 }
 
-/// A [`NoDataError`] with its `.edge` around the caller's sentence; both raise
-/// sites (`lookup_err`, `span`) must carry it (`docs/decisions/0058` §1). Takes
-/// the [`resolved_edge`] pair.
+/// A [`NoDataError`] with its `.edge` (`0058` §1); takes the [`resolved_edge`] pair.
 pub(crate) fn no_data_err(py: Python<'_>, edge: Option<(String, String)>, msg: String) -> PyErr {
     with_attrs(py, NoDataError::new_err(msg), |e| e.setattr("edge", edge))
 }
 
-/// The plan-time domain refusal (`docs/decisions/0038` §2): the same
-/// [`TimeDomainMismatchError`] type as the per-query arm (`0058` §4), with prose
-/// naming the route, since both frame names are still strings here.
+/// The plan-time domain refusal (`0038` §2): the same [`TimeDomainMismatchError`] type as the per-query arm.
 pub(crate) fn plan_domain_err(
     py: Python<'_>,
     target: &str,
@@ -835,11 +754,7 @@ fn domain_mismatch_attrs(py: Python<'_>, err: PyErr, expected: u8, got: u8) -> P
     })
 }
 
-/// Name a stored [`InterpPolicy`] discriminant as `interp=` spells it.
-///
-/// `InterpPolicy::from_u8` collapses unknown values onto the default, which
-/// would make a message from a future arena self-contradictory; an unknown
-/// number is echoed unresolved.
+/// Name a stored [`InterpPolicy`] discriminant as `interp=` spells it; an unknown number is echoed.
 fn stored_interp(interp: u8) -> String {
     let policy = InterpPolicy::from_u8(interp);
     if policy.as_u8() == interp {
@@ -852,18 +767,13 @@ fn stored_interp(interp: u8) -> String {
     }
 }
 
-/// Map a failed `push` onto Python. The message names the edge as the caller
-/// typed it ([`edge_label_of`]); the `.edge` attribute is the arena's stored pair
-/// (`docs/decisions/0058` §2). `ChildDetached` raises
-/// [`ChildProcessDetachedError`], `NonMonotonicStamp` raises
-/// [`NonMonotonicStampError`] (`0058` §4), the rest `TfTreeError`. `tree` is
-/// `None` only where the publisher's tree is gone; `.edge` is then `None`.
+/// Map a failed `push` onto Python (`0058` §2, §4). `tree` is `None` only where the
+/// publisher's tree is gone.
 pub(crate) fn push_err(py: Python<'_>, tree: Option<&Tree>, edge: &str, e: PushError) -> PyErr {
     push_class(py, tree, e)(push_msg(edge, e))
 }
 
-/// The class and attributes of a failed push, apart from its sentence, so
-/// `push_many` can prefix the sample index without re-wording or re-typing it.
+/// The class and attributes of a failed push, apart from its sentence.
 pub(crate) fn push_class<'a>(
     py: Python<'a>,
     tree: Option<&'a Tree>,
@@ -888,8 +798,8 @@ pub(crate) fn push_class<'a>(
 /// [`push_err`]'s sentence; the wildcard is `#[non_exhaustive]`'s.
 pub(crate) fn push_msg(edge: &str, e: PushError) -> String {
     match e {
-        // Equal stamps are accepted (invariant 6), hence "older than". The
-        // variant name stays as the search key of `docs/RUNBOOK.md`.
+        // Equal stamps are accepted (invariant 6), hence "older than"; the variant name is a
+        // `docs/RUNBOOK.md` search key.
         PushError::NonMonotonicStamp { last, got, .. } => format!(
             "{edge}: stamp {got} ns is older than the newest published stamp \
              {last} ns. Stamps are non-decreasing per edge; equal stamps are \
@@ -913,13 +823,8 @@ pub(crate) fn push_msg(edge: &str, e: PushError) -> String {
     }
 }
 
-/// Map a failed claim onto Python, naming the edge the caller asked for.
-///
-/// `ClaimApiError`'s `Display` spells edges `EdgeId(3)` and frames by raw index,
-/// unreachable from Python, so arms are re-spelled around the two names passed
-/// to `tree.publisher(child, parent)`. `ChildDetached` raises
-/// [`ChildProcessDetachedError`]; `AlreadyClaimed` raises
-/// [`EdgeAlreadyClaimedError`] (`docs/decisions/0058` §4); the rest `TfTreeError`.
+/// Map a failed claim onto Python (`0058` §4), re-spelling arms around the two names
+/// passed to `tree.publisher(child, parent)`.
 pub(crate) fn claim_err(
     py: Python<'_>,
     tree: &Tree,
@@ -930,8 +835,7 @@ pub(crate) fn claim_err(
     let edge = edge_label_of(parent, child);
     match e {
         ClaimApiError::ChildDetached => detached_err(),
-        // The three races of `docs/decisions/0005` §5 are transient; kept apart
-        // because `LeaseUnavailable` is a lock-file problem retrying cannot fix.
+        // The three races of `0005` §5 are transient; `LeaseUnavailable` is not.
         ClaimApiError::LeaseContended { .. } => TfTreeError::new_err(format!(
             "{edge}: the claim record was free but its lease is still held; \
              retry"
@@ -1007,12 +911,9 @@ pub(crate) fn claim_err(
     }
 }
 
-/// The participant slot holding a claim (not a pid) for [`claim_err`] and
-/// `EdgeAlreadyClaimedError.owner_slot`.
+/// The participant slot holding a claim (not a pid) for [`claim_err`].
 ///
-/// `None` exactly for `u32::MAX`, `edge::slot_of`'s value for a claim word in
-/// `CLAIMING`. No Python test reaches this arm: the window has no §11.3 crash
-/// site (`docs/decisions/0058` §4).
+/// `None` exactly for `u32::MAX`, a claim word in `CLAIMING` (`0058` §4).
 fn claimed_by(owner_slot: u32) -> Option<u32> {
     (owner_slot != u32::MAX).then_some(owner_slot)
 }

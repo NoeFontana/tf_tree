@@ -5,19 +5,15 @@
 //! cargo run --release -p tf_tree --features shm --example control_loop
 //! ```
 //!
-//! It fills `docs/API.md` §8.4's missing executor for the tail: it runs the query
-//! under a concurrent writer and reports p99.9 (`docs/PHASE1.md` §11.2). It is not
-//! the §11.3 gate, which needs core-pinned hardware.
+//! Reports p99.9 under a concurrent writer (`docs/API.md` §8.4,
+//! `docs/PHASE1.md` §11.2); not the §11.3 gate, which needs core-pinned hardware.
 //!
-//! 1. **Compile the plan once**, outside the loop (R1, D3); `Tree::lookup` is the
-//!    convenience tier.
+//! 1. **Compile the plan once**, outside the loop (R1, D3).
 //! 2. **One `Guard` per cycle**, covering every query in it.
-//! 3. **Ask past the newest sample.** A 1 kHz controller on a 200 Hz estimator
-//!    always extrapolates; `ExtrapPolicy::ConstantTwist` extends the last twist and
-//!    `Extrapolated::by_ns` is the number to gate on. The slowest edge on the route
-//!    sets it: `map -> lidar` also crosses the 10 Hz edge, so a budget belongs to a route.
-//! 4. **`SlotContended` is data** (`docs/API.md` §8.2): a writer was mid-publish;
-//!    reuse the previous pose rather than block.
+//! 3. **Ask past the newest sample**: `ExtrapPolicy::ConstantTwist` extends the
+//!    last twist and `Extrapolated::by_ns` is the number to gate on. The slowest
+//!    edge on the route sets it, so a budget belongs to a route.
+//! 4. **`SlotContended` is data** (`docs/API.md` §8.2): reuse the previous pose.
 //! 5. **Never allocate inside the loop**; the histogram is pre-sized.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
@@ -39,19 +35,14 @@ fn run() {
         TreeBuilder,
     };
 
-    /// The controller's rate.
     const CONTROL_HZ: u64 = 1_000;
-    /// The estimator's rate; extrapolation is the ordinary case.
     const ESTIMATE_HZ: u64 = 200;
-    /// Long enough for a p99.9 to mean something.
     const CYCLES: usize = 200_000;
-    /// Per-route extrapolation budget before the controller must degrade; staleness
-    /// is set by the slowest edge on the route.
+    /// Per-route extrapolation budget before the controller must degrade.
     const FAST_BUDGET_NS: i64 = 10_000_000; // 10 ms, over the 200 Hz route
     const FULL_BUDGET_NS: i64 = 150_000_000; // 150 ms, over the 10 Hz one
 
-    // Declare the topology once. Capacities are per edge and sized in time
-    // (`Capacity::history(rate, secs)`): how long a consumer may lag before the ring laps it.
+    // Capacities are sized in time: how long a consumer may lag before the ring laps it.
     let tree = Arc::new(
         TreeBuilder::new()
             .default_interp(InterpPolicy::ScLerp)
@@ -77,8 +68,7 @@ fn run() {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
-    // One clock origin for writer and loop; separate `Instant::now()`s would make
-    // `by_ns` measure startup skew.
+    // One clock origin for writer and loop, else `by_ns` measures startup skew.
     let t0 = Instant::now();
 
     // ---- the estimator, publishing on its own thread ----------------------
@@ -86,7 +76,6 @@ fn run() {
         let tree = Arc::clone(&tree);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            // Same `t0` as the control loop.
             let odom = tree.frame("odom").unwrap();
             let map = tree.frame("map").unwrap();
             let base = tree.frame("base_link").unwrap();
@@ -127,11 +116,9 @@ fn run() {
         assert!(Instant::now() < deadline, "the estimator never published");
         std::thread::sleep(Duration::from_millis(5));
     };
-    // The same route minus the 10 Hz edge. Compiled once, like the other.
     let fast_plan = tree.plan(odom, lidar).expect("compile the fast plan");
 
-    // Everything above happens once; everything below allocates nothing.
-    let mut lat_ns: Vec<u64> = Vec::with_capacity(CYCLES); // pre-sized: see §5
+    let mut lat_ns: Vec<u64> = Vec::with_capacity(CYCLES);
     let mut stale_fast: Vec<i64> = Vec::with_capacity(CYCLES);
     let mut stale_full: Vec<i64> = Vec::with_capacity(CYCLES);
     let mut contended = 0usize;
@@ -144,16 +131,13 @@ fn run() {
 
     for _ in 0..CYCLES {
         next += period;
-        // The stamp is now, past the newest sample by up to one estimator period.
         let now_ns = t0.elapsed().as_nanos() as i64;
         let t = Stamp::<SystemDomain>::from_nanos(now_ns);
 
-        // One guard for both transforms.
         let started = Instant::now();
         let g = tree.guard();
         let fast = fast_plan.at_extrapolating(&g, t, ExtrapPolicy::ConstantTwist);
         let full = plan.at_extrapolating(&g, t, ExtrapPolicy::ConstantTwist);
-        // Both queries and the guard, timed together.
         lat_ns.push(started.elapsed().as_nanos() as u64);
 
         for (answer, budget, stale) in [
@@ -164,19 +148,15 @@ fn run() {
                 Ok(e) => {
                     stale.push(e.by_ns);
                     if e.by_ns > budget {
-                        // Degrade: `by_ns` makes the staleness judgeable.
                         too_stale += 1;
                     } else {
                         last_good = e.pose;
                     }
                 }
-                // Bounded worst case, not a failure: reuse the previous pose.
                 Err(LookupError::SlotContended { .. }) => contended += 1,
-                // Before the estimator's first samples, or after it dies.
                 Err(LookupError::NoData { .. } | LookupError::Extrapolation { .. }) => {
                     no_data += 1;
                 }
-                // A real fault; `Tree::describe` resolves the edge id to names.
                 Err(other) => println!("unexpected: {}", tree.describe(other)),
             }
         }

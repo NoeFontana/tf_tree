@@ -1,34 +1,10 @@
-//! The A/B run store: what every performance harness emits, and how two of
-//! them are compared.
+//! The A/B run store: what every performance harness emits, and how two runs are compared.
 //!
-//! Each harness writes a [`Run`]: every number it took, with the direction it
-//! may move and the slack below which a move is not news. [`diff`] turns two
-//! runs into a verdict per row.
+//! Each harness writes a [`Run`]: every number with its direction and tolerance. [`diff`] turns two runs
+//! into a verdict per row and never infers direction from a key name ([`Metric`], [`Drift`]: `docs/PHASE5.md` §9).
 //!
-//! [`Metric`] and [`Drift`] are `docs/PHASE5.md` §9's; [`diff`] reads
-//! [`Metric::drift`] and never infers direction from a key name.
-//!
-//! Not the §9 report and not wired into `just bench-check`, which compares
-//! against a committed baseline and ignores host facts. This compares two runs
-//! on the *same* host, so a differing host fact surfaces ([`Diff::host_drift`]),
-//! and a differing *build* fact is refused ([`Diff::comparable`]); see
-//! [`HOST_CRITICAL_FACTS`] and [`BUILD_CRITICAL_FACTS`].
-//!
-//! Emitters covered, all by the refusal in [`diff`] with no per-binary opt-in:
-//!
-//! | emitter | artifact | cross-profile refusal |
-//! |---|---|---|
-//! | `contended_scaling`, `scale_sweep`, `soak` | a [`Run`] via `--json` (`just bench-run`, `just bench-ab`) | yes, [`diff`] |
-//! | `dds_report` | a [`Run`] via `aggregate --json` | yes; it measures *other* programs (see [`BUILD_CRITICAL_FACTS`]) |
-//! | `bench_report` | `results.json` vs the committed baseline (`just bench-check`) | yes, [`crate::baseline::PORTABLE_FACTS`] |
-//! | `embed_cost` | `embedder.json` + `release.json`, compared to each other | yes, [`crate::embed::Pair::load`] |
-//! | `native_arena` | a `.tfstream` (an input, not a measurement) | n/a |
-//! | every other `bin/` | stdout only | n/a |
-//!
-//! If a binary grows a `--json`, it grows a [`Run`] and this covers it.
-//!
-//! The schema is emitted by hand so a field rename is a deliberate edit; reading
-//! uses `serde_json`, since a hand-rolled parser fails open.
+//! Every emitter is covered by [`diff`]'s cross-profile refusal ([`BUILD_CRITICAL_FACTS`],
+//! [`crate::baseline::PORTABLE_FACTS`], [`crate::embed::Pair::load`]); `native_arena`'s `.tfstream` is an input.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -40,14 +16,9 @@ use crate::report::{jmetrics, jnum, jstr, Drift, Fitness, Metric, Provenance};
 use crate::workload::Shape;
 
 /// Run-file schema identifier. Bump on any consumer-visible change.
-///
-/// Adding a provenance fact is not a bump (`build_lto` was added without one): an
-/// older file lacks it and [`diff`] treats an absent build fact as a mismatch.
 pub const SCHEMA: &str = "tf_tree.bench-run/1";
 
 /// The provenance facts a timing comparison is only meaningful within.
-///
-/// Not every fact: `generated_utc` and `load_average` differ by construction.
 pub const HOST_CRITICAL_FACTS: &[&str] = &[
     "cpu_model",
     "physical_cores",
@@ -56,26 +27,13 @@ pub const HOST_CRITICAL_FACTS: &[&str] = &[
     "kernel",
     "target",
     "counters_feature",
-    // Both THP knobs: `enabled` governs anonymous (heap-arena) mappings,
-    // `shmem_enabled` the `MAP_SHARED` `memfd`, and they default differently.
-    // `every_host_critical_fact_is_pinned_and_diffed` pins the membership.
+    // Both THP knobs: `enabled` governs heap arenas, `shmem_enabled` the `MAP_SHARED` `memfd`.
     "transparent_hugepage",
     "transparent_hugepage_shmem",
 ];
 
 /// The provenance facts that make a comparison **impossible**, not merely
 /// suspect.
-///
-/// Unlike [`HOST_CRITICAL_FACTS`], these mean the two runs measured **different
-/// programs**, so [`diff`] refuses and `bench_ab` exits non-zero.
-///
-/// `build_profile`: `[profile.release]` is thin LTO, `[profile.embedder]` is not,
-/// and LTO inlines the boundary a boundary measurement prices (`docs/PHASE4.md`
-/// §0.0). `build_lto` catches a profile whose meaning changed under the same name.
-///
-/// The `dds_*` keys exist because `bin/dds_report` only parses the `.out` files of
-/// C++ processes built elsewhere, so it reads their build from the CMake caches
-/// and pushes it here. Both sides absent is agreement; only one side absent refuses.
 pub const BUILD_CRITICAL_FACTS: &[&str] = &[
     "build_profile",
     "build_lto",
@@ -158,12 +116,9 @@ pub struct Run {
 
 impl Run {
     /// Start a run, collecting provenance and probing the host.
-    ///
-    /// `consumers` is what the harness will ask of the machine (for the [`Fitness`] core budget).
     #[must_use]
     pub fn begin(consumers: usize) -> Run {
         let mut provenance = Provenance::collect();
-        // `collect` stamps the report schema; a run file must name its own.
         for f in &mut provenance.facts {
             if f.key == "schema" {
                 f.value = SCHEMA.to_owned();
@@ -182,9 +137,6 @@ impl Run {
     }
 
     /// Refuse a run that cannot be compared.
-    ///
-    /// A directional metric must carry a tolerance (else every last-bit difference
-    /// is a verdict), and row keys must be unique (else the diff depends on `Vec` order).
     ///
     /// # Errors
     ///
@@ -358,13 +310,11 @@ impl Run {
                 facts: facts
                     .into_iter()
                     .map(|(k, v)| crate::report::Fact {
-                        // Keys are leaked into `'static`: a short-lived CLI reads two files.
                         key: Box::leak(k.into_boxed_str()),
                         value: v,
                     })
                     .collect(),
             },
-            // Fitness is not reconstructed: nothing in `diff` reads it.
             fitness: Fitness::assess(0, 1, None, 0.0, None, false, true),
             rows,
         })
@@ -397,9 +347,7 @@ fn parse_metric(key: &str, m: &serde_json::Value, row: usize) -> Result<Metric> 
         .get("value")
         .ok_or_else(|| anyhow!("row {row}: metric `{key}` has no `value`"))?
         .as_f64()
-        // `null` is what `jnum` emits for a non-finite measurement; map it to NaN, not zero.
         .unwrap_or(f64::NAN);
-    // Leaked like the key: `Metric` holds `&'static str`.
     let unit: &'static str = m
         .get("unit")
         .and_then(serde_json::Value::as_str)
@@ -504,23 +452,17 @@ pub struct Diff {
     /// `(fact, a, b)` for each [`HOST_CRITICAL_FACTS`] entry that differs.
     pub host_drift: Vec<(String, String, String)>,
     /// `(fact, a, b)` for each [`BUILD_CRITICAL_FACTS`] entry that differs.
-    ///
-    /// Non-empty means the runs are **not comparable** ([`Diff::comparable`]).
     pub build_mismatch: Vec<(String, String, String)>,
 }
 
 impl Diff {
     /// Whether the two runs describe the same program built the same way.
-    ///
-    /// `false`: [`render`] prints the reason and not the table, and `bench_ab` exits non-zero.
     #[must_use]
     pub fn comparable(&self) -> bool {
         self.build_mismatch.is_empty()
     }
 
     /// Whether any metric regressed beyond its tolerance.
-    ///
-    /// Never consulted when [`Diff::comparable`] is false.
     #[must_use]
     pub fn regressed(&self) -> bool {
         self.deltas.iter().any(|d| d.verdict == Verdict::Worse)
@@ -538,8 +480,6 @@ impl Diff {
 }
 
 /// Compare `b` against baseline `a`.
-///
-/// Matches on `harness/workload/engine/point` plus the metric key.
 #[must_use]
 pub fn diff(a: &Run, b: &Run) -> Diff {
     let index = |run: &Run| -> BTreeMap<String, Vec<Metric>> {
@@ -572,7 +512,6 @@ pub fn diff(a: &Run, b: &Run) -> Diff {
         .cloned()
         .collect();
 
-    // An absent fact reads as a mismatch, not agreement.
     let drift = |facts: &[&str]| -> Vec<(String, String, String)> {
         facts
             .iter()
@@ -599,7 +538,6 @@ pub fn diff(a: &Run, b: &Run) -> Diff {
 }
 
 fn compare(row: &str, a: &Metric, b: &Metric) -> Delta {
-    // Direction comes from the baseline, so a retyped metric is not judged by its own rules.
     let drift = a.drift;
     let tolerance = a.tolerance;
 
@@ -615,7 +553,6 @@ fn compare(row: &str, a: &Metric, b: &Metric) -> Delta {
     } else if drift == Drift::Informational {
         Verdict::Info
     } else if !rel.is_finite() || rel.abs() <= tolerance {
-        // `a == 0`: a relative change against zero is undefined.
         Verdict::Noise
     } else {
         let improved = match drift {
@@ -644,8 +581,6 @@ fn compare(row: &str, a: &Metric, b: &Metric) -> Delta {
 
 /// Render a diff as a table — or, when the two runs are not comparable, as the
 /// reason there is no table.
-///
-/// The table is withheld, not annotated, so its numbers cannot be misquoted.
 #[must_use]
 pub fn render(d: &Diff) -> String {
     let mut s = String::with_capacity(4096);
@@ -696,7 +631,6 @@ pub fn render(d: &Diff) -> String {
     );
     let _ = writeln!(s, "{}", "-".repeat(120));
 
-    // Worse first.
     let mut ordered: Vec<&Delta> = d.deltas.iter().collect();
     ordered.sort_by_key(|x| {
         (
@@ -773,7 +707,6 @@ fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_owned()
     } else {
-        // Keep the tail: the sweep point distinguishes rows.
         let skip = s.chars().count() - (n - 1);
         format!("…{}", s.chars().skip(skip).collect::<String>())
     }
@@ -781,7 +714,6 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    // As `report.rs`'s tests: `panic!`/`expect` name the failing row.
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
@@ -801,7 +733,6 @@ mod tests {
 
     #[test]
     fn an_identical_run_is_all_noise() {
-        // Two runs of the same build produce no verdict.
         let a = run(vec![row("n=1", 100.0, 0.25), row("n=2", 200.0, 0.25)]);
         let b = run(vec![row("n=1", 100.0, 0.25), row("n=2", 200.0, 0.25)]);
         let d = diff(&a, &b);
@@ -820,7 +751,6 @@ mod tests {
 
     #[test]
     fn direction_is_read_not_guessed() {
-        // Direction comes from `Drift`, not the key name.
         let a = run(vec![row("n=1", 100.0, 0.10)]);
         let b = run(vec![row("n=1", 200.0, 0.10)]);
         assert_eq!(diff(&a, &b).deltas[0].verdict, Verdict::Worse);
@@ -897,7 +827,6 @@ mod tests {
         assert_eq!(back.rows[0].metrics[0].value, 123.5);
         assert_eq!(back.rows[0].metrics[0].drift, Drift::LowerIsBetter);
         assert_eq!(back.rows[0].metrics[0].tolerance, 0.25);
-        // The round-tripped run compares as unchanged.
         assert!(diff(&a, &back)
             .deltas
             .iter()
@@ -923,7 +852,6 @@ mod tests {
         let d = diff(&a, &b);
         assert!(d.host_drift.iter().any(|(k, _, _)| k == "cpu_model"));
         assert!(render(&d).contains("HOST DRIFT"));
-        // Host drift warns; the table is still printed.
         assert!(d.comparable(), "a different CPU is not a build mismatch");
         assert!(
             render(&d).contains("row / metric"),
@@ -931,13 +859,7 @@ mod tests {
         );
     }
 
-    /// [`HOST_CRITICAL_FACTS`]'s membership is pinned here, and every key is
-    /// separately shown to be diffed and produced.
-    ///
-    /// The expected list is spelled out, not derived: a loop over the const passes
-    /// with a key deleted. Three doors: deleting a key (membership pin), dropping
-    /// the list from `drift`'s call (per-key loop), renaming a `push` in
-    /// [`Provenance::collect`] (presence loop).
+    /// [`HOST_CRITICAL_FACTS`]'s membership is pinned, and every key is shown to be diffed and produced.
     #[test]
     fn every_host_critical_fact_is_pinned_and_diffed() {
         const EXPECTED: &[&str] = &[
@@ -959,9 +881,6 @@ mod tests {
              `transparent_hugepage` went missing"
         );
 
-        // PRESENCE only, never a value (`unknown` is a correct reading on some hosts).
-        // `BUILD_CRITICAL_FACTS` gets no such loop: `build_*` are asserted in
-        // `report.rs` and the `dds_*` keys come from `bin/dds_report`, not `collect`.
         let produced = Provenance::collect();
         for key in HOST_CRITICAL_FACTS {
             assert!(
@@ -976,7 +895,6 @@ mod tests {
         for key in HOST_CRITICAL_FACTS {
             let mut a = run(vec![row("n=1", 1.0, 0.1)]);
             let mut b = run(vec![row("n=1", 1.0, 0.1)]);
-            // Pin both sides: whether this host records the key is not under test.
             for (r, v) in [(&mut a, "before"), (&mut b, "after")] {
                 match r.provenance.facts.iter_mut().find(|f| &f.key == key) {
                     Some(f) => f.value = v.to_owned(),
@@ -996,8 +914,7 @@ mod tests {
         }
     }
 
-    /// A value for `key` guaranteed to differ from this build's recorded one: a
-    /// hardcoded `"thin"` for `build_lto` agrees under `--release` (`just tf2-check`).
+    /// A value for `key` guaranteed to differ from this build's recorded one.
     fn differing_value(r: &Run, key: &str) -> String {
         let real = r
             .provenance
@@ -1006,18 +923,14 @@ mod tests {
             .find(|f| f.key == key)
             .map_or("", |f| f.value.as_str());
         match key {
-            // `lto` is a TOML scalar: quoted `"thin"` or bare `false`.
             "build_lto" if real == "false" => "\"thin\"".to_owned(),
             "build_lto" => "false".to_owned(),
-            // Profile directory names.
             _ if real == "embedder" => "release".to_owned(),
             _ => "embedder".to_owned(),
         }
     }
 
     /// A run at `--profile embedder` and one at `--release` measure different programs.
-    ///
-    /// Mutant: delete `"build_profile"` from [`BUILD_CRITICAL_FACTS`]; fails on `comparable()`.
     #[test]
     fn two_runs_built_at_different_profiles_refuse_to_be_compared() {
         let mut a = run(vec![row("n=1", 1.0, 0.1)]);
@@ -1040,7 +953,6 @@ mod tests {
             .iter()
             .any(|(k, _, _)| k == "build_profile"));
 
-        // The numbers are withheld.
         let text = render(&d);
         assert!(text.contains("REFUSED"), "{text}");
         assert!(
@@ -1050,8 +962,6 @@ mod tests {
     }
 
     /// A profile whose meaning changed but not its name.
-    ///
-    /// Mutant: delete `"build_lto"` from [`BUILD_CRITICAL_FACTS`]; fails on `!d.comparable()`.
     #[test]
     fn a_profile_that_changed_its_lto_without_changing_its_name_is_refused() {
         let mut a = run(vec![row("n=1", 1.0, 0.1)]);
@@ -1071,8 +981,6 @@ mod tests {
     }
 
     /// A run file predating `build_lto` reads as a mismatch, not agreement.
-    ///
-    /// Mutant: make `diff`'s `drift` skip a fact absent from either side; fails on `!d.comparable()`.
     #[test]
     fn a_run_that_records_no_build_fact_does_not_compare_as_matching() {
         let mut a = run(vec![row("n=1", 1.0, 0.1)]);

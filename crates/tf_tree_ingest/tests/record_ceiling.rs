@@ -1,19 +1,7 @@
 //! `IngestOptions::max_record_bytes` — `docs/decisions/0010` question 1.
 //!
-//! The ceiling on one top-level MCAP record was a private constant until
-//! 2026-08-29, and `source.rs`'s own doc comment called that "**a gap rather
-//! than a decision**". `0010` asked whether it should become a knob; it now is
-//! one, and this file is what makes that a fact rather than a field nobody
-//! reads.
-//!
-//! **The knob moves, not the file.** The alternative — writing a recording with
-//! a genuinely oversized record — would need a multi-hundred-megabyte fixture to
-//! exercise the default, which is a slow test that measures the disk. Lowering
-//! the ceiling under a fixture the reader otherwise accepts isolates exactly the
-//! comparison the knob controls, and the pair of assertions below is what makes
-//! it non-vacuous: the *same file* must be refused at a low ceiling and accepted
-//! at the default. A test with only the first half would pass against a reader
-//! that refused everything.
+//! The knob moves, not the file: the same file must be refused at a low
+//! ceiling and accepted at the default.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -63,18 +51,14 @@ fn the_record_ceiling_is_a_knob_and_the_same_file_turns_on_it() {
     let dir = Scratch::new("knob");
     let path = fixture(&dir.0);
 
-    // A ceiling below the file's own magic-and-header framing refuses it. 32
-    // bytes is under any record MCAP can legally write, so this is the reader's
-    // bound firing and not a property of the fixture's contents.
+    // 32 bytes is under any record MCAP can legally write.
     let low = IngestOptions {
         max_record_bytes: 32,
         ..Default::default()
     };
     let mut frames = Frames::default();
     let refused = tf_tree_ingest::survey(&path, &low, &mut frames);
-    // **The variant, not `Mcap`** — `0010`'s Decision is that the refusal gets a
-    // name and carries the number to raise. Asserting on `Mcap` here would have
-    // passed against the reader as it stood before this change.
+    // The variant, not `Mcap`: `0010` gives the refusal a name and the number.
     let Err(IngestError::RecordTooLarge { declared, ceiling }) = refused else {
         panic!("a 32-byte ceiling did not report RecordTooLarge: {refused:?}");
     };
@@ -84,9 +68,7 @@ fn the_record_ceiling_is_a_knob_and_the_same_file_turns_on_it() {
         "a record was refused for being {declared} bytes against a {ceiling}-byte ceiling"
     );
 
-    // **The half that makes the first one mean something.** The identical file,
-    // at the shipped default, must go through — otherwise the assertion above
-    // would hold against a reader that refused every recording.
+    // The identical file at the default must go through.
     let mut frames = Frames::default();
     let accepted = tf_tree_ingest::survey(&path, &IngestOptions::default(), &mut frames);
     assert!(
@@ -96,11 +78,6 @@ fn the_record_ceiling_is_a_knob_and_the_same_file_turns_on_it() {
 }
 
 /// The default is the library constant, and the constant is the documented one.
-///
-/// Cheap, and it is the assertion that would have caught the CLI's `--max-record-size`
-/// default drifting from `DEFAULT_MAX_RECORD_BYTES` — the drift `--max-chunk-size`
-/// avoids by deriving its `default_value_t` from the constant rather than writing
-/// the number twice.
 #[test]
 fn the_default_ceiling_is_the_published_constant() {
     assert_eq!(
@@ -110,14 +87,9 @@ fn the_default_ceiling_is_the_published_constant() {
     assert_eq!(DEFAULT_MAX_RECORD_BYTES, 256 * 1024 * 1024);
 }
 
-/// A ceiling above `usize::MAX` on a 32-bit target must not wrap into a tiny one.
-///
-/// The comparison is made in `u64`, before the `usize` narrowing, precisely so
-/// that a caller who sets a very large ceiling gets a very large ceiling. On a
-/// 64-bit host this asserts the ordinary path still admits the fixture; the
-/// narrowing it guards is only reachable on a 32-bit target, which no CI row
-/// builds, so the test states what it does and does not cover rather than
-/// implying more.
+/// A ceiling above `usize::MAX` on a 32-bit target must not wrap into a tiny
+/// one. The comparison is in `u64`; on 64-bit hosts this covers only the
+/// ordinary path.
 #[test]
 fn a_very_large_ceiling_does_not_wrap() {
     let dir = Scratch::new("wide");
@@ -135,57 +107,27 @@ fn a_very_large_ceiling_does_not_wrap() {
 }
 
 // ---------------------------------------------------------------------------
-// The ceiling is a bound on what this reader **allocates**, so the opcode has to
-// be consulted before the length decides.
-//
-// Until 2026-09-05 it was not: `read_tf` compared `declared` against the ceiling
-// and returned before it had looked at `header[0]`, so a record the reader never
-// reads — an attachment, a metadata block — aborted an ingest whose transforms
-// were all intact. `DEFAULT_MAX_RECORD_BYTES`' own doc comment named the defect
-// ("the reader has no opcode-based skip") and `docs/decisions/0010`'s second open
-// question was measured against a corpus in which 41 of 41 recordings carry zero
-// attachments — so the case was known, unreproduced, and unhandled.
-//
-// Each arm below is red-tested on its own mutant, because a single "an attachment
-// is skipped" test passes against a reader that skips every oversized record
-// including a `Chunk` — and because a skip is a seek onto an offset nothing
-// validated, which is a second question with two answers of its own: where the
-// length lands, and what the report may claim about the span it stepped over.
+// The ceiling bounds what this reader allocates, so the opcode is consulted
+// before the length decides: an unneeded oversized record is skipped, a needed
+// one refuses, and a skip's landing point and report are checked (arms 1-5).
 // ---------------------------------------------------------------------------
 
 /// MCAP top-level record opcodes, from the specification rather than from
-/// `mcap::records::op` — `mcap` is not a dev-dependency here, and a test that
-/// asserts against the same constant the reader matches on is asserting nothing
-/// about the format.
+/// `mcap::records::op`.
 const OP_HEADER: u8 = 0x01;
 const OP_CHUNK: u8 = 0x06;
 const OP_ATTACHMENT: u8 = 0x09;
 
-/// A ceiling that admits every record `write_mcap` produces and refuses the
-/// spliced one below. The fixture writer chunks at `FIXTURE_CHUNK_SIZE` (4 KiB),
-/// so 16 KiB clears every chunk with room to spare — and
-/// `an_oversized_record_the_reader_does_not_need_is_skipped` asserts the
-/// unspliced file at this very ceiling, so "the ceiling admits the rest" is a
-/// measured control rather than an assumption.
+/// Admits every record `write_mcap` produces (chunks are 4 KiB) and refuses the
+/// spliced one below.
 const CEILING: u64 = 16 * 1024;
 
-/// Four times the ceiling: unambiguously over, and small enough that the fixture
-/// stays a few tens of kilobytes.
+/// Four times the ceiling.
 const OVERSIZED: usize = 64 * 1024;
 
-/// Splice a top-level record with `opcode` and a `len`-byte filler body in
-/// directly after the recording's `Header`.
-///
-/// **The body is filler and is never parsed**, which is the point: the reader
-/// steps over a record it does not need without handing the bytes to
-/// `mcap::parse_record`. Raising the ceiling above `len` in a future test would
-/// therefore make this file malformed, and deliberately so — the skip is what is
-/// under test.
-///
-/// The splice invalidates the summary section's byte offsets. That is harmless
-/// here and worth saying out loud: `read_tf` is a linear record walk and reads no
-/// index, so a `ChunkIndex` pointing at the wrong offset is parsed and dropped
-/// like every other record this reader does not need.
+/// Splice a top-level record with `opcode` and a `len`-byte filler body
+/// directly after the recording's `Header`. The body is never parsed; the
+/// splice invalidates summary offsets, which the linear `read_tf` walk ignores.
 fn splice_record(bytes: &[u8], opcode: u8, len: usize) -> Vec<u8> {
     // magic(8), then every record as opcode(1) + len(8, LE) + body.
     assert_eq!(
@@ -203,13 +145,8 @@ fn splice_record(bytes: &[u8], opcode: u8, len: usize) -> Vec<u8> {
     out
 }
 
-/// Arm 1: an oversized **attachment** is stepped over, counted, and costs the
+/// Arm 1: an oversized attachment is stepped over, counted, and costs the
 /// recording nothing.
-///
-/// Mutant: restore the old ordering by moving the `reader_needs(opcode)` test
-/// after the ceiling comparison — applied as `if !fits { return Err(...) }`, and
-/// this failed with `RecordTooLarge { declared: 65536, ceiling: 16384 }` on a
-/// recording whose every transform was intact.
 #[test]
 fn an_oversized_record_the_reader_does_not_need_is_skipped() {
     let dir = Scratch::new("attach");
@@ -219,9 +156,7 @@ fn an_oversized_record_the_reader_does_not_need_is_skipped() {
         ..Default::default()
     };
 
-    // **The control.** Without it the assertion below would hold against a reader
-    // that skipped everything, and "the ceiling admits every other record in this
-    // file" would be an assumption rather than a measurement.
+    // Control: the ceiling admits every other record in this file.
     let mut frames = Frames::default();
     let clean = tf_tree_ingest::run(&plain, &opts, &mut frames).expect("the unspliced file");
     assert_eq!(clean.report.anomalies.oversized_records_skipped, 0);
@@ -254,16 +189,8 @@ fn an_oversized_record_the_reader_does_not_need_is_skipped() {
     );
 }
 
-/// Arm 2: an oversized record the reader **does** need still refuses.
-///
-/// This is the arm a single "attachments are skipped" test would have hidden.
-/// Skipping a `Chunk` loses every transform inside it and reads, downstream,
-/// exactly like a recording that never had them — which is worse than a named
-/// error carrying the number to raise.
-///
-/// Mutant: widen the skip to every opcode (`if !fits { skip }` with no
-/// `reader_needs` test) — applied, and this failed: the ingest returned
-/// `Ok` with the spliced chunk silently gone.
+/// Arm 2: an oversized record the reader does need still refuses (skipping a
+/// `Chunk` would silently lose its transforms).
 #[test]
 fn an_oversized_record_the_reader_needs_still_refuses() {
     let dir = Scratch::new("chunk");
@@ -289,28 +216,13 @@ fn an_oversized_record_the_reader_needs_still_refuses() {
 }
 
 /// Arm 3: a skipped record whose body runs past the end of the file is
-/// **truncation**, not a clean end.
-///
-/// Seeking past the end of a file succeeds, so a skip that only seeks would leave
-/// the cursor past the end, the next header read would return zero bytes, and the
-/// walk would take that for the ordinary end of a recording. The file's length is
-/// read once at open for exactly this comparison.
-///
-/// The two outcomes are different error variants, which is what makes the
-/// assertion sharp: `TruncatedBeforeAnyChunk` means "the file stops early",
-/// `NoTransforms` means "the file is whole and has no TF in it", and those send an
-/// operator to opposite places.
-///
-/// Mutant: drop the `file_len` comparison from `skip_body` and always report the
-/// body complete — applied, and this failed with
-/// `IngestError::NoTransforms`, reporting an amputated recording as an intact one.
+/// truncation, not a clean end (`TruncatedBeforeAnyChunk`, not `NoTransforms`).
 #[test]
 fn a_skipped_record_cut_short_reports_truncation_not_a_clean_end() {
     let dir = Scratch::new("cut");
     let plain = fixture(&dir.0);
     let spliced = splice_record(&std::fs::read(&plain).unwrap(), OP_ATTACHMENT, OVERSIZED);
-    // Cut inside the attachment's body: the record header is whole and declares
-    // `OVERSIZED` bytes, and only a hundred of them exist.
+    // Cut inside the attachment's body.
     let header_len = u64::from_le_bytes(spliced[9..17].try_into().unwrap()) as usize;
     let cut = 17 + header_len + 9 + 100;
     let path = dir.0.join("cut.mcap");
@@ -328,19 +240,11 @@ fn a_skipped_record_cut_short_reports_truncation_not_a_clean_end() {
     );
 }
 
-/// MCAP's `Metadata` opcode. A real record kind this reader does not read, which
-/// is what makes the probe below a *plausible* corrupt header rather than a
-/// contrived one.
+/// MCAP's `Metadata` opcode: a real record kind this reader does not read.
 const OP_METADATA: u8 = 0x0C;
 
-/// A recording long enough to hold several chunks, so that a skip can be aimed to
-/// swallow some of them.
-///
-/// `write_mcap` chunks at `FIXTURE_CHUNK_SIZE`, so how many chunks this produces
-/// is the fixture writer's business and is deliberately not written down here:
-/// the caller walks the file for the real offsets and asserts only that it found
-/// enough of them to aim between, which is what would fail — loudly, and before
-/// the probe — if the writer's chunking ever changed.
+/// A recording long enough to hold several chunks; callers assert they found
+/// enough offsets to aim between.
 fn chunky_fixture(dir: &Path) -> PathBuf {
     let path = dir.join("chunky.mcap");
     let msgs: Vec<FixtureMessage> = (0..512)
@@ -390,18 +294,7 @@ fn splice_header_at(bytes: &[u8], at: usize, opcode: u8, declared: u64) -> Vec<u
 }
 
 /// Arm 4: a skip whose declared length lands on a later record boundary swallows
-/// everything between, and the report must not say otherwise.
-///
-/// **This arm exists because the shipped summary row said "no transform was
-/// lost", and here transforms are.** A record body is stepped over on the length
-/// written in its own header; nothing validates that length; and a corrupt one
-/// aimed at a later record's first byte resyncs perfectly. `resyncs_here` cannot
-/// see it — the position it checks *is* a record boundary — so what this arm pins
-/// is the honesty of the report rather than the absence of the loss, which a
-/// linear walk cannot deliver.
-///
-/// Mutant: restore the withdrawn wording (append "; no transform was lost" to
-/// `report.rs`'s row) — applied, and this failed on the summary assertion.
+/// everything between, and the report must not claim completeness.
 #[test]
 fn a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so() {
     let dir = Scratch::new("boundary");
@@ -413,9 +306,7 @@ fn a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so() {
         "the probe needs chunks to aim between, found {}",
         chunks.len()
     );
-    // The nearest later chunk boundary that is further away than the ceiling —
-    // the splice has to be *over* the ceiling to be skipped at all, and aiming at
-    // a boundary rather than a byte count is what makes the resync check pass.
+    // Nearest later chunk boundary further away than the ceiling.
     let land = chunks
         .iter()
         .position(|&c| c > chunks[1] && (c - chunks[1]) as u64 > CEILING)
@@ -449,7 +340,7 @@ fn a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so() {
         "nothing about this file is short — that is what makes the loss quiet"
     );
 
-    // So the one thing the operator is shown must not claim completeness.
+    // The summary must not claim completeness.
     let summary = out.report.summary();
     assert!(
         !summary.contains("no transform was lost"),
@@ -459,9 +350,7 @@ fn a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so() {
         summary.contains("--max-record-size"),
         "the flag that would have read the span must be named: {summary}"
     );
-    // The machine-readable path carries the same fact as a count. (Asserting the
-    // *absence* of the withdrawn sentence here would be a check that cannot fail
-    // — `to_json` renders no prose.)
+    // The JSON carries the same fact as a count.
     let json = out.report.to_json();
     assert!(
         json.contains("\"oversized_records_skipped\":1"),
@@ -469,27 +358,14 @@ fn a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so() {
     );
 }
 
-/// Arm 5: a skip that lands anywhere else refuses, as the ceiling did before the
-/// opcode was consulted at all.
-///
-/// The record is spliced with more filler than it declares, so the position the
-/// skip resyncs at is a run of `0xAB` — a deterministic non-header, rather than
-/// whatever compressed bytes happened to be at an offset. Without the resync
-/// check the walk reads `0xAB` as an opcode with a sixteen-exabyte length, skips
-/// again, runs off the end and reports the file as truncated: a corrupt file
-/// diagnosed as a short one, pointing the operator at the recorder instead of the
-/// bytes.
-///
-/// Mutant: delete the `resyncs_here` call from the skip branch — applied, and
-/// this failed with `TruncatedBeforeAnyChunk` in place of the refusal.
+/// Arm 5: a skip that lands off a boundary refuses. Extra `0xAB` filler makes
+/// the landing a deterministic non-header.
 #[test]
 fn a_skip_that_lands_off_a_boundary_refuses_rather_than_resyncing() {
     let dir = Scratch::new("resync");
     let plain = fixture(&dir.0);
     let bytes = std::fs::read(&plain).unwrap();
-    // `splice_record` writes `len` filler bytes and declares `len`; sixteen of
-    // those are then extra, so the skip stops sixteen bytes short of the record
-    // that follows.
+    // Sixteen extra filler bytes: the skip stops sixteen short of the next record.
     let mut spliced = splice_record(&bytes, OP_METADATA, OVERSIZED);
     let header_len = u64::from_le_bytes(spliced[9..17].try_into().unwrap()) as usize;
     let filler_end = 17 + header_len + 9 + OVERSIZED;
@@ -515,28 +391,12 @@ fn a_skip_that_lands_off_a_boundary_refuses_rather_than_resyncing() {
 }
 
 // ---------------------------------------------------------------------------
-// The ceiling bounds what the reader allocates; the **file** has to bound it too.
-//
-// `read_tf` sized the record body from the declared length alone. A seventeen-byte
-// file — the eight-byte magic plus one nine-byte record header — declaring 256 MiB
-// allocated and memset 256 MiB before discovering there were no bytes to fill it
-// with, and with `--max-record-size` raised (it saturates to `u64::MAX`) the same
-// seventeen bytes reached `RawVec`'s "capacity overflow" panic or the allocator's
-// abort. The buffer is clamped by `file_len` now, which is the comparison
-// `skip_body` and `resyncs_here` already made on the branches that do not
-// allocate.
-//
-// **Not in `tests/anomaly_corpus.rs`**, which is `PHASE5.md` §11's byte-exact
-// assertion over §3.2's *reportable* rows: this file produces no report at all —
-// it is a refusal path — and it is about `max_record_bytes`, which is what this
-// file is for.
+// The file bounds the allocation too: the record buffer is clamped by
+// `file_len`.
 // ---------------------------------------------------------------------------
 
-/// The smallest hostile input: magic, then a record header and nothing else.
-///
-/// Written by hand rather than by `fixture::write_mcap`, because the whole point
-/// is a header the writer would never emit. Seventeen bytes: `MAGIC` (8),
-/// opcode (1), length (8, LE).
+/// Magic, then a record header and nothing else; written by hand because the
+/// writer would never emit it.
 fn magic_and_one_header(opcode: u8, declared: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(17);
     out.extend_from_slice(b"\x89MCAP0\r\n");
@@ -546,28 +406,14 @@ fn magic_and_one_header(opcode: u8, declared: u64) -> Vec<u8> {
 }
 
 /// A record header declaring more than `isize::MAX` bytes must not reach the
-/// allocator.
-///
-/// The ceiling is a caller knob and the CLI saturates it to `u64::MAX`, so this
-/// configuration is reachable by a supported flag rather than only by a library
-/// caller. `2^63` is one past `isize::MAX`, which is where `Vec::reserve_exact`
-/// panics with "capacity overflow" — a panic inside a reader, from seventeen
-/// bytes on disk, in a workspace whose lints deny `clippy::panic`.
-///
-/// Mutant: restore `usize::try_from(declared)` in place of
-/// `usize::try_from(declared.min(file_len))` — applied, and this test died with
-/// `panicked at library/alloc/src/raw_vec/mod.rs:28:5: capacity overflow` rather
-/// than failing an assertion. Through the release binary the same mutant gives
-/// `exit 101` on this file and `SIGABRT` (`memory allocation of
-/// 140737488355328 bytes failed`, exit 134) on one declaring `2^47`.
+/// allocator (`Vec::reserve_exact` would panic).
 #[test]
 fn a_declared_length_past_the_address_space_is_truncation_not_a_panic() {
     let dir = Scratch::new("hostile_wide");
     let path = dir.0.join("tiny.mcap");
     std::fs::write(&path, magic_and_one_header(OP_CHUNK, 1u64 << 63)).unwrap();
 
-    // The ceiling that admits it: this is the arm the guard exists for, because
-    // at the default ceiling the length is refused before it is believed.
+    // The ceiling that admits it; the default would refuse first.
     let wide = IngestOptions {
         max_record_bytes: u64::MAX,
         ..Default::default()
@@ -580,27 +426,9 @@ fn a_declared_length_past_the_address_space_is_truncation_not_a_panic() {
     );
 }
 
-/// The same file at the **default** ceiling: a length inside the ceiling and far
-/// outside the file.
-///
-/// **This arm has no mutant and passes against the defect**, which is worth
-/// stating rather than leaving for the next reader to discover. The verdict was
-/// already right here — the recording is truncated — and what was wrong was the
-/// 256 MiB allocation and memset on the way to it. Nothing in this suite can see
-/// an allocation: measuring one needs a counting global allocator, which needs an
-/// `unsafe impl GlobalAlloc` and therefore a row in `scripts/unsafe-budget.txt`.
-/// So the cost is a hand measurement through the release binary, on 2026-09-06,
-/// on the file this test writes:
-///
-/// ```text
-/// unclamped: RSS 265 856 KB, 0.16 s, exit 1
-/// clamped:   RSS   3 968 KB, 0.00 s, exit 1
-/// ```
-///
-/// What this arm holds is that the *diagnosis* stays the truncation one at the
-/// shipped default, where the clamp changes what is allocated and must change
-/// nothing else. `a_declared_length_past_the_address_space_is_truncation_not_a_panic`
-/// is the arm that fails when the clamp is removed.
+/// The same file at the default ceiling. It passes against the defect too: it
+/// holds that the diagnosis stays truncation; the arm above fails without the
+/// clamp.
 #[test]
 fn a_declared_length_larger_than_the_file_is_truncation() {
     let dir = Scratch::new("hostile_default");

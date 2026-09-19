@@ -1,14 +1,8 @@
-//! The differential harness (`docs/PHASE1.md` §10.5): an identical tree and
-//! sample stream through two independent lookup pipelines, compared over random
-//! queries with [`InterpPolicy::LerpSlerp`].
-//!
-//! * [`Reference::NaiveRust`]: an independent Rust lookup sharing only the input
-//!   data with the engine. Runs anywhere.
-//! * [`Reference::Tf2`] (`--features tf2`): ROS 2's `tf2::BufferCore` via
-//!   `tf_tree_tf2_sys`; `just tf2-differential`.
-//!
-//! Both go through one private `Oracle` trait and query loop. Queries an oracle
-//! declines are skipped and counted, never scored ([`DiffReport::compared`]).
+//! The differential harness (`docs/PHASE1.md` §10.5): one tree and sample stream
+//! through two independent lookup pipelines ([`Reference::NaiveRust`], and
+//! [`Reference::Tf2`] under `--features tf2`, `just tf2-differential`), compared
+//! with [`InterpPolicy::LerpSlerp`]. Declined queries are skipped and counted
+//! ([`DiffReport::compared`]).
 
 use std::collections::HashMap;
 
@@ -22,14 +16,13 @@ use crate::fixture::{self, EdgeDefKind, EDGES};
 /// Which reference oracle to compare tf_tree against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reference {
-    /// The independent naive Rust lookup — always available.
+    /// The independent naive Rust lookup.
     NaiveRust,
-    /// ROS 2 `tf2::BufferCore` — requires `--features tf2` and a ROS 2 install.
+    /// ROS 2 `tf2::BufferCore`; needs `--features tf2`.
     Tf2,
 }
 
-/// The query that produced the worst disagreement, so a failure is reproducible
-/// rather than just a number.
+/// The query that produced the worst disagreement.
 #[derive(Clone, Copy, Debug)]
 pub struct WorstQuery {
     /// Target frame name.
@@ -47,21 +40,18 @@ pub struct DiffReport {
     pub reference: Reference,
     /// How many random queries were drawn.
     pub queries: usize,
-    /// How many were actually scored (identical pairs and oracle-declined
-    /// queries are skipped); a low value proved little.
+    /// How many were scored (identical pairs and declined queries are skipped).
     pub compared: usize,
-    /// The worst observed disagreement (max of rotation-angle error in radians
-    /// and translation error in metres) across all scored queries.
+    /// Worst disagreement (max of rotation-angle radians and translation metres).
     pub max_error: f64,
     /// The agreement tolerance the run was checked against.
     pub tolerance: f64,
-    /// Which query was worst, for reproduction.
+    /// Which query was worst.
     pub worst_query: Option<WorstQuery>,
 }
 
 impl DiffReport {
-    /// Whether the run stayed within [`Self::tolerance`]. A run that scored
-    /// nothing does not pass.
+    /// Whether the run stayed within [`Self::tolerance`]; scoring nothing does not pass.
     #[must_use]
     pub fn passed(&self) -> bool {
         self.compared > 0 && self.max_error <= self.tolerance
@@ -86,22 +76,20 @@ impl core::fmt::Display for DiffReport {
 struct RefFrame {
     parent: Option<usize>,
     depth: u32,
-    /// `Some(pose)` for a static edge (`T_parent_child`); `None` for dynamic.
+    /// `Some(pose)` for a static edge; `None` for dynamic.
     static_pose: Option<Iso3>,
     /// For a dynamic edge, its `(stamp, pose)` sample stream in publish order.
     samples: Vec<(i64, Iso3)>,
 }
 
-/// An in-memory reference tree built from the same declarations and sample
-/// stream as the engine tree, independent of its arena and plan machinery.
+/// An in-memory reference tree independent of the arena and plan machinery.
 struct RefModel {
     index: HashMap<&'static str, usize>,
     frames: Vec<RefFrame>,
 }
 
 impl RefModel {
-    /// Build the reference model from the fixture, replaying the identical
-    /// synthetic history the engine received.
+    /// Build the reference model, replaying the engine's synthetic history.
     fn build() -> RefModel {
         let names = fixture::frame_names();
         let mut index = HashMap::new();
@@ -118,7 +106,6 @@ impl RefModel {
             })
             .collect();
 
-        // Wire parents and edge payloads.
         let mut dyn_seed = 0.0f64;
         for e in EDGES {
             let ci = index[e.child];
@@ -142,7 +129,6 @@ impl RefModel {
             }
         }
 
-        // Compute depths by walking to the root.
         for i in 0..frames.len() {
             let mut d = 0u32;
             let mut cur = frames[i].parent;
@@ -165,8 +151,7 @@ impl RefModel {
         ref_sample(&f.samples, t)
     }
 
-    /// Independent `lookup(target, source)` at stamp `t`, returning
-    /// `T_target_source`, composing freshly sampled poses with no shared code.
+    /// Independent `lookup(target, source)` at `t`, returning `T_target_source`.
     fn lookup(&self, target: usize, source: usize, t: i64) -> Iso3 {
         let mut a = target;
         let mut b = source;
@@ -188,8 +173,6 @@ impl RefModel {
             b = self.frames[b].parent.unwrap_or(b);
         }
 
-        // T_target_source = (T_lca_target)^-1 * T_lca_source.
-        // Target side: inverted, in walk order. Source side: forward, reversed.
         let mut acc = Iso3::IDENTITY;
         for &f in &up_t {
             acc = acc.mul_inv(&self.edge_pose(f, t));
@@ -201,8 +184,7 @@ impl RefModel {
     }
 }
 
-/// Independent bracket-search + `LerpSlerp` sample of a `(stamp, pose)` stream
-/// at `t`; assumes an in-window `t`, clamps otherwise.
+/// Independent bracket-search + `LerpSlerp` sample at `t`; clamps outside the window.
 fn ref_sample(stream: &[(i64, Iso3)], t: i64) -> Iso3 {
     if stream.is_empty() {
         return Iso3::IDENTITY;
@@ -214,7 +196,6 @@ fn ref_sample(stream: &[(i64, Iso3)], t: i64) -> Iso3 {
     if t >= stream[last].0 {
         return stream[last].1;
     }
-    // Linear scan for the bracket [i, i+1] with stamps[i] <= t < stamps[i+1].
     let mut i = 0usize;
     while i + 1 < stream.len() && stream[i + 1].0 <= t {
         i += 1;
@@ -229,8 +210,7 @@ fn ref_sample(stream: &[(i64, Iso3)], t: i64) -> Iso3 {
 }
 
 /// The disagreement between two poses: `max(rotation-angle error, translation
-/// error)`. `pub(crate)` so [`crate::ratio`] applies the same check before it
-/// times anything.
+/// error)`; shared with [`crate::ratio`].
 pub(crate) fn pose_error(x: &Iso3, y: &Iso3) -> f64 {
     let dq = x.q.conjugate() * y.q;
     let rot = log_so3(dq).norm();
@@ -238,7 +218,7 @@ pub(crate) fn pose_error(x: &Iso3, y: &Iso3) -> f64 {
     rot.max(trans)
 }
 
-/// A tiny SplitMix64 PRNG so the harness needs no `rand` dependency.
+/// A tiny SplitMix64 PRNG, so no `rand` dependency.
 struct Rng(u64);
 impl Rng {
     fn next_u64(&mut self) -> u64 {
@@ -256,11 +236,9 @@ impl Rng {
 /// The agreement bound both references are held to (`docs/PHASE1.md` §10.5).
 pub const TOLERANCE: f64 = 1e-12;
 
-/// The oracle a differential run compares the engine against; both answer
-/// `T_target_source` at a stamp, and [`run`] drives them identically.
+/// The oracle a differential run compares against; [`run`] drives all identically.
 trait Oracle {
-    /// `T_target_source` at `stamp_ns`, or `None` if this oracle cannot answer
-    /// (only tf2 declines, at its cache horizon).
+    /// `T_target_source` at `stamp_ns`, or `None` if declined (only tf2, at its cache horizon).
     fn lookup(&self, target: &str, source: &str, stamp_ns: i64) -> Option<Iso3>;
 }
 
@@ -275,16 +253,13 @@ impl Oracle for RefModel {
     }
 }
 
-/// Run the differential query loop against an arbitrary oracle: `queries`
-/// random lookups at random in-window stamps on a `LerpSlerp` engine tree.
-/// Returns the worst disagreement; the caller asserts it is within [`TOLERANCE`].
-/// Declined queries are skipped and counted in [`DiffReport::compared`].
+/// Run the differential query loop against `oracle`; returns the worst
+/// disagreement, to be checked against [`TOLERANCE`].
 fn run(reference: Reference, oracle: &dyn Oracle, queries: usize, seed: u64) -> Result<DiffReport> {
     let tree: Tree = fixture::build_tree_with(InterpPolicy::LerpSlerp)?;
     let (_writers, _samples) = fixture::spin_up(&tree)?;
     let names = fixture::frame_names();
 
-    // Query stamps stay inside every edge's window: [NOW - 100 ms, NOW].
     let now = fixture::NOW_NS;
     let lo = now - 100_000_000;
 
@@ -342,8 +317,7 @@ fn run(reference: Reference, oracle: &dyn Oracle, queries: usize, seed: u64) -> 
     })
 }
 
-/// Run the differential harness against the naive Rust reference. Always
-/// available.
+/// Run the differential harness against the naive Rust reference.
 ///
 /// # Errors
 ///
@@ -353,8 +327,7 @@ pub fn run_naive_rust(queries: usize, seed: u64) -> Result<DiffReport> {
     run(Reference::NaiveRust, &model, queries, seed)
 }
 
-/// Run the differential harness against ROS 2's `tf2::BufferCore`
-/// (`docs/PHASE1.md` §10.5): identical tree and stream, `LerpSlerp` both sides.
+/// Run the differential harness against `tf2::BufferCore` (`docs/PHASE1.md` §10.5).
 ///
 /// # Errors
 ///

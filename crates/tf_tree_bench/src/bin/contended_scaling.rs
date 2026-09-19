@@ -1,17 +1,10 @@
-//! Read scaling with concurrent writers and per-core pinning: `docs/PHASE1.md`
-//! §11.2's "1/2/4/8/16 readers, 4 concurrent writers, cores pinned" row.
+//! Read scaling with concurrent writers and per-core pinning: `docs/PHASE1.md` §11.2's row.
 //!
-//! N reader processes and M writer processes on one shared arena, each on its
-//! own core: the deployment shape tf2 cannot enter. The head-to-head under
-//! writers is `src/bin/tf2_scaling.rs` (`TF2_WRITERS`).
+//! N reader and M writer processes on one shared arena, each on its own core; the head-to-head under writers
+//! is `src/bin/tf2_scaling.rs`. Pinning is `taskset -c N` per process, not `sched_setaffinity` (`0007` rule 1,
+//! `0048`); without `taskset` the run continues unpinned and says so.
 //!
-//! Pinning is `taskset -c N` per process, not `sched_setaffinity`: `0007` rule 1
-//! admits an OS boundary, not a convenience (`0048`, `scripts/unsafe-budget.txt`).
-//! Without `taskset` the run continues unpinned and says so in the output and JSON.
-//!
-//! Usage: `just contended-scaling`, or
-//! `contended_scaling --workload fleet_16 --json out.json`.
-// `panic!` is allowed: every use names the frame, pair or edge that failed.
+//! Usage: `just contended-scaling`, or `contended_scaling --workload fleet_16 --json out.json`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -31,19 +24,13 @@ use tf_tree_bench::runstore::{Run, RunRow};
 use tf_tree_bench::shm_util::{sibling_binary, spawn_attached, WRITER_SLACK_S};
 use tf_tree_bench::workload::{self, Backing, Built};
 
-/// Reader counts to sweep, matching §11.2's list.
 const READERS: &[usize] = &[1, 2, 4, 8, 16];
-/// Writer counts to sweep. `0` is the continuity row (must match the quiescent
-/// numbers); `4` is §11.2's figure.
+/// Writer counts to sweep; `0` is the continuity row, `4` is §11.2's figure.
 const WRITERS: &[usize] = &[0, 1, 2, 4];
-/// Per-reader tick rate in the latency pass (1 kHz control loop).
 const READER_HZ: f64 = 1000.0;
-/// Measurement window per point, split in half between the two reader passes.
 const SECONDS: f64 = 4.0;
-/// Query pairs handed to each reader; they travel on argv.
 const MAX_PAIRS: usize = 8;
 
-/// The rendezvous name for this harness's arena.
 const ARENA: &str = "tf_tree.contended";
 
 struct Args {
@@ -128,7 +115,6 @@ fn parse_list(s: &str) -> Vec<usize> {
     v
 }
 
-/// Whether `taskset` exists on this host, checked once so pinning is uniform.
 fn taskset_available() -> bool {
     std::process::Command::new("taskset")
         .arg("--version")
@@ -138,8 +124,7 @@ fn taskset_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Spawn `bin args...` attached to `tree`'s segment, pinned to `core` when
-/// pinning is available.
+/// Spawn `bin args...` attached to `tree`'s segment, pinned to `core` when available.
 fn spawn_on_core(
     tree: &Tree,
     bin: &Path,
@@ -149,8 +134,6 @@ fn spawn_on_core(
 ) -> std::io::Result<Child> {
     let fd = tree.shared_fd().expect("shared arena fd");
     let (program, full): (PathBuf, Vec<String>) = if pin {
-        // `taskset` `exec`s the target, so the segment installed on fd 0 by
-        // `spawn_attached` survives into the process that actually reads it.
         let mut v = vec!["-c".to_owned(), core.to_string(), bin.display().to_string()];
         v.extend_from_slice(args);
         (PathBuf::from("taskset"), v)
@@ -164,9 +147,7 @@ fn spawn_on_core(
 struct ReaderReport {
     ops: u64,
     elapsed_ns: u64,
-    /// Per-lookup engine cost: the column an engine comparison belongs in.
     service: Histogram,
-    /// Intended-tick-to-done; mostly scheduler wakeup.
     cycle: Histogram,
     clock_overhead_ns: u64,
     declined: u64,
@@ -217,8 +198,7 @@ fn collect_reader(child: &mut Child) -> ReaderReport {
 struct WriterReport {
     pushed: u64,
     rejected: u64,
-    /// This writer's rendezvous join cost (ns), outside every measured window
-    /// (`docs/decisions/0028` step 0b).
+    /// This writer's rendezvous join cost (ns), outside every measured window (`docs/decisions/0028` step 0b).
     join_ns: u64,
 }
 
@@ -242,9 +222,8 @@ fn collect_writer(child: &mut Child) -> WriterReport {
     w
 }
 
-/// The two counters that evidence read/write contention. Neither counts a
-/// successful retry: `err_slot_recycled` and `err_slot_contended` are failures, so
-/// zero means no read failed, not that none retried.
+/// The two counters that evidence read/write contention; neither counts a successful retry, so zero means
+/// no read failed.
 #[derive(Clone, Copy, Default)]
 struct Contention {
     recycled: u64,
@@ -270,7 +249,6 @@ fn read_contention(tree: &Tree) -> Contention {
 fn main() {
     let args = parse_args();
 
-    // Refuse before any work (as `mp_bench` does): latency here mostly measures the scheduler.
     let baseline_busy = match require_quiet_machine() {
         Ok(b) => b,
         Err(msg) => {
@@ -281,9 +259,7 @@ fn main() {
 
     let w = workload::by_name(args.workload).expect("workload");
     let built: Built = w
-        // `Served`: the coordinator owns the arena so writer children get a
-        // participant slot with a lock byte (`0028` step 0b); readers still attach
-        // read-only from stdin's descriptor.
+        // `Served`: the coordinator owns the arena so writers get a lock-byte slot (`0028` step 0b).
         .build(InterpPolicy::LerpSlerp, Backing::Served(ARENA))
         .unwrap_or_else(|e| {
             eprintln!("contended_scaling: {e:#}");
@@ -302,7 +278,6 @@ fn main() {
         .map(|(t, s)| format!("{t}|{s}"))
         .collect();
 
-    // Compiled once to probe the retained window before each point.
     let plans = built.plans().expect("compiling the workload's query pairs");
     let guard_tree = &built.tree;
     let live_window = |plans: &[tf_tree::Plan]| -> Option<(i64, i64)> {
@@ -318,11 +293,9 @@ fn main() {
         out
     };
 
-    // Where each publisher resumes; advanced across the sweep.
     let mut next_stamps: Vec<i64> = built.publishers.iter().map(|p| p.next_stamp_ns).collect();
 
     let mut run = Run::begin(*args.readers.iter().max().unwrap_or(&1));
-    // Slowest rendezvous join in the sweep, printed once in the footer.
     let mut worst_join_ns: u64 = 0;
 
     println!("tf_tree contended read scaling  [workload: {}]", w.name);
@@ -381,9 +354,6 @@ fn main() {
             continue;
         }
         for &n_readers in &args.readers {
-            // The readers' window is re-read at every point: writers evict the ring's
-            // bottom cumulatively across the sweep. `Plan::span` gives the retained
-            // window; inset the bottom by what the writers will publish.
             let Some((live_lo, live_hi)) = live_window(&plans) else {
                 println!(
                     "  (skipping readers={n_readers}, writers={n_writers}: no stamp \
@@ -412,11 +382,9 @@ fn main() {
             let mut writers: Vec<Child> = (0..n_writers)
                 .map(|i| {
                     let p = &built.publishers[i];
-                    // Where this writer resumes: restarting at the populated history's
-                    // end makes every push out of order, and `push` rejects those.
+                    // Where this writer resumes: past the history's end, or every push is out of order.
                     let a = vec![
                         "writer".to_owned(),
-                        // The rendezvous name, so the child joins this arena.
                         ARENA.to_owned(),
                         p.rate_hz.to_string(),
                         (args.seconds + WRITER_SLACK_S).to_string(),
@@ -425,7 +393,6 @@ fn main() {
                         p.parent.clone(),
                         p.child.clone(),
                     ];
-                    // Writers take cores from the top, readers from the bottom.
                     let core = (cpus - 1).saturating_sub(i % cpus);
                     spawn_on_core(&built.tree, &child_bin, core, &a, pin).expect("spawn writer")
                 })
@@ -455,8 +422,6 @@ fn main() {
             for c in &mut writers {
                 assert!(c.wait().expect("wait").success(), "a writer failed");
             }
-            // Advance past what was published, with two periods of margin; overshoot is
-            // safe, undershoot is an out-of-order push.
             for (stamp, p) in next_stamps
                 .iter_mut()
                 .zip(&built.publishers)
@@ -494,7 +459,6 @@ fn main() {
                 ""
             };
 
-            // A row of mostly declined lookups times the error path; threshold 1%.
             let decline_pct = if row.attempted == 0 {
                 0.0
             } else {
@@ -505,7 +469,6 @@ fn main() {
             } else {
                 ""
             };
-            // Refused pushes make a quiescent row wearing a writer's name.
             let writer_flag = if n_writers > 0 && row.rejected > row.pushes_per_s as u64 {
                 " <-- WRITERS REJECTED"
             } else {
@@ -654,8 +617,7 @@ fn summarise(
     }
 }
 
-/// Slack on a latency percentile: looser than `report::LATENCY_SLACK` because this
-/// harness runs on hosts that did not pass the fitness probe.
+/// Slack on a latency percentile: looser than `report::LATENCY_SLACK` (hosts here skip the fitness probe).
 const LATENCY_SLACK: f64 = 0.40;
 /// Slack on throughput, the steadier measurement (averaged over a window).
 const THROUGHPUT_SLACK: f64 = 0.15;
@@ -679,7 +641,6 @@ fn json_row(workload: &str, built: &Built, s: &Summary, scale: f64, pinned: bool
         Metric::new("worst_reader_service_p99_9_ns", s.worst_svc_p999_ns, "ns")
             .lower_is_better(LATENCY_SLACK),
     )
-    // Informational: dominated by scheduler wakeup.
     .metric(Metric::new("cycle_p99_9_ns", s.cycle_p999_ns, "ns"))
     // Informational: `scale` is a ratio, the counters are legitimately zero, `pinned` is a fact.
     .metric(Metric::new("scale_vs_1r0w", scale, "x"))

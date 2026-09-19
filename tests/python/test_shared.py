@@ -12,8 +12,7 @@ import pytest
 import tf_tree
 from conftest import LONG_CHILD, _stub_annotations
 
-#: The topology these tests create. `0004` sizes an arena from its declared
-#: edges, so creating one means saying what is in it.
+#: The topology these tests create; `0004` sizes an arena from its edges.
 EDGES = [("map", "base"), ("base", "cam")]
 
 shm = pytest.mark.skipif(
@@ -69,14 +68,11 @@ def test_a_released_claim_can_be_retaken_from_another_process(runtime_dir):
 
 @shm
 @pytest.mark.filterwarnings(
-    # Expected, and the reason the test exists: the arena's owner thread makes this
-    # process multi-threaded, and forking a multi-threaded process is exactly what
-    # `multiprocessing` does on Linux.
+    # Expected: the owner thread makes this process multi-threaded.
     "ignore:This process .* is multi-threaded:DeprecationWarning"
 )
 def test_a_forked_child_is_refused_rather_than_faulting(runtime_dir):
-    """**`multiprocessing` defaults to `fork` on Linux**, so this is how users meet
-    it."""
+    """`multiprocessing` defaults to `fork` on Linux, so this is how users meet it."""
     tree = tf_tree.open(mode="rw", create=EDGES)
     pub = tree.publisher("base", "map")
     pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
@@ -94,9 +90,8 @@ def test_a_forked_child_is_refused_rather_than_faulting(runtime_dir):
             status = status or 11
         except Exception:
             pass
-        # `_exit`, not `exit`: the interpreter's teardown would run the inherited
-        # objects' finalizers, and what those do in a fork child is the *other* half of
-        # this, covered on the Rust side by `crates/tf_tree_bench/tests/fork.rs`.
+        # `_exit`, not `exit`: teardown would run inherited finalizers (the Rust
+        # half is `crates/tf_tree_bench/tests/fork.rs`).
         os._exit(status)
 
     _, wstatus = os.waitpid(pid, 0)
@@ -118,7 +113,7 @@ def test_a_forked_child_is_refused_rather_than_faulting(runtime_dir):
 def test_a_forked_child_is_refused_with_child_process_detached_error(
     runtime_dir, tmp_path
 ):
-    """**`docs/PHASE3.md` §8.1 is NORMATIVE and names the class.**"""
+    """`docs/PHASE3.md` §8.1 is NORMATIVE and names the class."""
     tree = tf_tree.open(mode="rw", create=EDGES)
     pub = tree.publisher("base", "map")
     pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
@@ -162,8 +157,7 @@ def test_a_forked_child_is_refused_with_child_process_detached_error(
     got = dict(line.split("=", 1) for line in report.splitlines())
     assert got == dict.fromkeys(calls, "ChildProcessDetachedError"), got
 
-    # A subclass, so every `except tf_tree.TfTreeError` written before it
-    # existed still catches it.
+    # A subclass, so an earlier `except tf_tree.TfTreeError` still catches it.
     assert issubclass(tf_tree.ChildProcessDetachedError, tf_tree.TfTreeError)
     pub.release()
 
@@ -298,8 +292,7 @@ def test_opening_a_name_nothing_serves_raises_arena_absent(runtime_dir):
 
 
 def _rendezvous_child() -> pathlib.Path:
-    """The Rust test helper `tf_tree_rendezvous_child`, which the pytest recipes
-    build."""
+    """The Rust helper `tf_tree_rendezvous_child`, built by the pytest recipes."""
     root = pathlib.Path(__file__).resolve().parents[2]
     target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or root / "target")
     exe = target / "debug" / "tf_tree_rendezvous_child"
@@ -361,16 +354,12 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
         assert owner.stdout.readline().strip() == "owning", "the owner did not come up"
 
         tree = tf_tree.open(mode="rw")
-        # A read-only attach takes a lock-file participant byte too.
         second = tf_tree.open(mode="ro")
 
-        # The owner is alive: the loop is cheap and does nothing.
         assert not tree.owner_lost()
         assert tree.inherit_ownership() == "OwnerAlive"
 
-        # `wait` after `kill`, so the kernel has torn the descriptors down — its
-        # ownership byte and its participant byte are released with no cooperation from
-        # it.
+        # `wait` after `kill`, so the kernel has released its bytes.
         owner.kill()
         owner.wait(timeout=30)
 
@@ -387,26 +376,20 @@ def test_a_python_consumer_recovers_an_arena_whose_owner_died(runtime_dir):
 
         annotated = set(_stub_annotations("ArenaHeldButUnreachableError"))
         assert set(vars(held)) == annotated
-        # **Not a precondition, and that is measured rather than assumed**: with these
-        # two lines removed the inheritance below still answers `Inherited`. A read-only
-        # participant never holds byte 0, so it cannot contend for the vacant role —
-        # only its *participant* byte is held, and that is what `holder_slots` above is
-        # for.
+        # Not a precondition: a read-only participant never holds byte 0, only its
+        # participant byte (`holder_slots` above).
         del second
         gc.collect()
         assert tree.inherit_ownership() == "Inherited", (
             "the sole read-write survivor should have taken the vacant role"
         )
 
-        # And it settles rather than re-attempting the ownership lock every
-        # cycle: this process is the owner now (`docs/decisions/0043`).
+        # It settles as owner rather than retrying the lock (`docs/decisions/0043`).
         assert not tree.owner_lost(), (
             "an owner that reads its own death would retry the lock forever"
         )
 
-        # The dead owner's own participant record is collected — one of exactly two
-        # states the owner's hangup callback structurally cannot reach, because nothing
-        # hangs up on an owner.
+        # The dead owner's record: the hangup callback cannot reach it.
         assert tree.reap_dead() == 1, "the dead owner's record should be collected"
         assert tree.reap_dead() == 0, "and a second sweep must find nothing"
     finally:
@@ -449,8 +432,7 @@ def test_a_read_only_consumer_is_told_it_cannot_inherit(runtime_dir):
             "cannot be the heir — and it must be told so, not left guessing"
         )
         assert ro.reap_dead() == 0, "a read-only mapping may not write the arena"
-        # And it keeps reading straight through, which is the half of D18 that
-        # makes the refusal acceptable.
+        # It keeps reading through the refusal (D18).
         assert ro.plan("base", "map") is not None
     finally:
         if owner.poll() is None:

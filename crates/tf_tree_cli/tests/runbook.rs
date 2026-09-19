@@ -1,84 +1,35 @@
-//! **`docs/RUNBOOK.md` holds what an error message gave up** — `0055` step 7.
+//! `docs/RUNBOOK.md` holds what an error message gave up — `0055` step 7.
 //!
-//! `IpcError::HandshakeRejected` used to carry a remedy per `HelloStatus`, and
-//! the messages they made were 112 to 378 bytes against a C buffer of 256. They are
-//! now the runbook's `HandshakeRejected` table, and the message ends
-//! `(HandshakeRejected)` so a reader can find it. That split is only as good as
-//! the table, so the table is gated: a row per refusal status, rows that say
-//! something, and a worked example that is `Display`'s own output rather than a
-//! transcription of it.
-//!
-//! # Why this test is in `tf_tree_cli` and not beside the type
-//!
-//! It reads a file outside any crate directory. `tf_tree_ipc` is **published**,
-//! and `cargo package` does not put a file from outside the package into the
-//! tarball — an `include_str!("../../../docs/RUNBOOK.md")` there ships a crate
-//! whose tests cannot build. `crates/tf_tree_cli/src/lib.rs` writes that rule
-//! down for the README, and `checks.rs`'s `docs/API.md` gate is the precedent
-//! for putting the docs-reading half here, where `publish = false` makes the
-//! failure mode not exist.
-//!
-//! What stays beside the type, in `tf_tree_ipc`'s `error.rs`, is everything
-//! that needs no file: `both_rejection_arms_name_only_the_status_they_carry` (the
-//! facts, the search key, the 140-byte budget, and the rule that no rendering
-//! may name a status it did not get) and
-//! `every_ipc_error_message_fits_the_c_abis_buffer`.
+//! `IpcError::HandshakeRejected`'s message ends `(HandshakeRejected)` and its
+//! remedies live in the runbook's table, so the table is gated: a row per
+//! refusal status, rows that say something, and a worked example equal to
+//! `Display`'s output. It lives in `tf_tree_cli` because `tf_tree_ipc` is
+//! published and `cargo package` omits files outside the package; the file-free
+//! half is in `tf_tree_ipc`'s `error.rs`.
 #![cfg(all(feature = "shm", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use tf_tree::{HelloStatus, IpcError};
 
-/// How far up the wire numbering the derivation probes.
-///
-/// A status assigned a value past this is invisible to every gate here, and a
-/// first cut set it to 64 — which a status *at* 64 walked straight through,
-/// measured. The discriminants are a wire contract assigned explicitly
-/// (`wire.rs`), so every `u16` is far past what the protocol contemplates.
+/// How far up the wire numbering the derivation probes (wire discriminants are
+/// assigned explicitly in `wire.rs`, so every `u16` is past what is contemplated).
 const PROBE_RANGE: u32 = u16::MAX as u32 + 1;
 
-/// Every `HelloStatus` this build can **receive**, derived from the codec
-/// rather than copied.
-///
-/// **A hand-copied list here left a hole, and it took three review rounds to
-/// find.** `HelloStatus` is `#[non_exhaustive]`, so a downstream total `match`
-/// is impossible — deliberately, because a newer owner may refuse for a reason
-/// this build has no name for. From that I concluded there could be no
-/// downstream tripwire at all, and that was wrong: a `match` is not the only
-/// way to enumerate. `HelloStatus::from_u32` is injective on the values it
-/// names and folds every other onto `Malformed`, so **walking the whole probe
-/// range** and keeping each distinct status yields exactly the set the wire can
-/// deliver — and a status the wire cannot deliver is one no operator will ever
-/// be handed.
-///
-/// **Not "until a status repeats", which is what this doc said until round 18
-/// and what the body refuses.** Stopping at the first repeat assumes the wire
-/// numbering is contiguous; a status at 10, with 7 to 9 still folding onto
-/// `Malformed`, is then enumerated by nothing and owes no row — measured, round
-/// 5. The full sweep is 65,536 `match` arms and costs microseconds. **If you
-/// are here to make it cheaper, that is the shape that reinstates the hole**,
-/// and this doc licensed it for three rounds.
-///
-/// With the list copied, adding a variant, wiring it into `from_u32`, fixing
-/// `tf_tree_ipc`'s `status_is_a_refusal` and extending its `ALL_STATUSES` left
-/// every gate green and this table without a row. Derived, the new status
-/// appears here the moment the codec can produce it, and the row is owed.
+/// Every `HelloStatus` this build can receive, derived from the codec rather
+/// than copied: `HelloStatus` is `#[non_exhaustive]`, so the whole probe range
+/// is walked through `from_u32` and each distinct status kept. The full sweep is
+/// deliberate: stopping at the first repeat assumes contiguous numbering and
+/// misses a status added past a gap.
 fn receivable() -> Vec<HelloStatus> {
     let mut seen: Vec<HelloStatus> = Vec::new();
-    // **Every value in the range, not "until the first repeat".** Stopping at
-    // the fold assumes the wire numbering is contiguous, and nothing makes it
-    // so: a status added at 10, with 7 to 9 still folding onto `Malformed`,
-    // would never be enumerated and would owe no row. `PROBE_RANGE` is a bound
-    // on the walk, not a claim about the enum.
+    // Every value in the range, not until the first repeat: numbering need not be contiguous.
     for v in 0..PROBE_RANGE {
         let status = HelloStatus::from_u32(v);
         if !seen.contains(&status) {
             seen.push(status);
         }
     }
-    // **A derivation that collapses is a gate that checks nothing.** Every
-    // assertion below iterates this, so a `from_u32` that folded everything
-    // onto one status would leave them all holding over a single row. Seven
-    // exist today and a wire contract does not shrink.
+    // A derivation that collapses (everything folded onto one status) checks nothing.
     assert!(
         seen.len() >= 7,
         "the codec delivers {} distinct statuses, fewer than the seven that exist: this \
@@ -91,24 +42,13 @@ fn receivable() -> Vec<HelloStatus> {
 /// `docs/RUNBOOK.md`'s `HandshakeRejected` section.
 fn section() -> &'static str {
     const RUNBOOK: &str = include_str!("../../../docs/RUNBOOK.md");
-    // `\n### `, not `### `: a `#### ` subheading of the same name would match
-    // the start.
-    //
-    // **The end bound is "any heading", not a list of depths.** A list is the
-    // depths somebody thought of, and two rounds of this file added one each
-    // time: `## `, because a section that becomes the last `###` under its
-    // chapter would swallow the rest of the file and every `contains` below
-    // would hold vacuously; then `# `; and then `#####`, found by measurement —
-    // a footnote under this section lent it a remedy word the table did not
-    // have and the required-word half passed on borrowed text. A heading is one
-    // to six `#`s then a space, which a fenced line could imitate; this
-    // section's one fence holds a rendered message and no shell, and that is a
-    // caveat rather than a guarantee.
+    // `\n### `, not `### `, so a `#### ` subheading does not match. The end
+    // bound is any heading (one to six `#`s then a space), so a later section
+    // cannot lend the table a word.
     let after = RUNBOOK
         .split_once("\n### `HandshakeRejected`")
         .map_or("", |(_, after)| after);
-    // An empty parse is not a pass: every assertion below is a `contains`, and
-    // all of them hold vacuously against nothing.
+    // An empty parse is not a pass: every `contains` below would hold vacuously.
     assert!(
         !after.is_empty(),
         "docs/RUNBOOK.md must carry a `HandshakeRejected` section: it holds the remedies \
@@ -126,45 +66,13 @@ fn section() -> &'static str {
     &after[..end]
 }
 
-/// Words a remedy is written with.
-///
-/// **Required in the runbook and forbidden in the message**, which is the only
-/// pairing that keeps either half honest: a forbidden list nobody would ever
-/// write is vacuous, and a row can be checked for existing without being
-/// checked for saying anything.
-///
-/// **Over the union of the remedy cells, and deliberately not per row.** Per row would be the
-/// stronger rule and it is refused because it would dictate vocabulary:
-/// measured, `Malformed`'s remedy — *confirm both sides are the same release
-/// before reading this as corruption* — carries none of these five, and the
-/// only way to pass would be to write one in. A gate that edits prose to
-/// satisfy itself is worse than one that checks less. What holds a single row
-/// to account is [`REMEDY_FLOOR`], which is a length and says nothing about
-/// wording. Two documents described this check as per-row until round 9; they
-/// were corrected rather than the check, because the check is the defensible
-/// one.
-///
-/// **It was section-wide until round 16 and whole-row until round 17, and both
-/// let the table borrow.** The prose above it says "rebuilding every
-/// participant" and names `tf_tree doctor --explain-version`, so two of these
-/// five were satisfied by sentences no row owns; and a row has a second content
-/// column, so moving that pointer into *What the owner compared* and rewording
-/// the remedy passed as well. The remedy cell is what an operator acts on, so
-/// the remedy cells are what is searched.
+/// Words a remedy is written with. Required in the runbook remedy cells (their
+/// union, not per row, which would dictate vocabulary; [`REMEDY_FLOOR`] holds a
+/// single row) and forbidden in the message.
 const REMEDY_WORDS: [&str; 5] = ["rebuild", "restart", "read-only", "/proc", "doctor"];
 
-/// The shortest a row's *what to do* cell may be.
-///
-/// **A floor, not a target, and deliberately far below what these cells are.**
-/// Its job is to catch a cell that was emptied, not to police length: the
-/// remedy-word check below is over the *union* of the remedy cells, so one can
-/// be blanked without touching a word in any other — measured, on review round
-/// 2, when the `ModeNotPermitted` cell was emptied, the row stayed, and this
-/// file passed. *That sentence said "over the section" until round 17, three
-/// narrowings after it stopped being true.*
-/// The assertion prints the offending cell's actual length, which is where a
-/// number belongs; an earlier version of this sentence claimed the shortest
-/// cell was "several times this" and it was 1.7×.
+/// The shortest a row's *what to do* cell may be: a floor that catches an
+/// emptied cell, not a length target.
 const REMEDY_FLOOR: usize = 60;
 
 /// Every refusal has a row, the rows say something, and the example is real.
@@ -172,12 +80,8 @@ const REMEDY_FLOOR: usize = 60;
 fn the_runbook_answers_every_status_the_message_stopped_explaining() {
     let section = section();
 
-    // Every status but the acceptance, which is not a refusal and has no row.
-    // **The remedy column is found by its heading, not by counting to three.**
-    // `just artifact-versions` holds every row to the header's cell *count* and
-    // says nothing about its order, so reordering the table would move the
-    // remedy under a floor that went on measuring the column beside it — the
-    // same shape as the section-wide check this floor was added to replace.
+    // Every status but the acceptance has a row. The remedy column is found by
+    // its heading, since `just artifact-versions` checks cell count, not order.
     let header = section
         .lines()
         .find(|l| l.starts_with("| `status` |"))
@@ -190,20 +94,10 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
             panic!("the `HandshakeRejected` table has no `What to do` column: {header}")
         });
 
-    // **`!= Ok` is a second spelling of `tf_tree_ipc`'s `status_is_a_refusal`,
-    // and it cannot be the first.** That predicate is the canonical answer to
-    // *which statuses owe a row*; it is `#[cfg(test)]`, so this crate cannot
-    // call it, and `HelloStatus` is `#[non_exhaustive]`, so this crate cannot
-    // re-derive it with a `match` either. The duplication is structural rather
-    // than lazy — and its failure mode is worth naming: a future status that is
-    // *not* a refusal gets a `false` arm there and would still be demanded a
-    // row here, two gates contradicting each other. Whoever adds one edits both.
+    // `!= Ok` duplicates `tf_tree_ipc`'s `#[cfg(test)]` `status_is_a_refusal`,
+    // which this crate cannot call; whoever adds a non-refusal status edits both.
     for status in receivable().into_iter().filter(|s| s != &HelloStatus::Ok) {
-        // A **row**, not a mention: the section's prose names `VersionMismatch`
-        // and `LayoutMismatch` while distinguishing them from the
-        // header-validation checks that share those names, so a `contains` over
-        // the section is satisfied for two of the six by paragraphs that answer
-        // nothing.
+        // A row, not a mention: the section's prose names some statuses too.
         let row = format!("| `{status:?}` |");
         let line = section
             .lines()
@@ -216,10 +110,7 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
                 )
             });
 
-        // **The row's own remedy cell, not the section's prose.** A first
-        // version checked the remedy words over the whole section, and blanking
-        // this cell — leaving the row in place — passed: an operator followed
-        // the search key to an empty answer with the gate green.
+        // The row's own remedy cell, not the section's prose.
         let cells: Vec<&str> = line.trim_matches('|').split(" | ").collect();
         assert_eq!(
             cells.len(),
@@ -235,13 +126,7 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
         );
     }
 
-    // **The worked example is the real rendering.** A quoted message is the
-    // shape that drifts; this repository has corrected one figure across three
-    // documents more than once.
-    // **The values are the build's, not a second transcription.** A first cut
-    // hard-coded `3` and `0x3D104195` on both sides, so the format break `0032`
-    // already owes would have left the runbook quoting numbers no build
-    // produces with this assertion green.
+    // The worked example is the real rendering, with the build's own values.
     let example = IpcError::HandshakeRejected {
         status: HelloStatus::LayoutMismatch,
         owner_format_version: tf_tree_arena::header::FORMAT_VERSION,
@@ -254,29 +139,8 @@ fn the_runbook_answers_every_status_the_message_stopped_explaining() {
          produce; it must contain, verbatim: {example}"
     );
 
-    // The remedies say something, and the message says none of it.
-    //
-    // **Over the remedy cells, and this bound has been narrowed three times.**
-    // Round 10 widened the section's *end* because a footnote below it lent the
-    // table a word. Round 16 moved the search from the section to the rows,
-    // because the prose *above* the table says "rebuilding every participant"
-    // and names `tf_tree doctor --explain-version` — two of the five, borrowed.
-    // And a row is two content columns: with whole rows joined, moving
-    // `tf_tree doctor --explain-version` into `LayoutMismatch`'s *What the
-    // owner compared* cell and rewording its remedy left the only pointer to a
-    // reader's own `layout_hash` in no remedy anywhere, and passed (measured).
-    // The remedy column is the one an operator acts on, so it is the one
-    // searched. It still asks nothing of any *single* row — that is
-    // [`REMEDY_FLOOR`]'s job, and a word per row would dictate vocabulary, see
-    // [`REMEDY_WORDS`].
-    //
-    // **Case-folded on both sides.** The forbidden half lowercases the message;
-    // this half compared raw, so capitalising a remedy at the start of a cell —
-    // `Restart them together` — reddened the gate with *"no longer says
-    // restart"*, a diagnostic that contradicts the file in front of the author.
-    // `0055` step 6 shipped a defect through a case-sensitive forbidden list;
-    // this is the same rule with its polarity flipped, and it fails closed
-    // instead of open.
+    // The remedies say something and the message says none of it. Searched over
+    // the remedy cells only, case-folded on both sides.
     let folded = section
         .lines()
         .filter(|l| l.starts_with("| `") && !l.starts_with("| `status` |"))

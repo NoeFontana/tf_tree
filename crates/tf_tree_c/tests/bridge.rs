@@ -1,24 +1,8 @@
 //! The ingest-bridge seam of the C ABI — `docs/PHASE4.md` §5 and §6.3.
-//!
-//! `abi.rs` covers misuse with no handle, `live.rs` the read path, `publish.rs`
-//! the write path. This covers the seam an `rclcpp` node calls, which is the
-//! only one that both decides *and* writes: everything §5 judges about somebody
-//! else's misconfigured robot is reachable from C through exactly these nine
-//! entry points, and if a judgment cannot be printed by a C caller it may as
-//! well not have been made.
-//!
-//! **Every test here drives the `extern "C"` functions, not the Rust behind
-//! them.** `tf_tree_bridge`'s own tests already cover the pipeline; what is
-//! untested without this file is the boundary — the POD outcome, the borrowed
-//! `const char *` lifetimes, the arena write, and the counters the C layer adds
-//! to the pipeline's own.
 #![cfg(feature = "bridge")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
-// exercise or measure it** (`docs/decisions/0048`: a kind is a property, not a
-// crate name). The posture is declared here rather than inherited:
-// `crates/tf_tree_c/src/lib.rs` does not govern this file, because a test or
-// example is a **separate crate root**. `0048` step 4 is what this closes.
+// Posture (`docs/decisions/0007` rule 1, kind 5; `0048` step 4): our own C ABI called
+// from Rust; declared here because a test is a separate crate root.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -29,9 +13,9 @@ use std::ffi::{CStr, CString};
 use tf_tree_c::bridge::*;
 use tf_tree_c::*;
 
-/// One dynamic edge and one static one — the smallest topology that still
-/// exercises both `/tf` and `/tf_static`, in the real config format so these
-/// tests go through the parser an operator will use.
+/// One dynamic edge and one static one — the smallest topology that still exercises both `/tf`
+/// and `/tf_static`, in the real config format so these tests go through the parser an operator
+/// will use.
 const TOPO: &str = r#"
 [[edge]]
 parent = "odom"
@@ -46,9 +30,8 @@ kind = "static"
 pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
 "#;
 
-/// A 30° yaw with a translation nothing else in the fixture shares, so a
-/// read-back that returns identity — or the static edge's pose — fails rather
-/// than coincidentally passing.
+/// A 30° yaw with a translation nothing else in the fixture shares, so a read-back that returns
+/// identity — or the static edge's pose — fails rather than coincidentally passing.
 const POSE: [f64; 7] = [
     0.965_925_826_289_068_3,
     0.0,
@@ -59,10 +42,7 @@ const POSE: [f64; 7] = [
     0.75,
 ];
 
-/// A pose that is a valid transform and **not** [`POSE`], for a §5.7 value
-/// disagreement. The translation differs; the rotation is deliberately identical,
-/// so a comparison that only looked at the quaternion would call the two the same
-/// and the conflict this drives would not be detected at all.
+/// A pose that is a valid transform and **not** [`POSE`], for a §5.7 value disagreement.
 const OTHER_POSE: [f64; 7] = [
     0.965_925_826_289_068_3,
     0.0,
@@ -100,9 +80,8 @@ impl Bridge {
             on_clock_reset,
             domain,
             tf_prefix: prefix.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
-            // A private heap arena, which is what this whole file tests. The
-            // shared path needs `--features shm` and lives in
-            // `tests/bridge_shared.rs`.
+            // A private heap arena, which is what this whole file tests. The shared path needs
+            // `--features shm` and lives in `tests/bridge_shared.rs`.
             arena_name: ptr::null(),
         };
         let mut b: *mut tft_bridge = ptr::null_mut();
@@ -117,13 +96,8 @@ impl Bridge {
         }
     }
 
-    /// Offer one transform with **no receipt clock**, which is what a caller
-    /// that has none supplies.
-    ///
-    /// Deliberately the default for this file: §5.5's offset layer is then
-    /// absent, so every fixture that is about names, authority, statics or the
-    /// arena keeps testing exactly what it used to. The handful that are about
-    /// the clock say so by calling [`Bridge::offer_at`].
+    /// Offer one transform with **no receipt clock**, which is what a caller that has none
+    /// supplies.
     fn offer(
         &self,
         topic: tft_bridge_topic,
@@ -136,12 +110,8 @@ impl Bridge {
         self.offer_at(topic, parent, child, stamp, 0, pose, gid)
     }
 
-    /// Offer one transform and return the outcome, checking the call itself was
-    /// well-formed. The `CString`s outlive the call, which is all the ABI asks.
-    ///
-    /// `received` is the local steady clock's reading for the message this
-    /// transform came in — the reference §5.5 measures each publisher's stamp
-    /// against, and never derived from a stamp.
+    /// Offer one transform and return the outcome, checking the call itself was well-formed.
+    /// The `CString`s outlive the call, which is all the ABI asks.
     #[allow(clippy::too_many_arguments)]
     fn offer_at(
         &self,
@@ -178,8 +148,7 @@ impl Bridge {
         out
     }
 
-    /// Close `STRICT`'s startup window — §5.4's primary close, with no transform
-    /// in hand.
+    /// Close `STRICT`'s startup window — §5.4's primary close, with no transform in hand.
     fn close_startup_window(&self) -> tft_bridge_outcome {
         let mut out = poisoned_outcome();
         // SAFETY: live handle on its creating thread; `out` is a live local with
@@ -189,8 +158,8 @@ impl Bridge {
         out
     }
 
-    /// Report a jump the time source itself announced — §5.5's authoritative
-    /// rung, with no transform in hand.
+    /// Report a jump the time source itself announced — §5.5's authoritative rung, with no
+    /// transform in hand.
     fn note_time_jump(&self, delta_nanos: i64, kind: tft_bridge_jump_kind) -> tft_bridge_outcome {
         let mut out = poisoned_outcome();
         // SAFETY: live handle on its creating thread; `out` is a live local with
@@ -211,8 +180,8 @@ impl Bridge {
         s
     }
 
-    /// §5.6's remap table, walked exactly as the doc comment's C loop walks it:
-    /// row by row until `TFT_ERR_NO_DATA`.
+    /// §5.6's remap table, walked exactly as the doc comment's C loop walks it: row by row
+    /// until `TFT_ERR_NO_DATA`.
     fn remaps(&self) -> Vec<(String, String)> {
         let mut rows = Vec::new();
         for i in 0u32.. {
@@ -281,12 +250,6 @@ impl Drop for Tree {
 }
 
 /// An outcome whose every byte is 0xAA apart from `struct_size`.
-///
-/// The ABI promises `*out` is filled with a well-formed "nothing happened"
-/// before anything can fail. A zeroed struct would let that promise pass by
-/// accident — `TFT_BRIDGE_APPLIED` and `TFT_BRIDGE_REASON_NONE` are both 0 —
-/// and a NULL string pointer would read as "empty" to a lenient test while
-/// crashing a C caller that printed it.
 fn poisoned_outcome() -> tft_bridge_outcome {
     // SAFETY: `tft_bridge_outcome` is `#[repr(C)]`, `Copy`, and made of
     // integers, `f64`s and raw pointers — every bit pattern is a valid value of
@@ -312,9 +275,8 @@ fn text(p: *const c_char) -> String {
     unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
 }
 
-// `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast is necessary
-// on one target and a no-op on the other; see `src/error.rs` for the full
-// note. The allow is the fix — deleting the cast breaks x86_64.
+// `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast is necessary on one target and a
+// no-op on the other; see `src/error.rs` for the full note.
 #[allow(clippy::unnecessary_cast)]
 fn last_message() -> String {
     let mut e = tft_error::blank();
@@ -363,13 +325,9 @@ fn assert_balanced(s: &tft_bridge_stats) {
     );
 }
 
-/// **The seam writes the arena, and the arena is readable through the handle it
-/// hands back.** Both halves of `docs/PHASE4.md` §5 in one call: the pipeline
-/// decides, and Rust — not the C++ node — performs the write.
-///
-/// Mutant: make `write_sample` return `TFT_OK` without calling `w.push` ⇒ the
-/// outcome is still `TFT_BRIDGE_APPLIED`, so the first assertion survives and
-/// the read-back is what fails, with `TFT_ERR_NO_DATA`.
+/// **The seam writes the arena, and the arena is readable through the handle it hands back.**
+/// Both halves of `docs/PHASE4.md` §5 in one call: the pipeline decides, and Rust — not the C++
+/// node — performs the write.
 #[test]
 fn an_offer_on_a_declared_edge_is_written_and_reads_back() {
     let b = Bridge::new(
@@ -411,15 +369,6 @@ fn an_offer_on_a_declared_edge_is_written_and_reads_back() {
 }
 
 /// **A malformed pose never reaches the authority table** (§5.4).
-///
-/// A publisher whose first message is garbage must not take ownership of the
-/// edge under `FirstWriterWins`, because the ownership is for the life of the
-/// arena and the *correct* publisher would be locked out of it by one bad
-/// message.
-///
-/// Mutant: move the `layout::from_wxyz_pose` check below `inner.ingest.offer`
-/// ⇒ `/rogue` owns `odom -> base`, the `/ekf` offer comes back
-/// `TFT_BRIDGE_DROPPED` with `TFT_BRIDGE_REASON_NOT_THE_OWNER`, and this fails.
 #[test]
 fn a_bad_pose_is_refused_before_the_publisher_can_take_the_edge() {
     let b = Bridge::new(
@@ -437,9 +386,8 @@ fn a_bad_pose_is_refused_before_the_publisher_can_take_the_edge() {
         );
     }
 
-    // A quaternion of norm 2 — a plausible mistake (an unnormalized message),
-    // not a wild value, so `NotAUnitQuaternion` rather than `NotFinite` is what
-    // catches it.
+    // A quaternion of norm 2 — a plausible mistake (an unnormalized message), not a wild value,
+    // so `NotAUnitQuaternion` rather than `NotFinite` is what catches it.
     let bad = [2.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3];
     let o = b.offer(
         TFT_BRIDGE_TOPIC_TF,
@@ -479,19 +427,8 @@ fn a_bad_pose_is_refused_before_the_publisher_can_take_the_edge() {
     assert_balanced(&s);
 }
 
-/// **§5.4's headline diagnostic survives the C boundary: both nodes, the edge,
-/// and a rate-limit flag.**
-///
-/// This is the sentence §5.4 calls the better sales pitch — *"your `/ekf` and
-/// `/odom_node` have both been publishing `odom -> base_link`"* — and it is
-/// only printable if all four pieces reach C. It was not: the pipeline
-/// collapsed `Verdict::Reject`, which carries all of them, into an
-/// `Action::Drop { reason }` that carries none.
-///
-/// Mutant: drop `o.first_time = u8::from(*first_time)` from the
-/// `AuthorityConflict` arm ⇒ the second offer's `first_time` is 0 like the
-/// first, and a 1 kHz intruder becomes silent instead of rate-limited, so the
-/// `first_time == 1` assertion fails.
+/// **§5.4's headline diagnostic survives the C boundary: both nodes, the edge, and a rate-limit
+/// flag.**
 #[test]
 fn an_authority_conflict_names_both_publishers_and_the_edge() {
     let b = Bridge::new(
@@ -548,19 +485,6 @@ fn an_authority_conflict_names_both_publishers_and_the_edge() {
 }
 
 /// **A publisher that gets renamed is still the same publisher.**
-///
-/// This is the regression test for the defect `crates/tf_tree_bench`'s DDS
-/// comparison found. `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` for an
-/// endpoint discovered before its participant's node information arrives and
-/// corrects it on a later graph walk, so the *same* GID is attributed twice with
-/// two different names. When identity was the name, `FirstWriterWins` gave the
-/// edge to the placeholder and then rejected the real publisher forever:
-/// measured at 9 864 of 10 070 transforms dropped, against one correctly
-/// configured publisher, with 100 % of consumer lookups failing.
-///
-/// Mutant: make `tft_bridge_attribute` `insert` a fresh `Publisher` keyed on the
-/// name instead of mutating the entry's name ⇒ the second offer is
-/// `TFT_BRIDGE_DROPPED` / `NOT_THE_OWNER` and this fails on the first assert.
 #[test]
 fn a_publisher_renamed_by_a_later_graph_walk_keeps_its_edge() {
     let b = Bridge::new(
@@ -613,29 +537,14 @@ fn a_publisher_renamed_by_a_later_graph_walk_keeps_its_edge() {
 }
 
 /// **Two publishers the graph cannot name are still two publishers.**
-///
-/// The other half of the same defect, and the one `docs/PHASE4.md` §5.3's
-/// amendment already named: `Publisher::UnknownGid` was a *unit* variant, so on
-/// a walk that resolved no names every publisher compared equal and §5.4's
-/// conflict detection was silently off — in exactly the deployment least able to
-/// diagnose it. A GID with no name is now a distinct identity.
-///
-/// Note what this does **not** change: a publisher with no GID *at all* is still
-/// `Publisher::Unattributed`, a unit variant, because `0012`'s ladder requires
-/// that less attribution mean less detection and never more stopping. That case
-/// is `an_unreported_gid_degrades_rather_than_failing` below.
-///
-/// Mutant: have `publisher_of` return one shared sentinel for an uncached GID
-/// instead of populating the cache ⇒ both offers are `TFT_BRIDGE_APPLIED` and
-/// the conflict assertion fails.
 #[test]
 fn two_unnamed_publishers_on_one_edge_still_conflict() {
     let b = Bridge::new(
         TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
         TFT_BRIDGE_ON_CLOCK_RESET_HALT,
     );
-    // Neither GID is ever passed to `tft_bridge_attribute`, so neither has a
-    // name — the state an RMW without endpoint introspection leaves.
+    // Neither GID is ever passed to `tft_bridge_attribute`, so neither has a name — the state
+    // an RMW without endpoint introspection leaves.
     let (one, two) = ([0x66u8; 16], [0x77u8; 16]);
 
     let o = b.offer(
@@ -661,8 +570,8 @@ fn two_unnamed_publishers_on_one_edge_still_conflict() {
         "two distinct GIDs are two publishers even with no names for them"
     );
     assert_eq!(o.reason, TFT_BRIDGE_REASON_NOT_THE_OWNER);
-    // And the diagnostic must be able to tell them apart, or it says two
-    // identical things are fighting.
+    // And the diagnostic must be able to tell them apart, or it says two identical things are
+    // fighting.
     let (owner, intruder) = (text(o.owner), text(o.intruder));
     assert_ne!(
         owner, intruder,
@@ -676,16 +585,6 @@ fn two_unnamed_publishers_on_one_edge_still_conflict() {
 }
 
 /// **An unattributed publisher is not an error** (§5.3: attribution degrades).
-///
-/// A GID of all zeroes is what an RMW that reports none leaves behind, so it
-/// must mean "nothing was told to us" rather than "publisher number zero" —
-/// otherwise every unattributed sample on the bus would be attributed to one
-/// imaginary node and `FirstWriterWins` would hand it every edge.
-///
-/// Mutant: delete the `key == [0u8; 16]` early return in `publisher_of` ⇒ the
-/// zero GID misses the cache and resolves to `<unknown publisher>`, which under
-/// `Strict` is a second publisher on the edge, so the sample is dropped as
-/// `NOT_THE_OWNER` and the `TFT_BRIDGE_APPLIED` assertion fails.
 #[test]
 fn an_unreported_gid_degrades_rather_than_failing() {
     let b = Bridge::new(TFT_BRIDGE_AUTHORITY_STRICT, TFT_BRIDGE_ON_CLOCK_RESET_HALT);
@@ -693,10 +592,9 @@ fn an_unreported_gid_degrades_rather_than_failing() {
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 1_000 * MS, POSE, None);
     assert_eq!(o.action, TFT_BRIDGE_APPLIED);
 
-    // An all-zero GID is the same publisher as no GID, so `Strict` — which
-    // records a conflict on the *second* distinct publisher of an edge, and
-    // halts once at its startup window's close if it recorded any — must find
-    // nothing to record.
+    // An all-zero GID is the same publisher as no GID, so `Strict` — which records a conflict
+    // on the *second* distinct publisher of an edge, and halts once at its startup window's
+    // close if it recorded any — must find nothing to record.
     let zero = [0u8; 16];
     let o = b.offer(
         TFT_BRIDGE_TOPIC_TF,
@@ -721,65 +619,8 @@ fn an_unreported_gid_degrades_rather_than_failing() {
     assert_eq!(rc, TFT_ERR_BAD_ENUM);
 }
 
-/// **`STRICT` halts when its startup window closes, not on the message that
-/// collided — and a halted bridge then refuses everything, with the ledger still
-/// balancing.**
-///
-/// §5.5 says the bridge *stops*. This ABI cannot exit somebody else's process,
-/// so stopping means latching: a caller that logs the halt and keeps offering
-/// would push exactly the stamps §5.5 exists to prevent. That half is unchanged.
-///
-/// What `docs/decisions/0011` changed is the **trigger**. `STRICT` used to
-/// return `Fatal` on the second message that collided, which is neither §5.4's
-/// *"refuse to start if a conflict is detected within a startup window"* nor of
-/// any use to the CI the policy exists for: a deployment with four misconfigured
-/// publishers took four boots to diagnose, each reporting one of them. Now the
-/// collision is dropped and counted exactly as `FIRST_WRITER_WINS` would,
-/// conflicts accumulate while the window is open, and **one** halt at its close
-/// reports how many of each kind were found.
-///
-/// This fixture drives §5.4's **primary** close — `tft_bridge_close_startup_window`,
-/// `docs/decisions/0011` implementation step 6 — where it used to loop 4096
-/// transforms to reach the backstop, because until step 6 landed the backstop was
-/// the only close a C caller could reach at all. The backstop itself is still
-/// covered, in `tf_tree_bridge`'s own
-/// `the_startup_window_closes_itself_after_the_backstop`: it is that crate's
-/// private constant and this seam only forwards to it, so the loop was buying
-/// 4096 offers' worth of runtime for coverage one crate down.
-///
-/// **Nine mutants, each applied and run.** Quoted numbers are this fixture's,
-/// re-measured after step 6 changed it; the two that carried the 4096-transform
-/// loop's figures had gone stale, which is what re-running them was for.
-///
-/// Mutant: delete `inner.stopped = Some(…)` from the `Action::Halt` arm ⇒ *"the
-/// latch holds", left: 2, right: 5* — the **second** `close_startup_window()`
-/// comes back `TFT_BRIDGE_DROPPED`, because with nothing latched the idempotent
-/// `Ingest::close_startup_window` returns `None` and the blank outcome stands.
-/// It fails there rather than in the replay loop, which is earlier than this note
-/// used to claim. Mutant: drop `+ inner.refused_after_halt` from `transforms` in
-/// `tft_bridge_get_stats` ⇒ the offered-transform assertion, *left: 4, right: 7*,
-/// and `assert_balanced` would too, short by 3. Mutant: restore the unconditional
-/// `set(&mut inner.strings.detail, "the bridge halted; …")` after the
-/// `Action::Halt` match — the shape this arm had before, and the one the halt's
-/// numbers cannot survive ⇒ *"the close reports how many of each kind it found,
-/// or CI learns nothing from it: \"the bridge halted; free it and build a new
-/// one\""*. Mutant: call `name_the_edge(inner, o)` in the `StartupConflicts` arm
-/// ⇒ *left: ("base", "lidar"), right: ("", "")* — the halt names the static edge
-/// that happened to be last on the wire as its cause, which is an innocent edge
-/// printed as the fault.
-///
-/// The five that are about step 6's own code. Mutant: delete the authority
-/// enumeration loop ⇒ *"every recorded edge must be enumerated, both kinds"*, on
-/// a `detail` carrying `"; static base->lidar: …"` and no authority clause.
-/// Mutant: delete the static loop ⇒ the same assertion, mirrored. Mutant:
-/// `o.reason = TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` — the code this step
-/// replaced ⇒ *left: 5, right: 9*. Mutant: make the `inner.stopped` early return
-/// unreachable in `tft_bridge_close_startup_window` ⇒ *"the latch holds", left:
-/// 2, right: 5*, the same reading as deleting the latch, because a second close
-/// with nothing to report is indistinguishable from a bridge that never halted.
-/// Mutant: `inner.refused_after_halt += 1` on that early return ⇒ *left: 4,
-/// right: 3* — the call is not a transform, and charging it a bucket is the
-/// failure the "# What it does and does not charge" heading exists to prevent.
+/// **`STRICT` halts when its startup window closes, not on the message that collided — and a
+/// halted bridge then refuses everything, with the ledger still balancing.**
 #[test]
 fn a_halted_bridge_refuses_every_later_offer() {
     let b = Bridge::new(TFT_BRIDGE_AUTHORITY_STRICT, TFT_BRIDGE_ON_CLOCK_RESET_HALT);
@@ -792,9 +633,9 @@ fn a_halted_bridge_refuses_every_later_offer() {
             TFT_OK
         );
     }
-    // **Every `tft_bridge_offer` call this test makes, counted** — all of them,
-    // which is itself the shape step 6 changed: §5.4's primary close is a
-    // separate call, so there is no uncounted offer left to explain.
+    // **Every `tft_bridge_offer` call this test makes, counted** — all of them, which is itself
+    // the shape step 6 changed: §5.4's primary close is a separate call, so there is no
+    // uncounted offer left to explain.
     let mut offers = 0u64;
     let mut offer = |topic: tft_bridge_topic,
                      parent: &str,
@@ -821,10 +662,7 @@ fn a_halted_bridge_refuses_every_later_offer() {
         "and it still names both publishers, which is what the close will count"
     );
 
-    // A §5.7 static disagreement as well, so the halt has to report **both**
-    // kinds. It is what made `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` the wrong
-    // code for this event: the record contains a value conflict and that name
-    // says nothing about one.
+    // A §5.7 static disagreement as well, so the halt has to report **both** kinds.
     offer(TFT_BRIDGE_TOPIC_TF_STATIC, "base", "lidar", 0, POSE, &a);
     let o = offer(
         TFT_BRIDGE_TOPIC_TF_STATIC,
@@ -841,8 +679,7 @@ fn a_halted_bridge_refuses_every_later_offer() {
         text(o.detail)
     );
 
-    // **§5.4's primary close.** One call, no transform in hand, no bucket
-    // charged.
+    // **§5.4's primary close.** One call, no transform in hand, no bucket charged.
     let o = b.close_startup_window();
     assert_eq!(
         o.action,
@@ -859,17 +696,16 @@ fn a_halted_bridge_refuses_every_later_offer() {
         "the close reports how many of each kind it found, or CI learns nothing \
          from it: {detail:?}"
     );
-    // §5.4:1403, in its own words: *"the seam's `detail` enumerates **every**
-    // recorded edge with both of its publishers, not the first."* Both halves,
-    // because a report that named only the authority edges would send a CI
-    // operator to fix half a misconfiguration.
+    // *"the seam's `detail` enumerates **every** recorded edge
+    // with both of its publishers, not the first."* Both halves, because a report that named
+    // only the authority edges would send a CI operator to fix half a misconfiguration.
     assert!(
         detail.contains("authority odom->base") && detail.contains("static base->lidar"),
         "every recorded edge must be enumerated, both kinds: {detail:?}"
     );
-    // **"with both of its publishers"** taken literally: one `X vs Y` pair per
-    // recorded edge and no more, so a `detail` that named an edge and only the
-    // publisher that arrived last would fail here.
+    // **"with both of its publishers"** taken literally: one `X vs Y` pair per recorded edge
+    // and no more, so a `detail` that named an edge and only the publisher that arrived last
+    // would fail here.
     assert_eq!(
         detail.matches(" vs ").count(),
         2,
@@ -880,11 +716,8 @@ fn a_halted_bridge_refuses_every_later_offer() {
         detail.contains("authority odom->base: /a vs /b"),
         "the authority edge names the owner and the intruder: {detail:?}"
     );
-    // The static half's "owner" is the **declared constant**, not a node, because
-    // the fixture's topology declares `base -> lidar` static and both offers
-    // disagreed with it. That is §5.7's URDF-disagreement shape rather than a
-    // second publisher's, and it is the reading a CI operator needs: the config
-    // and the robot disagree, and the robot is `/a`.
+    // The static half's "owner" is the **declared constant**, not a node, because the fixture's
+    // topology declares `base -> lidar` static and both offers disagreed with it.
     assert!(
         detail.contains("static base->lidar: <topology config> vs /a"),
         "the static edge names what declared the constant and who contradicted \
@@ -897,8 +730,8 @@ fn a_halted_bridge_refuses_every_later_offer() {
          edge rather than an innocent one"
     );
 
-    // Called twice is not an error and does not reopen anything; the second call
-    // takes the already-halted path, like every other call now does.
+    // Called twice is not an error and does not reopen anything; the second call takes the
+    // already-halted path, like every other call now does.
     let again = b.close_startup_window();
     assert_eq!(again.action, TFT_BRIDGE_HALT, "the latch holds");
     assert_eq!(again.reason, TFT_BRIDGE_REASON_ALREADY_HALTED);
@@ -918,28 +751,17 @@ fn a_halted_bridge_refuses_every_later_offer() {
     }
     let s = b.stats();
     assert_eq!(s.refused_after_halt, 3);
-    // **Three drops for one authority collision, and the arithmetic is the
-    // point.** `dropped_authority` is the ledger's only term for a static value
-    // conflict too — `static_conflicts` is a side count and *not* a ledger term,
-    // so a §5.7 disagreement has to be charged somewhere or `assert_balanced`
-    // breaks. One collision plus two disagreements reads 3.
-    // `tf_tree_bridge`'s `strict_accumulates_conflicts_inside_the_window_and_halts_once_at_its_close`
-    // reads `(1, 2, 1)` on *its* fixture, and the two are **supposed** to differ:
-    // that one makes a single static observation and this one makes two, on
-    // purpose, so the `s.static_conflicts > 1` assertion below can separate
-    // observations from faults. Do not reconcile them — the shared rule is one
-    // bucket per drop, not one pair of numbers.
+    // **Three drops for one authority collision, and the arithmetic is the point.**
+    // `dropped_authority` is the ledger's only term for a static value conflict too —
+    // `static_conflicts` is a side count and *not* a ledger term, so a §5.7 disagreement has to
+    // be charged somewhere or `assert_balanced` breaks.
     assert_eq!(
         (s.applied, s.dropped_authority, s.static_conflicts),
         (1, 3, 2),
         "one write, three drops in one bucket, two static observations"
     );
-    // **Two observations, one fault** — and the `"1 static"` assertion above is
-    // what separates them. `StaticStore::conflicts()` would say 2 here; the
-    // close counts edges, via `conflicts_by_edge()`, because `/tf_static` is
-    // `transient_local` and a latched misconfiguration is redelivered to every
-    // late joiner. A fixture where the two numbers were equal could not tell
-    // which one the halt quotes.
+    // **Two observations, one fault** — and the `"1 static"` assertion above is what separates
+    // them.
     assert!(
         s.static_conflicts > 1,
         "the fixture must keep observations and faults apart: {}",
@@ -955,35 +777,6 @@ fn a_halted_bridge_refuses_every_later_offer() {
 }
 
 /// **`TFT_BRIDGE_RECREATE` stops the bridge too, and keeps saying `RECREATE`.**
-///
-/// §5.5's `recreate` builds a fresh arena; this ABI will not, because every
-/// plan the node compiled points into the current one. So the only correct
-/// continuation is that the caller tears the bridge down — and the pipeline has
-/// *already forgotten* every edge's high-water mark on this path, so an
-/// unlatched bridge would approve every subsequent sample and let the arena
-/// refuse them one at a time as non-monotonic: a bag loop turning into a silent
-/// permanent stall.
-///
-/// **The stop arrives through [`tft_bridge_note_time_jump`], and it has to.**
-/// This fixture is one publisher on one dynamic edge, and under §5.5's ladder a
-/// single source *never* promotes its own regression, however far back it goes
-/// (`a_lone_publisher_regressing_is_never_promoted_however_far_it_goes`). What
-/// a lone bag loop really has is the authoritative signal, because `rcl`
-/// reports the `/clock` rewind to the node directly. So the fixture uses it,
-/// and the latch is exercised through the entry point a real replay deployment
-/// would use.
-///
-/// Mutant: delete `inner.stopped = Some(…)` from the `RecreateArena` arm ⇒ the
-/// next offer comes back **`TFT_BRIDGE_REJECTED`** (*"left: 7, right: 6"*), not
-/// `APPLIED` — which is the failure mode this test's second paragraph describes,
-/// caught in the act: the pipeline waved the sample through because the recreate
-/// had rewound every high-water mark, and the arena refused it as
-/// non-monotonic. One `rejected_by_arena` per sample, forever, instead of one
-/// loud outcome. Mutant: latch it with `action: TFT_BRIDGE_HALT` ⇒ the caller is
-/// told a worse fault than the one that happened, and both the second
-/// `TFT_BRIDGE_RECREATE` assertion and the `"re-plan"` one fail. Mutant: negate
-/// the delta on the way through `note_time_jump` ⇒ *"left: 5000000000, right:
-/// -5000000000"*, a rewind reported as a fast-forward.
 #[test]
 fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
     let b = Bridge::new(
@@ -991,8 +784,8 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
         TFT_BRIDGE_ON_CLOCK_RESET_RECREATE,
     );
     b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 10_000 * MS, POSE, None);
-    // A bag loop, as `rcl_time_jump_t` reports it: new time minus old, so a
-    // five-second rewind is negative.
+    // A bag loop, as `rcl_time_jump_t` reports it: new time minus old, so a five-second rewind
+    // is negative.
     let o = b.note_time_jump(-5_000 * MS, TFT_BRIDGE_JUMP_BACKWARD);
     assert_eq!(o.action, TFT_BRIDGE_RECREATE, "{}", text(o.detail));
     assert_eq!(o.delta_nanos, -5_000 * MS);
@@ -1024,23 +817,8 @@ fn a_clock_reset_under_recreate_latches_and_keeps_its_own_action() {
     assert_balanced(&b.stats());
 }
 
-/// **A lone publisher regressing by five seconds is dropped, not promoted —
-/// however many times it does it.**
-///
-/// This is the defect §5.5's ladder exists to remove, stated as a fixture. One
-/// node restarting and replaying its own buffer looks *exactly* like a bag loop
-/// to anything watching one edge's stamps, and the rule that promoted it stopped
-/// robots that had nothing wrong with them. Distance is not evidence: the
-/// arriving samples are refused either way, because Phase 1's ring would refuse
-/// them anyway, so nothing is lost by not stopping.
-///
-/// Note the offers carry a real receipt clock, so the offset layer is fully
-/// engaged and this is not passing merely because that layer was asleep.
-///
-/// Mutant: promote a lone step by returning `Some(CommonMode { publishers: 1, …
-/// })` from `OffsetTable::observe` when one publisher steps ⇒ the first
-/// regression halts, and every `TFT_BRIDGE_DROPPED` assertion here fails.
-/// Mutant: drop the `publishers < 2` guard entirely ⇒ the same.
+/// **A lone publisher regressing by five seconds is dropped, not promoted — however many times
+/// it does it.**
 #[test]
 fn a_lone_publisher_regressing_is_never_promoted_however_far_it_goes() {
     let b = Bridge::new(
@@ -1091,47 +869,8 @@ fn a_lone_publisher_regressing_is_never_promoted_however_far_it_goes() {
     assert_balanced(&s);
 }
 
-/// **Two publishers whose offsets step by the same amount are the clock; one is
-/// not — and the halt says which rung concluded it.**
-///
-/// §5.5's fallback rung at the seam, in the shape the rest of this file cannot
-/// express: `TOPO` declares one dynamic edge, so nothing else here can put two
-/// distinct publishers inside one correlation window. Hence a local topology
-/// with a second dynamic edge and a second publisher — the pair `0011` was
-/// opened about, a localizer's `map -> odom` and a wheel driver's `odom ->
-/// base`.
-///
-/// **The receipt clock is what makes this work at all.** Each publisher's
-/// `stamp - received` offset is tracked, so a `transform_tolerance` is measured
-/// and subtracted rather than mistaken for a jump; what promotes is a *step* in
-/// that offset, seen in two distinct publishers within a second of each other
-/// and agreeing about its size. A real `/clock` step moves everybody by the same
-/// amount and two independent restarts do not, which is why agreement is the
-/// evidence rather than mere coincidence in time.
-///
-/// The delta is `-5_020 * MS` and not a round five seconds because it is
-/// measured against the *receipt* clock: the wheel driver's post-rewind message
-/// arrives 20 ms of real time after its last pre-rewind one, and those 20 ms are
-/// part of how far its offset moved. That is the measurement being honest about
-/// what it is, and the agreement tolerance — 25 % of 5 s, or 1.25 s — exists
-/// precisely so two publishers sampling the same jump at different instants
-/// still agree.
-///
-/// The evidence has to ride in `detail` because `tft_bridge_outcome` has room
-/// for exactly one `(parent, child)` pair — filled here with the edge whose
-/// sample *completed* the step — and growing that POD is a
-/// `struct_size`-versioned break. It is not decoration: an operator told "two
-/// publishers stepped together" goes and looks at those two nodes, and one told
-/// "the time source reported it" goes and looks at the bag.
-///
-/// Mutant: drop the evidence from the `HaltReason::ClockReset` detail and return
-/// the plain "the bridge halted" sentence ⇒ the `"publishers"` assertion fails
-/// and the halt no longer says what it concluded. Mutant: promote a single
-/// witness, by removing `OffsetTable::observe`'s `publishers < 2` guard ⇒ the
-/// first offer halts and the `TFT_BRIDGE_DROPPED` assertion fails, which is the
-/// false halt on a healthy robot this design exists to remove. Mutant: increment
-/// `clock_resets` on the isolated regression too ⇒ the `0` assertion fails, and
-/// the counter goes back to meaning "regressions" instead of "promotions".
+/// **Two publishers whose offsets step by the same amount are the clock; one is not — and the
+/// halt says which rung concluded it.**
 #[test]
 fn a_clock_reset_needs_a_second_publisher_and_reports_how_many_corroborated() {
     const TWO_PUBLISHERS: &str = r#"
@@ -1164,8 +903,8 @@ capacity = 256
             TFT_OK
         );
     }
-    // Both publishers' first sample defines their offset baseline: there is
-    // nothing yet for either to have stepped away from.
+    // Both publishers' first sample defines their offset baseline: there is nothing yet for
+    // either to have stepped away from.
     for (p, c, g) in [("map", "odom", &amcl), ("odom", "base", &wheels)] {
         let o = b.offer_at(
             TFT_BRIDGE_TOPIC_TF,
@@ -1180,8 +919,6 @@ capacity = 256
     }
 
     // `/amcl` republishes from five seconds ago, 10 ms of real time later.
-    // Alone, that is a node restarting — dropped, counted, and the bridge keeps
-    // running.
     let o = b.offer_at(
         TFT_BRIDGE_TOPIC_TF,
         "map",
@@ -1248,34 +985,8 @@ capacity = 256
     assert_balanced(&s);
 }
 
-/// **A stop is `first_time = 1` exactly once, and the replay after it is
-/// rate-limited like every other repeated outcome.**
-///
-/// `HALT` and `RECREATE` are the only actions a caller *must* log, and they are
-/// the only ones that repeat forever: every offer after the stop replays the
-/// latched action. Without a rate limiter on them the rclcpp bridge emitted one
-/// `RCLCPP_FATAL` per transform for the life of the process — at 20 edges and
-/// 100 Hz, 2000 lines a second, each taking rcutils' logging mutex on the
-/// ingest thread and burying the one actionable line. §5.4 requires the
-/// diagnostic be "loud, **rate-limited**"; `first_time` is the whole of that
-/// mechanism and it was set on three arms out of five.
-///
-/// **The stop is a reported clock jump**, because a single publisher on a single
-/// edge can no longer produce one and should not be able to: §5.5's ladder never
-/// promotes one witness. A bag replay really does have the authoritative signal,
-/// so the fixture uses it — and it also proves the new entry point latches
-/// through exactly the same machinery `offer` does, which is why it goes through
-/// `fill` rather than growing a second copy of the halt wording.
-///
-/// Mutant: delete `o.first_time = 1` from the `Action::Halt` arm ⇒ the halting
-/// call reports 0 and a caller has no way to tell the transition from the
-/// replay; the first `assert_eq!(o.first_time, 1)` fails. Mutant: the same
-/// deletion in `Action::RecreateArena` ⇒ the second one fails. Mutant: set
-/// `o.first_time = 1` on either `Stopped` short-circuit path ⇒ every replayed
-/// call claims to be the first and the `0` assertions fail. Mutant: hard-code
-/// `clock_resets: 0` in `tft_bridge_get_stats` ⇒ the promotion the halt was
-/// raised from is invisible to `tf_tree doctor`, and the `clock_resets`
-/// assertion fails.
+/// **A stop is `first_time = 1` exactly once, and the replay after it is rate-limited like
+/// every other repeated outcome.**
 #[test]
 fn a_stop_is_announced_once_and_every_replay_after_it_is_rate_limited() {
     let b = Bridge::new(
@@ -1292,8 +1003,8 @@ fn a_stop_is_announced_once_and_every_replay_after_it_is_rate_limited() {
         1,
         "the reported jump is a promotion, which is what `clock_resets` counts"
     );
-    // A jump reported twice — a bag that loops twice — replays the latch and is
-    // rate-limited exactly like a repeated offer.
+    // A jump reported twice — a bag that loops twice — replays the latch and is rate-limited
+    // exactly like a repeated offer.
     let o = b.note_time_jump(-5_000 * MS, TFT_BRIDGE_JUMP_BACKWARD);
     assert_eq!(o.action, TFT_BRIDGE_HALT);
     assert_eq!(o.reason, TFT_BRIDGE_REASON_ALREADY_HALTED);
@@ -1327,50 +1038,7 @@ fn a_stop_is_announced_once_and_every_replay_after_it_is_rate_limited() {
     assert_eq!(o.first_time, 0);
 }
 
-/// **A reported jump charges no counter, names no edge, and refuses a code it
-/// does not know.**
-///
-/// Three properties of the authoritative entry point that nothing else pins.
-///
-/// *No counter.* `tft_bridge_stats`' ledger totals to `transforms`, and this
-/// call is not a transform — not even on a stopped bridge, where an offer would
-/// have charged `refused_after_halt`. A counter that moved here would have to be
-/// added to the ledger to keep it balancing, which would be the ledger lying in
-/// order to look consistent. `clock_resets` moves, because it counts clock
-/// events rather than transforms and is not a ledger term.
-///
-/// *No edge.* The call has no transform in hand, so `scratch` holds whichever
-/// edge happened to be last on the wire — an innocent one. This is the same
-/// argument the `STRICT` window-close halt makes, and it is why the `ClockReset`
-/// arm names an edge only for the inferred rung.
-///
-/// *An unknown kind is a call fault*, like an out-of-range topic: it says the
-/// caller's build disagrees with this one about an enum, which is not something
-/// an outcome code can express.
-///
-/// Mutant: call `name_the_edge` unconditionally in the `HaltReason::ClockReset`
-/// arm ⇒ the halt names `odom -> base`, an edge that did nothing wrong:
-/// *"assertion `left == right` failed: a reported jump is not about any
-/// transform, so it names no edge rather than an innocent one; left:
-/// `("odom", "base")`, right: `("", "")`"*.
-///
-/// Mutant: increment `inner.refused_after_halt` on `note_time_jump`'s stopped
-/// path ⇒ `(transforms, refused_after_halt)` reads `(2, 1)` against `(1, 0)`.
-/// Note what that mutant does **not** break: `assert_balanced` still passes,
-/// because `tft_bridge_get_stats` folds `refused_after_halt` into `transforms`
-/// as well, so the ledger stays self-consistent while both numbers describe an
-/// event that was never a transform. The explicit assertion is the only thing
-/// standing between that and a counter nobody can interpret.
-///
-/// Mutant: accept any `kind` by defaulting to `JumpKind::Backward` ⇒ the
-/// `TFT_ERR_BAD_ENUM` assertion fails.
-///
-/// Mutant: report the evidence as `TFT_BRIDGE_EVIDENCE_COMMON_MODE` ⇒ the halt
-/// sends a field engineer to look at two publishers that did nothing, when the
-/// time source had already said what happened. Mutant: fill
-/// `clock_evidence_detail` from `delta_nanos` instead of the jump kind ⇒ the
-/// code is right and the number is nonsense, which the paired assertion catches
-/// and a `clock_evidence`-only assertion would not.
+/// **A reported jump charges no counter, names no edge, and refuses a code it does not know.**
 #[test]
 fn a_reported_jump_charges_nothing_and_names_no_edge() {
     let b = Bridge::new(
@@ -1389,8 +1057,8 @@ fn a_reported_jump_charges_nothing_and_names_no_edge() {
         "and *out is still well-formed"
     );
 
-    // `use_sim_time` switched at runtime: a source change, whose delta compares
-    // two different time bases and is therefore not printed as a duration.
+    // `use_sim_time` switched at runtime: a source change, whose delta compares two different
+    // time bases and is therefore not printed as a duration.
     let o = b.note_time_jump(7_000 * MS, TFT_BRIDGE_JUMP_CLOCK_TYPE_CHANGED);
     assert_eq!(o.action, TFT_BRIDGE_HALT, "{}", text(o.detail));
     assert_eq!(o.reason, TFT_BRIDGE_REASON_CLOCK_RESET);
@@ -1438,29 +1106,12 @@ fn a_reported_jump_charges_nothing_and_names_no_edge() {
 }
 
 /// **A topology that declares no edges is refused at `tft_bridge_create`.**
-///
-/// An empty config *parses* — it is a legal description of a tree with no edges
-/// — so nothing below this refused one, and a bridge built from it starts
-/// clean, reports "ingest bridge up" and answers `TFT_BRIDGE_UNDECLARED` to
-/// 100 % of the robot's traffic. That is the same shape as the `tf_prefix`
-/// defect §5.6's clarification records: a switch that drops every transform
-/// with nothing failing at startup. The engine has no runtime edge declaration
-/// (`docs/decisions/0004`, D4), so zero edges at create time means zero edges
-/// forever.
-///
-/// The check lives here rather than in one of §5.8's three deployment forms
-/// because it is a policy, and every other startup refusal — domain, cycle,
-/// claim — is already here. A form-3 `BridgeHandle` used to accept it.
-///
-/// Mutant: delete the `config.edges.is_empty()` refusal ⇒ both creates return
-/// `TFT_OK` and every `assert_eq!(…, Err(TFT_ERR_BAD_CONFIG))` fails.
 #[test]
 fn a_topology_declaring_no_edges_is_refused_rather_than_started() {
     for toml in [
         "",
-        // Not merely the empty string: a config with frames and headroom but no
-        // edge is equally unable to write anything, and it is what a truncated
-        // or half-written file looks like.
+        // Not merely the empty string: a config with frames and headroom but no edge is equally
+        // unable to write anything, and it is what a truncated or half-written file looks like.
         "[topology]\nframes = [\"odom\", \"base\"]\nframe_headroom = 8\n",
     ] {
         let rc = Bridge::try_new(
@@ -1480,24 +1131,16 @@ fn a_topology_declaring_no_edges_is_refused_rather_than_started() {
     }
 }
 
-/// **A `/tf_static` value that disagrees with the config is reported with both
-/// values and names the file as the incumbent** (§5.7, re-aimed by §5.8).
-///
-/// Two `robot_state_publisher`s with different URDFs is the canonical
-/// misconfiguration, and the actionable half of the diagnostic is the pair of
-/// values — "your file says the lidar is at x = 0.35, `/rsp_b` says 0.60".
-///
-/// Mutant: swap `o.existing` and `o.offered` in the `StaticConflict` arm ⇒ the
-/// operator is told the file holds the value the wire just offered, and both
-/// value assertions fail.
+/// **A `/tf_static` value that disagrees with the config is reported with both values and names
+/// the file as the incumbent** (§5.7, re-aimed by §5.8).
 #[test]
 fn a_static_that_disagrees_with_the_config_reports_both_values() {
     let b = Bridge::new(
         TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
         TFT_BRIDGE_ON_CLOCK_RESET_HALT,
     );
-    // Exactly the declared constant: silent verification, and a stamp of zero
-    // as `robot_state_publisher` commonly sends.
+    // Exactly the declared constant: silent verification, and a stamp of zero as
+    // `robot_state_publisher` commonly sends.
     let declared = [
         0.965_925_826_289_068_3,
         0.0,
@@ -1543,16 +1186,8 @@ fn a_static_that_disagrees_with_the_config_reports_both_values() {
     assert_balanced(&s);
 }
 
-/// **An edge the config does not declare is dropped, counted, and diagnosed
-/// once — naming both frames** (§5.8's amendment).
-///
-/// The engine has no runtime edge declaration, so a transform for a forgotten
-/// edge has nowhere to go and the only downstream symptom is a lookup returning
-/// no path with nothing anywhere saying why.
-///
-/// Mutant: set `o.first_time = 1` unconditionally in the `UndeclaredEdge` arm
-/// ⇒ an undeclared 1 kHz edge emits a thousand identical lines a second, and
-/// the loop's assertion fails on the second offer.
+/// **An edge the config does not declare is dropped, counted, and diagnosed once — naming both
+/// frames** (§5.8's amendment).
 #[test]
 fn an_undeclared_edge_is_diagnosed_once_and_names_both_frames() {
     let b = Bridge::new(
@@ -1593,31 +1228,8 @@ fn an_undeclared_edge_is_diagnosed_once_and_names_both_frames() {
     assert_balanced(&s);
 }
 
-/// **A stamp that goes backwards by less than the reset threshold is a drop,
-/// not a reset — and the drop names the edge that stalled.**
-///
-/// A `/tf` stream carries several publishers whose stamps interleave by
-/// milliseconds routinely, so a `< 0` test would restart the arena
-/// continuously; §5.5's threshold is 100 ms. But `Action::Drop` carries only a
-/// reason, so without the C layer filling the names from the sample a caller
-/// is told "something went backwards by 40 ms" and cannot say which edge.
-///
-/// Mutant: delete the `name_the_edge(inner, o)` call from `fill`'s
-/// `Action::Drop` arm ⇒ `parent` and `child` read `""` and this fails.
-/// **`by_nanos` and `delta_nanos` are both set, and they are not the same
-/// number.** One is a backwards *distance* — what a caller printing "went
-/// backwards by %ld ns" wants — and the other is the signed displacement the
-/// clock events use, so a caller reading either gets a true answer without
-/// having to know which arm produced the outcome. C has no type that carries
-/// that distinction; two field names are the whole of it.
-///
-/// Mutant: raise the drop's `by_nanos` assignment to `0` ⇒ the caller cannot
-/// tell a 40 ms interleave from a 4 s one, and the `by_nanos` assertion fails.
-/// Mutant: assign `o.delta_nanos = *by_nanos`, dropping the negation ⇒ a
-/// backward step reports a positive displacement, which under that field's one
-/// convention reads as a jump *forward*. Mutant: collapse the two, setting only
-/// `by_nanos` ⇒ `delta_nanos` stays 0 and the second assertion fails — which is
-/// the tidy-up this pair exists to stop.
+/// **A stamp that goes backwards by less than the reset threshold is a drop, not a reset — and
+/// the drop names the edge that stalled.**
 #[test]
 fn a_jittered_stamp_is_dropped_and_names_the_edge() {
     let b = Bridge::new(
@@ -1648,15 +1260,6 @@ fn a_jittered_stamp_is_dropped_and_names_the_edge() {
 }
 
 /// **`*out` is well-formed before the handle is validated.**
-///
-/// A caller that ignores the status must read "nothing happened" with printable
-/// empty strings, not its own stack — and that has to hold for the case where
-/// the handle is the thing that was wrong, which is the likeliest way a C
-/// caller gets here at all.
-///
-/// Mutant: delete the blank `core::ptr::write(out, o)` that precedes
-/// `bridge_of` ⇒ the poisoned struct survives untouched, `action` reads
-/// 0xAAAAAAAA, and this fails.
 #[test]
 fn a_bad_handle_still_leaves_a_printable_outcome() {
     let s = tft_bridge_sample {
@@ -1688,13 +1291,8 @@ fn a_bad_handle_still_leaves_a_printable_outcome() {
     }
 }
 
-/// **A `struct_size` from another build is refused, on every struct that
-/// carries one** (§3.6, §6.1).
-///
-/// Mutant: delete the `tft_bridge_sample` size check — that is,
-/// `read_sample`'s `declared != current && declared != v1` ⇒ the second case
-/// reads a struct laid out by a different build and returns `TFT_OK`, so the
-/// `TFT_ERR_BAD_STRUCT_SIZE` assertion fails.
+/// **A `struct_size` from another build is refused, on every struct that carries one** (§3.6,
+/// §6.1).
 #[test]
 fn a_struct_size_from_another_build_is_refused() {
     let b = Bridge::new(
@@ -1736,9 +1334,8 @@ fn a_struct_size_from_another_build_is_refused() {
         "and *out is still well-formed"
     );
 
-    // …and a size *larger* than this build's is refused too: that is a newer
-    // caller against an older library, whose extra bytes this build cannot
-    // interpret. `tft_check_abi`'s minor rule is what covers that direction.
+    // …and a size *larger* than this build's is refused too: that is a newer caller against an
+    // older library, whose extra bytes this build cannot interpret.
     let ahead = tft_bridge_sample {
         struct_size: core::mem::size_of::<tft_bridge_sample>() as u32 + 8,
         ..good
@@ -1756,40 +1353,7 @@ fn a_struct_size_from_another_build_is_refused() {
     );
 }
 
-/// **A caller built before `received_steady_nanos` existed still works** —
-/// §3.6's append rule.
-///
-/// §3.6 says fields may be appended to a `struct_size`-versioned struct without
-/// a major bump. Until this test there was nothing behind that sentence: every
-/// `struct_size` check in this file is an exact equality, so a caller holding a
-/// `libtf_tree_c.a` newer than its own header got `TFT_ERR_BAD_STRUCT_SIZE` on
-/// **every** offer — a total outage, in precisely the case the rule exists for,
-/// and reachable through §4.4's prebuilt-library path.
-///
-/// The old size is *computed* — `offset_of!` of the appended field is where the
-/// old struct ended — rather than written as `88`, which is right on the targets
-/// somebody checked and silently wrong elsewhere.
-///
-/// The missing field is filled from the library's own steady clock rather than
-/// left at the "no receipt clock" sentinel, so a legacy caller still gets the
-/// offset layer: the reading is taken microseconds after the message arrived,
-/// which against a 100 ms threshold is the same answer. What must never happen
-/// is substituting `stamp_nanos`, which would make every publisher's offset
-/// identically zero and re-enable inference over the signal under suspicion —
-/// for exactly the callers who cannot see the fix.
-///
-/// Mutant: accept only the current size, by dropping `declared != v1` from
-/// `read_sample`'s guard ⇒ *"an appended field must not lock an older caller
-/// out: a struct_size field names a size this build does not know; left: -3,
-/// right: 0"*.
-///
-/// Mutant: keep accepting the short struct but restore the whole-struct
-/// `core::ptr::read_unaligned` ⇒ **this test still passes**, which is exactly
-/// why the fixture allocates the prefix tightly instead of declaring a short
-/// size over a full-size struct. Under `just asan` the same run reports
-/// *"AddressSanitizer: heap-buffer-overflow … READ of size 96"* — the whole
-/// current struct, read out of an 88-byte allocation. Relaxing the size check
-/// without narrowing the read is the trap this pair of mutants exists to mark.
+/// **A caller built before `received_steady_nanos` existed still works** — §3.6's append rule.
 #[test]
 fn a_sample_from_before_the_receipt_clock_is_read_as_a_prefix() {
     let b = Bridge::new(
@@ -1801,9 +1365,9 @@ fn a_sample_from_before_the_receipt_clock_is_read_as_a_prefix() {
     let v1_size = core::mem::offset_of!(tft_bridge_sample, received_steady_nanos);
     assert!(v1_size < core::mem::size_of::<tft_bridge_sample>());
 
-    // **Allocated as exactly `v1_size` bytes**, so a read past the prefix is a
-    // genuine heap overrun a sanitizer can see, rather than a read into the
-    // tail of a full-size struct that happens to be there.
+    // **Allocated as exactly `v1_size` bytes**, so a read past the prefix is a genuine heap
+    // overrun a sanitizer can see, rather than a read into the tail of a full-size struct that
+    // happens to be there.
     let mut short = vec![0u8; v1_size];
     {
         let full = tft_bridge_sample {
@@ -1861,46 +1425,14 @@ fn a_sample_from_before_the_receipt_clock_is_read_as_a_prefix() {
     assert_balanced(&b.stats());
 }
 
-/// **A caller built before `arena_name` existed still gets a bridge, and a heap
-/// arena** — `docs/decisions/0015` step 1, and the same §3.6 append rule one
-/// struct over.
-///
-/// `tft_bridge_create` used to validate `struct_size` with exact equality and
-/// then `read_unaligned` the whole struct, so this call was
-/// `TFT_ERR_BAD_STRUCT_SIZE` — every 0.4 caller locked out of the entry point by
-/// an appended field, which is the outage §3.6 exists to prevent. **This test
-/// fails against the code that shipped before the record.**
-///
-/// The fixture allocates **exactly** the old struct's bytes, for the reason
-/// `a_sample_from_before_the_receipt_clock_is_read_as_a_prefix` allocates its
-/// own tightly. `just c-abi-check`'s ASan row now runs this file with
-/// `bridge,shm`.
-///
-/// The prefix's **last** field is the one at risk of arriving at the wrong
-/// offset, so the assertion is on `tf_prefix`: a remap table that renames
-/// `odom` proves the pointer was read from where the old layout put it, not
-/// merely that the call returned `TFT_OK`.
-///
-/// Mutant: accept only the current size, by dropping `declared != v1` from
-/// `read_options`'s guard ⇒ *"an appended field must not lock an older caller
-/// out: a struct_size field names a size this build does not know; left: -3,
-/// right: 0"*.
-///
-/// Mutant: keep accepting the short struct but restore the whole-struct
-/// `core::ptr::read_unaligned` ⇒ under `just shm-check` this is
-/// *"SIGSEGV [ 1.107s] an_options_struct_from_before_the_arena_name_is_read_as_a_prefix"*
-/// — the garbage past the prefix lands in `arena_name` and is walked as a C
-/// string — and under `just c-abi-check`'s ASan row it is diagnosed properly:
-/// *"AddressSanitizer: heap-buffer-overflow … READ of size 32 at … is located 0
-/// bytes after 24-byte region"*. **The crash is luck; the ASan report is the
-/// gate.** It is the same trap, and the same pair of mutants, that
-/// `a_sample_from_before_the_receipt_clock_is_read_as_a_prefix` carries.
+/// **A caller built before `arena_name` existed still gets a bridge, and a heap arena** —
+/// `docs/decisions/0015` step 1, and the same §3.6 append rule one struct over.
 #[test]
 fn an_options_struct_from_before_the_arena_name_is_read_as_a_prefix() {
     let toml = CString::new(TOPO).unwrap();
     let prefix = CString::new("robot1").unwrap();
-    // Computed, never a literal: `offset_of!` of the appended field is where
-    // the old struct ended, on whatever pointer width this build has.
+    // Computed, never a literal: `offset_of!` of the appended field is where the old struct
+    // ended, on whatever pointer width this build has.
     let v1_size = core::mem::offset_of!(tft_bridge_options, arena_name);
     assert!(v1_size < core::mem::size_of::<tft_bridge_options>());
 
@@ -1952,10 +1484,8 @@ fn an_options_struct_from_before_the_arena_name_is_read_as_a_prefix() {
         b.remaps()
     );
 
-    // **And it is a heap arena.** `arena_name` is the one field the copy leaves
-    // untouched, and the zero it is left at is NULL — the documented "private
-    // heap arena, as before". Had it been left undefined the create would have
-    // walked a garbage pointer as a C string instead of applying transforms.
+    // **And it is a heap arena.** `arena_name` is the one field the copy leaves untouched, and
+    // the zero it is left at is NULL — the documented "private heap arena, as before".
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 1_000 * MS, POSE, None);
     assert_eq!(o.action, TFT_BRIDGE_APPLIED, "{}", text(o.detail));
     let got = b
@@ -1969,16 +1499,6 @@ fn an_options_struct_from_before_the_arena_name_is_read_as_a_prefix() {
 }
 
 /// **An options `struct_size` belonging to neither build is still refused.**
-///
-/// The prefix rule accepts *two* sizes and nothing else. A size in between is a
-/// build this library has never seen; a size larger is a newer caller against an
-/// older library, whose extra bytes this build cannot interpret and must not
-/// read. Both are `TFT_ERR_BAD_STRUCT_SIZE` **before** anything reads that far,
-/// which is what keeps `read_options`'s bounded copy in bounds.
-///
-/// Mutant: replace `read_options`'s guard with `declared > current` ⇒ the
-/// in-between size is accepted and *"a size between the two known layouts is
-/// not a layout: left: 0, right: -3"* fails.
 #[test]
 fn an_options_size_from_neither_build_is_refused() {
     let toml = CString::new(TOPO).unwrap();
@@ -2033,24 +1553,8 @@ fn an_options_size_from_neither_build_is_refused() {
     assert!(b.is_null(), "a failed create must not hand out a handle");
 }
 
-/// **A `bridge`-without-`shm` build refuses a shared arena rather than ignoring
-/// it** — `docs/decisions/0015` *Failure*, the silent downgrade in its other
-/// costume.
-///
-/// `bridge` and `shm` are independent cargo features, so this configuration
-/// carries `arena_name` in its header with no `tf_tree::Open` behind it.
-/// Ignoring the field would start a bridge that fills a private heap arena while
-/// every consumer waits forever on a rendezvous that will never appear — reached
-/// through a *build* rather than a runtime fault, and the more likely of the two
-/// because it needs no misconfiguration on the robot at all.
-///
-/// **This test only exists in the `--features bridge` configuration**, which is
-/// `just test-rust`'s and `just lint`'s. Under `bridge,shm` the same request
-/// succeeds, and `tests/bridge_shared.rs` is where that is asserted.
-///
-/// Mutant: make `open_shared`'s no-`shm` arm ignore the field and fall through
-/// to `declared.builder().build()` ⇒ *"a shared arena with no shm behind it
-/// must refuse, not downgrade: left: 0, right: -42"*.
+/// **A `bridge`-without-`shm` build refuses a shared arena rather than ignoring it** —
+/// `docs/decisions/0015` *Failure*, the silent downgrade in its other costume.
 #[cfg(not(all(feature = "shm", target_os = "linux")))]
 #[test]
 fn a_shared_arena_without_the_shm_feature_is_refused() {
@@ -2087,16 +1591,8 @@ fn a_shared_arena_without_the_shm_feature_is_refused() {
     );
 }
 
-/// **A declared dynamic edge whose domain is not the bridge's is refused at
-/// startup** — §5.5, NORMATIVE, *"and fails at startup rather than at first
-/// message"*.
-///
-/// Sim and real transforms in one arena is a class of bug worth making
-/// impossible, and finding out at the first message means finding out after
-/// twenty nodes have attached.
-///
-/// Mutant: delete the `config.check_domain(domain)` call in
-/// `tft_bridge_create` ⇒ creation succeeds and this fails.
+/// **A declared dynamic edge whose domain is not the bridge's is refused at startup** — §5.5,
+/// NORMATIVE, *"and fails at startup rather than at first message"*.
 #[test]
 fn a_domain_the_bridge_does_not_run_in_is_refused_at_creation() {
     const SIM: &str = r#"
@@ -2134,12 +1630,8 @@ domain = 1
     );
 }
 
-/// **A config that does not describe a tree is refused, and says so in terms of
-/// the file** rather than of an arena that was never built.
-///
-/// Mutant: delete the `config.cycle_child()` check and let the builder find it
-/// ⇒ the message names `FrameId(1)`, an index into an arena the operator
-/// holding a text file cannot resolve, and the `"cycle"` assertion fails.
+/// **A config that does not describe a tree is refused, and says so in terms of the file**
+/// rather than of an arena that was never built.
 #[test]
 fn a_cyclic_topology_is_refused_in_the_files_own_terms() {
     const CYCLE: &str = r#"
@@ -2172,11 +1664,8 @@ capacity = 16
     );
 }
 
-/// **The message and queue-depth counters are what §5.9 asks for**: a mark that
-/// only rises, and a capacity to read it against.
-///
-/// Mutant: assign rather than `max` in `Ingest::note_queue_depth` ⇒ the final
-/// reading of 0 wins and a queue that was saturated reports idle.
+/// **The message and queue-depth counters are what §5.9 asks for**: a mark that only rises, and
+/// a capacity to read it against.
 #[test]
 fn the_queue_high_water_mark_survives_the_boundary() {
     let b = Bridge::new(
@@ -2198,16 +1687,8 @@ fn the_queue_high_water_mark_survives_the_boundary() {
     assert_eq!(s.transforms, 0, "a message is not a transform");
 }
 
-/// **The tree handle outlives the bridge**, so a reader thread cannot be
-/// dangled by the executor thread freeing its bridge.
-///
-/// **No mutant is claimed here, because the property is structurally
-/// guarded**: `tft_bridge_tree` hands back `Arc::clone(&share)`, and the only
-/// way to break it is to stop using a refcount at all — which does not
-/// type-check rather than failing this test. What this test does buy is that
-/// the *ordering* works in practice and that the read after the free is a real
-/// read of live memory, which is a claim `just c-abi-check`'s Miri and ASan
-/// rows can check and no amount of assertion here can.
+/// **The tree handle outlives the bridge**, so a reader thread cannot be dangled by the
+/// executor thread freeing its bridge.
 #[test]
 fn the_tree_handle_outlives_the_bridge_that_made_it() {
     let tree = {
@@ -2225,26 +1706,6 @@ fn the_tree_handle_outlives_the_bridge_that_made_it() {
 }
 
 /// **`tf_prefix` rewrites the declared topology, not only the wire** (§5.6).
-///
-/// The bridge normalizes incoming frame names with the prefix and then keys
-/// every §5 table on the result — so if the *config* keeps its raw names, the
-/// prefixed names match nothing the config declared and the bridge drops 100 %
-/// of a correctly configured robot's traffic, reporting `TFT_BRIDGE_UNDECLARED`
-/// with a diagnostic that blames the config rather than the prefix. Worse, the
-/// arena would be built from the raw names, so even a fixed lookup table would
-/// have nowhere to write.
-///
-/// The direction is settled by the documented operator workflow: `tf_tree
-/// topology --discover` emits the names as they appear on the wire, and adding
-/// `tf_prefix` for a second robot must not mean hand-editing every name in the
-/// file it just produced.
-///
-/// Mutant: seed `StaticStore` from `config` instead of from `config.rewritten`
-/// in `Ingest::with` ⇒ the first offer is `TFT_BRIDGE_UNDECLARED` and the
-/// `TFT_BRIDGE_APPLIED` assertion fails. Mutant: build the arena from `config`
-/// rather than `ingest.declared()` in `tft_bridge_create` ⇒ the pipeline
-/// approves the write and the arena has no `robot1/base` frame, so the outcome
-/// is `TFT_BRIDGE_REJECTED` and the same assertion fails with a different code.
 #[test]
 fn a_tf_prefix_rewrites_the_declared_topology_and_the_arena_with_it() {
     let b = Bridge::try_new(
@@ -2256,8 +1717,8 @@ fn a_tf_prefix_rewrites_the_declared_topology_and_the_arena_with_it() {
     )
     .expect("a prefixed bridge must build");
 
-    // The wire carries the robot's own names, exactly as `--discover` wrote them
-    // into the config.
+    // The wire carries the robot's own names, exactly as `--discover` wrote them into the
+    // config.
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 1_000 * MS, POSE, None);
     assert_eq!(
         o.action,
@@ -2272,8 +1733,8 @@ fn a_tf_prefix_rewrites_the_declared_topology_and_the_arena_with_it() {
         "and it reports the names the arena knows"
     );
 
-    // The arena is the prefixed one, so a consumer looks up the prefixed names —
-    // and the raw ones are not frames at all.
+    // The arena is the prefixed one, so a consumer looks up the prefixed names — and the raw
+    // ones are not frames at all.
     let tree = b.tree();
     let got = tree
         .at("robot1/odom", "robot1/base", 1_000 * MS)
@@ -2285,17 +1746,7 @@ fn a_tf_prefix_rewrites_the_declared_topology_and_the_arena_with_it() {
     assert_balanced(&s);
 }
 
-/// **§5.6's remap table is readable from C, and complete before the first
-/// message.**
-///
-/// *"A silent remap is worse than no remap"* is normative, and a C caller can
-/// only obey it if the table crosses the boundary. It is complete at startup
-/// because §5.8's amendment makes the config the sole source of declared edges,
-/// so every declared frame goes through the normalizer at create time.
-///
-/// Mutant: have `TopologyConfig::rewritten` bypass the caller's `NameNormalizer`
-/// (rewrite the strings itself) ⇒ nothing is recorded at create time, the first
-/// three rows are absent, and the `"odom"` assertion fails on `TFT_ERR_NO_DATA`.
+/// **§5.6's remap table is readable from C, and complete before the first message.**
 #[test]
 fn the_remap_table_crosses_the_boundary_and_is_complete_at_startup() {
     let b = Bridge::try_new(
@@ -2318,8 +1769,8 @@ fn the_remap_table_crosses_the_boundary_and_is_complete_at_startup() {
         "every declared frame, in file order, before any traffic"
     );
 
-    // A frame the config never declared still earns a row when it is first seen,
-    // because that is the remap an operator has no other way to learn about.
+    // A frame the config never declared still earns a row when it is first seen, because that
+    // is the remap an operator has no other way to learn about.
     b.offer(
         TFT_BRIDGE_TOPIC_TF,
         "/camera_mount",
@@ -2339,8 +1790,8 @@ fn the_remap_table_crosses_the_boundary_and_is_complete_at_startup() {
         "the leading slash is stripped and the prefix applied"
     );
 
-    // A bridge with nothing to remap has an empty table, and the first read is
-    // the loop's termination condition rather than a fault.
+    // A bridge with nothing to remap has an empty table, and the first read is the loop's
+    // termination condition rather than a fault.
     let plain = Bridge::new(
         TFT_BRIDGE_AUTHORITY_FIRST_WRITER_WINS,
         TFT_BRIDGE_ON_CLOCK_RESET_HALT,
@@ -2348,16 +1799,8 @@ fn the_remap_table_crosses_the_boundary_and_is_complete_at_startup() {
     assert!(plain.remaps().is_empty());
 }
 
-/// **A `/tf` message for an edge the config declared static is a kind change**
-/// (§5.7: *"the edge kind cannot change"*), and the drop names the edge.
-///
-/// The reachable half of §5.7's hard error through the C seam: a static edge's
-/// pose is inline in the arena and its ring capacity is zero, so there is
-/// genuinely nowhere to put a dynamic sample for it.
-///
-/// Mutant: map `DropReason::KindChange` to `TFT_BRIDGE_REASON_BAD_NAME` in
-/// `fill` ⇒ the operator is sent to look at frame names for an edge whose names
-/// are fine, and the `reason` assertion fails.
+/// **A `/tf` message for an edge the config declared static is a kind change** (§5.7: *"the
+/// edge kind cannot change"*), and the drop names the edge.
 #[test]
 fn a_static_edge_offered_on_slash_tf_is_a_kind_change() {
     let b = Bridge::new(
@@ -2377,17 +1820,7 @@ fn a_static_edge_offered_on_slash_tf_is_a_kind_change() {
     assert_balanced(&s);
 }
 
-/// **`TFT_BRIDGE_AUTHORITY_LAST_WRITER_WINS` decodes to the policy it names**
-/// (§5.4).
-///
-/// It is the one authority code with no other test behind it, and an enum
-/// decoded to the wrong arm is the quietest possible bug here: `FirstWriterWins`
-/// would still *look* correct — one publisher owning the edge — while silently
-/// being the opposite of what the launch file asked for.
-///
-/// Mutant: decode `TFT_BRIDGE_AUTHORITY_LAST_WRITER_WINS` to
-/// `AuthorityPolicy::FirstWriterWins` in `tft_bridge_create` ⇒ `/b`'s sample is
-/// dropped as `NOT_THE_OWNER` and the `TFT_BRIDGE_APPLIED` assertion fails.
+/// **`TFT_BRIDGE_AUTHORITY_LAST_WRITER_WINS` decodes to the policy it names** (§5.4).
 #[test]
 fn last_writer_wins_hands_the_edge_to_the_newcomer() {
     let b = Bridge::try_new(
@@ -2442,27 +1875,8 @@ fn last_writer_wins_hands_the_edge_to_the_newcomer() {
 }
 
 /// **A bridge freed from the wrong thread is refused, not freed** (§3.2).
-///
-/// The affinity rule bites harder on `free` than on `offer`. Dropping the handle
-/// drops one `EdgeWriter` per declared dynamic edge, and each of those releases
-/// a claim and an OFD lease — machine-wide state, per D7 — from a thread that
-/// never owned them. That is the corruption §3.2 exists to prevent rather than
-/// merely a misuse, so refusing and leaking the handle is the right trade: the
-/// claims stay held by the process that legitimately took them, and the operator
-/// gets a status naming the handle instead of an edge silently changing owner.
-///
-/// This runs in a **subprocess** for the same reason as `publish.rs`'s
-/// `a_publisher_refuses_the_wrong_thread`: a passing debug build aborts, and a
-/// test that aborts the runner is not a test.
-///
-/// * **debug** — the child must die by `SIGABRT` (6), naming `tft_bridge`.
-///   Mutant: delete the `check_thread_token` call from `tft_bridge_free` ⇒ the
-///   child frees the handle from the wrong thread, exits 0, and this fails.
-/// * **release** — the child must exit 0 having observed `TFT_ERR_WRONG_THREAD`
-///   *and* found the bridge still alive and writable afterwards.
-// Miri cannot spawn a process, and there is no way to observe an `abort()` from
-// inside the process performing it. The misuse is a logic error, not a
-// memory-model one.
+// Miri cannot spawn a process, and there is no way to observe an `abort()` from inside the
+// process performing it.
 #[cfg_attr(miri, ignore = "needs a subprocess to observe abort()")]
 #[test]
 fn a_bridge_refuses_to_be_freed_from_the_wrong_thread() {
@@ -2505,12 +1919,8 @@ fn a_bridge_refuses_to_be_freed_from_the_wrong_thread() {
     }
 }
 
-/// The child arm of [`a_bridge_refuses_to_be_freed_from_the_wrong_thread`].
-/// Inert unless `TFT_BRIDGE_FREE_CHILD` is set, so a normal run does not abort
-/// itself.
-///
-/// stdout is the channel the parent reads; see `publish.rs`'s
-/// `cross_thread_child`, which carries the same allow for the same reason.
+/// The child arm of [`a_bridge_refuses_to_be_freed_from_the_wrong_thread`]. Inert unless
+/// `TFT_BRIDGE_FREE_CHILD` is set, so a normal run does not abort itself.
 #[allow(clippy::print_stdout)]
 #[test]
 fn bridge_free_cross_thread_child() {
@@ -2539,8 +1949,8 @@ fn bridge_free_cross_thread_child() {
         saw.contains("tft_bridge is Send but not Sync"),
         "the refusal must name the handle: {saw:?}"
     );
-    // The handle survived: the claims were not released by a thread that never
-    // held them, and the bridge still writes.
+    // The handle survived: the claims were not released by a thread that never held them, and
+    // the bridge still writes.
     let o = b.offer(TFT_BRIDGE_TOPIC_TF, "odom", "base", 1_000 * MS, POSE, None);
     assert_eq!(o.action, TFT_BRIDGE_APPLIED, "{}", text(o.detail));
     println!("BRIDGE FREE REFUSED OK");

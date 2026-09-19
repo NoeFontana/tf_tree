@@ -1,11 +1,8 @@
 //! `loom` model-checked concurrency tests (run under `--cfg loom`).
 //!
-//! The hard gate for `docs/PHASE1.md`'s implementation step 5 and §10.2: the
-//! publish/read/claim/intern protocols must be sound under every interleaving
-//! loom explores. Buffers are capacity 4 with push counts <= 5 to bound the state
-//! space, but never so small that the code under test becomes unreachable (see
-//! [`writer_wraps_reader_gets_valid_or_recycled`]). Each test drives the *shared*
-//! algorithm code over heap instances built from `crate::sync` atomics.
+//! The gate for `docs/PHASE1.md` §10.2. Each test drives the shared algorithm code
+//! over heap instances built from `crate::sync` atomics; capacities stay small to
+//! bound the state space, but not so small that the code under test is unreachable.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use loom::sync::Arc;
@@ -62,17 +59,11 @@ impl HeapRing {
 }
 
 /// Run a `loom` model under a preemption bound the environment can raise but
-/// **cannot lower**.
-///
-/// `loom::model` is unbounded when `LOOM_MAX_PREEMPTIONS` is unset, which is
-/// weaker, not stronger: on `two_mutators_race_the_lock_and_a_reader_sees_no_mix`
-/// with its liveness predicate broken, unbounded search missed the violation in
-/// 8143 ms, bounds 0-2 missed it, and bound 3 found it in 373 ms. `xtask loom`
-/// sets 3; this floor keeps a hand-run `cargo test` from being a weaker check.
+/// **cannot lower**: unbounded search is weaker (it missed a broken liveness
+/// predicate in `two_mutators_race_...` that bound 3 finds). `xtask loom` sets 3.
 fn model(f: impl Fn() + Sync + Send + 'static) {
-    /// Enough to reach the topology lock's steal path, which needs the spin
-    /// budget (`MODEL_SPIN_LIMIT`) exhausted while another thread holds the
-    /// word. Raising it is safe; lowering it silently removes that path.
+    /// Reaches the topology lock's steal path, which needs `MODEL_SPIN_LIMIT`
+    /// exhausted while another thread holds the word. Lowering it removes that path.
     const PREEMPTION_FLOOR: usize = 3;
 
     let mut builder = loom::model::Builder::new();
@@ -102,9 +93,7 @@ fn writer_three_pushes_reader_never_torn() {
 
         let r = Arc::clone(&hr);
         let reader = thread::spawn(move || {
-            // Physical slot 1 is written exactly once (the second push, pose(2)),
-            // so a consistent read is either the initial zero pose or pose(2) —
-            // never a mix of the two.
+            // Slot 1 is written once (pose(2)): a read is the zero pose or pose(2).
             let ring = r.ring();
             match ring.read_slot(1) {
                 Ok(iso) => {
@@ -122,16 +111,11 @@ fn writer_three_pushes_reader_never_torn() {
 }
 
 /// Loom test 2 (`docs/PHASE1.md` §10.2, bullet 2): the writer **laps** the ring
-/// while a reader samples. The reader returns the one interpolation the
-/// published history permits, or a documented error — never a pose from two eras.
+/// while a reader samples. The reader returns the one interpolation the published
+/// history permits, or a documented error, never a pose from two eras.
 ///
-/// Capacity 4 and five pushes: [`SampleRing::retained`] is `capacity - 1`, so
-/// capacity 2 leaves a one-sample window that can only answer `NoData` or
-/// `Extrapolation`, making the bracket search, interpolation and trailing
-/// revalidation unreachable (a planted `panic!` in the `Ok` arm never fired).
-///
-/// The assertion is bit equality, not finiteness: a splice across eras is still
-/// finite. The only bracket containing `t = 25` is `(20, 30)` at `s = 0.5`.
+/// Capacity 4 and five pushes: capacity 2 leaves a one-sample window that cannot
+/// reach the bracket search. The only bracket containing `t = 25` is `(20, 30)`.
 #[test]
 fn writer_wraps_reader_gets_valid_or_recycled() {
     model(|| {
@@ -170,35 +154,17 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
     });
 }
 
-/// The same lap, through [`SampleRing::sample_from`] and a **caller-held cursor
-/// that points at the slot the lap destroys** — the shape `Plan::at` and every
-/// monotone batch use.
+/// The same lap through [`SampleRing::sample_from`] with a **caller-held cursor
+/// pointing at the slot the lap destroys**, the shape `Plan::at` and every monotone
+/// batch use.
 ///
-/// [`writer_wraps_reader_gets_valid_or_recycled`] drives [`SampleRing::sample`],
-/// which production reaches from `Plan::latest` alone. Everything else goes
-/// through `sample_from`, whose read carries its own trailing
-/// `head - i > retained` revalidation (in [`SampleRing::read_from`] since
-/// `docs/decisions/0060` step 2); deleting it passed `writer_wraps_...`.
+/// `10, 20, 30` are published first; the writer lands `40, 50`. The only legal `Ok`
+/// for `t = 25` is `(20, 30)`. The cursor is seeded `0`: seeded at `1` or `2` the
+/// trailing `head - i > retained` check in [`SampleRing::read_from`] can be deleted
+/// unnoticed (`docs/decisions/0060` step 2).
 ///
-/// Capacity 4; `10, 20, 30` are published before the threads start and the writer
-/// lands `40, 50`, the fifth overwriting logical 0 (stamp 10). The only bracket
-/// for `t = 25` is `(20, 30)` at `s = 0.5`, so that is the only legal `Ok`. The
-/// cursor is seeded **`0`**, where a batch starts and the recycled index: once the
-/// lap lands, `bracket_from` gallops down to a next-era slot that only the
-/// trailing check refuses.
-///
-/// **Mutant, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): delete that
-/// trailing `if self.head.load(Ordering::Acquire) - i > retained { return
-/// Err(LookupError::SlotRecycled { .. }); }` from `read_from` (`sample.rs`).
-/// **FAILS**; `writer_wraps_...` passes under it.
-///
-/// **The seed is the test:** seeded at `1` or `2` the deletion passes, since the
-/// hint gallops to `(1, 2)` inside the surviving window. Dropping the `.clamp(..)`
-/// in `bracket_from` also passes; the cursor sweeps in `tests.rs` kill that mutant.
-///
-/// The `Hold` and exact-newest arms are
-/// [`sample_from_hold_revalidates_across_a_lap`] and
-/// [`sample_from_exact_newest_revalidates_across_a_lap`].
+/// The `Hold` and exact-newest arms are [`sample_from_hold_revalidates_across_a_lap`]
+/// and [`sample_from_exact_newest_revalidates_across_a_lap`].
 #[test]
 fn sample_from_with_a_stale_cursor_across_a_lap() {
     model(|| {
@@ -245,21 +211,10 @@ fn sample_from_with_a_stale_cursor_across_a_lap() {
 
 /// `sample_from`'s **`Hold` arm** revalidates the newest slot against a lap.
 ///
-/// The `Hold` and exact-newest arms skip the bracket search and read the newest
-/// slot; removing either `revalidated` call passed the whole suite and
-/// [`sample_from_with_a_stale_cursor_across_a_lap`], which takes neither.
-///
-/// The newest slot is overwritten only after `capacity` pushes, so this is
-/// **capacity 2**; a one-sample window is fine for an arm that never
-/// interpolates. `10` is published first; the writer lands `20` and `30`
-/// (overwriting `10`). The reader calls `sample_from(15, Hold)` once; only at
-/// `head == 1` is `15` past the newest stamp, so the only legal `Ok` is `pose(1)`.
-/// One arm per model keeps each at ~30 s.
-///
-/// **Mutant M279, run** at [`model`]'s floor: remove
-/// `.and_then(|p| self.revalidated(newest, retained, p))` from `read_from`'s
-/// `Hold` arm (`sample.rs`). **FAILS**; the exact-newest and stale-cursor models
-/// pass under it, so each model's control is its own arm.
+/// Capacity 2: the newest slot is overwritten only after `capacity` pushes. `10` is
+/// published first; the writer lands `20` and `30`. Only at `head == 1` is `15` past
+/// the newest stamp, so the only legal `Ok` is `pose(1)`. One arm per model keeps
+/// each at ~30 s.
 #[test]
 fn sample_from_hold_revalidates_across_a_lap() {
     model(|| {
@@ -298,17 +253,9 @@ fn sample_from_hold_revalidates_across_a_lap() {
     });
 }
 
-/// `sample_from`'s **exact-newest arm** (`t == t_new`) revalidates the newest
-/// slot against a lap.
-///
-/// Same ring and writer as [`sample_from_hold_revalidates_across_a_lap`]; the
-/// reader calls `sample_from(10, Error)`. Only at `head == 1` is `10` the newest
-/// stamp, so the only legal `Ok` is `pose(1)`.
-///
-/// **Mutant M288, run** at [`model`]'s floor: replace the `t == t_new` arm's
-/// `return self.revalidated(newest, retained, p).map(Bracket::Exact);` with
-/// `return Ok(Bracket::Exact(p));` in `read_from` (`sample.rs`). **FAILS**; the
-/// `Hold` and stale-cursor models pass under it.
+/// `sample_from`'s **exact-newest arm** (`t == t_new`) revalidates the newest slot
+/// against a lap. Same ring and writer as [`sample_from_hold_revalidates_across_a_lap`];
+/// `sample_from(10, Error)` may return only `pose(1)`.
 #[test]
 fn sample_from_exact_newest_revalidates_across_a_lap() {
     model(|| {
@@ -347,20 +294,10 @@ fn sample_from_exact_newest_revalidates_across_a_lap() {
     });
 }
 
-/// [`SampleRing::read_from`] validates the bracket **before it hands it back**.
-///
-/// `sample_from` is `read_from` plus one `Interp::eval` (`docs/decisions/0060`
-/// step 2), so the three models above drive that body with the evaluation the next
-/// instruction. `Plan::fold_batch` carries the [`Bracket`] across up to fifteen
-/// further reads first, so the *endpoints* must have been judged, not the pose:
-/// an `Ok(Bracket::Between { .. })` must carry `(20, 30)` bit for bit.
-///
-/// Ring, writer, cursor seed and query are those of
-/// [`sample_from_with_a_stale_cursor_across_a_lap`].
-///
-/// **Mutant, run** at [`model`]'s floor: the same deletion of `read_from`'s
-/// trailing `head - i > retained` check fails this model and that one, necessarily
-/// (there is one check). This adds the deferred-evaluation caller.
+/// [`SampleRing::read_from`] validates the bracket **before it hands it back**:
+/// `Plan::fold_batch` carries it across further reads, so an
+/// `Ok(Bracket::Between { .. })` must carry `(20, 30)` bit for bit. Ring, writer,
+/// cursor and query are those of [`sample_from_with_a_stale_cursor_across_a_lap`].
 #[test]
 fn read_from_validates_the_bracket_it_hands_back() {
     model(|| {
@@ -383,11 +320,10 @@ fn read_from_validates_the_bracket_it_hands_back() {
         let r = Arc::clone(&hr);
         let reader = thread::spawn(move || {
             let ring = r.ring();
-            // Held by the caller across the whole chunk, as `Plan::fold_batch`
-            // holds one per step.
+            // Held across the chunk, as `Plan::fold_batch` does.
             let mut cursor = 0u64;
             match ring.read_from::<Bracket>(25, ExtrapPolicy::Error, &mut cursor) {
-                // The only bracket for 25 in this ring is (20, 30) at s = 0.5.
+                // The only bracket for 25 is (20, 30) at s = 0.5.
                 Ok(Bracket::Between { a, b, s }) => {
                     assert_eq!(
                         (a.to_bits(), b.to_bits(), s),
@@ -412,22 +348,12 @@ fn read_from_validates_the_bracket_it_hands_back() {
     });
 }
 
-/// Loom test 3 (`docs/PHASE1.md` §10.2's *mutation test*): the invariant
-/// `head`'s `Release` store carries — observing `head == h` makes the stamps of
-/// all `h` published samples visible.
+/// Loom test 3 (`docs/PHASE1.md` §10.2's *mutation test*): observing `head == h`
+/// makes the stamps of all `h` published samples visible.
 ///
-/// Weakening [`SampleRing::push`]'s `head.store(h + 1, Release)` survived the
-/// models above, and no `sample`-shaped fixture can catch it: `push`'s
-/// `fence(Release)` precedes its own stamp store, so a reader seeing `head == h`
-/// is guaranteed stamps `0 ..= h-2` but not the newest, `sample`'s `t_new`. A
-/// stale `t_new` is always below the fresh one, so every `t` above it exits
-/// through the tolerated `Extrapolation` arm; reaching a bit-equality assertion
-/// needs `t < 0`, which would pin the zero sentinel and not the ordering.
-///
-/// So the reader is transcribed as [`SampleRing::sample`] does it — `head`
-/// `Acquire`, stamps `Relaxed` — and the writer is the real `push`.
-///
-/// **Mutation-verified**: with `Relaxed` this fails; at `Release` it passes.
+/// No `sample`-shaped fixture catches a weakened `head.store(h + 1, Release)`, so
+/// the reader is transcribed as [`SampleRing::sample`] does it (`head` `Acquire`,
+/// stamps `Relaxed`) against the real `push`.
 #[test]
 fn head_publishes_every_stamp_below_it() {
     model(|| {
@@ -436,7 +362,7 @@ fn head_publishes_every_stamp_below_it() {
         let w = Arc::clone(&hr);
         let writer = thread::spawn(move || {
             let ring = w.ring();
-            // No lap: every stamp is written once, so a stale read is the zero value.
+            // No lap: a stale read is the zero value.
             for i in 1..=4u64 {
                 ring.push(i as i64 * 10, &pose(i)).unwrap();
             }
@@ -460,10 +386,8 @@ fn head_publishes_every_stamp_below_it() {
     });
 }
 
-/// The interning table's three parallel arrays plus its id allocator, on the heap
-/// from loom atomics — the shape `ArenaView` hands `intern_core`. Zero-initialized
-/// like the production arena: a different "unpublished" sentinel once made the
-/// publish-then-spin handshake inert.
+/// The interning table's parallel arrays plus its id allocator, on the heap from
+/// loom atomics. Zero-initialized like the production arena.
 struct HeapInternTable {
     hashes: alloc::vec::Vec<AtomicU64>,
     ids: alloc::vec::Vec<AtomicU32>,
@@ -501,18 +425,15 @@ impl HeapInternTable {
     }
 }
 
-/// Loom test 3: two threads racing `intern` on the same name get the same
-/// `FrameId`.
+/// Loom test 3: two threads racing `intern` on the same name get the same `FrameId`.
 #[test]
 fn intern_race_same_id() {
     model(|| {
-        // Interning table: 4 hash slots (mask 3), capacity 3 usable frames.
+        // 4 hash slots (mask 3), capacity 3.
         let t = Arc::new(HeapInternTable::new(4));
         let hash: u64 = 0xdead_beef_0000_0001;
 
-        // Two *live* registered participants (slots 0 and 1, so `me` is 1 and 2).
-        // Neither may be taken over: `claimant_alive` always agrees they are
-        // running, which is what the fail-safe default does in production.
+        // Two live participants (`me` is 1 and 2); neither may be taken over.
         let spawn_one = |t: Arc<HeapInternTable>, me: u32| {
             thread::spawn(move || {
                 intern_core(&t.table(3), hash, me, |_| true, |_| true, |_| {}).unwrap()
@@ -537,13 +458,12 @@ fn intern_race_same_id() {
 /// Loom test 6 — **amendment A8** (`docs/PHASE2.md` §1 A8, §11.3 crash point
 /// `intern.after_hash_cas_before_id_store`).
 ///
-/// One thread performs exactly the stores a killed interner completed (the two
-/// CASes below, open-coded because `intern_core` cannot be abandoned part-way)
-/// and vanishes. The other must still terminate with the name interned; before A8
-/// it spun forever.
+/// One thread performs the stores a killed interner completed (open-coded, since
+/// `intern_core` cannot be abandoned part-way) and vanishes. The other must still
+/// terminate with the name interned.
 #[test]
 fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
-    /// Participant slot of the doomed interner, as stored in `claiming` (slot + 1).
+    /// Doomed interner's slot, as stored in `claiming` (slot + 1).
     const DEAD: u32 = 1;
     /// The survivor's own `claiming` value.
     const ME: u32 = 2;
@@ -559,8 +479,7 @@ fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
                 .compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                // Record the claim, then die: no id is allocated, no record is
-                // written, nothing is ever published into `ids[slot]`.
+                // Record the claim, then die: nothing is published into `ids[slot]`.
                 let _ = d.claiming[slot].compare_exchange(
                     CLAIM_UNRECORDED,
                     DEAD,
@@ -572,9 +491,7 @@ fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
 
         let s = Arc::clone(&t);
         let survivor = thread::spawn(move || {
-            // Liveness predicate: participant `DEAD` is gone, everyone else runs.
-            // In production this is the injected OFD-lock/`/proc` predicate
-            // (`docs/PHASE2.md` §5.1, §6.2).
+            // Participant `DEAD` is gone, everyone else runs (`docs/PHASE2.md` §5.1).
             intern_core(
                 &s.table(3),
                 hash,
@@ -602,9 +519,7 @@ fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
             ME,
             "the rescuer must record itself as the entry's claimant"
         );
-        // Whoever wins, exactly one id is allocated: the dead claimant never got
-        // as far as `frame_count`, and the takeover happens before the rescuer
-        // touches it.
+        // The dead claimant never reached `frame_count`.
         assert_eq!(t.count.load(Ordering::Relaxed), 1, "no id was leaked");
     });
 }
@@ -623,36 +538,25 @@ fn claim_race_exactly_one_wins() {
         let ok1 = t1.join().unwrap();
         let ok2 = t2.join().unwrap();
         assert!(ok1 ^ ok2, "expected exactly one claim to succeed");
-        // The winner incremented the epoch exactly once.
+        // The winner incremented the epoch once.
         assert_eq!(rec.epoch.load(Ordering::Relaxed), 1);
     });
 }
 
-/// A model of the topology protocol as amended by `docs/PHASE2.md` §1 — A1's
-/// packed word and A2's in-arena mutation lock — mirroring
-/// `topology::{TopologyView, TopoLockView}` step for step. Keep the two in step;
-/// the real code ships.
-///
-/// It is a reimplementation because the lock word and blocks live in a
-/// `#[repr(C)]` arena header, which loom's instrumented atomics cannot inhabit
-/// (hence `crate::topology` is `#[cfg(not(loom))]`).
+/// A model of the topology protocol as amended by `docs/PHASE2.md` §1 (A1's packed
+/// word, A2's mutation lock), mirroring `topology::{TopologyView, TopoLockView}`
+/// step for step; keep the two in step. It is a reimplementation because loom's
+/// atomics cannot inhabit a `#[repr(C)]` arena header.
 ///
 /// # The control run
 ///
-/// A model that idealises the exclusion it checks proves it by construction.
-/// With `is_alive`'s refusal removed (every holder read as dead),
-/// `two_mutators_race_the_lock_and_a_reader_sees_no_mix` fails with *"two mutators
-/// inside the critical section"* while
-/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`] still passes. Its
-/// holder is live and unstealable, so the gate alone keeps the second mutator out;
-/// the other's is a corpse, so the gate alone lets the rescuer in. The control
-/// fires only under [`model`]'s preemption bound.
+/// With `is_alive`'s refusal removed, `two_mutators_race_...` fails while
+/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`] still passes, so each
+/// test exercises the gate from a different side. The control fires only under
+/// [`model`]'s preemption bound.
 ///
-/// `MODEL_BLOCKS` matches [`tf_tree_arena::TOPO_BLOCKS`] and that is load-bearing:
-/// with two blocks loom produced a reader observing `(P_OLD, D_A)`. The reader's
-/// `Relaxed` re-check proves only that no change has become *visible here*; what
-/// protects it is that a mutator never writes the block being read, and with `N`
-/// blocks that takes `N` publications inside one read (A1's "four flips").
+/// `MODEL_BLOCKS` matches [`tf_tree_arena::TOPO_BLOCKS`], which is load-bearing:
+/// with two blocks loom produced a reader observing `(P_OLD, D_A)`.
 struct TopoModel {
     /// A2: `0` = free, else `participant_slot + 1`.
     lock: AtomicU64,
@@ -662,22 +566,19 @@ struct TopoModel {
     word: AtomicU64,
     parent: [AtomicU32; MODEL_BLOCKS],
     depth: [AtomicU32; MODEL_BLOCKS],
-    /// Test-only witness: how many threads believe they are in the critical
-    /// section. Must never exceed one.
+    /// Test-only witness: threads believing they are in the critical section.
     in_section: AtomicU32,
 }
 
-/// Mirrors `tf_tree_arena::TOPO_BLOCKS`; see [`TopoModel`] for why it must.
+/// Mirrors `tf_tree_arena::TOPO_BLOCKS`; see [`TopoModel`].
 const MODEL_BLOCKS: usize = 4;
-/// Small enough that loom can reach the steal path; the production constant is
-/// `topology::TOPO_LOCK_SPIN_LIMIT`.
+/// Small enough that loom reaches the steal path.
 const MODEL_SPIN_LIMIT: u32 = 3;
 
 const P_OLD: u32 = 5;
 const D_OLD: u32 = 1;
 
-/// `pack`/`unpack` from `tf_tree_arena` — re-stated so the model does not depend
-/// on a `not(loom)` module. Bits 63..8 generation, bits 7..0 active index.
+/// `pack`/`unpack` from `tf_tree_arena`, re-stated to avoid a `not(loom)` module.
 fn pack(generation: u64, active: usize) -> u64 {
     (generation << 8) | active as u64
 }
@@ -686,8 +587,7 @@ fn unpack(word: u64) -> (u64, usize) {
     (word >> 8, (word & 0xff) as usize % MODEL_BLOCKS)
 }
 
-/// A held lock. Releases with a CAS, not a store, so a participant that was
-/// stolen from cannot free the thief's lock.
+/// A held lock. Releases with a CAS, so a participant stolen from cannot free the thief's lock.
 struct ModelGuard<'a> {
     model: &'a TopoModel,
     want: u64,
@@ -714,9 +614,7 @@ impl TopoModel {
         }
     }
 
-    /// A2's acquire: bounded spin, then resolve the holder and steal if it is
-    /// dead. `is_alive` is injected exactly as in the real code — the lock never
-    /// decides liveness itself.
+    /// A2's acquire: bounded spin, then steal if the holder is dead. `is_alive` is injected; the lock never decides liveness.
     fn acquire(&self, slot: u32, is_alive: impl Fn(u32) -> bool) -> Option<ModelGuard<'_>> {
         let want = u64::from(slot) + 1;
         for _ in 0..MODEL_SPIN_LIMIT {
@@ -743,9 +641,7 @@ impl TopoModel {
             .map(|_| ModelGuard { model: self, want })
     }
 
-    /// A1's writer, held under A2's lock: mutate the *inactive* block, then
-    /// publish with a **single store**. No odd state, so nothing a crash can
-    /// leave half-done is observable.
+    /// A1's writer under A2's lock: mutate the *inactive* block, then publish with a single store.
     fn mutate(&self, guard: &ModelGuard<'_>, parent: u32, depth: u32) {
         let _ = guard; // the type is the proof; this silences "unused".
 
@@ -754,8 +650,7 @@ impl TopoModel {
 
         let (g, active) = unpack(self.word.load(Ordering::Relaxed));
         let next = (active + 1) % MODEL_BLOCKS;
-        // Re-copy the active block wholesale — this is what makes stealing need
-        // no rollback: whatever a dead holder left in `next` is overwritten.
+        // Re-copy the active block wholesale: stealing needs no rollback.
         self.parent[next].store(
             self.parent[active].load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -773,9 +668,7 @@ impl TopoModel {
         self.in_section.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// A1's reader — what plan compilation does. Wait-free: it never spins on a
-    /// writer, because there is no state a writer can leave that a reader must
-    /// wait out.
+    /// A1's reader (plan compilation). Wait-free: no writer state needs waiting out.
     fn read(&self) -> (u32, u32, u64) {
         loop {
             let w1 = self.word.load(Ordering::Acquire);
@@ -791,8 +684,7 @@ impl TopoModel {
     }
 }
 
-/// Loom test 5: a topology mutation concurrent with a topology read. The reader
-/// sees the old pair or the new pair, never a mix.
+/// Loom test 5: a topology mutation concurrent with a read; the reader sees the old or new pair, never a mix.
 #[test]
 fn topology_read_sees_old_or_new_never_mixed() {
     const P_NEW: u32 = 9;
@@ -820,12 +712,8 @@ fn topology_read_sees_old_or_new_never_mixed() {
 }
 
 /// Loom test 6 (`docs/PHASE2.md` §1, A2): two participants racing the mutation
-/// lock, with a reader compiling a plan throughout. Asserted:
-///
-/// * exactly one mutator at a time (`in_section`, from inside the section);
-/// * every published generation is accounted for: a winner publishes once, a
-///   loser not at all;
-/// * the reader sees one generation or the other, never a mix.
+/// lock while a reader compiles a plan. Asserted: one mutator at a time; a winner
+/// publishes once and a loser not at all; the reader never sees a mix.
 #[test]
 fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
     const P_A: u32 = 11;
@@ -842,8 +730,7 @@ fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
                     topo.mutate(&g, parent, depth);
                     true
                 }
-                // Contended. Every participant is alive here, so nothing may be
-                // stolen and the loser simply does not publish.
+                // Contended, every participant alive: nothing is stolen.
                 None => false,
             })
         };
@@ -870,31 +757,24 @@ fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
                 || (parent, depth) == (P_B, D_B),
             "reader saw a topology nobody published: ({parent}, {depth})"
         );
-        // The lock is free again however the race went: every winner released,
-        // and no loser ever held it.
+        // The lock is free again however the race went.
         assert_eq!(topo.lock.load(Ordering::Relaxed), 0, "the lock leaked");
     });
 }
 
 /// Loom test 7 — the `topo.holding_lock` crash point (`docs/PHASE2.md` §11.3).
 ///
-/// One participant takes the lock, scribbles on the inactive block, and dies
-/// without releasing or publishing. A second must steal the lock and complete
-/// with **no trace** of the first (A2: recovery is a no-op), and a concurrent
-/// reader must never see the scribble.
-///
-/// The death is modelled inline, before the rescuer exists: a thread scheduled
-/// its scribble after the rescuer published, which is the false-negative hazard
-/// (a live-but-stalled participant declared dead; `docs/PHASE2.md` §6.1, §6.2),
-/// not this one.
+/// One participant takes the lock, scribbles on the inactive block, and dies. A
+/// second must steal the lock and complete with no trace of the first (A2), and a
+/// concurrent reader must never see the scribble. The death is modelled inline,
+/// before the rescuer exists.
 #[test]
 fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
     const P_GARBAGE: u32 = 0xDEAD;
     const D_GARBAGE: u32 = 0xBEEF;
     const P_NEW: u32 = 7;
     const D_NEW: u32 = 2;
-    /// The dead participant's slot. `is_alive` reports only this one dead, so
-    /// the test cannot pass by stealing indiscriminately.
+    /// The dead participant's slot; only this one is reported dead.
     const DEAD_SLOT: u32 = 0;
 
     model(|| {
@@ -940,13 +820,8 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
     });
 }
 
-/// A late `release` racing a reap + re-`register` must not free the new occupant.
-///
-/// Thread A is the departing participant's late `release(slot, 1)`; B reaps the
-/// slot and hands it to a new process. A load-then-CAS guard fails only in the
-/// window between its two words; the incarnation packed into `state` makes it one
-/// CAS. The failure is two live processes sharing a slot index, breaking the
-/// `slot + 1` owner encoding (A2, A3).
+/// A late `release` racing a reap + re-`register` must not free the new occupant
+/// (the incarnation packed into `state` makes the guard one CAS).
 #[test]
 fn a_late_release_racing_a_slot_handover_frees_nobody() {
     const P_LATE: u32 = 111;
@@ -962,8 +837,7 @@ fn a_late_release_racing_a_slot_handover_frees_nobody() {
         let a = Arc::clone(&table);
         let late = thread::spawn(move || ParticipantTable::new(&a).release(0, 1));
 
-        // B: modelled as the same release (a reap *is* a release performed by
-        // somebody else) followed by the new process's registration.
+        // B: a reap is a release by somebody else, then the new registration.
         let b = Arc::clone(&table);
         let handover = thread::spawn(move || {
             let t = ParticipantTable::new(&b);
@@ -987,18 +861,15 @@ fn a_late_release_racing_a_slot_handover_frees_nobody() {
 }
 
 /// Two joiners told to take the *same* slot: exactly one may get it
-/// (`docs/PHASE2.md` §3.7, `docs/decisions/0005`).
-///
-/// Loom-only: the window is between `register_at`'s CAS and its release-store,
-/// which a sequential test cannot enter. A load-compare-store shape lets both
-/// threads see `FREE` and publish, sharing one slot index.
+/// (`docs/PHASE2.md` §3.7, `docs/decisions/0005`). Loom-only: the window is inside
+/// `register_at`, which a sequential test cannot enter.
 #[test]
 fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
     const P_A: u32 = 101;
     const P_B: u32 = 202;
 
     model(|| {
-        // Four slots, so a loser could have gone elsewhere; `register_at` takes the named slot or nothing.
+        // Four slots: `register_at` takes the named slot or nothing.
         let table = Arc::new(alloc::vec![
             ParticipantRecord::default(),
             ParticipantRecord::default(),
@@ -1021,7 +892,7 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
 
         let t = ParticipantTable::new(&table);
         let (pid, _, inc) = t.identity(2).expect("the winner published a LIVE record");
-        // The record must belong to the winner entire, not a torn mix.
+        // The record belongs to the winner entire.
         let (winner_pid, winner_inc) = if let Ok(i) = ra {
             (P_A, i)
         } else {
@@ -1040,54 +911,37 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
 /// before the lock byte is probed, and no record a joiner published is erased.
 ///
 /// - **Ordering.** An `Acquire` load returning a `live_word` synchronises-with
-///   `fill_slot`'s `Release`, so the byte its holder took before that store reads
-///   held to any later probe. A byte-first sweep or an up-front holder mask has no
-///   such edge.
-/// - **No erasure.** A joiner that returned `Ok` is never left with a `FREE`
-///   record.
+///   `fill_slot`'s `Release`; a byte-first sweep has no such edge.
+/// - **No erasure.** A joiner that returned `Ok` is never left with a `FREE` record.
 ///
-/// It does **not** pin `reclaim`'s own CAS guard: the sweeper never reaches that
-/// CAS on the joiner's slot, so a `reclaim` ignoring `observed` passes.
-/// [`crate::tests::reclaim_fails_when_the_observed_word_has_changed`] pins the
-/// guard; nothing pins the CAS's strength (stated on `reclaim`). "No two
-/// occupants" is not asserted either: the byte being an exclusive lock entails it
-/// without schedule exploration (0028 steps 0b, 0c).
+/// It does not pin `reclaim`'s CAS guard
+/// ([`crate::tests::reclaim_fails_when_the_observed_word_has_changed`] does) or its
+/// strength (stated on `reclaim`).
 ///
 /// # Controls
 ///
-/// Both ship as runnable `#[should_panic]` tests, so a model that stops being
-/// falsifiable fails the suite:
-///
-/// - [`control_reclaim_races_register_probes_the_byte_first`] — reads swapped.
-/// - [`control_reclaim_races_register_observes_relaxed`] — right order, word
-///   observed `Relaxed`.
+/// Both are runnable `#[should_panic]` tests, so an unfalsifiable model fails:
+/// [`control_reclaim_races_register_probes_the_byte_first`] and
+/// [`control_reclaim_races_register_observes_relaxed`].
 ///
 /// # Modelling notes
 ///
-/// Slot 0's corpse is reclaimed uncontended, which keeps the model clear of loom
-/// 0.7.2's `match_rmw_to_stores` over-approximation; a failure needs its witness
-/// hand-checked. The byte is an exclusive per-slot lock word, taken and never
-/// released, probed `Relaxed` (`F_OFD_GETLK` is at least that strong). The corpse
-/// is staged inline, as in
-/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`].
+/// Slot 0's corpse is reclaimed uncontended, avoiding loom 0.7.2's
+/// `match_rmw_to_stores` over-approximation. The byte is an exclusive per-slot lock
+/// word, probed `Relaxed`.
 #[test]
 fn reclaim_races_register() {
     reclaim_races_register_model(Sweep::WordThenByte);
 }
 
 /// The failing control: the byte is probed **before** the word is observed.
-///
-/// See [`reclaim_races_register`].
 #[test]
 #[should_panic(expected = "no erasure")]
 fn control_reclaim_races_register_probes_the_byte_first() {
     reclaim_races_register_model(Sweep::ByteThenWord);
 }
 
-/// The second failing control: the right read order, the word observed
-/// `Relaxed`.
-///
-/// See [`reclaim_races_register`].
+/// The second failing control: the right order, the word observed `Relaxed`.
 #[test]
 #[should_panic(expected = "no erasure")]
 fn control_reclaim_races_register_observes_relaxed() {
@@ -1097,8 +951,7 @@ fn control_reclaim_races_register_observes_relaxed() {
 /// How one sweep reads a slot: the protocol, and the two controls that break it.
 #[derive(Clone, Copy)]
 enum Sweep {
-    /// The word (`Acquire`) first, then the byte. What `reclaim`'s doc requires
-    /// of a caller.
+    /// The word (`Acquire`) first, then the byte.
     WordThenByte,
     /// The byte first. Control.
     ByteThenWord,
@@ -1106,25 +959,19 @@ enum Sweep {
     WordRelaxedThenByte,
 }
 
-/// The model behind [`reclaim_races_register`] and its two controls.
+/// The model behind [`reclaim_races_register`] and its controls.
 fn reclaim_races_register_model(shape: Sweep) {
-    /// Killed between `fill_slot`'s CAS and its publishing store, leaving slot 0
-    /// `RESERVED` with a byte the kernel released at its death.
+    /// Killed between `fill_slot`'s CAS and its publish: slot 0 `RESERVED`, byte released.
     const P_CORPSE: u32 = 0xDEAD;
     /// The joiner the owner granted slot 1.
     const P_JOINER: u32 = 7;
     const T_JOINER: u64 = 2;
-    /// Lock-byte states. `docs/decisions/0005` makes the byte index and the
-    /// arena record index the same integer; 0028 step 0c asserts it.
+    /// Lock-byte states; the byte index equals the record index (`docs/decisions/0005`, 0028 step 0c).
     const BYTE_FREE: u32 = 0;
     const BYTE_HELD: u32 = 1;
 
-    /// One reclamation decision, for one slot.
-    ///
-    /// Returns whether the CAS fired, and whether this sweeper ever read a byte
-    /// free under a published `live_word` — the ordering violation itself,
-    /// reported rather than acted on so that the erasure assertion is the one
-    /// that speaks first.
+    /// One reclamation decision. Returns whether the CAS fired, and whether the sweeper
+    /// read a byte free under a published `live_word` (the ordering violation itself).
     fn sweep(
         table: &[ParticipantRecord],
         bytes: &[AtomicU32],
@@ -1162,12 +1009,11 @@ fn reclaim_races_register_model(shape: Sweep) {
             AtomicU32::new(BYTE_FREE)
         ]);
 
-        // The corpse in slot 0: `register` never collects it (it only CASes from FREE).
+        // Slot 0's corpse: `register` never collects it.
         table[0].pid.store(P_CORPSE, Ordering::Relaxed);
         table[0].state.store(RESERVED, Ordering::Release);
 
-        // A: a joiner granted slot 1. It takes its lock byte before it writes
-        // anything to the arena — the invariant step 0b makes total.
+        // A: a joiner granted slot 1 takes its byte before writing (0028 step 0b).
         let ta = Arc::clone(&table);
         let ba = Arc::clone(&bytes);
         let joiner = thread::spawn(move || {
@@ -1180,9 +1026,7 @@ fn reclaim_races_register_model(shape: Sweep) {
             ParticipantTable::new(&ta).register_at(1, P_JOINER, T_JOINER, 0)
         });
 
-        // B: a peer running `reap_participants` (0028 piece 4) over the whole
-        // table, holding no byte of its own. Slot 0 is the corpse it collects;
-        // slot 1 is the live joiner it must not touch.
+        // B: a peer reaping the whole table; it must not touch the live joiner.
         let tb = Arc::clone(&table);
         let bb = Arc::clone(&bytes);
         let sweeper = thread::spawn(move || (sweep(&tb, &bb, 0, shape), sweep(&tb, &bb, 1, shape)));
@@ -1202,8 +1046,7 @@ fn reclaim_races_register_model(shape: Sweep) {
             "ordering: a byte read free under a published live_word, so the word \
              was not observed first"
         );
-        // Harness liveness, not evidence about the guard: it is here so that a
-        // model in which nothing under test ever runs fails instead of passing.
+        // Harness liveness: fails a model in which nothing under test runs.
         assert!(
             corpse_fired,
             "the widened CAS never fired: nothing was tested"

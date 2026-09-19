@@ -1,10 +1,6 @@
-//! Construction tests for decision `0004`
-//! (`docs/decisions/0004-builder-time-edge-declaration.md`, still authoritative
-//! for the builder-time edge declaration API): the arena is sized from exactly the
-//! declared edges, per-edge capacities are honored (including one far larger than
-//! its siblings), edges of different capacities each sample their own ring (which
-//! guards the cumulative `stamp_off`/`pose_off` math), and `Capacity::history`
-//! rounds to a power of two.
+//! Construction tests for decision `0004`: the arena is sized from exactly the
+//! declared edges, per-edge capacities are honored and independent, and
+//! `Capacity::history` rounds to a power of two.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
@@ -15,9 +11,7 @@ use tf_tree::{Capacity, EdgeCfg, Iso3, LookupError, TreeBuilder};
 
 const TOL: f64 = 1e-12;
 
-/// A tree that is mostly static (a long static chain) plus a couple of dynamic
-/// edges has an arena whose size tracks only the two dynamic rings — far smaller
-/// than a uniform per-edge reservation would give (the waste `0004` warns about).
+/// A mostly-static tree has an arena sized by its two dynamic rings only (`0004`).
 #[test]
 fn sparse_tree_arena_tracks_only_dynamic_edges() {
     const STATIC: usize = 200;
@@ -39,16 +33,13 @@ fn sparse_tree_arena_tracks_only_dynamic_edges() {
 
     let actual = tree.arena_size_bytes();
 
-    // Uniform reservation would size the pose arena for every edge slot at
-    // `dyn_cap`: (STATIC + 2 dynamic + 1 sentinel) * dyn_cap * 64 B. Sparse
-    // sizing reserves rings for only the two dynamic edges.
+    // Uniform reservation would be (STATIC + 2 + 1) * dyn_cap * 64 B.
     let uniform_pose_bytes = (STATIC + 3) * dyn_cap as usize * 64;
     assert!(
         actual * 4 < uniform_pose_bytes,
         "sparse arena {actual} B is not far below the uniform {uniform_pose_bytes} B"
     );
 
-    // But it does hold the two dynamic rings (pose+stamp per slot).
     let two_rings = 2 * dyn_cap as usize * (64 + 8);
     assert!(
         actual > two_rings,
@@ -56,15 +47,13 @@ fn sparse_tree_arena_tracks_only_dynamic_edges() {
     );
 }
 
-/// A per-edge capacity far larger than its sibling's (8192 vs 16) is honored: the
-/// big edge retains ~8192 samples and samples correctly across a wrapped ring,
-/// which a 16-slot reservation could never do.
+/// A per-edge capacity far larger than its sibling's (8192 vs 16) is honored
+/// across a wrapped ring.
 #[test]
 fn large_capacity_edge_samples_across_a_wrapped_ring() {
     let big: u32 = 8192;
     let tree = TreeBuilder::new()
         .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::slots(big)))
-        // A small sibling so the big edge is not the only ring in the arena.
         .dynamic_edge("map", "aux", EdgeCfg::new(Capacity::slots(16)))
         .build()
         .unwrap();
@@ -80,7 +69,6 @@ fn large_capacity_edge_samples_across_a_wrapped_ring() {
         }
     }
 
-    // The newest sample reads back exactly (single-edge, exact stamp).
     let recent = ns((total - 1) as i64 * dt);
     assert_close(
         tree.lookup("map", "odom", recent).unwrap(),
@@ -89,8 +77,7 @@ fn large_capacity_edge_samples_across_a_wrapped_ring() {
         "newest sample after wrap",
     );
 
-    // The retained window is the last `big` samples: indices [total-big, total-1]
-    // = [500, 8691]. Index 550 is retained; index 450 was overwritten.
+    // Retained window: indices [500, 8691]; 550 is retained, 450 overwritten.
     let retained = ns(550 * dt);
     assert!(
         tree.lookup("map", "odom", retained).is_ok(),
@@ -104,9 +91,8 @@ fn large_capacity_edge_samples_across_a_wrapped_ring() {
     );
 }
 
-/// Two dynamic edges of different capacities each sample their own ring. A wrong
-/// cumulative `stamp_off`/`pose_off` would make one edge read into the other's
-/// ring; distinct pose streams make that visible.
+/// Two edges of different capacities each sample their own ring (guards the
+/// cumulative `stamp_off`/`pose_off` math).
 #[test]
 fn distinct_capacity_edges_sample_their_own_rings() {
     let cap_a: u32 = 8192; // map -> odom (no wrap)
@@ -136,7 +122,6 @@ fn distinct_capacity_edges_sample_their_own_rings() {
         }
     }
 
-    // Where both rings retain the index, each edge returns its OWN pose stream.
     for i in [50usize, 70, 103] {
         let s = ns(i as i64 * dt);
         assert_close(
@@ -153,8 +138,7 @@ fn distinct_capacity_edges_sample_their_own_rings() {
         );
     }
 
-    // The big edge retains a sample the small edge has long evicted — the two
-    // rings are independent, not aliased through a shared offset.
+    // The rings are independent, not aliased through a shared offset.
     let old = ns(10 * dt);
     assert_close(
         tree.lookup("map", "odom", old).unwrap(),
@@ -169,8 +153,7 @@ fn distinct_capacity_edges_sample_their_own_rings() {
     );
 }
 
-/// `Capacity::history(1000 Hz, 10 s)` -> `next_pow2(10_000)` == 16384, and
-/// `Capacity::slots` rounds up to the next power of two.
+/// `Capacity::history(1000 Hz, 10 s)` -> 16384; `Capacity::slots` rounds up to a power of two.
 #[test]
 fn capacity_rounds_to_power_of_two() {
     assert_eq!(Capacity::history(1000.0, 10.0).get(), 16384);
@@ -181,35 +164,9 @@ fn capacity_rounds_to_power_of_two() {
     assert_eq!(Capacity::slots(4097).get(), 8192);
 }
 
-/// **A declared nominal rate reaches `EdgeRecord::nominal_rate_mhz`, and an
-/// undeclared edge leaves it 0.**
-///
-/// The field is the *only* evidence `tf_tree doctor`'s `TFT007` has that an
-/// observed rate is wrong rather than merely what it is (`docs/PHASE5.md` §1.2,
-/// §6). Declaration is also the only moment it can be written: after `build()`
-/// the arena may be shared, and no API mutates a record afterwards.
-///
-/// The values are chosen so the units cannot pass by accident. 19.79 Hz is what
-/// `tf_tree topology --discover` emits for a 20 Hz publisher (it measures and
-/// rounds up to two decimals), so hertz-rounding would store 20 000 mHz and
-/// milli-hertz truncation would store 19 790 either way; 0.1 Hz is a map update,
-/// which an integer-hertz field could not express at all. **19.9999 Hz is the
-/// value that separates `round` from `as`** — the conversion's own comment calls
-/// the distinction load-bearing, and neither 19.79 nor 0.1 discriminates it,
-/// because `19.79 * 1000.0` and `0.1 * 1000.0` are both exact in `f64`.
-///
-/// Mutant: delete `record.nominal_rate_mhz = cfg.nominal_rate_mhz;` from
-/// `TreeBuilder::build_with`. Applied: the first assertion fails with
-/// `left: 0, right: 19790`.
-/// Mutant B: `mhz.round() as u32` -> `mhz as u32` in `EdgeCfg::nominal_rate_hz`.
-/// Applied: the 19.9999 Hz assertion fails with `left: 19999, right: 20000` —
-/// an edge the operator declared at 20 Hz, off by a milli-hertz forever.
-///
-/// Gated whole: `nominal_rate_mhz` is a field of the arena's `EdgeRecord` and
-/// the builder is the only thing that ever writes it, so reading it back
-/// through `ArenaView` *is* the test — there is no stable-tier accessor and a
-/// version of this without one would assert that `build()` returned `Ok`. It
-/// runs under `cargo nextest run --workspace`, where `unstable` is unified in.
+/// A declared nominal rate reaches `EdgeRecord::nominal_rate_mhz`; an undeclared
+/// edge leaves it 0 (`docs/PHASE5.md` §1.2, §6). 19.9999 Hz separates `round`
+/// from `as`. Gated on `unstable`: read back through `ArenaView`.
 #[test]
 #[cfg(feature = "unstable")]
 fn a_declared_nominal_rate_reaches_the_edge_record() {
@@ -224,11 +181,8 @@ fn a_declared_nominal_rate_reaches_the_edge_record() {
             "base",
             EdgeCfg::new(Capacity::slots(64)).nominal_rate_hz(0.1),
         )
-        // Declares nothing: sized by slots, so there is no rate to record.
         .dynamic_edge("base", "laser", EdgeCfg::new(Capacity::slots(64)))
-        // A rate no robot publishes at is dropped back to "undeclared" rather
-        // than clamped — a clamp would invent a nominal out of a typo and then
-        // report every real sample as deviating from it.
+        // An implausible rate drops to "undeclared" rather than being clamped.
         .dynamic_edge(
             "base",
             "imu",
@@ -239,7 +193,6 @@ fn a_declared_nominal_rate_reaches_the_edge_record() {
             "gps",
             EdgeCfg::new(Capacity::slots(64)).nominal_rate_hz(-5.0),
         )
-        // A 20 Hz rate that came back from a text round-trip a whisker short.
         .dynamic_edge(
             "base",
             "wheel",
@@ -265,9 +218,7 @@ fn a_declared_nominal_rate_reaches_the_edge_record() {
         "19.9999 Hz rounds to 20 000 mHz; truncating would store 19 999"
     );
 
-    // A static edge never publishes, so it has no rate and the builder writes
-    // none — checked because `EdgeRecord::static_edge` and `::dynamic` are
-    // separate constructors and only one of them is on the path above.
+    // A static edge has no rate; `EdgeRecord::static_edge` is a separate constructor.
     let tree = TreeBuilder::new()
         .static_edge("map", "odom", &Iso3::IDENTITY)
         .build()

@@ -1,19 +1,8 @@
-//! `tf_tree doctor --from-file` against a frozen `.tft` — `docs/PHASE5.md` §2 + §6.
+//! `tf_tree doctor --from-file` against a frozen `.tft` — `docs/PHASE5.md` §2, §6.
 //!
-//! `--from-file` is the source `docs/PHASE5.md` §6's `TFT019` amendment named,
-//! and it needs the frozen backend, so `cargo nextest run --workspace` — which
-//! builds without features — compiles this target out. `just shm-check` runs it.
-//!
-//! # The interesting assertion here is a *skip*
-//!
-//! §6's amendment expected a `.tft` source to unblock `TFT018` and `TFT019`.
-//! It does not, and this file is where that is pinned rather than left as prose:
-//! a `.tft` is an arena, `SampleRing::push` rejects an out-of-order stamp, and a
-//! ring therefore holds only accepted pushes. Running the two checks here would
-//! pass **every** `.tft` ever written, which is the fabricated all-clear the
-//! catalogue refuses everywhere else. The recording source (`--from-bag`) is the
-//! one that carries the evidence; `crates/tf_tree_cli/tests/doctor_recording.rs`
-//! is where it fires.
+//! Needs the frozen backend; `just shm-check` runs it. `TFT018`/`TFT019` skip on
+//! a `.tft` (a ring holds only accepted pushes, so they would always pass);
+//! `doctor_recording.rs` is where they fire.
 #![cfg(all(feature = "shm", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -45,10 +34,7 @@ fn tf_tree() -> Command {
 }
 
 /// Write a small recording into `dir` and freeze it, returning the `.tft`.
-///
-/// **The freeze runs in a subprocess and that is load-bearing rather than
-/// incidental**: it is what makes the file's participant table describe a
-/// process that has since exited, which is the state `TFT014` must not judge.
+/// The freeze runs in a subprocess, so the participant table names an exited process.
 fn freeze_a_recording(dir: &Scratch) -> PathBuf {
     let bag = dir.0.join("run.mcap");
     let tft = dir.0.join("run.tft");
@@ -88,8 +74,7 @@ fn doctor_json(tft: &PathBuf) -> String {
     json
 }
 
-/// The `--json` object for `id`, as a window wide enough to hold its status,
-/// its reason and its first finding.
+/// The `--json` object for `id`, wide enough for its status, reason and first finding.
 fn outcome_of<'a>(json: &'a str, id: &str) -> &'a str {
     let at = json
         .find(&format!("\"id\": \"{id}\""))
@@ -97,24 +82,9 @@ fn outcome_of<'a>(json: &'a str, id: &str) -> &'a str {
     &json[at..(at + 1200).min(json.len())]
 }
 
-/// **A frozen `.tft` is a `doctor` source, and the checks that read the arena
-/// run on it unchanged.**
-///
-/// §2.1 is NORMATIVE that a frozen arena is read by the identical code as a live
-/// one, so this is the smallest thing that shows the wiring is wiring: freeze a
-/// recording, point `doctor` at the file, and get a report about the same
-/// topology with no attach, no rendezvous and no publisher.
-///
-/// **And `TFT018`/`TFT019` skip, with the reason that is true of an arena** —
-/// not the live-arena one about a torn ring, which does not apply to a file
-/// nobody is writing. That distinction is the whole reason `checks::PushStream`
-/// has four variants instead of being a `live: bool`; keyed on liveness, both
-/// checks would have run here and passed unconditionally.
-///
-/// Mutant: give `Source::Frozen` the stream `PushStream::Observed` in
-/// `lib.rs`'s `Source::stream`. Applied, and this failed with
-/// `TFT018 must not claim a verdict it cannot have: ... "status": "pass"` —
-/// which is precisely the vacuous pass a `.tft` source would have shipped.
+/// A frozen `.tft` is a `doctor` source read by the same code as a live arena
+/// (§2.1), and `TFT018`/`TFT019` skip with the arena-specific reason
+/// (`checks::PushStream` has four variants for this).
 #[test]
 fn a_frozen_index_is_a_doctor_source_and_the_two_stream_checks_skip_on_it() {
     let dir = Scratch::new("wiring");
@@ -124,7 +94,6 @@ fn a_frozen_index_is_a_doctor_source_and_the_two_stream_checks_skip_on_it() {
         json.contains("\"source\": \"frozen .tft index\""),
         "the report must name what it read:\n{json}"
     );
-    // The topology `small_recording` describes, read back out of the file.
     assert!(
         json.contains("\"frames\": 6") && json.contains("\"edges\": 5"),
         "the arena's own shape must survive the round trip:\n{json}"
@@ -147,25 +116,9 @@ fn a_frozen_index_is_a_doctor_source_and_the_two_stream_checks_skip_on_it() {
     }
 }
 
-/// **`TFT014` skips on a `.tft`, and this is the file that proves it has to.**
-///
-/// §2.3's freeze copies the whole arena, participant records included, so this
-/// file carries a `LIVE` record for the `tf_tree freeze` subprocess that wrote
-/// it — a process this test had already reaped before `doctor` started. Ask
-/// `Tree::participant_alive` about it and the kernel says that pid is gone, so
-/// without the [`SlotTable::Image`] skip **every correct `.tft` in existence
-/// reports a leaked participant slot**, at warn severity, about an arena with
-/// no assigner for a leaked slot to wedge.
-///
-/// The `pass` it used to report was no better: `owner_pid` came from
-/// `ParticipantTable::identity`, which answers for any `LIVE` record however
-/// dead its process, so the old quiet was `PHASE2.md` §5.1's forbidden
-/// inference producing the right answer here for the wrong reason.
-///
-/// Mutant: give `Source::Frozen` the table `SlotTable::Current` in `lib.rs`'s
-/// `Source::slot_table`. Applied: the skipped-status assertion fails, and the
-/// window it prints is the finding — `"subject": "slot 0 pid 1019885"`, the pid
-/// of that reaped `tf_tree freeze`.
+/// `TFT014` skips on a `.tft`: the freeze copies a `LIVE` participant record for
+/// the already-exited `tf_tree freeze` process, so [`SlotTable::Image`] must
+/// skip the liveness probe (§2.3).
 ///
 /// [`SlotTable::Image`]: tf_tree_cli::checks::SlotTable::Image
 #[test]
@@ -188,15 +141,7 @@ fn a_frozen_index_is_not_asked_whether_its_participants_are_running() {
     );
 }
 
-/// **A recording handed to `--from-file` is told which flag it wanted.**
-///
-/// `.mcap` and `.tft` are one flag apart and the error a user gets from the
-/// container's magic check is `BadMagic`, which is accurate and unhelpful. The
-/// remedy costs a sentence and is the difference between a stranger's first run
-/// succeeding on the second attempt and them concluding the tool is broken.
-///
-/// Mutant: drop the `--from-bag` sentence from `doctor_source`'s frozen error
-/// context. Applied: the remedy assertion fails with only `BadMagic` printed.
+/// A recording handed to `--from-file` is told to use `--from-bag`.
 #[test]
 fn a_recording_handed_to_from_file_is_pointed_at_from_bag() {
     let dir = Scratch::new("wrongflag");
@@ -221,26 +166,9 @@ fn a_recording_handed_to_from_file_is_pointed_at_from_bag() {
     );
 }
 
-/// **`--attach` and a recording flag are refused together, whichever side of
-/// the subcommand `--attach` is typed on.**
-///
-/// `doctor` reports on one arena. Left undeclared, `doctor_source` tested
-/// `from_bag` first and the live arena silently lost: `tf_tree --attach --name
-/// prod doctor --from-bag x.mcap` exited 0 with a clean report about `x.mcap`
-/// while the operator read it as a clean report about `prod`. That is the worst
-/// available failure — a true report about the wrong subject.
-///
-/// **Both orders are asserted, and that is the point of the test.** `clap`'s
-/// `conflicts_with` looked like the fix and is not: `--attach` is
-/// `global = true` on the root command, so when it is typed *before* the
-/// subcommand `clap` matches it against the root and the `doctor` matcher has no
-/// conflict to report. Declared only that way, the pre-subcommand spelling — the
-/// one every example in `docs/RUNBOOK.md` uses — still slipped through. The
-/// check is therefore in `doctor_source`, which sees both.
-///
-/// Mutant: delete the `anyhow::ensure!(other.is_empty(), ...)` block from
-/// `doctor_source`. Applied, and the `--attach` before `doctor` case failed on
-/// its exit status: the run succeeds and reports on the bag.
+/// `--attach` and a recording flag are refused together, on either side of the
+/// subcommand. The check lives in `doctor_source` because `--attach` is
+/// `global = true` and clap's `conflicts_with` misses the pre-subcommand form.
 #[test]
 fn attach_and_a_recording_source_are_mutually_exclusive_in_both_orders() {
     let dir = Scratch::new("conflict");
@@ -276,24 +204,8 @@ fn attach_and_a_recording_source_are_mutually_exclusive_in_both_orders() {
     }
 }
 
-/// **`freeze --from-live` refuses an ingest flag it cannot act on, exactly as
-/// `doctor` does.**
-///
-/// `IngestArgs` is flattened into `freeze` so `--from-bag` takes the §3 knobs.
-/// On `--from-live` there is no recording to read, so all eleven were parsed and
-/// dropped: `freeze --from-live --tf-prefix robot1` wrote a `.tft` with no
-/// prefix applied and exited 0. It is the same defect as `doctor`'s and it is
-/// closed with the same predicate rather than left as the one remaining
-/// instance.
-///
-/// The assertion stops at the flag rejection: it must fire **before** the
-/// attach, because the attach is what fails on a machine with no arena, and a
-/// rejection that only arrives after a successful attach is not a rejection an
-/// operator can rely on.
-///
-/// Mutant: delete the `anyhow::ensure!(set.is_empty(), ...)` block from
-/// `cmd_freeze`. Applied, and this failed on `the flag must be refused before
-/// the attach is attempted` — the run reaches `no arena at domain ...` instead.
+/// `freeze --from-live` refuses an ingest flag it cannot act on, before the
+/// attach is attempted.
 #[test]
 fn freeze_from_live_refuses_an_ingest_flag_it_will_ignore() {
     let dir = Scratch::new("freeze-flags");

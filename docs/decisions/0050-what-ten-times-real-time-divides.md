@@ -8,145 +8,76 @@
 
 ## Context
 
-`docs/PHASE5.md` §12 criterion 5 reads *"ingest throughput ≥ **10× real time** on
-a representative recording"* and named neither what the ratio divides nor the
-memory regime. Its stated blocker and remedy were wrong: `just bench-check` runs
-`bench_report` and executes nothing under `benches/`, so a criterion bench cannot
-carry a verdict (`criterion` owns the exit status); the 0.048 s figure is a
-`survey` (pass one) figure, a full `run` is about twice it; and the 1.3× is a
-per-byte decode-rate claim, not an ingest claim.
-
-**Not this criterion.** `docs/PHASE4.md` §6.3 carries a different "10× real time"
-row (ROS 2 bag replay, no drops). `just gate5` does not touch it, and its verdict
-output says so on every run.
+`docs/PHASE5.md` §12 criterion 5 ("ingest throughput ≥ **10× real time** on a
+representative recording") named neither what the ratio divides nor the memory
+regime. `docs/PHASE4.md` §6.3's "10× real time" row (ROS 2 replay) is a different
+criterion.
 
 ## Decision
 
-**A `--gate` binary on `just gate4`'s pattern, not a `bench_report` row and not
-a criterion bench.**
+**A `--gate` binary on `just gate4`'s pattern, not a `bench_report` row** (a
+baseline comparison is two-sided, so `AbsoluteTiming` refuses here and the row
+would gate nothing) **and not a criterion bench** (`criterion` owns the exit status).
 
 ### Q1 — what does the ratio divide?
 
 * **Numerator**: wall time of `tf_tree_ingest::run` — survey *and* fill.
-* **Denominator**: `Survey::span_ns()`, the recording's own stamp span; no second
-  spelling of `max(newest) − min(oldest)` in the harness.
+* **Denominator**: `Survey::span_ns()`, the recording's own stamp span.
 * **Worst of N rounds, not the median.**
 
 ### Q2 — is "10× real time" a claim about the code or about the corpus?
 
-**About the corpus, unless the density is pinned.** So:
-
-* the gate **refuses** a corpus sparser than §12's representative recording
-  (100 Hz × 50 = 5 000 transforms per second of recording);
-* the density is **measured off the survey** (`transforms_read / span`), never
-  taken from the arguments, so the floor guards a corpus this harness did not
-  generate;
-* so is the **grouped arm's `--max-memory` cap**: the sum of the largest
-  `ceil(n/2)` edges as pass one measured them (the arms run in-memory then
-  grouped). Derived from `--edges`/`--rate-hz`/`--seconds` instead, a
-  `--reuse-corpus` run passed at exit 0 while described a corpus it was not;
-* transforms per second of wall clock is **reported** beside the ratio.
+**About the corpus, unless the density is pinned.** The gate **refuses** a corpus
+sparser than §12's representative recording (100 Hz × 50 = 5 000 transforms per
+second). The density is **measured off the survey** (`transforms_read / span`),
+never taken from the arguments, so the floor guards a corpus this harness did not
+generate; so is the grouped arm's `--max-memory` cap (the sum of the largest
+`ceil(n/2)` edges as pass one measured them). Transforms per second of wall clock
+is reported beside the ratio.
 
 ### Q3 — may this be gated on a host that fails `Fitness::probe`?
 
 **Yes, under `docs/PHASE5.md` §9.3's one-sided-budget amendment.** A floor on a
-ratio is one-sided: every check the probe fails (SMT, a busy machine, an
-unreadable governor) can only make an ingest slower, so a PASS with margin is
+ratio is one-sided: every failed check can only make an ingest slower, so a PASS is
 conservative and a FAIL is not attributable to the code. The harness prints the
-fitness verdict and reasons either way. **Not `Sensitivity::Ratio`**: that axis
-means two engines interleaved within one round.
+fitness verdict either way. **Not `Sensitivity::Ratio`**, which means two engines
+interleaved within one round.
 
 ### Q4 — at what pass count is the criterion stated?
 
-The recording is read `1 + passes` times (the survey reads it too), and
 `plan_groups` splits pass two whenever buffered samples exceed `--max-memory`.
-**§12's own representative recording does not fit the default cap**:
-
-```
-4 h × 100 Hz × 50 transforms = 72e6 samples
-72e6 × SAMPLE_BYTES (64)     = 4 608 000 000 B
-DEFAULT_MAX_MEMORY_BYTES     = 4 294 967 296 B
-```
-
-It gets two groups and one extra re-read, so a gate at `passes == 1` is not the
-criterion's claim (~1.5× apart). The gate measures **both arms and gates the
-grouped one**:
-
-| arm | `--max-memory` | verdict |
-|---|---|---|
-| `in-memory` | the default; one fill pass | reported |
-| `grouped` | sized for the group count the criterion's own recording forces | **gated** |
-
-Each arm **asserts the pass count it declares**, refusing otherwise.
-
-## Rationale
-
-**Not a `bench_report` row.** A row is compared against a committed baseline, a
-*two-sided* question, so `AbsoluteTiming` refuses on this host and the row would
-come back `unavailable`, gating nothing while looking like a gate. §9.3's
-amendment does not extend to a baseline comparison.
-
-**Not a criterion bench.** `criterion` owns the exit status, and nothing runs
-`benches/` in the go/no-go path.
-
-**Not a committed libzstd corpus.** The corpus is generated by
-`tf_tree_ingest::fixture`; a committed one is megabytes per clone plus a `zstd` CLI
-dependency no gate may have. It is a **round-trip** corpus, not a conformance one
-(`testdata/zstd_conformance.mcap` covers the decoder). zstd because rosbag2 and
-Foxglove write it by default; uncompressed would publish the flattering number.
-
-**No `required-features`.** Ingesting into an in-process `Tree` needs neither
-`shm` nor the frozen backend, so the binary and its red test run under `just test`
-on every pull request.
+§12's own recording (4 h × 100 Hz × 50 transforms × `SAMPLE_BYTES` 64 =
+4 608 000 000 B) exceeds `DEFAULT_MAX_MEMORY_BYTES` (4 294 967 296 B), so it gets
+two groups and one extra re-read, and a gate at `passes == 1` is not the
+criterion's claim. The gate measures **both arms and gates the grouped one**:
+`in-memory` (the default cap; one fill pass) is reported; `grouped` (sized for the
+group count the criterion's recording forces) is **gated**. Each arm **asserts the
+pass count it declares**, refusing otherwise.
 
 ## Consequences
 
-`tf_tree_bench` names `tf_tree_ingest` with `features = ["fixture"]`, through a
-default-on passthrough feature `tf_tree_bench/ingest-compression` rather than
-`features = ["compression"]`:
+The corpus is generated by `tf_tree_ingest::fixture` (zstd): a round-trip corpus,
+not a conformance one (`testdata/zstd_conformance.mcap` covers the decoder). No
+`required-features`, so the binary and its red test run under `just test`.
+
+`tf_tree_bench` names `tf_tree_ingest` with `features = ["fixture"]` through a
+default-on passthrough feature `tf_tree_bench/ingest-compression`:
 `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader` asserts the
-CLI's `compression` equals `tf_tree_ingest::compression_compiled_in()`, and the CLI
-depends on `tf_tree_bench`.
+CLI's `compression` equals `tf_tree_ingest::compression_compiled_in()`.
 
-**What the gate does not measure:**
+The gate does not measure conformance, a real recording, cold storage, a
+comparison between the arms, or the four-hour recording's size.
 
-* **Conformance** (the frames are the decoder's own encoder's) and **a real
-  recording** (`fixture` fabricates one; `testdata/tfstream/indoor_atelier.tfstream`
-  is not an MCAP).
-* **Cold storage**: on the 3.4 MB corpus cache state is inseparable from
-  run-to-run spread.
-* **A comparison between the two arms**: fixed order, no warm-up; on
-  `--reuse-corpus` the ordering has been observed to invert. The gated verdict does
-  not depend on it.
-* **The four-hour recording itself**: the gated arm reproduces its *pass count*,
-  not its size.
-* **`tft_open_vs_bag_parse`**: stays `unavailable`; no recording is on both sides
-  of `just gate2` and this gate.
-
-### Amendment (2026-09-06) — `--reuse-corpus` did not reuse
-
-End-of-run cleanup removes only what this process wrote, and `--reuse-corpus` on a
-path that does not exist **REFUSES** rather than fabricating a corpus. Driven by
-`reuse_corpus_neither_deletes_the_corpus_nor_fabricates_one`.
-
-### Residual — the grouped cap has no headroom
-
-On the default corpus (50 edges × 100 Hz × 32 s) the derived cap is exactly 25 of
-50 equal edges, so one edge in flight gives 3 fill passes and the binary refuses
-(twice in ~30 runs). It fails safe. Adding one edge of headroom changes what the
-gated arm measures, so it is an amendment to this record, not an edit to the binary.
+`--reuse-corpus` removes only what this process wrote and **REFUSES** on a path
+that does not exist (`reuse_corpus_neither_deletes_the_corpus_nor_fabricates_one`).
+The default corpus's derived grouped cap has no headroom: one edge in flight gives
+3 fill passes and the binary refuses. It fails safe; adding headroom is an
+amendment to this record.
 
 ## Implementation plan
 
-1. Corrections to `docs/PHASE5.md` §0.0's §3 row, §12 criterion 5, §13's verdict
-   row and `crates/tf_tree_ingest` docs — `just artifact-versions`.
-2. `ingest_throughput.rs`: both arms, density floor, pass-count assertions,
-   `--gate` — `just gate5`.
-3. `tests/ingest_throughput.rs` (unfenced): a denser corpus turns the gate red, the
-   same run exits 0 without `--gate`, every premise refuses — `cargo nextest run -p
-   tf_tree_bench --test ingest_throughput`; mutants in the file's header.
-4. `just gate5`, a step on `nightly.yml`'s `.tft`-gates job, and
-   `docs/benchmarks/EVIDENCE.md`'s Gates table — `just evidence-audit`.
+Landed: the `docs/PHASE5.md` corrections; `ingest_throughput.rs` (`just gate5`);
+`tests/ingest_throughput.rs`; the `nightly.yml` step and `EVIDENCE.md`'s Gates row.
 
 ## Open questions
 

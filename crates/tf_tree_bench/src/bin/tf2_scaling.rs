@@ -1,14 +1,9 @@
 //! Concurrent read scaling: tf_tree (lock-free readers) vs `tf2::BufferCore`
-//! (one mutex per lookup), at 1 / 2 / 4 / 8 threads (`docs/PHASE1.md` §11.2).
+//! (one mutex per lookup) at 1 / 2 / 4 / 8 threads (`docs/PHASE1.md` §11.2).
 //!
-//! Run with `just tf2-scaling`, on an otherwise idle machine. A standalone
-//! binary rather than criterion, because §11.2 wants p99.9 and criterion
-//! reports the distribution of batch times; this records per-lookup latencies.
-//!
-//! Method: one shared tree and one shared `BufferCore`; threads spawned once and
-//! parked on a barrier, the driver taking a share of the work; stamps sweep the
-//! whole retained window; throughput (whole batches) and latency (per-op clock,
-//! ~20 ns) are separate passes.
+//! Run with `just tf2-scaling` on an idle machine. Standalone rather than
+//! criterion because §11.2 wants p99.9 of per-lookup latencies. Throughput
+//! (whole batches) and latency (per-op clock, ~20 ns) are separate passes.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use std::hint::black_box;
@@ -25,8 +20,7 @@ use tf_tree_tf2_sys::{FrameName, Tf2Buffer};
 /// The sweep used when `TF2_THREADS` is unset or unusable.
 const DEFAULT_THREADS: [usize; 4] = [1, 2, 4, 8];
 
-/// Thread counts to sweep. Override with `TF2_THREADS=1,2,4,8`; an override with
-/// no usable count falls back to the default sweep.
+/// Thread counts to sweep; override with `TF2_THREADS=1,2,4,8`.
 fn thread_counts() -> Vec<usize> {
     let parsed: Vec<usize> = std::env::var("TF2_THREADS")
         .ok()
@@ -44,8 +38,7 @@ fn thread_counts() -> Vec<usize> {
     }
 }
 
-/// A count read from the environment, clamped to at least 1 (callers index a
-/// vector sized by it, and `Percentiles::from_sorted` computes `len() - 1`).
+/// A count read from the environment, clamped to at least 1.
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -61,18 +54,15 @@ struct Load {
     tf2: Tf2Buffer,
     target: String,
     source: String,
-    /// The same names pre-converted for the FFI boundary, so tf2 is not charged
-    /// two allocations per lookup.
+    /// The same names pre-converted for the FFI boundary.
     target_c: FrameName,
     source_c: FrameName,
     stamps: Vec<i64>,
-    /// Dynamic edges the query path does not traverse, as `(parent, child)`; see
-    /// [`writable_edges`].
+    /// Dynamic edges the query path does not traverse, as `(parent, child)`.
     writable: Vec<(String, String)>,
-    /// The next stamp any writer may publish, shared by every writer thread
-    /// across every pass and thread count. A per-writer counter republishes
-    /// stamps a previous pass wrote, and tf2 prints a `TF_OLD_DATA` warning per
-    /// rejected sample, which would be charged to its throughput.
+    /// The next stamp any writer may publish, shared across passes and thread
+    /// counts; a per-writer counter would republish old stamps and tf2 would warn
+    /// `TF_OLD_DATA`.
     next_stamp: std::sync::atomic::AtomicI64,
 }
 
@@ -142,8 +132,7 @@ fn replay_load() -> Load {
     }
 }
 
-/// Writer threads per engine. `TF2_WRITERS`, default **0**, so the quiescent
-/// rows in `docs/benchmarks/tf2.md` keep their meaning.
+/// Writer threads per engine: `TF2_WRITERS`, default **0**.
 fn writer_count() -> usize {
     std::env::var("TF2_WRITERS")
         .ok()
@@ -154,12 +143,10 @@ fn writer_count() -> usize {
 /// The dynamic edges of `tree` that the `target <- source` plan does **not**
 /// traverse.
 ///
-/// Off-path writing is the fair test: `tf2::BufferCore` has one mutex for the
-/// whole buffer, while tf_tree's rings are per edge, so it isolates the
-/// architectural difference. Writing on path would slide the queried window and
-/// measure the error path instead (`src/bin/contended_scaling.rs`). Edges are
-/// compared by `EdgeId` from a one-step plan, since a name comparison misses an
-/// edge the query reaches inverted.
+/// Off-path writing isolates tf2's whole-buffer mutex against per-edge rings;
+/// on-path writing would time the error path (`src/bin/contended_scaling.rs`).
+/// Edges are compared by `EdgeId` from a one-step plan, so an edge reached
+/// inverted still counts.
 fn writable_edges(
     tree: &Tree,
     target: &str,
@@ -197,12 +184,10 @@ fn writable_edges(
         .collect()
 }
 
-/// One writer thread: publish to `edge` on whichever engine the round selected.
+/// One writer thread: publish to `edge` on the engine the round selected.
 ///
-/// `which` is the engine the reader is on: `Some(a)` in the throughput pass
-/// (the writer follows it, so exactly `writers` threads are busy against the
-/// engine under test); `None` in the latency pass, where the writer alternates
-/// engines as the readers do.
+/// `which` is `Some(a)` in the throughput pass (writer follows the reader's
+/// engine) and `None` in the latency pass (writer alternates as readers do).
 fn writer_loop(
     load: &Load,
     edge: &(String, String),
@@ -219,8 +204,7 @@ fn writer_loop(
         return;
     };
 
-    // Stamps come from the load's shared counter (see `Load::next_stamp`); both
-    // engines get the identical sequence.
+    // Stamps come from `Load::next_stamp`; both engines get the same sequence.
     let pose = fixture::dynamic_pose(seed as f64, 0);
     let mut alternating = 0usize;
 
@@ -246,16 +230,14 @@ fn writer_loop(
     }
 }
 
-/// Which engine a worker drives. Both do the same lookups over the
-/// same stamps, so the only difference is the engine underneath.
+/// Which engine a worker drives; the lookups and stamps are identical.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Engine {
     TfTree,
     Tf2,
 }
 
-/// Index-addressable engine list, so a worker can be told which to run through
-/// a single atomic.
+/// Index-addressable engine list, selected through a single atomic.
 const ENGINES: [Engine; 2] = [Engine::TfTree, Engine::Tf2];
 
 impl Engine {
@@ -267,13 +249,12 @@ impl Engine {
     }
 }
 
-/// One worker's pass over the whole stamp sweep. Returns an accumulator so the
-/// optimiser cannot delete the work.
+/// One worker's pass over the stamp sweep; returns an accumulator so the work is not optimised out.
 fn pass(engine: Engine, load: &Load, plan: &Plan) -> f64 {
     let mut acc = 0.0f64;
     match engine {
         Engine::TfTree => {
-            // A fresh guard per pass, as a real reader would take per batch.
+            // A fresh guard per pass, as a real reader takes per batch.
             let guard = load.tree.guard();
             for &ns in &load.stamps {
                 let stamp: Stamp = Stamp::from_nanos(ns);
@@ -293,23 +274,20 @@ fn pass(engine: Engine, load: &Load, plan: &Plan) -> f64 {
     acc
 }
 
-/// Throughput of both engines at `threads`, interleaved within every round so
-/// drift lands on both rather than on whichever was measured second.
+/// Throughput of both engines at `threads`, interleaved per round so drift hits both.
 fn measure_throughput_pair(load: &Load, plan: &Plan, threads: usize) -> [Stats; 2] {
     let rounds = env_usize("TF2_ROUNDS", 51);
     let per_round = load.stamps.len();
     let start = Barrier::new(threads);
     let done = Barrier::new(threads);
     let stop = AtomicBool::new(false);
-    // Which engine this round: 0 = tf_tree, 1 = tf2. Published by the driver
-    // before releasing the barrier, so every worker reads the same value.
+    // Engine this round: 0 = tf_tree, 1 = tf2; published before the barrier.
     let which = AtomicUsize::new(0);
     let (start, done, stop, which) = (&start, &done, &stop, &which);
 
     let mut ns: [Vec<u128>; 2] = [Vec::with_capacity(rounds), Vec::with_capacity(rounds)];
 
-    // Separate from `stop`: the writers must keep running across the barrier
-    // waits between rounds too.
+    // Separate from `stop`: writers run across barrier waits.
     let stop_writers = AtomicBool::new(false);
     let stop_writers = &stop_writers;
     let writers = writer_count().min(load.writable.len());
@@ -331,8 +309,7 @@ fn measure_throughput_pair(load: &Load, plan: &Plan, threads: usize) -> [Stats; 
             });
         }
 
-        // Warm up both engines: page in the arenas, settle the caches, let the
-        // scheduler place the threads.
+        // Warm up both engines.
         for (w, &engine) in ENGINES.iter().enumerate() {
             for _ in 0..3 {
                 which.store(w, Ordering::Release);
@@ -364,8 +341,7 @@ fn measure_throughput_pair(load: &Load, plan: &Plan, threads: usize) -> [Stats; 
         v.sort_unstable();
         let rate = |x: u128| total / (x as f64 / 1e9);
         Stats {
-            // Fastest round is the least-disturbed one; median is the headline;
-            // the spread between them is how much to trust it.
+            // Fastest round is least disturbed; median is the headline; the spread is trust.
             best: rate(v[0]),
             median: rate(v[v.len() / 2]),
             worst: rate(v[v.len() - 1]),
@@ -382,22 +358,19 @@ struct Stats {
 }
 
 impl Stats {
-    /// How far the median sits from the best round, as a percentage. A large
-    /// value means the machine was disturbed and the number is soft.
+    /// Median's distance from the best round, in percent; large means a soft number.
     fn spread_pct(self) -> f64 {
         (self.best - self.median) / self.best * 100.0
     }
 
-    /// Slowest round as a fraction of the fastest; far below 1.0 means a
-    /// disturbed round.
+    /// Slowest round as a fraction of the fastest.
     fn worst_ratio(self) -> f64 {
         self.worst / self.best
     }
 }
 
 /// Per-lookup latency percentiles for both engines at `threads`, alternating
-/// engines sample by sample. Figures include two `Instant::now()` calls per
-/// lookup (~20 ns), identical for both engines.
+/// sample by sample; includes two `Instant::now()` calls (~20 ns) per lookup.
 fn measure_latency_pair(load: &Load, plan: &Plan, threads: usize) -> [Percentiles; 2] {
     let samples = env_usize("TF2_LATENCY_SAMPLES", 50_000);
     let start = Barrier::new(threads);
@@ -484,8 +457,7 @@ impl Percentiles {
     }
 }
 
-/// Physical cores, distinguished from logical CPUs: past the physical count,
-/// threads share execution units, so the scaling ceiling is the core count.
+/// Physical cores, not logical CPUs: past the physical count threads share execution units.
 fn physical_cores() -> Option<usize> {
     let txt = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     let mut ids = std::collections::BTreeSet::new();

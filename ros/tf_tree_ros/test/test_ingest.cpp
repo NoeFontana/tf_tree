@@ -1,7 +1,5 @@
-// `docs/PHASE4.md` §5 — the ingest path end to end, over a real DDS. What §5
-// judges is tested in `crates/tf_tree_bridge` and `crates/tf_tree_c/tests/bridge.rs`;
-// here: a `TFMessage` from another participant arrives, unpacks in the right
-// order, and lands in the arena.
+// `docs/PHASE4.md` §5: the ingest path end to end over a real DDS. The engine
+// rules are in `crates/tf_tree_bridge` and `crates/tf_tree_c/tests/bridge.rs`.
 
 #include <atomic>
 #include <chrono>
@@ -63,9 +61,7 @@ geometry_msgs::msg::TransformStamped make_transform(
   return t;
 }
 
-/// Publish `msg` until the bridge reports at least `want` transforms offered, or
-/// the deadline passes. Republishing, since a publish into an undiscovered
-/// subscription is lost.
+/// Publish `msg` until `want` transforms are offered or the deadline passes.
 bool pump_until(
   const rclcpp::Publisher<tf2_msgs::msg::TFMessage>::SharedPtr & pub,
   const tf2_msgs::msg::TFMessage & msg, const tf_tree_ros::BridgeHandle & bridge, uint64_t want,
@@ -111,13 +107,8 @@ protected:
   rclcpp::Publisher<tf2_msgs::msg::TFMessage>::SharedPtr pub_;
 };
 
-/// A `/tf` transform from a separate participant is written into the arena and
-/// reads back through `tft_plan_at` with the pose sent (the ROS half's whole
-/// contribution: QoS, and the unpack into `tft_bridge_sample`).
-///
-/// Mutant: swap `s.pose[0]` and `s.pose[3]` in `BridgeHandle::offer_one`
-/// (`geometry_msgs`' xyzw vs `qw qx qy qz`); still a unit quaternion, but `qw`
-/// reads back 0.2588 not 0.9659.
+/// A `/tf` transform from another participant reads back through `tft_plan_at`
+/// with the pose sent (QoS and the unpack into `tft_bridge_sample`).
 TEST_F(IngestTest, an_applied_transform_reads_back_with_the_pose_that_was_sent)
 {
   tf_tree_ros::BridgeHandle bridge(node_.get(), options());
@@ -149,9 +140,6 @@ TEST_F(IngestTest, an_applied_transform_reads_back_with_the_pose_that_was_sent)
 
 /// An undeclared edge is dropped and counted (§5.8's amendment) while declared
 /// ones keep being ingested.
-///
-/// Mutant: `break` out of `BridgeHandle::ingest`'s transform loop; nothing is
-/// applied.
 TEST_F(IngestTest, an_undeclared_edge_is_dropped_without_stopping_the_declared_one)
 {
   tf_tree_ros::BridgeHandle bridge(node_.get(), options());
@@ -172,11 +160,7 @@ TEST_F(IngestTest, an_undeclared_edge_is_dropped_without_stopping_the_declared_o
     stats.transforms);
 }
 
-/// A config the engine will not build fails in the constructor, not at the first
-/// message (§5.5 NORMATIVE for domains; same for every startup refusal).
-///
-/// Mutant: `ready.set_value(TFT_OK)` in `BridgeHandle::run`; the constructor
-/// returns with a NULL `bridge_`.
+/// A config the engine will not build fails in the constructor (§5.5).
 TEST_F(IngestTest, a_config_that_does_not_parse_throws_from_the_constructor)
 {
   tf_tree_ros::BridgeOptions o = options();
@@ -184,11 +168,7 @@ TEST_F(IngestTest, a_config_that_does_not_parse_throws_from_the_constructor)
   EXPECT_THROW(tf_tree_ros::BridgeHandle(node_.get(), o), tf_tree_ros::BridgeError);
 }
 
-/// Form 3 refuses an empty topology, as forms 1 and 2 do (an empty config parses;
-/// without this it would start clean and count all traffic `UNDECLARED`).
-///
-/// Mutant: delete the `config.edges.is_empty()` refusal in `tft_bridge_create`
-/// (`crates/tf_tree_c/src/bridge.rs`).
+/// Form 3 refuses an empty topology, as forms 1 and 2 do.
 TEST_F(IngestTest, form_3_refuses_a_topology_that_declares_no_edges)
 {
   tf_tree_ros::BridgeOptions o = options();
@@ -196,13 +176,9 @@ TEST_F(IngestTest, form_3_refuses_a_topology_that_declares_no_edges)
   EXPECT_THROW(tf_tree_ros::BridgeHandle(node_.get(), o), tf_tree_ros::BridgeError);
 }
 
-/// §5.6's remap table crosses the C boundary complete at startup, and a prefixed
-/// arena is the one a consumer looks up. `tft_bridge_get_remap` returns
-/// pointers into buffers it overwrites on the next call, so the walk must copy
-/// each row; the Rust half is in `crates/tf_tree_c/tests/bridge.rs`.
-///
-/// Mutant: delete the `tft_bridge_get_remap` loop in `create_bridge`; `remap()`
-/// is empty. Mutant: `break` after the first row; the vector equality fails.
+/// §5.6's remap table crosses the C boundary complete, and a prefixed arena is
+/// the one a consumer looks up. `tft_bridge_get_remap` pointers are overwritten
+/// by the next call, so each row must be copied.
 TEST_F(IngestTest, a_tf_prefix_is_reported_as_a_remap_table_and_renames_the_arena)
 {
   tf_tree_ros::BridgeOptions o = options();
@@ -215,8 +191,7 @@ TEST_F(IngestTest, a_tf_prefix_is_reported_as_a_remap_table_and_renames_the_aren
     {"base_link", "robot1/base_link"},
     {"lidar", "robot1/lidar"},
   };
-  // Exact and in file order: an equality catches a loop that stored the pointers
-  // instead of copying, where a `size()` check would not.
+  // Exact and in file order, so a loop that stored pointers fails.
   EXPECT_EQ(bridge.remap(), expected);
 
   // The wire is normalized too, so an unprefixed publisher lands on the prefixed edge.
@@ -234,9 +209,8 @@ TEST_F(IngestTest, a_tf_prefix_is_reported_as_a_remap_table_and_renames_the_aren
 
 namespace
 {
-/// Counts `FATAL` lines while forwarding every record to the prior handler. The
-/// handler is process-global and not thread-safe: swap it from the test thread
-/// while no bridge runs.
+/// Counts `FATAL` lines, forwarding every record to the prior handler. The
+/// handler is process-global: swap it while no bridge runs.
 std::atomic<int> g_fatal_lines{0};
 rcutils_logging_output_handler_t g_previous_handler = nullptr;
 
@@ -254,8 +228,8 @@ void counting_handler(
 }
 }  // namespace
 
-/// Two dynamic edges with one publisher each, the shape a `/clock` reset has. Local
-/// to the test because another test publishes `map -> odom` expecting it undeclared.
+/// Two dynamic edges with one publisher each, the shape of a `/clock` reset;
+/// local because another test expects `map -> odom` undeclared.
 constexpr const char * kTwoOwnerTopology = R"(
 [[edge]]
 parent = "odom"
@@ -297,19 +271,9 @@ private:
   std::string child_;
 };
 
-/// A halted bridge says so once, not once per transform, and it takes two
-/// publishers moving together to halt it (`docs/decisions/0012`: one witness is
-/// not a clock). The fixture is two nodes, two edges, one shared -5 s step, with
-/// stamps tracking real time so no offset is ramping. A stop is latched, so an
-/// ungated `RCLCPP_FATAL` is a line per transform (§5.4: "rate-limited"); the
-/// assertion is on the count.
-///
-/// Mutant (stated): remove the `if (out.first_time != 0)` guard in `report()`'s
-/// `HALT` arm. Mutant (applied, observed to fail after 20 s): delete
-/// `s.received_steady_nanos = ...` in `BridgeHandle::offer_one`; with no receipt
-/// clock no step exists and nothing halts. Mutant: publish both rewinds from the
-/// same `OneEdgeBroadcaster`; one publisher owning both is a restart, so the wait
-/// times out.
+/// A halted bridge says so once, not once per transform (§5.4 "rate-limited"),
+/// and it takes two publishers stepping together to halt it
+/// (`docs/decisions/0012`). Two nodes, two edges, one shared -5 s step.
 TEST_F(IngestTest, a_clock_reset_is_announced_once_and_not_once_per_refused_transform)
 {
   g_fatal_lines.store(0);
@@ -327,10 +291,7 @@ TEST_F(IngestTest, a_clock_reset_is_announced_once_and_not_once_per_refused_tran
     OneEdgeBroadcaster wheels("clock_reset_wheel_driver", topic_, "odom", "base_link");
     OneEdgeBroadcaster localizer("clock_reset_localizer", topic_, "map", "odom");
 
-    // Stamps read from the steady clock the bridge times receipt with, so each
-    // publisher's offset stays flat: a fixed `+20 ms` per `sleep_for` drifts
-    // into a common-mode ramp that could halt the healthy phase.
-    // `resets_while_healthy` below asserts it is gone.
+    // Stamps use the bridge's steady clock so each offset stays flat.
     const auto period = std::chrono::milliseconds(20);
     const auto t0 = std::chrono::steady_clock::now();
     int64_t rewind = 0;
@@ -374,8 +335,7 @@ TEST_F(IngestTest, a_clock_reset_is_announced_once_and_not_once_per_refused_tran
 
   ASSERT_GE(applied, 20u)
     << "the two broadcasters never got going, so there was no steady state to step away from";
-  // Asserted first: a halt during the healthy phase would satisfy every later
-  // expectation for the wrong reason.
+  // Asserted first: a healthy-phase halt would satisfy the rest wrongly.
   ASSERT_EQ(resets_while_healthy, 0u)
     << "the bridge decided the clock had moved while both publishers were healthy and their "
        "stamps were tracking wall time";

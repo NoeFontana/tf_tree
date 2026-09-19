@@ -1,7 +1,7 @@
 //! `memfd`-backed shared-memory arena.
 //!
-//! `docs/PHASE2.md` §4 (NORMATIVE): the read path's diff against the heap backend is **zero lines**;
-//! everything here is about *obtaining* the base pointer safely.
+//! `docs/PHASE2.md` §4 (NORMATIVE): the read path is identical to the heap backend;
+//! this module only obtains the base pointer safely.
 //!
 //! # SAFETY (module invariant)
 //!
@@ -17,9 +17,9 @@
 //!
 //! # Why `memfd` and not `shm_open`
 //!
-//! After [`MappedArena::create`] applies `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL` the size is
-//! immutable, so **`SIGBUS` is structurally impossible**. `shm_open` segments cannot be sealed
-//! (`docs/PHASE2.md` §3.2). [`MappedArena::attach`] verifies the seals and refuses an unsealed segment.
+//! After [`MappedArena::create`] applies `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`
+//! the size is immutable, so `SIGBUS` is structurally impossible (`docs/PHASE2.md`
+//! §3.2). [`MappedArena::attach`] refuses an unsealed segment.
 //!
 //! # Trust model
 //!
@@ -57,20 +57,17 @@ pub struct MappedArena {
     len: usize,
     fd: OwnedFd,
     writable: bool,
-    /// The process that established this mapping. It is `MADV_DONTFORK` (§7.3), so a `fork` child has a
-    /// hole there; `Drop` skips `munmap` unless this pid matches. `getpid` is affordable once per
-    /// teardown; the hot-path equivalent is `tf_tree_ipc::fork`'s counter.
-    ///
-    /// No test fails when this check is removed (`munmap` of a hole is a no-op); kept because the
-    /// failure it prevents is silent.
+    /// The process that made this mapping. It is `MADV_DONTFORK` (§7.3), so a
+    /// `fork` child has a hole there and `Drop` skips `munmap` unless the pid matches.
+    /// No test fails without the check; the failure it prevents is silent.
     owner_pid: rustix::process::Pid,
 }
 
 impl MappedArena {
     /// Create a new sealed segment sized for `layout` and write its header (`docs/PHASE2.md` §3.2).
     ///
-    /// Sealing happens **after** mapping so the creator keeps write access: `SHRINK|GROW` succeed with
-    /// a writable mapping held, where `F_SEAL_WRITE` would return `EBUSY`.
+    /// Sealing happens after mapping so the creator keeps write access
+    /// (`F_SEAL_WRITE` would return `EBUSY`).
     ///
     /// # Errors
     ///
@@ -106,8 +103,7 @@ impl MappedArena {
         // No `MAP_POPULATE`; see `unsafe_map`.
         let base = unsafe_map(len, ProtFlags::READ | ProtFlags::WRITE, &fd)?;
 
-        // Take ownership before the first fallible step: an early `?` with no `Drop` would strand the
-        // mapping and its committed pages.
+        // Own the mapping before the first fallible step so an early `?` cannot strand it.
         let arena = MappedArena {
             owner_pid: rustix::process::getpid(),
             base,
@@ -174,22 +170,20 @@ impl MappedArena {
         };
         arena.advise();
 
-        // Validate only now; on failure the drop unmaps. The checks live in `crate::check`, shared with
-        // the frozen-file backend.
+        // Validate only now; on failure the drop unmaps (`crate::check`).
         validate_arena_header(arena.header(), size)?;
         Ok(arena)
     }
 
     /// Fault in `[offset, offset + len)` of this arena, up front.
     ///
-    /// Not `MADV_WILLNEED`, which does nothing on a memfd (`docs/PHASE2.md` §7.1): this uses
-    /// `MADV_POPULATE_*`, read or write following the mapping's protection (`POPULATE_WRITE` on a
-    /// `PROT_READ` mapping is `EINVAL`).
+    /// Not `MADV_WILLNEED`, which does nothing on a memfd (`docs/PHASE2.md` §7.1):
+    /// uses `MADV_POPULATE_*`, read or write following the mapping's protection.
     ///
     /// # Errors
     ///
-    /// Never. Kernels before 5.14 (`EINVAL`) fall back to touching pages by hand; any other errno
-    /// leaves pages cold, which is slower, never incorrect.
+    /// Never. Kernels before 5.14 fall back to touching pages by hand; any other
+    /// errno leaves pages cold, which is slower, never incorrect.
     pub fn populate(&self, offset: usize, len: usize) {
         if len == 0 || offset >= self.len {
             return;
@@ -209,8 +203,8 @@ impl MappedArena {
         }
     }
 
-    /// Kernels before 5.14: touch one byte per page. A **read**, never a write: storing into a live
-    /// claim record or sample slot would race every reader of it.
+    /// Kernels before 5.14: touch one byte per page. A read, never a write, which
+    /// would race every reader of a live record.
     fn populate_by_touch(&self, offset: usize, len: usize) {
         for at in touch_offsets(offset, len) {
             // SAFETY: `at` is within `[offset, offset + len)` (see `touch_offsets`) and the caller clamped
@@ -233,8 +227,8 @@ impl MappedArena {
 
     /// Populate every region that is actually read, and nothing else (§7.1).
     ///
-    /// An **attaching** process derives the used extents from `frame_count` and `edge_count` in the
-    /// header (`0004` moved declaration to build time), with nothing passed in.
+    /// An attaching process derives the used extents from `frame_count` and
+    /// `edge_count` in the header.
     ///
     /// | region | populated |
     /// |---|---|
@@ -249,10 +243,8 @@ impl MappedArena {
     /// | edge counters | `edge_count` records — written by `Guard::drop` on every read batch |
     /// | participant counters | all (8 KiB) — same path, keyed by the reader's own slot |
     ///
-    /// The ring arenas are not populated here: §7.1 is NORMATIVE that population is **per-edge**, so it
-    /// happens at `Tree::claim` (writer) and plan compilation (reader), both off the query path (D3).
-    /// The extents come from `EdgeRecord`, in `tf_tree_core`; `ArenaView::ring_extents` is the other
-    /// half. Frames interned later fault once.
+    /// The ring arenas are not populated here: §7.1 (NORMATIVE) makes population
+    /// per-edge, at `Tree::claim` and plan compilation, off the query path (D3).
     pub fn populate_hot(&self) {
         // SAFETY: module invariant; the mapping holds at least `size_of::<ArenaHeader>()` bytes (checked by
         // `attach`) and the header is only read.
@@ -276,10 +268,8 @@ impl MappedArena {
             h.max_participants as usize * 128,
         );
         self.populate(h.edge_table_off as usize, edges * 128);
-        // The stamp and pose arenas are deliberately absent — see the doc comment.
 
-        // v3 counter regions (`docs/PHASE5.md` §5.2): `Guard::drop` writes them on every read batch, so
-        // they are on the lookup path.
+        // v3 counter regions (`docs/PHASE5.md` §5.2): written on every read batch.
         self.populate(h.edge_counters_off as usize, edges * 128);
         self.populate(
             h.participant_counters_off as usize,
@@ -323,8 +313,7 @@ impl MappedArena {
 
 /// Draw 16 random bytes for a new arena's `instance_uuid`.
 ///
-/// Refills after a short read (a signal can interrupt `getrandom`, and a partial uuid still looks
-/// random). Blocks deliberately: creation is a startup operation.
+/// Refills after a short read. Blocks deliberately: creation is a startup operation.
 fn instance_uuid() -> Result<[u8; 16], ShmError> {
     use rustix::rand::{getrandom, GetRandomFlags};
 
@@ -346,8 +335,7 @@ fn instance_uuid() -> Result<[u8; 16], ShmError> {
 /// Byte offsets to touch so every page overlapping `[offset, offset + len)` is faulted in: one per
 /// page, **never past the end**.
 ///
-/// A pure function so the bound is testable (residency is not observable here). Every offset is
-/// `< offset + len`, which makes the caller's `unsafe` read in-bounds.
+/// A pure function so the bound is testable: every offset is `< offset + len`.
 fn touch_offsets(offset: usize, len: usize) -> impl Iterator<Item = usize> {
     const PAGE: usize = 4096;
     // Step from `offset`, not an aligned base, which would touch a page before the range.
@@ -363,9 +351,8 @@ fn unsafe_map(len: usize, prot: ProtFlags, fd: &OwnedFd) -> Result<NonNull<u8>, 
             core::ptr::null_mut(),
             len,
             prot,
-            // No `MAP_POPULATE`: `docs/PHASE2.md` §7.1 is NORMATIVE that population is per-declaration
-            // (it charged 66.3 MiB RSS against 66.1 MiB declared on the measured arena). `populate_hot`
-            // restores the touched pages and reports failure.
+            // No `MAP_POPULATE`: `docs/PHASE2.md` §7.1 (NORMATIVE) makes population
+            // per-declaration; `populate_hot` restores the touched pages.
             MapFlags::SHARED,
             fd,
             0,
@@ -450,9 +437,7 @@ mod tests {
     }
 
     /// **The fallback must not write** — see [`MappedArena::populate_by_touch`].
-    ///
-    /// On kernels >= 5.14 [`MappedArena::populate`] takes the `madvise` branch, so calling this
-    /// directly is the only way it runs. The every-page bound is tested in [`touch_offsets`].
+    /// Called directly because kernels >= 5.14 take the `madvise` branch.
     #[test]
     fn the_pre_5_14_fallback_writes_nothing() {
         let arena = create();
@@ -501,8 +486,7 @@ mod tests {
         assert_eq!(arena.header().magic, u64::from_le_bytes(TF_TREE_MAGIC));
     }
 
-    /// Two different segments must get different instance ids; a constant would pass every other
-    /// assertion and defeat the split-brain check (`docs/PHASE2.md` §11.2 scenario 9).
+    /// Two segments must get different instance ids (`docs/PHASE2.md` §11.2 scenario 9).
     #[test]
     fn two_arenas_never_share_an_instance_uuid() {
         let a = create();
@@ -513,13 +497,12 @@ mod tests {
         assert_ne!(b.header().instance_uuid, [0; 16]);
     }
 
-    /// A joiner must read the *creator's* id: the wire compares `HelloResponse`'s `instance_uuid`
-    /// against the mapped header.
+    /// A joiner must read the creator's id.
     #[test]
     fn attach_preserves_the_creators_instance_uuid() {
         let created = create();
         let uuid = created.header().instance_uuid;
-        // Assert non-zero first: if the field was never written, both sides read zero and equality proves nothing.
+        // Assert non-zero first, or equal zeros prove nothing.
         assert_ne!(uuid, [0; 16], "instance_uuid was never written");
 
         let fd = rustix::io::fcntl_dupfd_cloexec(created.as_raw_fd(), 0).unwrap();
@@ -528,10 +511,8 @@ mod tests {
         assert_eq!(attached.header().instance_uuid, uuid);
     }
 
-    /// **The seal check is the `memfd`-not-`shm_open` argument**, and it runs before mapping.
-    ///
-    /// Mutant: delete the `seals.contains(REQUIRED_SEALS)` guard in `attach`; the unsealed case then maps
-    /// and this fails.
+    /// The seal check runs before mapping. Mutant: delete the
+    /// `seals.contains(REQUIRED_SEALS)` guard in `attach`.
     #[test]
     fn an_unsealed_or_undersized_segment_is_refused_before_it_is_mapped() {
         let len = fixture().total_size() as u64;
@@ -554,11 +535,8 @@ mod tests {
         assert_eq!(refused, Some(ShmError::TooSmall));
     }
 
-    /// **`docs/PHASE2.md` §11.2 scenario 4**: a segment from a different build is rejected by value,
-    /// naming both sides.
-    ///
-    /// Each case edits one field of a good segment. Mutant: drop any one comparison in
-    /// `validate_arena_header` and the matching case fails.
+    /// `docs/PHASE2.md` §11.2 scenario 4: a segment from a different build is
+    /// rejected by value. Mutant: drop any one comparison in `validate_arena_header`.
     #[test]
     fn attach_refuses_a_segment_this_build_cannot_read() {
         type Poke = fn(&mut ArenaHeader);
@@ -591,11 +569,9 @@ mod tests {
         }
     }
 
-    /// `CName::as_cstr` requires **exactly one** NUL, at the end, and `create("a\0b")` is reachable
-    /// public API, so the truncation is the sole guarantor.
-    ///
-    /// Mutants: drop the interior-NUL truncation (two NULs, unsound) or bound by `CAP` instead of
-    /// `CAP - 1` (terminator overwritten); the `"a\0b"` and long cases fail.
+    /// `CName::as_cstr` requires exactly one NUL, at the end, and `create("a\0b")`
+    /// is reachable, so truncation is the sole guarantor. Mutants: drop the
+    /// interior-NUL truncation, or bound by `CAP` instead of `CAP - 1`.
     #[test]
     fn a_segment_name_is_always_exactly_one_nul_terminated_string() {
         for (input, want) in [

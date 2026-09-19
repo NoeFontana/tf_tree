@@ -1,20 +1,8 @@
 //! `tf_tree doctor --from-bag` through the shipped binary — `docs/PHASE5.md` §6.
 //!
-//! # What this file is for
-//!
-//! `doctor`'s checks are unit-tested in `src/checks.rs` against hand-built
-//! inputs. What that cannot show is that a **recording** reaches them: the flag,
-//! the ingest, the arrival-order replay, the edge-id join between the recording's
-//! frame names and the arena's, and the two streams the report lands on. Every
-//! one of those lives between `clap` and `checks::run` and has its own way of
-//! being silently wrong — in particular, a join that resolved nothing would make
-//! `TFT018` pass on every recording, which is exactly the fabricated all-clear
-//! this source exists to remove.
-//!
-//! So this runs the real binary, through `clap`, on a real file.
-//!
-//! The recordings are synthetic — see `tf_tree_ingest::fixture`, which says so
-//! at length. Nothing here came off a robot.
+//! Pins that a recording reaches the checks (ingest, arrival-order replay, the
+//! edge-id join); a join that resolved nothing would make `TFT018` pass on
+//! everything. Recordings are synthetic (`tf_tree_ingest::fixture`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -62,13 +50,8 @@ fn doctor_json(bag: &Path, extra: &[&str]) -> (String, String, bool) {
     )
 }
 
-/// The `status` of one catalogue id in a `--json` report.
-///
-/// The document is written line by line by `catalogue::render_json`, in a fixed
-/// field order, so the status is the third line after the id. Parsing it by
-/// position rather than pulling in a JSON crate keeps this test's dependency
-/// footprint at zero, which is the same argument `render_json` itself makes for
-/// being hand-written.
+/// The `status` of one catalogue id in a `--json` report, parsed by position
+/// (`catalogue::render_json` has a fixed field order).
 fn status_of(json: &str, id: &str) -> String {
     let lines: Vec<&str> = json.lines().collect();
     let at = lines
@@ -108,33 +91,10 @@ fn reason_of(json: &str, id: &str) -> String {
         .to_owned()
 }
 
-/// **The wedge, in one command: point `doctor` at a bag and it reaches a
-/// verdict on the two checks no live arena can.**
-///
-/// `TFT018` and `TFT019` were structurally dead outside the built-in fixture:
-/// `doctor`'s only other source was a live `--attach`, where the push stream is
-/// reconstructed from a ring being written while it is read, so both skipped and
-/// no run against real data could ever produce an answer. This is that hole
-/// closed — and the assertion is `pass`, not merely "not skipped", because a
-/// recording of a healthy publisher is what a stranger's first run looks like.
-///
-/// `TFT001` is asserted to still skip, and to skip for the **recording's** own
-/// reason. It is the check `docs/PHASE4.md` §1.3 predicts a real stack will
-/// fail, and a bag cannot answer it: a `tf2_msgs/TFMessage` has no sender field.
-/// Saying "a live arena's rings remember the current owner" there would be a
-/// true sentence about a source this run did not use.
-///
-/// **This test cannot be its own non-vacuity check, and that is stated rather
-/// than papered over.** `pass` is also what an *empty* arrival stream produces —
-/// a frame-name join that resolved nothing would satisfy every assertion here.
-/// The two tests below are what forbid that: applying the mutant
-/// `arrival_observations` → `Ok(Observations::new())` leaves this test green and
-/// fails both of them, because a stream with no samples in it cannot fire.
-///
-/// Mutant: give `Source::Bag` the stream `PushStream::RingsAtRest` in `lib.rs`'s
-/// `Source::stream` — the state before this branch, expressed for a recording.
-/// Applied, and this failed with
-/// `TFT018 must run on a recording, not skip: ... "status": "skipped"`.
+/// `doctor` on a bag reaches a verdict on `TFT018`/`TFT019`, which no live arena
+/// can. `TFT001` still skips, with the recording's own reason (a `TFMessage` has
+/// no sender field, `docs/PHASE4.md` §1.3). `pass` is also what an empty arrival
+/// stream yields, so the two tests below are what forbid a vacuous join.
 #[test]
 fn a_recording_is_a_doctor_source_and_the_two_dead_checks_reach_a_verdict() {
     let dir = Scratch::new("wedge");
@@ -167,21 +127,9 @@ fn a_recording_is_a_doctor_source_and_the_two_dead_checks_reach_a_verdict() {
     );
 }
 
-/// **An out-of-order arrival in the recording is reported, and the arena it was
-/// ingested into could never have shown it.**
-///
-/// This is the whole argument for replaying the recording's log order rather
-/// than the arena's rings. `SampleRing::push` rejects a stamp older than the
-/// ring's last, so a ring holds only accepted pushes; `docs/PHASE5.md` §3.1
-/// additionally *sorts* every edge before pushing. The arena built from this
-/// exact file is therefore perfectly monotone, and a check reading it would
-/// pass. The file is not, and the check reading the file fires.
-///
-/// Mutant: read the arrival stream from the arena instead — replace the
-/// `Source::Bag(obs)` arm's observations with `Observations::from_arena(tree,
-/// &snap)` in `lib.rs`'s `observations`. Applied, and this failed with
-/// `left: "pass", right: "fired"`: the sorted arena shows no inversion, which is
-/// the vacuous pass this test exists to forbid.
+/// An out-of-order arrival in the recording is reported, though the arena built
+/// from it is monotone (`SampleRing::push` rejects it; `docs/PHASE5.md` §3.1
+/// sorts). The replay therefore reads the recording's log order.
 #[test]
 fn an_out_of_order_arrival_in_a_recording_fires_tft018() {
     let dir = Scratch::new("inversion");
@@ -196,8 +144,7 @@ fn an_out_of_order_arrival_in_a_recording_fires_tft018() {
             pose,
         ));
     }
-    // One arrival out of place, by 30 ms — well under the 100 ms clock-reset
-    // threshold, so ingest keeps it and counts it rather than halting.
+    // One arrival out of place by 30 ms, under the 100 ms clock-reset threshold.
     msgs.push(FixtureMessage::dynamic(
         "odom",
         "base_link",
@@ -228,26 +175,10 @@ fn an_out_of_order_arrival_in_a_recording_fires_tft018() {
     );
 }
 
-/// **A wall clock stepping backwards inside a recording is attributed to the
-/// clock, not to the publisher.**
-///
-/// `docs/API.md` §5.3 is the argument: an NTP step surfaces as a burst of
-/// `NonMonotonicStamp` rejections, which reads as a `tf_tree` defect at 3 a.m.
-/// `TFT019` is the attribution, and until `doctor` could read a recording it had
-/// no source to attribute on — the amendment at `docs/PHASE5.md` §6 called that
-/// out as a limitation rather than a caveat.
-///
-/// The step is 90 ms: under the 100 ms `--clock-reset-threshold`, so ingest
-/// keeps the samples and counts them as `out_of_order` instead of halting, which
-/// is §3.2's stated rule and is what leaves the evidence in the file. At a 10 ms
-/// period that rejects nine consecutive arrivals, above the eight
-/// `checks::CLOCK_STEP_MIN_REJECTED_RUN` requires.
-///
-/// Mutant: raise `CLOCK_STEP_MIN_REJECTED_RUN` from 8 to 12. Applied, and this
-/// failed with `left: "pass", right: "fired"` — the nine-arrival burst is no
-/// longer concentrated enough, so `TFT019` reports it as a stray inversion. That
-/// is the threshold this fixture is sized against, and it is why the burst is
-/// nine and not one.
+/// A wall clock stepping backwards inside a recording is attributed to the clock
+/// (`TFT019`, `docs/API.md` §5.3). The 90 ms step is under the 100 ms
+/// `--clock-reset-threshold` and rejects nine arrivals, above
+/// `checks::CLOCK_STEP_MIN_REJECTED_RUN`.
 #[test]
 fn a_backwards_wall_clock_in_a_recording_is_attributed_by_tft019() {
     let dir = Scratch::new("clockstep");
@@ -263,11 +194,7 @@ fn a_backwards_wall_clock_in_a_recording_is_attributed_by_tft019() {
             pose,
         ));
     }
-    // The clock steps back 90 ms — from `base + 90 ms`, the newest stamp so far,
-    // to `base` — and the publisher carries on at the same rate. Every arrival
-    // on the way back up is older than the newest accepted one, so the run of
-    // rejections is nine long and the largest single jump is 90 ms, under the
-    // 100 ms threshold that would have halted the ingest instead.
+    // The clock steps back 90 ms and the publisher carries on at the same rate.
     for i in 0..10i64 {
         msgs.push(FixtureMessage::dynamic(
             "odom",
@@ -296,19 +223,7 @@ fn a_backwards_wall_clock_in_a_recording_is_attributed_by_tft019() {
     );
 }
 
-/// **The §3.2 ingest report goes to stderr, so `--json` stdout stays a
-/// document.**
-///
-/// Both halves matter and they pull against each other. A stranger's first run
-/// has to be told what reading their file found — dropped zero stamps, a
-/// truncated recording, skipped chunks — or the catalogue's clean bill of health
-/// is a report about a fraction of their data. A CI job piping `--json` into a
-/// parser has to get JSON and nothing else. Two streams is what lets both be
-/// true.
-///
-/// Mutant: change `doctor_source`'s `eprint!` to `print!`. Applied, and this
-/// failed on `stdout must be a JSON document and nothing else`: the summary's
-/// first line lands ahead of the opening brace.
+/// The §3.2 ingest report goes to stderr, so `--json` stdout stays a document.
 #[test]
 fn the_ingest_report_lands_on_stderr_and_leaves_stdout_parseable() {
     let dir = Scratch::new("streams");
@@ -327,18 +242,8 @@ fn the_ingest_report_lands_on_stderr_and_leaves_stdout_parseable() {
     );
 }
 
-/// **A file that is not a recording is diagnosed, not reported as a healthy
-/// tree.**
-///
-/// The failure this forbids is a `doctor` that falls back to the built-in
-/// fixture when `--from-bag` cannot be read: it would print a clean report about
-/// a synthetic robot while the operator believed it was about their bag. The
-/// error also has to name the file, because "not a well-formed MCAP recording"
-/// with no path is unactionable when a script passes the wrong argument.
-///
-/// Mutant: make `doctor_source` fall through to `source(live)` when
-/// `open_bag` returns an error (`if let Ok(ingested) = ...`). Applied, and this
-/// failed on the exit status: the run succeeds and prints the fixture's report.
+/// A file that is not a recording is diagnosed, not reported as a healthy tree,
+/// and the error names the file.
 #[test]
 fn a_file_that_is_not_a_recording_is_refused_rather_than_silently_replaced() {
     let dir = Scratch::new("garbage");
@@ -367,31 +272,9 @@ fn a_file_that_is_not_a_recording_is_refused_rather_than_silently_replaced() {
     );
 }
 
-/// **The counter checks skip on a bag-built arena instead of reporting a clean
-/// sheet.**
-///
-/// This is the fabricated all-clear that `--from-bag` shipped with.
-/// `tf_tree_ingest::run` pushes into an arena and never reads from it, so every
-/// `EdgeCounters` field is zero — and zero extrapolation errors is exactly what
-/// a *healthy, heavily-used* arena looks like. `TFT010` walked the empty set and
-/// reported `pass`; `TFT011`'s counter half did the same, while its other half
-/// was already structurally silent on a recording. A stranger's first run got
-/// two green rows about instrumentation nobody had exercised.
-///
-/// It is asserted through the binary rather than in `checks.rs` because the unit
-/// tests build their own `EdgeStats`: only a real ingest shows that the arena a
-/// recording produces is genuinely in this state.
-///
-/// **The reason is asserted per feature configuration, because there are two of
-/// them and `just ingest-check` runs both.** With `counters` off — the CLI's
-/// `--no-default-features` build — every counter reads zero for a *different*
-/// reason, and "rebuild the engine" and "exercise the arena" are different
-/// instructions. The document says which build it is, so the test reads it from
-/// the same document rather than from a `cfg`.
-///
-/// Mutant: restore `tft010`'s old guard — `if !inp.counters { skip }` — so an
-/// unexercised sheet runs. Applied, and this failed on
-/// `assert_eq!(status_of(&json, "TFT010"), "skipped")` with `pass`.
+/// The counter checks skip on a bag-built arena (its counters are all zero, which
+/// reads as healthy). The reason differs per feature configuration
+/// (`just ingest-check` runs both), so it is read from the document, not a `cfg`.
 #[test]
 fn a_bag_built_arena_skips_the_counter_checks_rather_than_passing_them() {
     let dir = Scratch::new("counters");
@@ -401,7 +284,7 @@ fn a_bag_built_arena_skips_the_counter_checks_rather_than_passing_them() {
     let (json, stderr, ok) = doctor_json(&bag, &[]);
     assert!(ok, "{json}\n{stderr}");
 
-    // The counter half's expected sentence, whichever build this is.
+    // The counter half's expected sentence for this build.
     let counter_reason = if json.contains("\"counters_compiled_in\": true") {
         "served a lookup"
     } else {
@@ -431,19 +314,8 @@ fn a_bag_built_arena_skips_the_counter_checks_rather_than_passing_them() {
     );
 }
 
-/// **`TFT017` fires on every dynamic edge of a recording, and the report says
-/// that is what a recording looks like.**
-///
-/// An arena built from a bag has no writer at all — the ingest's claims are
-/// released when it returns — so this warn is guaranteed on every healthy
-/// recording anyone points `doctor` at. It stays a warn rather than becoming a
-/// skip because a fleet whose publishers have all stopped reaches the identical
-/// arena state, and falling silent there would delete the check's whole purpose;
-/// the disclosure in `Meta.notes` is what distinguishes the two.
-///
-/// Mutant: delete `notes.extend(unclaimed_coverage_note(snap));` from
-/// `evidence_notes`. Applied, and this failed on `no note explaining an
-/// all-unclaimed arena`.
+/// `TFT017` fires on every dynamic edge of a recording (the ingest releases its
+/// claims); it stays a warn, and `Meta.notes` discloses why.
 #[test]
 fn an_all_unclaimed_arena_is_warned_about_and_explained() {
     let dir = Scratch::new("unclaimed");
@@ -459,18 +331,7 @@ fn an_all_unclaimed_arena_is_warned_about_and_explained() {
     );
 }
 
-/// **An ingest flag `doctor` cannot act on is refused, not ignored.**
-///
-/// `IngestArgs` is flattened into `doctor` so `--from-bag` takes the knobs
-/// `tf_tree ingest` takes. Undeclared, that made all eleven of them parse on
-/// every `doctor` invocation and then vanish: `doctor --tf-prefix robot1` exited
-/// 0 having applied no prefix to anything, and `doctor --from-file x.tft
-/// --max-memory 64` bounded nothing. The user's only signal was the output being
-/// wrong in a way they had no reason to look for.
-///
-/// Mutant: delete the `anyhow::ensure!` on `ingest.flags_set()` in
-/// `doctor_source`. Applied, and this failed on the exit status: the fixture's
-/// report prints and the run succeeds.
+/// An ingest flag `doctor` cannot act on is refused, not ignored.
 #[test]
 fn an_ingest_flag_without_a_recording_is_refused() {
     let out = tf_tree()
@@ -490,8 +351,7 @@ fn an_ingest_flag_without_a_recording_is_refused() {
         "the error must name the flag and the flag that would make it mean something: {stderr}"
     );
 
-    // The same flag *with* a recording is accepted, so the rejection is about
-    // the missing source and not about the flag.
+    // The same flag with a recording is accepted.
     let dir = Scratch::new("prefixed");
     let bag = dir.0.join("clean.mcap");
     write_mcap(&bag, &small_recording()).unwrap();
@@ -503,21 +363,8 @@ fn an_ingest_flag_without_a_recording_is_refused() {
     );
 }
 
-/// **A recording too large for `--max-memory` is refused, not truncated.**
-///
-/// `arrival_observations` holds one 24-byte sample per dynamic transform, all of
-/// them at once, because `TFT018`'s question is about the whole sequence. It is
-/// the only allocation in `doctor` that grows with the user's input, and
-/// `--max-memory` — already on the command line, already bounding pass two — is
-/// what bounds it.
-///
-/// Refusing rather than truncating is the point: a prefix of the arrival stream
-/// would let `TFT018` and `TFT019` report `pass` about the part they happened to
-/// fit, which is the same fabricated all-clear this source exists to remove.
-///
-/// Mutant: replace the `anyhow::ensure!(!overflowed, ...)` with `Ok(obs)`.
-/// Applied, and this failed on the exit status: the run succeeds and TFT018
-/// passes on the first sample.
+/// A recording too large for `--max-memory` is refused, not truncated, so
+/// `TFT018`/`TFT019` cannot pass on a prefix.
 #[test]
 fn a_recording_that_will_not_fit_in_max_memory_is_refused() {
     let dir = Scratch::new("bounded");
@@ -547,8 +394,7 @@ fn a_recording_that_will_not_fit_in_max_memory_is_refused() {
         "no partial report may be printed alongside the refusal"
     );
 
-    // The same recording at the default bound is fine, so the refusal is about
-    // the limit and not about the file.
+    // The same recording at the default bound is fine.
     let (json, stderr, ok) = doctor_json(&bag, &[]);
     assert!(ok, "{json}\n{stderr}");
 }

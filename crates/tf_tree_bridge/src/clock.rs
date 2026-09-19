@@ -1,47 +1,38 @@
 //! Time domains and clock resets — `docs/PHASE4.md` §5.5, NORMATIVE.
 //!
-//! Bag loops and sim resets move `/clock` backwards. Phase 1 rejects
-//! non-monotonic stamps one at a time, so a bridge that forwards them logs one
-//! error per message per edge while the tree freezes. §5.5: detect the jump
-//! **once** and halt or recreate the arena.
+//! Bag loops and sim resets move `/clock` backwards; the bridge detects the jump
+//! **once** and halts or recreates the arena, and refuses **at startup** an edge
+//! whose declared domain differs from its own.
 //!
-//! §5.5 also requires the bridge to refuse, **at startup**, an edge whose
-//! declared domain differs from its own.
-//!
-//! Inference from `/tf` stamps is specified by `docs/decisions/0012`
-//! (§Context *The three rules, and what killed each*, §Decision *The five
-//! principles* and *L1*-*L3*); "P1"-"P5" are its principles, "the ladder" is *L3*,
-//! "defect 1"/"defect 3" are from its Context.
+//! Inference from `/tf` stamps is `docs/decisions/0012`; "P1"-"P5" are its principles,
+//! "the ladder" is *L3*, "defect 1"/"defect 3" are from its Context.
 
 use crate::interner::StrInterner;
 
 /// A reading of a local **steady** (monotonic) clock, in nanoseconds.
 ///
-/// Distinct from a publisher's stamp because confusing the two is the bug class
-/// this design removes. Never derived from `/clock` or a publisher.
+/// A reading of a local **steady** (monotonic) clock, in nanoseconds.
 ///
-/// Online: `rclcpp::Clock(RCL_STEADY_TIME).now()`, read **once per `TFMessage`**
-/// and copied onto every [`crate::Sample`] it expands into. Offline: the
-/// recording's log time (`RawRecord::log_time_ns`).
+/// Distinct from a publisher's stamp; never derived from `/clock` or a publisher.
+/// Online: read once per `TFMessage` and copied onto every [`crate::Sample`] it
+/// expands into; offline: the recording's log time (`RawRecord::log_time_ns`).
 ///
-/// Only differences mean anything, so `0` ([`SteadyNanos::UNKNOWN`]) is free to
-/// mean "no receipt clock supplied" and that sample skips the offset path.
-/// **Do not substitute `stamp_nanos` for a missing receipt time**: that makes
-/// `offset` zero for every publisher and resurrects defect 1.
+/// `0` ([`SteadyNanos::UNKNOWN`]) means "no receipt clock"; that sample skips the
+/// offset path. **Do not substitute `stamp_nanos` for a missing receipt time**
+/// (defect 1).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SteadyNanos(pub i64);
 
 impl SteadyNanos {
-    /// "No receipt clock was supplied", what [`Default`] produces.
-    /// [`OffsetTable::observe`] ignores such a sample.
+    /// "No receipt clock was supplied"; [`OffsetTable::observe`] ignores such a sample.
     pub const UNKNOWN: SteadyNanos = SteadyNanos(0);
 }
 
 /// What to do when the clock jumps.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OnClockReset {
-    /// Stop and report. The default: continuing would mix two recordings' transforms in one arena.
+    /// Stop and report. The default.
     #[default]
     Halt,
     /// Build a fresh arena instance, for bag-replay loops.
@@ -53,17 +44,15 @@ pub enum OnClockReset {
 pub enum ClockVerdict {
     /// Time moved forward, or not at all. Publish.
     Forward,
-    /// Time went backwards by less than the threshold: one publisher slightly out
-    /// of order (see [`DEFAULT_RESET_THRESHOLD_NANOS`]). Dropped and counted.
+    /// Time went backwards by less than the threshold ([`DEFAULT_RESET_THRESHOLD_NANOS`]). Dropped and counted.
     Jitter {
         /// How far back, in nanoseconds.
         by_nanos: i64,
     },
-    /// A regression past the threshold on **this one edge**: a fact, not a
-    /// judgment. [`crate::Ingest::offer`] treats it like [`ClockVerdict::Jitter`]
-    /// (drop, count, diagnose); promotion needs corroboration ([`OffsetTable`])
-    /// or [`crate::Ingest::note_time_jump`]. The offline half (`tf_tree_ingest`)
-    /// still halts on the first one, which is why `policy` travels with it.
+    /// A regression past the threshold on **this one edge**. [`crate::Ingest::offer`]
+    /// treats it like [`ClockVerdict::Jitter`]; promotion needs corroboration
+    /// ([`OffsetTable`]) or [`crate::Ingest::note_time_jump`]. The offline half
+    /// (`tf_tree_ingest`) halts on the first one.
     Reset {
         /// How far back, in nanoseconds. Always positive.
         by_nanos: i64,
@@ -84,9 +73,7 @@ pub struct ClockGuard {
 
 /// Default backward-jump threshold: **100 ms**.
 ///
-/// Above a single publisher's routine out-of-order stamps (a few ms) and below
-/// any bag loop or sim reset (seconds). Not sized for the offset *between*
-/// publishers: [`OffsetTable`] measures and subtracts that.
+/// Above a single publisher's routine out-of-order stamps and below any bag loop or sim reset.
 pub const DEFAULT_RESET_THRESHOLD_NANOS: i64 = 100_000_000;
 
 impl ClockGuard {
@@ -96,8 +83,7 @@ impl ClockGuard {
         ClockGuard::with_threshold(policy, DEFAULT_RESET_THRESHOLD_NANOS)
     }
 
-    /// A guard with an explicit threshold, for a workflow whose clock is
-    /// noisier or quieter than the default assumes.
+    /// A guard with an explicit threshold.
     #[must_use]
     pub fn with_threshold(policy: OnClockReset, threshold_nanos: i64) -> ClockGuard {
         ClockGuard {
@@ -119,8 +105,7 @@ impl ClockGuard {
             self.newest = Some(stamp_nanos);
             return ClockVerdict::Forward;
         }
-        // `saturating_sub`: both stamps are caller-supplied, and `i64::MIN`
-        // against `i64::MAX` overflows — silently, in a release build.
+        // `saturating_sub`: caller-supplied stamps can overflow.
         let by_nanos = newest.saturating_sub(stamp_nanos);
         if by_nanos < self.threshold_nanos {
             self.jitter_drops += 1;
@@ -142,9 +127,7 @@ impl ClockGuard {
 
     /// Forget the high-water mark entirely, as if the guard were new.
     ///
-    /// Counters are kept. Unlike [`ClockGuard::accept_reset`], which seeds the mark
-    /// from one edge's stamp, this leaves other edges uncontaminated; rewinding in
-    /// place keeps the per-edge table's shape and avoids re-allocating keys.
+    /// Counters are kept. Unlike [`ClockGuard::accept_reset`], seeds no stamp, so other edges are uncontaminated.
     pub fn forget(&mut self) {
         self.newest = None;
     }
@@ -170,25 +153,19 @@ impl ClockGuard {
     }
 }
 
-/// Which way, and in what sense, the time source said it jumped.
-///
-/// Mirrors `rcl_time_jump_t`: a change of time *source* versus motion within
-/// one, with `delta` = new time minus last time before the jump (a rewind is
-/// negative).
+/// Which way, and in what sense, the time source said it jumped (mirrors `rcl_time_jump_t`;
+/// `delta` = new time minus last time before the jump).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JumpKind {
-    /// The clock *source* changed (sim time toggled); the delta compares two time bases.
+    /// The clock *source* changed (sim time toggled).
     ClockTypeChanged,
     /// Time moved backwards: a bag loop, a sim reset, an NTP step back.
     Backward,
-    /// Time moved forwards past the threshold: a bag seek, sim fast-forward, NTP
-    /// step. Invisible to a backward-regression watcher.
+    /// Time moved forwards past the threshold: a bag seek, sim fast-forward, NTP step.
     Forward,
 }
 
-/// Why the bridge concluded the clock moved.
-///
-/// Carried on the halt: a reported jump is a fact, a common-mode step an inference.
+/// Why the bridge concluded the clock moved, carried on the halt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClockEvidence {
     /// The time source reported the jump itself ([`crate::Ingest::note_time_jump`]).
@@ -196,9 +173,7 @@ pub enum ClockEvidence {
         /// What the source said it was.
         kind: JumpKind,
     },
-    /// This many **distinct publishers** (always >= 2) stepped inside the
-    /// correlation window and agreed on the size. Publishers, not edges: one node
-    /// owning two edges moves both when it restarts.
+    /// This many **distinct publishers** (always >= 2) stepped inside the correlation window and agreed on the size.
     CommonMode {
         /// How many agreed, including the one whose step completed it.
         publishers: u32,
@@ -208,23 +183,13 @@ pub enum ClockEvidence {
 /// Every knob §5.5's detection has, in physical units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClockPolicy {
-    /// How far a stamp must move against its own last stamp or offset baseline to
-    /// stop being noise. Default [`DEFAULT_RESET_THRESHOLD_NANOS`] (100 ms); one
-    /// threshold serves both the guard and the step detector so they cannot
-    /// disagree about a sample.
+    /// How far a stamp must move against its own last stamp or offset baseline to stop being noise. Default [`DEFAULT_RESET_THRESHOLD_NANOS`] (100 ms), shared with the guard.
     pub reset_threshold_nanos: i64,
-    /// How close together, **in receipt time**, two publishers' steps must fall to
-    /// share a cause. Default **1 s**: above the slowest ordinary `/tf`
-    /// publisher's period (1 Hz localizers), and no wider, to limit coincident
-    /// unrelated restarts. Physical time, not a count (P3).
+    /// How close together, **in receipt time**, two publishers' steps must fall to share a cause. Default **1 s** (P3).
     pub correlation_window_nanos: i64,
-    /// How far two steps may differ, as a fraction of the larger, and still be
-    /// one step. Default **0.25**: a 5 s loop seen by a 10 Hz and a 1 Hz
-    /// publisher differs by ~20 %, a 5 s replay and a 400 ms hiccup by 92 %. A
-    /// negative or `NaN` value cannot go below the floor.
+    /// How far two steps may differ, as a fraction of the larger, and still be one step. Default **0.25**; a negative or `NaN` value cannot go below the floor.
     pub common_mode_tolerance_ratio: f64,
-    /// The tolerance never falls below this. Default **50 ms**: half the
-    /// threshold, enough to absorb scheduling jitter between first post-step messages.
+    /// The tolerance never falls below this. Default **50 ms**.
     pub common_mode_tolerance_floor_nanos: i64,
     /// What to do once the clock is judged to have moved.
     pub on_reset: OnClockReset,
@@ -242,26 +207,18 @@ impl Default for ClockPolicy {
     }
 }
 
-/// How many distinct publishers [`OffsetTable`] will track.
-///
 /// Cap on distinct publishers [`OffsetTable`] tracks (see [`OffsetTable::observe`]).
 pub(crate) const MAX_TRACKED_PUBLISHERS: usize = 64;
 
-/// The EWMA divisor: the baseline moves by a **1/8** of each residual.
+/// The EWMA divisor: the baseline moves by **1/8** of each residual (integer arithmetic).
 ///
-/// Integer arithmetic keeps the update deterministic. 1/8: a steady drift `d`
-/// per sample lags by `7d` (well inside the threshold), while a real step is
-/// barely absorbed (a 5 s rewind leaves 4.4 s residual on the next sample).
-/// Truncation toward zero gives a symmetric 8 ns dead zone.
+/// A steady drift `d` per sample lags by `7d`; a real step is barely absorbed.
 const BASELINE_DIVISOR: i64 = 8;
 
 /// One publisher's offset baseline and its most recent step.
 #[derive(Clone, Copy, Debug)]
 struct Offset {
-    /// The smoothed `stamp - received` for this publisher.
-    ///
-    /// The publisher's `transform_tolerance`, measured: a localizer dating
-    /// `map -> odom` 300 ms ahead has baseline +300 ms and residual ~0.
+    /// The smoothed `stamp - received` for this publisher (its `transform_tolerance`, measured).
     baseline: i64,
     /// Receipt time of the last step; ages out against [`ClockPolicy::correlation_window_nanos`].
     stepped_at: Option<SteadyNanos>,
@@ -278,16 +235,13 @@ pub struct CommonMode {
     pub publishers: u32,
 }
 
-/// Per-publisher stamp-to-receipt offsets, and the common-mode rule over them.
-///
-/// The fallback rung of the ladder (`docs/decisions/0012`, *L3*), above
-/// [`ClockGuard`] and never inside it.
+/// Per-publisher stamp-to-receipt offsets, and the common-mode rule over them: the
+/// fallback rung of the ladder (`docs/decisions/0012`, *L3*), above [`ClockGuard`].
 #[derive(Debug)]
 pub struct OffsetTable {
     /// Publisher name -> id, capped at [`MAX_TRACKED_PUBLISHERS`].
     ids: StrInterner,
-    /// One row per interned publisher; `None` until its first sample. [`OffsetTable::clear`]
-    /// blanks rows and keeps ids, so a recreate does not re-intern.
+    /// One row per interned publisher; [`OffsetTable::clear`] blanks rows and keeps ids.
     rows: Vec<Option<Offset>>,
     policy: ClockPolicy,
     steps: u64,
@@ -313,42 +267,30 @@ impl OffsetTable {
         }
     }
 
-    /// Fold one sample's offset in, and say whether it completed a common-mode
-    /// step.
+    /// Fold one sample's offset in, and say whether it completed a common-mode step.
     ///
-    /// `owner` is the publisher's identity (`Ingest::owner_key`); `stamp_nanos` is
-    /// the publisher's and `received` the local steady clock. They must come from
-    /// different sources (P2).
+    /// `owner` is the publisher's identity (`Ingest::owner_key`); `stamp_nanos` is the
+    /// publisher's and `received` the local steady clock (P2).
     ///
     /// Returns `Some` exactly when at least two distinct publishers stepped within
-    /// [`ClockPolicy::correlation_window_nanos`] of `received` and agree in size;
-    /// one publisher never does.
-    ///
-    /// Allocation-free after a publisher's first sample (`get_mut(&str)`, never
-    /// `entry`), because a publisher replaying stale stamps sits on this path at
-    /// message rate. The publisher name comes from the ROS graph, so rows are
-    /// capped at `MAX_TRACKED_PUBLISHERS` (64); past it a publisher gets no row and
-    /// cannot corroborate, which only makes a halt harder to reach.
+    /// [`ClockPolicy::correlation_window_nanos`] of `received` and agree in size.
+    /// Allocation-free after a publisher's first sample; rows are capped at
+    /// `MAX_TRACKED_PUBLISHERS` (64), and past it a publisher cannot corroborate.
     pub fn observe(
         &mut self,
         owner: &str,
         stamp_nanos: i64,
         received: SteadyNanos,
     ) -> Option<CommonMode> {
-        // No physical reference, no inference.
         if received == SteadyNanos::UNKNOWN {
             return None;
         }
         let offset = stamp_nanos.saturating_sub(received.0);
 
-        let Some(id) = self.ids.intern(owner) else {
-            // Past the cap.
-            return None;
-        };
+        let id = self.ids.intern(owner)?;
         if self.rows.len() <= id.get() {
             self.rows.resize(id.get() + 1, None);
         }
-        // Scoped so the row's mutable borrow ends before the agreement scan.
         let delta = {
             let Some(row) = self.rows[id.get()].as_mut() else {
                 self.rows[id.get()] = Some(Offset {
@@ -365,7 +307,7 @@ impl OffsetTable {
                     .saturating_add(residual / BASELINE_DIVISOR.max(1));
                 return None;
             }
-            // A step: snap the baseline, or it would re-report the step until it caught up.
+            // A step: snap the baseline, or it would re-report until it caught up.
             row.baseline = offset;
             row.stepped_at = Some(received);
             row.step_delta = residual;
@@ -373,7 +315,6 @@ impl OffsetTable {
         };
         self.steps += 1;
 
-        // Agreement, not coincidence.
         let mut publishers: u32 = 1;
         for (other_id, other) in self.rows.iter().enumerate() {
             if other_id == id.get() {
@@ -385,7 +326,7 @@ impl OffsetTable {
             let Some(at) = other.stepped_at else {
                 continue;
             };
-            // `received < at` is a stale reading: out of window, so a broken clock only makes a halt harder.
+            // `received < at` is a stale reading: out of window.
             let age = received.0.saturating_sub(at.0);
             if age < 0 || age > self.policy.correlation_window_nanos {
                 continue;
@@ -406,23 +347,18 @@ impl OffsetTable {
         })
     }
 
-    /// How far two step sizes may differ and still be called one step.
-    ///
-    /// `max(floor, ratio * max(|a|, |b|))`. The floor clamps a negative or `NaN`
-    /// ratio, so a hostile config can make agreement stricter, never looser.
+    /// How far two step sizes may differ and still be one step:
+    /// `max(floor, ratio * max(|a|, |b|))`; the floor clamps a negative or `NaN` ratio.
     fn tolerance(&self, a: i64, b: i64) -> i64 {
         let scale = a.saturating_abs().max(b.saturating_abs());
         let scaled = (scale as f64 * self.policy.common_mode_tolerance_ratio) as i64;
         scaled.max(self.policy.common_mode_tolerance_floor_nanos.max(0))
     }
 
-    /// Forget every baseline, after an [`OnClockReset::Recreate`] or an
-    /// authoritative jump.
+    /// Forget every baseline, after an [`OnClockReset::Recreate`] or an authoritative jump.
     ///
-    /// The baselines refer to a time base that no longer exists; keeping them would
-    /// make every first post-reset sample a step, and the steps would agree.
+    /// Kept baselines would make every first post-reset sample a step.
     pub fn clear(&mut self) {
-        // Rows blanked, ids kept (see `rows`); `tracked()` counts live rows.
         self.rows.fill(None);
     }
 
@@ -454,21 +390,17 @@ mod tests {
     const S: i64 = 1_000_000_000;
 
     /// Ordinary interleaving is not a reset.
-    ///
-    /// Mutant: classify any `stamp < newest` as a reset ⇒ this fails on the first out-of-order message.
     #[test]
     fn a_few_milliseconds_out_of_order_is_jitter_not_a_reset() {
         let mut g = ClockGuard::new(OnClockReset::Halt);
         assert_eq!(g.observe(1_000 * MS), ClockVerdict::Forward);
         assert_eq!(g.observe(1_010 * MS), ClockVerdict::Forward);
-        // 8 ms late — a second publisher's message, arriving after a faster one's.
         assert_eq!(
             g.observe(1_002 * MS),
             ClockVerdict::Jitter { by_nanos: 8 * MS }
         );
         assert_eq!(g.resets(), 0, "no reset may be reported");
         assert_eq!(g.jitter_drops(), 1);
-        // The high-water mark did not move backwards.
         assert_eq!(g.newest(), Some(1_010 * MS));
     }
 
@@ -487,9 +419,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(g.resets(), 1);
-        // **The mark does not move until the caller says the recreate worked**:
-        // otherwise the next message reads as forward motion into an arena that
-        // still holds the previous recording.
+        // The mark does not move until the caller says the recreate worked.
         assert_eq!(g.newest(), Some(1_009 * MS));
         g.accept_reset(0);
         assert_eq!(g.observe(MS), ClockVerdict::Forward);
@@ -539,17 +469,11 @@ mod tests {
     fn a_negative_threshold_is_clamped_to_zero() {
         let mut g = ClockGuard::with_threshold(OnClockReset::Halt, -5);
         g.observe(100);
-        // Any backward motion is >= 0 >= threshold, so it is a reset — but
-        // forward motion is still forward, which a negative threshold used
-        // arithmetically could not guarantee.
         assert_eq!(g.observe(200), ClockVerdict::Forward);
         assert!(matches!(g.observe(199), ClockVerdict::Reset { .. }));
     }
 
-    /// A rewound guard has seen nothing, not "seen the stamp some other
-    /// edge happened to be at".
-    ///
-    /// Mutant: `pub fn forget(&mut self) {}`.
+    /// A rewound guard has seen nothing.
     #[test]
     fn a_forgotten_guard_accepts_the_next_stamp_whatever_it_is() {
         let mut g = ClockGuard::new(OnClockReset::Halt);
@@ -565,22 +489,17 @@ mod tests {
         );
     }
 
-    /// A table under the shipped defaults, so the unit tests below exercise the
-    /// constants an operator actually gets.
+    /// A table under the shipped defaults.
     fn table() -> OffsetTable {
         OffsetTable::new(ClockPolicy::default())
     }
 
-    /// A steady `transform_tolerance` is measured and subtracted, so it is
-    /// never a step.
-    ///
-    /// Mutant: compare `offset` against the threshold instead of `offset - baseline` (`if offset.saturating_abs() <= ...`).
+    /// A steady `transform_tolerance` is measured and subtracted, so it is never a step.
     #[test]
     fn a_steady_offset_is_a_baseline_not_a_step() {
         let mut t = table();
         for k in 0..40i64 {
             let received = SteadyNanos(100 * S + k * 10 * MS);
-            // Stamped 300 ms into the future, every single time.
             assert_eq!(t.observe("/amcl", received.0 + 300 * MS, received), None);
         }
         assert_eq!(t.steps(), 0, "a configuration is not an event");
@@ -588,8 +507,6 @@ mod tests {
     }
 
     /// One publisher stepping is never a common-mode step, however large.
-    ///
-    /// Mutant: `if publishers < 1 { return None; }` — i.e. promote on one witness, which is defect 3 restored.
     #[test]
     fn one_publisher_stepping_is_never_common_mode() {
         let mut t = table();
@@ -597,7 +514,6 @@ mod tests {
             let received = SteadyNanos(100 * S + k * 10 * MS);
             assert_eq!(t.observe("/wheels", received.0, received), None);
         }
-        // It restarts and replays from five seconds ago.
         for k in 0..10i64 {
             let received = SteadyNanos(200 * S + k * 10 * MS);
             assert_eq!(
@@ -610,10 +526,7 @@ mod tests {
         assert_eq!(t.steps(), 1, "one bout of stepping is one step");
     }
 
-    /// Two publishers moved by the same amount inside the window are the
-    /// clock.
-    ///
-    /// Mutant: drop the `if name == owner { continue; }` guard, so a publisher corroborates itself.
+    /// Two publishers moved by the same amount inside the window are the clock.
     #[test]
     fn two_publishers_stepping_together_are_the_clock() {
         let mut t = table();
@@ -624,10 +537,8 @@ mod tests {
                 assert_eq!(t.observe(who, received.0, received), None);
             }
         }
-        // The bag loops. `/amcl` notices first.
         let a = SteadyNanos(base + 200 * MS);
         assert_eq!(t.observe("/amcl", a.0 - 5 * S, a), None, "one witness only");
-        // …and `/wheels` corroborates 50 ms later, having moved by the same 5 s.
         let b = SteadyNanos(base + 250 * MS);
         assert_eq!(
             t.observe("/wheels", b.0 - 5 * S, b),
@@ -639,10 +550,7 @@ mod tests {
         assert_eq!(t.common_modes(), 1);
     }
 
-    /// A forward jump is detected, which no backward-regression watcher can
-    /// see at all.
-    ///
-    /// Mutant: `if residual > -self.policy.reset_threshold_nanos` in place of `if residual.saturating_abs() <= self.policy.reset_threshold_nanos` — i.e. a watcher that only looks for backward motion.
+    /// A forward jump is detected, which no backward-regression watcher can see.
     #[test]
     fn a_forward_common_mode_jump_is_detected() {
         let mut t = table();
@@ -667,8 +575,6 @@ mod tests {
     }
 
     /// Agreement is what decides, not mere coincidence in time.
-    ///
-    /// Mutant: drop the agreement test (count every stepped row inside the window).
     #[test]
     fn two_publishers_stepping_by_unrelated_amounts_are_two_faults() {
         let mut t = table();
@@ -692,10 +598,6 @@ mod tests {
     }
 
     /// The agreement tolerance is proportional, with a floor.
-    ///
-    /// Mutant: `scaled.min(floor)` instead of `.max(floor)`.
-    ///
-    /// Mutant: `let scale = a.saturating_abs().min(b.saturating_abs());`.
     #[test]
     fn the_agreement_tolerance_scales_with_the_step() {
         for (second, agrees) in [(4_000 * MS, true), (3_000 * MS, false)] {
@@ -721,8 +623,6 @@ mod tests {
     }
 
     /// The correlation window is physical time, and its boundary is exact.
-    ///
-    /// Mutant: `age >= self.policy.correlation_window_nanos` instead of `>`.
     #[test]
     fn the_correlation_window_boundary_is_exact_and_in_nanoseconds() {
         for (gap, agrees) in [(1_000 * MS, true), (1_000 * MS + 1, false)] {
@@ -745,10 +645,7 @@ mod tests {
         }
     }
 
-    /// A publisher that has been broken for hours is not evidence about the
-    /// clock.
-    ///
-    /// Mutant: leave the baseline smoothing (`row.baseline = row.baseline.saturating_add(residual / BASELINE_DIVISOR.max(1))`) in place of the snap on a step.
+    /// A publisher that has been broken for hours is not evidence about the clock.
     #[test]
     fn a_persistently_stale_publisher_steps_once_per_bout() {
         let mut t = table();
@@ -757,8 +654,6 @@ mod tests {
             let received = SteadyNanos(base + k * 10 * MS);
             t.observe("/wheels", received.0, received);
         }
-        // Stuck: the stamp advances at the same rate as real time, but five
-        // seconds behind it, for a thousand messages.
         for k in 0..1_000i64 {
             let received = SteadyNanos(base + S + k * MS);
             assert_eq!(t.observe("/wheels", received.0 - 5 * S, received), None);
@@ -766,10 +661,7 @@ mod tests {
         assert_eq!(t.steps(), 1, "one bout of being broken is one step");
     }
 
-    /// A caller with no steady clock gets no inference at all, rather than
-    /// inference over a fiction.
-    ///
-    /// Mutant: delete the `received == SteadyNanos::UNKNOWN` early return.
+    /// A caller with no steady clock gets no inference at all.
     #[test]
     fn no_receipt_clock_means_no_inference() {
         let mut t = table();
@@ -784,8 +676,6 @@ mod tests {
     }
 
     /// The table is bounded, because its keys are chosen by somebody else.
-    ///
-    /// Mutant: drop the `self.rows.len() < MAX_TRACKED_PUBLISHERS` guard.
     #[test]
     fn the_publisher_table_is_capped() {
         let mut t = table();
@@ -797,8 +687,6 @@ mod tests {
     }
 
     /// A stale receipt reading cannot forge a correlation, or overflow.
-    ///
-    /// Mutant: drop the `age < 0` arm.
     #[test]
     fn a_stale_receipt_reading_cannot_forge_a_correlation() {
         let mut t = table();
@@ -809,10 +697,8 @@ mod tests {
                 t.observe(who, received.0, received);
             }
         }
-        // `/a` steps, timed an hour into the future.
         let far = SteadyNanos(base + 3_600 * S);
         assert_eq!(t.observe("/a", far.0 - 5 * S, far), None);
-        // `/b` steps by the same amount, now.
         let now = SteadyNanos(base + 200 * MS);
         assert_eq!(
             t.observe("/b", now.0 - 5 * S, now),
@@ -822,8 +708,6 @@ mod tests {
     }
 
     /// A recreate throws the baselines away with the arena.
-    ///
-    /// Mutant: `pub fn clear(&mut self) {}`.
     #[test]
     fn clear_forgets_the_time_base_that_was_thrown_away() {
         let mut t = table();
@@ -841,8 +725,6 @@ mod tests {
         t.clear();
         assert_eq!(t.tracked(), 0);
 
-        // The new recording starts. Both publishers are back on the old stamps,
-        // which against a kept baseline would be a +5 s step for each.
         let p = SteadyNanos(base + 300 * MS);
         assert_eq!(t.observe("/a", p.0, p), None);
         let q = SteadyNanos(base + 310 * MS);

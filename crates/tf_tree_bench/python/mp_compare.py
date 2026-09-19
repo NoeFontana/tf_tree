@@ -1,15 +1,8 @@
 """Multi-process Python: N consumer nodes on one arena, against N `tf2_ros` buffers.
 
-`docs/PHASE2.md` §12.4 and `docs/PHASE3.md` §12.1. A Python `tf2_ros` node carries a
-full private `Buffer`; a Python `tf_tree` node carries a `PROT_READ` mapping of one
-shared arena. Methodology is `crates/tf_tree_bench/src/mp.rs`'s:
-
-* **Open loop.** Tick `i` is due at `t0 + i/rate`; latency is `finish - intended`
-  (a closed loop hides stalls: coordinated omission).
-* **A publisher runs throughout**, so the seqlock retry path is exercised.
-* **Per-consumer tails**, not one mean (`PHASE1.md` §11.2: p99.9).
-* **PSS, not summed RSS**, which double-counts shared pages.
-* **CPU from `schedstat`** in ns (`stat`'s 10 ms ticks read as 0.0%).
+`docs/PHASE2.md` §12.4 and `docs/PHASE3.md` §12.1. Methodology is
+`crates/tf_tree_bench/src/mp.rs`'s: open loop (latency is `finish - intended`), a
+publisher throughout, per-consumer tails, PSS not summed RSS, CPU from `schedstat`.
 
 **`subprocess`, never `os.fork`**: the arena is mapped `MADV_DONTFORK`.
 
@@ -26,32 +19,18 @@ import time
 
 # Consumer counts to sweep; above the physical core count rows are scheduler noise.
 CONSUMERS = [1, 2, 4, 8]
-#: Per-consumer tick rate. 100 Hz is a plausible perception/planning node.
 HZ = 100.0
-#: Measurement window per point.
 SECONDS = 4.0
-#: The publisher's rate, and the depth of the chain every consumer resolves.
 PUB_HZ = 100.0
 #: How far behind the wall clock every query is aimed.
-#:
-#: Both engines are stamped with `time.time_ns()`; 100 ms back avoids timing an
-#: `ExtrapolationError` path.
 LAG_NS = 100_000_000
-#: History each tf2 consumer must materialise to answer the same queries.
-#: tf2's buffer is static once filled, so it is filled past the end of the window;
-#: that is what having no shared arena costs (reported as `fill`).
+#: History each tf2 consumer must materialise (its buffer is static once filled).
 TF2_HISTORY_S = 30.0
 EDGES = [("map", "odom"), ("odom", "base"), ("base", "cam")]
 
 
-# Process accounting
-
-
 def pss_kib(pid: int) -> int:
-    """Proportional set size, from `smaps_rollup`.
-    Each shared page is counted as `1/n` for `n` mappers; summed RSS would flatter
-    tf_tree by exactly the amount claimed.
-    """
+    """Proportional set size from `smaps_rollup` (RSS double-counts shared pages)."""
     try:
         with open(f"/proc/{pid}/smaps_rollup") as f:
             for line in f:
@@ -63,9 +42,7 @@ def pss_kib(pid: int) -> int:
 
 
 def cpu_ns(pid: int) -> int:
-    """CPU time in nanoseconds, from `schedstat` field 1.
-    Not `stat`'s utime+stime (10 ms ticks, which read as 0.0%).
-    """
+    """CPU time in nanoseconds, from `schedstat` field 1 (`stat` ticks are 10 ms)."""
     try:
         with open(f"/proc/{pid}/schedstat") as f:
             return int(f.read().split()[0])
@@ -81,9 +58,6 @@ def pct(xs: list[float], q: float) -> float:
     return xs[i]
 
 
-# The consumer, also this file run as `-m` with a role argument
-
-
 def run_consumer(engine: str) -> None:
     """One node's worth of work, reporting its latency distribution on stdout."""
     ticks = int(HZ * SECONDS)
@@ -92,14 +66,11 @@ def run_consumer(engine: str) -> None:
         import numpy as np
         import tf_tree
 
-        # Time to first usable lookup (a handshake and a mapping for tf_tree).
         fill_t0 = time.perf_counter()
         tree = tf_tree.open(mode="ro")
         plan = tree.plan("map", "cam")
 
-        # `at_into` a buffer allocated once: a node cannot batch, and `at` allocates
-        # per call
-        # (224 ns against 173 ns).
+        # `at_into` a buffer allocated once: a node cannot batch (`at` allocates).
         out = np.empty((4, 4))
 
         def lookup(stamp_ns: int) -> None:
@@ -114,11 +85,8 @@ def run_consumer(engine: str) -> None:
         def rclpy_duration(seconds: float) -> Duration:
             return Duration(seconds=seconds)
 
-        # The structural difference: no shared arena, so this consumer holds its own
-        # copy
-        # of the whole history.
+        # The structural difference: no shared arena, so each holds its own copy.
         buf = Buffer(cache_time=rclpy_duration(TF2_HISTORY_S + 5.0))
-        # Anchored on this consumer's own start; every consumer materialises all of it.
         fill_t0 = time.perf_counter()
         t_start = time.time_ns()
         n_ticks = int(PUB_HZ * TF2_HISTORY_S)
@@ -139,7 +107,6 @@ def run_consumer(engine: str) -> None:
 
     fill_ms = (time.perf_counter() - fill_t0) * 1e3
 
-    # Wait for history before measuring: an early consumer gets `ExtrapolationError`.
     deadline = time.perf_counter() + 20.0
     while True:
         try:
@@ -151,8 +118,7 @@ def run_consumer(engine: str) -> None:
             time.sleep(0.02)
 
     period = 1.0 / HZ
-    # CPU is measured by the consumer over its own loop; sampling from the coordinator
-    # overlapped the consumer's exit and understated tf2.
+    # CPU is measured by the consumer over its own loop.
     cpu_t0 = cpu_ns(os.getpid())
     t0 = time.perf_counter()
     service: list[float] = []
@@ -166,7 +132,6 @@ def run_consumer(engine: str) -> None:
         start = time.perf_counter()
         lookup(time.time_ns() - LAG_NS)
         done = time.perf_counter()
-        # `service` is engine cost; `cycle` is measured from the intended time.
         service.append((done - start) * 1e9)
         cycle.append((done - due) * 1e9)
 
@@ -186,28 +151,22 @@ def run_publisher() -> None:
     """Publish into the shared arena until killed."""
     import tf_tree
 
-    # `interp="lerpslerp"` explicitly, to match tf2's interpolator (`API.md` §3).
     tree = tf_tree.open(mode="rw", create=EDGES, capacity=4096, interp="lerpslerp")
     writers = [tree.publisher(child, parent) for parent, child in EDGES]
     print("READY", flush=True)
     period = 1.0 / PUB_HZ
     t0 = time.perf_counter()
     while True:
-        # The tick index is derived from elapsed time and not also incremented: a
-        # catching-up burst laps the ring, and incrementing twice ran ~156 Hz, not
-        # `PUB_HZ`.
+        # The tick index comes from elapsed time and is not also incremented (that ran
+        # ~156 Hz, not `PUB_HZ`).
         now = time.perf_counter()
         i = int((now - t0) / period) + 1
         due = t0 + i * period
         if now < due:
             time.sleep(due - now)
-        # Wall-clock stamps, so a consumer can aim at an instant.
         stamp = time.time_ns()
         for w in writers:
             w.push(stamp, [1.0, 0.0, 0.0, 0.0, 0.001 * i, 0.0, 0.0])
-
-
-# Coordinator
 
 
 def measure(engine: str, n: int, env: dict[str, str]) -> dict[str, float]:
@@ -221,7 +180,6 @@ def measure(engine: str, n: int, env: dict[str, str]) -> dict[str, float]:
         )
         for _ in range(n)
     ]
-    # Let every consumer reach its loop before sampling steady-state memory and CPU.
     time.sleep(1.5 if engine == "tf_tree" else 3.0)
     pss = sum(pss_kib(k.pid) for k in kids)
 
@@ -300,8 +258,7 @@ def main() -> None:
                     env=env,
                 )
                 assert pub.stdout is not None
-                # Reading READY synchronises: the arena exists and is being published
-                # into.
+                # Reading READY synchronises: the arena exists and is published into.
                 assert pub.stdout.readline().strip() == "READY", (
                     "publisher did not start"
                 )
@@ -322,13 +279,10 @@ def main() -> None:
                     pub.kill()
                     pub.wait()
 
-        # Marginal cost is the claim: totals are dominated by the interpreter and numpy.
         if len(sweep) >= 2:
             lo, hi = sweep[0], sweep[-1]
             dn = CONSUMERS[-1] - CONSUMERS[0]
             d_pss = (hi["pss_mib"] - lo["pss_mib"]) / dn
-            # `cpu_pct` is a per-row mean, scaled back to a fleet total before
-            # differencing.
             d_cpu = (hi["cpu_pct"] * CONSUMERS[-1] - lo["cpu_pct"] * CONSUMERS[0]) / dn
             print(f"  marginal: {d_pss:.1f} MiB/node, {d_cpu:.2f}% cpu/node")
         print()

@@ -1,16 +1,9 @@
-//! The C ABI against a real tree — `docs/PHASE4.md` §6.1, the half that needs a
-//! live handle.
-//!
-//! `abi.rs` covers misuse with no handle at all. This covers the working path and
-//! the misuse that only becomes reachable *once you have* a handle: freeing in
-//! the wrong order, using a freed handle, striding a batch write.
+//! The C ABI against a live handle (`docs/PHASE4.md` §6.1): the working path
+//! and the misuse reachable only once you hold one.
 #![cfg(feature = "test-hooks")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
-// exercise or measure it** (`docs/decisions/0048`: a kind is a property, not a
-// crate name). The posture is declared here rather than inherited:
-// `crates/tf_tree_c/src/lib.rs` does not govern this file, because a test or
-// example is a **separate crate root**. `0048` step 4 is what this closes.
+// `docs/decisions/0007` rule 1, kind 5: our own C ABI called from Rust; a test
+// is a separate crate root, so the posture is declared here (`0048`).
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -95,18 +88,7 @@ fn a_lookup_through_the_c_abi_returns_a_valid_rigid_transform() {
     }
 }
 
-/// **The four `f64` pose layouts must agree about the transform**, differing
-/// only in how it is written. A disagreement here means one of them is
-/// transposing or reordering something.
-///
-/// Four, not six, and the name says four because it used to say five and was
-/// wrong on both counts. `TFT_LAYOUT_AFFINE12_ROW_F32` is narrowed to `f32`, so
-/// it cannot be compared bit for bit against these; it is pinned instead against
-/// a hand-written pattern, in
-/// `layout::tests::affine12_is_f32_row_major_without_the_bottom_row`.
-/// `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is a pose *and a twist*, and
-/// its pose half is asserted equal to `QVEC7_WXYZ` — byte for byte, from the
-/// same call — in `the_twist_layout_writes_the_pose_and_the_twist_contiguously`.
+/// The four `f64` pose layouts describe the same transform.
 #[test]
 fn the_four_f64_pose_layouts_describe_the_same_transform() {
     let tree = Tree::new();
@@ -179,12 +161,6 @@ fn the_four_f64_pose_layouts_describe_the_same_transform() {
 
 /// **`out_stride_bytes` writes into an array of caller structs** — §4.3's reason
 /// for the parameter, exercised here without needing Sophus.
-///
-/// The stride is deliberately larger than the payload, and the gap bytes are
-/// pre-filled with a sentinel that must survive: if the ABI wrote tightly packed
-/// and ignored the stride, it would overwrite them.
-///
-/// Mutant: ignore `out_stride_bytes` and use `payload` ⇒ the sentinel check fails.
 #[test]
 fn a_strided_batch_writes_into_caller_structs_without_touching_the_gaps() {
     let tree = Tree::new();
@@ -328,9 +304,6 @@ fn a_successful_call_clears_the_error_slot() {
 
 /// **Freeing the tree before its plans must not dangle** — the natural C order,
 /// and the reason `tft_plan` holds a refcounted share rather than a pointer.
-///
-/// Mutant: make `tft_plan` hold `*const tft_tree` ⇒ use-after-free here, which
-/// ASan catches and which a plain run may or may not.
 #[test]
 fn a_plan_outlives_the_tree_handle_it_was_compiled_from() {
     let mut t: *mut tft_tree = ptr::null_mut();
@@ -358,18 +331,8 @@ fn a_plan_outlives_the_tree_handle_it_was_compiled_from() {
     unsafe { tft_plan_free(p) };
 }
 
-// **There is deliberately no "a freed handle is rejected" test.**
-//
-// One was written, and it was wrong in a way worth recording: reading a freed
-// handle's magic word *is* a heap-use-after-free, so the test made
-// `docs/PHASE4.md` §7 gate criterion 4 ("zero ASan findings") fail on unmutated
-// code. ASan was right and the test was not.
-//
-// The magic-zeroing in `tft_tree_free`/`tft_plan_free` is still worth doing —
-// it turns the common double-free into a no-op while the allocation is
-// untouched — but that is a best-effort mitigation, not a checkable contract,
-// and the ABI documents double-free as undefined. A test cannot assert
-// undefined behaviour behaves; it can only commit the UB.
+// No "freed handle is rejected" test: reading a freed handle's magic word is a
+// use-after-free, which ASan (`docs/PHASE4.md` §7 criterion 4) rightly flags.
 
 /// An unknown frame name is refused by name, not by crashing.
 #[test]
@@ -386,14 +349,6 @@ fn an_unknown_frame_is_refused() {
 
 /// **A batch failure must carry the same detail a single call would**, plus the
 /// index of the element that failed.
-///
-/// Found by review: `at_many` called `set_error` after `record_lookup`, and
-/// `set_error` blanks the slot first — so a batch caller got `edge = INVALID` and
-/// `oldest = newest = 0` where the equivalent single call reported the edge and
-/// the retained window it needs to clamp its next query. That is exactly the
-/// information loss §3.3 exists to prevent.
-///
-/// Mutant: use `set_error` instead of `amend_error` ⇒ fails on the window.
 #[test]
 fn a_batch_failure_keeps_the_detail_a_single_call_would_give() {
     let tree = Tree::new();
@@ -436,12 +391,6 @@ fn a_batch_failure_keeps_the_detail_a_single_call_would_give() {
 }
 
 /// A plan whose compilation fails must return the failure, not a handle.
-///
-/// Found by review: this arm was untested, and returning `TFT_OK` there survived
-/// the whole suite — which would hand the caller an uninitialised `out` pointer
-/// it believes is a handle.
-///
-/// Mutant: return `TFT_OK` from `tft_plan_create`'s `Err` arm ⇒ fails.
 #[test]
 fn a_plan_that_cannot_compile_returns_no_handle() {
     let tree = Tree::new();
@@ -467,16 +416,6 @@ fn fetch_error() -> tft_error {
 // The unstable tier — `tf_tree_unstable.h`, §3.1
 
 /// **Derivatives cross the boundary, and the twist is the one §2 defines.**
-///
-/// The fixture's two dynamic edges are ScLerp with a constant screw per edge, so
-/// the composed twist is checked against a **central difference of the pose**
-/// rather than against another `tf_tree` call — the same oracle the Rust-side
-/// tests use, and one that shares no code with the adjoint fold.
-///
-/// Asserted as a *convergence order*, not an absolute error: the stencil's own
-/// truncation is O(h²), so halving `h` must quarter the error. An absolute
-/// tolerance here would either be loose enough to pass a wrong answer or tight
-/// enough to fail on the stencil rather than on the code.
 #[test]
 fn derivatives_match_a_central_difference_of_the_pose() {
     let t = Tree::new();
@@ -532,28 +471,8 @@ fn derivatives_match_a_central_difference_of_the_pose() {
     );
 }
 
-/// **`TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is the same numbers in one buffer** —
-/// `docs/API.md` §3.3's `(N, 13)` row, appended as a **minor** ABI bump
-/// (`docs/PHASE4.md` §3.6).
-///
-/// The whole claim of a layout — rather than a fourth entry point — is that it
-/// is a *re-encoding* and never a second computation. So this asserts the 104
-/// bytes against the 56-byte pose write and the 6-element twist buffer taken
-/// from the very same call, bit for bit. A tolerance would let a second
-/// implementation hide inside it.
-///
-/// Mutants, applied to the source, run and reverted. Both name `write_twist6`,
-/// which is where this write lives — `layout::write` has been pose-only since
-/// the round that split the two, so a mutant naming *its* twist arm could not be
-/// applied at all:
-///
-/// * `write_twist6` writes the pose half inline in `xyzw` order rather than
-///   delegating to `put_qvec7_wxyz` ⇒ fails, "the pose half is not QVEC7_WXYZ
-///   byte for byte". Delegation is the whole guard: an inline copy that happens
-///   to be right today is one edit from being the trap this module opens with.
-/// * `write_twist6` emits `v` before `ω` ⇒ fails, "twist slot 0 differs between
-///   out_pose's tail and out_twist", `4620749313291464668` against
-///   `4608340743733235298`.
+/// `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is the same numbers in one buffer
+/// (`docs/API.md` §3.3, `docs/PHASE4.md` §3.6).
 #[test]
 fn the_twist_layout_writes_the_pose_and_the_twist_contiguously() {
     let t = Tree::new();
@@ -613,43 +532,8 @@ fn the_twist_layout_writes_the_pose_and_the_twist_contiguously() {
     );
 }
 
-/// **The stable batch entry points serve the twist layout, and every row they
-/// write is bit-identical to the scalar derivative call** — `docs/PHASE5.md`
-/// §4.4 item 1, which is NORMATIVE and says derivatives reach C.
-///
-/// This is the assertion the whole layout rests on. `tft_plan_at_many` is a
-/// different loop from `tft_plan_at_with_derivatives` — it strides, it batches,
-/// and it evaluates through `Plan::at_many_into` rather than one scalar call per
-/// element — so "the same numbers" is a claim about two independent code paths
-/// and not a tautology. Compared with `to_bits`, because a tolerance is exactly
-/// where a second implementation of a velocity would hide.
-///
-/// **Both of `twist_batch`'s shapes are exercised**, and they are genuinely
-/// different code: a tightly packed buffer is handed to `at_many_into` as the
-/// output slice itself, while a strided one is evaluated a chunk at a time and
-/// scattered. §4.3's whole reason for the stride parameter is writing into an
-/// array of caller structs, and a 13-element row is the widest payload the ABI
-/// has, so the offset arithmetic has the most room to be wrong.
-///
-/// Mutants, all applied to the source, run and reverted:
-///
-/// * `panic!()` as the first statement of
-///   `Plan::fold_at_with_derivatives_cursors` ⇒ **fails**, in
-///   `tft_plan_at_many`'s panic guard: `left: -99, right: 0`, i.e.
-///   `TFT_ERR_INTERNAL` where `TFT_OK` was expected. This is the mutant worth
-///   reading. With the same injection *and* `twist_batch` disabled — which is
-///   what this entry point did before this round, a scalar
-///   `at_with_derivatives` per element — the test passes. It is the only
-///   assertion available that the C batch reaches the cursor fold at all: a
-///   cursor is a hint and cannot change an answer, so nothing about the values
-///   below can distinguish the two.
-/// * drop the `stride == payload` test in `twist_batch`, so the strided call
-///   takes the packed arm ⇒ fails at element 1, "the strided batch row differs
-///   from the scalar call" — the packed arm writes rows 104 bytes apart into a
-///   buffer whose rows are 128 apart.
-/// * `layout::write_twist6` emits `v` before `ω` ⇒ fails at element 0. The batch
-///   rows come from `tf_tree_core::layout::write_quat_twist` and the reference
-///   from `write_twist6`, so the two orders are exactly what this compares.
+/// The stable batch entry points serve the twist layout, bit-identical to the
+/// scalar derivative call (`docs/PHASE5.md` §4.4 item 1).
 #[test]
 fn the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call() {
     let t = Tree::new();
@@ -764,31 +648,6 @@ fn the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call() {
 
 /// **A twist batch that fails part-way still names the element and keeps the
 /// rows before it** — the §4.3 contract, across the two-phase evaluation.
-///
-/// `tft_plan_at_many` serves this layout by handing the whole batch to
-/// `Plan::at_many_into`, which reports *which error* and never *which element*.
-/// So a failure falls back to the scalar loop, which reproduces it and reports
-/// the index. Everything a caller can observe has to come out the same as it
-/// would from a single-phase loop, and that is what this asserts: the status,
-/// `frame_b`, the live prefix, and the untouched tail.
-///
-/// Both shapes are run, because they fail in different places — the packed arm
-/// fails after `at_many_into` has already written rows into the caller's buffer,
-/// the strided one after it has written them into a stack chunk that is then
-/// discarded. The observable result must not be able to tell.
-///
-/// Mutants, applied to the source, run and reverted:
-///
-/// * `twist_batch`'s packed arm ignores the result and returns `true` ⇒ fails
-///   at "stride 0" with `left: 0, right: -13` — `TFT_OK` reported for a batch
-///   that did not evaluate.
-/// * `note_batch_failure` is passed `0` instead of `i` ⇒ fails at "stride 0: the
-///   failing index" with `left: 0, right: 2`.
-/// * delete the `if twist_batch(..) { return TFT_OK; }` early return, leaving
-///   only the scalar loop ⇒ **passes**, and that is the point: this test pins
-///   the contract the fast path must not change, not the fast path itself. The
-///   fast path is pinned by
-///   `the_batch_twist_layout_is_bit_identical_to_the_scalar_derivative_call`.
 #[test]
 fn a_twist_batch_that_fails_part_way_reports_the_element_and_keeps_the_prefix() {
     let t = Tree::new();
@@ -852,42 +711,13 @@ fn a_twist_batch_that_fails_part_way_reports_the_element_and_keeps_the_prefix() 
 
 /// **A tightly packed but `f64`-misaligned `out` is still correct**, and is the
 /// reason `twist_batch`'s zero-copy arm tests alignment as well as stride.
-///
-/// A C caller's `void*` carries no alignment promise. `layout::write_twist6`
-/// never needed one — it stores through `f64::to_ne_bytes` into a byte slice —
-/// but the packed arm builds a `&mut [f64]` over the caller's memory, and a
-/// misaligned reference is Undefined Behaviour in Rust *even on a target whose
-/// loads would have worked*. So the alignment test is not defensive style; it is
-/// what decides which arm runs, and this is a caller that must take the other
-/// one.
-///
-/// The buffer is deliberately skewed to `addr % 8 == 4`, which is reachable in C
-/// from a `char` buffer, a packed struct, or an arena allocator.
-///
-/// Mutant, run: delete the `align_offset` test from `twist_batch` so this call
-/// takes the packed arm. Two distinct failures, and both were observed:
-///
-/// * Under `just c-abi-check`'s Miri pass — "Undefined Behavior: constructing
-///   invalid value of type `&mut [f64]`: encountered an unaligned reference
-///   (required 8 byte alignment but found 4)".
-/// * Under a plain `cargo nextest run` (the debug profile `just test` uses) —
-///   `SIGABRT`, "unsafe precondition(s) violated: `slice::from_raw_parts_mut`
-///   requires the pointer to be aligned and non-null". The standard library's
-///   own debug-assertion catches it before Miri is needed.
-///
-/// It survives **only** under `--release`, where `debug_assertions` is off and
-/// the UB goes unobserved on a target whose loads happen to work. That is the
-/// configuration Miri exists for here, and it is why the claim is stated against
-/// the arm that runs rather than against the values written.
 #[test]
 fn an_unaligned_packed_twist_batch_is_written_correctly() {
     let t = Tree::new();
     let p = t.plan("map", "sensor");
     let stamps: Vec<i64> = (0..8).map(|k| 200_000_000 + k * 7_300_000).collect();
 
-    // Sixteen bytes of headroom, not eight: `skew` is at most 11 (up to 7 to
-    // reach an 8-boundary, then 4 past it), and a shorter tail is a three-byte
-    // overrun the allocator hides on most runs. Miri found exactly that.
+    // 16 bytes of headroom: `skew` is at most 11.
     let mut raw = vec![0xAAu8; stamps.len() * 104 + 16];
     let base = raw.as_mut_ptr();
     let skew = (8 - (base as usize % 8)) % 8 + 4;
@@ -933,9 +763,7 @@ fn an_unaligned_packed_twist_batch_is_written_correctly() {
             "element {i} of a misaligned packed batch"
         );
     }
-    // Non-vacuity: the rows must not all be the sentinel, and the twist tail
-    // must be live — six zeros would satisfy the comparison above against a
-    // layout that wrote nothing but a pose.
+    // Non-vacuity: the rows are not all the sentinel and the tail is live.
     assert!(
         (0..stamps.len())
             .any(|i| (7..13).any(|k| read_f64(&raw[skew + i * 104..], k).abs() > 1e-9)),
@@ -945,25 +773,6 @@ fn an_unaligned_packed_twist_batch_is_written_correctly() {
 
 /// **A `LerpSlerp` edge refuses the twist layout with a *typed* status** —
 /// `TFT_ERR_NO_DERIVATIVES`, naming the edge, not `TFT_ERR_BAD_ENUM`.
-///
-/// `LerpSlerp`'s body twist is an artifact of the interpolant rather than of
-/// the motion, so it is refused rather than reported (`docs/PHASE4.md` §2.4).
-/// The *status* is the load-bearing part: `TFT_ERR_BAD_ENUM` would tell a
-/// caller their layout argument was invalid, sending them to fix a call that is
-/// correct, when the real answer is "declare this edge `ScLerp`". That
-/// distinction is the entire content of a typed error space (R5), and the two
-/// are one `record_lookup`-versus-`bad_enum` away from each other at every call
-/// site in the crate.
-///
-/// The buffer is checked untouched as well. `DerivativesUnavailable` is a
-/// property of the *edge*, so it fires on the first element and nothing is
-/// written — unlike the stamp-dependent errors, which can stop a batch part-way
-/// through.
-///
-/// Mutant, run: in `tft_plan_at`'s twist arm, replace `Err(e) => record_lookup(e)`
-/// with `Err(_) => bad_enum("layout")` ⇒ fails on the status assertion. The
-/// pose-layout call below is the non-vacuity guard: without it, a fixture whose
-/// plan simply did not resolve would satisfy every refusal assertion here.
 #[test]
 fn a_lerpslerp_edge_refuses_the_twist_layout_with_a_typed_status() {
     let mut raw: *mut tft_tree = ptr::null_mut();
@@ -1083,16 +892,6 @@ fn derivatives_write_only_what_was_asked_for() {
 
 /// **Introspection reports the fixture's actual shape**, and a frame name that
 /// does not fit is refused rather than truncated.
-///
-/// Mutant: write `buf_len` bytes and NUL-terminate at the end ⇒ `"sen"` comes
-/// back for `"sensor"`, which is a *different plausible frame name* — the exact
-/// failure mode this library exists to argue against.
-///
-/// This is also where both id conventions are pinned. They were established by
-/// probing a built tree, not by reading the docs, because the docs disagree:
-/// `error.rs` says edge index 0 is an ordinary slot while `TreeBuilder` reserves
-/// it and `doctor` skips it. What is true is that **ids of both kinds run
-/// `1 ..= count`**, and this is the test that keeps that true.
 #[test]
 fn introspection_reports_the_tree_and_refuses_to_truncate() {
     let t = Tree::new();
@@ -1115,9 +914,7 @@ fn introspection_reports_the_tree_and_refuses_to_truncate() {
     // Frame 0 is the root sentinel, not the first frame.
     assert_eq!(name_of(0, &mut buf), TFT_ERR_UNKNOWN_FRAME);
 
-    // `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast is necessary
-    // on one target and a no-op on the other; see `src/error.rs` for the full
-    // note. The allow is the fix — deleting the cast breaks x86_64.
+    // `c_char` signedness: see `src/error.rs`.
     #[allow(clippy::unnecessary_cast)]
     let read_name = |buf: &[c_char; 64]| -> String {
         buf.iter()
@@ -1150,15 +947,6 @@ fn introspection_reports_the_tree_and_refuses_to_truncate() {
 }
 
 /// **A private arena reports that it has no instance UUID, rather than zeros.**
-///
-/// The UUID is written only when a *shared* arena is created (`docs/PHASE2.md`
-/// §1, A1); a heap arena leaves the field zero. This test was written to assert
-/// that two trees differ, and found that two unrelated heap trees both reported
-/// sixteen zero bytes and therefore compared **equal** — so a caller asking "are
-/// we on the same arena?" would have got `yes` for two processes that had never
-/// met.
-///
-/// Mutant: drop the `is_shared` check ⇒ `TFT_OK` and a zero buffer come back.
 #[test]
 fn a_private_arena_reports_no_instance_uuid_rather_than_zeros() {
     let t = Tree::new();
@@ -1199,10 +987,6 @@ impl Drop for DomainTree {
 }
 
 /// Plan `target <- source` in `domain`, returning the status and the handle.
-///
-/// The handle is returned even on failure so the caller can assert it was left
-/// alone: a refused plan must not hand back something a C caller will later
-/// free.
 fn plan_in(
     tree: *mut tft_tree,
     target: &str,
@@ -1218,22 +1002,6 @@ fn plan_in(
 }
 
 /// **The arena the project tells operators to build is readable from C.**
-///
-/// `ros/tf_tree_ros/src/bridge_node.cpp` warns an operator running
-/// `use_sim_time` to give the simulated tree its own domain (`docs/PHASE4.md`
-/// §5.5). Before `docs/decisions/0038` following that advice made the arena
-/// unreadable from C, C++ and Python by construction: every query site
-/// constructed a `Stamp<SystemDomain>`, so `Plan::check_domain` compared tag `0`
-/// against the arena's and refused — permanently, with no argument the caller
-/// could pass.
-///
-/// Both halves are the test. Domain 1 reads a transform; domain 0 — which is
-/// what `tft_plan_create` means and all a C caller *could* say before — is
-/// refused with the code §5.5 already defined.
-///
-/// Mutant: route `tft_plan_at` back through the typed `Plan::at` (hard-coding
-/// `SystemDomain::TAG`) ⇒ the domain-1 lookup below returns
-/// `TFT_ERR_TIME_DOMAIN`. Confirmed by running it, not by reading it.
 #[test]
 fn a_plan_in_a_non_default_domain_reads_a_transform() {
     let tree = DomainTree::new(1);
@@ -1297,9 +1065,7 @@ fn a_plan_in_a_non_default_domain_reads_a_transform() {
         read_f64(&out, 3)
     );
 
-    // The batch and derivative paths carry the same tag: three entry points
-    // route through the handle, and a test that only drove the scalar one would
-    // leave two of them able to regress silently.
+    // Batch and derivative paths carry the same tag.
     let stamps = [100_000_000i64, 150_000_000, 200_000_000];
     let mut rows = [0f64; 3 * 13];
     // SAFETY: live plan; three stamps; `rows` is 3 x 13 f64, tightly packed.
@@ -1336,16 +1102,6 @@ fn a_plan_in_a_non_default_domain_reads_a_transform() {
 }
 
 /// **A static route accepts any domain**, because the engine accepts it too.
-///
-/// `Plan::check_domain_tag` fires only when the plan has a dynamic edge, so a
-/// lookup over `odom -> sensor` succeeds whatever tag it is asked in. Refusing
-/// it at plan time would be a refusal the lookup would never have made — and a
-/// caller holding one domain for a whole arena cannot know which of its routes
-/// happen to be static.
-///
-/// Mutant: replace the plan-time predicate with a bare
-/// `plan.domain() != domain` ⇒ the `1` and `7` arms below return
-/// `TFT_ERR_TIME_DOMAIN`. Confirmed by running it.
 #[test]
 fn a_static_route_is_readable_from_any_domain() {
     let tree = DomainTree::new(1);
@@ -1368,18 +1124,6 @@ fn a_static_route_is_readable_from_any_domain() {
 }
 
 /// **A tag-0 dynamic route is refused at plan time too, not only at lookup.**
-///
-/// The other half of `a_static_route_is_readable_from_any_domain`, and the one
-/// a `plan.domain()`-only predicate gets wrong. `Plan::domain` reports `0` for
-/// both "no dynamic edge" and "dynamic edge in domain 0", so a check written
-/// against it alone has to let this case through and leave the engine to refuse
-/// every evaluate call — with `TimeDomainMismatch { expected: 0, got: 7 }` and
-/// no frame names, which is the diagnostic `docs/decisions/0038` moved the
-/// check to recover. Asking `Plan::steps` for a `Step::Dyn` separates the two.
-///
-/// Mutant: drop the `has_dynamic &&` conjunct's *other* direction — i.e. gate
-/// the refusal on `plan.domain() != 0` instead — ⇒ `TFT_OK` here, and the
-/// message assertions below never run.
 #[test]
 fn a_tag_zero_dynamic_route_is_refused_before_the_first_lookup() {
     // `Tree::new()`'s fixture publishes in domain 0 and `map <- sensor` crosses
@@ -1413,11 +1157,6 @@ fn a_tag_zero_dynamic_route_is_refused_before_the_first_lookup() {
 }
 
 /// **The tag-0 arenas everything already used are untouched.**
-///
-/// `tft_plan_create` is `tft_plan_create_in_domain` with `domain = 0`, so the
-/// fixture every other test in this file drives must behave identically through
-/// either spelling — same status, same bytes. This is the half of the ABI
-/// promise a new parameter is most likely to break.
 #[test]
 fn the_default_domain_is_what_tft_plan_create_always_meant() {
     let tree = Tree::new();
@@ -1461,17 +1200,6 @@ const NEWEST_NS: i64 = 310_000_000;
 const PAST_NS: i64 = 400_000_000;
 
 /// A value the callee cannot be confused with, `struct_size` set.
-///
-/// **Not [`tft_extrapolated::blank`], and the reason is that `blank()` is
-/// field-identical to the answer.** On the in-window path
-/// `tft_plan_at_extrapolating` writes `{ struct_size, by_ns: 0, edge:
-/// TFT_INVALID_ID }`, which is exactly what `blank()` already holds — so a
-/// caller that seeded `blank()` cannot tell *the callee wrote the sentinel*
-/// from *the callee wrote nothing*. `by_ns` is seeded to a distance no
-/// extrapolation can report, so every assertion about a written `by_ns`
-/// requires the write. `edge` stays `TFT_INVALID_ID`, because the
-/// extrapolating assertions are `assert_ne!(info.edge, TFT_INVALID_ID)` and a
-/// seed that already differed would make *those* vacuous instead.
 const EXTRAP_OUT_UNWRITTEN_BY_NS: i64 = i64::MIN;
 
 /// A [`tft_extrapolated`] a C caller could write, seeded so the callee's write
@@ -1507,22 +1235,6 @@ fn at_extrapolating(
 }
 
 /// **All three policies, and the third assertion is what earns the test.**
-///
-/// `docs/decisions/0039` step 3 asks for exactly this shape: a query past the
-/// newest sample is `Err(Extrapolation)` under `Error`, the newest pose with a
-/// positive `by_ns` under `Hold`, and a *different* pose with the same `by_ns`
-/// under `ConstantTwist`. Without the last one a binding that ignored its
-/// `policy` argument and always held would pass every other assertion here.
-///
-/// The route is `map <- sensor`, which folds the fixture's static
-/// `odom -> sensor` on top of its dynamic `map -> odom`: a static step
-/// contributes no sample and must therefore contribute nothing to `by_ns`
-/// either, which is what makes the 90 ms below the *dynamic* edge's distance
-/// rather than a number that happens to be right.
-///
-/// Mutant: make this entry point pass `ExtrapPolicy::Hold` whatever it was
-/// given ⇒ `the two policies must differ ...` fails, and so does the `Error`
-/// arm. Run, not reasoned about.
 #[test]
 fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
     let tree = DomainTree::new(1);
@@ -1530,9 +1242,7 @@ fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
     assert_eq!(rc, TFT_OK);
     let plan = Plan(raw);
 
-    // `Error` refuses, and writes neither buffer. This is `tft_plan_at`'s
-    // behaviour with a distance attached on success and nothing changed on
-    // failure.
+    // `Error` refuses and writes neither buffer.
     let (rc, out, info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_ERROR);
     assert_eq!(
         rc, TFT_ERR_EXTRAPOLATION,
@@ -1550,11 +1260,7 @@ fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
         "the detail names the window that ended"
     );
 
-    // `Hold` answers with the newest pose. Compared against `tft_plan_at` at
-    // the newest stamp rather than against a hand-written matrix: "held" means
-    // "the pose the plan gives at `newest`", and asserting it against the
-    // engine's own answer there is what makes that a definition rather than a
-    // second implementation of it.
+    // `Hold` answers with the pose at `newest`.
     let (rc, held, info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_HOLD);
     assert_eq!(rc, TFT_OK, "Hold answers past the newest sample");
     assert_eq!(
@@ -1579,9 +1285,7 @@ fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
     assert_eq!(rc, TFT_OK);
     assert_eq!(held, newest, "Hold is the pose at the newest sample");
 
-    // `ConstantTwist` extends the screw the two newest samples imply, so it is
-    // *not* the held pose — and it is measured at the same stamp, so the two
-    // differ in the policy and in nothing else.
+    // `ConstantTwist` extends the newest screw, so it differs from `Hold` only in policy.
     let (rc, twisted, twist_info) = at_extrapolating(plan.0, PAST_NS, TFT_EXTRAP_CONSTANT_TWIST);
     assert_eq!(rc, TFT_OK, "ConstantTwist answers past the newest sample");
     assert_eq!(
@@ -1598,9 +1302,7 @@ fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
     assert_eq!(read_f64(&twisted, 13), 0.0);
     assert_eq!(read_f64(&twisted, 14), 0.0);
     assert_eq!(read_f64(&twisted, 15), 1.0);
-    // It kept going the way the samples were going: the fixture's translation
-    // grows monotonically with the stamp, so extending the screw past the last
-    // sample must land further along than holding it does.
+    // The fixture's translation grows with the stamp, so extension lands beyond a hold.
     assert!(
         read_f64(&twisted, 3) > read_f64(&held, 3),
         "ConstantTwist did not extend the motion: {} against {}",
@@ -1610,27 +1312,6 @@ fn the_three_extrapolation_policies_differ_at_the_same_stamp() {
 }
 
 /// **`by_ns == 0` is the interpolated case, and it is reported as one.**
-///
-/// A stamp inside every edge's window is not extrapolation whatever policy was
-/// asked for, so the three policies must agree there and the distance must be
-/// zero. This is the half of the surface that says "the answer you got is
-/// fresh" — without it, a caller could not tell an extrapolating call that did
-/// not need to extrapolate from one that did.
-///
-/// The `edge` sentinel is the C side's sharpening of the Rust value it mirrors:
-/// `Extrapolated::edge` is documented *meaningless when `by_ns == 0`*, and a
-/// plausible edge id for an answer nothing invented is exactly the kind of
-/// meaningless a diagnostic gets logged as fact. `TFT_INVALID_ID` is what the
-/// rest of this header already means by "does not apply".
-///
-/// Mutant: pass `x.edge.get()` through unconditionally ⇒ `an interpolated
-/// answer has no stale edge to name` fails with `edge` = the fixture's dynamic
-/// edge id.
-///
-/// **The `edge` assertion here reads a value only because the `by_ns` one
-/// proves a write happened.** The callee writes the whole struct or none of it,
-/// and the seed is [`EXTRAP_OUT_UNWRITTEN_BY_NS`] for the reason that constant
-/// records.
 #[test]
 fn an_in_window_stamp_reports_no_extrapolation_under_any_policy() {
     let tree = DomainTree::new(1);
@@ -1666,15 +1347,6 @@ fn an_in_window_stamp_reports_no_extrapolation_under_any_policy() {
 }
 
 /// **The distance is not optional, and that is the whole design.**
-///
-/// `docs/decisions/0039` §1: the Rust return type has no accessor yielding the
-/// pose alone. C cannot enforce that in the type system, so the closest honest
-/// analogue is a required out-parameter — there is no second spelling of this
-/// call without it, and NULL is refused before anything is evaluated.
-///
-/// Mutant: treat a NULL `info` as "the caller does not want it" and skip the
-/// write ⇒ the first assertion fails with `TFT_OK`, and the property the whole
-/// surface exists for is gone.
 #[test]
 fn the_extrapolation_distance_cannot_be_declined() {
     let tree = DomainTree::new(1);
@@ -1701,9 +1373,7 @@ fn the_extrapolation_distance_cannot_be_declined() {
         "and nothing was written on the way to saying so"
     );
 
-    // A caller that forgot `struct_size` is refused rather than served: §3.6's
-    // append mechanism only works if the size is checked, and this is the
-    // check `tft_error` already makes.
+    // A missing `struct_size` is refused (§3.6).
     let mut info = extrap_out();
     info.struct_size = 4;
     // SAFETY: live plan, valid `out`, live `info` — with a deliberately wrong
@@ -1726,18 +1396,6 @@ fn the_extrapolation_distance_cannot_be_declined() {
 }
 
 /// **Two enum arguments, two refusals, and neither is a silent fallback.**
-///
-/// A policy discriminant this build does not define is `TFT_ERR_BAD_ENUM`
-/// rather than a quiet `TFT_EXTRAP_ERROR`: the policies differ in what the
-/// answer *is*, so serving a different one than the caller named is a wrong
-/// pose, not a wrong format.
-///
-/// `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is refused for a different reason — it is a
-/// layout this build defines and this entry point does not take, exactly as
-/// `tft_publisher_push` refuses the write-only `AFFINE12_ROW_F32`. The engine
-/// has no extrapolating `at_with_derivatives`, and emitting a twist under
-/// `Error` beside a pose under the caller's policy would put two answers in
-/// one thirteen-`f64` row.
 #[test]
 fn an_unknown_policy_and_the_twist_layout_are_both_refused() {
     let tree = DomainTree::new(1);
@@ -1781,15 +1439,6 @@ fn an_unknown_policy_and_the_twist_layout_are_both_refused() {
 }
 
 /// **The handle's time domain reaches this entry point too.**
-///
-/// `docs/decisions/0038` put the tag on the plan handle and routed the three
-/// evaluate entry points through the tagged core methods. A fourth evaluate
-/// entry point that reconstructed `SystemDomain` would be that defect again,
-/// one call over, and it would be invisible on every tag-0 arena.
-///
-/// Mutant: call `at_extrapolating` (the typed form, hard-coding
-/// `SystemDomain::TAG`) instead of `at_extrapolating_tagged` ⇒ `TFT_ERR_TIME_DOMAIN`
-/// here.
 #[test]
 fn extrapolating_carries_the_plans_time_domain() {
     let tree = DomainTree::new(1);

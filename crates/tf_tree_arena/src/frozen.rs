@@ -2,9 +2,8 @@
 //!
 //! # The file *is* the arena
 //!
-//! The pointer-free arena maps back with no parsing. §2.1 is NORMATIVE that the
-//! frozen read path is the identical `Plan::at` code; [`FrozenArena`] only
-//! *obtains* the base pointer, as [`crate::mapped`] does.
+//! §2.1 (NORMATIVE): the frozen read path is the identical `Plan::at` code;
+//! [`FrozenArena`] only obtains the base pointer, as [`crate::mapped`] does.
 //!
 //! # SAFETY (module invariant)
 //!
@@ -12,18 +11,15 @@
 //! at offset `arena_off`, unmapped exactly once in [`Drop`]. For its lifetime:
 //!
 //! * `base` is non-null, page-aligned (hence 64-byte aligned), and addresses
-//!   `len` **readable** bytes. The mapping is `PROT_READ`; see
-//!   [`FrozenArena::base`] for why the trait still hands out a `*mut u8`.
+//!   `len` **readable** bytes (`PROT_READ`; see [`FrozenArena::base`]).
 //! * `len` is the [`FrozenHeader`]'s `arena_size`, checked against the file's
 //!   size and the [`ArenaHeader`]'s own before acceptance.
 //! * Typed access goes through `tf_tree_core`'s protocols, as for the other backends.
 //!
-//! # `SIGBUS`, and why a file cannot be sealed
+//! # `SIGBUS`
 //!
-//! A file has no seals, so truncating a mapped `.tft` faults its readers; the
-//! mitigation is §2.4's trust model (no writers; a `.tft` is a regenerable cache).
-//!
-//! # What is deliberately *not* here
+//! A file has no seals, so truncating a mapped `.tft` faults its readers;
+//! mitigated by §2.4's trust model (no writers, a regenerable cache).
 //!
 //! No `MADV_DONTFORK`: inheriting the mapping across `fork` is §2.2's feature.
 
@@ -40,22 +36,19 @@ use crate::header::{ArenaHeader, FORMAT_VERSION};
 use crate::heap::Arena;
 use crate::layout::layout_hash;
 
-/// First eight bytes of a `.tft` file (§2.3). Deliberately *not*
-/// [`crate::header::TF_TREE_MAGIC`]: the arena starts two megabytes in, and a raw
-/// arena image must not be mistaken for a frozen file.
+/// First eight bytes of a `.tft` file (§2.3); deliberately not
+/// [`crate::header::TF_TREE_MAGIC`], so a raw arena image is not mistaken for one.
 pub const FROZEN_MAGIC: [u8; 8] = *b"TFTFROZ\0";
 
 /// Size of the on-disk [`FrozenHeader`], and the offset the manifest may start at.
 pub const FROZEN_HEADER_SIZE: usize = 128;
 
-/// Alignment of the arena image within the file (§2.3): **2 MiB, not one
-/// page**, because a huge page needs virtual address and file offset congruent
-/// modulo 2 MiB (~28 000 TLB entries on 4 KiB pages against 55).
+/// Alignment of the arena image within the file (§2.3): 2 MiB, not one page,
+/// because a huge page needs congruent virtual address and file offset.
 pub const ARENA_FILE_ALIGN: u64 = 2 * 1024 * 1024;
 
-/// The `.tft` container header — `docs/PHASE5.md` §2.3, NORMATIVE: **128 bytes
-/// with 8 reserved**, no implicit padding, pinned by
-/// [`frozen_header_has_no_padding`](self#tests).
+/// The `.tft` container header — `docs/PHASE5.md` §2.3, NORMATIVE: 128 bytes
+/// with 8 reserved, pinned by [`frozen_header_has_no_padding`](self#tests).
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct FrozenHeader {
@@ -132,8 +125,7 @@ impl From<ShmError> for FrozenError {
     }
 }
 
-// `Display` and `core::error::Error` follow `docs/decisions/0059`, decision 2
-// (a)-(g); the match is exhaustive with no catch-all.
+// `Display` and `core::error::Error` follow `docs/decisions/0059` decision 2.
 
 /// **The text is a diagnostic, not a compatibility promise** (`docs/API.md`
 /// R5); callers match on the discriminant. `source` returns `None`.
@@ -176,9 +168,8 @@ impl core::fmt::Display for FrozenError {
     }
 }
 
-/// Lets a `FrozenError` leave a function through `?` into `Box<dyn Error>`.
-/// `source` is `None`, including for [`FrozenError::Arena`], whose payload is
-/// already in its `Display`.
+/// Lets a `FrozenError` leave a function through `?` into `Box<dyn Error>`;
+/// `source` is `None`.
 impl core::error::Error for FrozenError {}
 
 /// Bytes copied per pass: one 64 KiB buffer, not a second copy of the index.
@@ -190,9 +181,9 @@ const SNAPSHOT_CHUNK: usize = 64 * 1024;
 /// `fd` must refer to a regular file that this call may size and overwrite from
 /// offset 0. The gap between the manifest and the 2 MiB-aligned arena is a hole.
 ///
-/// # The container header is written **last**, and that is the whole crash story
+/// # The container header is written **last**
 ///
-/// A crash leaves a **full-length** file with a zeroed tail, which `file_size`
+/// A crash leaves a full-length file with a zeroed tail, which `file_size`
 /// cannot catch. Order: `ftruncate(fd, 0)` (load-bearing: a stale same-geometry
 /// header would certify a half-written body), size, write manifest and arena,
 /// flush, then `pwrite` the header at offset 0; until then
@@ -200,10 +191,9 @@ const SNAPSHOT_CHUNK: usize = 64 * 1024;
 ///
 /// # The snapshot is not atomic
 ///
-/// Publishers keep storing into a live arena, so the bytes are a *smear*
-/// (a slot caught mid-publish reads back `SlotContended`). Freeze a quiesced or
-/// bag-built (§3) arena for a clean index. The chunked copy is a deliberate data
-/// race under the memory model.
+/// A live arena is a *smear* (a slot caught mid-publish reads back
+/// `SlotContended`); freeze a quiesced or bag-built (§3) arena. The chunked copy
+/// is a deliberate data race under the memory model.
 ///
 /// # Errors
 ///
@@ -251,8 +241,7 @@ fn plan_header(
         format_version: FORMAT_VERSION,
         layout_hash: layout_hash(),
         file_size,
-        // `try_from`, not `as`: an oversized manifest is a refusal, not a
-        // truncated offset.
+        // `try_from`, not `as`: an oversized manifest is a refusal.
         manifest_off: u32::try_from(manifest_off).map_err(|_| FrozenError::HeaderInconsistent)?,
         manifest_len: u32::try_from(manifest_len).map_err(|_| FrozenError::HeaderInconsistent)?,
         arena_off,
@@ -272,8 +261,7 @@ fn write_body<A: Arena + ?Sized>(
     manifest: &[u8],
     header: &FrozenHeader,
 ) -> Result<(), FrozenError> {
-    // Discard first (see `write_frozen`), then size the file up: everything
-    // below is `pwrite` at an explicit offset.
+    // Discard first (see `write_frozen`), then size the file up.
     rustix::fs::ftruncate(fd, 0).map_err(FrozenError::Io)?;
     rustix::fs::ftruncate(fd, header.file_size).map_err(FrozenError::Io)?;
     pwrite_all(fd, manifest, u64::from(header.manifest_off))?;
@@ -343,10 +331,8 @@ pub struct FrozenArena {
     len: usize,
     /// Kept open for [`FrozenArena::read_manifest`].
     file: OwnedFd,
-    /// **Boxed, and the indirection is the point.** Inline, this cold 128-byte
-    /// header grew `size_of::<Tree>()` from 224 to 344 bytes (four cache lines to
-    /// six) for every backing. (`docs/PROJECT.md` §5 D4 forbids `Box` inside an
-    /// *arena structure*; this is a process-local handle.)
+    /// Boxed: inline, this cold header grew `size_of::<Tree>()` from 224 to 344
+    /// bytes. (D4 forbids `Box` inside an arena structure, not a process-local handle.)
     header: alloc::boxed::Box<FrozenHeader>,
 }
 
@@ -354,8 +340,8 @@ impl FrozenArena {
     /// Validate a `.tft` and map its arena image read-only (§2.4).
     ///
     /// `fd` must refer to a regular file opened for reading. The mapping is
-    /// `MAP_PRIVATE | MAP_NORESERVE`: clean page cache stays shared across every
-    /// process that opens the file (§2.2), with no possibility of writeback.
+    /// `MAP_PRIVATE | MAP_NORESERVE`: clean page cache is shared across
+    /// processes (§2.2), with no writeback.
     /// # Errors
     ///
     /// See [`FrozenError`]; in particular a `layout_hash` mismatch is refused
@@ -371,8 +357,7 @@ impl FrozenArena {
         // `pod_read_unaligned`: `raw` has no alignment guarantee.
         let header: FrozenHeader = bytemuck::pod_read_unaligned(&raw);
 
-        // Identity, vocabulary, geometry, self-consistency: the order of
-        // `crate::check`.
+        // Order of `crate::check`.
         if header.magic != FROZEN_MAGIC {
             return Err(FrozenError::BadMagic);
         }
@@ -407,8 +392,7 @@ impl FrozenArena {
                 core::ptr::null_mut(),
                 len,
                 ProtFlags::READ,
-                // NORESERVE: a frozen index is mapped in full and touched
-                // sparsely, so it must not be charged at its full size.
+                // NORESERVE: mapped in full, touched sparsely.
                 MapFlags::PRIVATE | MapFlags::NORESERVE,
                 &fd,
                 header.arena_off,
@@ -439,8 +423,8 @@ impl FrozenArena {
         &self.header
     }
 
-    /// The CBOR manifest bytes (§2.3), read from the file rather than mapped:
-    /// it is cold, and mapping it would put its pages in every worker.
+    /// The CBOR manifest bytes (§2.3), read from the file so its cold pages stay
+    /// out of every worker.
     ///
     /// # Errors
     ///
@@ -467,17 +451,15 @@ impl FrozenArena {
     }
 }
 
-/// Whether the header's own offsets describe a file that hangs together,
-/// checked **before** any is handed to `mmap` or `pread`. The
-/// `manifest_off + manifest_len` overflow arm is unreachable while both fields
-/// are `u32`; it is a width guard, and `+` would wrap silently if either widens.
-/// The `arena_off + arena_size` arm is reachable from a hand-edited header.
+/// Whether the header's own offsets describe a file that hangs together, checked
+/// before any is handed to `mmap` or `pread`. The manifest `+` arm is a width
+/// guard (unreachable while both fields are `u32`); the arena arm is reachable
+/// from a hand-edited header.
 fn check_extents(h: &FrozenHeader) -> Result<(), FrozenError> {
     if !h.arena_off.is_multiple_of(ARENA_FILE_ALIGN) {
         return Err(FrozenError::HeaderInconsistent);
     }
-    // The manifest must live strictly between the container header and the
-    // arena.
+    // The manifest must live strictly between the container header and the arena.
     if u64::from(h.manifest_off) < FROZEN_HEADER_SIZE as u64 {
         return Err(FrozenError::HeaderInconsistent);
     }
@@ -514,8 +496,7 @@ impl core::fmt::Debug for FrozenArena {
 
 impl Drop for FrozenArena {
     fn drop(&mut self) {
-        // No `getpid` guard, unlike `MappedArena`: this mapping is deliberately
-        // inherited across `fork` (see the module docs).
+        // No `getpid` guard, unlike `MappedArena`: the mapping is inherited across `fork`.
         //
         // SAFETY: module invariant — `base`/`len` are exactly what `mmap`
         // returned for this arena, unmapped here exactly once.
@@ -534,10 +515,8 @@ unsafe impl Sync for FrozenArena {}
 unsafe impl Arena for FrozenArena {
     /// # A `*mut u8` into a `PROT_READ` mapping
     ///
-    /// A store through it delivers `SIGSEGV`, as for a
-    /// [`crate::mapped::AttachMode::ReadOnly`] `MappedArena`; the `Tree` above
-    /// consults `is_writable()` and refuses every mutating entry point. A frozen
-    /// arena is *permanently* read-only (§2.4).
+    /// A store through it delivers `SIGSEGV`; the `Tree` above consults
+    /// `is_writable()` and refuses every mutating entry point (§2.4).
     fn base(&self) -> *mut u8 {
         self.base.as_ptr()
     }
@@ -563,7 +542,7 @@ mod tests {
     fn scratch() -> OwnedFd {
         use rustix::fs::{Mode, OFlags};
         let mut name = alloc::string::String::from("/tmp/tf_tree_frozen_test_");
-        // Pid *and* a counter: `cargo test` runs these as threads of one process.
+        // Pid and a counter: `cargo test` runs these as threads of one process.
         static N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let pid = rustix::process::getpid().as_raw_nonzero().get();
         let n = N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -585,17 +564,15 @@ mod tests {
         (fd, h)
     }
 
-    /// The header is a wire structure, so implicit padding would be
-    /// uninitialised bytes on disk. `Pod` rejects padding at compile time; this
-    /// pins the *size*. Mutant: `_reserved` → `[u8; 16]` ⇒ fails.
+    /// The header is a wire structure; `Pod` rejects padding, this pins the size.
+    /// Mutant: `_reserved` → `[u8; 16]`.
     #[test]
     fn frozen_header_has_no_padding() {
         assert_eq!(core::mem::size_of::<FrozenHeader>(), FROZEN_HEADER_SIZE);
         assert_eq!(core::mem::align_of::<FrozenHeader>(), 8);
     }
 
-    /// Pins the boxing argument on the `header` field. Mutant: store the
-    /// `FrozenHeader` inline ⇒ 152 bytes and this fails.
+    /// Pins the boxing on the `header` field. Mutant: store `FrozenHeader` inline.
     #[test]
     fn the_frozen_handle_stays_pointer_sized() {
         assert!(
@@ -606,13 +583,9 @@ mod tests {
     }
 
     /// A crash between the last arena byte and the container header must leave a
-    /// file that will not open, not one that serves zeros.
-    ///
-    /// Calls the same `write_body` as `write_frozen` and stops. The scratch fd
-    /// already holds a **complete, valid `.tft` of identical geometry**, so its
-    /// header is byte-for-byte the one the interrupted write would publish.
-    /// Mutant: drop the leading `ftruncate(fd, 0)` in `write_body` ⇒ the stale
-    /// header survives and the file opens.
+    /// file that will not open. Stops after `write_body`, so the scratch fd holds
+    /// a complete `.tft` whose header is the one the interrupted write would
+    /// publish. Mutant: drop the leading `ftruncate(fd, 0)` in `write_body`.
     #[test]
     fn a_crash_before_the_header_lands_leaves_an_unopenable_file() {
         let layout = fixture();
@@ -646,8 +619,7 @@ mod tests {
             "a body with no header must not open"
         );
 
-        // Once the header is committed the same file is good: the refusal above
-        // is the ordering.
+        // Once the header is committed the same file is good.
         commit_header(fd.as_fd(), &planned).unwrap();
         let opened = FrozenArena::open(fd).unwrap();
         // SAFETY: both arenas are live and `len` bytes each.
@@ -656,8 +628,7 @@ mod tests {
         assert_eq!(mapped, bytes(&second));
     }
 
-    /// Fill the pose region with a non-zero pattern: `HeapArena::new` zeroes
-    /// everything past the header, so a body comparison would hold vacuously.
+    /// Fill the pose region with a non-zero pattern, or a body comparison is vacuous.
     fn scribble(arena: &mut HeapArena, tag: u8) {
         let off = fixture().pose_arena().offset;
         // SAFETY: `off + 64` is inside the pose region; `&mut` owns the allocation.
@@ -678,10 +649,8 @@ mod tests {
         rustix::io::dup(fd).unwrap()
     }
 
-    /// A `.tft` round-trips: the mapped image is byte-for-byte the frozen arena
-    /// and the manifest comes back unchanged. The body is scribbled so a
-    /// header-only freeze cannot pass. Mutant: drop the arena-chunk
-    /// `pwrite_all` in `write_frozen` ⇒ fails on the body.
+    /// A `.tft` round-trips: mapped image byte-identical, manifest unchanged.
+    /// Mutant: drop the arena-chunk `pwrite_all` in `write_frozen`.
     #[test]
     fn a_frozen_file_maps_back_to_the_same_bytes() {
         let layout = fixture();
@@ -711,11 +680,8 @@ mod tests {
         assert_eq!(a, b, "the frozen image is not the arena it came from");
     }
 
-    /// The arena image must be [`ARENA_FILE_ALIGN`]-aligned in the file (§2.3),
-    /// and the skipped gap is a **hole**: a 25 KB arena in a 2.1 MB file must
-    /// occupy well under 100 KB of blocks. Mutants: round `arena_off` up to 4096
-    /// ⇒ fails; `pwrite_all` zeros into the gap in `write_body` ⇒ `st_blocks`
-    /// jumps and this fails.
+    /// The arena image is [`ARENA_FILE_ALIGN`]-aligned (§2.3) and the gap is a
+    /// hole. Mutants: round `arena_off` up to 4096; `pwrite_all` zeros into the gap.
     #[test]
     fn the_arena_image_is_two_megabyte_aligned_and_the_gap_is_a_hole() {
         let arena = HeapArena::new(&fixture(), 0, 0, [0; 16]);
@@ -733,9 +699,8 @@ mod tests {
         );
     }
 
-    /// A `.tft` from a different build must be refused, not reinterpreted
-    /// (§2.4, NORMATIVE). Each case is a single-field edit of a good file.
-    /// Mutant: delete either check in `FrozenArena::open` ⇒ that case fails.
+    /// A `.tft` from a different build is refused (§2.4, NORMATIVE). Mutant:
+    /// delete either check in `FrozenArena::open`.
     #[test]
     fn a_stale_layout_or_version_is_refused_by_value() {
         let arena = HeapArena::new(&fixture(), 0, 0, [0; 16]);
@@ -765,10 +730,8 @@ mod tests {
         }
     }
 
-    /// Truncation must be an error rather than a `SIGBUS` from inside a lookup:
-    /// a regular file has no seals, so the size check is the only guard. Mutant:
-    /// delete the `file_size != actual` comparison ⇒ this fails with `Truncated`,
-    /// not `SizeMismatch`, so the assertion pins the check that ran.
+    /// Truncation is an error, not a `SIGBUS`. Mutant: delete the
+    /// `file_size != actual` comparison (fails with `Truncated`).
     #[test]
     fn a_truncated_file_is_refused_before_it_is_mapped() {
         let arena = HeapArena::new(&fixture(), 0, 0, [0; 16]);
@@ -783,9 +746,8 @@ mod tests {
         );
     }
 
-    /// Anything that is not a `.tft` must be rejected on the magic, before an
-    /// offset is believed. Mutant: delete the magic check ⇒ `VersionMismatch`.
-    /// The second case pins the `< FROZEN_HEADER_SIZE` guard before the `pread`.
+    /// A non-`.tft` is rejected on the magic. Mutant: delete the magic check. The
+    /// second case pins the `< FROZEN_HEADER_SIZE` guard.
     #[test]
     fn a_foreign_file_is_not_a_tft() {
         let fd = scratch();
@@ -800,12 +762,9 @@ mod tests {
         );
     }
 
-    /// `check_extents` guards a hand-edited header from an `mmap` of something
-    /// that is not there; every branch is unreachable through `write_frozen`, so
-    /// each is exercised directly. Mutants: drop `manifest_end > arena_off` ⇒
-    /// the overlapping case fails; `checked_add` → `wrapping_add` on the arena
-    /// ⇒ the `wraps` case fails (it was the survivor). The manifest `checked_add`
-    /// is deliberately not covered: it is unreachable while both operands are `u32`.
+    /// `check_extents` guards a hand-edited header; each branch is unreachable
+    /// through `write_frozen`, so each is exercised directly. Mutants: drop
+    /// `manifest_end > arena_off`; `checked_add` → `wrapping_add` on the arena.
     #[test]
     fn check_extents_rejects_every_way_the_offsets_can_lie() {
         let good = FrozenHeader {
@@ -854,10 +813,8 @@ mod tests {
         past_end.arena_size = ARENA_FILE_ALIGN;
         assert_eq!(check_extents(&past_end), Err(FrozenError::Truncated));
 
-        // `arena_off + arena_size` overflowing `u64`: the offset `2^64 - 2^21` is
-        // still `ARENA_FILE_ALIGN`-aligned and the sum is exactly `2^64`. The
-        // `is_multiple_of` assertion guards the constant staying a power of two,
-        // so this case keeps failing the overflow branch and not alignment.
+        // `arena_off + arena_size` overflowing `u64`; the `is_multiple_of`
+        // assertion keeps this failing the overflow branch, not alignment.
         let mut wraps = good;
         wraps.arena_off = u64::MAX - ARENA_FILE_ALIGN + 1;
         wraps.arena_size = ARENA_FILE_ALIGN;
@@ -873,14 +830,12 @@ mod tests {
     }
 
     /// `docs/decisions/0059` step 1(b) for `FrozenError`: every variant renders
-    /// by decision 2's rules, and **every `ShmError` wrapped in
-    /// `FrozenError::Arena`** must contain the payload's own `Display` and state
-    /// re-freezing (for a unit payload only that separates `{inner}` from
-    /// `{inner:?}`).
+    /// by decision 2's rules, and every `ShmError` in `FrozenError::Arena` must
+    /// contain the payload's own `Display` and state re-freezing.
     ///
-    /// **Mutants, each alone:** (M5) `Arena`'s arm → `{inner:?}`; (M6) drop
-    /// `, so it must be re-frozen` from `LayoutMismatch`; (M9) `Arena`'s arm →
-    /// `"{inner}; the .tft must be re-frozen"` (fails the search-key-last rule).
+    /// Mutants: (M5) `Arena`'s arm → `{inner:?}`; (M6) drop `, so it must be
+    /// re-frozen` from `LayoutMismatch`; (M9) `Arena`'s arm → `"{inner}; the .tft
+    /// must be re-frozen"`.
     #[test]
     fn every_frozen_error_variant_renders_by_0059s_rules() {
         use crate::check::every_shm_error;

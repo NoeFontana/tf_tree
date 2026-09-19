@@ -1,63 +1,16 @@
-//! **The guard on this suite's own `cfg` gates.** It contains no `#[test]`, and
-//! that is the point.
+//! The guard on this suite's own `cfg` gates. It contains no `#[test]`.
 //!
-//! # What it is guarding
+//! A misspelt `feature = "unstable"` makes gated tests absent, not broken, and
+//! `cargo test` reports nothing. A `const` assertion fails wherever the target
+//! compiles, tarball included; a test-count floor in `just` catches a whole
+//! target vanishing, and the two do not overlap.
 //!
-//! Four targets in this crate gate code on `feature = "unstable"` — `counters`
-//! whole, `behavior`, `construction` and `frozen` one test each — because
-//! `Tree::arena_view` exists only there and `cargo test` on the published
-//! tarball has to compile (see the `[dev-dependencies]` comment in
-//! `crates/tf_tree/Cargo.toml` for why the self-dev-dependency that used to
-//! force the feature on had to go). A `cfg` is a silent switch: misspell the
-//! feature and the gated code is not *broken*, it is *absent*, and an absent
-//! test reports nothing. Measured, on this branch: writing
-//! `#![cfg(feature = "unstabel")]` at the top of `tests/counters.rs` took
-//! `cargo nextest run --workspace` from *"825 tests run: 825 passed"* to
-//! *"820 tests run: 820 passed"*, still exit 0.
-//!
-//! # Why this is a `const` and not a test
-//!
-//! Two of the three things that could catch that misspelling only catch it
-//! somewhere:
-//!
-//! * `rustc`'s `unexpected_cfgs` does catch it, and it is not decoration —
-//!   measured, the same typo makes `just lint`'s
-//!   `cargo clippy --workspace --all-targets -- -D warnings` exit 101 with
-//!   *"unexpected `cfg` condition value: `unstabel` … `-D unexpected-cfgs`
-//!   implied by `-D warnings`"*. But it is a **warning** by default, so
-//!   `cargo test`, `cargo nextest run` and a packager building the tarball all
-//!   sail past it. It catches a name this crate does not declare and nothing
-//!   else.
-//! * A test-count floor in a `just` recipe catches a target that stops running,
-//!   which nothing in this file can see — but only in the recipes that carry it.
-//!
-//! A `const` assertion fails wherever the target is *compiled*, which is every
-//! one of those places and the tarball besides, and it costs no test name, so
-//! the counts this release measures do not move. It is the cheap half; the
-//! floor in `just` is the half that catches a whole target vanishing, and the
-//! two do not overlap.
-//!
-//! # What it checks
-//!
-//! Per file: that every `feature = "…"` in the source names a feature this
-//! crate actually declares, and that the number of them naming `unstable` has
-//! not fallen below what the file is supposed to have. A floor rather than an
-//! equality, because the failure being guarded against is a gate that *stops*
-//! matching — adding a gated test is a normal thing to do and should not need
-//! an edit here. `owned_writer.rs` is the one exception, and it is a ceiling
-//! rather than a floor: `just shm-check` runs that target as
-//! `cargo nextest run -p tf_tree --features shm --test owned_writer`, so a test
-//! gated on `unstable` in that file would run in no recipe in the repository.
-//!
-//! It reads the sources with `include_str!`, so it is checking the same bytes
-//! the compiler is compiling.
-//!
-//! **The list is the five targets the 0.0.1 refactor touched, and it is not the
-//! whole suite.** `tests/rendezvous.rs` and `tests/tsan.rs` gate on `shm` and
-//! `test-hooks` too and are not scanned; behind them stands `unexpected_cfgs`
-//! and nothing else, which is the weaker half — it fires only in a recipe that
-//! passes `-D warnings`. If a gate in either of them ever decides whether a
-//! tier runs a test, it belongs on this list.
+//! Per file: every `feature = "…"` names a declared feature, and the count
+//! naming `unstable` has not fallen below a floor (a ceiling for
+//! `owned_writer.rs`, which runs only under `just shm-check`). Sources are read
+//! with `include_str!`. The list is the five targets the 0.0.1 refactor
+//! touched; `tests/rendezvous.rs` and `tests/tsan.rs` are not scanned, so a
+//! gate there that decides whether a tier runs a test belongs on it.
 
 /// `true` when `needle` sits at `at` in `haystack`.
 const fn matches_at(haystack: &[u8], at: usize, needle: &[u8]) -> bool {
@@ -74,11 +27,8 @@ const fn matches_at(haystack: &[u8], at: usize, needle: &[u8]) -> bool {
     true
 }
 
-/// `(gates naming "unstable", gates naming a feature this crate does not
-/// declare)`.
-///
-/// The needle is written escaped, so this file's own text does not match it and
-/// the scanner cannot be fooled into counting itself.
+/// `(gates naming "unstable", gates naming an undeclared feature)`. The needle is
+/// written escaped so the scanner cannot count itself.
 const fn scan(src: &str) -> (usize, usize) {
     const KEY: &[u8] = b"feature = \"";
     let b = src.as_bytes();
@@ -90,8 +40,7 @@ const fn scan(src: &str) -> (usize, usize) {
             i += 1;
             continue;
         }
-        // The name starts after the opening quote; the closing quote is part of
-        // each candidate, so `"shm"` cannot match a hypothetical `"shmm"`.
+        // Each candidate includes its closing quote, so `"shm"` cannot match `"shmm"`.
         let name = i + KEY.len();
         if matches_at(b, name, b"unstable\"") {
             unstable += 1;
@@ -113,8 +62,7 @@ const COUNTERS: &str = include_str!("counters.rs");
 const FROZEN: &str = include_str!("frozen.rs");
 const OWNED_WRITER: &str = include_str!("owned_writer.rs");
 
-// `assert!` in a const context takes a literal message — no formatting — so
-// each file gets its own line and says what to do about it.
+// `assert!` in a const context takes a literal message, so each file gets its own line.
 const _: () = assert!(
     scan(BEHAVIOR).1 == 0,
     "tests/behavior.rs gates on a feature this crate does not declare — a \

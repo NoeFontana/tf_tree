@@ -1,33 +1,20 @@
 //! Consumer-side diagnostic counters — `docs/PHASE5.md` §5.
 //!
-//! # Publish-side counters need no storage
+//! Publish-side counters need no storage: push count is `EdgeRecord::head`, rate
+//! and gaps derive from the stamp array (§1.3). Only consumer-side failures are
+//! stored; `lookups_ok` accumulates in a `Guard`'s `Cell` and flushes on `Drop` (§5.4).
 //!
-//! Push count is `EdgeRecord::head`; rate, jitter and gaps derive from the stamp
-//! array; last publish time is the newest stamp (§1.3). A relaxed `fetch_add` on
-//! the push path would only duplicate them. Only consumer-side *failures* get
-//! storage, incremented on error paths.
-//!
-//! `lookups_ok` is the denominator and is the one that could be hot: a `Guard`
-//! accumulates it in a plain `Cell` and flushes once on `Drop` (§5.4).
-//!
-//! # Always on
-//!
-//! §5.3 is NORMATIVE: no environment variable, no runtime flag. The only switch
-//! is the compile-time `counters` feature (§5.5), which leaves the arena
-//! **regions in place** so the layout hash does not fork (D34).
+//! §5.3 is NORMATIVE: always on, no environment variable or runtime flag. The
+//! compile-time `counters` feature (§5.5) leaves the arena regions in place (D34).
 
 use crate::sync::{AtomicI64, AtomicU32, AtomicU64};
 
-/// Per-edge consumer-side counters. One cache line, exclusively.
-///
-/// `align(64)` and padded to 128 so two edges never share a line (consumers on
-/// different cores write these).
+/// Per-edge consumer-side counters; `align(64)`, padded to 128 so two edges
+/// never share a line.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct EdgeCounters {
-    /// Successful lookups that traversed this edge. **The denominator.**
-    ///
-    /// Flushed from a `Guard` on drop (§5.4), not incremented per lookup.
+    /// Successful lookups that traversed this edge. **The denominator;** flushed on `Guard` drop (§5.4).
     pub lookups_ok: AtomicU64,
     /// Requests older than the retained window.
     pub err_extrap_before: AtomicU64,
@@ -40,20 +27,15 @@ pub struct EdgeCounters {
     /// A slot stayed mid-write past the retry limit.
     pub err_slot_contended: AtomicU64,
     /// When the most recent failure happened, in arena-domain nanoseconds.
-    ///
-    /// `0` means "never failed".
+    /// When the most recent failure happened (arena-domain ns); `0` = never.
     pub last_err_nanos: AtomicI64,
-    /// The largest gap, in nanoseconds, between a requested stamp and the
-    /// nearest end of the retained window.
-    ///
-    /// A high-water mark, not a total.
+    /// The largest gap (ns) between a requested stamp and the nearest end of
+    /// the retained window; a high-water mark.
     pub worst_extrap_gap_ns: AtomicI64,
     _pad: [u8; 64],
 }
 
-/// The same counters, per **participant slot** rather than per edge.
-///
-/// An edge counter says failures exist; this says *which consumer* is failing.
+/// The same counters per **participant slot**: which consumer is failing.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct ParticipantCounters {
@@ -72,13 +54,11 @@ pub struct ParticipantCounters {
     /// See [`EdgeCounters::last_err_nanos`].
     pub last_err_nanos: AtomicI64,
     /// The edge this participant most recently failed on, or `u32::MAX`.
-    ///
-    /// Not in [`EdgeCounters`], where it would be a tautology.
     pub last_err_edge: AtomicU32,
     _pad: [u8; 60],
 }
 
-// By hand: `[u8; 64]` has no `Default`, and the sentinels are stated.
+// By hand: `[u8; 64]` has no `Default`.
 impl Default for EdgeCounters {
     fn default() -> EdgeCounters {
         EdgeCounters {
@@ -114,8 +94,7 @@ impl Default for ParticipantCounters {
 
 #[cfg(not(loom))]
 const _: () = {
-    // Cross-process contract folded into `tf_tree_arena::layout::layout_hash`
-    // (stride 128 for each counter region); change both together.
+    // Folded into `tf_tree_arena::layout::layout_hash` (stride 128); change both together.
     assert!(core::mem::size_of::<EdgeCounters>() == 128);
     assert!(core::mem::align_of::<EdgeCounters>() == 64);
     assert!(core::mem::size_of::<ParticipantCounters>() == 128);

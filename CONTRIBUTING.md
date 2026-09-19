@@ -1,82 +1,51 @@
 # Contributing
 
-Human-facing guide; agents also read [`CLAUDE.md`](./CLAUDE.md) (its *Project
-shape* annotates each crate's unsafe and dependency budget). The crate tree is in
+Agents also read [`CLAUDE.md`](./CLAUDE.md); the crate tree is in
 [`README.md`](./README.md#workspace).
 
-`docs/PROJECT.md` and `docs/PHASE1.md` are the contract — read them in that order
-before proposing a change. `docs/PHASE2.md` §1 lists Phase 1 amendments A1–A8
-(all applied); read them before altering a concurrency protocol. Each spec's §0.0
-status table outranks this file.
+`docs/PROJECT.md` and `docs/PHASE1.md` are the contract; read them in that order
+before proposing a change. `docs/PHASE2.md` §1 (amendments A1–A8) before altering
+a concurrency protocol. Each spec's §0.0 status table outranks this file.
 
-`tf_tree_core` is the source of truth. `tf_tree_math` and `tf_tree_arena` are
-separately publishable; `just miri` covers `tf_tree_arena`, `tf_tree_core` and
-`tf_tree`, never `tf_tree_math`. The Python bindings (`crates/tf_tree_py`) are
-excluded from the cargo workspace because they link libpython; `just py-test` /
-`just py-lint` are their gate.
+`crates/tf_tree_py` is excluded from the cargo workspace (it links libpython);
+`just py-test` / `just py-lint` are its gate.
 
 ## Prerequisites
 
-Rust (stable, pinned by `rust-toolchain.toml`) via `rustup`, plus `nightly` with
-`miri` for `just miri`; [`just`](https://github.com/casey/just);
-`cargo-nextest` and `cargo-deny` (`cargo install <name> --locked`).
-
-## Quickstart
-
-`just build`, `just test` (nextest + doctests + ingest-check), `just lint` (fmt
-`--check`, then a clippy `-D warnings` pass per feature config), `just audit`
-(cargo deny; **not** part of `just lint`), `just fmt`, `just loom`, `just miri`
-(arena + core + the facade's one unsafe), `just bench` (suite + go/no-go gate).
+`rustup` (stable per `rust-toolchain.toml`, plus `nightly` with `miri`),
+[`just`](https://github.com/casey/just), `cargo-nextest`, `cargo-deny`.
 
 ## Workflow for significant changes
 
-Work scoped by a phase spec is implemented directly against it — cite the section
-number in the PR. Anything else that touches the public API, crate boundaries,
-build system or release process starts as a **decision document**:
+Work scoped by a phase spec cites its section in the PR. Anything else touching
+the public API, crate boundaries, build system or release process starts as a
+**decision document**:
 
 1. Copy [`docs/decisions/template.md`](./docs/decisions/template.md) to
    `docs/decisions/NNNN-kebab-case-title.md` (next number); status starts `draft`.
-2. Open a PR with **just the decision document**; when the open questions are
-   resolved, flip the status to `ready` — now the implementation contract.
-3. Implement under PRs that link the number; each maps to one step of the
-   *Implementation plan*.
+2. Open a PR with just the record; once its open questions are resolved, flip the
+   status to `ready`.
+3. Implement under PRs that link the number, one per *Implementation plan* step.
 4. When all merge, flip the status to `implemented` and list the PR numbers.
-   This is the immutability lock.
 
 Bug fixes, behavior-preserving refactors and dependency bumps need no record.
 
-## Changelog entries
-
-`CHANGELOG.md`'s `[Unreleased]` says **what changed, whether it breaks anything,
-the PR number, and where the argument lives** — not the argument itself.
-
 ## Pull-request checklist
 
-- [ ] `just lint` is clean.
-- [ ] `just test` passes (and `just loom` / `just miri` if you touched
-      concurrency or arena code).
-- [ ] `just audit` is clean (or the failure is explained).
-- [ ] The `CHANGELOG.md` entry links its argument rather than repeating it.
-- [ ] Public Rust items have doc comments (`missing_docs` warns; CI builds docs
-      with `-D warnings`).
-- [ ] Every `unsafe` block has a `// SAFETY:` comment naming its invariant, and
-      `unsafe` stays within its budgeted crates/modules.
-      `clippy::undocumented_unsafe_blocks` fails a missing comment only in a
-      configuration some clippy line compiles (`just lint`; `just shm-check` for
-      `shm`-gated files; `just py-compile`; the container-only `just tf2-check`);
-      `scripts/unsafe-budget.sh`'s *What it does NOT prove* lists the rest. It
-      never fails a comment that names nothing; that half is yours.
-- [ ] An architectural change cites the spec section it implements, or a linked
-      `ready`/`implemented` decision.
+- [ ] `just lint`, `just test` and `just audit` pass (plus `just loom` /
+      `just miri` for concurrency or arena code).
+- [ ] The `CHANGELOG.md` `[Unreleased]` entry says what changed and whether it
+      breaks anything, and links the argument.
+- [ ] Every `unsafe` block has a `// SAFETY:` comment naming its invariant, within
+      its budgeted crate/module.
+- [ ] An architectural change cites the spec section or `ready`/`implemented`
+      decision it implements.
 
 ## Releasing
 
-`release.yml` and `wheels.yml` fire on a `v*` tag and publish irreversibly. Two
-things are the maintainer's:
+`release.yml` and `wheels.yml` fire on a `v*` tag and publish irreversibly.
 
-**Signed tags.** `docs/PHASE5.md` §10 lists this as the one open
-release-automation item. The workflow **warns** on an unsigned tag until a key
-exists. One-time setup:
+**Signed tags** (`docs/PHASE5.md` §10). One-time setup:
 
 ```sh
 git config --global gpg.format ssh
@@ -84,16 +53,12 @@ git config --global user.signingkey ~/.ssh/id_ed25519.pub
 git config --global tag.gpgSign true       # sign every annotated tag
 ```
 
-Add the same public key to your GitHub account **as a signing key** (separate
-from authentication keys), and set the repository variable `REQUIRE_SIGNED_TAGS`
-to `true`; from then on an unsigned tag is refused. `git verify-tag v0.0.6`
-checks locally.
+Add the same public key to GitHub **as a signing key** and set the repository
+variable `REQUIRE_SIGNED_TAGS` to `true`; an unsigned tag is then refused.
 
-**The SBOM** is generated by `scripts/sbom.py` from `cargo metadata` over the
-shipped crates' `normal` edges, attached to the release and covered by
-`SHA256SUMS`; `just sbom <version>` writes it locally.
+**The SBOM** comes from `scripts/sbom.py` (`just sbom <version>`) and is attached
+to the release.
 
 ## License
 
-Contributions are dual-licensed under [Apache-2.0](./LICENSE-APACHE) and
-[MIT](./LICENSE-MIT) at the contributor's option.
+Contributions are dual-licensed [Apache-2.0](./LICENSE-APACHE) / [MIT](./LICENSE-MIT).

@@ -1,7 +1,5 @@
-//! The benchmark artifact as a **regression gate** (`docs/PHASE5.md` §10).
-//!
-//! A committed `results.json` and a comparison that fails when the report this build
-//! produces is worse than it (§10's "benchmark artifact as a regression gate").
+//! The benchmark artifact as a **regression gate** (`docs/PHASE5.md` §10): a committed `results.json` and a
+//! comparison that fails when this build's report is worse.
 //!
 //! # What is compared
 //!
@@ -10,31 +8,21 @@
 //! | Compared | Ignored |
 //! |---|---|
 //! | `schema` | `generated_utc`, `git_commit`, `git_dirty` |
-//! | [`PORTABLE_FACTS`] — the build's identity, not the host's | `cpu_model`, `physical_cores`, `logical_cpus`, `kernel`, governor, THP, load |
+//! | [`PORTABLE_FACTS`] | `cpu_model`, `physical_cores`, `logical_cpus`, `kernel`, governor, THP, load |
 //! | the set of row ids, and of `where_we_are_worse` ids | every row's `reason`, `note` and `reproduce` prose |
-//! | each row's *status*, one-directionally (see below) | `host_fitness`, except as the classification of a **missing** metric, which decides refusal vs failure |
+//! | each row's *status*, one-directionally | `host_fitness`, except to classify a **missing** metric (refusal vs failure) |
 //! | directional metric values inside rows both sides call `measured` | metrics whose `drift` is `informational` |
-//! | directional metric values inside `where_we_are_worse` entries | a `where_we_are_worse` entry's `statement` and `metrics_absent_because` prose |
+//! | directional metric values inside `where_we_are_worse` entries (`0021` step 4) | those entries' `statement` and `metrics_absent_because` prose |
 //!
-//! `compare_worse` covers `where_we_are_worse` metrics (`docs/decisions/0021` step 4):
-//! such entries have no `status`, so the metric's direction is the whole contract.
-//! Prose is ignored because `reason` strings embed host facts.
+//! `Measured` in the baseline and not now is a failure (a withdrawn claim, §9.3); the reverse is a `new claim`
+//! note. The baseline's tolerance is used, since reading the running build's would let one commit widen the gate.
 //!
-//! # Status is compared in one direction only
-//!
-//! `Measured` in the baseline and not now is a failure (a withdrawn claim, §9.3). The
-//! reverse is a `new claim` note: the baseline is stale in our favour.
-//!
-//! # Whose tolerance
-//!
-//! The baseline's: it is the committed contract, and reading the running build's
-//! would let one commit widen the gate and hide the regression.
+//! The baseline's: reading the running build's would let one commit widen the gate.
 //!
 //! # Why `serde_json` here and hand-rolled JSON in [`crate::report`]
 //!
-//! Writing is hand-rolled so a `#[derive]` cannot rename a field; a parser bug
-//! reading a committed file fails open, so reading uses `serde_json`
-//! (`publish = false`, already in the lockfile).
+//! Writing is hand-rolled so a `#[derive]` cannot rename a field; reading uses `serde_json`, since a parser
+//! bug reading a committed file fails open.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -47,16 +35,11 @@ use crate::report::{Drift, Metric, Report, Status};
 /// The committed baseline, relative to the workspace root.
 pub const BASELINE_PATH: &str = "crates/tf_tree_bench/baseline/results.json";
 
-/// Provenance keys describing the artifact, which must match: `format_version` /
-/// `layout_hash` (a different arena), `interp_policy`, `build_profile` (the measured
-/// profile directory, so an `embedder` report cannot pass as `release`), and
-/// `counters_feature` / `shm_feature` / `tf2_feature` (each adds rows or changes the
-/// read path; `just bench-report-shm` has no committed baseline).
+/// Provenance keys that must match: `format_version`/`layout_hash`, `interp_policy`, `build_profile`, and
+/// `counters_feature`/`shm_feature`/`tf2_feature`.
 ///
-/// `target` is absent so the aarch64 job can run the gate (per-metric tolerances absorb
-/// cross-arch drift). `build_lto` is absent because it is a function of
-/// `build_profile` and adding a key forces a baseline regeneration; it lives in
-/// [`crate::runstore::BUILD_CRITICAL_FACTS`].
+/// `target` (the aarch64 job runs the gate) and `build_lto` (see
+/// [`crate::runstore::BUILD_CRITICAL_FACTS`]) are absent.
 pub const PORTABLE_FACTS: &[&str] = &[
     "format_version",
     "layout_hash",
@@ -72,8 +55,7 @@ pub const PORTABLE_FACTS: &[&str] = &[
 pub struct Comparison {
     /// One line per regression. Non-empty means the gate fails.
     pub failures: Vec<String>,
-    /// One line per row that became a claim the baseline does not carry. Not a
-    /// failure; the baseline is stale in our favour.
+    /// One line per row that became a claim the baseline lacks; not a failure.
     pub notes: Vec<String>,
     /// Directional metrics that were compared and held.
     pub checked: usize,
@@ -86,9 +68,7 @@ impl Comparison {
         self.failures.is_empty()
     }
 
-    /// A clean result that compared no directional metric: "0 failures" is also what a
-    /// gate that stopped comparing prints. A predicate so one unit test reaches the
-    /// branch `bench_report` refuses on.
+    /// A clean result that compared no directional metric: what a gate that stopped comparing also prints.
     #[must_use]
     pub fn compared_nothing(&self) -> bool {
         self.passed() && self.checked == 0
@@ -148,7 +128,6 @@ pub fn compare(baseline: &Value, current: &Report) -> Result<Comparison> {
              baseline deliberately (`just bench-baseline-update`) and review the diff",
             crate::report::SCHEMA
         ));
-        // Everything after this reads fields whose meaning just changed.
         return Ok(out);
     }
 
@@ -251,17 +230,13 @@ pub fn compare(baseline: &Value, current: &Report) -> Result<Comparison> {
     Ok(out)
 }
 
-/// Compare the `where_we_are_worse` entries' metrics (`0021` step 4: otherwise a
-/// directional metric there gated nothing). Entry ids are diffed by the caller.
+/// Compare the `where_we_are_worse` entries' metrics (`0021` step 4); the caller diffs entry ids.
 fn compare_worse(baseline: &Value, current: &Report, out: &mut Comparison) -> Result<()> {
     let Some(b_worse) = baseline.get("where_we_are_worse").and_then(Value::as_array) else {
-        // The caller has already failed on this.
         return Ok(());
     };
-    // Read from this report: `Worse` entries carry no per-metric sensitivity, and the
-    // memory axis is the one that reaches them. A passing axis does not prove the
-    // absence is the code's (`measure_idle_arena_resident` also withholds on a
-    // non-positive Pss delta), so the message names both possibilities.
+    // Read from this report: `Worse` entries carry no per-metric sensitivity. A passing axis does not prove
+    // the absence is the code's, so the message names both possibilities.
     let memory_reasons = if current.fitness.memory_reasons.is_empty() {
         String::from("(no reason recorded, which is itself a bug)")
     } else {
@@ -349,8 +324,7 @@ fn parse_metrics(
     Ok(out)
 }
 
-/// Compare one metric map. `absence` decides whether a missing metric is a failure or
-/// a refusal (see [`Absence`]).
+/// Compare one metric map; `absence` decides whether a missing metric is a failure or a refusal.
 fn compare_metrics(
     what: &str,
     baseline: &BTreeMap<String, BaselineMetric>,
@@ -450,7 +424,6 @@ mod tests {
     use super::*;
     use crate::report::{Fitness, Provenance, Row};
 
-    /// The seven artifact facts and one host fact, so a test can tell them apart.
     const FIXTURE_FACTS: &[(&str, &str)] = &[
         ("format_version", "3"),
         ("layout_hash", "0x3D104195"),
@@ -462,12 +435,10 @@ mod tests {
         ("cpu_model", "a CPU the baseline was taken on"),
     ];
 
-    /// A one-row report whose row is `measured` with one directional metric.
     fn report_with(value: f64, drift_hi: bool) -> Report {
         report_tuned(value, drift_hi, 0.10)
     }
 
-    /// [`report_with`] with the tolerance spelled out, so the two sides can disagree.
     fn report_tuned(value: f64, drift_hi: bool, tolerance: f64) -> Report {
         let m = crate::report::Metric::new("max_deviation", value, "rad or m");
         let m = if drift_hi {
@@ -476,7 +447,6 @@ mod tests {
             m.lower_is_better(tolerance)
         };
         Report {
-            // Spelled out, not derived from `PORTABLE_FACTS`, so the fixture cannot move with it.
             provenance: Provenance {
                 facts: FIXTURE_FACTS
                     .iter()
@@ -506,14 +476,11 @@ mod tests {
         }
     }
 
-    /// The baseline document for [`report_with`], rendered by the real writer.
     fn baseline_of(r: &Report) -> Value {
         serde_json::from_str(&r.to_json()).expect("the writer emits valid JSON")
     }
 
     /// An identical report passes and compares something (`checked` > 0).
-    ///
-    /// Mutant: make `compare_column`'s outer loop filter everything out.
     #[test]
     fn an_identical_report_passes_and_compares_something() {
         let r = report_with(2.5e-16, false);
@@ -523,8 +490,6 @@ mod tests {
     }
 
     /// Growth inside the tolerance passes; past it fails, naming the metric.
-    ///
-    /// Mutant: `c.value > b.value + slack * 100.0`.
     #[test]
     fn growth_past_the_baselines_tolerance_is_a_regression() {
         let base = baseline_of(&report_with(100.0, false));
@@ -542,8 +507,6 @@ mod tests {
     }
 
     /// A metric that changes direction fails rather than comparing inverted.
-    ///
-    /// Mutant: delete the `b.drift != c.drift` arm.
     #[test]
     fn a_metric_that_changes_direction_fails() {
         let base = baseline_of(&report_with(100.0, false));
@@ -557,8 +520,6 @@ mod tests {
     }
 
     /// A claim withdrawn fails; a claim new here does not.
-    ///
-    /// Mutant: push the withdrawal into `out.notes`.
     #[test]
     fn status_is_compared_in_one_direction_only() {
         let base = baseline_of(&report_with(100.0, false));
@@ -590,8 +551,6 @@ mod tests {
     }
 
     /// Host facts are ignored, build facts are not.
-    ///
-    /// Mutant: add `"cpu_model"` to [`PORTABLE_FACTS`] (fatal because `FIXTURE_FACTS` is fixed).
     #[test]
     fn host_facts_are_ignored_and_build_facts_are_not() {
         let r = report_with(100.0, false);
@@ -624,8 +583,6 @@ mod tests {
     }
 
     /// The set of rows and of `where_we_are_worse` entries must match in both directions.
-    ///
-    /// Mutant: make `diff_ids` return immediately.
     #[test]
     fn a_row_set_that_does_not_match_the_baseline_fails_in_both_directions() {
         let base = baseline_of(&report_with(100.0, false));
@@ -640,7 +597,6 @@ mod tests {
             c.failures
         );
 
-        // A row this build emits that the baseline never saw: easiest to leave ungated.
         let mut grown = report_with(100.0, false);
         let mut extra = grown.rows[0].clone();
         extra.id = "lookup_latency";
@@ -655,7 +611,6 @@ mod tests {
             c.failures
         );
 
-        // The same rule for §9.3's list.
         let mut worse = report_with(100.0, false);
         worse.worse.push(crate::report::Worse {
             id: "attach_latency",
@@ -676,7 +631,6 @@ mod tests {
         );
     }
 
-    /// A report carrying only §9.2's embedding row.
     fn embedding_report(out_of_crate_ns: f64, in_crate_ns: f64) -> Report {
         let ratio = out_of_crate_ns / in_crate_ns;
         let run = crate::embed::Run {
@@ -699,22 +653,14 @@ mod tests {
         r
     }
 
-    /// §9.2's 5% on the embedding row through the real gate; the middle case is why every
-    /// duration is gated, not only the ratio.
-    ///
-    /// Mutants: `boundary_ratio` tolerance `0.10`; the two durations informational.
+    /// §9.2's 5% on the embedding row through the real gate; the middle case is why every duration is gated.
     #[test]
     fn the_embedding_row_is_gated_at_five_percent_in_every_direction() {
         let base = baseline_of(&embedding_report(240.0, 200.0));
 
-        // 1. Both halves move 3% the same way: the ratio is unchanged and no
-        //    duration moved past the bound.
         let quiet = compare(&base, &embedding_report(247.2, 206.0)).expect("baseline");
         assert!(quiet.passed(), "a 3% shift in both halves: {quiet:?}");
 
-        // 2. The out-of-crate half loses ground against the in-crate one — the
-        //    exact shape a lost `#[inline]` on the cross-crate path has. The
-        //    ratio moves 5.3% while neither absolute number moves more than 5%.
         let skewed = compare(&base, &embedding_report(240.0, 190.0)).expect("baseline");
         assert!(!skewed.passed(), "a 5.3% ratio regression passed the gate");
         assert!(
@@ -723,8 +669,6 @@ mod tests {
             skewed.failures
         );
 
-        // 3. Both halves get 6% slower and the ratio does not move at all. A
-        //    row gated only on §9.2's quotient would call this clean.
         let slower = compare(&base, &embedding_report(254.4, 212.0)).expect("baseline");
         assert!(!slower.passed(), "6% slower on both sides passed the gate");
         assert!(
@@ -738,10 +682,7 @@ mod tests {
         );
     }
 
-    /// `bench-check` and `bench-baseline-update` must pass `bench_report` the same
-    /// `--embed-cost`: otherwise the row is `Unavailable` on the check side and the
-    /// one-directional status rule reports a withdrawn claim on every run. The current
-    /// row is the production one (`Options` with no `embed_cost`).
+    /// `bench-check` and `bench-baseline-update` must pass `bench_report` the same `--embed-cost`.
     #[test]
     fn a_baseline_that_measured_the_embedding_row_fails_a_check_that_did_not() {
         let measured = embedding_report(240.0, 200.0);
@@ -771,10 +712,7 @@ mod tests {
         );
     }
 
-    /// A directional metric the baseline does not carry fails; an informational one does
-    /// (`Report::validate` forces only one per row).
-    ///
-    /// Mutant: `if false && !baseline.contains_key(…)` in `compare_column`'s trailing loop.
+    /// A directional metric the baseline does not carry fails; an informational one does not.
     #[test]
     fn a_directional_metric_the_baseline_does_not_gate_fails() {
         let base = baseline_of(&report_with(100.0, false));
@@ -793,7 +731,6 @@ mod tests {
             c.failures
         );
 
-        // The control: most report numbers are context and must not need a regeneration.
         let mut context = report_with(100.0, false);
         context.rows[0]
             .tf_tree
@@ -807,11 +744,8 @@ mod tests {
     }
 
     /// The tolerance used is the baseline's.
-    ///
-    /// Mutant: `b.value.abs() * c.tolerance` in `compare_column`.
     #[test]
     fn the_tolerance_is_the_baselines_not_the_running_builds() {
-        // Baseline: 100, 10% allowed. This build: 150, and it says 100% is fine.
         let base = baseline_of(&report_tuned(100.0, false, 0.10));
         let widened = report_tuned(150.0, false, 1.00);
         let c = compare(&base, &widened).expect("baseline");
@@ -825,7 +759,6 @@ mod tests {
             c.failures
         );
 
-        // The control: a committed 100% tolerance really allows it.
         let generous = baseline_of(&report_tuned(100.0, false, 1.00));
         let c = compare(&generous, &report_tuned(150.0, false, 1.00)).expect("baseline");
         assert!(
@@ -836,16 +769,12 @@ mod tests {
     }
 
     /// A comparison that matched nothing is not a pass.
-    ///
-    /// Mutant: make `compared_nothing` return `false`.
     #[test]
     fn a_comparison_that_matched_nothing_is_not_a_pass() {
         let r = report_with(2.5e-16, false);
         let c = compare(&baseline_of(&r), &r).expect("baseline");
         assert!(c.passed() && !c.compared_nothing(), "a real comparison");
 
-        // A baseline whose only directional metric became context: it parses,
-        // it compares cleanly, and it gates nothing.
         let mut informational = baseline_of(&r);
         informational["rows"][0]["tf_tree"]["max_deviation"]["drift"] =
             Value::String(String::from("informational"));
@@ -859,8 +788,6 @@ mod tests {
     }
 
     /// A baseline with no `drift` is rejected, not compared as context.
-    ///
-    /// Mutant: default a missing `drift` to `Informational`.
     #[test]
     fn a_pre_gate_baseline_is_rejected_not_silently_skipped() {
         let r = report_with(100.0, false);
@@ -876,8 +803,7 @@ mod tests {
         );
     }
 
-    /// A `where_we_are_worse` entry with one directional metric, and its baseline, built
-    /// from [`report_with`] so row and entry are compared in one document.
+    /// A `where_we_are_worse` entry with one directional metric, and its baseline.
     fn report_with_worse(row_value: f64, worse_value: f64, tolerance: f64) -> Report {
         let mut r = report_tuned(row_value, false, 0.10);
         r.worse = vec![crate::report::Worse {
@@ -896,14 +822,10 @@ mod tests {
     }
 
     /// A directional metric inside a `where_we_are_worse` entry is gated (`0021` step 4).
-    ///
-    /// Mutant: delete the `compare_worse(...)` call in [`compare`].
     #[test]
     fn a_directional_metric_inside_a_worse_entry_is_gated() {
         let base = baseline_of(&report_with_worse(100.0, 24_576.0, 3.0));
 
-        // The row's own metric is unchanged throughout, so every verdict below
-        // is about the entry.
         let identical = compare(&base, &report_with_worse(100.0, 24_576.0, 3.0)).expect("baseline");
         assert!(identical.passed(), "identical: {:?}", identical.failures);
         assert_eq!(
@@ -911,7 +833,6 @@ mod tests {
             "the row's metric and the entry's must both be compared, not just the row's"
         );
 
-        // Inside the 300% band the real gate uses.
         let within = compare(&base, &report_with_worse(100.0, 90_000.0, 3.0)).expect("baseline");
         assert!(
             within.passed(),
@@ -919,7 +840,6 @@ mod tests {
             within.failures
         );
 
-        // Past it. 98x is what a revert of `0021` step 2 actually produces.
         let over = compare(&base, &report_with_worse(100.0, 2_408_448.0, 3.0)).expect("baseline");
         assert!(!over.passed(), "a 98x residency regression passed the gate");
         assert!(
@@ -933,11 +853,8 @@ mod tests {
         );
     }
 
-    /// A gated metric this build no longer emits is a failure on a host that could have
-    /// measured it and a refusal (with a note) on one that could not; informational
-    /// vanishings are reported as context.
-    ///
-    /// Mutant: collapse both [`Absence`] arms into `out.failures.push(...)`.
+    /// A gated metric this build no longer emits fails on a host that could have measured it and is a
+    /// refusal on one that could not; informational vanishings are context.
     #[test]
     fn a_withheld_worse_metric_is_a_failure_or_a_refusal_depending_on_the_host() {
         let base = baseline_of(&report_with_worse(100.0, 24_576.0, 3.0));
@@ -960,8 +877,6 @@ mod tests {
             c.failures
         );
 
-        // The same absence on a host whose memory axis failed is a refusal: a
-        // note naming the host's reason, and no failure.
         let mut unfit = gone.clone();
         unfit.fitness.fair_for_memory = false;
         unfit.fitness.memory_reasons = vec!["/proc/self/smaps_rollup is unreadable".to_owned()];
@@ -979,8 +894,6 @@ mod tests {
             c.notes
         );
 
-        // An informational metric that vanishes is still reported. `fair_for_memory` is set by
-        // hand: `Fitness::probe` fails every axis on a debug build.
         let mut ctx_gone = report_with_worse(100.0, 24_576.0, 3.0);
         ctx_gone.fitness.fair_for_memory = true;
         ctx_gone.worse[0]
@@ -999,12 +912,9 @@ mod tests {
 
     /// A `where_we_are_worse` entry with no directional baseline metric contributes no
     /// comparison.
-    ///
-    /// Mutant: count an informational metric into `out.checked`.
     #[test]
     fn an_all_informational_worse_entry_contributes_no_comparison() {
         let mut r = report_with_worse(100.0, 24_576.0, 3.0);
-        // Exactly what the committed baseline held before `0021` step 4.
         r.worse[0].metrics = vec![
             crate::report::Metric::new("idle_arena_bytes", 2_405_696.0, "B"),
             crate::report::Metric::new("idle_arena_resident_bytes", 24_576.0, "B"),

@@ -1,14 +1,10 @@
 //! `docs/PHASE2.md` §11.3 — one test per crash point this crate owns.
 //!
-//! Each crash point has two halves. The **death** is observed across a process
-//! boundary: each `<site>_aborts_*` test re-executes this binary with
-//! `TF_TREE_CRASH_AT` armed on an `#[ignore]`d `child_*` workload and asserts
-//! `SIGABRT` plus the site name and hit number on stderr (arming `:2` pins the
-//! counting). The **repair** is observed in the parent against staged state,
-//! because this `no_std` crate's structures are heap-backed and the `fork`+`mmap`
-//! a real post-mortem read needs belongs in `tf_tree_ipc` (`docs/decisions/0007`).
-//! §11.2 names the same split; the join (that the real path leaves exactly the
-//! staged words) is argued from each site's placement, not measured.
+//! Each site's **death** is observed across a process boundary: a `<site>_aborts_*`
+//! test re-executes this binary with `TF_TREE_CRASH_AT` armed on an `#[ignore]`d
+//! `child_*` workload and asserts `SIGABRT` plus the site name and hit on stderr.
+//! The **repair** is observed in the parent against staged state (§11.2), since
+//! the `fork`+`mmap` post-mortem belongs in `tf_tree_ipc` (`docs/decisions/0007`).
 //!
 //! # Where each row's repair is asserted
 //!
@@ -21,10 +17,9 @@
 //! | `claim.after_cas` | [`a_claim_left_by_a_dead_participant_resolves_and_is_reapable`], below |
 //! | `intern.after_hash_cas_before_id_store` | `tests::intern_recovers_from_a_claimant_that_died_before_publishing` |
 //!
-//! The child workloads are `#[ignore]`d so they are listed and harmless if run
-//! unarmed (each performs its operation and exits 0).
+//! The `child_*` workloads are `#[ignore]`d and exit 0 if run unarmed.
 
-// The child's stdout is its protocol; `panic`/`unwrap` as in the rest of the suite.
+// The child's stdout is its protocol.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -75,12 +70,8 @@ fn built_arena() -> HeapArena {
 
 // ---- the repair halves (feature-independent: the repair ships in every build) --
 
-/// `push.after_seq_even_before_head`: "sample fully written but unpublished →
-/// invisible, then overwritten".
-///
-/// Staged by rewinding the publishing store (§11.2's technique): a completed push
-/// then `head = 0` and `heartbeat = 0` is the state the crash point leaves. The
-/// second half (overwritten, not merely invisible) is the one with teeth.
+/// `push.after_seq_even_before_head`: a fully written but unpublished sample is
+/// invisible, then overwritten; staged by rewinding `head` and `heartbeat` to 0.
 #[test]
 fn an_unpublished_sample_is_invisible_and_then_overwritten() {
     let arena = built_arena();
@@ -130,14 +121,9 @@ fn an_unpublished_sample_is_invisible_and_then_overwritten() {
     ));
 }
 
-/// `claim.after_cas`: "claim held by a dead participant → reapable via slot
-/// indirection (A3)".
-///
-/// No rewind needed (A3): a `claim` whose caller never builds a `Publisher` *is*
-/// the post-crash state. Asserted in order: the owner word resolves to a slot;
-/// the slot to a judgeable record; a competing claimer is refused and told which
-/// slot; `reap` frees it; it is claimable again. A4's other half is
-/// `tests::a_reaped_writer_refuses_to_push`.
+/// `claim.after_cas`: a claim held by a dead participant is reapable via slot
+/// indirection (A3); a `claim` with no `Publisher` *is* the post-crash state.
+/// A4's other half is `tests::a_reaped_writer_refuses_to_push`.
 #[test]
 fn a_claim_left_by_a_dead_participant_resolves_and_is_reapable() {
     let arena = built_arena();
@@ -298,10 +284,7 @@ fn assert_aborted_at(run: &ChildRun, site: &str, hit: u64, progress: &[&str], no
     }
 }
 
-/// Assert the same workload, unarmed, runs to completion.
-///
-/// The control: without it a workload broken for another reason would pass every
-/// abort assertion.
+/// The control: an unarmed workload runs to completion.
 #[cfg(all(feature = "crash-points", unix))]
 fn assert_clean_run(workload: &str, progress: &[&str]) {
     let run = run_child(workload, None);
@@ -318,12 +301,8 @@ fn assert_clean_run(workload: &str, progress: &[&str]) {
     }
 }
 
-/// `push.after_seq_odd` — the parity is flipped, no payload is written yet.
-///
-/// Armed on the **second** push, so the child prints `push 0 done` and dies in
-/// push 1: the site fires on a counter, not the first thing it sees.
-///
-/// Repair: `tests::stale_odd_seq_from_a_dead_writer_is_healed_by_the_next_push`.
+/// `push.after_seq_odd` — parity flipped, no payload yet. Armed on the second
+/// push, so the site fires on a counter.
 #[cfg(all(feature = "crash-points", unix))]
 #[test]
 fn push_after_seq_odd_aborts_at_the_named_point() {
@@ -339,8 +318,6 @@ fn push_after_seq_odd_aborts_at_the_named_point() {
 }
 
 /// `push.after_data_before_seq_even` — payload written, seq still odd.
-///
-/// Repair: the same A5 test; §11.3's row for this site says "as above".
 #[cfg(all(feature = "crash-points", unix))]
 #[test]
 fn push_after_data_before_seq_even_aborts_at_the_named_point() {
@@ -355,8 +332,6 @@ fn push_after_data_before_seq_even_aborts_at_the_named_point() {
 }
 
 /// `push.after_seq_even_before_head` — sample complete, `head` not yet moved.
-///
-/// Repair: [`an_unpublished_sample_is_invisible_and_then_overwritten`].
 #[cfg(all(feature = "crash-points", unix))]
 #[test]
 fn push_after_seq_even_before_head_aborts_at_the_named_point() {
@@ -371,12 +346,8 @@ fn push_after_seq_even_before_head_aborts_at_the_named_point() {
 }
 
 /// `topo.after_copy_before_publish` — inactive block written, word unchanged.
-///
-/// Repair: `tests::topology_depth_and_cycle_detection` asserts the published
-/// topology and the generation are untouched by a mutation that did not reach
-/// its publishing store, and `topology::tests::a_dead_holder_is_stolen_from_and_
-/// leaves_no_trace` asserts the dirty scratch block is overwritten wholesale by
-/// the next mutation.
+/// Repair: `tests::topology_depth_and_cycle_detection` and
+/// `topology::tests::a_dead_holder_is_stolen_from_and_leaves_no_trace`.
 #[cfg(all(feature = "crash-points", unix))]
 #[test]
 fn topo_after_copy_before_publish_aborts_at_the_named_point() {
@@ -391,12 +362,8 @@ fn topo_after_copy_before_publish_aborts_at_the_named_point() {
     );
 }
 
-/// `claim.after_cas` — the owner word is installed and no `Publisher` exists.
-///
-/// Repair: [`a_claim_left_by_a_dead_participant_resolves_and_is_reapable`].
-///
-/// **Mutant:** delete the `crash_point!("claim.after_cas")` line from `edge::claim`;
-/// the armed child exits cleanly and only this test fails.
+/// `claim.after_cas` — owner word installed, no `Publisher` exists. Deleting the
+/// `crash_point!` line from `edge::claim` fails only this test.
 #[cfg(all(feature = "crash-points", unix))]
 #[test]
 fn claim_after_cas_aborts_at_the_named_point() {
@@ -412,15 +379,9 @@ fn claim_after_cas_aborts_at_the_named_point() {
 }
 
 /// `attach.after_slot_assigned_before_publish` — slot `RESERVED`, nothing
-/// published into it.
-///
-/// The window (`FREE -> RESERVED` CAS to the `live_word` store) is too narrow to
-/// hit without fault injection ([`0028`] open question 4); §11.2's two
-/// `..._collects_a_record_left_reserved_by_a_killed_registrant` tests stage it.
-/// This site produces it for real.
-///
-/// Repair: those two collectors, which accept any observed word including
-/// `RESERVED` (`0028` plan step 1).
+/// published. The window is too narrow to hit without this site ([`0028`] plan
+/// step 1; §11.2's two `..._collects_a_record_left_reserved_by_a_killed_registrant`
+/// tests stage it).
 ///
 /// [`0028`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0028-the-slot-a-killed-participant-keeps.md
 #[cfg(all(feature = "crash-points", unix))]
@@ -441,11 +402,7 @@ fn attach_after_slot_assigned_before_publish_aborts_at_the_named_point() {
 }
 
 /// `intern.after_hash_cas_before_id_store` — hash claimed, claimant recorded, id
-/// unpublished.
-///
-/// Repair: `tests::intern_recovers_from_a_claimant_that_died_before_publishing`,
-/// whose staging helper `wedge_intern_slot` documents itself as "exactly as a
-/// process killed between the hash CAS and the id store would leave it".
+/// unpublished. Repair: `tests::intern_recovers_from_a_claimant_that_died_before_publishing`.
 #[cfg(all(feature = "crash-points", unix))]
 #[test]
 fn intern_after_hash_cas_before_id_store_aborts_at_the_named_point() {
@@ -463,8 +420,7 @@ fn intern_after_hash_cas_before_id_store_aborts_at_the_named_point() {
     );
 }
 
-/// An armed name no site carries fires nowhere (else every test above could pass
-/// for the wrong reason).
+/// An armed name no site carries fires nowhere.
 #[cfg(all(feature = "crash-points", unix))]
 #[test]
 fn an_unknown_site_name_arms_nothing() {
@@ -486,8 +442,7 @@ fn an_unknown_site_name_arms_nothing() {
 
 // ---- child workloads ----------------------------------------------------
 //
-// Each runs its operation more than once so `:n` has something to count, and
-// prints a marker after each.
+// Each runs its operation more than once so `:n` has something to count.
 
 /// Three pushes on one ring. Marker after each.
 #[test]
@@ -536,9 +491,7 @@ fn child_claim() {
     }
 }
 
-/// Two registrations into the participant table. Marker after each.
-///
-/// `register` is `fill_slot`, where the §11.3 `attach.*` window is.
+/// Two registrations into the participant table (`register` is `fill_slot`, the §11.3 `attach.*` window).
 #[test]
 #[ignore = "child workload for the §11.3 attach crash point"]
 fn child_attach() {
@@ -568,9 +521,7 @@ fn child_intern() {
     }
 }
 
-/// Print a progress marker the parent can look for, and flush it.
-///
-/// Flushed so a buffered-away marker cannot hide a site firing too early.
+/// Print a flushed progress marker the parent can look for.
 fn report(what: impl core::fmt::Display) {
     use std::io::Write as _;
     std::println!("{what}");

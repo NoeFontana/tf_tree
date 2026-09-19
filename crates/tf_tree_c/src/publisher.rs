@@ -1,13 +1,8 @@
 //! The publish surface — `docs/PHASE4.md` §3.2's `tft_publisher`.
 //!
-//! `Publisher` is `!Sync`; C cannot express that, so §3.2 (NORMATIVE) has the
-//! handle record its creating thread and `abort()` in debug builds on use from
-//! another. Release builds return `TFT_ERR_WRONG_THREAD` instead. No mutex,
-//! unlike `tf_tree_py`: a C caller sharing a publisher has made a mistake, and
-//! serializing it would hide it.
-//!
-//! The handle holds an [`OwnedWriter`], the facade's single reviewed lifetime
-//! extension (`docs/decisions/0017`), whose `Arc<Tree>` keeps the arena mapped.
+//! `Publisher` is `!Sync`: the handle records its creating thread and `abort()`s in debug builds on
+//! use from another (release returns `TFT_ERR_WRONG_THREAD`), with no mutex (§3.2, NORMATIVE). It
+//! holds an [`OwnedWriter`] (`docs/decisions/0017`).
 
 use core::ffi::{c_char, c_void};
 use std::cell::Cell;
@@ -24,18 +19,13 @@ use crate::{
 
 const MAGIC_PUBLISHER: u64 = 0x7446_5F50_5542_3031;
 
-// Thread identity
-
-/// Monotonic thread tokens, never recycled (unlike Linux `gettid`).
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    /// This thread's token, assigned on first use. A `Cell<u64>` so the fast
-    /// path is a plain load with no lazy-destructor registration.
     static TOKEN: Cell<u64> = const { Cell::new(0) };
 }
 
-/// This thread's token, stable for the thread's lifetime and never reused.
+/// This thread's token, stable for its lifetime and never reused.
 #[inline]
 pub(crate) fn thread_token() -> u64 {
     TOKEN.with(|t| {
@@ -49,18 +39,11 @@ pub(crate) fn thread_token() -> u64 {
     })
 }
 
-// The handle
-
-/// An exclusive claim on one edge, and the only way to publish through the C
-/// ABI. `Send`, but one thread at a time (see the module docs).
-///
-/// `#[repr(C)]` because the magic check reads a named field. The generated
-/// header declares this as an incomplete type (§3.2 opaque handles): `xtask
-/// headers` emits the forward declaration itself.
+/// An exclusive claim on one edge, and the only way to publish through the C ABI. `Send`, but one
+/// thread at a time (see the module docs). `#[repr(C)]` because the magic check reads a named field.
 #[repr(C)]
 pub struct tft_publisher {
     magic: u64,
-    /// The token of the thread that called `tft_tree_claim`.
     owner: u64,
     /// `None` after [`tft_publisher_release`]. A leaked handle leaks the claim.
     writer: Option<OwnedWriter>,
@@ -68,26 +51,23 @@ pub struct tft_publisher {
 
 /// # Safety
 ///
-/// `p` must be NULL or point to a live handle (see `crate`'s `magic_check!`).
+/// `p` must be NULL or point to a live handle (see `magic_check!`).
 #[inline]
 unsafe fn check_publisher(p: *const tft_publisher) -> bool {
     if p.is_null() {
         return false;
     }
-    // SAFETY: non-null, and the caller contracts eight readable bytes at the
-    // magic field's offset; `read_unaligned`.
+    // SAFETY: non-null, and the caller contracts eight readable bytes at the magic offset.
     unsafe { core::ptr::addr_of!((*p).magic).read_unaligned() == MAGIC_PUBLISHER }
 }
 
-/// Check thread affinity, per §3.2: `TFT_OK` on the owning thread; otherwise
-/// debug builds abort and release builds return [`TFT_ERR_WRONG_THREAD`].
+/// Check thread affinity (§3.2): `TFT_OK` on the owning thread, else abort (debug) or error.
 #[inline]
 fn check_thread(h: &tft_publisher) -> tft_status {
     check_thread_token(h.owner, "tft_publisher")
 }
 
-/// [`check_thread`]'s body over a bare token, shared with the bridge handle;
-/// `what` names the handle type in the message.
+/// [`check_thread`] over a bare token, shared with the bridge; `what` names the handle type.
 #[inline]
 pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
     if owner == thread_token() {
@@ -95,8 +75,7 @@ pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
     }
     #[cfg(debug_assertions)]
     {
-        // Not `panic!`: the guard would convert it into a status, and §3.2 asks
-        // for an abort. `eprintln!`: no logging dependency here.
+        // Not `panic!`: the guard would turn it into a status, and §3.2 asks for an abort.
         #[allow(clippy::print_stderr)]
         {
             eprintln!(
@@ -118,10 +97,7 @@ pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
     }
 }
 
-/// The sentence both profiles print. It names `what` because only one profile
-/// is compiled at a time, so a name dropped from the other arm goes unobserved.
-///
-/// ASCII only: `set_message` substitutes `?` for non-ASCII bytes.
+/// The sentence both profiles print; ASCII only (`set_message` substitutes `?`).
 fn wrong_thread_message(what: &str) -> String {
     format!(
         "{what} is Send but not Sync (docs/PHASE4.md 3.2): it was created on \
@@ -129,8 +105,6 @@ fn wrong_thread_message(what: &str) -> String {
     )
 }
 
-/// Borrow the live writer, or report why not; every path to the writer goes
-/// through the affinity check here.
 fn writer_of(h: &tft_publisher) -> Result<&OwnedWriter, tft_status> {
     let rc = check_thread(h);
     if rc != TFT_OK {
@@ -146,17 +120,10 @@ fn writer_of(h: &tft_publisher) -> Result<&OwnedWriter, tft_status> {
     })
 }
 
-// Claim
-
-/// Claim exclusive write access to the edge attaching `child` to `parent`.
-///
-/// One participant per edge (D7), machine-wide when shared. Released by
-/// [`tft_publisher_release`] or [`tft_publisher_free`]; a leaked handle leaks
-/// the claim. The calling thread owns the publisher (§3.2).
-///
-/// A frame name not seen before is interned, not rejected, so a mistyped
-/// `child` fails with `TFT_ERR_NO_EDGE`, not [`TFT_ERR_UNKNOWN_FRAME`] (which
-/// means the frame table is full). Ids are never recycled (D10).
+/// Claim exclusive write access to the edge attaching `child` to `parent` (one participant per edge,
+/// D7). Released by [`tft_publisher_release`] or [`tft_publisher_free`]; a leaked handle leaks the
+/// claim. The calling thread owns the publisher. An unseen frame name is interned, so a mistyped
+/// `child` fails with `TFT_ERR_NO_EDGE`.
 ///
 /// # Safety
 ///
@@ -198,8 +165,7 @@ pub unsafe extern "C" fn tft_tree_claim(
             set_error(TFT_ERR_UNKNOWN_FRAME, "no such frame in this tree", |_| {});
             return TFT_ERR_UNKNOWN_FRAME;
         };
-        // `claim_owned`: the writer carries its own `Arc<Tree>`
-        // (`docs/decisions/0017` step 7).
+        // `claim_owned`: the writer carries its own `Arc<Tree>` (`docs/decisions/0017`).
         let writer = match h.share.tree.claim_owned(cf, pf) {
             Ok(w) => w,
             Err(e) => return map::claim(&e),
@@ -217,9 +183,7 @@ pub unsafe extern "C" fn tft_tree_claim(
 
 /// Publish one transform at `stamp`, read from `src` in `layout`.
 ///
-/// `src` must hold at least `tft_layout_size(layout)` bytes. `AFFINE12_ROW_F32`
-/// is not accepted (`TFT_ERR_BAD_ENUM`); matrix layouts are validated (see
-/// `crate::layout::read`).
+/// `src` must hold at least `tft_layout_size(layout)` bytes. `AFFINE12_ROW_F32` is refused.
 ///
 /// # Safety
 ///
@@ -263,11 +227,9 @@ pub unsafe extern "C" fn tft_publisher_push(
     })
 }
 
-/// Publish `n` transforms, reading each `src_stride_bytes` apart (0 means
-/// tightly packed; §4.3).
+/// Publish `n` transforms, reading each `src_stride_bytes` apart (0 means tightly packed; §4.3).
 ///
-/// Stops at the first rejected element, leaving earlier ones published (unlike
-/// `tft_plan_at_many`'s all-or-nothing: there is no unpublishing). The failing
+/// Stops at the first rejected element, leaving earlier ones published (no unpublishing); the failing
 /// index is in the error detail's `frame_b`.
 ///
 /// # Safety
@@ -291,7 +253,6 @@ pub unsafe extern "C" fn tft_publisher_push_many(
         let Some(payload) = layout::payload_bytes(layout) else {
             return bad_enum("layout");
         };
-        // Zero elements is a no-op before the NULL checks.
         if n == 0 {
             return TFT_OK;
         }
@@ -311,7 +272,6 @@ pub unsafe extern "C" fn tft_publisher_push_many(
             );
             return TFT_ERR_BUFFER_TOO_SMALL;
         }
-        // The extent is `(n-1)*stride + payload`, checked for overflow.
         let Some(span) = (n - 1)
             .checked_mul(stride)
             .and_then(|x| x.checked_add(payload))
@@ -326,12 +286,9 @@ pub unsafe extern "C" fn tft_publisher_push_many(
             Ok(w) => w,
             Err(rc) => return rc,
         };
-        // SAFETY: `stamps` was checked non-NULL above, and the caller contracts
-        // `n` readable, aligned `i64` there; `n > 0` past the early return.
+        // SAFETY: `stamps` is non-NULL and the caller contracts `n` readable, aligned `i64`.
         let ts = unsafe { core::slice::from_raw_parts(stamps, n) };
-        // SAFETY: `src` was checked non-NULL above, and the caller contracts
-        // `span` readable bytes there — `(n - 1) * stride + payload`, the
-        // overflow-checked extent computed above; `u8` has no alignment.
+        // SAFETY: `src` is non-NULL and the caller contracts `span` readable bytes, the overflow-checked extent.
         let bytes = unsafe { core::slice::from_raw_parts(src.cast::<u8>(), span) };
 
         for (i, &t) in ts.iter().enumerate() {
@@ -355,7 +312,6 @@ pub unsafe extern "C" fn tft_publisher_push_many(
     })
 }
 
-/// Record which element of a batch failed in `frame_b`, unused by publish errors.
 fn blame_index(i: usize, stamp: i64) {
     crate::error::amend_error(|d| {
         d.frame_b = u32::try_from(i).unwrap_or(crate::TFT_INVALID_ID);
@@ -365,8 +321,7 @@ fn blame_index(i: usize, stamp: i64) {
     });
 }
 
-/// Release the claim now, leaving the handle valid but unusable for publishing.
-/// Also released by [`tft_publisher_free`]; calling it twice is a no-op.
+/// Release the claim now, leaving the handle valid but unusable. Calling it twice is a no-op.
 ///
 /// # Safety
 ///
@@ -378,8 +333,7 @@ pub unsafe extern "C" fn tft_publisher_release(pubh: *mut tft_publisher) -> tft_
         if !unsafe { check_publisher(pubh) } {
             return bad_handle("tft_publisher");
         }
-        // SAFETY: `check_publisher` confirmed the magic word, and this is the
-        // one entry point that needs `&mut`: it drops the writer.
+        // SAFETY: `check_publisher` confirmed the magic word; this is the one entry point needing `&mut`.
         let h = unsafe { &mut *pubh };
         let rc = check_thread(h);
         if rc != TFT_OK {
@@ -405,23 +359,19 @@ pub unsafe extern "C" fn tft_publisher_free(pubh: *mut tft_publisher) {
     if !unsafe { check_publisher(pubh) } {
         return;
     }
-    // The affinity check applies to `free` too: dropping the writer off-thread
-    // is the corruption §3.2 exists to prevent.
-    //
+    // Affinity applies to `free`: dropping the writer off-thread is the corruption §3.2 prevents.
     // SAFETY: `check_publisher` confirmed the magic word.
     if check_thread(unsafe { &*pubh }) != TFT_OK {
         return;
     }
-    // Zero the magic so a repeated free sees a dead handle.
     // SAFETY: `check_publisher` confirmed this is a live `tft_publisher`.
     unsafe { core::ptr::write(pubh.cast::<u64>(), 0) };
     // SAFETY: produced by `Box::into_raw` in `tft_tree_claim`.
     drop(unsafe { Box::from_raw(pubh) });
 }
 
-/// `tft_publisher_push` without the panic guard: measurement scaffolding for
-/// `examples/abi_cost.rs`, only under `--features test-hooks`, never in a header
-/// (a panic would abort the caller, §3.4).
+/// `tft_publisher_push` without the panic guard: measurement scaffolding for `examples/abi_cost.rs`
+/// under `--features test-hooks`, never in a header.
 ///
 /// # Safety
 ///
@@ -463,8 +413,6 @@ pub unsafe extern "C" fn tft_test_push_unguarded(
     }
 }
 
-// Error mapping
-
 /// The claim and push error families.
 pub(crate) mod map {
     use super::{ClaimApiError, ClaimError, PushError};
@@ -488,10 +436,7 @@ pub(crate) mod map {
                     TFT_ERR_ALREADY_CLAIMED,
                     "another participant already holds this edge (one writer per edge)",
                     |d| {
-                        // D11: the refused edge.
                         d.edge = edge.get();
-                        // The owner is a participant slot, not a pid. `ClaimError`
-                        // is `#[non_exhaustive]`, so `match`, not `let`.
                         if let ClaimError::EdgeAlreadyClaimed { owner_slot } = cause {
                             d.frame_a = *owner_slot;
                         }
@@ -499,7 +444,6 @@ pub(crate) mod map {
                 );
                 TFT_ERR_ALREADY_CLAIMED
             }
-            // Both mean "somebody else was mid-protocol"; the response is to retry.
             C::LeaseContended { edge } | C::ReapedDuringClaim { edge } => {
                 set_error(
                     TFT_ERR_RETRY,
@@ -647,8 +591,6 @@ pub(crate) mod map {
 mod tests {
     use super::wrong_thread_message;
 
-    /// The cross-thread diagnostic names the handle type in both profiles.
-    /// Mutant: drop `{what}` from the format string ⇒ fails.
     #[test]
     fn the_wrong_thread_message_names_the_handle_that_moved() {
         for what in ["tft_publisher", "tft_bridge"] {

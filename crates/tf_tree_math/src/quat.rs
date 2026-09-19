@@ -136,9 +136,6 @@ impl Quat {
     }
 
     /// Component-wise difference.
-    ///
-    /// Used by `slerp`'s chord form `|a − b|² = 2 − 2·(a·b)`, avoiding the
-    /// cancelling `1 − dot` for near-parallel inputs.
     #[inline]
     #[must_use]
     pub const fn sub(self, rhs: Self) -> Self {
@@ -237,8 +234,7 @@ pub(crate) fn exp_so3_theta(w: Vec3, theta: f64) -> Quat {
 /// SO(3) logarithm: map a unit quaternion to its rotation vector `ω` in the
 /// principal branch `|ω| ∈ [0, π]`.
 ///
-/// Quaternion form, never the trace: `θ = 2·atan2(‖q_v‖, q_w)` stays accurate
-/// near `θ = π`, where `acos((tr R − 1)/2)` loses nine digits.
+/// `θ = 2·atan2(‖q_v‖, q_w)`, not the trace form, which loses nine digits near `θ = π`.
 #[inline]
 #[must_use]
 pub fn log_so3(q: Quat) -> Vec3 {
@@ -263,11 +259,8 @@ pub fn log_so3(q: Quat) -> Vec3 {
 
 /// The unit quaternion of a **row-major 3×3 rotation matrix**.
 ///
-/// `r` is `[r00 r01 r02, r10 r11 r12, r20 r21 r22]`, the same order
-/// `tf_tree_c`'s `rot3` emits, so this is exactly its inverse.
-///
-/// Shepperd's method: built around the largest of `w, x, y, z`, so it is
-/// accurate for half-turns where `√(1 + tr R)/2` is `0/0`.
+/// `r` is `[r00 r01 r02, r10 r11 r12, r20 r21 r22]`, the inverse of
+/// `tf_tree_c`'s `rot3`. Shepperd's method, accurate for half-turns.
 ///
 /// # Does not validate `r`
 ///
@@ -279,7 +272,6 @@ pub fn quat_from_rot3(r: &[f64; 9]) -> Quat {
     let (r00, r11, r22) = (r[0], r[4], r[8]);
     let trace = r00 + r11 + r22;
     if trace > 0.0 {
-        // s = 4w, and w ≥ 1/2 here, so s ≥ 2.
         let s = libm::sqrt(trace + 1.0) * 2.0;
         Quat::new(
             0.25 * s,
@@ -288,7 +280,6 @@ pub fn quat_from_rot3(r: &[f64; 9]) -> Quat {
             (r[3] - r[1]) / s,
         )
     } else if r00 > r11 && r00 > r22 {
-        // s = 4x.
         let s = libm::sqrt(1.0 + r00 - r11 - r22) * 2.0;
         Quat::new(
             (r[7] - r[5]) / s,
@@ -297,7 +288,6 @@ pub fn quat_from_rot3(r: &[f64; 9]) -> Quat {
             (r[2] + r[6]) / s,
         )
     } else if r11 > r22 {
-        // s = 4y.
         let s = libm::sqrt(1.0 + r11 - r00 - r22) * 2.0;
         Quat::new(
             (r[2] - r[6]) / s,
@@ -306,7 +296,6 @@ pub fn quat_from_rot3(r: &[f64; 9]) -> Quat {
             (r[5] + r[7]) / s,
         )
     } else {
-        // s = 4z.
         let s = libm::sqrt(1.0 + r22 - r00 - r11) * 2.0;
         Quat::new(
             (r[3] - r[1]) / s,

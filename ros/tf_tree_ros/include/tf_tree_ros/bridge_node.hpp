@@ -1,5 +1,4 @@
-// `docs/PHASE4.md` §5.8 forms 1 and 2 — the node that wraps form 3. It only
-// translates ROS parameters into `BridgeOptions`.
+// `docs/PHASE4.md` §5.8 forms 1 and 2; translates ROS parameters into `BridgeOptions`.
 
 #ifndef TF_TREE_ROS__BRIDGE_NODE_HPP_
 #define TF_TREE_ROS__BRIDGE_NODE_HPP_
@@ -13,10 +12,8 @@
 namespace tf_tree_ros
 {
 
-/// A standalone ingest-bridge node.
-///
-/// `RCLCPP_COMPONENTS_REGISTER_NODE` in `bridge_component.cpp` makes this both
-/// §5.8 form 2 (component) and form 1 (`tf_tree_bridge` executable).
+/// A standalone ingest-bridge node: §5.8 form 2 (component) and form 1
+/// (executable) via `bridge_component.cpp`.
 ///
 /// # Parameters
 ///
@@ -30,11 +27,10 @@ namespace tf_tree_ros
 /// | `time_domain` | int | `0` | §5.5's domain tag; every declared dynamic edge must agree |
 /// | `queue_depth` | int | `100` | §5.2's `KeepLast` depth on both topics |
 /// | `tf_topic` / `tf_static_topic` | string | `/tf`, `/tf_static` | for a namespaced or replayed stream |
-/// | `arena_name` | string | `""` | `docs/decisions/0015`: rendezvous name for a **separate process** to attach; empty is a private arena |
+/// | `arena_name` | string | `""` | `docs/decisions/0015`: shared rendezvous name; empty is private |
 ///
-/// Form 3 sets `BridgeOptions::arena_name` directly. Exactly one of
-/// `topology_config_file` and `topology_config` must be set: the engine has no
-/// runtime edge declaration (`docs/decisions/0004`, D4).
+/// Exactly one of `topology_config_file` and `topology_config` must be set
+/// (`docs/decisions/0004`).
 class BridgeNode : public rclcpp::Node
 {
 public:

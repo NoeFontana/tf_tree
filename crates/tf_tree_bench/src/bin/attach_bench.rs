@@ -1,17 +1,9 @@
-//! `docs/PHASE2.md` §12's attach rows: attach time (cold and warm, p50) and first
-//! access after attach.
+//! `docs/PHASE2.md` §12's attach rows: attach time (cold and warm, p50) and first access after attach.
 //!
-//! `Tree::attach_shared` maps the segment, validates the header, claims a
-//! participant slot and calls `populate_hot()`, which (0024) warms the tables and
-//! not the ring arenas; rings show up in the `plan compile` row.
-//!
-//! The "population on vs off" row is not produced: `populate_hot()` is
-//! unconditional inside `attach_shared_inner` and no public path yields an "off"
-//! arm. `attach` and `plan compile (first)` bracket what population costs.
-//!
-//! `cold` is the first attach in this process (fresh VMA and page tables). It is
-//! not a cold page cache, so it bounds the warm case from above and a genuinely
-//! cold attach from below.
+//! `Tree::attach_shared` maps the segment, validates the header, claims a slot and calls `populate_hot()`,
+//! which (`0024`) warms the tables, not the ring arenas; rings show in the `plan compile` row. No
+//! "population on vs off" row: `populate_hot()` is unconditional. `cold` is the first attach in this
+//! process, not a cold page cache, so it bounds warm from above.
 
 #![allow(clippy::print_stdout)]
 
@@ -19,19 +11,15 @@ use anyhow::{anyhow, Context, Result};
 
 use tf_tree::{AttachMode, InterpPolicy, Stamp, Tree};
 
-/// Attach/lookup cycles timed. Odd, so a median is an observation.
 const CYCLES: usize = 201;
 
-/// The page size `docs/PHASE2.md` §12.2's per-page arithmetic divides by; a constant
-/// because `sysconf` would need `unsafe` (the byte count beside it is authoritative).
+/// The page size `docs/PHASE2.md` §12.2's arithmetic divides by; constant because `sysconf` needs `unsafe`.
 const PAGE_BYTES: usize = 4096;
 
-/// The pair every other harness in this crate measures, so the first-access
-/// number is comparable with the steady-state one.
+/// The pair every other harness measures, so first-access is comparable with steady state.
 const TARGET: &str = "imu_link";
 const SOURCE: &str = "map";
 
-/// A stamp off every dynamic grid, so the first lookup interpolates (`0013`).
 const STAMP_NS: i64 = tf_tree_bench::fixture::NOW_NS - 3_700_000;
 
 fn main() -> Result<()> {
@@ -55,7 +43,6 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow!("attaching: {e:?}"))?;
         let a = t0.elapsed().as_nanos();
 
-        // Separate from the lookup: plan compilation walks the topology blocks.
         let t1 = std::time::Instant::now();
         let target = tree
             .frame(TARGET)
@@ -73,20 +60,17 @@ fn main() -> Result<()> {
         let t2 = std::time::Instant::now();
         let got = plan.at(&guard, stamp);
         let f = t2.elapsed().as_nanos();
-        // Checked: an error would measure a refusal, and be faster.
         got.map_err(|e| anyhow!("the first lookup after attach was refused: {e:?}"))?;
 
         attach_ns.push(a as f64);
         plan_ns.push(p as f64);
         first_at_ns.push(f as f64);
 
-        // `guard` borrows `tree`, so it drops first; unmapping keeps cycles comparable.
         drop(guard);
         drop(tree);
     }
 
-    // A separate pass: a fourth timer inside the loop above shifted `first lookup
-    // after attach` from 130 to 210 ns p50 (predictor and cache state).
+    // A separate pass: a fourth timer in the loop above shifted `first lookup after attach` (130 to 210 ns).
     for _ in 0..CYCLES {
         let dup = fd
             .try_clone_to_owned()
@@ -102,7 +86,6 @@ fn main() -> Result<()> {
         let _ = tree
             .plan(target, source)
             .map_err(|e| anyhow!("compiling {SOURCE} <- {TARGET}: {e:?}"))?;
-        // Recompiling the same path prices per-edge re-population after a topology change.
         let t1b = std::time::Instant::now();
         let _ = tree
             .plan(target, source)
@@ -144,8 +127,7 @@ fn build_owner() -> Result<Tree> {
     let tree = b
         .build_shared("tf_tree_attach_bench")
         .map_err(|e| anyhow!("building the shared fixture: {e:?}"))?;
-    // Leak the writers so the claims stay live and the history stays published
-    // for every attach below; the process is about to exit anyway.
+    // Leak the writers so claims and history stay live for every attach.
     let (writers, samples) = tf_tree_bench::fixture::spin_up(&tree)?;
     core::mem::forget(writers);
     drop(samples);
@@ -155,7 +137,6 @@ fn build_owner() -> Result<Tree> {
 fn report(arena_bytes: usize, attach: &[f64], plan: &[f64], replan: &[f64], first: &[f64]) {
     println!("PHASE2 §12 — attach time, and first access after attach");
     println!("  §11.1 fixture on a memfd, {CYCLES} attach/lookup cycles, ReadOnly");
-    // Pages round up: population advises whole pages.
     println!(
         "  arena {arena_bytes} B = {} pages of {PAGE_BYTES} B",
         arena_bytes.div_ceil(PAGE_BYTES)
@@ -199,7 +180,6 @@ fn row(label: &str, v: &[f64]) {
     );
 }
 
-/// Nearest-rank percentile over a sorted slice.
 fn pct(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;

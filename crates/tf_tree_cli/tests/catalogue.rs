@@ -1,12 +1,6 @@
-//! End-to-end: run the `docs/PHASE5.md` §6 catalogue against the real
-//! benchmark fixture.
-//!
-//! The unit tests in `checks.rs` build each offending state by hand, which
-//! proves a check *fires*. This file proves the opposite and harder property:
-//! that on a **correct, fully populated, live** transform tree the catalogue
-//! stays quiet. Every false positive found so far was found here and nowhere
-//! else, because a hand-built fixture only contains what its author thought to
-//! put in it.
+//! End-to-end: run the `docs/PHASE5.md` §6 catalogue against the real benchmark
+//! fixture. `checks.rs` unit tests prove a check fires; this proves the
+//! catalogue stays quiet on a correct, fully populated, live tree.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -16,14 +10,11 @@ use tf_tree_cli::catalogue::{Severity, Status, Tft};
 use tf_tree_cli::checks::{self, Clock, Inputs};
 use tf_tree_cli::doctor::{Observations, Snapshot};
 
-/// Run the catalogue over the fixture with its publishers still holding their
-/// claims, which is the state a healthy robot is in.
+/// Run the catalogue over the fixture with its publishers still holding their claims.
 fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) -> R) -> R {
     let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
-    // The writers are held for the whole run: dropping them releases every
-    // claim, and the tree would then be a *different* state — one where
-    // `TFT017` legitimately fires on all four dynamic edges, which would make
-    // this test assert nothing about the healthy case.
+    // Writers are held for the whole run: dropping them releases the claims and
+    // makes `TFT017` fire on all four dynamic edges.
     let (writers, samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
 
     let snap = Snapshot::capture(&tree);
@@ -34,9 +25,7 @@ fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) 
         snap: &snap,
         obs: &obs,
         stats: &stats,
-        // `None` on purpose: `TFT016` reads this host's `/sys` and `/proc`, and
-        // a test whose result depends on the CI runner's huge-page setting is a
-        // test that fails for a reason nobody can act on.
+        // `None` on purpose: `TFT016` reads this host's `/sys` and `/proc`.
         host: None,
         clock,
         arena_bytes: tree.arena_size_bytes() as u64,
@@ -52,22 +41,10 @@ fn run_on_fixture<R>(f: impl FnOnce(&tf_tree_cli::catalogue::Report, &Snapshot) 
     out
 }
 
-/// **A healthy, fully published tree produces no finding except the one that is
-/// true of it.**
-///
-/// The fixture's arena is sized exactly to its topology, so `TFT015` (occupancy
-/// above 80%) is a correct report at 100%, not a false positive. Everything
-/// else must be silent — a diagnostic that fires on a correct robot is one that
-/// gets piped to `/dev/null` inside a week, and this is the assertion that
-/// makes each new check earn its place.
-///
-/// Mutant: in `Snapshot::capture`, decode the claim owner word by hand as
-/// `u32::try_from(owner_word - 1).ok()` instead of calling
-/// `tf_tree_core::edge::slot_of`. Applied: every live writer resolves to pid 0
-/// and `TFT014` fires on all four claimed edges, which this test fails with
-/// listed. That is the false positive this test exists for — the word is
-/// `(epoch << 16) | (slot + 1)`, and no unit test on a hand-built `Snapshot`
-/// can see a decode bug, because a hand-built one never encodes anything.
+/// A healthy, fully published tree produces no finding except `TFT015` (the
+/// fixture's arena is sized exactly to its topology, so 100% occupancy is true).
+/// The claim owner word is `(epoch << 16) | (slot + 1)`, so a decode bug in
+/// `Snapshot::capture` shows up here as a `TFT014` false positive.
 #[test]
 fn the_healthy_fixture_fires_only_the_check_that_is_true_of_it() {
     run_on_fixture(|report, snap| {
@@ -98,8 +75,7 @@ fn the_healthy_fixture_fires_only_the_check_that_is_true_of_it() {
             "`doctor --exit-code` must pass on a healthy tree"
         );
 
-        // Non-vacuity: the fixture really is populated and claimed, so the
-        // checks above had something to look at rather than an empty tree.
+        // Non-vacuity: the fixture is populated and claimed.
         assert_eq!(snap.frames.len(), 24);
         assert_eq!(snap.edges.len(), 23);
         assert!(
@@ -109,15 +85,8 @@ fn the_healthy_fixture_fires_only_the_check_that_is_true_of_it() {
     });
 }
 
-/// **Every check the catalogue could not run states why, and no check is
-/// missing from the report.**
-///
-/// A skipped check with an empty reason is indistinguishable in the output from
-/// one that passed, which is the specific dishonesty `Status::Skipped` carries a
-/// mandatory `String` to prevent.
-///
-/// Mutant: change `TFT007`'s reason to `""`. Applied: the non-empty-reason
-/// assertion fails, naming `TFT007`.
+/// Every check the catalogue could not run states why, and none is missing from
+/// the report.
 #[test]
 fn every_id_is_reported_and_every_skip_states_a_reason() {
     run_on_fixture(|report, _| {
@@ -136,34 +105,15 @@ fn every_id_is_reported_and_every_skip_states_a_reason() {
                 );
             }
         }
-        // Non-vacuity: this build genuinely cannot run several checks, so the
-        // loop above examined something.
+        // Non-vacuity: this build cannot run several checks.
         assert!(skipped >= 5, "expected several skips, saw {skipped}");
     });
 }
 
-/// **`--exit-code` has two tiers, and the default one is unchanged.**
-///
-/// Six ids carry `Error`, and on a *live* arena four of them structurally skip —
-/// so `--exit-code error` reduces to `TFT006` (impossible stamps) and `TFT012`
-/// (cycle or disconnected subtree). Those are the right errors: both make every
-/// lookup fail. But almost everything an operator is paged about is `Warn` — an
-/// edge with no live writer, an undersized ring, rate collapse, gaps, clock
-/// skew, a slot leak, an arena at capacity — and all of it exited 0.
-///
-/// **The capability existed and the exit code did not.** `doctor --json | jq -e
-/// '.summary.warn == 0 and .summary.error == 0'` gates on exactly that today,
-/// and `Report::is_healthy` was written and unit-tested for it with **no
-/// caller**. This connects them.
-///
-/// One thing the assertions below do not spell out: the `warn` tier is
-/// warn-and-above rather than warn-only, so an arena with a cycle in it must
-/// not pass `--exit-code warn` just because nothing warned.
-///
-/// **Mutant:** write the `warn` arm as `report.count_at(Severity::Warn) > 0`.
-/// The first two assertions still hold and the tier stops being a ladder; this
-/// test does not catch it, which is why the arm's comment argues it and the
-/// unit test in `catalogue.rs` pins `is_healthy` against an error-only report.
+/// `--exit-code` has two tiers: `error` (in practice `TFT006`, `TFT012` on a
+/// live arena) and `warn`, which is warn-and-above, so an arena with a cycle
+/// must not pass `--exit-code warn`. `Report::is_healthy` is pinned against an
+/// error-only report in `catalogue.rs`.
 #[test]
 fn the_exit_code_gate_has_a_warn_tier_and_an_unchanged_default() {
     use std::process::Command;
@@ -191,19 +141,9 @@ fn the_exit_code_gate_has_a_warn_tier_and_an_unchanged_default() {
     );
 }
 
-/// `--json` is what a CI job consumes and `--exit-code` is what it gates on. If
-/// the two disagree, a job either fails while its report says everything is
-/// fine, or passes while the report lists errors — and both are worse than
-/// having neither.
-///
-/// Mutant: make `Report::count_at` in the JSON summary use `at()` alone,
-/// dropping the `uncatalogued` term. Applied: the summary/gate agreement below
-/// still holds on the healthy fixture (nothing id-less fires — nothing produces
-/// an [`Uncatalogued`] at all since §6's amendment), so the case is forced
-/// explicitly with an injected id-less error, and *that* assertion fails. The
-/// injection is the point: the `uncatalogued` array is still part of the stable
-/// JSON schema, and this pins that a finding placed in it would still be counted
-/// by the summary a CI job reads.
+/// `--json` and `--exit-code` must agree: a finding in the `uncatalogued` array
+/// (part of the stable JSON schema) is counted by the summary a CI job reads, so
+/// one is injected explicitly. [`Uncatalogued`] is that type.
 ///
 /// [`Uncatalogued`]: tf_tree_cli::catalogue::Uncatalogued
 #[test]
@@ -240,36 +180,11 @@ fn the_json_summary_agrees_with_the_exit_status() {
     );
 }
 
-/// **Every occupancy row TFT015 reports must be capable of being non-zero.**
-///
-/// `TFT015` is a threshold check, so a row whose numerator is stuck at 0 does
-/// not merely fail to fire — it reports `pass`, which is an active claim that
-/// the table has room. `ArenaHeader::participant_count` is never incremented
-/// anywhere in the workspace, so a `participants` row would read `0 / max` on
-/// every arena that has ever existed and would report `pass` on a fleet that
-/// had exhausted every slot and could not attach another node. The catalogue's
-/// premise is that a check without evidence says so; the row is therefore
-/// omitted and disclosed in `Meta.notes` instead.
-///
-/// The fixture is non-degenerate: it is a fully built tree with live
-/// publishers, so `frames` and `edges` are both genuinely non-zero and the
-/// assertion is about the *absent* row rather than about an empty arena.
-///
-/// **What this test does NOT cover, measured rather than reasoned.** Feed the
-/// participants row from the *arena participant table* instead of the header
-/// counter and this test still **passes**: its fixture is an in-process arena
-/// whose own process holds a record, so `used > 0` and the row looks like a real
-/// measurement. That numerator is wrong for a different reason — a read-only
-/// attachment writes no arena record (D18), so it under-reports by the whole
-/// consumer population — and the assertion added *because* the row was untested
-/// does not reach the likeliest wrong answer to it. The guard for that is
-/// `crates/tf_tree_cli/tests/attach.rs`'s
-/// `the_two_participant_censuses_disagree_by_the_read_only_population`, which
-/// needs a live arena and so cannot live here.
-///
-/// Mutant: restore the `("participants", h.participant_count, h.max_participants)`
-/// row in `occupancy_of`. Applied: *"occupancy row \"participants\" reads 0 used
-/// of 64 on a fully populated arena"*.
+/// Every occupancy row `TFT015` reports must be capable of being non-zero: the
+/// `participants` row is omitted and disclosed in `Meta.notes`, because
+/// `ArenaHeader::participant_count` is never incremented. The participant
+/// census itself is guarded by `attach.rs`'s
+/// `the_two_participant_censuses_disagree_by_the_read_only_population`.
 #[test]
 fn no_occupancy_row_is_permanently_zero() {
     let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
@@ -288,32 +203,15 @@ fn no_occupancy_row_is_permanently_zero() {
     drop(writers);
 }
 
-/// **The whole `TFT007` evidence path, end to end: a topology file's `rate_hz`
-/// reaches the arena, is read back out of it, and judges a real publisher.**
-///
-/// The unit tests own the two halves — `config.rs` proves `rate_hz` lands in
-/// `EdgeRecord::nominal_rate_mhz`, and `checks.rs` proves the comparison — and
-/// neither can see the seam between them, which is `Snapshot::capture` mapping
-/// the record's `0` sentinel to `None`. A capture that mapped it to `Some(0)`
-/// passes every unit test in this repository (they build `EdgeInfo` directly)
-/// and turns every undeclared edge on a live robot into a warn about deviating
-/// from 0 Hz by infinity — the exact fabricated finding this id was blocked on
-/// for one revision.
-///
-/// The arena is non-degenerate: two dynamic edges, one declaring a rate and one
-/// not, both published into at the *same* wrong rate, so the difference between
-/// them is the declaration and nothing else.
-///
-/// Mutant: in `Snapshot::capture`, map the field as `Some(rec.nominal_rate_mhz)`
-/// unconditionally. Applied: `TFT007` fires on both edges and the "exactly the
-/// declared edge" assertion fails. Mutant B: map it to `None` unconditionally.
-/// Applied: the check skips instead of firing and the first assertion fails.
+/// The whole `TFT007` path end to end: a topology file's `rate_hz` reaches the
+/// arena, is read back, and judges a real publisher. The seam under test is
+/// `Snapshot::capture` mapping the record's `0` sentinel to `None`. One edge
+/// declares a rate and one does not, both published at the same wrong rate.
 #[test]
 fn a_topology_files_declared_rate_reaches_doctor_and_judges_the_publisher() {
     use tf_tree_bridge::TopologyConfig;
 
-    // 20 Hz declared, 2 s of history -> a 64-slot ring; the sibling is sized by
-    // slots and declares nothing.
+    // 20 Hz declared, 2 s of history -> a 64-slot ring; the sibling declares nothing.
     let text = "\
 [[edge]]
 parent = \"odom\"
@@ -386,7 +284,7 @@ capacity = 64
         o.findings[0].message
     );
 
-    // And the arena discloses that one of its two edges was never compared.
+    // The arena discloses that one of its two edges was never compared.
     let note = checks::rate_coverage_note(&snap, &obs, clock, checks::PushStream::RingsUnderWriter)
         .expect("a partial run must say so");
     assert!(note.contains("compared 1 of 2"), "{note}");
@@ -395,48 +293,12 @@ capacity = 64
     drop(undeclared);
 }
 
-/// **`TFT014` sees the wedge, on a real arena, through the real liveness
-/// predicate.**
-///
-/// The unit tests build a `ParticipantInfo` and hand it to the check, which
-/// proves the reporting and nothing about how `alive` was reached. This one
-/// puts a `LIVE` record into an actual participant table and lets
-/// `Snapshot::capture` ask `Tree::participant_alive` about it — the seam issue
-/// #184 fell through, where a killed writer's record is left `LIVE` and
-/// `ParticipantTable::identity` keeps answering with its dead pid.
-///
-/// **What is staged and what is real.** The record is injected with
-/// `register_at`, which no ordinary code path produces, so this proves the
-/// *predicate and the report* on a real arena and not that any deployment
-/// reaches this state. The shape that does is a whole process dying, and it is
-/// `crates/tf_tree/tests/rendezvous.rs`'s
-/// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live`: a real owner
-/// `SIGKILL`ed, leaving a real `LIVE` record over a free byte, which is
-/// `docs/decisions/0028`'s candidate-B hole 3. It lives there rather than here
-/// because that arena has no owner left to attach to — `doctor --attach` is
-/// refused `ArenaHeldButUnreachable`, so the only observer is a process that
-/// joined first.
-///
-/// **The pid is `u32::MAX` because that is the deterministic form of "gone".**
-/// It exceeds every `pid_max`, so `/proc/<pid>` cannot exist and the predicate
-/// takes its `NoSuchProcess` branch — the same branch a killed and reaped
-/// writer's pid takes, without racing pid reuse to get there. On a
-/// rendezvous-opened tree the same slot is answered by `F_OFD_GETLK` on its
-/// lock byte instead; both are `Tree::participant_alive`, which is the point of
-/// routing through it rather than spelling a third predicate here.
-///
-/// Non-vacuity is the whole risk in a test like this, so the *healthy* half of
-/// the same arena is asserted about too.
-///
-/// Mutant: in `tft014`, drop the participant loop. Applied: `left: Pass,
-/// right: Fired` — which is exactly the state `tf_tree doctor` was in before
-/// this, on the arena the check is named for.
-/// Mutant B: in `Snapshot::capture`, set `alive: state == SlotState::Live`.
-/// Applied: the "must read dead through the real predicate" assertion fires
-/// first, printing `alive: true` for pid 4294967295. That mutant is
-/// `docs/PHASE2.md` §5.1's forbidden inference written out, and the assertion
-/// that catches it is deliberately upstream of the check, so the failure names
-/// the predicate rather than the report.
+/// `TFT014` sees the wedge on a real arena through the real liveness predicate
+/// (`Tree::participant_alive`). The `LIVE` record is injected with `register_at`
+/// (staged); the real-death case is `crates/tf_tree/tests/rendezvous.rs`'s
+/// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` (0028). The pid
+/// is `u32::MAX`: it exceeds every `pid_max`, so it is deterministically gone.
+/// The healthy half of the arena is asserted too.
 #[test]
 fn a_stale_live_participant_record_is_reported_on_a_real_arena() {
     const GONE: u32 = u32::MAX;
@@ -444,9 +306,8 @@ fn a_stale_live_participant_record_is_reported_on_a_real_arena() {
     let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
     let (writers, samples) = tf_tree_bench::fixture::spin_up(&tree).expect("populate history");
 
-    // Slot 1 is the record a killed writer leaves: the publication protocol is
-    // the same one `register` runs, because the state being simulated is a
-    // *complete* registration whose process then died.
+    // Slot 1 is the record a killed writer leaves: a complete registration
+    // whose process then died.
     tree.arena_view()
         .participants()
         .register_at(1, GONE, 1, 0)
@@ -502,10 +363,8 @@ fn a_stale_live_participant_record_is_reported_on_a_real_arena() {
          their claims: {:?}",
         o.findings
     );
-    // `byte not probed`: this is an in-process arena with no rendezvous, so
-    // `Snapshot::probe_lock_facts` was never called and the verdict rests on
-    // `/proc` alone. The subject says which evidence the run had rather than
-    // letting a `--from-bag` finding read like an `--attach` one.
+    // `byte not probed`: an in-process arena with no rendezvous, so the verdict
+    // rests on `/proc` alone and the subject says so.
     assert_eq!(
         o.findings[0].subject,
         format!("slot 1 pid {GONE}, byte not probed")
@@ -524,29 +383,9 @@ fn a_stale_live_participant_record_is_reported_on_a_real_arena() {
     drop(writers);
 }
 
-/// **The CLI's `counters` feature must actually control the engine's.**
-///
-/// `TFT010`'s "built without counters" skip and `render_human`'s banner both
-/// key off `tf_tree::counters_compiled_in`, which reports what the *engine* was
-/// built with. The CLI's own `counters` feature is supposed to be what sets
-/// that. Cargo will silently break the link: any workspace dependency declared
-/// without `default-features = false` re-enables `tf_tree/counters` through its
-/// own defaults, independently of what the CLI asked for. That is what
-/// happened — `tf_tree_bench` (a dependency of this crate, carrying
-/// `default = ["counters"]`) pinned the engine's counters on, so
-/// `--no-default-features` produced a byte-identical report and the skip branch
-/// was unreachable in every buildable configuration. Nothing warned, because
-/// each half was individually truthful.
-///
-/// This assertion is the only place the two answers are compared, so it is the
-/// only thing that can see them disagree.
-///
-/// Mutant: drop `default-features = false` from the `tf_tree_bench` line in the
-/// workspace `Cargo.toml`. Applied, under
-/// `cargo nextest run -p tf_tree_cli --no-default-features`: `left = false`,
-/// `right = true`, and this fails. It passes on the default build with or
-/// without the mutant, which is exactly why the mutant must be run with the
-/// feature off — and why the defect survived the default gate.
+/// The CLI's `counters` feature must control the engine's: a dependency without
+/// `default-features = false` re-enables `tf_tree/counters`. Only meaningful
+/// under `--no-default-features`.
 #[test]
 fn the_cli_counters_feature_switches_the_engine() {
     assert_eq!(
@@ -559,33 +398,10 @@ fn the_cli_counters_feature_switches_the_engine() {
     );
 }
 
-/// **A publisher's clock offset travels from `EdgeWriter::push` to a `TFT004`
-/// finding, on a real arena.**
-///
-/// The unit tests in `checks.rs` set `EdgeInfo::clock_offset_nanos` by hand,
-/// which proves the check reads its input and proves nothing about whether
-/// anything writes one. Three seams sit between the two and none of them is
-/// visible from either side: `EdgeWriter`'s sampler, `ClaimRecord`'s field, and
-/// `Snapshot::capture` mapping the arena's `0` sentinel to `None`. This is the
-/// test that fails if any of them stops.
-///
-/// Both edges publish with **wall-clock** stamps, because that is the only
-/// configuration in which this check runs at all — the benchmark fixture stamps
-/// from zero, so `Clock::decide` puts it in the `NewestStamp` arm and `TFT004`
-/// skips there for `TFT005`'s reason.
-///
-/// One publisher is healthy. The other stamps an hour into the past, which is a
-/// machine whose NTP never came up — the failure the check exists to name, and
-/// the one an operator cannot attribute from the symptom.
-///
-/// Mutants, run:
-///
-/// * in `Tree::claim`, drop `claim_rec.clock_offset_nanos.store(0, ..)` and the
-///   sampler's store — the check skips with *"no edge has recorded a clock
-///   offset yet"* and the assertion on `Fired` fails.
-/// * in `Snapshot::capture`, map the field as `Some(raw)` rather than matching
-///   the `0` sentinel — the healthy publisher's unsampled sibling arrives as
-///   `Some(0)` and the note reports a fleet member that was never measured.
+/// A publisher's clock offset travels from `EdgeWriter::push` to a `TFT004`
+/// finding on a real arena (sampler, `ClaimRecord` field, and `Snapshot::capture`
+/// mapping the `0` sentinel to `None`). Both edges use wall-clock stamps, the
+/// only configuration in which `TFT004` runs; one publisher is an hour behind.
 #[test]
 fn a_publishers_clock_offset_reaches_a_tft004_finding_on_a_real_arena() {
     use tf_tree::{Capacity, EdgeCfg, TreeBuilder};
@@ -595,10 +411,7 @@ fn a_publishers_clock_offset_reaches_a_tft004_finding_on_a_real_arena() {
     let tree = TreeBuilder::new()
         .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::slots(64)))
         .dynamic_edge("odom", "base", EdgeCfg::new(Capacity::slots(64)))
-        // **Never claimed and never pushed**, which makes the `0 -> None`
-        // mapping in `Snapshot::capture` load-bearing: without a never-sampled
-        // edge, a capture that passed the raw value through would be
-        // indistinguishable from one that maps the sentinel.
+        // Never claimed and never pushed: makes the `0 -> None` mapping load-bearing.
         .dynamic_edge("base", "sensor", EdgeCfg::new(Capacity::slots(64)))
         .build()
         .expect("build");
@@ -617,7 +430,7 @@ fn a_publishers_clock_offset_reaches_a_tft004_finding_on_a_real_arena() {
 
     // Healthy: stamps track this host's clock.
     let healthy = tree.claim(odom, map).expect("claim map->odom");
-    // Broken: an hour behind, which no publish pipeline accounts for.
+    // Broken: an hour behind.
     let broken = tree.claim(base, odom).expect("claim odom->base");
     for k in 0..4i64 {
         healthy
@@ -692,34 +505,11 @@ fn a_publishers_clock_offset_reaches_a_tft004_finding_on_a_real_arena() {
     );
 }
 
-/// **A stamp in the future travels from `EdgeWriter::push` to a `TFT005`
-/// finding, on a real arena.**
-///
-/// The unit test in `checks.rs` sets `EdgeInfo::newest_stamp` by hand, which
-/// proves the rule and proves nothing about the seam between the ring and the
-/// check: `Snapshot::capture` reads the newest retained stamp out of
-/// `SampleRing`, and `Clock::decide` has to put a wall-clock arena in its `Wall`
-/// arm before the check runs at all. Neither is visible from a hand-built
-/// `EdgeInfo`.
-///
-/// **The reference fixture cannot host this test, which is why there is a second
-/// arena here rather than an addition to `run_on_fixture`.** `fixture::spin_up`
-/// stamps from zero, so `Clock::decide` lands on `Clock::NewestStamp` and
-/// `TFT005` skips there — the same reason `TFT004`'s end-to-end test builds its
-/// own tree. Re-basing the fixture's stamps onto the wall clock would move
-/// `NOW_NS`/`QUERY_NS`, which every latency and history benchmark keys on.
-///
-/// One publisher is healthy. The other stamps half a second ahead of this host's
-/// clock, which is ten times `FUTURE_TOLERANCE_NS` — comfortably past the band
-/// the constant exists to leave for a publisher that stamps just before it
-/// pushes, and comfortably inside `OFFSET_BEYOND_ANY_PIPELINE_NS`, so `TFT004`
-/// stays quiet and this is a statement about `TFT005` alone.
-///
-/// Mutant: in `Snapshot::capture`, drop the newest-stamp read and leave
-/// `newest_stamp: None`. Applied: `TFT005` reports `Pass` and the `Fired`
-/// assertion fails. Mutant B: return `Clock::NewestStamp` unconditionally from
-/// `Clock::decide`. Applied: the `matches!(clock, Clock::Wall(_))` assertion
-/// fails first, which is the point of asserting it.
+/// A stamp in the future travels from `EdgeWriter::push` to a `TFT005` finding
+/// on a real arena. The reference fixture stamps from zero (`Clock::NewestStamp`,
+/// so `TFT005` skips), hence a second arena with wall-clock stamps. One publisher
+/// stamps half a second ahead: past `FUTURE_TOLERANCE_NS`, under
+/// `OFFSET_BEYOND_ANY_PIPELINE_NS`, so `TFT004` stays quiet.
 #[test]
 fn a_stamp_in_the_future_reaches_a_tft005_finding_on_a_real_arena() {
     use tf_tree::{Capacity, EdgeCfg, TreeBuilder};
@@ -810,11 +600,7 @@ fn a_stamp_in_the_future_reaches_a_tft005_finding_on_a_real_arena() {
         o.findings[0].message
     );
 
-    // `TFT004` reads the same arena from the other side — `wall clock - stamp`,
-    // recorded by the writer — and half a second is an ordinary stamp-to-push
-    // latency there. Asserted so this fixture cannot quietly become a test of
-    // two checks at once, which is what §11's "exactly that check and no other"
-    // is about.
+    // `TFT004` must stay quiet, so this tests `TFT005` alone.
     let clocks = report
         .outcomes
         .iter()
@@ -831,106 +617,17 @@ fn a_stamp_in_the_future_reaches_a_tft005_finding_on_a_real_arena() {
     drop(future);
 }
 
-/// **`doctor --json` is parsed as JSON and checked against the schema
-/// `render_json` documents — `docs/PHASE5.md` §11's *"schema-validated"*.**
+/// `doctor --json` is parsed as JSON and checked against the schema
+/// `render_json` documents (`docs/PHASE5.md` §11, "schema-validated").
 ///
-/// Until this test the schema was a rustdoc code block and nothing compared it
-/// to the bytes. What existed was positional: `tests/doctor_recording.rs` finds
-/// the `"id"` line and then indexes `lines[at + 3]` for the status, with an
-/// assertion that the field order has not moved — which is an explicit
-/// acknowledgement that it is reading a layout rather than a document. Nothing
-/// would have caught an unbalanced brace, a trailing comma, an unescaped byte
-/// outside the one hostile-name unit test, a missing id, or a `reason` on a
-/// check that ran.
-///
-/// **It runs the real binary**, so it covers the whole path a CI consumer uses:
-/// `clap`, the fixture source, `checks::run`, `Meta`, `render_json`, stdout.
-///
-/// # What is asserted, and why each one
-///
-/// * **It parses.** The document is hand-written with `writeln!`, so this is the
-///   one property no unit test on a `String` had.
-/// * **The top-level key set is exactly the documented one**, in both
-///   directions. A key present in the bytes and absent from `render_json`'s
-///   schema block is an undocumented field a consumer will come to depend on;
-///   a key in the block and absent from the bytes is a promise. §6 says adding a
-///   field is compatible by construction — it stays compatible, and it now
-///   requires editing the schema block and this list in the same commit, which
-///   is the point.
-///
-///   **That last clause was false of the block until 2026-09-06 and it is the
-///   defect worth recording**, because the assertion message named a comparison
-///   nobody made. The wire document has **three** spellings — the block, the
-///   `writeln!` emitter under it, and `expected_keys` here — and only the last
-///   two were compared. Measured: emitting `"host_arch"` and adding it to
-///   `expected_keys`, with the block untouched, left `cargo nextest run -p
-///   tf_tree_cli` green, and `cargo test --doc` never sees the block because it
-///   is fenced ```` ```text ````. [`documented_top_level_keys`] parses it now
-///   and this list is held to it first, so the literal keeps its value (it is
-///   what caught the `Tft::ALL` reorder mutant below) while the block stops
-///   being a spelling nothing reads. Its **top level only** — see that
-///   function's own doc for which lists that leaves uncoupled.
-/// * **The schema string is pinned to a literal**, so `JSON_SCHEMA` moving is a
-///   deliberate edit and not a typo. §6's rule is *bump only for an incompatible
-///   change*, and nothing else in the tree reads that constant.
-/// * **Every catalogue id appears exactly once, in id order.** `checks` always
-///   carrying every id is what lets a consumer tell "did not fire" from "this
-///   build does not have this check". The expected sequence is a literal here.
-///   It was a fold over `Tft::ALL` until a review swapped two entries of that
-///   array and watched the wire document reorder with this test still green:
-///   `render_json`'s order *is* `Tft::ALL`'s, so comparing against it asserted
-///   only membership, which the `[Tft; 19]` type already gives. The literal is
-///   held to be ascending on its own terms, and to `Tft::ALL` as a set, so
-///   neither an id missing from the wire nor a mis-typed literal passes.
-/// * **`reason` is a string iff `status` is `"skipped"`.** A `Skipped` with no
-///   reason is the specific dishonesty `Status::Skipped(String)` exists to
-///   prevent, and a `reason` on a check that *ran* would read as a caveat on its
-///   verdict.
-/// * **The summary agrees with the arrays it summarises.** `summary.error`,
-///   `warn` and `info` count findings — `uncatalogued` ones included, which is
-///   what makes them agree with the exit status — and `passed`/`fired`/`not_run`
-///   count checks: two different denominators in one object, which is how a
-///   consumer comes to read one as the other. All three severities are compared;
-///   the first version of this test compared `warn` alone, so the other two
-///   agreed with nothing. The reference fixture produces no **error**-severity
-///   finding, so that arm holds `0 == 0` against the findings arrays and catches
-///   only an emitter that invents a count — the mutant below is what it is
-///   worth.
-/// * **`uncatalogued` is present** even with no producer: §6's amendment keeps
-///   it in the schema deliberately.
-///
-/// Non-vacuity is asserted rather than assumed: the fixture must produce at
-/// least one fired check with a finding and at least one skip, or every rule
-/// above holds over an empty document.
-///
-/// # Mutants, all run
-///
-/// * Append a `,` after the `"uncatalogued"` array's closing bracket in
-///   `render_json`. Applied: `serde_json::from_str` fails and the parse
-///   assertion reports "trailing comma".
-/// * Emit `TFT018` as `TFT019`'s id, which leaves the document *valid* — the
-///   obvious mutant, dropping the last outcome, is caught by the parse instead,
-///   because the comma logic keys on the array's last index and the id rule is
-///   then never reached. Applied: the id sequence assertion fails on a list
-///   ending `"TFT018", "TFT018"`.
-/// * Emit `"reason": ""` for a check that passed. Applied: the reason/status
-///   agreement fails on `TFT006`.
-/// * Count *checks* at info severity into `summary.info` instead of findings.
-///   Applied: the info arm fails at `2` against `1`.
-/// * Emit the fired-check count as `summary.error`. Applied: the error arm
-///   fails at `2` against `0`.
-/// * `JSON_SCHEMA = "tf_tree.doctor/2"`. Applied: the pin fails. (The
-///   `contains` check in `catalogue.rs`'s own unit tests does not: it reads the
-///   constant, so it agrees with any value.)
-/// * Swap `Tft::Tft018` and `Tft::Tft019` in `Tft::ALL`. Applied: the sequence
-///   assertion fails on a list ending `"TFT019", "TFT018"`. Against the earlier
-///   `Tft::ALL`-derived expectation this mutant was green, which is why the
-///   literal exists.
-/// * Add a `Tft020` variant to `Tft::ALL` and `continue` past it in
-///   `checks::run`, so the catalogue carries an id the wire never emits — the
-///   one shape the sequence assertion cannot see, since the literal and the
-///   emitter would agree on the other nineteen. Applied: the set comparison
-///   against `Tft::ALL` fails.
+/// Asserted: it parses; the top-level key set equals the documented one
+/// ([`documented_top_level_keys`]) and a literal; the schema string is pinned;
+/// every catalogue id appears once, in id order, against a literal (a fold over
+/// `Tft::ALL` would only assert membership) and to `Tft::ALL` as a set; `reason`
+/// is a string iff `status` is `"skipped"`; `summary.error/warn/info` count
+/// findings (`uncatalogued` included) while `passed/fired/not_run` count checks;
+/// `uncatalogued` is present (§6). The fixture must produce a fired check and a
+/// skip, or every rule holds over an empty document.
 #[test]
 fn the_json_report_parses_and_matches_its_documented_schema() {
     use serde_json::Value;
@@ -943,7 +640,7 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
     let doc: Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("doctor --json is not JSON ({e}):\n{stdout}"));
 
-    // The keys `render_json`'s doc comment documents, and no others.
+    // The keys `render_json` documents, and no others.
     let expected_keys = [
         "arena",
         "checks",
@@ -1027,8 +724,7 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
         ]
     );
 
-    // Every id, exactly once, in id order. The expected sequence is a literal
-    // and not a fold over `Tft::ALL` — this test's doc has the reason.
+    // Every id, exactly once, in id order, against a literal (see the test doc).
     let checks = doc["checks"].as_array().expect("checks is an array");
     let ids: Vec<&str> = checks
         .iter()
@@ -1058,7 +754,7 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
     );
 
     let (mut pass, mut fired, mut skipped) = (0usize, 0usize, 0usize);
-    // Findings by severity, all three of them (this test's doc says why).
+    // Findings by severity, all three.
     let mut findings_at: BTreeMap<&str, usize> = BTreeMap::new();
     for c in checks {
         let id = c["id"].as_str().unwrap();
@@ -1154,7 +850,7 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
         );
     }
 
-    // Non-vacuity: without these every rule above holds over an empty document.
+    // Non-vacuity: without these every rule holds over an empty document.
     assert!(fired > 0, "the fixture must fire something:\n{stdout}");
     assert!(skipped > 0, "the fixture must skip something:\n{stdout}");
     assert!(
@@ -1165,41 +861,11 @@ fn the_json_report_parses_and_matches_its_documented_schema() {
     );
 }
 
-/// **`TFT013`'s grace evidence is unobtainable on an arena whose rings retain
-/// one sample, and the skip it printed there stated something false about the
-/// arena.**
-///
-/// The grace period is `(head - 1) x median period`, and `doctor::median_period`
-/// needs two retained samples. `Capacity::history` is
-/// `next_pow2(ceil(rate_hz * secs))` and `SampleRing::retained` is
-/// `capacity - 1`, so an edge declared `rate_hz * secs <= 2` retains **one**
-/// sample however long its publisher runs — the median is `None`, the whole
-/// check skips, and it skipped saying *nothing in this arena has published a
-/// measurable stream … an edge with head == 0 is what every dynamic edge of a
-/// correct arena reads as at bringup. TFT017 is the id for an edge whose writer
-/// is gone*. The publisher below has accepted 3 600 pushes.
-///
-/// It is an integration test rather than a unit one because the claim under test
-/// is **reachability**: a hand-built `Snapshot` can be given `head = 3600` and
-/// one observation by fiat, which proves the reason and not that any arena is
-/// ever in that state. This builds the ring through the shipped `Capacity` and
-/// lets `Observations::from_arena` decide how many samples come back.
-///
-/// **The second arena below is the same defect one level down.**
-/// `Unmeasurable` is reached whenever *no* dynamic edge yields two
-/// observations, and a ring size is only one of the two ways to get there: a
-/// publisher that has pushed once into a 512-slot ring — every `doctor
-/// --attach` at bringup — is in it with 511 slots free. A skip that answered
-/// *make the ring bigger* there would be the ring-size sentence stating
-/// something false about the arena it printed on, which is what the first
-/// arena's assertions exist to stop.
-///
-/// Mutant, run: fold `PublishActivity::Unmeasurable` back into `NoPublisher`.
-/// The status is unchanged and the reason assertion fails — which is the whole
-/// finding, since the defect was never a wrong verdict.
-/// **Mutant, run:** delete the `retained_capacity < 2` branch and print the
-/// ring-size clause unconditionally. The first arena still passes and the
-/// second one fails on `!why.contains("four slots")`.
+/// `TFT013`'s skip must not state something false about an arena whose rings
+/// retain one sample (`PublishActivity::Unmeasurable`, not `NoPublisher`): the
+/// grace period needs two retained samples for a median period. A second arena,
+/// one push into a 512-slot ring (every `doctor --attach` at bringup), reaches
+/// the same variant without the ring-size cause.
 #[test]
 fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_measure() {
     use tf_tree::{Capacity, EdgeCfg, TreeBuilder};
@@ -1214,8 +880,7 @@ fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_
 
     let tree = TreeBuilder::new()
         .dynamic_edge("odom", "base_footprint", EdgeCfg::new(slow))
-        // The fault `TFT013` exists to name, present and unreportable: declared
-        // dynamic and never published to.
+        // The fault `TFT013` names: declared dynamic, never published to.
         .dynamic_edge(
             "base_footprint",
             "base_link",
@@ -1235,8 +900,7 @@ fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_
     let obs = Observations::from_arena(&tree, &snap);
     let stats = checks::collect_edge_stats(&tree, &snap);
 
-    // Non-vacuity, both halves: the publisher really has published, and the
-    // arena really cannot yield it a median period.
+    // Non-vacuity: the publisher has published and the arena yields no median period.
     assert_eq!(
         snap.edges.iter().map(|e| e.head).max(),
         Some(3_600),
@@ -1290,8 +954,7 @@ fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_
         other => panic!("TFT013 reported {other:?} on an arena it cannot measure a grace on"),
     }
 
-    // The catalogue's rule that one fault is one id: no two checks may report a
-    // finding about the same subject. `TFT017` owns the unpublished edge here.
+    // One fault is one id: no two checks report a finding about the same subject.
     let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for oc in &report.outcomes {
         for f in &oc.findings {
@@ -1300,8 +963,7 @@ fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_
                 .push(oc.check.id());
         }
     }
-    // An empty subject set is not a pass: if nothing fired at all the loop
-    // below runs no comparison and this section asserts nothing.
+    // An empty subject set is not a pass: the loop below would assert nothing.
     assert!(
         seen.values().flatten().any(|id| *id == "TFT017"),
         "the never-published edge must reach TFT017, or the duplicate check \
@@ -1316,8 +978,7 @@ fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_
         );
     }
 
-    // The other arena that reaches the same variant: a 512-slot ring with one
-    // push in it, which is every `doctor --attach` issued at bringup.
+    // The other arena reaching the same variant: 512 slots, one push.
     let tree = TreeBuilder::new()
         .dynamic_edge("odom", "base_footprint", EdgeCfg::new(Capacity::slots(512)))
         .dynamic_edge(
@@ -1383,33 +1044,10 @@ fn tft013_skips_with_the_ring_size_reason_on_an_arena_whose_publisher_it_cannot_
     }
 }
 
-/// The **top-level** keys `catalogue::render_json`'s rustdoc schema block
-/// documents, sorted.
-///
-/// Source-text parsing, because the block is fenced ```` ```text ```` — rustdoc
-/// never runs it and `#[doc = ...]` takes no `const`, so there is no way to
-/// interpolate one list into both. What this buys is that the block stops being
-/// a spelling nothing compares: the literal in
-/// [`the_json_report_parses_and_matches_its_documented_schema`] is held to it,
-/// and the bytes are held to the literal, so all three move together.
-///
-/// # What it does not recover
-///
-/// **Only the top level.** The block spells nested shapes inline
-/// (`"rings": { "edges": u32, … }`), so `arena`, `arena.rings`, the per-check
-/// object, `summary` and the per-finding object are still compared against
-/// literals in that test and against nothing else. Writing a parser for the
-/// nested shapes would be a second, partial JSON grammar in a test file, which
-/// is a worse trade than naming the lists that stay uncoupled — the sentence
-/// above enumerates them, which is what a count of them would replace.
-///
-/// The rule is "a `///` line whose content begins at exactly three spaces and a
-/// quote", which is what makes the top level separable from a continuation line
-/// — every nested key in the block is indented past its opening brace.
-///
-/// **Mutant, run:** emit and document one extra top-level key, then delete it
-/// from the block alone. The assertion fails with the 13 documented keys on the
-/// left and 14 on the right.
+/// The top-level keys `catalogue::render_json`'s rustdoc schema block documents,
+/// sorted. Parsed from source (the block is fenced `text`): a `///` line whose
+/// content begins at exactly three spaces and a quote. Nested shapes are not
+/// parsed and stay compared against literals in the test.
 fn documented_top_level_keys() -> Vec<&'static str> {
     let src = include_str!("../src/catalogue.rs");
     let (_, after) = src
@@ -1429,9 +1067,7 @@ fn documented_top_level_keys() -> Vec<&'static str> {
         .filter_map(|l| l.split_once('"'))
         .map(|(key, _)| key)
         .collect();
-    // Non-vacuity: a parse that found nothing would make the comparison above
-    // an assertion that the emitter documents no keys at all, which is the
-    // empty-subject-set pass this repository keeps finding.
+    // Non-vacuity: a parse that found nothing would compare against no keys.
     assert!(
         keys.len() > 5,
         "the schema block parse recovered {} key(s); the block's shape has \

@@ -1,33 +1,19 @@
 //! Memory footprint and computation-per-lookup, tf_tree vs `tf2::BufferCore`.
 //!
-//! `docs/PHASE1.md` §11 pins latency; this covers memory and work per lookup.
-//!
-//! One engine per process: building both would let the first's freed chunks
-//! satisfy the second's requests. `just footprint` runs the modes separately
-//! (the tf2 modes need the container).
-//!
-//! Memory is `mallinfo2` (`uordblks + hblkhd`), not RSS: C++ `operator new` and
-//! Rust both bottom out in `malloc`, and tf_tree's arena is a single mmapped
-//! allocation invisible to `uordblks` alone.
-//!
-//! Computation is cachegrind's exact `Ir`: `--mode lookup-* 0` performs setup
-//! only, so subtracting it from an `N`-lookup run leaves the lookups alone.
-// Output is the result: `just footprint` pipes it into `docs/benchmarks/tf2.md`'s table.
+//! One engine per process (freed chunks would satisfy the second's requests). Memory is `mallinfo2`
+//! (`uordblks + hblkhd`), not RSS; computation is cachegrind's `Ir`, with `--mode lookup-* 0` (setup only) subtracted.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::print_stdout,
     clippy::print_stderr
 )]
-// `docs/decisions/0007` rule 1, kind 2 (the OS), per `0048`. A bin is a separate
-// crate root, so the library's `forbid(unsafe_code)` does not govern it.
+// `docs/decisions/0007` rule 1, kind 2 (the OS), per `0048`; a bin is a separate crate root.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// SAFETY (module invariant): the single `unsafe` block calls glibc's `mallinfo2`,
-// declared in this file's `extern "C"` block. It takes no arguments, reads only
-// allocator bookkeeping, and returns a POD struct mirroring the documented
-// ten-`size_t` layout.
+// SAFETY (module invariant): the single `unsafe` block calls glibc's `mallinfo2` (declared in this file's
+// `extern "C"` block): no arguments, reads only allocator bookkeeping, returns a POD struct of the documented layout.
 
 use std::hint::black_box;
 
@@ -42,11 +28,9 @@ struct MallInfo2 {
     ordblks: usize,
     smblks: usize,
     hblks: usize,
-    /// Bytes in `mmap`ed regions, including tf_tree's whole arena.
     hblkhd: usize,
     usmblks: usize,
     fsmblks: usize,
-    /// Bytes in use from the normal heap.
     uordblks: usize,
     fordblks: usize,
     keepcost: usize,
@@ -58,13 +42,11 @@ extern "C" {
 
 /// Bytes currently in use across both the sbrk heap and mmapped regions.
 fn heap_in_use() -> usize {
-    // SAFETY: `mallinfo2` takes no arguments, reads only allocator bookkeeping and
-    // returns a POD struct by value mirroring the documented layout.
+    // SAFETY: see the module invariant.
     let mi = unsafe { mallinfo2() };
     mi.uordblks + mi.hblkhd
 }
 
-/// Samples the fixture holds after `spin_up`: one per dynamic edge per tick.
 fn fixture_sample_count() -> usize {
     fixture::DYNAMIC_EDGES
         .iter()
@@ -79,7 +61,6 @@ fn main() {
 
     match mode {
         "mem-tf_tree" => mem_tf_tree(),
-        // The tf2-comparable policy (tf2 has no screw-geodesic interpolation).
         "lookup-tf_tree" => lookup_tf_tree(n, InterpPolicy::LerpSlerp),
         "lookup-tf_tree-sclerp" => lookup_tf_tree(n, InterpPolicy::ScLerp),
         "push-tf_tree" => push_tf_tree(n),
@@ -102,16 +83,12 @@ fn main() {
     }
 }
 
-/// Heap held by a fully populated tf_tree. Reports per declared slot (marginal ring
-/// capacity) and per stored sample (larger: `Capacity::history` rounds rings up to a
-/// power of two).
+/// Heap held by a fully populated tf_tree, per declared slot and per stored sample.
 fn mem_tf_tree() {
-    // `mallinfo2` compares the engines; Pss is what an operator sees (0021).
     let before = heap_in_use();
     let pss_before = tf_tree_bench::mp::self_pss_kib();
     let tree = {
         let (tree, samples) = fixture::populated_tree().expect("build fixture");
-        // The harness's recorded push stream is not engine memory.
         drop(samples);
         tree
     };
@@ -133,7 +110,6 @@ fn mem_tf_tree() {
     black_box(&tree);
 }
 
-/// `N` publishes onto one dynamic edge: the write-path allocation measure.
 fn push_tf_tree(n: usize) {
     let tree = fixture::build_tree_with(InterpPolicy::LerpSlerp).expect("build fixture");
     let (parent, child, rate_hz) = fixture::DYNAMIC_EDGES[2]; // the 1 kHz edge
@@ -151,14 +127,12 @@ fn push_tf_tree(n: usize) {
     println!("pushes\t{n}");
 }
 
-/// Stamp for lookup `i`: a 100 ms window ending at `NOW` (`docs/PHASE1.md` §11.2), in
-/// 1 µs steps so queries do not stay inside a few ring slots. Shared by both engines.
+/// Stamp for lookup `i`: a 100 ms window ending at `NOW` (`docs/PHASE1.md` §11.2); shared by both engines.
 fn window_stamp(i: usize) -> i64 {
     fixture::NOW_NS - (i as i64 % 100_000) * 1_000
 }
 
-/// `N` plan evaluations at the deepest dynamic chain (`imu_link <- map`). Only
-/// `LerpSlerp` is tf2-comparable. Untimed: it runs under cachegrind.
+/// `N` plan evaluations at the deepest dynamic chain (`imu_link <- map`); untimed, it runs under cachegrind.
 fn lookup_tf_tree(n: usize, interp: InterpPolicy) {
     let tree = fixture::build_tree_with(interp).expect("build fixture");
     {
@@ -207,8 +181,7 @@ mod tf2_modes {
         black_box(&fixture);
     }
 
-    /// `N` `setTransform` calls onto one edge, mirroring `push_tf_tree`, via prebuilt
-    /// `std::string` handles so tf2 is not charged for allocations a C++ caller avoids.
+    /// `N` `setTransform` calls onto one edge via prebuilt `std::string` handles.
     pub(super) fn push(n: usize) {
         use tf_tree_bench::fixture;
         let buffer = Tf2Buffer::new(fixture::HISTORY_SECS * 3.0).expect("tf2 buffer");
@@ -228,8 +201,7 @@ mod tf2_modes {
         black_box(&buffer);
     }
 
-    /// `N` `lookupTransform` calls over the same chain and window, via `lookup_by_name`
-    /// (the `&str` overload allocates two C++ strings per call).
+    /// `N` `lookupTransform` calls over the same chain and window, via `lookup_by_name`.
     pub(super) fn lookup(n: usize) {
         let fixture = Tf2Fixture::load().expect("load tf2 fixture");
         let target = FrameName::new("imu_link").expect("imu_link");

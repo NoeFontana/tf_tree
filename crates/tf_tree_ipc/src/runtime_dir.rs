@@ -1,11 +1,8 @@
 //! Runtime-directory resolution — the sharing boundary.
 //!
-//! `docs/PHASE2.md` §3.1: **two processes share an arena if and only if they
-//! resolve to the same runtime directory, domain and name.** Every ambiguity
-//! fails loudly rather than landing in a different directory, which would leave
-//! nodes talking to half a transform tree with nothing reporting an error. The
-//! boundary is a directory so it is inspectable with `ls` and shared between
-//! containers by a volume mount.
+//! `docs/PHASE2.md` §3.1: two processes share an arena if and only if they
+//! resolve to the same runtime directory, domain and name. Every ambiguity
+//! fails loudly rather than landing in a different directory.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,19 +13,15 @@ use crate::error::{IpcError, RuntimeDirSource};
 const NFS_SUPER_MAGIC: u64 = 0x6969;
 /// `CIFS_MAGIC_NUMBER` (`"\xffSMB"`).
 const CIFS_MAGIC_NUMBER: u64 = 0xFF53_4D42;
-/// `SMB_SUPER_MAGIC`, the pre-CIFS name for the same family. Rejected for the
-/// same reason.
+/// `SMB_SUPER_MAGIC`, the pre-CIFS name for the same family.
 const SMB_SUPER_MAGIC: u64 = 0x517B;
 /// `SMB2_MAGIC_NUMBER`, used by the `smb3`/`cifs` module for SMB2+ mounts.
 const SMB2_MAGIC_NUMBER: u64 = 0xFE53_4D42;
 
-/// Environment lookup, injected so the resolution *rules* are unit-testable
-/// without mutating process-global state.
+/// Environment lookup, injected so the resolution rules are unit-testable.
 pub trait EnvLookup {
     /// The value of `key`, or `None` if unset.
-    ///
-    /// Returns `OsString` because `$TF_TREE_RUNTIME_DIR` is a path and need not
-    /// be UTF-8.
+    /// The value of `key`, or `None` if unset (`OsString`: a path need not be UTF-8).
     fn var(&self, key: &str) -> Option<OsString>;
 }
 
@@ -56,7 +49,7 @@ impl RuntimeDir {
         &self.path
     }
 
-    /// Which §3.1 rule produced it; worth printing at startup.
+    /// Which §3.1 rule produced it.
     #[must_use]
     pub fn source(&self) -> RuntimeDirSource {
         self.source
@@ -81,8 +74,7 @@ impl RuntimeDir {
     /// 4. `/tmp/tf_tree-<uid>`, created `0700`
     ///
     /// **A set variable is a hit even if it does not work**: falling through
-    /// would put this process on a different sharing boundary. Only
-    /// `/run/tf_tree` may be skipped, being a probe rather than an instruction.
+    /// would change the sharing boundary. Only `/run/tf_tree` may be skipped.
     ///
     /// # Errors
     ///
@@ -126,8 +118,7 @@ fn finish(path: PathBuf, source: RuntimeDirSource, uid: u32) -> Result<RuntimeDi
     if !meta.is_dir() {
         return Err(IpcError::RuntimeDirNotADirectory { source });
     }
-    // `/tmp/tf_tree-<uid>` can be pre-created by anyone; this is the only place
-    // §3.10's same-user boundary is checkable.
+    // Anyone can pre-create `/tmp/tf_tree-<uid>`; §3.10's same-user boundary is checked here.
     if source == RuntimeDirSource::Tmp {
         use std::os::unix::fs::MetadataExt;
         if meta.uid() != uid {
@@ -142,17 +133,14 @@ fn finish(path: PathBuf, source: RuntimeDirSource, uid: u32) -> Result<RuntimeDi
     Ok(RuntimeDir { path, source })
 }
 
-/// NORMATIVE (`docs/PHASE2.md` §3.1): refuse NFS and CIFS, where locks are
-/// leases that can be lost or outlive the holder, so §3.3's "released by the
-/// kernel at exit" and §3.4's split-brain check would degrade to a timing
-/// heuristic.
+/// NORMATIVE (`docs/PHASE2.md` §3.1): refuse NFS and CIFS, whose locks are
+/// leases that can outlive the holder, breaking §3.3 and §3.4.
 fn reject_network_filesystem(path: &Path, source: RuntimeDirSource) -> Result<(), IpcError> {
     let st = rustix::fs::statfs(path).map_err(|e| IpcError::StatFsFailed {
         source,
         raw_os_error: e.raw_os_error(),
     })?;
-    // `f_type` is i32 on 32-bit targets, where `CIFS_MAGIC_NUMBER`'s top bit
-    // would sign-extend and never match; masking to 32 bits is right for both.
+    // `f_type` is i32 on 32-bit targets; mask to 32 bits so the CIFS magic matches.
     #[allow(clippy::unnecessary_cast)]
     let magic = (st.f_type as i64 as u64) & 0xFFFF_FFFF;
     if matches!(
@@ -164,12 +152,11 @@ fn reject_network_filesystem(path: &Path, source: RuntimeDirSource) -> Result<()
     Ok(())
 }
 
-/// Create `path` (and any missing parents) with mode `0700`, set explicitly
-/// because `mkdir`'s mode is masked by the umask.
+/// Create `path` (and missing parents) with mode `0700`, set explicitly because
+/// the umask masks `mkdir`'s mode.
 fn ensure_dir(path: &Path) -> std::io::Result<()> {
-    // `symlink_metadata`, and a symlink is refused: another user could pre-create
-    // `/tmp/tf_tree-<uid>` as a symlink to a directory we own and redirect the
-    // whole rendezvous.
+    // `symlink_metadata`: a symlink is refused, else another user could redirect
+    // the rendezvous.
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(std::io::Error::new(
@@ -328,8 +315,8 @@ mod tests {
 
     #[test]
     fn a_tmp_directory_owned_by_someone_else_is_refused() {
-        // Ask for uid+1's directory: it is created owned by the real uid, the
-        // "belongs to somebody else" shape.
+        // uid+1's directory is created owned by the real uid: the "somebody
+        // else's" shape.
         let uid = current_uid();
         let env = FakeEnv::new(&[]);
         if uid == 0 {
@@ -348,8 +335,7 @@ mod tests {
         let _ = std::fs::remove_dir(PathBuf::from(format!("/tmp/tf_tree-{}", uid + 1)));
     }
 
-    /// **A symlinked runtime directory is refused, never followed.** Changing
-    /// `symlink_metadata` back to `metadata` left every other test green.
+    /// A symlinked runtime directory is refused, never followed.
     #[test]
     fn a_symlinked_runtime_directory_is_refused_rather_than_followed() {
         let target = scratch("symlink-target");

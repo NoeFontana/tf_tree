@@ -1,8 +1,6 @@
-//! Validating an arena header that came from somewhere else.
-//!
-//! [`crate::mapped`] (a peer's `memfd`) and [`crate::frozen`] (a file) both
-//! decide through [`validate_arena_header`], so the answer is the same on both
-//! paths. [`ShmError`] lives here as the vocabulary of validating foreign bytes.
+//! Validating an arena header that came from somewhere else. [`crate::mapped`]
+//! and [`crate::frozen`] both decide through [`validate_arena_header`];
+//! [`ShmError`] is the vocabulary of validating foreign bytes.
 
 use crate::header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC};
 use crate::layout::{layout_hash, ArenaLayout};
@@ -26,8 +24,8 @@ pub enum ShmError {
     Unsealed,
     /// `fstat` on the segment failed.
     Stat(rustix::io::Errno),
-    /// `getrandom` could not fill the arena's `instance_uuid`. Fatal rather than
-    /// falling back to a guessable id, which would defeat the split-brain check.
+    /// `getrandom` could not fill the arena's `instance_uuid`; fatal, never a
+    /// guessable fallback.
     Random(rustix::io::Errno),
     /// The fd's size disagrees with the header's `arena_size`.
     SizeMismatch {
@@ -58,19 +56,15 @@ pub enum ShmError {
     TooSmall,
     /// This process could not register in the arena's participant table.
     ///
-    /// **Not evidence that the table is full**: the attach raises it for any
-    /// refusal to register, usually the granted slot being taken or out of range.
-    /// A full table is refused earlier, by the rendezvous.
+    /// **Not evidence that the table is full** (the rendezvous refuses that
+    /// earlier): usually the granted slot is taken or out of range.
     ParticipantTableFull,
     /// [`crate::AttachMode::ReadWrite`] was asked for over a bare file
-    /// descriptor, which takes no participant lock byte.
-    ///
-    /// The fd-passing attach is for readers (`docs/decisions/0028`, open
-    /// question 1); writers join through `tf_tree::Open`.
+    /// descriptor, which takes no participant lock byte (`docs/decisions/0028`,
+    /// open question 1); writers join through `tf_tree::Open`.
     ReadWriteNeedsRendezvous,
-    /// The header's region offsets do not match the geometry its own capacities
-    /// imply. Distinct from [`ShmError::LayoutMismatch`], which compares against
-    /// a *build* constant.
+    /// The header's region offsets do not match the geometry its capacities
+    /// imply; unlike [`ShmError::LayoutMismatch`], a build-constant comparison.
     HeaderInconsistent,
 }
 
@@ -226,9 +220,7 @@ pub(crate) fn validate_arena_header(h: &ArenaHeader, size: u64) -> Result<(), Sh
 
 /// One value of every `ShmError` variant, integers at their maximum and each
 /// `Errno` at 4095, paired with the numbers `docs/decisions/0059` decision 2(a)
-/// requires in the text. Shared with `frozen.rs`'s rendering test. Guarded by
-/// the exhaustive `shm_error_index` and
-/// `every_shm_error_variant_renders_by_0059s_rules`.
+/// requires in the text. Shared with `frozen.rs`'s rendering test.
 #[cfg(test)]
 pub(crate) fn every_shm_error(
 ) -> alloc::vec::Vec<(ShmError, alloc::vec::Vec<alloc::string::String>)> {
@@ -315,14 +307,10 @@ mod tests {
         HeapArena::new(&layout, 0, 0, [0; 16])
     }
 
-    /// Every field the geometry block compares, scrambled one at a time,
-    /// including `arena_size`, which ties the derived geometry to the mapped
-    /// length. `size` is read *after* the poke so `SizeMismatch` cannot
-    /// pre-empt the geometry block (it is covered by
-    /// `the_checks_run_in_the_documented_order`).
+    /// Every field the geometry block compares, scrambled one at a time.
+    /// `size` is read after the poke so `SizeMismatch` cannot pre-empt it.
     ///
-    /// Mutant: drop any one conjunct of the `let matches = …` chain ⇒ the case
-    /// naming that field reports `Ok(())` and fails.
+    /// Mutant: drop any one conjunct of the `let matches = …` chain.
     #[test]
     fn a_header_that_disagrees_with_its_own_counts_is_refused() {
         let good = arena();
@@ -357,7 +345,6 @@ mod tests {
             // SAFETY: this test uniquely owns `a`, whose base is a live,
             // 64-byte-aligned, initialized `ArenaHeader`; the `&mut` is unaliased.
             unsafe { poke(&mut *a.base().cast::<ArenaHeader>()) };
-            // Read after the poke so the `arena_size` row reaches the geometry.
             let size = a.header().arena_size;
             assert_eq!(
                 validate_arena_header(a.header(), size),
@@ -367,10 +354,8 @@ mod tests {
         }
     }
 
-    /// Identity, then vocabulary, then geometry, then self-consistency: each step
-    /// repairs the field the previous error named, so the errors *are* the order.
-    /// Mutant: hoist the version check above the magic check ⇒ the first
-    /// assertion sees `VersionMismatch` and fails.
+    /// Each step repairs the field the previous error named, so the errors are
+    /// the order. Mutant: hoist the version check above the magic check.
     #[test]
     fn the_checks_run_in_the_documented_order() {
         let a = arena();
@@ -422,10 +407,7 @@ mod tests {
     }
 
     /// `docs/decisions/0059` step 1(b): every variant renders structurally, never
-    /// as a pinned sentence (`docs/API.md` R5).
-    ///
-    /// **Mutant (M1):** `SizeMismatch`'s arm → `write!(f, "{self:?}")` ⇒ this
-    /// and `frozen.rs`'s test fail.
+    /// as a pinned sentence. Mutant (M1): `SizeMismatch` → `write!(f, "{self:?}")`.
     #[test]
     fn every_shm_error_variant_renders_by_0059s_rules() {
         use crate::render_test::{assert_structure, variant_name};
@@ -448,8 +430,7 @@ mod tests {
         }
     }
 
-    /// Decision 2(f): on `tf_tree`'s joiner path this variant erases a taken or
-    /// out-of-range slot, so its text may not say the table is full.
+    /// Decision 2(f): this variant's text may not say the table is full.
     #[test]
     fn participant_table_full_does_not_claim_a_full_table() {
         use alloc::string::ToString;
@@ -465,8 +446,7 @@ mod tests {
     }
 
     /// A `ShmError` leaves a function through `?` into `Box<dyn Error>`.
-    /// **Mutant (M4):** delete `impl core::error::Error for ShmError` ⇒ the tests
-    /// do not compile.
+    /// Mutant (M4): delete `impl core::error::Error for ShmError`.
     #[test]
     fn a_shm_error_can_leave_a_function_as_box_dyn_error() {
         use alloc::boxed::Box;

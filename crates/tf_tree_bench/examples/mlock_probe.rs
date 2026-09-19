@@ -1,20 +1,10 @@
-//! What `mlock` actually does to an arena-shaped mapping — `docs/API.md` §8.3's
-//! executor, and [`0049`](../../../docs/decisions/0049-the-flag-that-prefaults-the-arena.md)'s.
-//! §8.3 asserts syscall behaviour that `PHASE2.md`'s preamble says must be backed by a reproduced
-//! probe; this is that probe.
+//! What `mlock` does to an arena-shaped mapping: the probe behind `docs/API.md` §8.3 and
+//! [`0049`](../../../docs/decisions/0049-the-flag-that-prefaults-the-arena.md).
 //!
-//! # It is a probe and never a gate
-//!
-//! It prints and exits 0: every arm's answer is a property of the kernel, cgroup and swap, so a
-//! recipe asserting one would gate the machine. `docs/benchmarks/EVIDENCE.md` registers it as a
-//! probe; the numbers `0049` quotes are dated readings.
-//!
-//! # The mapping under test
-//!
-//! A `memfd`, `ftruncate`d and mapped `MAP_SHARED` (the shape `tf_tree_arena::mapped` gives a live
-//! arena), populated with `MADV_POPULATE_WRITE` as `PHASE2.md` §7.1 and
-//! [`0024`](../../../docs/decisions/0024-population-is-per-edge-at-take-up.md) do. Deliberately **not**
-//! a `tf_tree` arena: a claim protocol would sit between the syscall and the answer.
+//! A probe, never a gate: it prints and exits 0, since every answer is a property of the kernel, cgroup and
+//! swap (`docs/benchmarks/EVIDENCE.md`). It maps a `memfd` `MAP_SHARED` populated with `MADV_POPULATE_WRITE`
+//! (`PHASE2.md` §7.1, [`0024`](../../../docs/decisions/0024-population-is-per-edge-at-take-up.md)), deliberately
+//! not a `tf_tree` arena.
 //!
 //! # Running it
 //!
@@ -23,11 +13,8 @@
 //! cargo run --release -p tf_tree_bench --example mlock_probe -- retention
 //! ```
 //!
-//! With no argument it runs every arm, each in a **child process**: `mlockall(2)` is process-wide.
-//!
-//! `MADV_PAGEOUT` is a **directed** reclaim, so the `retention` arm shows the teardown *mechanism* is
-//! not blocked by swaplessness and nothing about organic pressure. The `pressure` arm is the organic
-//! half; it needs a memory cgroup, and its file-backed positive control must be read first:
+//! With no argument it runs every arm, each in a child process (`mlockall(2)` is process-wide). `pressure` needs
+//! a memory cgroup, and its positive control `pressure-file` is read first:
 //!
 //! ```sh
 //! systemd-run --user --scope -p MemoryMax=96M -q \
@@ -35,8 +22,6 @@
 //! systemd-run --user --scope -p MemoryMax=96M -q \
 //!     ./target/release/examples/mlock_probe pressure-file
 //! ```
-//!
-//! Global `kswapd` pressure is reachable by neither and stays untested.
 #![allow(
     missing_docs,
     clippy::unwrap_used,
@@ -46,21 +31,18 @@
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss
 )]
-// **`docs/decisions/0007` rule 1, kind 2 — the OS**, declared here because an example is a separate
-// crate root that `crates/tf_tree_bench/src/lib.rs`'s `forbid` does not govern (`0048`; `0049` is why
-// the file exists).
+// `docs/decisions/0007` rule 1, kind 2 (the OS); an example is a separate crate root (`0048`, `0049`).
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// SAFETY (module invariant): every `unsafe` block is a libc call on a mapping this file created and
-// owns; `LEN` is the length given to `ftruncate`, `mmap` and every later `mlock2`/`munlock`/`madvise`,
-// so no call names a byte outside it. Mappings are never unmapped: each arm is a short-lived process.
+// SAFETY (module invariant): every `unsafe` block is a libc call on a mapping this file created; `LEN` bounds
+// every call, and mappings are never unmapped (each arm is a short-lived process).
 
 use std::io::Write;
 
-/// 64 MiB — sixteen 2 MiB huge-page units. Nothing depends on the exact size.
+/// 64 MiB.
 const LEN: usize = 64 << 20;
-/// The page size every arm strides by; this file is `cfg`-ed to Linux, where 4 KiB is what it runs on.
+/// The page size every arm strides by.
 const PAGE: usize = 4096;
 
 #[cfg(not(target_os = "linux"))]
@@ -98,7 +80,6 @@ mod linux {
     use std::ffi::CString;
     use std::io::{BufRead, BufReader};
 
-    /// Every arm the no-argument run drives, each in its own process (`mlockall(2)` is process-wide).
     const ARMS: [&str; 6] = [
         "onfault",
         "retention",
@@ -131,8 +112,7 @@ mod linux {
         );
     }
 
-    /// `Rss:` in kB for the mapping starting at `p`, read from `/proc/self/smaps` and keyed on the start
-    /// address so a second mapping in the same process is not mistaken for it.
+    /// `Rss:` in kB for the mapping starting at `p`, keyed on start address.
     fn rss_kb(p: *mut libc::c_void) -> i64 {
         let want = p as usize;
         let Ok(f) = std::fs::File::open("/proc/self/smaps") else {
@@ -158,19 +138,16 @@ mod linux {
         -1
     }
 
-    /// A `memfd`, `ftruncate`d to `LEN` and mapped `MAP_SHARED` — a live arena's shape; `populate` runs
-    /// §7.1's own `MADV_POPULATE_WRITE` over all of it.
+    /// A `memfd` of `LEN` bytes mapped `MAP_SHARED`; `populate` runs `MADV_POPULATE_WRITE` over it.
     fn arena(populate: bool) -> *mut libc::c_void {
         let name = CString::new("mlock_probe").unwrap_or_default();
-        // SAFETY: `name` is a live NUL-terminated string for the duration of the
-        // call, which is all `memfd_create` reads.
+        // SAFETY: `name` is a live NUL-terminated string for the call.
         let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
         assert!(fd >= 0, "memfd_create: {}", last_error());
         // SAFETY: `fd` is the descriptor just returned and is still open.
         let rc = unsafe { libc::ftruncate(fd, LEN as libc::off_t) };
         assert!(rc == 0, "ftruncate: {}", last_error());
-        // SAFETY: a null hint asks the kernel to choose the address; `fd` is a
-        // live memfd of exactly `LEN` bytes, so the whole mapping is backed.
+        // SAFETY: null hint; `fd` is a live memfd of exactly `LEN` bytes.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -197,15 +174,13 @@ mod linux {
     }
 
     fn advise(p: *mut libc::c_void, advice: libc::c_int) -> (i32, String) {
-        // SAFETY: `p`/`LEN` is a mapping this process created and has not
-        // unmapped.
+        // SAFETY: `p`/`LEN` is a live mapping this process created.
         let rc = unsafe { libc::madvise(p, LEN, advice) };
         (rc, if rc == 0 { "ok".into() } else { last_error() })
     }
 
     fn lock_onfault(p: *mut libc::c_void) -> (i32, String) {
-        // SAFETY: same mapping, same length. `MLOCK_ONFAULT` = 1; libc does not
-        // export the constant for every target, and it is ABI, not policy.
+        // SAFETY: same mapping and length. `MLOCK_ONFAULT` = 1 (ABI; libc lacks it on some targets).
         let rc = unsafe { libc::mlock2(p, LEN, 1) };
         (rc, if rc == 0 { "ok".into() } else { last_error() })
     }
@@ -220,9 +195,6 @@ mod linux {
     }
 
     /// §8.3's second clause: *"so it adds nothing over §7.1"*.
-    ///
-    /// One mapping, `VM_LOCKED` the only variable between the two `MADV_PAGEOUT`
-    /// calls.
     pub(crate) fn retention() {
         let p = arena(true);
         println!("retention: population and locking are different things");
@@ -249,13 +221,12 @@ mod linux {
         );
     }
 
-    /// §8.3's *recommendation*, which is the clause an operator acts on.
+    /// §8.3's recommendation, the clause an operator acts on.
     pub(crate) fn mlockall_prefaults() {
         let p = arena(false);
         println!("mlockall: what MCL_CURRENT|MCL_FUTURE costs an over-provisioned arena");
         println!("  untouched                       Rss={} kB", rss_kb(p));
-        // SAFETY: no arguments beyond the flag word; process-wide, which is why
-        // this arm runs in its own process.
+        // SAFETY: flag word only; process-wide, hence this arm's own process.
         let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
         let err = if rc == 0 { "ok".into() } else { last_error() };
         println!(
@@ -273,8 +244,7 @@ mod linux {
     /// The flag §8.3 dismissed, at address-space scope.
     pub(crate) fn mlockall_onfault() {
         let p = arena(false);
-        // SAFETY: as above; `MCL_ONFAULT` is the address-space spelling of
-        // `MLOCK_ONFAULT`.
+        // SAFETY: as above; `MCL_ONFAULT` is the address-space `MLOCK_ONFAULT`.
         let rc =
             unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
         let err = if rc == 0 { "ok".into() } else { last_error() };
@@ -285,8 +255,7 @@ mod linux {
         );
         let q = arena(false);
         println!("  a NEW untouched mapping         Rss={} kB", rss_kb(q));
-        // SAFETY: `q`/`LEN` is the mapping just created; writing through it is
-        // what faults its pages in.
+        // SAFETY: `q`/`LEN` is the mapping just created; the write faults its pages in.
         unsafe { std::ptr::write_bytes(q.cast::<u8>(), 1, LEN) };
         println!("  after touching it               Rss={} kB", rss_kb(q));
         let (rc, err) = advise(q, libc::MADV_PAGEOUT);
@@ -296,8 +265,7 @@ mod linux {
         );
     }
 
-    /// What a refault costs, the quantity §8.3 exists to protect. **The accumulator is read after the
-    /// loop**: a discarded warm-read loop compiles away at `-O2`.
+    /// What a refault costs; the accumulator is read after the loop so `-O2` keeps the reads.
     pub(crate) fn refault_cost() {
         let p = arena(true);
         let base = p.cast::<u8>();
@@ -313,8 +281,7 @@ mod linux {
         let before = fault_counts();
         let t0 = std::time::Instant::now();
         for i in (0..LEN).step_by(PAGE) {
-            // SAFETY: as above — MADV_PAGEOUT drops the PTEs, it does not
-            // shrink the mapping.
+            // SAFETY: as above; `MADV_PAGEOUT` drops PTEs, not the mapping.
             acc += u64::from(unsafe { std::ptr::read_volatile(base.add(i)) });
         }
         let cold = t0.elapsed();
@@ -338,8 +305,7 @@ mod linux {
         );
     }
 
-    /// `(minor, major)` faults for this process, from `/proc/self/stat` fields 10 and 12; the split starts
-    /// after the last `)` because `comm` may contain spaces.
+    /// `(minor, major)` faults from `/proc/self/stat`, split after the last `)`.
     fn fault_counts() -> (u64, u64) {
         let Ok(s) = std::fs::read_to_string("/proc/self/stat") else {
             return (0, 0);
@@ -348,14 +314,11 @@ mod linux {
             return (0, 0);
         };
         let f: Vec<&str> = rest.split_whitespace().collect();
-        // `rest` starts at field 3 (`state`), so field 10 is index 7.
         let get = |i: usize| f.get(i).and_then(|v| v.parse().ok()).unwrap_or(0);
         (get(7), get(9))
     }
 
-    /// Whether `TFT016`'s comparison predicts `mlockall`'s outcome: it compares `RLIMIT_MEMLOCK` against
-    /// the **arena**, but `mlockall` charges the whole address space, so the call can fail under a limit
-    /// comfortably above a small arena.
+    /// Whether `TFT016` predicts `mlockall`'s outcome (`mlockall` charges the whole address space).
     pub(crate) fn memlock_limit(argv: &[String]) {
         let limits: Vec<u64> = if argv.len() > 2 {
             argv[2..].iter().filter_map(|a| a.parse().ok()).collect()
@@ -385,7 +348,7 @@ mod linux {
         );
     }
 
-    /// One `setrlimit` + `mlockall` measurement, in its own process because both are irreversible.
+    /// One `setrlimit` + `mlockall` measurement, in its own process (both are irreversible).
     pub(crate) fn memlock_limit_child(argv: &[String]) {
         let lim: u64 = argv.get(2).and_then(|a| a.parse().ok()).unwrap_or(0);
         let onfault = argv.get(3).map(String::as_str) == Some("1");
@@ -412,10 +375,7 @@ mod linux {
         );
     }
 
-    /// The organic half of the reclaim question: does a kernel under real pressure choose these folios?
-    ///
-    /// `file` swaps the `memfd` for a file-backed mapping, the **positive control**: read that arm before
-    /// believing the shmem one.
+    /// The organic half: does a kernel under pressure choose these folios? `file` is the positive control.
     pub(crate) fn pressure(file: bool) {
         let (p, kind) = if file {
             (file_arena(), "file-backed")
@@ -467,7 +427,6 @@ mod linux {
         );
     }
 
-    /// A file-backed mapping of the same size, as `pressure`'s positive control.
     fn file_arena() -> *mut libc::c_void {
         let path = std::env::temp_dir().join(format!("mlock_probe-{}.bin", std::process::id()));
         let f = match std::fs::File::options()
@@ -487,11 +446,9 @@ mod linux {
             eprintln!("mlock_probe: cannot size {}: {e}", path.display());
             std::process::exit(2);
         }
-        // Unlinked immediately: the mapping keeps it alive and an OOM-killed run leaves nothing.
         let _ = std::fs::remove_file(&path);
         use std::os::fd::AsRawFd;
-        // SAFETY: `f` is open for the duration of the call and the mapping keeps
-        // the description alive afterwards.
+        // SAFETY: `f` is open for the call and the mapping keeps the description alive.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

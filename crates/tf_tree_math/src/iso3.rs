@@ -5,10 +5,8 @@ use bytemuck::{Pod, Zeroable};
 use core::ops::Mul;
 
 /// Angle threshold below which `V`/`V⁻¹` coefficients use their Taylor series.
-/// NORMATIVE (`docs/PHASE1.md` §3.3): `0.1`. Below it the closed forms cancel
-/// (`c3` subtracts two `O(1/θ²)` terms); above it the four-term series truncates
-/// at `O(θ⁸)`. Continuity: `branch_boundary_value_is_continuous`; accuracy:
-/// `theta_sweep_matches_reference`.
+/// NORMATIVE (`docs/PHASE1.md` §3.3): `0.1`. See `branch_boundary_value_is_continuous`
+/// and `theta_sweep_matches_reference`.
 const THETA_SMALL: f64 = 0.1;
 
 /// Series coefficients of `c1 = (1 − cos θ)/θ²`, powers of `θ²` (Horner order).
@@ -117,9 +115,8 @@ impl Vec3 {
 /// `t`. `T_parent_child` — applying it to a point in `child` yields the point in
 /// `parent`.
 ///
-/// Seven `f64` in canonical order — 56 bytes, `align(8)`, no padding, so `Pod`
-/// holds ([`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)).
-/// A field added here must keep it so.
+/// Seven `f64`: 56 bytes, `align(8)`, no padding, so `Pod` holds
+/// ([`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Iso3 {
@@ -166,10 +163,8 @@ impl Iso3 {
 
     /// Return a copy with the rotation renormalized to unit norm.
     ///
-    /// Every rigid-transform op assumes a unit quaternion and drifts ~`1e-16` of
-    /// norm per composition: negligible for plans of depth ≤ 16, but callers
-    /// composing long chains should call this periodically. Not done inside
-    /// every op, to keep the `sqrt` off the lookup hot path.
+    /// Composition drifts ~`1e-16` of norm per op; call this periodically on long
+    /// chains. Not done inside ops, to keep the `sqrt` off the hot path.
     #[inline]
     #[must_use]
     pub fn normalized(self) -> Self {
@@ -255,9 +250,7 @@ fn v_coeffs(theta: f64) -> (f64, f64) {
 ///
 /// # Domain
 ///
-/// **`θ ∈ [0, π]` only**: `c3` diverges at `θ = 2kπ`. The only caller,
-/// [`log_se3`], takes `θ` from [`log_so3`]'s principal branch; a debug assertion
-/// pins it.
+/// `θ ∈ [0, π]` only: `c3` diverges at `θ = 2kπ`; a debug assertion pins it.
 #[inline]
 fn vinv_c3(theta: f64) -> f64 {
     debug_assert!(
@@ -332,12 +325,10 @@ mod tests {
     #[test]
     fn pod_zeroable_roundtrips() {
         let iso = Iso3::new(Quat::new(0.5, 0.5, 0.5, 0.5), Vec3::new(1.0, -2.0, 3.0));
-        // Pod cast to bytes and back is identity.
         let bytes: &[u8] = bytemuck::bytes_of(&iso);
         assert_eq!(bytes.len(), 56);
         let back: Iso3 = *bytemuck::from_bytes::<Iso3>(bytes);
         assert_eq!(back, iso);
-        // Zeroable identity.
         let z: Iso3 = bytemuck::Zeroable::zeroed();
         assert_eq!(z.q, Quat::new(0.0, 0.0, 0.0, 0.0));
         assert_eq!(z.t, Vec3::ZERO);
@@ -354,12 +345,9 @@ mod tests {
 
     // --- theta-sweep against a high-precision reference table ---------------
     //
-    // Reference c1/c2/c3 from an 80-digit `decimal` oracle (not tracked).
-    // Columns: (theta, c1, c2, c3). At the θ = 0.1 boundary the closed forms of
-    // `c2` and `c3` inherently lose digits, so `docs/PHASE1.md` §3.3's flat 1e-14
-    // is unreachable for them; the bounds below sit above this table's maxima
-    // only. A dense sweep puts `c2` at ~9.2e-14 near θ = 0.10549; near-π is
-    // guarded by the proptests in `tests/proptests.rs`. Do not tighten `e2`.
+    // 80-digit reference; columns (theta, c1, c2, c3). The closed forms of `c2`
+    // and `c3` lose digits at θ = 0.1 (~9.2e-14), so §3.3's flat 1e-14 is
+    // unreachable for them: do not tighten `e2`.
     const REF: [(f64, f64, f64, f64); 30] = [
         (1e-12, 0.5, 0.16666666666666666, 0.08333333333333333),
         (
@@ -541,20 +529,17 @@ mod tests {
     #[test]
     fn theta_sweep_matches_reference() {
         for &(theta, r1, r2, r3) in REF.iter() {
-            // REF only samples θ ∈ [1e-12, π], the valid domain of vinv_c3.
             let (c1, c2) = v_coeffs(theta);
             let c3 = vinv_c3(theta);
             let e1 = ((c1 - r1) / r1).abs();
             let e2 = ((c2 - r2) / r2).abs();
             let e3 = ((c3 - r3) / r3).abs();
             if theta < THETA_SMALL {
-                // Series branch: the spec's verified regime. Tight bound.
                 assert!(
                     e1 < 1e-14 && e2 < 1e-14 && e3 < 1e-14,
                     "series branch theta={theta}: e1={e1:e} e2={e2:e} e3={e3:e}"
                 );
             } else {
-                // Closed branch: see the note above `REF`.
                 assert!(
                     e1 < 1e-15 && e2 < 3e-14 && e3 < 1e-13,
                     "closed branch theta={theta}: e1={e1:e} e2={e2:e} e3={e3:e}"
@@ -565,8 +550,7 @@ mod tests {
 
     #[test]
     fn branch_boundary_value_is_continuous() {
-        // Series truncation (`c1`'s `θ⁸/10!` = 2.8e-15) makes the spec's 1e-15
-        // unreachable; assert the absolute jump stays under 1e-14.
+        // Series truncation makes 1e-15 unreachable; bound the jump at 1e-14.
         let th = THETA_SMALL;
         let t2 = th * th;
         let series = (horner(&C1, t2), horner(&C2, t2), horner(&C3, t2));
@@ -591,7 +575,6 @@ mod tests {
     #[test]
     fn exp_se3_is_finite_at_full_rotations() {
         use core::f64::consts::PI;
-        // V(θ) stays finite at θ = 2kπ.
         for &mag in &[2.0 * PI, 4.0 * PI, 2.0 * PI + 0.05] {
             let iso = exp_se3([mag, 0.0, 0.0, 0.5, -0.3, 0.8]);
             assert!(
@@ -606,7 +589,6 @@ mod tests {
                 "non-finite translation at |ω|={mag}"
             );
         }
-        // A 2π turn is the identity rotation: the quaternion axis is ≈ 0.
         let full = exp_se3([2.0 * PI, 0.0, 0.0, 1.0, 2.0, 3.0]);
         let axis = libm::sqrt(full.q.x * full.q.x + full.q.y * full.q.y + full.q.z * full.q.z);
         assert!(

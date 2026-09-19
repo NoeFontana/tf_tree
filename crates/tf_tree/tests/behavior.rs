@@ -38,7 +38,6 @@ fn disconnected_frames_are_reported_and_described() {
         .unwrap();
     let a = tree.frame("island_a").unwrap();
     let b = tree.frame("island_b").unwrap();
-    // Two interned but unattached roots.
     let plan = tree.plan(a, b).unwrap_err();
     assert!(matches!(plan, LookupError::Disconnected { .. }), "{plan:?}");
     let msg = tree.describe(plan).to_string();
@@ -56,7 +55,6 @@ fn no_data_is_reported_and_described() {
         .unwrap();
     let _map = tree.frame("map").unwrap();
     let _odom = tree.frame("odom").unwrap();
-    // No samples published.
     let err = tree.lookup("odom", "map", ns(0)).unwrap_err();
     assert!(matches!(err, LookupError::NoData { .. }), "{err:?}");
     let msg = tree.describe(err).to_string();
@@ -81,7 +79,6 @@ fn cross_domain_lookup_is_rejected_but_matching_domain_succeeds() {
         w.push(1000, &pose(2)).unwrap();
     }
 
-    // System-domain stamp against a sensor-domain edge: mismatch.
     let err = tree
         .lookup::<SystemDomain>("odom", "map", ns(500))
         .unwrap_err();
@@ -93,16 +90,12 @@ fn cross_domain_lookup_is_rejected_but_matching_domain_succeeds() {
         "{err:?}"
     );
 
-    // Matching sensor-domain stamp: succeeds.
     let ok = tree.lookup("odom", "map", Stamp::<SensorDomain>::from_nanos(500));
     assert!(ok.is_ok(), "sensor-domain lookup should succeed: {ok:?}");
 }
 
-/// A path whose dynamic edges live in different clock domains cannot be
-/// evaluated at any single stamp, so compilation rejects it. Recording only the
-/// last edge's domain (as `fold` used to) let such a plan pass `check_domain` and
-/// then sample the other edge with the wrong clock — the silent misread D9 exists
-/// to prevent.
+/// A path whose dynamic edges live in different clock domains is rejected at
+/// compile time (D9).
 #[test]
 fn a_path_crossing_time_domains_is_rejected_at_compile_time() {
     let tree = TreeBuilder::new()
@@ -130,8 +123,7 @@ fn a_path_crossing_time_domains_is_rejected_at_compile_time() {
         ),
         "{err:?}"
     );
-    // The message names the offending edge (D11). Walking up from `base` visits
-    // the sensor-domain edge first, so `map->odom` is the one that disagrees.
+    // Walking up from `base` visits the sensor-domain edge first.
     let msg = tree.describe(err).to_string();
     assert!(
         msg.contains("time domains") && msg.contains("map->odom"),
@@ -139,8 +131,7 @@ fn a_path_crossing_time_domains_is_rejected_at_compile_time() {
     );
 }
 
-/// A single-domain path still compiles and evaluates — the mixed-domain rejection
-/// must not catch the ordinary case.
+/// A single-domain path still compiles and evaluates.
 #[test]
 fn a_single_domain_path_still_compiles() {
     let cfg = EdgeCfg::new(Capacity::slots(16)).domain(SensorDomain::TAG);
@@ -167,9 +158,7 @@ fn a_single_domain_path_still_compiles() {
         .is_ok());
 }
 
-/// Claiming a static edge used to reach `ring()` unconditionally: a debug build
-/// tripped the `is_power_of_two` assertion and a release build built a ring with
-/// `mask == u64::MAX` over an empty slot slice, panicking on the first push.
+/// Claiming a static edge is refused rather than reaching `ring()`.
 #[test]
 fn claiming_a_static_edge_is_a_typed_error() {
     let tree = TreeBuilder::new()
@@ -183,8 +172,7 @@ fn claiming_a_static_edge_is_a_typed_error() {
     assert!(matches!(err, ClaimApiError::NotDynamic { .. }), "{err:?}");
 }
 
-/// A rejected `reparent` leaves the published topology byte-identical, so it must
-/// not invalidate compiled plans.
+/// A rejected `reparent` leaves the topology byte-identical and plans valid.
 #[test]
 fn a_rejected_reparent_does_not_invalidate_plans() {
     let tree = TreeBuilder::new()
@@ -199,7 +187,6 @@ fn a_rejected_reparent_does_not_invalidate_plans() {
     let plan = tree.plan(base, map).unwrap();
     assert!(plan.at(&tree.guard(), ns(0)).is_ok());
 
-    // Moving `odom` under its own descendant would close a cycle: rejected.
     assert!(tree.reparent(odom, base).is_err());
 
     assert!(
@@ -210,7 +197,6 @@ fn a_rejected_reparent_does_not_invalidate_plans() {
 
 #[test]
 fn topology_change_invalidates_a_plan() {
-    // `extra` is declared under `odom` so it can be re-parented at runtime.
     let tree = TreeBuilder::new()
         .static_edge("map", "odom", &Iso3::IDENTITY)
         .static_edge("odom", "extra", &Iso3::IDENTITY)
@@ -221,10 +207,9 @@ fn topology_change_invalidates_a_plan() {
     let extra = tree.frame("extra").unwrap();
 
     let plan = tree.plan(odom, map).unwrap();
-    // Works before the change.
     assert!(plan.at(&tree.guard(), ns(0)).is_ok());
 
-    // A runtime re-parent (off the odom<-map path) bumps the topology generation.
+    // A runtime re-parent bumps the topology generation.
     tree.reparent(extra, map).unwrap();
 
     let err = plan.at(&tree.guard(), ns(0)).unwrap_err();
@@ -235,8 +220,7 @@ fn topology_change_invalidates_a_plan() {
 }
 
 /// `Latest` samples each edge at its own newest stamp; `LatestCommon` uses the
-/// min of the newest stamps (tf2 `Time(0)`). They differ when the edges have
-/// different newest stamps.
+/// min of the newest stamps (tf2 `Time(0)`).
 #[test]
 fn latest_and_latest_common_differ_when_edges_are_uneven() {
     let cfg = EdgeCfg::new(Capacity::slots(64));
@@ -249,7 +233,6 @@ fn latest_and_latest_common_differ_when_edges_are_uneven() {
     let odom = tree.frame("odom").unwrap();
     let base = tree.frame("base").unwrap();
 
-    // map->odom: 11 samples up to t=10000. odom->base: 6 samples up to t=5000.
     let mo: Vec<Iso3> = (0..=10).map(|i| pose(i as u64 + 1)).collect();
     let ob: Vec<Iso3> = (0..=5).map(|i| pose(i as u64 + 100)).collect();
     {
@@ -266,42 +249,23 @@ fn latest_and_latest_common_differ_when_edges_are_uneven() {
     let plan = tree.plan(base, map).unwrap();
     let g = tree.guard();
 
-    // LatestCommon: min newest = 5000. Both edges at 5000.
     let common = plan.latest_common(&g).unwrap();
     let want_common = (mo[5] * ob[5]).inverse(); // T_base_map at t=5000
     assert_close(common, want_common, TOL, "latest_common");
 
-    // Latest: map->odom at 10000, odom->base at 5000.
     let latest = plan.latest(&g).unwrap();
     let want_latest = (mo[10] * ob[5]).inverse();
     assert_close(latest, want_latest, TOL, "latest");
 
-    // They genuinely differ (the map->odom pose moved between t=5000 and 10000).
     assert!(
         common.t.sub(latest.t).norm() > 1e-6,
         "latest and latest_common should differ"
     );
 }
 
-/// A8's rescue path must be **wired**, not merely present.
-///
-/// The core tests inject a liveness predicate and name a participant slot by
-/// hand. That proves the algorithm; it does not prove `Tree` supplies either —
-/// and at first it supplied neither. `Tree::view` built an anonymous view with
-/// no liveness source, so a rescuer had no identity to publish into `claiming`
-/// and believed every claimant alive. A8 was correct, loom-tested, and totally
-/// inert through the public API.
-///
-/// An earlier version of this test interned a fresh name and asserted it
-/// terminated. That passed with the wiring deliberately removed — interning an
-/// unclaimed name never reaches the rescue path, so it asserted nothing. This
-/// checks the two properties that were actually missing.
-///
-/// Gated whole: both properties are questions asked *of the view* —
-/// `interning_identity` and `has_liveness_source` are `ArenaView` methods with
-/// no stable-tier spelling — so with `unstable` off there is nothing left to
-/// assert. It still runs under `cargo nextest run --workspace`, which unifies
-/// the feature in from the four consumers that declare it.
+/// A8's rescue path is wired through the public API: `Tree` supplies an
+/// interning identity and a liveness source. Gated on `unstable` because both
+/// are `ArenaView` methods.
 #[test]
 #[cfg(feature = "unstable")]
 fn a_tree_can_rescue_a_wedged_intern() {
@@ -323,23 +287,9 @@ fn a_tree_can_rescue_a_wedged_intern() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// `Plan::span` — `docs/PHASE5.md` §4.2
-// ---------------------------------------------------------------------------
-
-/// Three dynamic edges whose retained windows are staggered *and* whose
-/// intersection is bounded by two **different** edges, neither of them the first.
-///
-/// `map->odom` is deliberately the widest window, so a `span` that returned the
-/// first step's own window (or stopped after it) reports `(0, 30_000)` and every
-/// assertion below fails. `odom->base`'s ring is smaller than its push count, so
-/// its lower end is a genuinely *lapped* window rather than "the first stamp ever
-/// pushed" — a fixture where every ring still held its whole history could not
-/// tell `oldest_stamp` from `stamps[0]`.
-///
-/// Windows: `map->odom = [0, 30_000]`, `odom->base = [19_000, 25_000]`,
-/// `base->lidar = [0, 22_000]`. Intersection `[19_000, 22_000]`: the low end
-/// comes from the second edge, the high end from the third.
+/// Three dynamic edges with staggered windows, the intersection bounded by two
+/// different non-first edges: `[0, 30_000]`, `[19_000, 25_000]` (lapped ring),
+/// `[0, 22_000]`, so `[19_000, 22_000]`.
 fn staggered_tree() -> tf_tree::Tree {
     let big = EdgeCfg::new(Capacity::slots(64));
     let small = EdgeCfg::new(Capacity::slots(8));
@@ -358,8 +308,7 @@ fn staggered_tree() -> tf_tree::Tree {
         for i in 0..=30i64 {
             w.push(i * 1000, &pose(i as u64 + 1)).unwrap();
         }
-        // 25 pushes into an 8-slot ring: `retained() == 7`, so the readable
-        // window is the last seven stamps, `[19_000, 25_000]`.
+        // 25 pushes into an 8-slot ring: window is the last seven stamps.
         let w = tree.claim(base, odom).unwrap();
         for i in 0..25i64 {
             w.push(1000 + i * 1000, &pose(i as u64 + 100)).unwrap();
@@ -373,11 +322,6 @@ fn staggered_tree() -> tf_tree::Tree {
 }
 
 /// The intersection is a `max` of lower ends and a `min` of upper ends.
-///
-/// Mutant: `lo.max(oldest)` -> `lo.min(oldest)` in `Plan::span` yields
-/// `(0, 22_000)`. Mutant: `hi.min(newest)` -> `hi.max(newest)` yields
-/// `(19_000, 30_000)`. Mutant: `break` after the first step yields
-/// `(0, 30_000)`.
 #[test]
 fn span_is_the_intersection_of_every_dynamic_window() {
     let tree = staggered_tree();
@@ -388,14 +332,8 @@ fn span_is_the_intersection_of_every_dynamic_window() {
     assert_eq!(plan.span(&tree.guard()).unwrap(), Some((19_000, 22_000)));
 }
 
-/// The interval means what it says: answerable inside it, refused outside it.
-///
-/// This is what makes the numbers above more than arithmetic — it is the same
-/// claim `docs/PHASE5.md` §4.2 makes for the query, checked against the sampler
-/// rather than against a second copy of `span`'s own `max`/`min`.
-///
-/// Mutant: widen either end by one nanosecond (`hi.min(newest) + 1`, or
-/// `lo.max(oldest) - 1`) and the matching `at` past that end stops raising.
+/// The interval is answerable inside it and refused outside it
+/// (`docs/PHASE5.md` §4.2), checked against the sampler.
 #[test]
 fn span_answers_exactly_at_the_ends_it_reports() {
     let tree = staggered_tree();
@@ -416,8 +354,7 @@ fn span_answers_exactly_at_the_ends_it_reports() {
         Err(LookupError::Extrapolation { .. })
     ));
 
-    // The upper end *is* `latest_common`'s stamp, which is the agreement
-    // `Plan::span`'s doc comment claims the two keep without sharing a helper.
+    // The upper end is `latest_common`'s stamp.
     assert_close(
         plan.at(&g, ns(t1)).unwrap(),
         plan.latest_common(&g).unwrap(),
@@ -426,15 +363,8 @@ fn span_answers_exactly_at_the_ends_it_reports() {
     );
 }
 
-/// A static step constrains nothing in time and must be skipped, not folded in.
-///
-/// **This is the branch no Python-reachable plan can contain** — `tf_tree.build`
-/// declares only dynamic edges — which is why the coverage lives here, in a crate
-/// `just test` runs.
-///
-/// Mutant: replace the `continue` in `Plan::span`'s `else` arm with
-/// `return Ok(None)`. The path then reports itself answerable at every stamp
-/// while its one dynamic edge bounds it to `[0, 3_000]`.
+/// A static step constrains nothing in time and is skipped. No Python-reachable
+/// plan contains one, so coverage lives here.
 #[test]
 fn span_skips_static_steps_and_is_bounded_by_the_dynamic_one() {
     let tree = TreeBuilder::new()
@@ -455,9 +385,7 @@ fn span_skips_static_steps_and_is_bounded_by_the_dynamic_one() {
     }
 
     let plan = tree.plan(lidar, map).unwrap();
-    // Without these the test would still pass if constant folding ever stopped
-    // emitting a `Step::Static` here, and would then assert nothing about the
-    // branch it is named for.
+    // Guards against constant folding no longer emitting a `Step::Static`.
     assert!(
         plan.steps()
             .iter()
@@ -476,14 +404,7 @@ fn span_skips_static_steps_and_is_bounded_by_the_dynamic_one() {
     assert_eq!(plan.span(&tree.guard()).unwrap(), Some((0, 3_000)));
 }
 
-/// `None` means *unbounded*, and an all-static path is the case it is for.
-///
-/// Distinguished from the empty `lookup(x, x)` plan below on purpose: a test that
-/// queries `span(x, x)` takes the `len == 0` path and never reaches the
-/// `Step::Static` arm at all.
-///
-/// Mutant: return `Some((0, 0))` for a plan with no dynamic step. A caller's
-/// `t0 <= t <= t1` is then false everywhere for a path that answers everywhere.
+/// `None` means unbounded; an all-static path is the case it is for.
 #[test]
 fn span_of_an_all_static_path_is_none() {
     let tree = TreeBuilder::new()
@@ -498,8 +419,7 @@ fn span_of_an_all_static_path_is_none() {
     assert_eq!(plan.span(&tree.guard()).unwrap(), None);
 }
 
-/// The empty `lookup(x, x)` plan is unbounded for the same reason but by a
-/// different code path: `steps()` is empty, so the loop body never runs.
+/// The empty `lookup(x, x)` plan is unbounded too, via an empty `steps()`.
 #[test]
 fn span_of_an_empty_plan_is_none() {
     let tree = staggered_tree();
@@ -509,14 +429,7 @@ fn span_of_an_empty_plan_is_none() {
     assert_eq!(plan.span(&tree.guard()).unwrap(), None);
 }
 
-/// An empty intersection is a real answer — not an error, and not `None`.
-///
-/// Two edges with genuinely disjoint histories: the caller's `t0 <= t <= t1` is
-/// correctly false everywhere, which is a different fact from "this path is
-/// answerable at any stamp".
-///
-/// Mutant: collapse `t0 > t1` to `None` in `Plan::span`. The `Some` assertion
-/// fails — and the two cases become indistinguishable to a caller.
+/// An empty intersection is a real answer, not an error and not `None`.
 #[test]
 fn span_reports_a_disjoint_intersection_rather_than_none() {
     let cfg = EdgeCfg::new(Capacity::slots(64));
@@ -533,7 +446,6 @@ fn span_reports_a_disjoint_intersection_rather_than_none() {
         for i in 0..=5i64 {
             w.push(i * 1000, &pose(i as u64 + 1)).unwrap();
         }
-        // Starts long after the first edge stopped: no overlap at all.
         let w = tree.claim(base, odom).unwrap();
         for i in 0..=5i64 {
             w.push(100_000 + i * 1000, &pose(i as u64 + 50)).unwrap();
@@ -546,12 +458,7 @@ fn span_reports_a_disjoint_intersection_rather_than_none() {
     assert_eq!((t0, t1), (100_000, 5_000));
 }
 
-/// An edge that has never published is `NoData` naming that edge — not an empty
-/// interval, because the caller acts differently on the two.
-///
-/// Mutant: `continue` past an empty ring in `Plan::span` instead of propagating
-/// `Guard::window`'s error. `span` then reports the *other* edges' intersection,
-/// a window over which the path is not answerable at all, and this gets `Ok`.
+/// An edge that has never published is `NoData` naming that edge.
 #[test]
 fn span_names_the_edge_that_has_never_published() {
     let cfg = EdgeCfg::new(Capacity::slots(64));
@@ -569,24 +476,10 @@ fn span_names_the_edge_that_has_never_published() {
             w.push(i * 1000, &pose(i as u64 + 1)).unwrap();
         }
     }
-    // `odom->base` was declared and never pushed to.
     let plan = tree.plan(base, map).unwrap();
     let err = plan.span(&tree.guard()).unwrap_err();
-    // It must name the *silent* edge, not merely fail: a `span` that reported
-    // whichever edge it looked at first would satisfy a bare `matches!`.
-    //
-    // **The resolution goes through `Tree::edges`, not `arena_view`, so that
-    // there is one assertion here and not two of different strengths.** Both
-    // read the same `EdgeRecord`'s `parent`/`child` — `edges()` is the stable
-    // tier's spelling of it — but the view exists only under `unstable`, so
-    // gating this half would leave the bare `matches!` standing alone in the
-    // tier a packager builds: a `span` that named the wrong edge would then be
-    // caught everywhere *except* there, which is precisely backwards.
-    //
-    // `edges()` lists declared edges in `EdgeId` order, skipping slots whose
-    // record is still zeros; a `TreeBuilder` tree has no such slot, and the
-    // length check below is what turns "`EdgeId` order" into "index `id - 1`"
-    // rather than leaving it a guess.
+    // It must name the silent edge; resolved through the stable `Tree::edges`
+    // (`EdgeId` order, index `id - 1`).
     let edges = tree.edges().unwrap();
     assert_eq!(edges.len(), 2, "both declared edges are listed: {edges:?}");
     let named = match err {
@@ -602,16 +495,8 @@ fn span_names_the_edge_that_has_never_published() {
     );
 }
 
-/// A plan compiled against an older topology must not be answered from, and
-/// `span` is not an exception.
-///
-/// This is the property the binding-side implementation could not have: it read
-/// `ArenaView` directly and never consulted a `Guard`, so it answered where
-/// `Plan::at` refuses — including from a fork-poisoned child, whose guard reports
-/// `ChildDetached` through the same `check_generation`.
-///
-/// Mutant: drop the `check_generation(g)?` from `Plan::span`. The stale plan then
-/// returns `Ok` and this fails.
+/// A plan compiled against an older topology is refused by `span` too
+/// (`check_generation`).
 #[test]
 fn span_refuses_a_plan_from_an_older_topology() {
     let cfg = EdgeCfg::new(Capacity::slots(64));
@@ -643,21 +528,8 @@ fn span_refuses_a_plan_from_an_older_topology() {
     );
 }
 
-/// **A contended topology lock must not name a participant slot it cannot see.**
-///
-/// `docs/API.md` R5 makes the *field* the contract and the message a diagnostic,
-/// which cuts both ways: nothing may match on this text, and the text may not be
-/// false. It was, briefly — `owner_slot` was a `u32` carrying
-/// `tf_tree_core::topology::TopoLockError`'s `u32::MAX` sentinel straight
-/// through, so a holder that had taken the lock and not yet published its slot
-/// rendered as *"held by live participant slot 4294967295"*. An operator reading
-/// that at 3am has to already know the magic number to disbelieve it, and the
-/// alternative the sentinel exists to avoid — `slot_of(0)`'s plausible-looking
-/// `0` — is worse, because it names a real process that is doing nothing wrong.
-///
-/// So this asserts the two properties that matter and neither of the words:
-/// the named case reaches the reader, and the unnamed case reaches them without
-/// a number in it at all.
+/// A contended topology lock never names a participant slot it cannot see
+/// (`docs/API.md` R5): the unnamed case renders without a number.
 #[test]
 fn a_contended_topology_lock_never_renders_a_sentinel_slot() {
     let named = tf_tree::ReparentError::LockContended {

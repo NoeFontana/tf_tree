@@ -1,19 +1,7 @@
-//! `Plan::at_with_derivatives` — `docs/PHASE4.md` §2.
-//!
-//! # What has to be true, and why each is its own test
-//!
-//! The derivative is cheap because it is *exact*, not because it is
-//! approximated well. Four independent claims carry that:
-//!
-//! 1. The pose it returns is the pose [`tf_tree::Plan::at`] returns — bit-for-bit,
-//!    so no caller can observe a difference between the two entry points.
-//! 2. The twist matches a central difference of the pose path. This is the only
-//!    check that is genuinely independent of the implementation: it differentiates
-//!    the *shipped* `at()` numerically and compares against the analytic answer.
-//! 3. The two composition identities of §2.3 hold, which is what licenses folding
-//!    an adjoint per step rather than differentiating the composed chain.
-//! 4. `LerpSlerp` is **refused**. §2.4 is the reason, and it is a deliberate
-//!    refusal rather than a gap.
+//! `Plan::at_with_derivatives` (`docs/PHASE4.md` §2). Claims: the pose is
+//! bit-identical to `Plan::at`; the twist matches a central difference of the
+//! shipped `at()`; the §2.3 composition identities hold; `LerpSlerp` is
+//! refused (§2.4).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -24,26 +12,9 @@ use tf_tree::{
     Vec3,
 };
 
-/// **A fixture whose adjoint logic is actually observable.**
-///
-/// `common::Chain` is not. Its poses are `pose(i) = exp_se3(i·ξ)` on both edges
-/// with the *same* `ξ`, so every transform lies in one one-parameter subgroup.
-/// Two things follow, and both make the fold's adjoint invisible:
-///
-/// * every relative transform is `exp(c·ξ)`, so every twist in the system is
-///   parallel to `ξ`;
-/// * `Ad(exp(s·ξ))·ξ = ξ` exactly — the adjoint fixes its own generator.
-///
-/// So `Ad(T)` and `Ad(T⁻¹)` both act as the identity on everything that appears,
-/// and a fold that used the wrong one, or that skipped it entirely, would pass.
-/// Verified: three deliberate mutations of the fold survived the whole suite when
-/// it was written against `Chain`.
-///
-/// This rig fixes that with **non-commuting screw axes** on the two dynamic edges
-/// and a **non-trivial static edge**, so:
-/// * `Ad ≠ I` on the twists that actually flow through the fold;
-/// * the static arm is executed at all (`Chain` has no static edge);
-/// * planning in both directions exercises the forward and inverted branches.
+/// A rig whose adjoint is observable: non-commuting screw axes on two dynamic
+/// edges plus a non-trivial static edge, unlike `common::Chain` (one
+/// one-parameter subgroup, where `Ad` acts as the identity).
 struct Rig {
     tree: Tree,
     map: FrameId,
@@ -54,13 +25,11 @@ impl Rig {
     const DT: i64 = 10_000_000;
 
     fn new() -> Rig {
-        // Deliberately non-parallel, non-commuting generators: a mostly-z screw
-        // with x translation, against a mostly-x screw with y translation.
+        // Non-parallel, non-commuting generators.
         let a = [0.00, 0.00, 0.05, 0.40, 0.00, 0.00];
         let b = [0.06, 0.01, 0.00, 0.00, 0.30, -0.10];
         let cfg = EdgeCfg::new(Capacity::slots(256));
-        // A static edge with both rotation and translation: a pure translation
-        // would leave the rotational block of the adjoint untested.
+        // A static edge with rotation and translation, to test the adjoint's rotational block.
         let mount = exp_se3([0.3, -0.7, 0.2, 0.11, -0.05, 0.37]);
         let tree = TreeBuilder::new()
             .dynamic_edge("map", "odom", cfg)
@@ -77,8 +46,7 @@ impl Rig {
         let w_ob = tree.claim(base, odom).unwrap();
         for i in 0..64i64 {
             let f = i as f64;
-            // Quadratic in the algebra so the twist genuinely varies segment to
-            // segment, rather than being globally constant as in `Chain`.
+            // Quadratic in the algebra, so the twist varies segment to segment.
             let g = f * f / 64.0;
             w_mo.push(i * Self::DT, &exp_se3(a.map(|c| c * g))).unwrap();
             w_ob.push(i * Self::DT, &exp_se3(b.map(|c| c * (f * 0.5 + g))))
@@ -90,16 +58,11 @@ impl Rig {
     }
 }
 
-/// Central difference of a pose path, as a body twist.
-///
-/// `V^b = (T⁻¹ Ṫ)^∨`, so this forms `T(t)⁻¹ · (T(t+h) − T(t−h))/2h` and reads off
-/// the `se(3)` components. `at` is deliberately the *shipped* `plan.at`, so this
-/// shares no code with `at_with_derivatives`.
+/// Central difference of the shipped `plan.at`, as a body twist `(T⁻¹ Ṫ)^∨`.
 fn central_difference(at: &dyn Fn(i64) -> Iso3, t_ns: i64, h_ns: i64) -> Twist {
     let (tm, tp, t0) = (at(t_ns - h_ns), at(t_ns + h_ns), at(t_ns));
     let h = (h_ns as f64) * 1e-9;
 
-    // d/dt of the 4x4, then T^-1 * Tdot, read off as [omega, v].
     let r0 = mat3(&t0);
     let rm = mat3(&tm);
     let rp = mat3(&tp);
@@ -114,14 +77,12 @@ fn central_difference(at: &dyn Fn(i64) -> Iso3, t_ns: i64, h_ns: i64) -> Twist {
         (tp.t.y - tm.t.y) / (2.0 * h),
         (tp.t.z - tm.t.z) / (2.0 * h),
     );
-    // omega^ = R^T Rdot
     let mut w = [[0.0f64; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
             w[i][j] = (0..3).map(|k| r0[k][i] * rdot[k][j]).sum();
         }
     }
-    // v = R^T tdot
     let v = Vec3::new(
         (0..3).map(|k| r0[k][0] * comp(tdot, k)).sum(),
         (0..3).map(|k| r0[k][1] * comp(tdot, k)).sum(),
@@ -164,15 +125,7 @@ fn rel(a: Twist, b: Twist) -> f64 {
     d / b.amax().max(1e-12)
 }
 
-/// **The pose must be bit-identical to `at`.**
-///
-/// A caller receiving a pose and a twist together is entitled to assume they
-/// describe the same instant. If this drifted by an ulp, the same stamp queried
-/// through two entry points would disagree, and the difference would be blamed
-/// on the interpolation rather than on the API.
-///
-/// Mutant: change `fold_at_with_derivatives` to accumulate `acc * p` for the
-/// inverted branch ⇒ fails immediately.
+/// The pose is bit-identical to `at`.
 #[test]
 fn the_pose_is_bit_identical_to_at() {
     let c = Chain::new(64, 10_000_000);
@@ -190,21 +143,9 @@ fn the_pose_is_bit_identical_to_at() {
     }
 }
 
-/// **The analytic twist must match a central difference of the shipped `at`, and
-/// the agreement must improve as `O(h²)`.**
-///
-/// A tolerance alone would be weak here: a central difference of the *composed*
-/// depth-2 path carries genuine truncation error, because the composed body twist
-/// varies within a segment even when each edge's does not (`V_ac` depends on
-/// `Ad(T_bc⁻¹)`, and `T_bc` moves). Measured at `h = 1 ms` the disagreement is
-/// 2.8e-6, which is the stencil's error and not the code's.
-///
-/// So this asserts the *convergence order* instead. If the analytic twist were
-/// wrong by any fixed amount, halving `h` would leave that error untouched and the
-/// ratio would collapse to 1. Only a correct analytic value gives ~4.
-///
-/// Mutant: drop the adjoint from the static-step arm of the fold ⇒ the twist is
-/// expressed in the wrong frame, the error stops shrinking, and the ratio fails.
+/// The analytic twist matches a central difference of `at`, asserted by
+/// convergence order (~4 on halving `h`), since a composed path carries real
+/// truncation error.
 #[test]
 fn the_twist_matches_a_central_difference_to_second_order() {
     let c = Chain::new(64, 10_000_000);
@@ -241,9 +182,7 @@ fn the_twist_matches_a_central_difference_to_second_order() {
     );
 }
 
-/// **The twist is constant within a segment.** The substance of §2.3: the
-/// derivative is exact because ScLerp's body twist genuinely does not vary across
-/// a segment, so no finite difference is involved.
+/// The twist is constant within a segment (§2.3).
 #[test]
 fn the_twist_is_constant_within_a_segment() {
     let c = Chain::new(64, 10_000_000);
@@ -258,8 +197,7 @@ fn the_twist_is_constant_within_a_segment() {
             .at_with_derivatives(&g, ns(k * 10_000_000 + 9_000_000))
             .unwrap()
             .twist;
-        // Not bit-equal: the *composed* twist varies within a segment even though
-        // each edge's does not, because `Ad(T_bc^-1)` moves. Tight but not zero.
+        // Not bit-equal: the composed twist varies within a segment.
         assert!(
             rel(a, b) < 1e-2,
             "composed twist swung within segment {k}: {:e}",
@@ -268,19 +206,8 @@ fn the_twist_is_constant_within_a_segment() {
     }
 }
 
-/// **The twist must be computed per segment, not once for the whole edge.**
-///
-/// Non-vacuity for the test above, and it needs its own fixture: `Chain`'s poses
-/// are `exp_se3(i·ξ)`, a one-parameter subgroup, so `pose(i)⁻¹·pose(i+1) = exp(ξ)`
-/// is *identical for every i* and the twist is globally constant by construction.
-/// A "does it ever change" check against `Chain` therefore fails against perfectly
-/// correct code — which is exactly what it did when this suite was first written.
-///
-/// This fixture instead accelerates: sample `i` is at `exp_se3(i²·ξ/64)`, so each
-/// segment has a genuinely different relative transform.
-///
-/// Mutant: hoist the segment lookup out of the fold and reuse one twist for every
-/// stamp ⇒ fails.
+/// The twist is computed per segment (non-vacuity for the test above): this
+/// fixture accelerates, sample `i` at `exp_se3(i²·ξ/64)`.
 #[test]
 fn the_twist_changes_across_segments_when_the_motion_does() {
     use tf_tree::exp_se3;
@@ -294,7 +221,6 @@ fn the_twist_changes_across_segments_when_the_motion_does() {
     let base = tree.frame("base").unwrap();
     let w = tree.claim(base, map).unwrap();
     for i in 0..64i64 {
-        // Quadratic in the algebra: velocity grows linearly with i.
         let f = (i * i) as f64 / 64.0;
         w.push(
             i * 10_000_000,
@@ -310,8 +236,7 @@ fn the_twist_changes_across_segments_when_the_motion_does() {
             .twist
     };
 
-    // Accelerating motion: every consecutive pair of segments must differ, and the
-    // speed must be monotonically increasing.
+    // Every consecutive pair of segments differs; speed increases monotonically.
     let mut prev = seg(1).amax();
     for k in 2..50i64 {
         let now = seg(k).amax();
@@ -324,20 +249,8 @@ fn the_twist_changes_across_segments_when_the_motion_does() {
     }
 }
 
-/// **The adjoint fold, on a rig where the adjoint is not the identity.**
-///
-/// The test that carries §2.3. Run in **both** plan directions so the forward
-/// (`Ad(T⁻¹)·V + V_p`) and inverted (`Ad(T)·(V − V_p)`) branches are both
-/// executed, across a path that includes a static edge.
-///
-/// Asserted by convergence order, for the reason given on the `Chain` variant: a
-/// wrong analytic twist leaves a fixed error that halving `h` does not shrink.
-///
-/// Mutants this kills, each of which survived the whole suite when it was written
-/// against `common::Chain` (see [`Rig`] for why):
-/// * static step skips `adjoint_inv` — the twist stays in an ancestor's frame;
-/// * forward step uses `Ad(T)` where it needs `Ad(T⁻¹)`;
-/// * inverted step adds the step twist instead of subtracting it.
+/// The adjoint fold, on a rig where the adjoint is not the identity (§2.3), in
+/// both plan directions and across a static edge; asserted by convergence order.
 #[test]
 fn the_adjoint_fold_is_correct_in_both_directions() {
     let rig = Rig::new();
@@ -376,20 +289,12 @@ fn the_adjoint_fold_is_correct_in_both_directions() {
     }
 }
 
-/// The static arm specifically: a plan whose *only* step between two dynamic
-/// edges is static must still transport the twist through it.
-///
-/// Isolated from the test above so that a failure points at the static arm rather
-/// than at the fold in general.
-///
-/// Mutant: delete `vel = m.adjoint_inv(&vel);` ⇒ fails.
+/// A static step between two dynamic edges still transports the twist.
 #[test]
 fn a_static_step_transports_the_twist() {
     let rig = Rig::new();
     let base = rig.tree.frame("base").unwrap();
-    // `map->base` stops before the static mount; `map->sensor` continues through
-    // it. The mount is constant, so the two twists must differ by exactly the
-    // mount's adjoint — and in particular must NOT be equal.
+    // `map->sensor` continues through the constant mount; the twists differ by its adjoint.
     let p_base = rig.tree.plan(rig.map, base).unwrap();
     let p_sensor = rig.tree.plan(rig.map, rig.sensor).unwrap();
     let g = rig.tree.guard();
@@ -404,8 +309,7 @@ fn a_static_step_transports_the_twist() {
          adjoint_inv is being skipped on static steps"
     );
 
-    // And the difference is exactly the mount's adjoint, not something arbitrary.
-    // T_map_sensor = T_map_base · T_base_sensor, so V_sensor = Ad(T_base_sensor⁻¹)·V_base.
+    // V_sensor = Ad(T_base_sensor⁻¹)·V_base.
     let t_base_sensor = p_base.at(&g, t).unwrap().inverse() * p_sensor.at(&g, t).unwrap();
     let predicted = t_base_sensor.adjoint_inv(&v_base);
     assert!(
@@ -415,14 +319,8 @@ fn a_static_step_transports_the_twist() {
     );
 }
 
-/// **`LerpSlerp` must be refused, not answered** — §2.4, and NORMATIVE.
-///
-/// The refusal names the edge and the policy, because "derivatives unavailable"
-/// on a twelve-edge plan without naming which edge is a diagnostic that costs an
-/// hour.
-///
-/// Mutant: dispatch `LerpSlerp` to `sample_with_twist` anyway ⇒ this returns a
-/// plausible twist and the test fails.
+/// `LerpSlerp` is refused, not answered (§2.4, NORMATIVE); the error names the
+/// edge and the policy.
 #[test]
 fn lerpslerp_is_refused_and_names_the_edge() {
     let cfg = EdgeCfg::new(Capacity::slots(64));
@@ -440,11 +338,9 @@ fn lerpslerp_is_refused_and_names_the_edge() {
     let plan = tree.plan(map, base).unwrap();
     let g = tree.guard();
 
-    // The plain lookup still works — this is a derivative-only refusal.
     plan.at(&g, ns(25_000_000)).expect("at() must still work");
 
-    // The edge the plan actually walks, read from the plan rather than assumed —
-    // edge ids are allocation order, not something a test should hardcode.
+    // Read the edge from the plan; ids are allocation order.
     let want_edge = plan
         .steps()
         .iter()
@@ -463,26 +359,9 @@ fn lerpslerp_is_refused_and_names_the_edge() {
     }
 }
 
-/// **`Layout::QuatTwist` inherits the refusal** — `docs/API.md` §3.3,
-/// `docs/PHASE5.md` §4.4, and NORMATIVE.
-///
-/// The batch layout is the only place derivatives reach a Python or C caller,
-/// and it is exactly the place where "just fill the tail with something" is
-/// tempting: the buffer is already sized, the pose half succeeded, and six zeros
-/// or a finite difference would look like an answer. It must not. A layout whose
-/// meaning depends on which interpolator the publisher happened to declare is
-/// the quaternion-order trap moved into the time axis — the caller cannot see
-/// it, no norm check fires, and the number is simply a different quantity.
-///
-/// The buffer is checked untouched as well. `PHASE3.md` §5.3's rule is that a
-/// rejected call leaves the caller's memory alone, and a twist layout that wrote
-/// its pose half before discovering the refusal would leave 7 live elements and
-/// 6 stale ones per row with nothing marking the boundary.
-///
-/// Mutant: give `Layout::QuatTwist` its own emitter that finite-differences the
-/// pose instead of routing through `fold_at_with_derivatives` ⇒ this returns
-/// `Ok` and the assertion on the error fails. Mutant B: emit the pose half
-/// before folding the twist ⇒ the sentinel assertion fails.
+/// `Layout::QuatTwist` inherits the refusal (`docs/API.md` §3.3,
+/// `docs/PHASE5.md` §4.4, NORMATIVE), and the buffer is left untouched
+/// (`PHASE3.md` §5.3).
 #[test]
 fn the_quat_twist_layout_refuses_lerpslerp_exactly_as_the_scalar_call_does() {
     use tf_tree::{Layout, Stamp, SystemDomain};
@@ -513,8 +392,7 @@ fn the_quat_twist_layout_refuses_lerpslerp_exactly_as_the_scalar_call_does() {
 
     let stamps = [25_000_000i64, 35_000_000];
 
-    // The pose-only layouts still work over the same stamps, so the refusal is
-    // specific to the derivative and not to the fixture.
+    // Pose-only layouts still work, so the refusal is specific to the derivative.
     let mut poses = vec![0.0f64; stamps.len() * Layout::Quat.elems()];
     plan.at_many_into::<SystemDomain>(&g, &stamps, Layout::Quat, &mut poses)
         .expect("the pose layout must still work over a LerpSlerp edge");
@@ -533,9 +411,7 @@ fn the_quat_twist_layout_refuses_lerpslerp_exactly_as_the_scalar_call_does() {
         "a refused QuatTwist batch wrote into the caller's buffer"
     );
 
-    // The scalar call refuses identically — the whole point of the layout is
-    // that it is the same path, so a divergence in the *error* is as much a
-    // divergence as one in the numbers.
+    // The scalar call refuses identically.
     assert_eq!(
         plan.at_with_derivatives(&g, Stamp::<SystemDomain>::from_nanos(stamps[0]))
             .unwrap_err(),
@@ -546,12 +422,7 @@ fn the_quat_twist_layout_refuses_lerpslerp_exactly_as_the_scalar_call_does() {
     );
 }
 
-/// A single-sample edge has a pose but no segment, and must say so *specifically*.
-///
-/// `NoData` would be wrong and actively misleading: there is data, and the caller
-/// would go looking for a publisher that is in fact running.
-///
-/// Mutant: return `NoData` for the one-sample case ⇒ fails.
+/// A single-sample edge has a pose but no segment and says so (`NoSegment`, not `NoData`).
 #[test]
 fn one_sample_is_no_segment_not_no_data() {
     let cfg = EdgeCfg::new(Capacity::slots(64));
@@ -566,9 +437,7 @@ fn one_sample_is_no_segment_not_no_data() {
 
     let plan = tree.plan(map, base).unwrap();
     let g = tree.guard();
-    // The pose is available...
     plan.at(&g, ns(1_000_000)).expect("pose is well defined");
-    // ...the derivative is not, and the error says which of the two is missing.
     assert!(
         matches!(
             plan.at_with_derivatives(&g, ns(1_000_000)),
@@ -606,10 +475,7 @@ fn a_zero_length_segment_is_no_segment_not_infinity() {
     }
 }
 
-/// `accel` is `None` under ScLerp, and that is a statement about the interpolant.
-///
-/// `Some(ZERO)` would claim the path is twice differentiable at the knots. It is
-/// not: the twist is piecewise-constant, so the acceleration is a train of deltas.
+/// `accel` is `None` under ScLerp: the twist is piecewise-constant.
 #[test]
 fn accel_is_none_because_sclerp_has_no_second_derivative() {
     let c = Chain::new(16, 10_000_000);
@@ -619,10 +485,7 @@ fn accel_is_none_because_sclerp_has_no_second_derivative() {
     assert!(s.accel.is_none());
 }
 
-/// **`to_spatial` round-trips through the returned pose.**
-///
-/// The pairing between a twist and the pose it was taken at is the thing most
-/// easily got wrong by a caller, so the API-level round trip is worth pinning.
+/// `to_spatial` round-trips through the returned pose.
 #[test]
 fn the_spatial_twist_round_trips_through_the_pose() {
     let c = Chain::new(32, 10_000_000);
@@ -640,14 +503,9 @@ fn the_spatial_twist_round_trips_through_the_pose() {
     }
 }
 
-/// **§2.4's finding, asserted rather than merely documented.**
-///
-/// ScLerp's body-frame linear velocity is constant across a segment; LerpSlerp's
-/// is not — and the trap is that its *magnitude* is, so a caller sanity-checking
-/// `‖v‖` sees nothing wrong while the vector rotates.
-///
-/// This test computes both numerically from the shipped interpolators, so it is a
-/// claim about this implementation and not a restatement of the spec's prose.
+/// §2.4's finding: ScLerp's body-frame linear velocity is constant across a
+/// segment; LerpSlerp's rotates while its magnitude does not (computed from the
+/// shipped interpolators).
 #[test]
 fn lerpslerp_body_velocity_swings_while_its_magnitude_does_not() {
     use tf_tree::{Interp, LerpSlerp, ScLerp};
@@ -656,7 +514,6 @@ fn lerpslerp_body_velocity_swings_while_its_magnitude_does_not() {
     let b = common::pose(9);
     let h = 1e-6;
 
-    // Body-frame linear velocity of an interpolator at parameter s.
     let body_v = |eval: &dyn Fn(&Iso3, &Iso3, f64) -> Iso3, s: f64| {
         let t0 = eval(&a, &b, s);
         let tp = eval(&a, &b, s + h);
@@ -689,27 +546,17 @@ fn lerpslerp_body_velocity_swings_while_its_magnitude_does_not() {
         l_vec > 1e-3 * l0.norm(),
         "LerpSlerp body velocity did not swing; the fixture is degenerate"
     );
-    // ...but the magnitude does not, which is precisely why a magnitude check
-    // cannot catch it. Orders of magnitude apart, not merely different.
+    // ...but the magnitude does not, so a magnitude check cannot catch it.
     assert!(
         l_mag < 1e-6 * l_vec,
         "the |v| trap did not reproduce: vector spread {l_vec:e}, magnitude spread {l_mag:e}"
     );
 }
 
-/// **A plan where only *some* edges are LerpSlerp must still be refused.**
-///
-/// Found by review: the original refusal test used a single-edge, uniformly
-/// LerpSlerp plan, so an implementation that checked only the *first* dynamic
-/// step — or only the last — passed the whole suite. This puts the LerpSlerp edge
-/// in the middle of an otherwise ScLerp chain, and asserts the refusal names
-/// *that* edge and not one of its neighbours.
-///
-/// Mutant: check the policy of `steps()[0]` once instead of per-step ⇒ fails.
+/// A plan where only some edges are LerpSlerp is refused, naming that edge.
 #[test]
 fn a_single_lerpslerp_edge_mid_chain_refuses_and_names_that_edge() {
     let cfg = EdgeCfg::new(Capacity::slots(64));
-    // Default ScLerp; the middle edge is explicitly LerpSlerp.
     let tree = TreeBuilder::new()
         .default_interp(InterpPolicy::ScLerp)
         .dynamic_edge("map", "odom", cfg)
@@ -737,12 +584,9 @@ fn a_single_lerpslerp_edge_mid_chain_refuses_and_names_that_edge() {
     let g = tree.guard();
     let t = ns(35_000_000);
 
-    // The plain lookup works across all three edges.
     plan.at(&g, t).expect("at() must still work");
 
-    // The middle edge is the one that must be named. Read it from the plan
-    // rather than assuming an id: the chain is linear and end-to-end, so the
-    // middle dynamic step is the middle edge whichever way the walk emits them.
+    // The middle dynamic step is the middle edge.
     let dyn_edges: Vec<_> = plan
         .steps()
         .iter()
@@ -770,18 +614,11 @@ fn a_single_lerpslerp_edge_mid_chain_refuses_and_names_that_edge() {
     }
 }
 
-/// **A stale plan must be refused before any sampling happens.**
-///
-/// Found by review: `check_generation` could be deleted from
-/// `at_with_derivatives` with the whole suite green, which would let a plan
-/// compiled against an old topology silently evaluate against a new one.
-///
-/// Mutant: remove `self.check_generation(g)?` ⇒ fails.
+/// A stale plan is refused before any sampling.
 #[test]
 fn at_with_derivatives_refuses_a_stale_plan() {
     let rig = Rig::new();
     let plan = rig.tree.plan(rig.map, rig.sensor).unwrap();
-    // A guard taken before the topology moves, and a re-parent that moves it.
     let base = rig.tree.frame("base").unwrap();
     let map = rig.tree.frame("map").unwrap();
     rig.tree.reparent(rig.sensor, map).expect("reparent");
@@ -796,10 +633,7 @@ fn at_with_derivatives_refuses_a_stale_plan() {
     );
 }
 
-/// **A cross-domain query must be refused**, the same way `at` refuses it.
-///
-/// Mutant: remove `self.check_domain::<D>()?` ⇒ the sensor-domain stamp is used
-/// to index a system-domain edge and returns a confident wrong answer.
+/// A cross-domain query is refused, as `at` refuses it.
 #[test]
 fn at_with_derivatives_refuses_a_cross_domain_stamp() {
     use tf_tree::{SensorDomain, Stamp};
@@ -816,22 +650,9 @@ fn at_with_derivatives_refuses_a_cross_domain_stamp() {
     );
 }
 
-/// **The twist is in the plan's SOURCE frame, not its target frame.**
-///
-/// Found by review, and the docstring said the opposite. This is the one fact a
-/// caller must have right, and it is invisible to every sanity check they are
-/// likely to apply: the error is the full rotation `R_target_source`, so `‖v‖`
-/// is *identical* either way.
-///
-/// The fixture makes the two answers maximally distinguishable. `base` is rotated
-/// +90° about z relative to `map`, and moves along **map**'s +x at exactly 1 m/s.
-/// `plan(map, base)` evaluates `T_map_base`, so:
-///
-/// * source (base) axes — what the API returns: `v = (0, −1, 0)`
-/// * target (map) axes — what `to_spatial` returns: `v = (1, 0, 0)`
-///
-/// Mutant: swap `adjoint` and `adjoint_inv` anywhere in the fold, or "fix" the
-/// docs back to "target" ⇒ this fails.
+/// The twist is in the plan's SOURCE frame, not its target frame: `base` is
+/// rotated +90° about z and moves along map's +x at 1 m/s, so the source-frame
+/// twist is `(0, −1, 0)` and `to_spatial` gives `(1, 0, 0)`.
 #[test]
 fn the_twist_is_in_the_source_frame_not_the_target_frame() {
     use tf_tree::Quat;
@@ -862,8 +683,7 @@ fn the_twist_is_in_the_source_frame_not_the_target_frame() {
     let body = s.twist.v;
     let spatial = s.twist.to_spatial(&s.pose).v;
 
-    // Both describe 1 m/s — the magnitudes are equal, which is exactly why a
-    // magnitude check cannot catch a frame mix-up.
+    // Equal magnitudes, so a magnitude check cannot catch a frame mix-up.
     assert!(
         (body.norm() - 1.0).abs() < 1e-9,
         "body speed should be 1 m/s"

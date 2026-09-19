@@ -1,17 +1,15 @@
 //! Where does tf_tree bend, and where does it break? Four questions:
 //!
-//! 1. **Does lookup cost depend on tree *size* or only depth?** Sweeps width to
-//!    12 000 frames with the dynamic-step count fixed (`docs/PHASE1.md` §11.3: a
-//!    row labelled by depth alone is not interpretable).
-//! 2. **What does the *tree* cost, as opposed to the lookup?** Plan compilation
-//!    and `Tree::build` walk the topology.
-//! 3. **Does the arena cost what `ArenaLayout` arithmetic says?** Checked against a
-//!    measured RSS delta (`report::worse_entries`).
-//! 4. **Where are the walls?** `BuildError::TooManyFrames`, `TooManyEdges`, and
-//!    `LayoutError::ArenaTooLarge` (region offsets are `u32`, so 4 GiB).
+//! 1. Does lookup cost depend on tree size or only depth? Sweeps width to 12 000
+//!    frames with the dynamic-step count fixed (`docs/PHASE1.md` §11.3).
+//! 2. What do plan compilation and `Tree::build` cost?
+//! 3. Does the arena cost what `ArenaLayout` says? Checked against a measured
+//!    RSS delta (`report::worse_entries`).
+//! 4. Where are the walls (`BuildError::TooManyFrames`, `TooManyEdges`,
+//!    `LayoutError::ArenaTooLarge`)?
 //!
-//! Wall-clock rows are **indicative on any host**; ratios, counts and byte/slot
-//! figures are not.
+//! Wall-clock rows are indicative on any host; ratios, counts and byte/slot
+//! figures are exact.
 //!
 //! Usage: `just scale-sweep`, or `scale_sweep --json out.json`.
 // This binary's output IS its result.
@@ -95,10 +93,6 @@ fn main() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1 + 2 + 3: the catalogue, widest axis first
-// ---------------------------------------------------------------------------
-
 fn catalogue_sweep(run: &mut Run) {
     println!("Per-workload: lookup cost, what the tree itself costs, and memory");
     println!(
@@ -121,13 +115,11 @@ fn catalogue_sweep(run: &mut Run) {
     );
 
     for w in workload::CATALOGUE {
-        // Build is timed, so the estimate decides whether to try at all.
         let Ok(estimate) = w.estimate() else {
             println!("{:<14} (estimate refused this workload)", w.name);
             continue;
         };
 
-        // Pss, despite the local names (see `rss_over_arena` below).
         let rss_before = ProcStats::read().pss_kib;
         let t0 = Instant::now();
         let built = match w.build(InterpPolicy::LerpSlerp, Backing::Heap) {
@@ -147,8 +139,6 @@ fn catalogue_sweep(run: &mut Run) {
         let common = time_latest_common(&built, &plans);
         let compile_ns = time_compile(&built);
 
-        // Measured against arithmetic: far above 1 means the arena is not the dominant
-        // allocation; far below, untouched pages.
         let rss_delta_kib = rss_after.saturating_sub(rss_before);
         let rss_ratio = if built.shape.arena_bytes == 0 {
             f64::NAN
@@ -184,14 +174,12 @@ fn catalogue_sweep(run: &mut Run) {
                     Metric::new("plan_compile_ns", compile_ns, "ns").lower_is_better(TIME_SLACK),
                 )
                 .metric(Metric::new("build_ms", build_ms, "ms").lower_is_better(TIME_SLACK))
-                // Arithmetic, gated tightly: changes only with a `layout_hash` bump.
                 .metric(
                     Metric::new("arena_bytes", built.shape.arena_bytes as f64, "B")
                         .lower_is_better(0.01),
                 )
-                // **The id says `rss` and the instrument is Pss**: `Metric` ids are join keys
-                // for `bench_ab` and the baseline differ (`runstore::Run::key`), so renaming one
-                // reads as a vanished row. The id is frozen.
+                // The id says `rss` but the instrument is Pss; ids are join keys
+                // (`runstore::Run::key`), so it is frozen.
                 .metric(Metric::new("rss_over_arena", rss_ratio, "x"))
                 .metric(Metric::new("dyn_steps", steps as f64, "steps")),
         );
@@ -212,7 +200,6 @@ fn time_at(built: &Built, plans: &[Plan]) -> (f64, f64) {
     let mut hist = Histogram::new();
     let mut acc = 0.0f64;
 
-    // Warm: first touch is a separate measurement.
     for p in plans {
         let warm: Stamp = Stamp::from_nanos(stamps[0]);
         let _ = p.at(&guard, warm);
@@ -231,8 +218,7 @@ fn time_at(built: &Built, plans: &[Plan]) -> (f64, f64) {
     (hist.quantile(0.50) as f64, hist.quantile(0.999) as f64)
 }
 
-/// p50 of `Plan::latest_common`, the query whose cost should grow with the tree
-/// (it finds the newest stamp every edge on the path can answer).
+/// p50 of `Plan::latest_common`, whose cost should grow with the tree.
 fn time_latest_common(built: &Built, plans: &[Plan]) -> f64 {
     let guard = built.tree.guard();
     let mut hist = Histogram::new();
@@ -270,15 +256,10 @@ fn sweep(built: &Built) -> Vec<i64> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Ring capacity: the bracket search's own axis
-// ---------------------------------------------------------------------------
-
 /// Ring sizes to sweep, in slots (powers of two: `Capacity` rounds up).
 const RING_SLOTS: &[u32] = &[8, 64, 1024, 16_384, 262_144, 1_048_576];
 
-/// How lookup cost moves with the *depth* of one ring: logarithmic in theory, but
-/// a 1 M-slot ring is 72 MiB and the search misses cache on nearly every step.
+/// How lookup cost moves with the depth of one ring: logarithmic in theory.
 fn ring_sweep(run: &mut Run) {
     println!("Ring depth: one dynamic edge, query stamps swept across the whole ring");
     println!(
@@ -298,7 +279,6 @@ fn ring_sweep(run: &mut Run) {
         let b = tree.frame("b").expect("b");
         let w = tree.claim(b, a).expect("claim");
 
-        // Fill the ring completely: a partly full ring has a shorter search.
         let retained = slots - 1;
         let step_ns = 1_000_000i64;
         for k in 0..u64::from(retained) {
@@ -336,7 +316,6 @@ fn ring_sweep(run: &mut Run) {
         black_box(acc);
 
         let p50 = hist.quantile(0.50) as f64;
-        // Cost per doubling: a binary search predicts a constant; rising is the cache.
         let per_doubling = prev.map_or(f64::NAN, |(pslots, pp50)| {
             let doublings = (f64::from(slots) / f64::from(pslots)).log2();
             (p50 - pp50) / doublings
@@ -366,15 +345,11 @@ fn ring_sweep(run: &mut Run) {
     println!("giving out, which is a property of the machine as much as of the engine.");
 }
 
-// ---------------------------------------------------------------------------
-// Publish throughput against the number of edges being written
-// ---------------------------------------------------------------------------
-
 /// Concurrent writer-edge counts to sweep.
 const WRITER_EDGES: &[usize] = &[1, 16, 64, 256];
 
-/// Whether publishing cost depends on how many edges are published to: it should
-/// not (`EdgeCounters` is padded to 128 bytes); this row catches lost padding.
+/// Publishing cost should not depend on the edge count (`EdgeCounters` is padded
+/// to 128 bytes); this row catches lost padding.
 fn publish_sweep(run: &mut Run) {
     println!("Publish: one thread, round-robin over N edges");
     println!("{:>10} | {:>12} {:>12}", "edges", "ns/push", "Mpush/s");
@@ -399,7 +374,7 @@ fn publish_sweep(run: &mut Run) {
 
         let pose = tf_tree_bench::fixture::dynamic_pose(1.0, 0);
         const PUSHES: usize = 500_000;
-        // Warm every ring, so first-touch faults are not charged (18 MiB at 256 rings).
+        // Warm every ring so first-touch faults are not charged.
         for (i, w) in writers.iter().enumerate() {
             w.push(i as i64, &pose).expect("warm push");
         }
@@ -407,7 +382,6 @@ fn publish_sweep(run: &mut Run) {
         let start = Instant::now();
         for k in 0..PUSHES {
             let w = &writers[k % n];
-            // Stamps must be monotone per edge; global `k` is.
             let _ = w.push(k as i64 + 1_000_000, &pose);
         }
         let elapsed = start.elapsed();
@@ -429,17 +403,11 @@ fn publish_sweep(run: &mut Run) {
     println!("padding exists to prevent.");
 }
 
-// ---------------------------------------------------------------------------
-// The walls
-// ---------------------------------------------------------------------------
-
-/// Find and print the limits by asking for something too big and reporting the
-/// refusal. Not assertions: documentation produced by the engine. Nothing allocates
-/// the arena asked about (`ArenaLayout` decides first).
+/// Print the limits by asking for something too big and reporting the refusal;
+/// nothing allocates the arena asked about.
 fn limits() {
     println!("Limits, as reported by the engine itself");
 
-    // The `u32` offset model: the one that binds.
     let mut lo = 1u32;
     let mut hi = u32::MAX / 64;
     while lo < hi {
@@ -458,8 +426,7 @@ fn limits() {
         "",
     );
 
-    // Depth, a compile-time constant. **Two constants since `0034`**: print both,
-    // since a rigid chain that is not refused by the raw walk is by the compiled one.
+    // Two depth constants since `0034`: print both.
     println!(
         "  path edges walked:           {} — LookupError::TreeTooDeep beyond it.\n\
          {:31}This is what a tf2 tree's own depth is measured against.\n\
@@ -473,7 +440,6 @@ fn limits() {
         "",
     );
 
-    // Frames and edges are `u32` counts checked by `TreeBuilder`; stated, not searched.
     println!(
         "  frames / edges:              u32 each (BuildError::TooManyFrames / TooManyEdges),\n\
          {:31}but the slot ceiling above is reached first on any populated tree",

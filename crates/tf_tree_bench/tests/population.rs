@@ -1,45 +1,11 @@
 //! Page population — `docs/PHASE2.md` §7.1, `docs/decisions/0005` step 10.
 //!
-//! §7.1 is NORMATIVE: `mmap` **without** `MAP_POPULATE`, then populate at
-//! declaration granularity. The reason is a page-fault storm — a minor fault
-//! costs single-digit microseconds against a 150 ns p50 lookup budget, so the
-//! *first* lookup after attach pays two orders of magnitude more than the steady
-//! state and never appears in a steady-state benchmark.
-//!
-//! # The test has to be three-sided, or it proves nothing
-//!
-//! "Headroom is not charged" is satisfied perfectly by populating *nothing* —
-//! which reintroduces exactly the fault storm §7.1 exists to prevent, and would
-//! look like a resounding success on a one-sided test. So there were two:
-//!
-//! * [`declared_headroom_is_not_charged`] — big headroom, small content.
-//! * [`declared_content_is_charged`] — no headroom, big content.
-//!
-//! Each fails against the other's fix. Restoring `MAP_POPULATE` fails the first;
-//! making population a no-op fails the second.
-//!
-//! **That pair has a hole between it, and a third test closes it.** Both are
-//! satisfied by populating every declared ring at attach, which is what this
-//! crate did until population became per-edge: headroom is not declared content,
-//! so the first still passes, and everything declared is charged, so the second
-//! passes emphatically. Neither notices a process being charged for two hundred
-//! edges it never reads.
-//!
-//! * [`only_the_edges_this_process_uses_are_charged`] — no headroom, big
-//!   content, and only a few edges taken up.
-//!
-//! It fails against the other two's fix in exactly the same way they fail
-//! against each other's: restoring the per-arena ring population passes both of
-//! them and fails it. All three mutants have been run rather than reasoned
-//! about, and each test's doc names its own with the number it produced.
-//!
-//! # Why RSS and not `mincore`
-//!
-//! `mincore` needs the mapping's base pointer, which `tf_tree` does not expose
-//! and should not start exposing for a test. `/proc/self/statm` is coarser but
-//! answers the only question being asked: whether pages nobody declared are
-//! being charged to this process. Measured as a **delta** around the
-//! construction, so the process's own baseline drops out.
+//! §7.1 is NORMATIVE: `mmap` without `MAP_POPULATE`, then populate per edge, so
+//! the first lookup after attach takes no page fault. Three tests bound
+//! residency from three sides, each failing against the others' fix:
+//! [`declared_headroom_is_not_charged`], [`declared_content_is_charged`] and
+//! [`only_the_edges_this_process_uses_are_charged`]. Residency is the RSS delta
+//! from `/proc/self/statm`; `mincore` would need the mapping's base pointer.
 #![cfg(all(feature = "shm", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -59,54 +25,18 @@ fn charged(build: impl FnOnce() -> Tree) -> (usize, usize) {
     let tree = build();
     let after = rss_bytes();
     let size = tree.arena_size_bytes();
-    // The tree stays alive until here, so the mapping cannot have been torn down
-    // between the two readings.
+    // The tree stays alive until here, so the mapping is not torn down early.
     drop(tree);
     (after.saturating_sub(before), size)
 }
 
-/// **Headroom must not be charged.**
+/// Headroom must not be charged: one 1024-slot dynamic edge against 200 000
+/// slots each of frame and edge headroom (tens of MB nobody declared).
 ///
-/// One declared dynamic edge with 1024 slots — about 74 KiB of rings — against
-/// 200 000 slots each of frame and edge headroom. The headroom is tens of
-/// megabytes of tables nobody declared and nothing ever reads.
-///
-/// Measured before this landed, with `MAP_POPULATE`: **66.3 MiB charged against
-/// 66.1 MiB declared, 100%**. After: **3.8 MiB, 6%**.
-///
-/// **The residue is not `MADV_HUGEPAGE`, and this comment used to say it was.**
-/// It claimed that populating any part of a 2 MiB-aligned range under THP faults
-/// in the whole huge page, so small live regions round up. Three measurements
-/// refute it:
-///
-/// * **Transparent huge pages are not granted here at all.** The arena is a
-///   `memfd` mapped `MAP_SHARED`, which is *shmem* and is governed by
-///   `transparent_hugepage/shmem_enabled` — `[never]` on this host — not by
-///   `transparent_hugepage/enabled`. `/proc/vmstat` agrees: `thp_file_alloc 0`
-///   **and** `thp_file_fallback 0`, so nothing has ever asked and been refused
-///   either. `docs/PHASE5.md` §2.3 records the same finding independently, and
-///   `TFT016` was fixed to read the right sysfs file because of it.
-/// * **The residue scales linearly with headroom**, which a huge-page round-up
-///   cannot do. Measured at 50k/100k/200k/400k units of headroom: 1.05, 1.95,
-///   3.75, 7.34 MB — doubling the headroom doubles the residue, ~19 B per unit.
-///   A 2 MiB round-up would be a step function, not a line.
-/// * **About half of it appears on the *heap* path too**, where `populate_hot`
-///   does not exist. Same headroom, `build()` against `build_shared()`: 2.04 MB
-///   against 3.76 MB at 200k. So at least that half is not population of any
-///   kind — it is the builder's own `O(max_frames + max_edges)` temporaries,
-///   freed before the second reading but still resident in the process heap,
-///   which `charged()` cannot separate because it reads whole-process RSS.
-///
-/// **The remaining ~10 B/unit that is specific to the shared path is not
-/// attributed here.** It is small, it is bounded by the assertion below, and
-/// guessing at it is what produced the sentence this replaced. Re-run the
-/// experiment by varying `edge_headroom`/`frame_headroom` and comparing `build`
-/// with `build_shared`.
-///
-/// None of this weakens the test: the bound is a fraction of the arena because
-/// the residue is dominated by costs that scale with *declared* size, whatever
-/// their origin, and the property under test is that the headroom *pages* are
-/// not faulted.
+/// The residue is not huge pages (`shmem_enabled` is `never`; `docs/PHASE5.md`
+/// §2.3). It scales linearly with headroom, and about half also appears on the
+/// heap path, from the builder's own temporaries. The bound is a fraction of the
+/// arena.
 ///
 /// Mutant: restore `MapFlags::POPULATE` in `unsafe_map` ⇒ 100% charged.
 #[test]
@@ -121,8 +51,7 @@ fn declared_headroom_is_not_charged() {
             .expect("build_shared")
     });
 
-    // Non-vacuity: there must actually be a large headroom region to leave cold,
-    // or this passes on an arena that never had anything to save.
+    // Non-vacuity: a large headroom region must exist to leave cold.
     assert!(
         size > 32 * MIB,
         "the over-provisioned arena is only {size} B — the layout is not what this test assumes"
@@ -133,14 +62,9 @@ fn declared_headroom_is_not_charged() {
     );
 }
 
-/// Sixty-four dynamic edges of 8192 slots each — about 36 MiB of rings — with
-/// **no headroom at all**, so every page of the arena is live. `used` names how
-/// many of the 64 the returned tree actually takes up, by claiming them.
-///
-/// The writers are dropped before the closure returns, which is deliberate and
-/// is the thing that makes this measurable: releasing a claim un-*owns* the
-/// edge, it does not un-populate its pages. So the residency this reads back is
-/// attributable to population and to nothing the writer is still holding.
+/// 64 dynamic edges of 8192 slots (~36 MiB of rings), no headroom, so every page
+/// is live; `used` of them are claimed. The writers drop before return:
+/// releasing a claim un-owns the edge but does not un-populate its pages.
 fn build_claiming(name: &str, used: usize) -> Tree {
     let mut b = TreeBuilder::new().default_interp(InterpPolicy::LerpSlerp);
     for i in 0..64 {
@@ -156,31 +80,13 @@ fn build_claiming(name: &str, used: usize) -> Tree {
     tree
 }
 
-/// **Declared content must be charged.** The other half, and the one that stops
-/// "populate nothing" from passing.
+/// Declared content must be charged, which stops "populate nothing" from
+/// passing. It claims all 64 edges because population is per edge, at
+/// `Tree::claim` (writer) or plan compilation (reader), per
+/// `docs/PHASE2.md` §7.1.
 ///
-/// # Why this claims all 64 edges, and why that is not a relaxation
-///
-/// It used to build the arena and measure, because population was per-*arena*:
-/// `populate_hot` warmed the whole stamp and pose arenas at build, so declaring
-/// an edge was enough to be charged for it. Population is now per-*edge*, which
-/// is what `docs/PHASE2.md` §7.1 says it should always have been, and the moment
-/// an edge is taken up is `Tree::claim` (writer) or plan compilation (reader).
-/// So the test has to take the edges up to be asking the same question.
-///
-/// **Weakening the assertion instead would have been the wrong repair**, and it
-/// is the one available: this file's header explains that a one-sided test is
-/// satisfied perfectly by populating nothing, so an `rss > size / 2` softened to
-/// accommodate the new scheme would have quietly become the no-op-passes test
-/// the header exists to forbid. The property is unchanged — pages an edge's user
-/// will read are warm before they read them — and only the *moment* it is
-/// established has moved. Measured: 38 584 320 B charged of a 37 797 888 B
-/// arena, 102%.
-///
-/// Mutant, run: drop the `populate_edge_rings` call from `Tree::claim` ⇒ 438 272
-/// B charged of the same arena (1%) and this fails, while
-/// [`declared_headroom_is_not_charged`] and
-/// [`the_first_lookup_after_attach_does_not_fault`] go right on passing.
+/// Mutant: drop the `populate_edge_rings` call from `Tree::claim` ⇒ 1% charged,
+/// while the other two residency tests keep passing.
 #[test]
 fn declared_content_is_charged() {
     let (rss, size) = charged(|| build_claiming("tf_tree_pop_declared", 64));
@@ -196,30 +102,12 @@ fn declared_content_is_charged() {
     );
 }
 
-/// **A process is charged for the edges it uses, not the edges that exist.**
+/// A process is charged for the edges it uses, not the edges that exist: the
+/// per-arena scheme passes the other two residency tests and fails this. The
+/// bound is a quarter of the arena, since the tables are charged either way.
 ///
-/// This is the third side of the test, and without it the pair above is
-/// satisfied by the per-arena scheme this replaced — that scheme passes
-/// [`declared_content_is_charged`] (it populates everything) and passes
-/// [`declared_headroom_is_not_charged`] (headroom is not declared content). The
-/// gap between them is exactly the case this covers: capacity that *is*
-/// declared, by somebody, and that this process never touches.
-///
-/// It is also the realistic one. A robot's arena is declared once, for the whole
-/// vehicle; a node attaches to it and reads a handful of chains. Under the old
-/// scheme every such node paid for every edge on the vehicle, permanently, and
-/// the rings are 99.8% of a large arena.
-///
-/// Four of sixty-four edges, measured: **7 368 704 B charged of 37 797 888 B,
-/// 19.5%**, against 102% for the same arena fully taken up — a 5.2× reduction in
-/// what an operator sees against this arena in `top`. The bound below is a
-/// quarter rather than that 19.5%, because the tables are charged in full either
-/// way and the point is the order of magnitude, not the constant.
-///
-/// Mutant, run: restore the two `self.populate(h.stamp_arena_off …)` /
-/// `pose_arena_off` lines in `populate_hot` ⇒ 38 248 448 B charged, 101%, and
-/// this fails while both tests above keep passing. That is the mutation this
-/// test exists to catch and the reason it is not redundant with them.
+/// Mutant: restore the two `populate(h.stamp_arena_off …)` / `pose_arena_off`
+/// lines in `populate_hot` ⇒ ~101% charged.
 #[test]
 fn only_the_edges_this_process_uses_are_charged() {
     let (rss, size) = charged(|| build_claiming("tf_tree_pop_subset", 4));
@@ -235,17 +123,12 @@ fn only_the_edges_this_process_uses_are_charged() {
     );
 }
 
-/// Minor faults taken by this process, from `/proc/self/stat` field 10.
-///
-/// A count, not a duration. §7.1's claim is about *page faults*, and measuring
-/// it as a duration would mean measuring scheduler noise and cache state at the
-/// same time — a test that fails on a loaded machine and passes on an idle one
-/// proves nothing about the code.
+/// Minor faults taken by this process, from `/proc/self/stat` field 10 — a
+/// count, not a duration, so load cannot flip it.
 fn minor_faults() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    // Field 2 is `comm`, parenthesised and free to contain spaces and
-    // parentheses, so the scan starts after the **last** `)` — the same parsing
-    // trap `docs/PHASE2.md` §5.1 calls out for `start_time`.
+    // Field 2 (`comm`) may contain spaces and parentheses, so scan after the last
+    // `)` (`docs/PHASE2.md` §5.1).
     let after_comm = &stat[stat.rfind(')').unwrap() + 1..];
     after_comm
         .split_whitespace()
@@ -255,32 +138,14 @@ fn minor_faults() -> u64 {
         .unwrap()
 }
 
-/// **The first lookup after attach must not fault** — which is the entire reason
-/// §7.1 exists.
+/// The first lookup after attach must not fault (§7.1): one minor fault is two
+/// orders of magnitude over the 150 ns p50 budget. A second mapping of the
+/// segment has cold page tables, which makes this measurable in-process.
+/// `joiner.plan` is not scaffolding: it warms this edge's rings.
 ///
-/// A minor fault costs single-digit microseconds against a 150 ns p50 budget, so
-/// one fault in the lookup path is two orders of magnitude over. It happens
-/// exactly once per page, on first touch, which is why it never appears in a
-/// steady-state benchmark and why an attaching consumer is the process that eats
-/// it: inside the first iteration of a control loop.
-///
-/// A **second mapping of the same segment** in this process is what makes this
-/// measurable without a second process — the new mapping has its own page
-/// tables, so its pages are cold no matter how warm the creator's are.
-///
-/// # This test now covers two call sites, and it is the only one that covers the
-/// second
-///
-/// `joiner.plan(s, t)` above is not scaffolding. Since population became
-/// per-edge it is what warms this edge's rings, so the fault this measures would
-/// be taken *inside `plan.at`* without it — which is the one place §7.1 says a
-/// fault may never be. The other two tests in this file weigh residency and
-/// would not notice.
-///
-/// Mutants, both run: drop the `populate_hot()` call from `attach_shared_inner`
-/// ⇒ the first lookup faults on the tables. Drop the `populate_edge_rings` loop
-/// from `Tree::plan` ⇒ **1 minor fault**, on the rings. Either is a failure, and
-/// the other two tests stay green through the second of them.
+/// Mutants: drop `populate_hot()` from `attach_shared_inner` ⇒ the lookup faults
+/// on the tables; drop the `populate_edge_rings` loop from `Tree::plan` ⇒ 1
+/// fault on the rings.
 #[test]
 fn the_first_lookup_after_attach_does_not_fault() {
     use tf_tree::{AttachMode, Stamp, SystemDomain};
@@ -307,8 +172,7 @@ fn the_first_lookup_after_attach_does_not_fault() {
     let s = joiner.frame("map").unwrap();
     let plan = joiner.plan(s, t).unwrap();
 
-    // Everything above has already touched whatever it is going to touch. From
-    // here on, any fault is one the lookup itself took.
+    // From here on, any fault is one the lookup itself took.
     let before = minor_faults();
     let g = joiner.guard();
     plan.at(&g, Stamp::<SystemDomain>::from_nanos(2_000_000))

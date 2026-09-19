@@ -1,37 +1,24 @@
 //! The fixed-size arena header — the first bytes of every arena.
 //!
-//! [`ArenaHeader`] is a `#[repr(C, align(64))]` control block; a second process
-//! reads it to locate every region, so its field order, offsets and
-//! little-endian encoding are a **normative** wire contract. It is exactly the
-//! 320-byte header region since `FORMAT_VERSION` 3.
+//! [`ArenaHeader`] is a `#[repr(C, align(64))]` control block that a second
+//! process reads to locate every region: its field order, offsets and
+//! little-endian encoding are a normative wire contract (320 bytes).
 
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64};
 
 /// Magic identifying a `tf_tree` arena.
-///
-/// Stored as a byte array rather than a `u64` literal so the on-disk/in-memory
-/// byte order is unambiguous regardless of host endianness.
+/// Magic identifying a `tf_tree` arena, a byte array so byte order is unambiguous.
 pub const TF_TREE_MAGIC: [u8; 8] = *b"TF_TREE\0";
 
-/// Arena format version. Bumped on any incompatible layout change.
+/// Arena format version, bumped on any incompatible layout change.
 ///
-/// **2** — `docs/PHASE2.md` §1's amendments A1 (packed [`ArenaHeader::topo`],
-/// four topology blocks), A2 ([`TopoLock`] in the arena), A6 (participant
-/// table) and A7 (16-byte `boot_id`, `owner_start_time`).
-///
-/// **3** — `docs/PHASE5.md` §1: one deliberate break adding the counter regions
-/// (§5.2), Phase 6's `spline_region_off`/`_degree` (`0` when absent) and
-/// reserved bytes in `EdgeRecord`/`FrameRecord`. The header grew from 256 to 320
-/// bytes with §1.2's 64 reserved bytes still free, moving `topo_lock` and
-/// `layout_hash`; tests pin both.
-///
-/// A version-1 or version-2 arena must not be attached; `MappedArena::attach`
-/// refuses both.
+/// **2**: `docs/PHASE2.md` §1 A1, A2, A6, A7. **3**: `docs/PHASE5.md` §1, the
+/// counter regions, Phase 6's `spline_region_off`/`_degree`, and a 320-byte
+/// header. `MappedArena::attach` refuses versions 1 and 2.
 pub const FORMAT_VERSION: u32 = 3;
 
-/// Number of topology blocks the arena rotates through. **Four, not two**
-/// (`docs/PHASE2.md` §1 A1): a reader is hit after four flips mid-read, not two,
-/// for ~5 KB at `max_frames = 256`.
+/// Number of topology blocks the arena rotates through: four, not two
+/// (`docs/PHASE2.md` §1 A1).
 pub const TOPO_BLOCKS: usize = 4;
 
 /// Pack a topology generation and active-block index into one word.
@@ -50,15 +37,13 @@ pub const fn unpack_topo(word: u64) -> (u64, u8) {
     (word >> 8, (word & 0xff) as u8)
 }
 
-/// The in-arena topology mutation lock (`docs/PHASE2.md` §1 A2). It is
-/// **reapable**: A1 makes an abandoned mutation leave no trace, so a stealer
-/// re-copies from the active block with no rollback.
+/// The in-arena topology mutation lock (`docs/PHASE2.md` §1 A2), reapable: an
+/// abandoned mutation leaves no trace, so a stealer re-copies from the active block.
 #[repr(C, align(64))]
 pub struct TopoLock {
     /// `0` = free, else `participant_slot + 1`.
     pub owner: AtomicU64,
-    /// When the current holder acquired it, for staleness diagnostics. Never a
-    /// reaping trigger on its own (`docs/PHASE2.md` §6.4).
+    /// When the holder acquired it; diagnostics only (`docs/PHASE2.md` §6.4).
     pub acquired_at_nanos: AtomicI64,
     _pad: [u8; 48],
 }
@@ -72,8 +57,8 @@ pub struct ArenaHeader {
     pub magic: u64,
     /// [`FORMAT_VERSION`] at construction time.
     pub format_version: u32,
-    /// Compile-time hash of the header size/alignment and region strides
-    /// (see [`crate::layout::layout_hash`]). Checked on attach in Phase 2.
+    /// Compile-time hash of header size/alignment and region strides
+    /// ([`crate::layout::layout_hash`]).
     pub layout_hash: u32,
     /// Total arena size in bytes (equals [`crate::layout::ArenaLayout::total_size`]).
     pub arena_size: u64,
@@ -107,43 +92,36 @@ pub struct ArenaHeader {
     pub pose_arena_off: u32,
     /// Packed topology generation and active block index — see [`pack_topo`].
     ///
-    /// **There is no odd state** (A1): the writer mutates an *inactive* block, so
-    /// publication is one store and a killed writer leaves no trace.
+    /// There is no odd state (A1): the writer mutates an inactive block.
     pub topo: AtomicU64,
     /// Number of frames interned so far.
     pub frame_count: AtomicU32,
     /// Number of edges declared so far.
     pub edge_count: AtomicU32,
-    /// **Vestigial: nothing increments it and nothing should read it** (liveness
-    /// is a lock byte, D17). Kept because removing it moves every later offset
-    /// (`docs/decisions/0056`, `docs/decisions/0032` part 2).
+    /// **Vestigial: nothing increments or reads it** (liveness is a lock byte,
+    /// D17). Kept because removal moves every later offset (`docs/decisions/0056`,
+    /// `0032` part 2).
     pub participant_count: AtomicU32,
     /// PID of the process that created the arena.
     pub creator_pid: u32,
-    /// The creator's process start time (jiffies since boot, `/proc/<pid>/stat`
-    /// field 22), which makes `creator_pid` PID-reuse-proof (A7).
+    /// The creator's process start time (`/proc/<pid>/stat` field 22), which makes
+    /// `creator_pid` PID-reuse-proof (A7).
     pub owner_start_time: u64,
-    /// Linux boot id of the creating host, all 16 bytes (A7): detects a segment
-    /// that outlived a reboot.
+    /// Linux boot id of the creating host (A7): detects a segment that outlived a reboot.
     pub boot_id: [u8; 16],
     /// Reserved padding to keep the layout stable across future additions.
     _reserved: [u8; 8],
-    /// Identifies *this* arena instance, not its name: the split-brain check
-    /// (`docs/PHASE2.md` §3.7, `docs/decisions/0005`).
-    ///
-    /// **All-zero means "not a shared instance"** ([`crate::HeapArena`]). Offset 136.
+    /// Identifies this arena instance (`docs/PHASE2.md` §3.7, `docs/decisions/0005`);
+    /// all-zero means "not a shared instance" ([`crate::HeapArena`]). Offset 136.
     pub instance_uuid: [u8; 16],
-    // FORMAT_VERSION 3 additions (`docs/PHASE5.md` §1.2), at 152 in the padding
-    // before `topo_lock`.
+    // FORMAT_VERSION 3 additions (`docs/PHASE5.md` §1.2).
     /// Byte offset of the per-edge counter region (§5.2). Never zero in a v3
     /// arena, so disabling `counters` does not fork the layout hash (D34).
     pub edge_counters_off: u32,
     /// Byte offset of the per-participant counter region (§5.2). Same contract.
     pub participant_counters_off: u32,
-    /// Eight bytes that were `covariance_region_off` + `covariance_stride`
-    /// until [`0009`] descoped covariance, reserved **in place**: closing the gap
-    /// would move `spline_region_off`/`spline_degree` (168, 172), and
-    /// `layout_hash` would not notice.
+    /// Formerly `covariance_region_off` + `covariance_stride`; reserved in place
+    /// after [`0009`] so `spline_region_off`/`spline_degree` (168, 172) do not move.
     ///
     /// [`0009`]: ../../../docs/decisions/0009-descoping-phase-6.md
     _reserved_covariance: [u8; 8],
@@ -205,8 +183,7 @@ mod tests {
         // FORMAT_VERSION 3 additions.
         assert_eq!(offset_of!(ArenaHeader, edge_counters_off), 152);
         assert_eq!(offset_of!(ArenaHeader, participant_counters_off), 156);
-        // 160..168 was covariance's (`docs/decisions/0009`); see
-        // `_reserved_covariance`.
+        // 160..168 was covariance's (`docs/decisions/0009`).
         assert_eq!(offset_of!(ArenaHeader, _reserved_covariance), 160);
         assert_eq!(offset_of!(ArenaHeader, spline_region_off), 168);
         assert_eq!(offset_of!(ArenaHeader, spline_degree), 172);
@@ -217,8 +194,7 @@ mod tests {
     /// **§1.2 requires ≥ 64 bytes still reserved after the v3 additions.**
     #[test]
     fn at_least_64_reserved_bytes_remain_after_the_v3_fields() {
-        // Named reserved arrays, plus the implicit padding between the last
-        // named field and the lock's 64-byte boundary.
+        // Named reserved arrays plus the padding before the lock's 64-byte boundary.
         let named = 8usize /* _reserved */
             + 8 /* _reserved_covariance, freed by `0009` */
             + 3 /* _pad_v3 */
@@ -233,23 +209,20 @@ mod tests {
         );
     }
 
-    /// `instance_uuid`'s slot at 136 was pre-existing padding; a later field must
-    /// not silently push the lock off its cacheline.
+    /// A later field must not silently push the lock off its cacheline.
     #[test]
     fn the_header_has_no_slack_left_between_its_last_field_and_the_lock() {
         let after_boot_id = offset_of!(ArenaHeader, boot_id) + 16;
         let uuid_at = offset_of!(ArenaHeader, instance_uuid);
         let lock_at = offset_of!(ArenaHeader, topo_lock);
 
-        // `instance_uuid` sits after `boot_id` + `_reserved` and before the lock.
         assert!(uuid_at >= after_boot_id, "{uuid_at} < {after_boot_id}");
         assert!(
             uuid_at + 16 <= lock_at,
             "uuid overruns the lock at {lock_at}"
         );
 
-        // The lock is where alignment puts it given everything in front of it:
-        // add a field without extending the header and this fails.
+        // Adding a field without extending the header fails this.
         assert_eq!(align_of::<TopoLock>(), 64);
         let last_named_end = offset_of!(ArenaHeader, _reserved_v3) + 64;
         assert_eq!(

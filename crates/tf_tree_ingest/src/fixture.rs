@@ -1,34 +1,26 @@
 //! A **synthetic** MCAP writer for tests — not a recording.
 //!
-//! Nothing here came off a robot; no rosbag2 bag is vendored. The framing is real
-//! MCAP (from `mcap::Writer`, or hand-written for the chunked fixtures) around
-//! real CDR payloads ([`crate::cdr::encode_tf_message`], checked against
-//! hand-assembled bytes in `cdr::tests::wire_bytes_decode_w_last`). This gates
-//! this crate's logic hermetically and says nothing about real recordings'
-//! quirks (`docs/PHASE5.md` §0.0).
+//! Nothing here came off a robot. The framing is real MCAP (from `mcap::Writer`,
+//! or hand-written for the chunked fixtures) around real CDR payloads
+//! ([`crate::cdr::encode_tf_message`]); it gates this crate's logic hermetically
+//! and says nothing about real recordings' quirks (`docs/PHASE5.md` §0.0).
 //!
 //! # Compression
 //!
-//! [`write_mcap`] is uncompressed: `mcap` is taken `default-features = false`.
-//! [`ChunkedSpec::compressed`] compresses chunks with `ruzstd` or `lz4_flex`, the
-//! crates `crate::decompress` reads with, so it proves **round-trip**, not
-//! conformance: `testdata/zstd_conformance.mcap` (real `zstd` CLI) and a
-//! hand-authored lz4 frame in `crate::decompress`'s tests cover that
-//! (`testdata/ATTRIBUTION.md`). A [`ChunkDamage`] variant's documented fault is the
-//! one it produces on an uncompressed chunk unless the variant says otherwise.
+//! [`write_mcap`] is uncompressed. [`ChunkedSpec::compressed`] compresses with
+//! `ruzstd` or `lz4_flex`, the crates `crate::decompress` reads with, so it
+//! proves round-trip, not conformance (`testdata/ATTRIBUTION.md`). A
+//! [`ChunkDamage`] variant's documented fault is the one it produces on an
+//! uncompressed chunk unless the variant says otherwise.
 //!
 //! # Why a second writer
 //!
-//! `mcap::Writer` cannot produce a damaged chunk (every length and CRC is
-//! correct) and always emits a summary section repeating every `Schema` and
-//! `Channel`, which makes [`OnBadChunk`](crate::OnBadChunk)'s "the skipped chunk
-//! held the only `Channel` record" caveat unreachable. [`write_mcap_chunked`]
-//! writes the framing itself with no summary, chunks on an explicit message count,
-//! and damages the second chunk only. Record bodies are hand-rolled because
-//! `mcap` exposes no public serializer (its `binrw` derive would need `binrw` as a
-//! direct dependency); they are read back in this module's tests with
-//! `mcap::read::LinearReader` as the oracle, whose limits are stated at
-//! `a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`.
+//! `mcap::Writer` cannot produce a damaged chunk and always emits a summary
+//! section repeating every `Schema` and `Channel`. [`write_mcap_chunked`] writes
+//! the framing itself with no summary, chunks on an explicit message count, and
+//! damages the second chunk only. Record bodies are hand-rolled because `mcap`
+//! exposes no public serializer; tests read them back with
+//! `mcap::read::LinearReader` as the oracle.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -40,21 +32,17 @@ use crate::cdr::{encode_tf_message, TransformStamped};
 /// The schema name a real `rosbag2` writes for `/tf`.
 pub const TF_SCHEMA: &str = "tf2_msgs/msg/TFMessage";
 
-/// Target uncompressed chunk size for the `mcap::Writer` fixtures: **4 KiB**
-/// (`mcap` defaults to 1 MiB, which would make each corpus one chunk). Several
-/// chunks exercise truncation recovery with earlier chunks complete and the last
-/// cut (`truncation_recovery_is_record_granular`) and enter
-/// `crate::decompress::for_each_record` once per chunk. The hand-rolled fixtures
-/// chunk by message count ([`ChunkedSpec`]) and ignore this.
+/// Target uncompressed chunk size for the `mcap::Writer` fixtures: **4 KiB**, so
+/// each corpus spans several chunks. The hand-rolled fixtures chunk by message
+/// count ([`ChunkedSpec`]).
 pub const FIXTURE_CHUNK_SIZE: u64 = 4 * 1024;
 
 /// One fabricated message: a topic, a log time, and the transforms in it.
 #[derive(Clone, Debug)]
 pub struct FixtureMessage {
-    /// Topic to publish on. `/tf_static` (or anything ending in it) becomes a
-    /// static channel by the same rule the reader uses.
+    /// Topic to publish on; one ending in `/tf_static` is a static channel.
     pub topic: String,
-    /// MCAP log time in nanoseconds — when the recorder wrote it.
+    /// MCAP log time in nanoseconds.
     pub log_time_ns: i64,
     /// The transforms this `TFMessage` carries.
     pub transforms: Vec<TransformStamped>,
@@ -114,8 +102,7 @@ pub fn write_mcap(
 }
 
 /// Write `messages` with an explicit schema name (e.g. the ROS 1 spelling
-/// `tf2_msgs/TFMessage`) and a per-topic message encoding for the topics in
-/// `encodings` (else `cdr`); per topic so a mixed file can show a skip counted.
+/// `tf2_msgs/TFMessage`) and a per-topic message encoding (else `cdr`).
 ///
 /// # Errors
 ///
@@ -130,11 +117,9 @@ pub fn write_mcap_as(
     let mut w = mcap::WriteOptions::new()
         .compression(None)
         .profile("ros2")
-        // Far below `mcap`'s default; see [`FIXTURE_CHUNK_SIZE`].
         .chunk_size(Some(FIXTURE_CHUNK_SIZE))
         .library("tf_tree_ingest fixture (synthetic, not a recording)")
         .create(out)?;
-    // Empty schema payload: nothing here parses the IDL text.
     let schema = w.add_schema(schema_name, "ros2msg", b"")?;
     let mut channels: BTreeMap<String, u16> = BTreeMap::new();
     for (sequence, m) in messages.iter().enumerate() {
@@ -162,18 +147,13 @@ pub fn write_mcap_as(
         )?;
     }
     w.finish()?;
-    // `Writer::finish` does not flush the `BufWriter`; `Drop` would swallow an
-    // ENOSPC and leave a truncated fixture behind an `Ok`.
+    // `Writer::finish` does not flush the `BufWriter`; `Drop` would swallow an ENOSPC.
     w.into_inner().flush()?;
     Ok(())
 }
 
 /// A small, non-degenerate recording: two static edges and three dynamic ones
-/// at different rates, with a rotation that actually turns.
-///
-/// Non-degenerate: every pose has a distinct quaternion and translation (identity
-/// poses hide transposed quaternions and mis-sorted rings), and the dynamic edges
-/// publish at 100, 50 and 10 Hz.
+/// at 100, 50 and 10 Hz, every pose with a distinct quaternion and translation.
 #[must_use]
 pub fn small_recording() -> Vec<FixtureMessage> {
     let mut out = vec![
@@ -204,7 +184,6 @@ pub fn small_recording() -> Vec<FixtureMessage> {
             ],
         ),
     ];
-    // 1 second of data, interleaved so per-edge grouping is exercised.
     for i in 0..100i64 {
         let t = 1_000_000_000 + i * 10_000_000;
         let a = i as f64 * 0.01;
@@ -242,14 +221,12 @@ pub fn small_recording() -> Vec<FixtureMessage> {
     out
 }
 
-/// Messages per chunk in `testdata/zstd_conformance.mcap`; shared by the
-/// generator and the test so the control has the same layout.
+/// Messages per chunk in `testdata/zstd_conformance.mcap`.
 pub const CONFORMANCE_MESSAGES_PER_CHUNK: usize = 4;
 
 /// The corpus behind `testdata/zstd_conformance.mcap`: twelve messages over three
-/// chunks, small because the file is committed. **Frozen**: changing it
-/// invalidates the file (`ingest::a_real_libzstd_recording_ingests` fails on the
-/// transform count).
+/// chunks. **Frozen**: changing it invalidates the file
+/// (`ingest::a_real_libzstd_recording_ingests`).
 #[must_use]
 pub fn conformance_recording() -> Vec<FixtureMessage> {
     let mut out = vec![FixtureMessage::static_edge(
@@ -278,18 +255,16 @@ pub fn conformance_recording() -> Vec<FixtureMessage> {
     out
 }
 
-/// The shape of a **real** `/tf`: publishers stamping at different points in
-/// their pipelines, interleaved. `odom -> base_link` is stamped as published
-/// (100 Hz); `map -> odom` (10 Hz) is stamped `latency_ns` before it is published,
-/// so the merged stamp stream is not monotone ([`small_recording`]'s is). At
-/// 200 ms the skew exceeds the 100 ms threshold and a per-stream guard halts.
+/// The shape of a real `/tf`: `odom -> base_link` is stamped as published
+/// (100 Hz); `map -> odom` (10 Hz) is stamped `latency_ns` before it is
+/// published, so the merged stamp stream is not monotone. At 200 ms the skew
+/// exceeds the 100 ms threshold and a per-stream guard halts.
 #[must_use]
 pub fn two_publishers_with_latency(latency_ns: i64) -> Vec<FixtureMessage> {
     let mut out = Vec::new();
     for i in 0..100i64 {
         let t = 10_000_000_000 + i * 10_000_000;
         let a = i as f64 * 0.01;
-        // Published now, stamped now.
         out.push(
             FixtureMessage::dynamic(
                 "odom",
@@ -300,7 +275,6 @@ pub fn two_publishers_with_latency(latency_ns: i64) -> Vec<FixtureMessage> {
             .logged_at(t),
         );
         if i % 10 == 0 {
-            // Published now, stamped `latency_ns` ago.
             out.push(
                 FixtureMessage::dynamic(
                     "map",
@@ -315,36 +289,30 @@ pub fn two_publishers_with_latency(latency_ns: i64) -> Vec<FixtureMessage> {
     out
 }
 
-/// `library` every hand-rolled fixture stamps into its `Header`, so a stray file
-/// is not mistaken for a recording.
+/// `library` every hand-rolled fixture stamps into its `Header`.
 const HAND_ROLLED_LIBRARY: &str = "tf_tree_ingest hand-rolled fixture (synthetic, not a recording)";
 
-/// Zero-based ordinal of the chunk [`ChunkDamage`] is applied to: **the second**,
-/// so a test can assert chunks before and after both survived.
+/// Zero-based ordinal of the chunk [`ChunkDamage`] is applied to: the second.
 pub const DAMAGED_CHUNK_ORDINAL: u64 = 1;
 
 /// Fewest chunks a damaged fixture must split into, so a survivor sits on each
-/// side. Derived from [`DAMAGED_CHUNK_ORDINAL`] so a moved ordinal cannot leave a
-/// guard that passes and hands back a pristine recording.
+/// side.
 const fn min_chunks_for_damage() -> usize {
     DAMAGED_CHUNK_ORDINAL as usize + 2
 }
 
-/// Which chunk carries the `Schema` and `Channel` records. Only meaningful because
-/// [`write_mcap_chunked`] emits no summary section.
+/// Which chunk carries the `Schema` and `Channel` records (no summary section).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DefinitionsIn {
-    /// The first chunk, which is where a real recorder puts them.
+    /// The first chunk, where a real recorder puts them.
     #[default]
     FirstChunk,
-    /// The chunk [`ChunkedSpec::damaged`] damages. Skipping it costs the only
-    /// `Channel` record, so every later message is dropped uncounted
-    /// ([`OnBadChunk`](crate::OnBadChunk)'s caveat).
+    /// The chunk [`ChunkedSpec::damaged`] damages; skipping it costs the only
+    /// `Channel` record ([`OnBadChunk`](crate::OnBadChunk)'s caveat).
     DamagedChunk,
 }
 
 /// Which codec a hand-rolled fixture's chunk records are compressed with.
-/// Defaults to [`FixtureCodec::None`] so existing layouts are byte-identical.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FixtureCodec {
     /// Records stored verbatim; `compression` is `""`.
@@ -367,8 +335,8 @@ impl FixtureCodec {
         }
     }
 
-    /// Whether this build has an encoder (the `compression` feature); otherwise
-    /// `chunked_mcap_bytes` refuses with [`FixturePlanError::CodecUnavailable`].
+    /// Whether this build has an encoder; otherwise `chunked_mcap_bytes` refuses
+    /// with [`FixturePlanError::CodecUnavailable`].
     #[must_use]
     pub fn is_available(self) -> bool {
         match self {
@@ -383,12 +351,9 @@ impl FixtureCodec {
 
 /// Compress one chunk's records field at the cheapest level.
 ///
-/// Frames come from `ruzstd`, not libzstd, so they prove round-trip only and are
-/// not shaped like a recorder's (128 KiB declared window against `zstd -19`'s
-/// 8 MiB); never read a timing taken from them as a bag timing
-/// (`docs/decisions/0050-what-ten-times-real-time-divides.md` records the limit
-/// for `just gate5`, which uses this writer). `bytes` is by value so the
-/// uncompressed arm is a move.
+/// `ruzstd` frames prove round-trip only and are not shaped like a recorder's;
+/// never read a timing from them as a bag timing
+/// (`docs/decisions/0050-what-ten-times-real-time-divides.md`).
 #[cfg_attr(not(feature = "compression"), allow(unused_variables))]
 fn compress_records(codec: FixtureCodec, bytes: Vec<u8>) -> Result<Vec<u8>, FixturePlanError> {
     match codec {
@@ -419,77 +384,49 @@ fn compress_records(codec: FixtureCodec, bytes: Vec<u8>) -> Result<Vec<u8>, Fixt
 
 /// A deliberate defect in the second chunk of a hand-rolled fixture.
 ///
-/// Each variant's documented fault is checked by
-/// `fixture::tests::each_damage_variant_produces_its_documented_fault`. Six of
-/// seven produce a [`BadChunkKind`](crate::BadChunkKind) on an uncompressed chunk
-/// (two name a different one when compressed); [`ChunkDamage::Relabelled`]'s fault
-/// depends on the build.
+/// Checked by `fixture::tests::each_damage_variant_produces_its_documented_fault`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChunkDamage {
-    /// `compressed_size` declares more bytes than the chunk contains.
-    ///
-    /// Detected in every build, as `BadChunkKind::CompressedSizeMismatch` (not
-    /// `LengthMismatch`: no decoder has run).
+    /// `compressed_size` declares more bytes than the chunk contains:
+    /// `BadChunkKind::CompressedSizeMismatch` in every build.
     CompressedSizeTooLarge,
-    /// `compressed_size` declares four bytes fewer than the records field holds.
-    ///
-    /// Detected in every build, as `BadChunkKind::StoredSizeMismatch`: the two size
-    /// fields must agree on an uncompressed chunk. This fires before the CRC, which
-    /// a `0` ("not computed") hash would skip. On a compressed chunk the lie
-    /// truncates the codec frame, surfacing as `BadChunkKind::Decompress`; no
-    /// fixture combines the two.
+    /// `compressed_size` declares four bytes fewer than the records field holds:
+    /// `BadChunkKind::StoredSizeMismatch` (before the CRC); on a compressed chunk,
+    /// `BadChunkKind::Decompress`.
     CompressedSizeTooSmall,
-    /// `uncompressed_crc` holds a hash the records do not have (never `0`, which
-    /// means "not computed"). Detected in every build, as `BadChunkKind::Crc`.
+    /// `uncompressed_crc` holds a wrong, non-zero hash: `BadChunkKind::Crc`.
     UncompressedCrc,
-    /// One bit flipped inside the records field, `uncompressed_crc` left as computed
-    /// over the clean bytes. Detected in every build, as `BadChunkKind::Crc`; models
-    /// real corruption, which the CRC alone catches.
+    /// One bit flipped inside the records field, CRC left clean:
+    /// `BadChunkKind::Crc`.
     FlippedBitInRecords,
-    /// The `compression` field relabelled, records left uncompressed.
-    ///
-    /// A name no build knows ([`ChunkCodec::Other`](crate::ChunkCodec::Other), e.g.
-    /// `"brotli"`) is `ChunkFault::Unsupported`, hence never-skippable
-    /// [`IngestError::CompressedChunk`](crate::IngestError::CompressedChunk).
-    /// `"zstd"`/`"lz4"` in the default build is skippable
-    /// `BadChunkKind::Decompress`
-    /// (`ingest::a_mislabelled_codec_is_damage_not_an_unsupported_codec`); under
-    /// `--no-default-features` it is `Unsupported`.
+    /// The `compression` field relabelled, records left uncompressed. An unknown
+    /// name (`"brotli"`) is never-skippable
+    /// [`IngestError::CompressedChunk`](crate::IngestError::CompressedChunk);
+    /// `"zstd"`/`"lz4"` is skippable `BadChunkKind::Decompress`
+    /// (`ingest::a_mislabelled_codec_is_damage_not_an_unsupported_codec`), or
+    /// `Unsupported` under `--no-default-features`.
     Relabelled(&'static str),
-    /// The last inner record's declared length inflated past the end of the records
-    /// field, `uncompressed_crc` recomputed (so the CRC does not fire first).
-    ///
-    /// Detected in every build, as `BadChunkKind::InnerFraming`. The one variant
-    /// whose skip is not all-or-nothing: records before the fault were already
-    /// delivered, yet the whole chunk is counted skipped
+    /// The last inner record's declared length inflated past the end of the
+    /// records field, CRC recomputed: `BadChunkKind::InnerFraming`. Records before
+    /// the fault were already delivered
     /// (`ingest::a_framing_fault_mid_chunk_keeps_what_it_already_delivered`).
     InnerRecordRunsPastTheEnd,
-    /// `uncompressed_size` declares 64 bytes more than the records field holds.
-    ///
-    /// Detected in every build, differently per path:
-    ///
-    /// * Uncompressed: `BadChunkKind::StoredSizeMismatch` (the two sizes must be
-    ///   equal; asserted of every clean chunk by
-    ///   `a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate`).
-    /// * Compressed: `BadChunkKind::LengthMismatch` (the decoder produced less than
-    ///   declared).
-    ///
-    /// See `ingest::a_lying_uncompressed_size_is_refused` and
-    /// `ingest::a_short_decompression_is_not_read_as_a_short_recording`.
+    /// `uncompressed_size` declares 64 bytes more than the records field holds:
+    /// `StoredSizeMismatch` uncompressed, `LengthMismatch` compressed
+    /// (`ingest::a_lying_uncompressed_size_is_refused`).
     UncompressedSizeTooLarge,
 }
 
 /// How [`write_mcap_chunked`] lays a fixture out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkedSpec {
-    /// Messages per chunk — a count, not bytes, so a test knows which messages a
-    /// damaged chunk costs.
+    /// Messages per chunk — a count, not bytes.
     pub messages_per_chunk: usize,
     /// Which chunk carries the `Schema` and `Channel` records.
     pub definitions: DefinitionsIn,
     /// The defect to write into the second chunk, if any.
     pub damage: Option<ChunkDamage>,
-    /// Which codec compresses **every** chunk's records field, as a recorder does.
+    /// Which codec compresses every chunk's records field.
     pub codec: FixtureCodec,
 }
 
@@ -543,9 +480,8 @@ impl ChunkedSpec {
 
 /// Why a corpus and a [`ChunkedSpec`] could not be turned into a fixture.
 ///
-/// `Copy` and `String`-free (`docs/PROJECT.md` §5). Nothing about a
-/// [`ChunkedSpec`] is clamped: a fixture that is not what was asked for makes a
-/// damage test vacuous, so it is refused.
+/// `Copy` and `String`-free. Nothing is clamped, since a fixture that is not what
+/// was asked for makes a damage test vacuous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FixturePlanError {
     /// The corpus does not split into enough chunks to damage the second one and
@@ -567,8 +503,7 @@ pub enum FixturePlanError {
          test starts measuring nothing, so this is refused rather than read as 1"
     )]
     ZeroMessagesPerChunk,
-    /// The chunk to be damaged holds no record the damage can land on, so it would
-    /// stay intact. Unreachable today; refused so it stays so.
+    /// The chunk to be damaged holds no record the damage can land on.
     #[error(
         "the chunk to damage holds no records, so {damage} would leave it intact; a \
          fixture that is quietly undamaged is worse than one that fails to build"
@@ -595,11 +530,8 @@ pub enum FixturePlanError {
 }
 
 /// Write `messages` to `path` as an MCAP with hand-rolled framing, **no summary
-/// section**, and an optional deliberate defect in its second chunk.
-///
-/// See [`ChunkDamage`] for what each defect produces. Unlike [`write_mcap`] it
-/// buffers the whole file, and the schema name and encoding are fixed at
-/// [`TF_SCHEMA`] and `cdr`.
+/// section**, and an optional deliberate defect in its second chunk. Buffers the
+/// whole file; schema name and encoding are fixed at [`TF_SCHEMA`] and `cdr`.
 ///
 /// # Errors
 ///
@@ -613,9 +545,7 @@ pub fn write_mcap_chunked(
     Ok(())
 }
 
-/// The bytes [`write_mcap_chunked`] would write.
-///
-/// Separate so tests can truncate or byte-compare without the filesystem.
+/// The bytes [`write_mcap_chunked`] would write, without the filesystem.
 ///
 /// # Errors
 ///
@@ -636,8 +566,6 @@ pub fn chunked_mcap_bytes(
         });
     }
 
-    // Every channel is declared in one chunk, so a skip's loss depends on the spec,
-    // not the corpus.
     let mut topics: Vec<&str> = Vec::new();
     for m in messages {
         if !topics.contains(&m.topic.as_str()) {
@@ -668,7 +596,6 @@ pub fn chunked_mcap_bytes(
             }
         }
         for (i, m) in group.iter().enumerate() {
-            // Unreachable: `topics` was collected from these messages.
             let Some(slot) = topics.iter().position(|t| *t == m.topic.as_str()) else {
                 continue;
             };
@@ -698,9 +625,8 @@ pub fn chunked_mcap_bytes(
         );
     }
 
-    // `DataEnd` with CRC `0` ("not computed"), as a conforming data section ends.
+    // `DataEnd` with CRC `0`; a footer naming no summary.
     push_record(&mut out, mcap::records::op::DATA_END, &0u32.to_le_bytes());
-    // A footer naming no summary, so definitions exist only where placed.
     push_record(&mut out, mcap::records::op::FOOTER, &footer_body());
     out.extend_from_slice(mcap::MAGIC);
     Ok(out)
@@ -719,8 +645,7 @@ fn log_time_of(m: &FixtureMessage) -> u64 {
     u64::try_from(m.log_time_ns).unwrap_or(0)
 }
 
-/// One chunk's records field under construction, tracking where the last record's
-/// length field sits for [`ChunkDamage::InnerRecordRunsPastTheEnd`].
+/// One chunk's records field under construction.
 #[derive(Default)]
 struct RecordBuf {
     /// The records field so far.
@@ -748,18 +673,11 @@ fn push_record(out: &mut Vec<u8>, opcode: u8, body: &[u8]) {
 
 /// Assemble a chunk record's body under `codec`, applying `damage`.
 ///
-/// Field order is the specification's (`message_start_time`, `message_end_time`,
-/// `uncompressed_size`, `uncompressed_crc`, `compression`, `compressed_size`,
-/// records), checked by this module's tests.
-///
 /// # Phase order
 ///
-/// 1. Damage that rewrites the records (bit flip, inflated inner length), before
-///    compression so the codec does not encode clean bytes.
-/// 2. Compression: `uncompressed_size` and `uncompressed_crc` describe the bytes
-///    that went in.
-/// 3. Damage that lies in the header (the `compressed_size` variants, CRC, relabel,
-///    `uncompressed_size`), after compression computed those numbers.
+/// 1. Damage that rewrites the records, before compression.
+/// 2. Compression: the size and CRC fields describe the bytes that went in.
+/// 3. Damage that lies in the header, after those numbers are computed.
 fn chunk_body(
     records: RecordBuf,
     start_ns: u64,
@@ -771,13 +689,10 @@ fn chunk_body(
         mut bytes,
         last_len_at,
     } = records;
-    // Hashed before phase 1 so a bit flip keeps the clean hash.
     let clean_crc = crc32fast::hash(&bytes);
 
-    // Phase 1: damage that rewrites the records field.
     match damage {
         Some(ChunkDamage::FlippedBitInRecords) => {
-            // Mid-field: inside a message body, so only the CRC witnesses it.
             let at = bytes.len() / 2;
             match bytes.get_mut(at) {
                 Some(b) => *b ^= 0x01,
@@ -800,8 +715,8 @@ fn chunk_body(
         _ => {}
     }
 
-    // Phase 2: compression. The inner-length variant is re-hashed over its patched
-    // bytes so the framing walk, not the CRC, catches it.
+    // Phase 2: compression; the inner-length variant is re-hashed so the framing
+    // walk, not the CRC, catches it.
     let uncompressed_size_true = bytes.len() as u64;
     let mut uncompressed_crc = if damage == Some(ChunkDamage::InnerRecordRunsPastTheEnd) {
         crc32fast::hash(&bytes)
@@ -818,7 +733,6 @@ fn chunk_body(
     let mut uncompressed_size = uncompressed_size_true;
     let mut compressed_size = payload.len() as u64;
 
-    // Phase 3: damage that lies in the header.
     match damage {
         Some(ChunkDamage::CompressedSizeTooLarge) => compressed_size += 64,
         Some(ChunkDamage::CompressedSizeTooSmall) => {
@@ -832,7 +746,6 @@ fn chunk_body(
         Some(ChunkDamage::UncompressedCrc) => {
             uncompressed_crc = a_wrong_but_nonzero_crc(uncompressed_crc);
         }
-        // The relabel deliberately overrides the codec's name.
         Some(ChunkDamage::Relabelled(name)) => compression = name,
         Some(ChunkDamage::UncompressedSizeTooLarge) => uncompressed_size += 64,
         _ => {}
@@ -865,8 +778,7 @@ fn header_body(profile: &str, library: &str) -> Vec<u8> {
     b
 }
 
-/// `Footer`: `summary_start`, `summary_offset_start`, `summary_crc` — all zero,
-/// which is how a file says it has no summary section.
+/// `Footer`: `summary_start`, `summary_offset_start`, `summary_crc`, all zero.
 fn footer_body() -> Vec<u8> {
     let mut b = Vec::new();
     put_u64(&mut b, 0);
@@ -887,8 +799,7 @@ fn schema_body(id: u16, name: &str, encoding: &str, data: &[u8]) -> Vec<u8> {
 }
 
 /// `Channel`: `id`, `schema_id`, `topic`, `message_encoding`, `metadata`.
-///
-/// The metadata map is a `u32` byte length, not a count; empty is a bare zero.
+/// The metadata map is a `u32` byte length, not a count.
 fn channel_body(id: u16, schema_id: u16, topic: &str, message_encoding: &str) -> Vec<u8> {
     let mut b = Vec::new();
     put_u16(&mut b, id);
@@ -900,9 +811,7 @@ fn channel_body(id: u16, schema_id: u16, topic: &str, message_encoding: &str) ->
 }
 
 /// `Message`: `channel_id`, `sequence`, `log_time`, `publish_time`, then the
-/// payload to the end of the record.
-///
-/// `publish_time` is `log_time`; the reader consumes only the latter.
+/// payload; `publish_time` is `log_time`.
 fn message_body(channel_id: u16, sequence: u32, log_time: u64, payload: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     put_u16(&mut b, channel_id);
@@ -934,8 +843,7 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-/// Read back a little-endian `u64` this module wrote; `0` on a short slice
-/// (the workspace denies `unwrap`).
+/// Read back a little-endian `u64` this module wrote; `0` on a short slice.
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
     match bytes
         .get(at..at + 8)
@@ -968,9 +876,6 @@ mod tests {
     }
 
     /// The top-level records of a hand-rolled file, as `(opcode, body)`.
-    ///
-    /// Walked with `decompress::for_each_record` because the `mcap` reader refuses
-    /// a damaged chunk's body.
     fn top_level(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let inner = &bytes[mcap::MAGIC.len()..bytes.len() - mcap::MAGIC.len()];
         let mut out = Vec::new();
@@ -992,14 +897,9 @@ mod tests {
             .expect("the fixture must have that many chunks")
     }
 
-    /// The `mcap` crate accepts every byte this writer produces, and the
-    /// explicit `uncompressed_crc` assertion below is not redundant:
-    /// `LinearReader::new` does not check chunk CRCs (it emits chunks unexpanded),
-    /// so a `UncompressedCrc`- or `FlippedBitInRecords`-damaged fixture reads as
-    /// good. The CRC is covered here and, via `crate::decompress::check_crc`, in
-    /// `each_damage_variant_produces_its_documented_fault`. The per-message
-    /// `log_time` table exists because `IngestReport` never reads MCAP's
-    /// `log_time`, so nothing else would notice a wrong one.
+    /// The `mcap` crate accepts every byte this writer produces. The explicit
+    /// `uncompressed_crc` assertion is not redundant: `LinearReader::new` does not
+    /// check chunk CRCs.
     #[test]
     fn a_clean_hand_rolled_file_is_accepted_by_the_mcap_crate() {
         let messages = corpus(6);
@@ -1036,7 +936,6 @@ mod tests {
             assert_eq!(header.message_end_time, log_time_of(&group[1]));
         }
 
-        // The definitions are in the first chunk, and the first chunk only.
         let inner: Vec<mcap::records::Record<'_>> =
             mcap::read::LinearReader::sans_magic(chunks[0].1)
                 .map(|r| r.expect("every inner record must parse"))
@@ -1071,7 +970,6 @@ mod tests {
             other => panic!("expected a Message third, got {other:?}"),
         }
         assert_eq!(inner.len(), 4, "a Schema, a Channel and two Messages");
-        // A later chunk carries messages only.
         let later: Vec<mcap::records::Record<'_>> =
             mcap::read::LinearReader::sans_magic(chunks[1].1)
                 .map(|r| r.expect("every inner record must parse"))
@@ -1081,7 +979,6 @@ mod tests {
             .iter()
             .all(|r| matches!(r, mcap::records::Record::Message { .. })));
 
-        // Every message, not just the first (a wrong `log_time` is invisible to the report).
         let all_messages: Vec<(u16, u32, u64, u64, Vec<u8>)> = chunks
             .iter()
             .flat_map(|(_, data)| mcap::read::LinearReader::sans_magic(data))
@@ -1115,7 +1012,6 @@ mod tests {
             "every message must carry its own channel, sequence, times and payload"
         );
 
-        // No summary section, so a skipped definitions chunk is unrecoverable.
         match records.last() {
             Some(mcap::records::Record::Footer(f)) => {
                 assert_eq!(f.summary_start, 0, "a summary section would be repeated");
@@ -1141,8 +1037,7 @@ mod tests {
         );
     }
 
-    /// Damage lands on the second chunk only: chunks 0 and 2 stay byte-identical to
-    /// the clean fixture's, and the damaged one differs.
+    /// Damage lands on the second chunk only.
     #[test]
     fn damage_lands_on_the_second_chunk_and_nowhere_else() {
         let messages = corpus(9);
@@ -1174,14 +1069,10 @@ mod tests {
     }
 
     /// Every [`ChunkDamage`]'s documented fault, checked against `crate::decompress`.
-    /// Non-obvious rows: a long `compressed_size` is `CompressedSizeMismatch` (no
-    /// decoder ran); a short one is caught by `uncompressed_size == compressed_size`,
-    /// not the CRC; a lying `uncompressed_size` is caught in every build.
     #[test]
     fn each_damage_variant_produces_its_documented_fault() {
         let messages = corpus(9);
         let spec = ChunkedSpec::new(3);
-        // What `read_chunk` does: take the records field, then walk it.
         let fault_of = |damage: ChunkDamage| -> Option<ChunkFault> {
             let bytes = chunked_mcap_bytes(&messages, spec.damaged(damage)).unwrap();
             let body = chunk_at(&bytes, DAMAGED_CHUNK_ORDINAL as usize);
@@ -1209,7 +1100,6 @@ mod tests {
             fault_of(ChunkDamage::FlippedBitInRecords),
             Some(ChunkFault::Bad(BadChunkKind::Crc { .. }))
         ));
-        // Each row is asserted in the configuration that can reach it.
         #[cfg(feature = "compression")]
         assert!(
             matches!(
@@ -1245,9 +1135,7 @@ mod tests {
         );
     }
 
-    /// A compressed fixture round-trips and the codec is really in the file: the
-    /// header names it with `compressed_size != uncompressed_size`, and the records
-    /// come back byte-identical to the uncompressed fixture's.
+    /// A compressed fixture round-trips and the codec is really in the file.
     #[cfg(feature = "compression")]
     #[test]
     fn a_compressed_fixture_round_trips_through_the_reader() {
@@ -1293,9 +1181,7 @@ mod tests {
         (u64_at(body, 16), u64_at(body, 32 + name_len))
     }
 
-    /// A codec-free build refuses to write a compressed fixture rather than writing
-    /// an uncompressed one under a compressed name (structurally guarded by
-    /// `compress_records`'s own `cfg` arm as well).
+    /// A codec-free build refuses to write a compressed fixture.
     #[cfg(not(feature = "compression"))]
     #[test]
     fn a_codec_free_build_refuses_to_write_a_compressed_fixture() {
@@ -1311,8 +1197,7 @@ mod tests {
         }
     }
 
-    /// A corpus without a survivor on each side of the damage is an error, not a
-    /// quietly undamaged fixture.
+    /// A corpus without a survivor on each side of the damage is an error.
     #[test]
     fn a_corpus_too_short_to_damage_is_refused() {
         let spec = ChunkedSpec::new(3).damaged(ChunkDamage::UncompressedCrc);
@@ -1330,9 +1215,7 @@ mod tests {
                 needed: 3
             }
         );
-        // Fine when nothing is damaged.
         assert!(chunked_mcap_bytes(&corpus(6), ChunkedSpec::new(3)).is_ok());
-        // Definitions in the damaged chunk need three too.
         assert!(chunked_mcap_bytes(
             &corpus(6),
             ChunkedSpec::new(3).definitions_in_damaged_chunk()
@@ -1359,8 +1242,6 @@ mod tests {
     }
 
     /// A damage with nothing to land on is refused, not applied to nothing.
-    /// `chunk_body` is called directly because the public writer cannot reach an
-    /// empty chunk today.
     #[test]
     fn a_damage_with_nothing_to_land_on_is_refused() {
         for damage in [

@@ -21,62 +21,45 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-# Chunk decompression, on by default: rosbag2 and Foxglove write zstd chunks.
-# One feature, not two, and not named `zstd`/`lz4` (those name `mcap`'s C-building
-# features, which `docs/PHASE2.md` §2 forbids); the codecs here are pure Rust.
+# Chunk decompression; the codecs are pure Rust and the feature is not named
+# `zstd`/`lz4` (`docs/PHASE2.md` §2).
 compression = ["dep:ruzstd", "dep:lz4_flex"]
 default = ["compression"]
-# `.tft` writing needs `tf_tree`'s Linux-only frozen backend; in-process ingest does not.
+# `.tft` writing needs `tf_tree`'s Linux-only frozen backend.
 shm = ["tf_tree/shm"]
-# Synthetic MCAP fixture writer; test scaffolding, off by default.
 fixture = []
 
 [dependencies]
 tf_tree.workspace = true
 tf_tree_bridge.workspace = true
-# `default-features = false` is load-bearing (`docs/PHASE5.md` §0.0): `mcap`'s
-# defaults vendor C via `zstd-sys`/`lz4-sys`, against `docs/PHASE2.md` §2. `mcap`
-# owns record bodies; `crate::decompress` owns decompression.
+# `default-features = false` is load-bearing (`docs/PHASE5.md` §0.0, `docs/PHASE2.md` §2):
+# `mcap`'s defaults vendor C.
 mcap = { version = "0.25", default-features = false }
-# Pure-Rust zstd decoder (`docs/PHASE2.md` §2 forbids the C one). It carries 39
-# `unsafe` occurrences across `decoding/ringbuffer.rs` and `decoding/decode_buffer.rs`,
-# a dependency fact outside `docs/decisions/0007`'s budget. Fixes the workspace MSRV at 1.87.
-#
-# `default-features = false` drops `hash`: it xxhash64s every decoded byte for
-# `get_calculated_checksum()`, which `crate::decompress` never calls (the chunk
-# CRC32 covers the same bytes). Decoding is unchanged; `twox-hash` stays in
-# `Cargo.lock` via `lz4_flex`.
+# Pure-Rust zstd decoder (`docs/PHASE2.md` §2). Its `unsafe` is a dependency
+# fact outside `docs/decisions/0007`'s budget. `default-features = false` drops
+# `hash`, which `crate::decompress` never calls.
 ruzstd = { version = "0.9", optional = true, default-features = false, features = [
     "std",
 ] }
-# Pure-Rust lz4 decoder. MCAP's `"lz4"` is the LZ4 *frame* format, so
-# `crate::decompress` uses `frame::FrameDecoder`, never the block helpers.
-# Default features stay ON: `safe-encode`/`safe-decode` are what keep the unsafe
-# block code uncompiled, so `default-features = false` would opt in to it.
+# Pure-Rust lz4 decoder: MCAP's `"lz4"` is the frame format. Default features
+# stay ON: `safe-encode`/`safe-decode` keep the unsafe block code uncompiled.
 lz4_flex = { version = "0.14", optional = true }
 thiserror.workspace = true
-# Chunk CRC32 validation: `mcap` verifies chunk CRCs only under
-# `validate_chunk_crcs`, which is off by default. Already in `Cargo.lock`.
+# Chunk CRC32 validation (`mcap` verifies only under `validate_chunk_crcs`).
 crc32fast = { version = "1", default-features = false }
-# `docs/PHASE5.md` §2.3's `source_digest` (BLAKE3). Unconditional so `digest_file`
-# is available on every platform (`docs/decisions/0046`); already required by `tf_tree_core`.
+# `docs/PHASE5.md` §2.3's `source_digest` (`docs/decisions/0046`).
 blake3 = { workspace = true }
 
 [dev-dependencies]
-# Self-reference enabling `fixture` for this crate's tests.
-# `default-features = false` is required: dev-dependency features unify with the
-# package's, so without it `--no-default-features` would re-enable `compression`.
+# Enables `fixture` for this crate's tests; `default-features = false` because
+# dev-dependency features unify with the package's.
 tf_tree_ingest = { path = ".", default-features = false, features = ["fixture"] }
-# `tests/frozen_bag.rs` recomputes `source_digest` independently of the writer.
 blake3 = { workspace = true }
 
-# The `.tft` half needs `shm`.
 [[test]]
 name = "frozen_bag"
 required-features = ["shm"]
 
-# Generator for `testdata/zstd_conformance.mcap`; an example because it shells out
-# to the host `zstd` CLI (see `testdata/ATTRIBUTION.md`).
 [[example]]
 name = "gen_zstd_conformance"
 required-features = ["fixture"]

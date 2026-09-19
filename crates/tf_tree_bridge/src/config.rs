@@ -1,15 +1,13 @@
 //! The topology config file (`docs/PHASE4.md` §5.8's amendment).
 //!
-//! The engine has no runtime edge declaration (`docs/decisions/0004`, D4), so a
-//! bridge cannot learn its topology from `/tf`: it is told before the arena
-//! exists, in this format (`docs/PHASE2.md` §9's `tf_treed --config`).
+//! The engine has no runtime edge declaration (`docs/decisions/0004`, D4), so the
+//! topology is declared before the arena exists, in this format (`docs/PHASE2.md` §9's
+//! `tf_treed --config`).
 //!
-//! The parser is hand-written: the workspace has no TOML dependency, and a
-//! general parser plus `serde` silently drops unknown keys (a `capaciy = 4096`
-//! typo would size an edge 1). Unsupported constructs (dotted keys, inline
-//! tables, literal and multi-line strings, datetimes, multi-line arrays, any
-//! table but `[topology]` / `[[edge]]`) are a [`ConfigErrorKind::Unsupported`]
-//! naming the line, never a silent skip.
+//! The parser is hand-written: a general parser plus `serde` silently drops unknown
+//! keys. Unsupported constructs (dotted keys, inline tables, literal and multi-line
+//! strings, datetimes, multi-line arrays, any table but `[topology]` / `[[edge]]`) are a
+//! [`ConfigErrorKind::Unsupported`] naming the line, never a silent skip.
 //!
 //! # The schema
 //!
@@ -38,15 +36,11 @@
 //! ```
 //!
 //! [`TopologyConfig::check_domain`] refuses, at startup, any *dynamic* edge whose
-//! resolved domain differs from the bridge's own tag (`time_domain` parameter,
-//! `tft_bridge_options::domain`); static edges are exempt.
+//! resolved domain differs from the bridge's own tag; static edges are exempt.
 //!
-//! `rate_hz` both sizes the ring and is recorded in the arena as the edge's
-//! declared nominal rate (`EdgeRecord::nominal_rate_mhz`), the evidence
-//! `TFT007` judges against. An edge sized by `capacity` declares no rate.
-//!
-//! [`ConfigError`] borrows `&str` from the config text, so validation runs in
-//! [`TopologyConfig::parse`] while the source is in hand.
+//! `rate_hz` also becomes the edge's declared nominal rate
+//! (`EdgeRecord::nominal_rate_mhz`), the evidence `TFT007` judges against; an edge
+//! sized by `capacity` declares none. [`ConfigError`] borrows `&str` from the text.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -58,8 +52,7 @@ use tf_tree::{
 
 use crate::names::NameNormalizer;
 
-/// How a dynamic edge's ring is sized: a slot count or a rate plus history.
-/// Both resolve through [`Capacity`], which rounds up to a power of two.
+/// How a dynamic edge's ring is sized; both resolve through [`Capacity`], which rounds up to a power of two.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RingSize {
     /// `capacity = N` — at least `N` slots.
@@ -84,8 +77,7 @@ impl RingSize {
     }
 }
 
-/// What an edge declaration describes. Not `EdgeKind`: `tf_tree::EdgeKind`
-/// is the arena's record of the same distinction.
+/// What an edge declaration describes (`tf_tree::EdgeKind` is the arena's record of it).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EdgeShape {
     /// A constant `T_parent_child`, `[qw qx qy qz tx ty tz]`. Zero ring slots.
@@ -128,13 +120,11 @@ impl EdgeConfig {
 pub struct TopologyConfig {
     /// Frames with no edge — lookup endpoints that nothing publishes yet.
     pub frames: Vec<String>,
-    /// Spare frame-name slots for `Tree::frame()` at runtime. There is no
-    /// `edge_headroom`: those slots would have zero capacity (§5.8).
+    /// Spare frame-name slots for `Tree::frame()`. There is no `edge_headroom` (§5.8).
     pub frame_headroom: u32,
     /// Default interpolation for dynamic edges that do not override it.
     pub default_interp: InterpPolicy,
-    /// Default time-domain tag for edges that do not override it. A `u8` because
-    /// [`Domain`] is an open trait (user tags start at 4, `docs/API.md` §2.5).
+    /// Default time-domain tag for edges that do not override it; a `u8` because [`Domain`] is an open trait.
     pub default_domain: u8,
     /// The edges, in file order.
     pub edges: Vec<EdgeConfig>,
@@ -161,8 +151,7 @@ impl TopologyConfig {
             .find(|e| e.parent == parent && e.child == child)
     }
 
-    /// The time-domain tag `(parent, child)` will be declared with — its own
-    /// override, or the file default.
+    /// The time-domain tag `(parent, child)` will be declared with.
     #[must_use]
     pub fn domain_of(&self, edge: &EdgeConfig) -> u8 {
         edge.domain.unwrap_or(self.default_domain)
@@ -170,16 +159,13 @@ impl TopologyConfig {
 
     /// Check every dynamic edge against the domain the bridge stamps in.
     ///
-    /// `docs/PHASE4.md` §5.5, **NORMATIVE**: the bridge fails at startup, not at
-    /// first message, on a declared domain differing from its own.
+    /// `docs/PHASE4.md` §5.5, **NORMATIVE**: fails at startup on a declared domain differing from the bridge's.
     ///
     /// # Errors
     ///
     /// [`DomainMismatch`] naming the first offending edge in file order.
     pub fn check_domain(&self, bridge_domain: u8) -> Result<(), DomainMismatch<'_>> {
         for e in &self.edges {
-            // Static edges are exempt: no stamp to be wrong about, and
-            // `robot_state_publisher` stamps them zero under `use_sim_time`.
             if matches!(e.shape, EdgeShape::Static { .. }) {
                 continue;
             }
@@ -196,11 +182,9 @@ impl TopologyConfig {
         Ok(())
     }
 
-    /// The child frame that closes a parent cycle, if any, by name (`build()`
-    /// reports only an index into an arena never constructed).
+    /// The child frame that closes a parent cycle, if any, by name.
     ///
-    /// Not folded into [`TopologyConfig::parse`]: `ConfigError` is `Copy` and
-    /// borrows from the text, and a cycle is a property of the owned edge set.
+    /// Not folded into [`TopologyConfig::parse`]: a cycle is a property of the owned edge set.
     #[must_use]
     pub fn cycle_child(&self) -> Option<&str> {
         let parent_of: BTreeMap<&str, &str> = self
@@ -222,12 +206,7 @@ impl TopologyConfig {
     }
 
     /// This topology with every declared frame name put through `names` (§5.6,
-    /// `tf_prefix` included).
-    ///
-    /// The config is the sole source of declared edges, so it must be rewritten
-    /// with the wire: otherwise a prefixed bridge misses every declared edge.
-    /// The same `NameNormalizer` the wire uses is passed in, which also
-    /// populates its remap table before the first message (§5.6's startup log).
+    /// `tf_prefix` included), so a prefixed bridge does not miss every declared edge.
     /// A name that does not normalize (a bare `"/"`) is kept verbatim.
     #[must_use]
     pub fn rewritten(&self, names: &mut NameNormalizer) -> TopologyConfig {
@@ -251,8 +230,7 @@ impl TopologyConfig {
         }
     }
 
-    /// A [`TreeBuilder`] carrying exactly this topology, declared before
-    /// `build()` (§5.8's amendment).
+    /// A [`TreeBuilder`] carrying exactly this topology (§5.8's amendment).
     #[must_use]
     pub fn builder(&self) -> TreeBuilder {
         let mut b = TreeBuilder::new()
@@ -269,8 +247,6 @@ impl TopologyConfig {
                     let mut cfg = EdgeCfg::new(ring.capacity());
                     cfg.interp = e.interp;
                     cfg.domain = e.domain;
-                    // `rate_hz` is also the arena's nominal for `TFT007`; a
-                    // `capacity` edge declares none (0).
                     if let RingSize::History { rate_hz, .. } = ring {
                         cfg = cfg.nominal_rate_hz(rate_hz);
                     }
@@ -281,8 +257,7 @@ impl TopologyConfig {
         b
     }
 
-    /// Render back to the file format; parsing the result yields an equal
-    /// [`TopologyConfig`].
+    /// Render back to the file format; parsing the result yields an equal config.
     #[must_use]
     pub fn to_toml(&self) -> String {
         let mut s = String::new();
@@ -341,8 +316,6 @@ impl TopologyConfig {
     }
 }
 
-/// `[qw qx qy qz tx ty tz]` as an [`Iso3`], without renormalizing:
-/// [`TopologyConfig::parse`] already refused a non-unit quaternion.
 fn iso_of(p: [f64; 7]) -> Iso3 {
     Iso3::new(
         Quat::new(p[0], p[1], p[2], p[3]),
@@ -357,8 +330,6 @@ fn interp_name(i: InterpPolicy) -> &'static str {
     }
 }
 
-/// A TOML basic string. No escaping: [`check_frame_name`] refuses `"`, `\` and
-/// control characters, so the emitter and parser agree.
 fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -367,8 +338,6 @@ fn quote(s: &str) -> String {
     out
 }
 
-/// An `f64` as a TOML float, round-tripping exactly (`.0` appended to a whole
-/// number). Cosmetic: [`as_f64`] accepts an integer, so no test pins the `.0`.
 fn float(v: f64) -> String {
     let s = format!("{v:?}");
     if s.contains('.') || s.contains('e') || s.contains('E') {
@@ -381,12 +350,11 @@ fn float(v: f64) -> String {
 /// What was wrong with a config file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigErrorKind {
-    /// A TOML construct outside this schema's subset (dotted key, inline
-    /// table, literal or multi-line string, datetime, multi-line array).
+    /// A TOML construct outside this schema's subset.
     Unsupported,
     /// A table other than `[topology]` or `[[edge]]`.
     UnknownTable,
-    /// A key this schema does not define — a typo, not something to ignore.
+    /// A key this schema does not define.
     UnknownKey,
     /// The same key twice in one table.
     DuplicateKey,
@@ -455,7 +423,6 @@ impl ConfigErrorKind {
 }
 
 /// A config error, naming the line and the offending frame, edge or key.
-/// `Copy`; `at` borrows from the config text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConfigError<'a> {
     /// 1-based line number.
@@ -505,11 +472,9 @@ impl fmt::Display for DomainMismatch<'_> {
 
 impl std::error::Error for DomainMismatch<'_> {}
 
-/// How far a config quaternion may be from unit norm. `1e-9`: URDF-derived
-/// files carry finite digits; looser lets a mis-scaled rotation through.
+/// How far a config quaternion may be from unit norm.
 pub const POSE_UNIT_EPS: f64 = 1e-9;
 
-/// One TOML value, in the four scalar kinds this schema uses plus arrays.
 #[derive(Clone, Debug, PartialEq)]
 enum Value<'a> {
     Str(&'a str),
@@ -518,7 +483,6 @@ enum Value<'a> {
     Array(Vec<Value<'a>>),
 }
 
-/// A table's key/value pairs with their lines, so a combination error can name one.
 type Table<'a> = Vec<(&'a str, Value<'a>, u32)>;
 
 impl TopologyConfig {
@@ -595,9 +559,6 @@ impl TopologyConfig {
     }
 }
 
-/// The name inside a table header, given the text after its opening bracket.
-/// A trailing comment is accepted (`[[edge]] # left wheel`); anything else after
-/// the bracket is refused.
 fn header_name<'a>(
     rest: &'a str,
     close: &str,
@@ -617,7 +578,6 @@ fn header_name<'a>(
     Ok(rest[..end].trim())
 }
 
-/// `key = value`; only a comment may follow the value.
 fn parse_key_value(s: &str, line: u32) -> Result<(&str, Value<'_>), ConfigError<'_>> {
     let eq = s.find('=').ok_or(ConfigError {
         line,
@@ -632,7 +592,6 @@ fn parse_key_value(s: &str, line: u32) -> Result<(&str, Value<'_>), ConfigError<
             at: s,
         });
     }
-    // A dotted key is valid TOML this schema has no place for; refuse it.
     if !key
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -655,7 +614,6 @@ fn parse_key_value(s: &str, line: u32) -> Result<(&str, Value<'_>), ConfigError<
     Ok((key, value))
 }
 
-/// One value, returning it and whatever follows on the line.
 fn parse_value(s: &str, line: u32) -> Result<(Value<'_>, &str), ConfigError<'_>> {
     let err = |kind, at| ConfigError { line, kind, at };
     let mut chars = s.char_indices();
@@ -664,14 +622,11 @@ fn parse_value(s: &str, line: u32) -> Result<(Value<'_>, &str), ConfigError<'_>>
     };
     match first {
         '"' => {
-            // `"""` (multi-line) is refused, not parsed as an empty string plus junk.
             if s.starts_with("\"\"\"") {
                 return Err(err(ConfigErrorKind::Unsupported, s));
             }
             for (i, c) in s.char_indices().skip(1) {
                 match c {
-                    // No escapes: `check_frame_name` rejects `"` and `\`, so
-                    // `quote` never emits one and the parser never decodes one.
                     '\\' => return Err(err(ConfigErrorKind::Unsupported, s)),
                     '"' => return Ok((Value::Str(&s[1..i]), &s[i + 1..])),
                     _ => {}
@@ -679,20 +634,16 @@ fn parse_value(s: &str, line: u32) -> Result<(Value<'_>, &str), ConfigError<'_>>
             }
             Err(err(ConfigErrorKind::BadValue, s))
         }
-        // Literal strings, inline tables: valid TOML, outside this schema.
         '\'' | '{' => Err(err(ConfigErrorKind::Unsupported, s)),
         '[' => {
             let mut items = Vec::new();
             let mut rest = s[1..].trim_start();
-            // Commas are required (`[1.0 0.0]` is not TOML and `to_toml` never
-            // writes it); a trailing comma stays legal.
             let mut need_comma = false;
             loop {
                 if let Some(r) = rest.strip_prefix(']') {
                     return Ok((Value::Array(items), r));
                 }
                 if rest.is_empty() {
-                    // Multi-line arrays: the parser is line-oriented.
                     return Err(err(ConfigErrorKind::Unsupported, s));
                 }
                 if need_comma {
@@ -716,7 +667,6 @@ fn parse_value(s: &str, line: u32) -> Result<(Value<'_>, &str), ConfigError<'_>>
                 return Err(err(ConfigErrorKind::BadValue, s));
             }
             if tok == "true" || tok == "false" {
-                // No key in this schema is a boolean.
                 return Err(err(ConfigErrorKind::BadValue, tok));
             }
             if tok.contains('.') || tok.contains('e') || tok.contains('E') {
@@ -769,7 +719,6 @@ fn as_str<'a>(v: &Value<'a>, line: u32, at: &'a str) -> Result<&'a str, ConfigEr
 fn as_f64<'a>(v: &Value<'a>, line: u32, at: &'a str) -> Result<f64, ConfigError<'a>> {
     match v {
         Value::Float(f) => Ok(*f),
-        // A hand-written `history_secs = 10` is an integer; accept it.
         Value::Int(i) => Ok(*i as f64),
         _ => Err(ConfigError {
             line,
@@ -807,11 +756,8 @@ fn parse_interp<'a>(v: &Value<'a>, line: u32) -> Result<InterpPolicy, ConfigErro
     }
 }
 
-/// `domain = "system" | "sensor" | "sim" | "steady" | 0..=255`.
-///
-/// Names resolve through each built-in's [`Domain::TAG`] (permanent, `docs/API.md`
-/// §2.5). The integer form stays: [`Domain`] is an open trait and user tags
-/// start at 4.
+/// `domain = "system" | "sensor" | "sim" | "steady" | 0..=255`; names resolve through each
+/// built-in's [`Domain::TAG`] (`docs/API.md` §2.5), and the integer form serves user tags.
 fn parse_domain<'a>(v: &Value<'a>, line: u32) -> Result<u8, ConfigError<'a>> {
     match v {
         Value::Str("system") => Ok(SystemDomain::TAG),
@@ -836,8 +782,6 @@ fn parse_domain<'a>(v: &Value<'a>, line: u32) -> Result<u8, ConfigError<'a>> {
     }
 }
 
-/// A frame name usable as both an arena key and a TOML basic string (see
-/// [`quote`]).
 fn check_frame_name<'a>(name: &'a str, line: u32) -> Result<&'a str, ConfigError<'a>> {
     if !frame_name_ok(name) {
         return Err(ConfigError {
@@ -849,8 +793,7 @@ fn check_frame_name<'a>(name: &'a str, line: u32) -> Result<&'a str, ConfigError
     Ok(name)
 }
 
-/// Whether a frame name can be written to a config file and read back; shared
-/// by the parser and [`crate::Discovery`] so a discovered config reparses.
+/// Whether a frame name survives a config write/read round trip.
 pub(crate) fn frame_name_ok(name: &str) -> bool {
     !name.is_empty()
         && !name
@@ -903,7 +846,6 @@ fn build_config<'a>(
         }
     }
 
-    // Edges, then cross-edge checks.
     let mut children: BTreeMap<&str, u32> = BTreeMap::new();
     let mut endpoints: BTreeMap<&str, ()> = BTreeMap::new();
     for t in edges {
@@ -992,8 +934,6 @@ fn build_config<'a>(
                     (None, Some((rv, rl)), Some((sv, sl))) => {
                         let rate_hz = as_f64(rv, rl, child)?;
                         let secs = as_f64(sv, sl, child)?;
-                        // The product must be finite too: an overflow makes
-                        // `Capacity::history` fall back to a one-slot ring.
                         if !(rate_hz.is_finite()
                             && rate_hz > 0.0
                             && secs.is_finite()
@@ -1017,7 +957,6 @@ fn build_config<'a>(
                             at: child,
                         })
                     }
-                    // Under- or over-specified: a half-edit, not a guess.
                     _ => {
                         return Err(ConfigError {
                             line: kl,
@@ -1136,10 +1075,7 @@ interp = "sclerp"
 domain = 0
 "#;
 
-    /// The documented schema parses to what it says, with per-edge overrides
-    /// that differ from the defaults.
-    ///
-    /// Mutant: `build_config` ignores an edge's `interp`.
+    /// The documented schema parses to what it says, with per-edge overrides.
     #[test]
     fn the_schema_parses_to_what_it_says() {
         let c = TopologyConfig::parse(SAMPLE).unwrap();
@@ -1168,9 +1104,6 @@ domain = 0
         assert_eq!(c.edges[1].domain, Some(0));
     }
 
-    /// `to_toml` round-trips.
-    ///
-    /// Mutant: drop the `domain = ...` line from `to_toml`'s `[topology]` block.
     #[test]
     fn a_config_round_trips_through_its_own_emitter() {
         let c = TopologyConfig::parse(SAMPLE).unwrap();
@@ -1179,10 +1112,6 @@ domain = 0
         assert_eq!(c, c2);
     }
 
-    /// An unknown key is an error, not a shrug.
-    ///
-    /// Mutant: delete the edge `reject_unknown` call ⇒ a `MissingKey` on the
-    /// wrong key.
     #[test]
     fn a_typo_is_named_not_ignored() {
         let text = "[[edge]]\nparent=\"a\"\nchild=\"b\"\nkind=\"dynamic\"\ncapaciy = 4096\n";
@@ -1192,9 +1121,6 @@ domain = 0
         assert_eq!(e.line, 5);
     }
 
-    /// Every error names the offending frame or edge.
-    ///
-    /// Mutant: report a constant `at` instead of `child` in any arm.
     #[test]
     fn errors_name_the_offending_frame() {
         let cases: [(&str, ConfigErrorKind, &str); 6] = [
@@ -1236,10 +1162,6 @@ domain = 0
         }
     }
 
-    /// TOML this schema does not implement is refused, never half-read.
-    ///
-    /// Mutant: fall through `'{'` to the number branch ⇒ `BadValue`, not
-    /// `Unsupported`.
     #[test]
     fn unsupported_toml_is_refused_by_name() {
         for text in [
@@ -1251,16 +1173,12 @@ domain = 0
             let e = TopologyConfig::parse(text).unwrap_err();
             assert_eq!(e.kind, ConfigErrorKind::Unsupported, "for {text:?}");
         }
-        // …and a table nobody defined.
         let e = TopologyConfig::parse("[edges]\n").unwrap_err();
         assert_eq!(e.kind, ConfigErrorKind::UnknownTable);
         assert_eq!(e.at, "edges");
     }
 
-    /// The config builds a real tree: the static edge is constant-folded and
-    /// the dynamic one is claimable.
-    ///
-    /// Mutant: build the dynamic edge with `static_edge` ⇒ `claim` fails.
+    /// The config builds a real tree: the dynamic edge is claimable, the static one is not.
     #[test]
     fn a_config_builds_a_tree_whose_dynamic_edges_are_claimable() {
         let c = TopologyConfig::parse(SAMPLE).unwrap();
@@ -1275,15 +1193,10 @@ domain = 0
             .claim(foot, odom)
             .unwrap_or_else(|e| panic!("declared dynamic edge must be claimable: {e:?}"));
         w.push(1, &Iso3::IDENTITY).unwrap();
-        // A static edge has no ring, so claiming it is refused.
         assert!(tree.claim(base, foot).is_err());
     }
 
-    /// `rate_hz` reaches the arena as the edge's declared nominal
-    /// (`docs/PHASE5.md` §6, `TFT007`); a `capacity` edge declares nothing. 5.4
-    /// Hz is fractional so an integer-hertz field would fail.
-    ///
-    /// Mutant: drop the `RingSize::History` arm from `TopologyConfig::builder`.
+    /// `rate_hz` reaches the arena as the edge's declared nominal (`docs/PHASE5.md` §6, `TFT007`); a `capacity` edge declares nothing.
     #[test]
     fn a_declared_rate_hz_reaches_the_arena_and_capacity_declares_nothing() {
         let text = "\
@@ -1313,14 +1226,10 @@ capacity = 512
             0,
             "an edge sized by `capacity` states no rate, and 0 means undeclared"
         );
-        // Non-vacuity: both are dynamic rings.
         assert_eq!(view.edge(tf_tree::EdgeId(1)).unwrap().capacity, 64);
         assert_eq!(view.edge(tf_tree::EdgeId(2)).unwrap().capacity, 512);
     }
 
-    /// A quaternion a few ulps off unit is accepted; a scaled one is refused.
-    ///
-    /// Mutant: tighten the bound to `1e-13`.
     #[test]
     fn the_unit_quaternion_tolerance_admits_rounding_and_refuses_scaling() {
         let ok = format!(
@@ -1335,9 +1244,6 @@ capacity = 512
         );
     }
 
-    /// A listed frame that is already an edge endpoint is an error.
-    ///
-    /// Mutant: push the listed frame without consulting `endpoints`.
     #[test]
     fn a_frame_that_is_already_an_endpoint_is_rejected() {
         let text = "[topology]\nframes = [\"b\"]\n[[edge]]\nparent=\"a\"\nchild=\"b\"\nkind=\"dynamic\"\ncapacity=8\n";
@@ -1346,18 +1252,11 @@ capacity = 512
         assert_eq!(e.at, "b");
     }
 
-    /// §5.5's NORMATIVE startup domain check: an edge declared in another domain
-    /// is refused before the arena is built; static edges are exempt.
-    ///
-    /// Mutants: drop the `declared != bridge_domain` return; drop the static
-    /// `continue`.
+    /// §5.5's NORMATIVE startup domain check; static edges are exempt.
     #[test]
     fn a_bridge_refuses_an_edge_declared_in_another_time_domain() {
-        // SAMPLE's file default is "sensor" (1); its one dynamic edge overrides
-        // to 0. A bridge in domain 0 is therefore fine…
         let c = TopologyConfig::parse(SAMPLE).unwrap();
         assert_eq!(c.check_domain(0), Ok(()));
-        // …and one in domain 1 is not, and is told which edge.
         let e = c.check_domain(1).unwrap_err();
         assert_eq!((e.parent, e.child), ("odom", "base_footprint"));
         assert_eq!((e.declared, e.bridge), (0, 1));
@@ -1367,11 +1266,7 @@ capacity = 512
         assert_eq!(c.check_domain(0), Ok(()), "a static edge has no clock");
     }
 
-    /// All four built-in domains are spellable by name (file default and
-    /// per-edge), resolving to the engine's tags; the integer form stays for
-    /// user tags from 4 (`docs/API.md` §2.5).
-    ///
-    /// Mutant: drop the `Value::Str("sim")` arm.
+    /// All four built-in domains are spellable by name, resolving to the engine's tags; integers serve user tags from 4.
     #[test]
     fn every_built_in_domain_is_spellable_by_name() {
         let cases: [(&str, u8); 6] = [
@@ -1379,7 +1274,6 @@ capacity = 512
             ("\"sensor\"", SensorDomain::TAG),
             ("\"sim\"", SimDomain::TAG),
             ("\"steady\"", SteadyDomain::TAG),
-            // A user-declared domain, which has no name to be spelled with.
             ("4", 4),
             ("255", 255),
         ];
@@ -1392,15 +1286,11 @@ capacity = 512
                 .unwrap_or_else(|e| panic!("{e} for domain = {spelling}"));
             assert_eq!(c.default_domain, tag, "[topology] domain = {spelling}");
             assert_eq!(c.edges[0].domain, Some(tag), "[[edge]] domain = {spelling}");
-            // …and the check §5.5 exists for reads the same tag.
             assert_eq!(c.check_domain(tag), Ok(()), "domain = {spelling}");
         }
     }
 
-    /// An unknown domain spelling (`"sim_time"`, `256`) is refused by name, not
-    /// taken as the default.
-    ///
-    /// Mutant: make the `Value::Str(s)` arm return `Ok(SystemDomain::TAG)`.
+    /// An unknown domain spelling (`"sim_time"`, `256`) is refused by name.
     #[test]
     fn a_domain_that_is_not_a_built_in_name_is_refused_by_name() {
         let cases = [
@@ -1419,9 +1309,6 @@ capacity = 512
         }
     }
 
-    /// Ring sizing resolves the way `Capacity` documents.
-    ///
-    /// Mutant: `Capacity::slots(rate_hz as u32)` in `RingSize::capacity`.
     #[test]
     fn ring_sizes_round_up_to_a_power_of_two() {
         assert_eq!(RingSize::Slots(5000).capacity().get(), 8192);
@@ -1436,9 +1323,6 @@ capacity = 512
         );
     }
 
-    /// A trailing comment after a table header is a comment.
-    ///
-    /// Mutant: `header_name` back to `rest.strip_suffix(close)`.
     #[test]
     fn a_table_header_may_carry_a_trailing_comment() {
         let c = TopologyConfig::parse(
@@ -1456,9 +1340,6 @@ capacity = 512
         assert_eq!(c.edges[0].child, "wheel");
     }
 
-    /// Junk after a table header is still refused (`[[edge]] [[edge]]`).
-    ///
-    /// Mutant: drop the `!tail.starts_with('#')` check from `header_name`.
     #[test]
     fn junk_after_a_table_header_is_still_refused() {
         for text in ["[topology] junk\n", "[[edge]] [[edge]]\n"] {
@@ -1470,10 +1351,7 @@ capacity = 512
         }
     }
 
-    /// A ring whose `rate_hz * history_secs` overflows to infinity is refused,
-    /// naming the child; `1e10 * 1.0` pins that only overflow is refused.
-    ///
-    /// Mutant: remove `&& (rate_hz * secs).is_finite()`.
+    /// A ring whose `rate_hz * history_secs` overflows to infinity is refused, naming the child.
     #[test]
     fn a_ring_size_that_overflows_to_infinity_is_refused() {
         let overflowing = "[[edge]]\n\
@@ -1500,9 +1378,6 @@ capacity = 512
         );
     }
 
-    /// An array needs its separators; a trailing comma stays legal.
-    ///
-    /// Mutant: make the comma optional in the `need_comma` branch.
     #[test]
     fn an_array_requires_commas_between_its_items() {
         let no_commas = "[[edge]]\n\
@@ -1524,10 +1399,7 @@ capacity = 512
         );
     }
 
-    /// A cycle is reported by frame name; the acyclic half is a two-edge chain
-    /// so "any child with a parent" cannot pass.
-    ///
-    /// Mutant: return `Some(cur)` unconditionally on the first iteration.
+    /// A cycle is reported by frame name; an acyclic chain is not.
     #[test]
     fn a_cycle_is_named_by_frame_and_an_acyclic_chain_is_not() {
         let chain = "[[edge]]\n\
@@ -1558,8 +1430,6 @@ capacity = 512
             child == "base" || child == "odom",
             "names a frame on the cycle, got {child:?}"
         );
-        // And the builder does refuse it, so the preflight is not inventing a
-        // rule the engine does not have.
         assert!(c.builder().build().is_err());
     }
 }

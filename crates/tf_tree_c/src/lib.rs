@@ -2,27 +2,21 @@
 //!
 //! # SAFETY (module-level, per `docs/decisions/0007`)
 //!
-//! This crate is one of the boundaries where `unsafe` is permitted: **a foreign
-//! caller**. The `unsafe` here turns caller pointers into Rust references, once,
-//! at the entry point; past that check every body is safe code. Three rules:
+//! This crate is an `unsafe` boundary: **a foreign caller**. `unsafe` turns caller pointers into
+//! references once, at the entry point; past that check every body is safe code.
 //!
-//! 1. **Handles carry a magic word** written by the constructor and zeroed by
-//!    the destructor (§3.2). It rejects NULL and handle-type confusion (a
-//!    `tft_plan*` for a `tft_tree*`). It does **not** validate an arbitrary
-//!    foreign pointer (reading 8 bytes through one is UB whatever the bytes are;
-//!    the read is [`core::ptr::read_unaligned`] so alignment is not a hazard): the
-//!    caller's contract is that the pointer is NULL or a handle. Use-after-free
-//!    is best-effort, only while the memory is untouched.
-//! 2. **`#![deny(unsafe_op_in_unsafe_fn)]`**: each dereference carries its own
-//!    `// SAFETY:` naming what it relies on.
-//! 3. **This crate depends on `tf_tree`, not `tf_tree_core`**, so it cannot reach
-//!    an invariant the safe facade protects (fork-generation and detach checks).
+//! 1. **Handles carry a magic word**, written by the constructor and zeroed by the destructor (§3.2).
+//!    It rejects NULL and handle-type confusion; it does **not** validate an arbitrary foreign
+//!    pointer (the read is `read_unaligned`), so the caller's contract is NULL or a handle.
+//!    Use-after-free is best-effort.
+//! 2. **`#![deny(unsafe_op_in_unsafe_fn)]`**: each dereference carries its own `// SAFETY:`.
+//! 3. **This crate depends on `tf_tree`, not `tf_tree_core`**, so it cannot reach an invariant the
+//!    safe facade protects.
 //!
 //! # Panics cannot escape
 //!
-//! A panic crossing an `extern "C"` boundary aborts the process, so every entry
-//! point wraps its body in `error::guard`, which converts a panic into
-//! `TFT_ERR_INTERNAL`. The exception is [`tft_last_error`], which must stay
+//! Every entry point wraps its body in `error::guard`, which converts a panic into
+//! `TFT_ERR_INTERNAL`; [`tft_last_error`] is the exception, staying callable from an error path.
 //! callable from an error path.
 //!
 //! `#[allow(non_camel_case_types)]` below: these names appear verbatim in
@@ -78,36 +72,23 @@ pub use unstable::{
 
 use error::{amend_error, guard, record_lookup, set_error};
 
-// ABI version — §3.6
-
-/// Major ABI version. **Must match exactly** between the header a caller
-/// compiled against and the library it links.
+/// Major ABI version; **must match exactly** between the compiled-against header and the linked library.
 pub const TFT_ABI_VERSION_MAJOR: u32 = 0;
-/// Minor ABI version. The runtime's may be **≥** the compiled-against value (§3.6).
+/// Minor ABI version; the runtime's may be **≥** the compiled-against value (§3.6). Every bump is an
+/// append.
 ///
-/// Every bump is an append (nothing moved, changed type or changed meaning), and
-/// the minor answers "can I name this symbol?", so a new function or enumerator
-/// bumps it even in the unstable tier:
-///
-/// * `1` → `2`: `tft_bridge_note_time_jump`; fields appended to
-///   `tft_bridge_sample` and `tft_bridge_outcome`. `tft_bridge_offer` reads a
-///   shorter `tft_bridge_sample` as the prefix it is.
+/// * `1` → `2`: `tft_bridge_note_time_jump`; fields appended to `tft_bridge_sample` and
+///   `tft_bridge_outcome`.
 /// * `2` → `3`: [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] (`docs/API.md` §3.3).
-/// * `3` → `4`: [`tft_stamp_from_parts`], [`tft_stamp_from_timespec`] (`docs/API.md`
-///   §5.1) and [`TFT_ERR_BAD_STAMP`], which only they return.
-/// * `4` → `5`: `tft_bridge_options::arena_name` (`docs/decisions/0015`) and
-///   [`TFT_ERR_ARENA_UNAVAILABLE`], reachable only when `arena_name` is non-NULL;
-///   `tft_bridge_create` reads a shorter `tft_bridge_options` as its prefix.
+/// * `3` → `4`: [`tft_stamp_from_parts`], [`tft_stamp_from_timespec`], [`TFT_ERR_BAD_STAMP`]
+///   (`docs/API.md` §5.1).
+/// * `4` → `5`: `tft_bridge_options::arena_name`, [`TFT_ERR_ARENA_UNAVAILABLE`]
+///   (`docs/decisions/0015`).
 /// * `5` → `6`: [`tft_plan_create_in_domain`] (`docs/decisions/0038`).
-///   [`tft_plan_create`] is it with `domain = 0`, and now returns
-///   [`TFT_ERR_TIME_DOMAIN`] at plan time instead of on every lookup.
-/// * `6` → `7`: [`tft_plan_at_extrapolating`], [`tft_extrap_policy`] and
-///   [`tft_extrapolated`] (`docs/decisions/0039`).
-/// * `7` → `8`: `tft_bridge_close_startup_window` and
-///   `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` (`docs/decisions/0011` step 6). A
-///   `STRICT` startup halt reached through `tft_bridge_offer` now reports 9
-///   where it reported `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` (5); the action is
-///   `TFT_BRIDGE_HALT` either way.
+/// * `6` → `7`: [`tft_plan_at_extrapolating`], [`tft_extrap_policy`], [`tft_extrapolated`]
+///   (`docs/decisions/0039`).
+/// * `7` → `8`: `tft_bridge_close_startup_window`, `TFT_BRIDGE_REASON_STARTUP_CONFLICTS`
+///   (`docs/decisions/0011` step 6).
 pub const TFT_ABI_VERSION_MINOR: u32 = 8;
 
 /// The library's major ABI version.
@@ -122,12 +103,9 @@ pub extern "C" fn tft_abi_version_minor() -> u32 {
     TFT_ABI_VERSION_MINOR
 }
 
-/// Check the header a caller compiled against against the library they linked:
-/// major must match exactly; the runtime minor may be ≥ the compiled-against
-/// minor (§3.6).
-///
-/// Call it as `tft_check_abi(TFT_ABI_VERSION_MAJOR, TFT_ABI_VERSION_MINOR)` with
-/// the constants **from the header**, once at startup (the C++ wrapper does).
+/// Check the compiled-against header against the linked library: major must match exactly; the
+/// runtime minor may be ≥ (§3.6). Call once at startup with the header's constants (the C++ wrapper
+/// does).
 ///
 /// # Errors
 ///
@@ -139,7 +117,6 @@ pub extern "C" fn tft_check_abi(compiled_major: u32, compiled_minor: u32) -> tft
         if compiled_major == TFT_ABI_VERSION_MAJOR && compiled_minor <= TFT_ABI_VERSION_MINOR {
             return TFT_OK;
         }
-        // Allocates only on the failure path.
         let msg = format!(
             "ABI mismatch: compiled against {compiled_major}.{compiled_minor}, \
              linked {TFT_ABI_VERSION_MAJOR}.{TFT_ABI_VERSION_MINOR} (major must \
@@ -155,14 +132,11 @@ pub extern "C" fn tft_check_abi(compiled_major: u32, compiled_minor: u32) -> tft
     })
 }
 
-// Stamps — `docs/API.md` §5.1
-
-/// Assemble a stamp from a `(sec, nanos)` pair, exactly — `docs/API.md` §5.1.
+/// Assemble a stamp from a `(sec, nanos)` pair, exactly (`docs/API.md` §5.1); the C spelling of
+/// `Stamp::from_parts`. No float on any surface (R3).
 ///
-/// The C spelling of `Stamp::from_parts`, for a ROS 2 `builtin_interfaces/Time`.
-/// No float on any surface (R3). It returns a status because two inputs have no
-/// correct answer and no `int64_t` sentinel exists: normalising an out-of-range
-/// `nanos` or wrapping an out-of-range sum would each yield a plausible stamp.
+/// It returns a status because out-of-range `nanos` or a wrapping sum would each yield a plausible
+/// stamp and no `int64_t` sentinel exists.
 ///
 /// # Errors
 ///
@@ -181,21 +155,17 @@ pub unsafe extern "C" fn tft_stamp_from_parts(sec: i64, nanos: u32, out: *mut i6
         let Some(s) = Stamp::<SystemDomain>::from_parts(sec, nanos) else {
             return bad_stamp(sec, i64::from(nanos));
         };
-        // SAFETY: `out` is non-null by the check above and the caller contracts
-        // it writable. Written only after the conversion succeeded, so a refused
-        // call leaves the caller's variable as it was.
+        // SAFETY: `out` is non-null and caller-writable; written only after success, so a refusal leaves it as it was.
         unsafe { core::ptr::write(out, s.nanos()) };
         TFT_OK
     })
 }
 
-/// Assemble a stamp from the two fields of a POSIX `struct timespec`
-/// (`tft_stamp_from_timespec(ts.tv_sec, ts.tv_nsec, &out)`).
+/// Assemble a stamp from a POSIX `struct timespec`'s fields.
 ///
 /// # Errors
 ///
-/// Everything [`tft_stamp_from_parts`] refuses, plus a negative `tv_nsec`
-/// (legal only in a relative `timespec`, so an interval is being converted as an
+/// Everything [`tft_stamp_from_parts`] refuses, plus a negative `tv_nsec` (an interval passed as an
 /// instant).
 ///
 /// # Safety
@@ -220,8 +190,7 @@ pub unsafe extern "C" fn tft_stamp_from_timespec(
     })
 }
 
-/// The one refusal both stamp converters raise; `requested` carries the seconds
-/// and `newest` the nanoseconds.
+/// The refusal both stamp converters raise; `requested` carries seconds, `newest` nanoseconds.
 fn bad_stamp(sec: i64, nanos: i64) -> tft_status {
     set_error(
         TFT_ERR_BAD_STAMP,
@@ -236,68 +205,48 @@ fn bad_stamp(sec: i64, nanos: i64) -> tft_status {
     TFT_ERR_BAD_STAMP
 }
 
-// Handles — §3.2
-
-/// Magic words, distinct per type.
 const MAGIC_TREE: u64 = 0x7446_5F54_5245_4531; // "tFT_TREE1"-ish
 const MAGIC_PLAN: u64 = 0x7446_5F50_4C41_4E31;
 
-/// An opaque handle to a transform tree. `Send + Sync`.
-///
-/// `#[repr(C)]` because `check_tree` reads the magic through a field projection.
-/// The generated header declares this as an incomplete type (§3.2): `xtask
-/// headers` excludes it and emits the forward declaration itself.
+/// An opaque handle to a transform tree. `Send + Sync`. `#[repr(C)]` because `check_tree` reads the
+/// magic through a field projection; the header declares it incomplete.
 #[repr(C)]
 pub struct tft_tree {
     magic: u64,
     share: Arc<TreeShare>,
 }
 
-/// An opaque handle to a compiled plan. `Send + Sync`, immutable. `#[repr(C)]`
-/// and an incomplete type in the header, as [`tft_tree`].
+/// An opaque handle to a compiled plan. `Send + Sync`, immutable; incomplete in the header.
 #[repr(C)]
 pub struct tft_plan {
     magic: u64,
     plan: tf_tree::Plan,
-    /// The plan owns a share of the tree, not a pointer: freeing the tree before
-    /// its plans is the natural C order and must not dangle.
+    /// The plan owns a share of the tree, so freeing the tree first must not dangle.
     share: Arc<TreeShare>,
-    /// The time domain every evaluate call on this handle asks the engine about
-    /// (`docs/decisions/0038`), set by [`tft_plan_create_in_domain`].
+    /// The time domain every evaluate call asks the engine about (`docs/decisions/0038`).
     domain: u8,
 }
 
-/// The tree, shared between its own handle and every plan compiled from it.
-///
-/// `Arc<Tree>` because [`tf_tree::Tree::claim_owned`] takes `self: &Arc<Tree>`
-/// (`docs/decisions/0017`). `Arc<TreeShare>` is the handle refcount (free order
-/// is irrelevant); `Arc<Tree>` is the arena refcount a publisher holds after
-/// every handle is gone.
+/// The tree, shared between its handle and every plan compiled from it (`docs/decisions/0017`).
 pub(crate) struct TreeShare {
     pub(crate) tree: Arc<Tree>,
 }
 
-/// Generate a magic-word validator that reads the field **by name** (correct
-/// under any layout, and keeps `magic` from being dead code) with
-/// [`core::ptr::read_unaligned`] (an aligned read through a non-handle pointer is
-/// UB) via `addr_of!`, so no reference to a possibly-invalid handle is created.
-/// Not a validator for arbitrary memory; see the module docs.
+/// Generate a magic-word validator reading the field by name via `read_unaligned`; not a validator
+/// for arbitrary memory.
 macro_rules! magic_check {
     ($name:ident, $ty:ty, $magic:expr) => {
         /// # Safety
         ///
-        /// `p` must be NULL, or point to at least `size_of::<u64>()` readable
-        /// bytes at the offset of the handle's `magic` field (any live handle type
-        /// satisfies that, which is what makes type-confusion detection work).
+        /// `p` must be NULL, or point to at least eight readable bytes at the handle's `magic` offset
+        /// (any live handle type satisfies that).
         #[inline]
         pub(crate) unsafe fn $name(p: *const $ty) -> bool {
             if p.is_null() {
                 return false;
             }
-            // SAFETY: `p` is non-null and, per the contract above, has at least
-            // eight readable bytes at the magic field's offset. `read_unaligned`
-            // so a caller's misaligned handle-shaped pointer is not additionally
-            // UB; the projection reads only the magic field.
+            // SAFETY: non-null, with eight readable bytes at the magic offset per the contract;
+            // `read_unaligned` and a field projection add no further UB.
             unsafe { core::ptr::addr_of!((*p).magic).read_unaligned() == $magic }
         }
     };
@@ -306,8 +255,7 @@ macro_rules! magic_check {
 magic_check!(check_tree, tft_tree, MAGIC_TREE);
 magic_check!(check_plan, tft_plan, MAGIC_PLAN);
 
-/// Wrap a share of an already-built tree in a fresh, independently owned handle,
-/// so free order is irrelevant to the bridge's reader.
+/// Wrap a share of a tree in a fresh, independently owned handle.
 #[cfg(feature = "bridge")]
 pub(crate) fn tree_handle(share: Arc<TreeShare>) -> Box<tft_tree> {
     Box::new(tft_tree {
@@ -316,14 +264,9 @@ pub(crate) fn tree_handle(share: Arc<TreeShare>) -> Box<tft_tree> {
     })
 }
 
-// Lifecycle — §3.2
-
-/// Join the running arena named by the environment, read-only (D18).
-///
-/// Mirrors `tf_tree::open()`: `$TF_TREE_DOMAIN`, `$TF_TREE_NAME` and
-/// `$TF_TREE_RUNTIME_DIR` select the arena. On success `*out` must be passed to
-/// [`tft_tree_free`] exactly once.
-///
+/// Join the running arena named by the environment, read-only (D18), as `tf_tree::open()` does
+/// (`$TF_TREE_DOMAIN`, `$TF_TREE_NAME`, `$TF_TREE_RUNTIME_DIR`). Pass `*out` to [`tft_tree_free`]
+/// exactly once.
 /// # Safety
 ///
 /// `out` must be NULL or point to a writable `*mut tft_tree`.
@@ -342,8 +285,7 @@ pub unsafe extern "C" fn tft_tree_open(out: *mut *mut tft_tree) -> tft_status {
                         tree: Arc::new(tree),
                     }),
                 });
-                // SAFETY: `out` is non-null by the check above and the caller
-                // contracts that it is writable.
+                // SAFETY: `out` is non-null and caller-writable.
                 unsafe { core::ptr::write(out, Box::into_raw(h)) };
                 TFT_OK
             }
@@ -360,13 +302,11 @@ pub unsafe extern "C" fn tft_tree_open(out: *mut *mut tft_tree) -> tft_status {
     })
 }
 
-/// Release a tree handle. Freeing NULL is a no-op. Plans compiled from it stay
-/// valid (the tree is refcounted).
+/// Release a tree handle; freeing NULL is a no-op. Plans compiled from it stay valid.
 ///
 /// # Safety
 ///
-/// `tree` must be NULL or a handle from a `tft_tree_*` constructor that has not
-/// already been freed. Double-free is undefined; the magic word catches it only
+/// `tree` must be NULL or a live handle not already freed; the magic word catches a double-free only
 /// while the allocation is intact.
 #[no_mangle]
 pub unsafe extern "C" fn tft_tree_free(tree: *mut tft_tree) {
@@ -377,41 +317,35 @@ pub unsafe extern "C" fn tft_tree_free(tree: *mut tft_tree) {
     if !unsafe { check_tree(tree) } {
         return;
     }
-    // Zero the magic before dropping so a repeated free sees a dead handle.
+    // Zero the magic first, so a repeated free sees a dead handle.
     // SAFETY: `check` confirmed this is a live `tft_tree`.
     unsafe { core::ptr::write(tree.cast::<u64>(), 0) };
     // SAFETY: the handle was produced by `Box::into_raw` in a constructor above.
     drop(unsafe { Box::from_raw(tree) });
 }
 
-/// Compile a plan for `target <- source`, by frame name.
+/// Compile a plan for `target <- source`, by frame name; compile once, evaluate many times (D3).
 ///
-/// Compilation walks the topology once; evaluating is the hot path (D3), so
-/// compile once and evaluate many times.
-///
-/// This is [`tft_plan_create_in_domain`] with `domain = 0`, the real-time tag. On
-/// an arena whose dynamic edges carry another tag (`docs/PHASE4.md` §5.5) it
-/// returns [`TFT_ERR_TIME_DOMAIN`] here (`docs/decisions/0038`).
+/// This is [`tft_plan_create_in_domain`] with `domain = 0`; on an arena whose dynamic edges carry
+/// another tag (`docs/PHASE4.md` §5.5) it returns [`TFT_ERR_TIME_DOMAIN`] (`docs/decisions/0038`).
 ///
 /// # Errors
 ///
 /// `*out` is not written on any failure. Three codes carry extra meaning here:
 ///
-/// * [`TFT_ERR_UNKNOWN_FRAME`] — a name is not UTF-8 or does not resolve (on a
-///   read-only attachment: undeclared, or a hash-slot collision (permanent), or
-///   being interned right now (transient, retry); on a writable tree: a full
-///   frame table). From compilation, with `frame_a` set: no consistent topology
-///   snapshot within the retry limit (transient), or a parent index outside the
-///   frame table (corrupt arena).
-/// * [`TFT_ERR_NO_DATA`] — the topology records a parent for `frame_a` but no
-///   edge (a corrupt arena). An edge with no samples yet compiles.
-/// * [`TFT_ERR_TIME_DOMAIN`] — the route's dynamic edges publish in a tag other
-///   than `domain`, or disagree among themselves (`edge` names the one that did).
+/// * [`TFT_ERR_UNKNOWN_FRAME`] — a name is not UTF-8 or does not resolve (read-only: undeclared, a
+///   permanent hash-slot collision, or being interned right now, retry; writable: a full frame
+///   table). With `frame_a` set: no consistent topology snapshot within the retry limit
+///   (transient), or a parent index outside the frame table (corrupt arena).
+/// * [`TFT_ERR_NO_DATA`] — the topology records a parent for `frame_a` but no edge (corrupt arena).
+///   An edge with no samples yet compiles.
+/// * [`TFT_ERR_TIME_DOMAIN`] — the route's dynamic edges publish in a tag other than `domain`, or
+///   disagree among themselves (`edge` names the one that did).
 ///
 /// # Safety
 ///
-/// `tree` must be a live handle. `target` and `source` must be NUL-terminated
-/// UTF-8. `out` must be NULL or point to a writable `*mut tft_plan`.
+/// `tree` must be a live handle. `target` and `source` must be NUL-terminated UTF-8. `out` must be
+/// NULL or point to a writable `*mut tft_plan`.
 #[no_mangle]
 pub unsafe extern "C" fn tft_plan_create(
     tree: *const tft_tree,
@@ -423,23 +357,18 @@ pub unsafe extern "C" fn tft_plan_create(
     unsafe { tft_plan_create_in_domain(tree, target, source, 0, out) }
 }
 
-/// Compile a plan for `target <- source` that will be queried in time domain
-/// `domain` (`docs/decisions/0038`).
+/// Compile a plan for `target <- source` queried in time domain `domain` (`docs/decisions/0038`).
 ///
-/// [`tf_tree::Domain`] is an open trait, so a foreign caller carries the tag
-/// (`0`–`3` are the built-in domains, `4`+ are driver-declared; `docs/API.md`
-/// §2.5) as data. `0` is [`tft_plan_create`]. A mismatch is reported once, at
-/// plan time, with the frame names in hand; every evaluate entry point still
-/// passes the handle's tag to the engine and the engine still compares it.
+/// A foreign caller carries the tag (`0`–`3` built-in, `4`+ driver-declared; `docs/API.md` §2.5) as
+/// data; `0` is [`tft_plan_create`]. A mismatch is reported once, at plan time; every evaluate still
+/// passes the tag to the engine.
 ///
 /// # Errors
 ///
-/// Everything [`tft_plan_create`] returns, plus [`TFT_ERR_TIME_DOMAIN`] when
-/// this route has a dynamic edge whose tag is not `domain`; `*out` is not
-/// written. The condition is the engine's `has_dynamic() && domain !=
-/// self.domain`: a bare `domain != plan.domain()` would wrongly refuse a static
-/// route (`Plan::domain` reports `0` for one), so this asks
-/// [`tf_tree::Plan::steps`] whether any [`tf_tree::Step::Dyn`] is present.
+/// Everything [`tft_plan_create`] returns, plus [`TFT_ERR_TIME_DOMAIN`] when the route has a dynamic
+/// edge whose tag is not `domain`; `*out` is not written. A bare `domain != plan.domain()` would
+/// wrongly refuse a static route, so this asks [`tf_tree::Plan::steps`] whether any
+/// [`tf_tree::Step::Dyn`] is present.
 ///
 /// # Safety
 ///
@@ -484,8 +413,7 @@ pub unsafe extern "C" fn tft_plan_create_in_domain(
         };
         match h.share.tree.plan(tf, sf) {
             Ok(plan) => {
-                // `Plan::has_dynamic` is private; rebuild its predicate from
-                // `steps()`. It must match the engine's exactly (see *Errors*).
+                // `Plan::has_dynamic` is private; this must match its predicate (see *Errors*).
                 let has_dynamic = plan
                     .steps()
                     .iter()
@@ -519,7 +447,6 @@ pub unsafe extern "C" fn tft_plan_create_in_domain(
     })
 }
 
-/// Release a plan handle. Freeing NULL is a no-op.
 ///
 /// # Safety
 ///
@@ -539,20 +466,14 @@ pub unsafe extern "C" fn tft_plan_free(plan: *mut tft_plan) {
     drop(unsafe { Box::from_raw(plan) });
 }
 
-// Hot path — §3.7
-
-/// Evaluate `plan` at `stamp`, writing the result into `out` in `layout`.
+/// Evaluate `plan` at `stamp`, writing the result into `out` in `layout` (at least
+/// `tft_layout_size(layout)` bytes).
 ///
-/// `out` must have room for at least `tft_layout_size(layout)` bytes.
+/// **On a hot path, prefer [`tft_plan_at_many`]**: this builds a `Guard` per lookup
+/// (`docs/decisions/0022`). The plan is evaluated in the domain it was compiled for.
 ///
-/// **On a hot path, prefer [`tft_plan_at_many`]**: this builds a `Guard` per
-/// lookup (`docs/decisions/0022`), the batch pays it once per call. The plan is
-/// evaluated in the domain it was compiled for ([`tft_plan_create_in_domain`]).
-///
-/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] is asking for derivatives: thirteen `f64`
-/// are written, and it fails with `TFT_ERR_NO_DERIVATIVES` (a `LerpSlerp` edge)
-/// or `TFT_ERR_NO_SEGMENT` (a pose but no segment), writing nothing.
-///
+/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] asks for derivatives: thirteen `f64` are written, failing with
+/// `TFT_ERR_NO_DERIVATIVES` or `TFT_ERR_NO_SEGMENT` and writing nothing.
 /// # Safety
 ///
 /// `plan` must be a handle from `tft_plan_create` that has not been freed.
@@ -583,10 +504,8 @@ pub unsafe extern "C" fn tft_plan_at(
         let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), n) };
 
         let g = h.share.tree.guard();
-        // `_tagged`, with the handle's tag (`docs/decisions/0038`): `Domain` is
-        // an open trait, so no type here stands for the caller's domain.
-        // Two evaluations, chosen once from the layout: a pose layout must not
-        // pay for `at_with_derivatives`' adjoint chain.
+        // `_tagged`, with the handle's tag (`docs/decisions/0038`); the layout picks the evaluation once,
+        // so a pose layout never pays for the adjoint chain.
         if layout::carries_twist(layout) {
             match h.plan.at_with_derivatives_tagged(&g, stamp, h.domain) {
                 Ok(s) => {
@@ -607,15 +526,10 @@ pub unsafe extern "C" fn tft_plan_at(
     })
 }
 
-/// [`tft_plan_at`]'s body without the panic guard: the read-path twin of
-/// [`tft_test_push_unguarded`], so `examples/abi_cost.rs` can price
-/// `catch_unwind` on a real, non-inlinable call by subtraction
-/// (`docs/decisions/0022`). Behind `test-hooks`.
-///
+/// [`tft_plan_at`] without the panic guard, to price `catch_unwind` (`docs/decisions/0022`); `test-hooks`.
 /// # Safety
 ///
-/// As [`tft_plan_at`]. Unlike it, this does not catch unwinds: a panic crossing
-/// this boundary is undefined behaviour.
+/// As [`tft_plan_at`]; a panic crossing this boundary is undefined behaviour.
 #[cfg(feature = "test-hooks")]
 #[no_mangle]
 pub unsafe extern "C" fn tft_test_plan_at_unguarded(
@@ -642,7 +556,6 @@ pub unsafe extern "C" fn tft_test_plan_at_unguarded(
     let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), n) };
 
     let g = h.share.tree.guard();
-    // Tagged, as `tft_plan_at` is: only the guard may differ.
     if layout::carries_twist(layout) {
         match h.plan.at_with_derivatives_tagged(&g, stamp, h.domain) {
             Ok(s) => {
@@ -662,31 +575,23 @@ pub unsafe extern "C" fn tft_test_plan_at_unguarded(
     }
 }
 
-/// Evaluate `plan` at `n` stamps, writing each result `out_stride_bytes` apart.
-///
-/// `out_stride_bytes == 0` means tightly packed; a larger stride writes into an
-/// array of caller structs (§4.3).
+/// Evaluate `plan` at `n` stamps, writing each result `out_stride_bytes` apart (0 = packed; §4.3).
 ///
 /// # Partial writes
 ///
-/// Evaluation stops at the first failing stamp and earlier elements stay
-/// written; `tft_last_error`'s `frame_b` carries the failing index. Only the
-/// argument checks (NULL, stride, overflow, unknown layout) are all-or-nothing.
+/// Evaluation stops at the first failing stamp and earlier elements stay written; `frame_b` carries
+/// the failing index. Only the argument checks are all-or-nothing.
 ///
 /// # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
 ///
-/// Accepted as by [`tft_plan_at`], per element. `TFT_ERR_NO_DERIVATIVES` is a
-/// property of an edge and fires on the first element with the buffer untouched;
-/// `TFT_ERR_NO_SEGMENT` can fire part-way. Sort your stamps: non-decreasing
-/// stamps ride a resumable cursor (`O(1)` amortized bracket search). A packed,
-/// `f64`-aligned `out` is written in place; any other stride is evaluated in
-/// chunks and scattered.
+/// Accepted as by [`tft_plan_at`], per element. `TFT_ERR_NO_DERIVATIVES` fires on the first element
+/// with the buffer untouched; `TFT_ERR_NO_SEGMENT` can fire part-way. Sort your stamps:
+/// non-decreasing stamps ride a resumable cursor.
 ///
 /// # Safety
 ///
-/// `plan` must be a live handle. `stamps` must point to `n` readable `int64_t`.
-/// `out` must point to at least `n * stride` writable bytes, where `stride` is
-/// `out_stride_bytes` or the layout's payload size when that is zero.
+/// `plan` must be a live handle. `stamps` must point to `n` readable `int64_t`. `out` must point to at
+/// least `n * stride` writable bytes (`stride` is `out_stride_bytes`, or the payload size if zero).
 #[no_mangle]
 pub unsafe extern "C" fn tft_plan_at_many(
     plan: *const tft_plan,
@@ -704,7 +609,6 @@ pub unsafe extern "C" fn tft_plan_at_many(
         let Some(payload) = layout::payload_bytes(layout) else {
             return bad_enum("layout");
         };
-        // Zero elements is a no-op before the NULL checks.
         if n == 0 {
             return TFT_OK;
         }
@@ -727,7 +631,6 @@ pub unsafe extern "C" fn tft_plan_at_many(
             );
             return TFT_ERR_BUFFER_TOO_SMALL;
         }
-        // The extent is `(n-1)*stride + payload`, checked for overflow.
         let Some(span) = (n - 1)
             .checked_mul(stride)
             .and_then(|x| x.checked_add(payload))
@@ -745,14 +648,10 @@ pub unsafe extern "C" fn tft_plan_at_many(
         let dst = unsafe { core::slice::from_raw_parts_mut(out.cast::<u8>(), span) };
 
         let g = h.share.tree.guard();
-        // The layout decides which evaluation runs once, outside the loop, in
-        // two loops rather than a compare (or a closure, ~5 % slower per
-        // `examples/abi_cost.rs`) on the per-element path.
+        // Two loops chosen once from the layout, not a compare or closure per element (`examples/abi_cost.rs`).
         if layout::carries_twist(layout) {
-            // `Plan::at_many_into`: the same batch fold and monotone cursor as
-            // the Rust path. It reports only success, so on failure the scalar
-            // loop re-runs to find the index for `frame_b` (§4.3); rewritten rows
-            // are bit-identical.
+            // `at_many_into` reports only success, so on failure the scalar loop re-runs to find the
+            // index for `frame_b` (§4.3).
             if twist_batch(&h.plan, &g, ts, h.domain, dst, stride, payload) {
                 return TFT_OK;
             }
@@ -780,14 +679,8 @@ pub unsafe extern "C" fn tft_plan_at_many(
     })
 }
 
-/// Evaluate `stamps` in [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] through
-/// [`tf_tree::Plan::at_many_into`], returning `false` if any element failed.
-///
-/// Its batch fold rides a monotone cursor per plan step (`docs/API.md` §3.3's
-/// n = 1024 row). A tightly packed, aligned `dst` (the C++ wrapper's case) is
-/// the output slice itself; any other stride goes `CHUNK` rows at a time through
-/// a stack buffer and is scattered, restarting the cursor per chunk. `domain` is
-/// the plan handle's tag (`docs/decisions/0038`).
+/// Evaluate `stamps` as [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] via [`tf_tree::Plan::at_many_into`]; `false` if
+/// any element failed. Non-packed strides go through a stack buffer (`docs/API.md` §3.3).
 fn twist_batch(
     plan: &tf_tree::Plan,
     g: &tf_tree::Guard<'_>,
@@ -797,20 +690,13 @@ fn twist_batch(
     stride: usize,
     payload: usize,
 ) -> bool {
-    /// `f64` per row — `Layout::QuatTwist::elems()`.
     const ROW: usize = 13;
-    /// Rows per pass of the scatter path.
     const CHUNK: usize = 32;
     debug_assert_eq!(payload, ROW * 8, "the twist layout is thirteen f64");
 
     if stride == payload && dst.as_ptr().align_offset(core::mem::align_of::<f64>()) == 0 {
-        // `dst.len()` is `(n-1) * stride + payload`, which with `stride ==
-        // payload` is `n * ROW` f64.
-        //
-        // SAFETY: `dst` is a live, uniquely borrowed `&mut [u8]` whose start is
-        // `f64`-aligned (tested above) and whose length is `n * payload`, a
-        // multiple of eight; the reborrow is the only access to those bytes, and
-        // `f64` has no invalid bit patterns.
+        // SAFETY: `dst` is uniquely borrowed, `f64`-aligned (tested above) and `n * payload` long, a
+        // multiple of eight; `f64` has no invalid bit patterns.
         let rows = unsafe {
             core::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f64>(), dst.len() / 8)
         };
@@ -836,12 +722,8 @@ fn twist_batch(
     true
 }
 
-/// Record the failure of element `i` of a batch, at stamp `t`.
-///
-/// `amend_error`, not `set_error`: the latter blanks the slot and would erase
-/// the edge id and retained window `record_lookup` just recorded (§3.3). The
-/// index goes in `frame_b`, which no lookup error uses; `requested` keeps the
-/// stamp.
+/// Record the failure of batch element `i` at stamp `t` with `amend_error`, keeping the detail
+/// `record_lookup` set (§3.3); the index goes in `frame_b`.
 #[cold]
 fn note_batch_failure(i: usize, t: i64, e: tf_tree::LookupError) -> tft_status {
     let status = record_lookup(e);
@@ -854,36 +736,24 @@ fn note_batch_failure(i: usize, t: i64, e: tf_tree::LookupError) -> tft_status {
     status
 }
 
-/// The number of bytes one transform occupies in `layout`, or `0` if the
-/// discriminant is not one this build defines.
+/// The bytes one transform occupies in `layout`, or `0` for an undefined discriminant.
 #[no_mangle]
 pub extern "C" fn tft_layout_size(layout: tft_layout) -> usize {
     layout::payload_bytes(layout).unwrap_or(0)
 }
 
-// Extrapolation — `docs/decisions/0039`
-
-/// What to do when the requested stamp is newer than every published sample on
-/// the route.
-///
-/// A `uint32_t` typedef with named constants, like [`tft_layout`] (§3.6 needs
-/// every ABI value's width stated). Every entry point that takes one rejects an
-/// undefined discriminant with [`TFT_ERR_BAD_ENUM`].
+/// What to do when the stamp is newer than every sample on the route; an undefined value is
+/// [`TFT_ERR_BAD_ENUM`].
 pub type tft_extrap_policy = u32;
 
-/// Refuse: the lookup returns [`TFT_ERR_EXTRAPOLATION`] and writes nothing. `0`,
-/// so a zeroed struct refuses; it is `tf_tree::ExtrapPolicy`'s `Default` and what
-/// [`tft_plan_at`] does.
+/// Refuse: [`TFT_ERR_EXTRAPOLATION`], nothing written. `0`, the default, and what [`tft_plan_at`] does.
 pub const TFT_EXTRAP_ERROR: tft_extrap_policy = 0;
-/// Hold the newest sample constant; [`tft_extrapolated::by_ns`] comes back in
-/// the same call.
+/// Hold the newest sample constant; [`tft_extrapolated::by_ns`] comes back in the same call.
 pub const TFT_EXTRAP_HOLD: tft_extrap_policy = 1;
-/// Extend the constant screw twist implied by the two newest samples
-/// (`docs/decisions/0039` *Context*); falls back to [`TFT_EXTRAP_HOLD`] on an
-/// edge retaining a single sample.
+/// Extend the constant screw twist of the two newest samples (`docs/decisions/0039`); falls back to
+/// [`TFT_EXTRAP_HOLD`] on a single-sample edge.
 pub const TFT_EXTRAP_CONSTANT_TWIST: tft_extrap_policy = 2;
 
-/// `policy` as the engine's enum, or `None` for an undefined discriminant.
 fn extrap_policy(policy: tft_extrap_policy) -> Option<tf_tree::ExtrapPolicy> {
     Some(match policy {
         TFT_EXTRAP_ERROR => tf_tree::ExtrapPolicy::Error,
@@ -893,31 +763,24 @@ fn extrap_policy(policy: tft_extrap_policy) -> Option<tf_tree::ExtrapPolicy> {
     })
 }
 
-/// How far past the route's newest common sample an answer was extrapolated.
-///
-/// The caller must pass one to get a pose at all (`docs/decisions/0039` §1):
-/// [`tft_plan_at_extrapolating`] returns [`TFT_ERR_NULL_ARG`] for a NULL `info`,
-/// and there is no second spelling without it. `struct_size` is §3.6's append
-/// mechanism, checked as [`tft_error`]'s is: set it to `sizeof(tft_extrapolated)`
-/// or the call returns [`TFT_ERR_BAD_STRUCT_SIZE`].
+/// How far past the route's newest common sample an answer was extrapolated (`docs/decisions/0039`
+/// §1). Required: a NULL `info` is [`TFT_ERR_NULL_ARG`]; `struct_size` must be
+/// `sizeof(tft_extrapolated)` or the call returns [`TFT_ERR_BAD_STRUCT_SIZE`] (§3.6).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct tft_extrapolated {
-    /// `sizeof(tft_extrapolated)` — §3.6.
+    /// `sizeof(tft_extrapolated)` (§3.6).
     pub struct_size: u32,
-    /// Nanoseconds past the newest stamp that every dynamic edge on this plan has
-    /// data for; `0` means every edge bracketed the query. Otherwise the worst
-    /// case over the route (`docs/decisions/0039` §3).
+    /// Nanoseconds past the newest stamp every dynamic edge has data for; `0` means every edge
+    /// bracketed the query (`docs/decisions/0039` §3).
     pub by_ns: i64,
-    /// The dynamic edge whose newest stamp is [`Self::by_ns`] behind the query, or
-    /// [`TFT_INVALID_ID`] when `by_ns` is `0` (where the engine's edge id is
-    /// meaningless).
+    /// The dynamic edge whose newest stamp is `by_ns` behind the query, or [`TFT_INVALID_ID`] when
+    /// `by_ns` is `0`.
     pub edge: u32,
 }
 
 impl tft_extrapolated {
-    /// A "not extrapolated" value with `struct_size` set and `edge` the sentinel;
-    /// public to spare callers `unsafe { core::mem::zeroed() }` (`docs/decisions/0048`).
+    /// A "not extrapolated" value with `struct_size` set and `edge` the sentinel (`docs/decisions/0048`).
     #[must_use]
     pub const fn blank() -> tft_extrapolated {
         tft_extrapolated {
@@ -928,30 +791,24 @@ impl tft_extrapolated {
     }
 }
 
-/// [`tft_plan_at`], permitting extrapolation past the newest sample under
-/// `policy` and reporting how far (`docs/decisions/0039`).
+/// [`tft_plan_at`], permitting extrapolation under `policy` and reporting how far
+/// (`docs/decisions/0039`).
 ///
-/// `info` is required: the distance comes back with the pose. NULL is
-/// [`TFT_ERR_NULL_ARG`] and nothing is written. [`tft_plan_at`] still refuses, and
-/// is what a caller that must not act on invented data should call. The plan is
-/// evaluated in the domain it was compiled for.
+/// `info` is required (NULL is [`TFT_ERR_NULL_ARG`], nothing written). [`tft_plan_at`] still refuses
+/// and is what a caller that must not act on invented data should call.
 ///
-/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] is refused with [`TFT_ERR_BAD_ENUM`]: the
-/// engine has no extrapolating `at_with_derivatives`.
+/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] is refused with [`TFT_ERR_BAD_ENUM`].
 ///
 /// # Errors
 ///
-/// Everything [`tft_plan_at`] returns. Under [`TFT_EXTRAP_ERROR`] a stamp past
-/// the newest sample is [`TFT_ERR_EXTRAPOLATION`]; otherwise `info->by_ns` says
-/// how far. [`TFT_ERR_BAD_STRUCT_SIZE`] if `info->struct_size` is not
-/// `sizeof(tft_extrapolated)`.
+/// Everything [`tft_plan_at`] returns. Under [`TFT_EXTRAP_ERROR`] a stamp past the newest sample is
+/// [`TFT_ERR_EXTRAPOLATION`]; otherwise `info->by_ns` says how far. [`TFT_ERR_BAD_STRUCT_SIZE`] if
+/// `info->struct_size` is not `sizeof(tft_extrapolated)`.
 ///
 /// # Safety
 ///
-/// `plan` must be a handle from [`tft_plan_create`] that has not been freed.
-/// `out` must point to at least `tft_layout_size(layout)` writable bytes.
-/// `info` must point to a writable `tft_extrapolated` whose `struct_size` this
-/// caller has set.
+/// `plan` must be a live handle. `out` must point to at least `tft_layout_size(layout)` writable
+/// bytes. `info` must point to a writable `tft_extrapolated` with `struct_size` set.
 #[no_mangle]
 pub unsafe extern "C" fn tft_plan_at_extrapolating(
     plan: *const tft_plan,
@@ -969,7 +826,6 @@ pub unsafe extern "C" fn tft_plan_at_extrapolating(
         if out.is_null() {
             return null_arg("out");
         }
-        // Checked beside `out`, so a caller who forgot it gets the refusal.
         if info.is_null() {
             return null_arg("info");
         }
@@ -988,9 +844,8 @@ pub unsafe extern "C" fn tft_plan_at_extrapolating(
             );
             return TFT_ERR_BAD_ENUM;
         }
-        // SAFETY: `info` is non-null and the caller contracts it points at a
-        // `tft_extrapolated` with `struct_size` set; `read_unaligned` as
-        // `magic_check!`.
+        // SAFETY: `info` is non-null and the caller contracts a `tft_extrapolated` with `struct_size`
+        // set; `read_unaligned` as `magic_check!`.
         let declared = unsafe { core::ptr::addr_of!((*info).struct_size).read_unaligned() };
         if declared as usize != core::mem::size_of::<tft_extrapolated>() {
             set_error(
@@ -1012,8 +867,7 @@ pub unsafe extern "C" fn tft_plan_at_extrapolating(
         match h.plan.at_extrapolating_tagged(&g, stamp, h.domain, policy) {
             Ok(x) => {
                 layout::write(&x.pose, layout, dst);
-                // Written only on success, after the pose. `by_ns == 0` reports
-                // the sentinel edge (see `tft_extrapolated::edge`).
+                // Written only on success; `by_ns == 0` reports the sentinel edge.
                 let e = tft_extrapolated {
                     struct_size: core::mem::size_of::<tft_extrapolated>() as u32,
                     by_ns: x.by_ns,
@@ -1023,8 +877,7 @@ pub unsafe extern "C" fn tft_plan_at_extrapolating(
                         x.edge.get()
                     },
                 };
-                // SAFETY: `info` is non-null, the caller contracts it writable,
-                // and its `struct_size` matched this build's exactly — so the
+                // SAFETY: `info` is non-null, caller-writable, and its `struct_size` matched exactly, so the
                 // whole struct is inside the caller's allocation.
                 unsafe { core::ptr::write(info, e) };
                 TFT_OK
@@ -1034,22 +887,18 @@ pub unsafe extern "C" fn tft_plan_at_extrapolating(
     })
 }
 
-// Test-only panic hook — §6.1
-
-/// A guarded entry point that does nothing, for pricing `guard` against the
-/// unguarded `tft_layout_size` (`examples/abi_cost.rs`).
+/// A guarded no-op, to price `guard`.
 #[cfg(feature = "test-hooks")]
 #[no_mangle]
 pub extern "C" fn tft_guarded_noop(x: i32) -> tft_status {
     guard(|| x)
 }
 
-/// Force a panic inside an `extern "C"` body, to prove the guard converts it
-/// into a status. Only under `--features test-hooks`.
+/// Force a panic inside an `extern "C"` body, to prove the guard converts it into a status.
 ///
 /// # Safety
 ///
-/// Takes no pointers; `unsafe` only for signature symmetry.
+/// Takes no pointers.
 #[cfg(feature = "test-hooks")]
 #[no_mangle]
 pub extern "C" fn tft_test_panic() -> tft_status {
@@ -1061,12 +910,11 @@ pub extern "C" fn tft_test_panic() -> tft_status {
     })
 }
 
-/// The same, for an entry point with no status to report through (a count or
-/// size, like `tft_tree_frame_count`): the caller sees the fallback.
+/// The same for an entry point with no status (a count or size): the caller sees the fallback.
 ///
 /// # Safety
 ///
-/// Takes no pointers; `unsafe` only for signature symmetry.
+/// Takes no pointers.
 #[cfg(feature = "test-hooks")]
 #[no_mangle]
 pub extern "C" fn tft_test_panic_value() -> u32 {
@@ -1078,11 +926,7 @@ pub extern "C" fn tft_test_panic_value() -> u32 {
     })
 }
 
-/// Build an in-process fixture tree: `map -> odom -> base`, two dynamic ScLerp
-/// edges with 64 samples each 10 ms apart, plus a static `base -> sensor`.
-///
-/// Lets the §6.1 suite and §7 benchmark drive the real entry points without a
-/// running arena; only under `--features test-hooks`.
+/// Build a fixture: `map -> odom -> base` (dynamic ScLerp, 64 samples) plus a static `base -> sensor`.
 ///
 /// # Safety
 ///
@@ -1143,8 +987,7 @@ pub unsafe extern "C" fn tft_test_tree_create(out: *mut *mut tft_tree) -> tft_st
     })
 }
 
-/// Build a fixture tree whose dynamic edge interpolates with `LerpSlerp`:
-/// `map -> base`, 32 samples 10 ms apart, for the `TFT_ERR_NO_DERIVATIVES` path.
+/// Build a fixture whose dynamic edge uses `LerpSlerp` (`map -> base`), for `TFT_ERR_NO_DERIVATIVES`.
 ///
 /// # Safety
 ///
@@ -1188,7 +1031,7 @@ pub unsafe extern "C" fn tft_test_lerpslerp_tree_create(out: *mut *mut tft_tree)
                 return TFT_ERR_INTERNAL;
             }
         }
-        // Held for the life of the tree: a released claim would let a lookup race a reaper.
+        // Held for the life of the tree.
         core::mem::forget(w);
         let h = Box::new(tft_tree {
             magic: MAGIC_TREE,
@@ -1202,10 +1045,7 @@ pub unsafe extern "C" fn tft_test_lerpslerp_tree_create(out: *mut *mut tft_tree)
     })
 }
 
-/// Build a fixture tree whose dynamic edge is published in time domain
-/// `domain`: `map -> odom` (ScLerp, 32 samples 10 ms apart) plus a static
-/// `odom -> sensor` (which must not trigger a plan-time refusal;
-/// `docs/decisions/0038`).
+/// Build a fixture whose dynamic edge publishes in `domain`, plus a static edge (`docs/decisions/0038`).
 ///
 /// # Safety
 ///
@@ -1253,7 +1093,6 @@ pub unsafe extern "C" fn tft_test_domain_tree_create(
                 return TFT_ERR_INTERNAL;
             }
         }
-        // Held for the life of the tree.
         core::mem::forget(w);
         let h = Box::new(tft_tree {
             magic: MAGIC_TREE,
@@ -1267,10 +1106,7 @@ pub unsafe extern "C" fn tft_test_domain_tree_create(
     })
 }
 
-/// Build a fixture tree with a **claimable** dynamic edge: `world -> robot`
-/// (ScLerp, no samples, unclaimed) plus a static `robot -> tool`. Separate from
-/// [`tft_test_tree_create`], whose writers are forgotten and which the §7
-/// benchmark measures.
+/// Build a fixture with a claimable dynamic edge `world -> robot` and a static `robot -> tool`.
 ///
 /// # Safety
 ///
@@ -1287,7 +1123,6 @@ pub unsafe extern "C" fn tft_test_publishable_tree_create(out: *mut *mut tft_tre
         let Ok(tree) = tf_tree::TreeBuilder::new()
             .dynamic_edge("world", "robot", cfg)
             .static_edge("robot", "tool", &mount)
-            // Headroom makes `tft_tree_frame_name`'s range check testable.
             .frame_headroom(4)
             .edge_headroom(2)
             .build()
@@ -1305,8 +1140,6 @@ pub unsafe extern "C" fn tft_test_publishable_tree_create(out: *mut *mut tft_tre
         TFT_OK
     })
 }
-
-// Small helpers, so every entry point reports failures identically
 
 pub(crate) fn bad_handle(what: &str) -> tft_status {
     set_error(

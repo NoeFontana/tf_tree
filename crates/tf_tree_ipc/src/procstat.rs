@@ -1,10 +1,6 @@
-//! `(pid, start_time, boot_id)` — the identity triple, and the one parser in
-//! this crate that is a documented trap.
-//!
-//! `docs/PHASE2.md` §5.1: the lock file is authoritative for liveness; this is
-//! for `doctor`, the takeover path and [`crate::CreatePolicy::Always`], which
-//! must say *whose* arena is being abandoned. A bare pid is not an identity
-//! (pids recycle), so a record without its start time names nothing.
+//! `(pid, start_time, boot_id)` — the identity triple. `docs/PHASE2.md` §5.1:
+//! the lock file is authoritative for liveness; this names *whose* arena, and a
+//! bare pid is not an identity (pids recycle).
 
 use crate::error::{ProcError, ProcParseError};
 
@@ -43,10 +39,9 @@ pub fn self_start_time() -> Result<u64, ProcError> {
 
 /// Parse field 22 out of one `/proc/<pid>/stat` line.
 ///
-/// **NORMATIVE (`docs/PHASE2.md` §5.1).** Field 2 is `comm`, unescaped and free
-/// to contain spaces *and* parentheses, so splitting on whitespace reads a
-/// different field for a name containing `) `. The only safe anchor is the
-/// **last** `)`; `raw[rp + 2..]` starts at field 3, so field 22 is `nth(19)`.
+/// **NORMATIVE (`docs/PHASE2.md` §5.1).** Field 2 is `comm`, free to contain
+/// spaces and parentheses, so the only safe anchor is the **last** `)`;
+/// `raw[rp + 2..]` starts at field 3, so field 22 is `nth(19)`.
 /// `evil_comm_defeats_the_naive_split` is Appendix B's fixture.
 ///
 /// # Errors
@@ -55,8 +50,7 @@ pub fn self_start_time() -> Result<u64, ProcError> {
 /// not a decimal integer.
 pub fn parse_start_time(raw: &str) -> Result<u64, ProcParseError> {
     let rp = raw.rfind(')').ok_or(ProcParseError::NoClosingParen)?;
-    // `rp + 2` skips ") "; `get` reports a line ending at the paren as
-    // `TooFewFields` rather than panicking.
+    // `rp + 2` skips ") "; `get` turns a line ending at the paren into `TooFewFields`.
     let tail = raw.get(rp + 2..).ok_or(ProcParseError::TooFewFields)?;
     let field22 = tail
         .split_ascii_whitespace()
@@ -102,11 +96,8 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 
-/// This process's `comm`, NUL-padded into the 16 bytes an identity record has
-/// for it. Diagnostics only.
-///
-/// Sixteen because the kernel caps `comm` at 15 bytes plus NUL
-/// (`docs/decisions/0033`); the wire's 32-byte `client_name` is separate.
+/// This process's `comm`, NUL-padded to the record's 16 bytes
+/// (`docs/decisions/0033`). Diagnostics only.
 #[must_use]
 pub fn self_comm() -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -117,30 +108,21 @@ pub fn self_comm() -> [u8; 16] {
     out
 }
 
-/// This process's PID namespace, as the `nsfs` inode `/proc/self/ns/pid` names.
+/// This process's PID namespace, as the `nsfs` inode `/proc/self/ns/pid` names,
+/// so a `doctor` elsewhere can tell "pid not comparable" from "process gone"
+/// (`0033`).
 ///
-/// Lets a `doctor` in another PID namespace tell "the recorded pid is not
-/// comparable from here" from "the recorded process is gone" (`0033`).
+/// **NORMATIVE (`docs/decisions/0033` *Decision* 1):** `read_link`, never
+/// `metadata()` (`EACCES` under an unmapped user namespace) or
+/// `symlink_metadata()` (the procfs dentry's inode).
 ///
-/// # `readlink`, not `stat`, and never `lstat`
-///
-/// **NORMATIVE (`docs/decisions/0033` *Decision* 1).** Measured in four arms,
-/// `read_link` is the only read correct in all: `metadata()` fails `EACCES`
-/// under an unmapped user namespace, and `symlink_metadata()` returns the procfs
-/// dentry's inode, a plausible wrong number.
-///
-/// # `None`, not an error
-///
-/// An unreadable `/proc` means *unknown namespace*; every caller degrades to
-/// the behaviour it had before this field, so an `IpcError` would have one
-/// correct handler at every call site.
+/// `None` (unknown namespace), not an error: callers degrade to pre-`0033` behaviour.
 #[must_use]
 pub fn self_pid_ns_inode() -> Option<u64> {
     parse_ns_inode(std::fs::read_link("/proc/self/ns/pid").ok()?.to_str()?)
 }
 
-/// `pid:[4026531836]` into `4026531836`. Strict on both ends: a prefix, suffix
-/// or another namespace type's link must not compare equal to a pid namespace.
+/// `pid:[4026531836]` into `4026531836`; strict on prefix, suffix and type.
 fn parse_ns_inode(link: &str) -> Option<u64> {
     let inner = link.strip_prefix("pid:[")?.strip_suffix(']')?;
     // `u64::from_str` accepts a leading `+`; the kernel never writes one.
@@ -150,12 +132,9 @@ fn parse_ns_inode(link: &str) -> Option<u64> {
     inner.parse().ok()
 }
 
-/// The pid this process's `/proc` calls it — `readlink("/proc/self")`.
-///
-/// Half of `0033` *Decision* 4's guard: it equals [`std::process::id`] exactly
-/// when `/proc` describes the caller's own pid namespace. Compare in one process
-/// (a shell substitution forks). `None` on failure; the caller degrades per
-/// `0033`.
+/// The pid this process's `/proc` calls it — `readlink("/proc/self")` — half of
+/// `0033` *Decision* 4's guard: equals [`std::process::id`] exactly when `/proc`
+/// is the caller's own pid namespace. `None` on failure.
 #[must_use]
 pub fn proc_self_pid() -> Option<u32> {
     std::fs::read_link("/proc/self")
@@ -200,7 +179,7 @@ mod tests {
 
     #[test]
     fn ordinary_comm_parses() {
-        // A boring name, so the naive parse agrees — why the trap survives review.
+        // A boring name, so the naive parse agrees.
         let line = "42 (bash) S 1 42 42 0 -1 4194304 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16";
         assert_eq!(parse_start_time(line).unwrap(), 13);
         let naive: u64 = line
@@ -265,8 +244,7 @@ mod tests {
         assert!(parse_uuid("zzzz4567-89ab-cdef-0123-456789abcdef").is_none());
     }
 
-    /// The link texts measured in `docs/decisions/0033` *Decision* 1, and near
-    /// misses that must not parse.
+    /// Link texts from `docs/decisions/0033` *Decision* 1, and near misses.
     #[test]
     fn ns_link_parsing_rejects_near_misses() {
         assert_eq!(parse_ns_inode("pid:[4026531836]"), Some(4_026_531_836));
@@ -284,8 +262,7 @@ mod tests {
         assert_eq!(parse_ns_inode(""), None);
     }
 
-    /// The two `/proc` reads `0033` adds. Only the shape is pinned; the
-    /// disagreeing arm is staged as arm D of `0033`'s subprocess test.
+    /// Only the shape is pinned; `0033`'s subprocess test stages the disagreeing arm.
     #[test]
     fn the_namespace_reads_answer_about_this_process() {
         let ino = self_pid_ns_inode().expect("/proc/self/ns/pid is readable here");

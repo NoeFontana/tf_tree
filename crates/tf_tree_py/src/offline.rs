@@ -1,13 +1,10 @@
 //! The offline API — `docs/PHASE5.md` §4.
 //!
 //! §4.1 (NORMATIVE): a `.tft` opens into the **same** [`PyTree`](crate::PyTree) a live arena
-//! does. This module adds only [`open_file`], [`freeze_impl`] (behind `Tree.freeze`), and the
-//! queries §4.2/§4.4 cannot phrase online: [`span_impl`] and the *names* half of `edges`.
+//! does. This module adds only [`open_file`], [`freeze_impl`] and the queries §4.2/§4.4
+//! cannot phrase online: [`span_impl`] and the *names* half of `edges`.
 //!
-//! Not shipped: `resample` (a second spelling of `plan.at(np.arange(...))`); per-edge rate,
-//! jitter, gaps and count (§4.2's `ds.edges()`), and `gaps()`, which need §3's counting pass
-//! — and the names must not acquire the statistics by adjacency (§4.4); `manifest`, which
-//! needs a CBOR reader.
+//! Not shipped: `resample`, per-edge statistics, `gaps()` (§4.2, §4.4), `manifest`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -24,13 +21,9 @@ use crate::tree::PyTree;
 
 /// Open a frozen `.tft` and read it through the ordinary `Tree` (§4.1).
 ///
-/// Opening is an `mmap`: microseconds, no parse. Workers that open the same file share one set
-/// of clean page-cache pages (§2.2), so **open it inside the worker**, not in the parent.
-///
-/// A `Tree` cannot be pickled, and a `DataLoader` with `num_workers > 0` pickles its dataset
-/// under `spawn` and `forkserver`. Hold a `None` until the first `__getitem__` (§4.3). Under
-/// `fork` an inherited mapping keeps working: it is `MAP_PRIVATE | PROT_READ` and not
-/// fork-poisoned.
+/// Opening is an `mmap`; open it inside the worker, not the parent (§2.2). A `Tree` cannot
+/// be pickled: hold a `None` until the first `__getitem__` (§4.3). Under `fork` an inherited
+/// mapping keeps working.
 ///
 /// `path` is any `os.PathLike`, including non-UTF-8 paths.
 #[pyfunction]
@@ -41,15 +34,10 @@ pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
 
 /// The interval over which a plan is answerable, or `None` when it is unbounded.
 ///
-/// A forwarder to [`tf_tree::Plan::span`], so a stale-topology plan raises
-/// `TopologyChangedError` and a fork-poisoned guard raises rather than reading a detached arena.
-///
 /// # Errors
 ///
-/// Everything `Plan::span` reports, mapped by [`lookup_err_untagged`] (neither call can return
-/// `Extrapolation`, the one variant carrying a time-domain tag) — except
-/// `LookupError::NoData`, re-raised with **where on the path** the silent edge sits. One
-/// [`ArenaView`] serves the whole message.
+/// Everything `Plan::span` reports, mapped by [`lookup_err_untagged`], except
+/// `LookupError::NoData`, re-raised naming the silent edge on the path.
 pub(crate) fn span_impl(
     py: Python<'_>,
     tree: &Tree,
@@ -81,8 +69,7 @@ pub(crate) fn span_impl(
 
 /// `(parent, child)` frame names for an edge, or `None` if either is missing.
 ///
-/// Takes the view so per-edge callers build it once. Allocates, but only on error paths and
-/// listings.
+/// Takes the view so per-edge callers build it once.
 pub(crate) fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(String, String)> {
     // One observation of the record: two reads could name a parent and child of different edges.
     let rec = view.edge(edge)?;
@@ -92,16 +79,9 @@ pub(crate) fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(Strin
 
 /// One frame's stored name, or `None` if this arena has no usable record there.
 ///
-/// `None` means "no usable record at that index". Three checks:
-///
-///  1. `FrameId::new` rejects 0, the root sentinel.
-///  2. `id <= frame_count`, which excludes the zeroed headroom slots `frame_record` would hand
-///     back (they would render as `""`).
-///  3. `name_hash != 0`, which excludes a slot counted by a concurrent interner before its
-///     record exists.
-///
-/// `Relaxed`: `frame_count` is bumped *before* the record is written, so acquire orders
-/// nothing useful; check 3 is the guard.
+/// Rejects the root sentinel, headroom slots past `frame_count`, and a slot counted by a
+/// concurrent interner before its record exists (`name_hash == 0`). `Relaxed`: `frame_count`
+/// is bumped before the record is written, so the `name_hash` check is the guard.
 pub(crate) fn named_frame_in(view: &ArenaView<'_>, frame: FrameId) -> Option<String> {
     if frame.get() > view.header().frame_count.load(Ordering::Relaxed) {
         return None;
@@ -122,33 +102,22 @@ fn stored_name(bytes: &[u8], len: u8) -> String {
 
 /// The frame names on this tree, in `FrameId` order, behind `Tree.frames`.
 ///
-/// Follow-up: `tf_tree::Tree::frames` (`docs/API.md` §2.6) applies the same three checks, so
-/// this body should become a forwarder; not done because `tests/python/test_api.py`, which pins
-/// the `('', '')` case, runs only under `just py-test`.
-///
-/// The result is a snapshot: on a live shared arena a frame may be interned mid-call, and
-/// nothing listed is ever removed or renumbered. It does **not** promise unique names: a
-/// rescued interner's abandoned record (`tf_tree_core::frame`'s `finish`) keeps its real name
-/// and lands at a second id, so `len()` is an upper bound.
+/// A snapshot; names are not promised unique (a rescued interner's abandoned record lands at
+/// a second id), so `len()` is an upper bound.
 ///
 /// # Errors
 ///
 /// [`detached_err`] on a tree inherited across a `fork()`.
 pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
-    // Refuse a fork-detached tree: the poison arena reads 0 frames, which would hand a
-    // `multiprocessing` worker `[]` (`docs/PHASE5.md` §4.3).
+    // A fork-detached tree's poison arena reads 0 frames (`docs/PHASE5.md` §4.3).
     if tree.detached() {
         return Err(detached_err());
     }
     let view = tree.arena_view();
-    // Ids are `1..=frame_count`. `Relaxed` on purpose: `finish` bumps `frame_count` before
-    // writing the record, so `Acquire` would order nothing here; the `name_hash` filter guards.
+    // Ids are `1..=frame_count`; `Relaxed` as in `named_frame_in`.
     let count = view.header().frame_count.load(Ordering::Relaxed);
     let mut out = Vec::with_capacity(count as usize);
     for raw in 1..=count {
-        // `count` is read once so the loop does not chase a concurrent interner. A counted slot
-        // whose record is not yet written reads as zeros (`name_hash == 0`); skipping it reports
-        // the frame one call later instead of as `""`.
         let Some(id) = FrameId::new(raw) else {
             continue;
         };
@@ -162,11 +131,9 @@ pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
 
 /// The edges on this tree as `(parent, child)` name pairs, behind `Tree.edges`.
 ///
-/// `(parent, child)` is the order `tf_tree.build` and `open(create=...)` take. This is the
-/// graph, **not** a round trip: it does not report an edge's kind and Python cannot declare a
-/// static edge, so a rebuilt tree turns every static edge dynamic. The pair is the *declared*
-/// endpoints (`EdgeRecord::parent`), which differ from the live topology only on an arena a
-/// peer has reparented. Names only; statistics wait on §3's counting pass (§4.2).
+/// The graph, **not** a round trip: an edge's kind is not reported, so a rebuilt tree turns
+/// every static edge dynamic. The pair is the *declared* endpoints (`EdgeRecord::parent`).
+/// Names only (§4.2).
 ///
 /// # Errors
 ///
@@ -177,13 +144,11 @@ pub(crate) fn edges_impl(tree: &Tree) -> PyResult<Vec<(String, String)>> {
         return Err(detached_err());
     }
     let view = tree.arena_view();
-    // Real ids are `1..edge_count` (the count includes the sentinel). `Relaxed`: the edge table
-    // is filled and `edge_count` stored once before the arena is shared.
+    // Real ids are `1..edge_count` (the count includes the sentinel).
     let count = view.header().edge_count.load(Ordering::Relaxed);
     let mut out = Vec::with_capacity(count.saturating_sub(1) as usize);
     for raw in 1..count {
-        // `None` means a zeroed record (frame 0), which keeps the sentinel and headroom slots
-        // out of the list; do not swap in an always-Some fallback. Pinned in `test_api.py`.
+        // `None` (a zeroed record) keeps sentinel and headroom slots out; pinned in `test_api.py`.
         if let Some(pair) = named_edge_in(&view, EdgeId(raw)) {
             out.push(pair);
         }
@@ -193,12 +158,11 @@ pub(crate) fn edges_impl(tree: &Tree) -> PyResult<Vec<(String, String)>> {
 
 /// The **dynamic** edges a compiled plan samples, behind `Plan.edges`.
 ///
-/// A plan folds static edges into one `Step::Static`, so their identities are gone; only
-/// `Step::Dyn` steps are listed, in fold order, without direction.
+/// Static edges fold into one `Step::Static`; only `Step::Dyn` steps are listed, in fold order.
 ///
 /// # Errors
 ///
-/// [`detached_err`] on a tree inherited across a `fork()`; nothing else guards a silent `[]`.
+/// [`detached_err`] on a tree inherited across a `fork()`.
 pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> PyResult<Vec<(String, String)>> {
     if tree.detached() {
         return Err(detached_err());
@@ -218,11 +182,8 @@ pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> PyResult<Vec<(String,
 
 /// Write this tree's arena to `path` as a `.tft` (§2.3), behind `Tree.freeze`.
 ///
-/// `source_digest` is BLAKE3 of the source recording, all-zero when there is none
-/// ([`PyTree::source`](crate::tree::PyTree), `docs/decisions/0046`).
-///
-/// The GIL is released for the copy: it writes the whole arena, and nothing inside the
-/// `detach` touches a Python object.
+/// `source_digest` is BLAKE3 of the source recording, all-zero when there is none (`0046`).
+/// The GIL is released for the copy.
 #[cfg(target_os = "linux")]
 pub(crate) fn freeze_impl(
     py: Python<'_>,
@@ -236,8 +197,8 @@ pub(crate) fn freeze_impl(
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
         .unwrap_or(0);
-    // Refuse a fork-detached tree: `freeze_to` reads the backing bytes without a `Guard` and
-    // would `SIGSEGV` where `docs/PHASE3.md` §8.1 (NORMATIVE) requires `ChildProcessDetachedError`.
+    // `freeze_to` reads without a `Guard` and would `SIGSEGV`; `docs/PHASE3.md` §8.1 requires
+    // `ChildProcessDetachedError`.
     if tree.detached() {
         return Err(detached_err());
     }
@@ -246,7 +207,7 @@ pub(crate) fn freeze_impl(
         .map_err(|e| frozen_err(path, e))
 }
 
-/// See [`freeze_impl`]. `.tft` support is Linux-only, like the mapping it is.
+/// See [`freeze_impl`]. Linux-only.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn freeze_impl(
     _py: Python<'_>,
@@ -263,14 +224,13 @@ fn open_frozen(path: &Path) -> PyResult<Tree> {
     Tree::open_frozen(path).map_err(|e| frozen_err(path, e))
 }
 
-/// See [`open_file`]. `.tft` support is Linux-only, like the mapping it is.
+/// See [`open_file`]. Linux-only.
 #[cfg(not(target_os = "linux"))]
 fn open_frozen(_path: &Path) -> PyResult<Tree> {
     Err(not_on_this_platform())
 }
 
-/// The frozen path is Linux-only in the facade; the method still exists and refuses, so a
-/// portable script does not fail with `AttributeError`.
+/// The method still exists and refuses, so a portable script gets no `AttributeError`.
 #[cfg(not(target_os = "linux"))]
 fn not_on_this_platform() -> PyErr {
     TfTreeError::new_err(
@@ -281,13 +241,11 @@ fn not_on_this_platform() -> PyErr {
 
 /// Map a `.tft` failure onto Python, keeping the path and the remedy.
 ///
-/// An errno failure becomes a real `OSError` subclass (`FileNotFoundError` etc.). Container
-/// failures stay `TfTreeError` and carry §2.4's remedy: re-freeze, because a `.tft` is a
-/// cache and not an archive.
+/// Errno failures become `OSError` subclasses; container failures stay `TfTreeError` and
+/// carry §2.4's remedy (re-freeze).
 #[cfg(target_os = "linux")]
 fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
     use tf_tree::{FrozenError, FrozenFileError, ShmError};
-    // `display()` is lossy for non-UTF-8 paths: fine for a message; `filename` keeps the bytes.
     let shown = path.display();
     match e {
         FrozenFileError::Path { raw_os_error } if raw_os_error != 0 => {
@@ -295,7 +253,7 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
             PyErr::new::<pyo3::exceptions::PyOSError, _>((
                 raw_os_error,
                 io.to_string(),
-                // `OsString`, not `PathBuf`: keeps `e.filename` a `str` and survives non-UTF-8.
+                // `OsString`, not `PathBuf`: keeps `e.filename` a `str`.
                 path.as_os_str().to_owned(),
             ))
         }
@@ -317,9 +275,8 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                      {expected}. Re-freeze the source recording — a .tft is a cache, not \
                      an archive (`tf_tree doctor --explain-version`)"
                 ),
-                // `FrozenError` is exhaustive here on purpose: a new variant is a compile error, not
-                // a raw struct shown to a user. Only the layout/version arms above mean "wrong
-                // build, re-freeze"; damaged-file arms below must not send anyone to re-run ingest.
+                // Exhaustive on purpose: a new variant is a compile error. Only the layout/version
+                // arms mean "re-freeze"; damaged-file arms must not.
                 FrozenError::Truncated => {
                     "ends before a structure its own header promises — the write \
                      was interrupted, or the file is still being written"
@@ -335,13 +292,11 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                     "is {actual} bytes but its header says {expected}; the file is \
                      truncated or has been appended to"
                 ),
-                // The errno is carried through: `EACCES` and `ENOMEM` want different responses.
                 FrozenError::Io(errno) | FrozenError::Map(errno) => format!(
                     "could not be read or mapped: {}",
                     std::io::Error::from_raw_os_error(errno.raw_os_error())
                 ),
-                // Forward the engine's `Display` (`docs/decisions/0059`). `LayoutMismatch` is split
-                // out because §2.4 (NORMATIVE) requires a layout-hash mismatch to say re-freeze.
+                // Engine `Display` forwarded (`0059`); `LayoutMismatch` split out per §2.4.
                 FrozenError::Arena(inner @ ShmError::LayoutMismatch { .. }) => format!(
                     "contains an arena image whose layout hash is not this \
                      build's. Re-freeze the source recording — a .tft is a cache, \
@@ -356,7 +311,7 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
             };
             TfTreeError::new_err(format!("{shown}: {detail}"))
         }
-        // `FrozenFileError` is `#[non_exhaustive]`: a new variant reaches Python as a base `TfTreeError`.
+        // `#[non_exhaustive]`: a new variant reaches Python as a base `TfTreeError`.
         other => TfTreeError::new_err(format!("{shown}: {other:?}")),
     }
 }

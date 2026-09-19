@@ -1,11 +1,5 @@
-//! `docs/PHASE5.md` §2.1, end to end: **the file *is* the arena**.
-//!
-//! §2.1 is NORMATIVE that a frozen `.tft` is read by the identical `Plan::at`
-//! code as a live arena, against a `PROT_READ` mapping, with no offline variant
-//! of the lookup and no separate index. The only way to hold that claim to
-//! account is to run the *same* lookups against both and demand **bit-for-bit**
-//! agreement — not agreement to a tolerance, which would pass even if the frozen
-//! path had quietly acquired its own interpolation.
+//! `docs/PHASE5.md` §2.1: a frozen `.tft` is read by the same `Plan::at` code as
+//! a live arena. The same lookups run against both and must agree bit for bit.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -17,21 +11,10 @@ use tf_tree::{
 
 const MS: i64 = 1_000_000;
 
-/// A **private directory** in the temp dir, holding one `.tft`, removed when the
-/// test ends, pass or fail.
+/// A private per-pid, per-tag directory holding one `.tft`, removed on drop.
 ///
-/// The directory is the point. `freeze_to` writes its temporary as a *sibling*
-/// of the target, so [`freezing_replaces_the_target_by_rename_not_in_place`]
-/// proves the cleanup by looking at what the target's parent holds afterwards.
-/// With the target directly in the shared `std::env::temp_dir()`, that parent is
-/// a directory every other process on the machine also writes to, and the test
-/// spent its life either accusing `freeze_to` of another process's litter or
-/// narrowing its predicate until it only matched the litter it already knew
-/// about. A directory of our own makes the assertion the strict one: **exactly
-/// the target file is here**, whatever the temporary was called.
-///
-/// Per-pid and per-tag, so `nextest`'s process-per-test and a plain
-/// `cargo test`'s threads both get their own.
+/// `freeze_to` writes its temporary beside the target, so a directory of our own
+/// lets the rename test assert that exactly the target file is present.
 struct Scratch {
     dir: PathBuf,
     file: PathBuf,
@@ -48,8 +31,7 @@ impl Scratch {
     fn path(&self) -> &Path {
         &self.file
     }
-    /// What the target's parent holds — the directory `freeze_to`'s temporary
-    /// sibling lands in.
+    /// What the target's parent directory holds.
     fn entries(&self) -> Vec<std::ffi::OsString> {
         let mut names: Vec<_> = std::fs::read_dir(&self.dir)
             .unwrap()
@@ -68,22 +50,10 @@ impl Drop for Scratch {
 
 /// A four-level tree with three dynamic edges and one static one.
 ///
-/// **Non-degeneracy is the whole point of this fixture.** Every pushed pose has
-/// a rotation *and* a translation on all three axes, driven by irrational
-/// multiples of the sample index, so no two samples agree in any component and
-/// none of them is the identity. A fixture of identity poses — or of pure
-/// translations, or of one sample per edge — would make "the frozen bits equal
-/// the live bits" true for reasons that have nothing to do with the freeze
-/// working, which is exactly the failure this file exists to avoid.
-///
-/// The rings are deliberately *lapped*: 2048 pushes into 512 slots, so `head`
-/// exceeds capacity and the retained window has actually wrapped. A ring that
-/// never wrapped would leave the physical layout equal to the logical one and
-/// hide any index confusion introduced by relocation.
-///
-/// The size is also load-bearing. Three 512-slot rings put the arena at ~130 KB,
-/// which is **more than one `SNAPSHOT_CHUNK`** (64 KiB), so `write_frozen`'s copy
-/// loop actually iterates.
+/// Every pose is non-identity with rotation and translation on all axes, so
+/// bit-equality cannot hold vacuously. Rings are lapped (2048 pushes into 512
+/// slots) and the arena exceeds one `SNAPSHOT_CHUNK` (64 KiB), so both the wrap
+/// and `write_frozen`'s copy loop are exercised.
 fn fixture() -> Tree {
     let cfg = EdgeCfg::new(Capacity::slots(512)).interp(InterpPolicy::ScLerp);
     let tree = TreeBuilder::new()
@@ -111,9 +81,7 @@ fn fixture() -> Tree {
             let t = k as f64 * 0.001 * seed;
             w.push(k * MS, &pose_at(seed, t)).unwrap();
         }
-        // The claim must stay held for the duration; releasing it would clear
-        // the claim record and change the bytes under comparison for a reason
-        // unrelated to freezing.
+        // Releasing the claim would change the bytes under comparison.
         core::mem::forget(w);
     }
     tree
@@ -131,12 +99,8 @@ fn pose_at(seed: f64, t: f64) -> Iso3 {
     ])
 }
 
-/// The frame pairs and stamps every comparison runs over.
-///
-/// The stamps land **between** sample instants (`+0.37 ms` of a 1 ms grid), so
-/// every answer is an interpolated value the arena does not literally contain.
-/// Comparing stored samples would only prove the bytes were copied; comparing
-/// interpolated ones proves the *same interpolation ran over the same bits*.
+/// Frame pairs and stamps for every comparison; stamps fall between samples, so
+/// answers are interpolated values the arena does not literally contain.
 fn probes() -> Vec<(&'static str, &'static str, Stamp<SystemDomain>)> {
     let mut out = Vec::new();
     for (a, b) in [
@@ -153,25 +117,12 @@ fn probes() -> Vec<(&'static str, &'static str, Stamp<SystemDomain>)> {
     out
 }
 
-/// **§2.1.** The same lookup against a live arena and against a `.tft` frozen
-/// from it must agree bit for bit.
+/// **§2.1.** The same lookup against a live arena and its frozen `.tft` agrees bit
+/// for bit.
 ///
-/// Mutant: drop the `.add(done)` from `write_frozen`'s source pointer, or the
-/// `+ done` from its destination offset — the two ways a chunked copy loses its
-/// cursor — ⇒ verified, this fails on the first probe. **Both needed the
-/// enlarged fixture below**: at the 128-slot size this test started with, the
-/// whole arena fitted in one `SNAPSHOT_CHUNK`, `done` was never non-zero, and
-/// both mutants were no-ops the assertion could not see.
-///
-/// A *third* mutant is recorded here because it **survives**: truncating the
-/// copy by the last 64 bytes changes nothing, because the arena's final region
-/// is the participant-counter tail, which is zero in this fixture and which the
-/// file is zero-filled with anyway. A tail truncation is only visible when the
-/// tail is occupied, and nothing this test can build makes it so.
-///
-/// The two `assert!`s before the comparison are not decoration: without them a
-/// fixture that produced identity everywhere, or one whose lookups all failed,
-/// would satisfy the bit comparison while proving nothing.
+/// Mutant: drop the `.add(done)` or the `+ done` in `write_frozen`'s copy loop
+/// ⇒ fails (needs the multi-chunk fixture). A tail truncation survives: the
+/// counter tail is zero here.
 #[test]
 fn a_frozen_lookup_is_bit_identical_to_the_live_one() {
     let live = fixture();
@@ -197,8 +148,7 @@ fn a_frozen_lookup_is_bit_identical_to_the_live_one() {
         seen.push(l.to_bits());
     }
 
-    // The fixture must not be degenerate: no answer is the identity, and no two
-    // probes agree. Either would make the equality above vacuous.
+    // Guards against a degenerate fixture making the equality vacuous.
     assert!(
         seen.iter().all(|b| *b != Iso3::IDENTITY.to_bits()),
         "a probe returned the identity — the fixture is degenerate"
@@ -207,33 +157,18 @@ fn a_frozen_lookup_is_bit_identical_to_the_live_one() {
     assert_eq!(unique.len(), seen.len(), "probes are not distinguishing");
 }
 
-/// **§5.6.** `freeze --from-live` carries the counter regions.
+/// **§5.6.** `freeze --from-live` carries the counter regions, with the live
+/// arena's values.
 ///
-/// The section is NORMATIVE and the implementation satisfies it *structurally* —
-/// the whole arena is copied, so `ArenaLayout::edge_counters()` and
-/// `participant_counters()` land at their own offsets and are read back through
-/// the identical accessor. This pins that, and pins that the values are the ones
-/// the live arena had rather than zeros.
-///
-/// Mutant: shorten `write_frozen`'s `arena_size` by the two counter regions
-/// (`64 * 128 + 8 * 128` bytes — i.e. stop at the end of the Phase 1 regions,
-/// which is what a freeze written before v3 would do) ⇒ verified, this fails.
-///
-/// **Gated whole, and it is the only test in this crate whose gate had to be
-/// paid for in the justfile.** All three arena reads need `unstable` — the
-/// topology block, and the before/after `edge_counters` — so nothing survives
-/// with the feature off. This target also carries `required-features = ["shm"]`,
-/// so unlike the other gated tests it is *not* reached by
-/// `cargo nextest run --workspace`, which builds without `shm`; `just shm-check`
-/// runs it with `--features shm,unstable`, and says so where the line is.
+/// Mutant: shorten `write_frozen`'s `arena_size` by the two counter regions ⇒
+/// fails. Needs `unstable`, and this target needs `shm`: it runs in
+/// `just shm-check`, not `just test`.
 #[test]
 #[cfg(feature = "unstable")]
 fn freezing_carries_the_counter_regions() {
     let live = fixture();
 
-    // The edge id comes from the topology block's `edge_of_child`, which is
-    // where it lives — guessing `EdgeId(1)` would silently measure a different
-    // edge if the builder ever reordered declarations.
+    // Read from the topology block rather than guessing `EdgeId(1)`.
     let odom = live.frame("odom").unwrap();
     let edge = tf_tree::EdgeId(
         live.arena_view()
@@ -243,10 +178,8 @@ fn freezing_carries_the_counter_regions() {
             .2,
     );
 
-    // Both kinds of counter must move. `lookups_ok` is §5.4's `Guard`-batched
-    // denominator, so it only reaches the arena when the guard drops — which is
-    // why the scope closes before the freeze. `err_extrap_after` is an
-    // error-path counter and needs a query past the newest sample.
+    // `lookups_ok` reaches the arena only when the guard drops, so the scope
+    // closes before the freeze; `err_extrap_after` needs a query past the newest.
     let map = live.frame("map").unwrap();
     let plan = live.plan(map, odom).unwrap();
     {
@@ -291,17 +224,11 @@ fn freezing_carries_the_counter_regions() {
     );
 }
 
-/// A `.tft` is permanently read-only (§2.4), and that must be an error rather
-/// than a `SIGSEGV`.
+/// A `.tft` is permanently read-only (§2.4): mutation is an error, not a
+/// `SIGSEGV`.
 ///
-/// This is the one place where "read-only" has to be enforced in Rust rather
-/// than by the MMU: the counter flush in `Guard::drop` is an unconditional
-/// `fetch_add` on a writable view, so a frozen tree that reported itself
-/// writable would kill the process on the *first lookup*, not on an attempted
-/// publish. Mutant: make `ArenaBacking::Frozen`'s `is_writable` return `true` ⇒
-/// verified, this test aborts with SIGSEGV on the `drop(g)` below. Second
-/// mutant: bypass the `!self.arena.is_writable()` branch in `Tree::frame` ⇒
-/// verified, SIGSEGV on the unknown-name probe.
+/// Mutant: `ArenaBacking::Frozen`'s `is_writable` returns `true`, or bypass the
+/// `is_writable` branch in `Tree::frame` ⇒ SIGSEGV.
 #[test]
 fn a_frozen_tree_refuses_every_mutation() {
     let live = fixture();
@@ -309,19 +236,14 @@ fn a_frozen_tree_refuses_every_mutation() {
     live.freeze_to(scratch.path(), None, [0; 32], 0).unwrap();
     let frozen = Tree::open_frozen(scratch.path()).unwrap();
 
-    // A lookup must still work — this is the line that faults under the mutant.
+    // Faults under the first mutant.
     let g = frozen.guard();
     drop(g);
     assert!(frozen
         .lookup("map", "imu", Stamp::<SystemDomain>::from_nanos(1800 * MS))
         .is_ok());
 
-    // Resolving a name the file *does not* contain must be an error, not a
-    // fault. `Tree::frame` interns on demand, and interning publishes into the
-    // frame hash table with a `compare_exchange` — through a `PROT_READ`
-    // mapping that is a `SIGSEGV`, and it is reachable from the most ordinary
-    // possible typo. The read-only branch that catches it predates this
-    // backend; what is new is that a frozen tree takes it.
+    // Interning an unknown name would write through a `PROT_READ` mapping.
     assert!(
         frozen.frame("a_frame_that_was_never_declared").is_err(),
         "interning through a read-only mapping must not be attempted"
@@ -336,46 +258,15 @@ fn a_frozen_tree_refuses_every_mutation() {
     assert!(!frozen.is_shared());
 }
 
-/// **A frozen tree refuses `await_frames` instead of napping through the
-/// caller's budget.**
+/// A frozen tree refuses `await_frames` at once instead of sleeping through the
+/// caller's budget (`docs/decisions/0019`).
 ///
-/// `is_writable()` is `false` on a `.tft`, so the `WritableTree` guard does not
-/// catch it and the poll loop would run — for a name that can never appear,
-/// because §2.4 gives a frozen arena no writers at all. The refusal is the
-/// sibling of the writable one and rests on the same argument from
-/// `docs/decisions/0019`: a wait that cannot mean what the caller thinks should
-/// answer, not sleep.
-///
-/// **The absent name is asked first, and the ordering is the test's design.**
-/// A guard-less build answers a *present* name in microseconds — measured by
-/// timing `await_frames(["map"])` under that mutation, `Ok([FrameId(1)])` in
-/// **19.289 µs** — so a test that only asked for `map` would catch the mutant on
-/// the value but never on the clock, and would say nothing at all about the
-/// futile wait this guard exists to prevent. Asking for a name the file does not
-/// contain, against a **300 ms** budget, puts the mutant in the poll loop where
-/// both assertions can see it.
-///
-/// The budget is short on purpose: a guard-less build polls for the whole
-/// budget before it answers `Timeout`, so the budget is what the mutant costs,
-/// and 300 ms keeps that failure under a second instead of wedging the suite.
-/// `.config/nextest.toml` would bound a wait only at 180 s (`slow-timeout`'s 60 s
-/// period, `terminate-after = 3`), and would report it as a timeout rather than
-/// as this assertion.
-///
-/// **Mutants, each applied, run, observed and reverted:**
-/// - `if false && self.arena.is_frozen()` ⇒ *"assertion `left == right` failed:
-///   elapsed 300.090015ms — left: Err(Timeout { hash: 7284396103932369152 }),
-///   right: Err(FrozenTree)"*.
-/// - `ArenaBacking::is_frozen` returns `false` for `Frozen` ⇒ *"elapsed
-///   300.062125ms — left: Err(Timeout { hash: 7284396103932369152 }), right:
-///   Err(FrozenTree)"*, identical.
-/// - `is_frozen` returns `true` for `Mapped` ⇒ **not** caught here, and it
-///   cannot be: this file never constructs a live shared tree. Verified against
-///   `tests/rendezvous.rs`'s
-///   `a_consumer_waits_for_a_frame_interned_after_the_arena_exists`, which fails
-///   *"the frame was interned well inside the budget: FrozenTree"* — so the two
-///   halves of the predicate are pinned by two targets, in two recipes
-///   (`just shm-check` and `just shm-rendezvous`).
+/// The absent name is asked first against a 300 ms budget: only there does a
+/// guard-less build poll and time out, so both assertions can see the mutant.
+/// Mutants: `ArenaBacking::is_frozen` false for `Frozen`, or the guard removed
+/// ⇒ `Timeout` instead of `FrozenTree`. `is_frozen` true for `Mapped` is caught
+/// by `tests/rendezvous.rs`
+/// `a_consumer_waits_for_a_frame_interned_after_the_arena_exists`.
 #[test]
 fn a_frozen_tree_refuses_to_wait_for_a_frame() {
     use std::time::{Duration, Instant};
@@ -388,7 +279,6 @@ fn a_frozen_tree_refuses_to_wait_for_a_frame() {
     let frozen = Tree::open_frozen(scratch.path()).unwrap();
     assert!(!frozen.is_writable(), "a .tft is permanently read-only");
 
-    // The absent name first, because it is the one with somewhere to fail.
     let budget = Duration::from_millis(300);
     let started = Instant::now();
     let absent = frozen.await_frames(["a_frame_that_was_never_declared"], budget);
@@ -400,19 +290,14 @@ fn a_frozen_tree_refuses_to_wait_for_a_frame() {
          by construction and must not be attempted: {elapsed:?}"
     );
 
-    // And a name the file *does* contain is refused just the same: the refusal
-    // is about the handle, not about the request.
+    // Refused even for a present name: the refusal is about the handle.
     let present = frozen.await_frames(["map"], Duration::from_secs(5));
     assert_eq!(present, Err(AwaitError::FrozenTree));
 }
 
-/// A `.tft` written by a build with a different layout is refused, with both
-/// hashes named (§2.4, NORMATIVE).
+/// A `.tft` with a different layout is refused, naming both hashes (§2.4).
 ///
-/// The file is otherwise perfect and only the `layout_hash` word is scrambled,
-/// which is the exact shape of the real failure: the same tool, rebuilt after a
-/// record grew. Mutant: drop the `layout_hash` comparison in
-/// `FrozenArena::open` ⇒ the open succeeds and the assertion fails.
+/// Mutant: drop the `layout_hash` comparison in `FrozenArena::open`.
 #[test]
 fn a_stale_tft_is_refused_and_names_both_hashes() {
     use std::io::{Seek, SeekFrom, Write};
@@ -440,35 +325,13 @@ fn a_stale_tft_is_refused_and_names_both_hashes() {
     );
 }
 
-/// Freezing the same quiesced arena twice produces the same file, byte for byte
-/// (modulo the timestamp the caller supplies).
+/// §2.3: the bytes go to a sibling temporary and are `rename`d over `path`.
 ///
-/// This is what makes a `.tft` cacheable and diffable, and it is only true
-/// because the manifest encoder uses CBOR's preferred (shortest-form)
-/// serialization. Mutant: in `cbor::Writer::head`, always emit the 8-byte form
-/// (`self.head`'s final branch) ⇒ still deterministic, so this test survives it
-/// — the property it pins is determinism, *not* shortest-form, and the RFC
-/// vectors in `cbor.rs` are what pin the latter.
-/// §2.3: the bytes go to a **sibling temporary** and are `rename`d over `path`.
+/// The inode is the assertion: a value comparison passes even when `freeze_to`
+/// writes in place. `rename` keeps an interrupted freeze from wearing the name
+/// `open_frozen` will read, and keeps a currently mapped image intact.
 ///
-/// **The inode is the assertion**, and it has to be: freezing twice and comparing
-/// the numbers read back passes just as well when `freeze_to` writes straight to
-/// `path`, so until this test existed the property was asserted nowhere in the
-/// repository — the whole suite passed with the `rename` deleted.
-///
-/// Why it matters is `write_frozen`'s `ftruncate`: an interrupted freeze leaves a
-/// **full-length** file with a zeroed tail, not a short one. At a temporary name
-/// that file is unlinked and forgotten. At `path` it is what next week's
-/// `open_frozen` finds, and it fails `BadMagic` only because the header is
-/// published last — a partial file that happened to keep a valid header would be
-/// silently wrong instead. `rename` is what keeps such a file from ever wearing
-/// the name somebody will open.
-///
-/// It is also what makes re-freezing over a *currently mapped* path safe, which
-/// the second half checks: the open tree keeps the old inode and its answers.
-///
-/// Mutant: `File::create(path)` instead of `File::create(&tmp)` with the
-/// `rename` removed ⇒ the inode is unchanged and the first assertion fails.
+/// Mutant: `File::create(path)` with no `rename` ⇒ the inode is unchanged.
 #[test]
 fn freezing_replaces_the_target_by_rename_not_in_place() {
     use std::os::unix::fs::MetadataExt;
@@ -478,8 +341,7 @@ fn freezing_replaces_the_target_by_rename_not_in_place() {
     live.freeze_to(s.path(), Some("src"), [7; 32], 99).unwrap();
     let first_ino = std::fs::metadata(s.path()).unwrap().ino();
 
-    // Hold the first image open across the second freeze: this mapping is what
-    // the rename exists to protect.
+    // The mapping the rename exists to protect.
     let held = Tree::open_frozen(s.path()).unwrap();
     let (target, source, at) = probes()[0];
     let before = held
@@ -501,18 +363,8 @@ fn freezing_replaces_the_target_by_rename_not_in_place() {
         "the mapping held open across the freeze changed answers"
     );
 
-    // The temporary is a sibling and is gone. A temporary in `/tmp` would make
-    // the `rename` non-atomic whenever `path` is on another filesystem — so the
-    // sibling is required, and its removal is what this asserts.
-    //
-    // **The directory `Scratch` owns holds exactly the target and nothing
-    // else.** Deliberately not "no entry matching `.{stem}.tmp.`": that
-    // predicate is a copy of `frozen.rs`'s *private* `temp_sibling` naming
-    // scheme, so renaming that scheme would leave this assertion matching
-    // nothing and passing forever while real litter piled up — the test's whole
-    // job is proving `freeze_to` cleans up. Naming what must be present instead
-    // of what must be absent needs no knowledge of the scheme at all, and it
-    // also catches a temporary written under a name nobody predicted.
+    // Names what must be present rather than matching the private temporary
+    // naming scheme, so a renamed scheme cannot make this pass vacuously.
     assert_eq!(
         s.entries(),
         vec![s.path().file_name().unwrap().to_owned()],
@@ -520,6 +372,8 @@ fn freezing_replaces_the_target_by_rename_not_in_place() {
     );
 }
 
+/// Freezing the same arena twice gives the same bytes: the property is
+/// determinism, not shortest-form CBOR (pinned by the RFC vectors in `cbor.rs`).
 #[test]
 fn freezing_twice_produces_the_same_bytes() {
     let live = fixture();
@@ -533,19 +387,10 @@ fn freezing_twice_produces_the_same_bytes() {
     );
 }
 
-/// `samples` is what the **file** holds; `pushes_total` is what the source
-/// pushed. On a lapped ring those differ by 4x, and conflating them is a rate
-/// error, not a rounding one.
+/// `samples` is what the file holds (511 on a lapped 512 ring); `pushes_total`
+/// is what was pushed (2048). The lapped fixture is what makes them differ.
 ///
-/// The fixture is load-bearing here in a way it is nowhere else: 2048 pushes
-/// into 512 slots. On a ring that had *not* lapped both keys would carry the
-/// same number and this test would pass no matter which one the encoder emitted
-/// — which is precisely how the original defect survived review. 511, not 512,
-/// because the slot at `head & mask` is the one being overwritten and is not
-/// retained (`SampleRing::retained`).
-///
-/// Mutant: emit `e.head` for `samples` (the pre-amendment encoding) ⇒ the
-/// `samples` value becomes `0x19 0x08 0x00` and both assertions below fail.
+/// Mutant: emit `e.head` for `samples` ⇒ both assertions fail.
 #[test]
 fn the_manifest_separates_what_the_file_holds_from_what_was_pushed() {
     let live = fixture();
@@ -571,21 +416,13 @@ fn the_manifest_separates_what_the_file_holds_from_what_was_pushed() {
         3,
         "expected 2048 total pushes on each of the 3 lapped edges"
     );
-    // And the all-time count must never appear *as* `samples`.
     assert_eq!(count(m, b"\x67samples\x19\x08\x00"), 0);
 }
 
-/// The manifest is real CBOR and carries the frames and edges §2.3 asks for.
+/// The manifest is CBOR naming the frames and edges §2.3 asks for, checked on the
+/// encoded bytes (no CBOR dev-dependency).
 ///
-/// Decoded here by hand rather than with a CBOR crate, because adding one as a
-/// dev-dependency to check a seven-key map would be a bigger commitment than the
-/// thing being checked. The assertions are on the *encoded* bytes, which is the
-/// strongest form: the frame name must appear as a length-prefixed text string
-/// with the right prefix byte, so a length that disagreed with the payload would
-/// fail. Mutant: emit `w.array(frames - 1)` and iterate `1..frames` — the
-/// off-by-one that `edge_count`'s *opposite* convention invites, since that
-/// field really does carry a sentinel — ⇒ verified, the array header byte
-/// becomes `0x84` and the assertion fails.
+/// Mutant: `w.array(frames - 1)` ⇒ the array header becomes `0x84`.
 #[test]
 fn the_manifest_is_cbor_and_names_the_frames() {
     let live = fixture();
@@ -616,44 +453,14 @@ fn the_manifest_is_cbor_and_names_the_frames() {
     assert!(m.windows(9).any(|w| w == b"\x68bag.mcap"));
 }
 
-/// **The committed tag-1 fixture still reads, and still carries tag 1.**
+/// The committed tag-1 fixture `testdata/frozen/sensor_domain.tft` still reads
+/// and still carries tag 1 (`0038` step 4).
 ///
-/// `testdata/frozen/sensor_domain.tft` exists so `0038` step 4's verification can
-/// be written at all: Python cannot construct an arena whose edges carry a
-/// non-zero time domain, so before this file every Python query site could have
-/// been reverted to the pre-`0038` `Stamp::<SystemDomain>` spelling with the
-/// suite staying green. `testdata/frozen/README.md` and
-/// `crates/tf_tree/examples/gen_domain_fixture.rs` carry the argument.
-///
-/// This test is what stops the fixture going stale silently. A `.tft` is
-/// version- and layout-checked on open, so a `FORMAT_VERSION` or `layout_hash`
-/// change makes the file unreadable — and it would be unreadable *in a Python
-/// test run*, which is not where a Rust format change should first be noticed.
-/// Here it fails naming the regenerator — in `just shm-check`, not in
-/// `just test`: this target carries `required-features = ["shm"]`, so
-/// `cargo nextest run --workspace` does not list it. *This line said
-/// `just test` until 2026-09-05.*
-///
-/// It is also the Rust-side red arm for a forgotten region stride — see
-/// `docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md`,
-/// which cites this test as the answer to its question 1. It is not the only
-/// place that failure lands: `tests/python/test_domains.py` and
-/// `tests/python/test_extrapolation.py` open this same file through
-/// `tf_tree.open_file`, so `just py-test` stops opening it too. The two arms
-/// are worth telling apart, because it goes red in both and says something
-/// different: a twelfth region with the stride array updated fails here as
-/// `LayoutMismatch`, which is a true statement about version skew; with the
-/// stride forgotten it fails as `HeaderInconsistent`, which `docs/RUNBOOK.md`
-/// tells an operator to treat as corruption. Since the stride array is
-/// declared `[u32; N_REGIONS + 1]` (`crates/tf_tree_arena/src/layout.rs`), the
-/// build that forgot the stride now fails with `error[E0308]` first, so the
-/// second arm is reached only by taking rustc's suggestion to pin the length
-/// back to a literal.
-///
-/// **Properties, not bytes.** Two freezes of one tree are never byte-identical:
-/// the header carries `created_unix_ns`, `creator_pid`, `boot_id` and
-/// `instance_uuid`. A `memcmp` gate would fail on every run and teach people to
-/// delete it.
+/// It fails naming the regenerator when `FORMAT_VERSION` or `layout_hash`
+/// changes, in `just shm-check`. It is also the Rust-side red arm for a forgotten
+/// region stride (`docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md`
+/// question 1): `LayoutMismatch` for version skew, `HeaderInconsistent` for a
+/// forgotten stride. Properties, not bytes: two freezes never match bytewise.
 #[test]
 fn the_committed_sensor_domain_fixture_reads_and_is_still_tag_one() {
     use tf_tree::{Domain, SensorDomain};
@@ -677,7 +484,6 @@ fn the_committed_sensor_domain_fixture_reads_and_is_still_tag_one() {
     let lidar = tree.frame("lidar").unwrap();
     let plan = tree.plan(map, base).unwrap();
 
-    // The property the whole fixture exists for.
     assert_eq!(
         plan.domain(),
         SensorDomain::TAG,
@@ -686,13 +492,12 @@ fn the_committed_sensor_domain_fixture_reads_and_is_still_tag_one() {
     );
 
     let g = tree.guard();
-    // Tag 1 answers...
     let want = plan
         .at(&g, Stamp::<SensorDomain>::from_nanos(75_000_000))
         .expect("the fixture's own domain must answer");
-    // ...and the tagged spelling agrees with it, which is what the bindings call.
+    // The tagged spelling is what the bindings call.
     assert_eq!(plan.at_tagged(&g, 75_000_000, SensorDomain::TAG), Ok(want));
-    // ...and tag 0 does not, which is what makes a mis-tagged binding observable.
+    // Tag 0 must not answer.
     assert_eq!(
         plan.at(&g, Stamp::<SystemDomain>::from_nanos(75_000_000)),
         Err(tf_tree::LookupError::TimeDomainMismatch {
@@ -702,8 +507,7 @@ fn the_committed_sensor_domain_fixture_reads_and_is_still_tag_one() {
         "a tag-0 query answered a tag-1 plan"
     );
 
-    // A route through the static edge, so the Python batch calls have something
-    // to fold that is more than one step.
+    // A route through the static edge, folding more than one step.
     let through_static = tree.plan(map, lidar).unwrap();
     assert_eq!(through_static.domain(), SensorDomain::TAG);
     through_static

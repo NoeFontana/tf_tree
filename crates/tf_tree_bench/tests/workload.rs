@@ -1,32 +1,14 @@
-//! The workload catalogue's own gate.
-//!
-//! Every performance harness in this crate is driven by
-//! [`tf_tree_bench::workload::CATALOGUE`], and every one of them reports
-//! numbers. The failure mode that matters is therefore not a crash: it is a
-//! sweep that runs green while measuring nothing — a query pair that does not
-//! resolve, a stamp window that no edge covers, a fleet whose cross-robot path
-//! exceeds `MAX_DEPTH` once folded (or `MAX_PATH_EDGES` before it is). Each of
-//! those turns a benchmark row into a timing of
-//! the error path, and none of them is visible in the output.
-//!
-//! So this file builds **every** catalogue entry and asserts, for each, that its
-//! pairs compile, that a query at both ends of its window is answered, and that
-//! the shape it reported is the shape it built. Adding a catalogue entry without
-//! adding a test is the point: the test is written once, over the catalogue.
-//!
-//! `extreme_wide` is deliberately included despite costing seconds. It is the
-//! entry most likely to break — it is the one near the arena's `u32` ceiling —
-//! and a limit that is only found by the harness that trips over it in a
-//! 30-minute run is not a limit anybody has documented.
-// `panic!` is in this list deliberately: every assertion here is over the whole
-// catalogue in a loop, so a failure that does not name the entry it came from
-// costs a bisect through seven workloads to find out which one broke.
+//! The workload catalogue's own gate: every entry is built and its pairs must
+//! compile, be answered at both ends of its window, and match the reported
+//! shape, so no benchmark sweep times the error path. `extreme_wide` is included
+//! despite costing seconds; it is near the arena's `u32` ceiling.
+// `panic!`: a failure must name the catalogue entry it came from.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use tf_tree::{InterpPolicy, Stamp};
 use tf_tree_bench::workload::{self, Backing, Workload};
 
-/// Build a workload on the heap, with the tf2-comparable interpolation policy.
+/// Build a workload on the heap with the tf2-comparable interpolation policy.
 fn build(w: &Workload) -> workload::Built {
     w.build(InterpPolicy::LerpSlerp, Backing::Heap)
         .unwrap_or_else(|e| panic!("building workload {}: {e:#}", w.name))
@@ -34,10 +16,8 @@ fn build(w: &Workload) -> workload::Built {
 
 #[test]
 fn every_catalogue_entry_estimates_before_it_is_built() {
-    // `estimate` is what a harness calls to decide whether it can afford a
-    // workload. If it disagrees with what `build` produces, that decision is
-    // made on a wrong number — and the disagreement would only ever be noticed
-    // as an unexplained OOM.
+    // `estimate` decides whether a harness can afford a workload; it must agree
+    // with `build`.
     for w in workload::CATALOGUE {
         let estimated = w
             .estimate()
@@ -64,8 +44,7 @@ fn every_catalogue_entry_estimates_before_it_is_built() {
             "{}: estimated arena size disagrees with the built tree",
             w.name
         );
-        // `estimate` cannot know this one — folding is a property of the
-        // compiled plan — and it must say so rather than guess.
+        // Folding is a property of the compiled plan, so `estimate` must not guess.
         assert!(
             estimated.dyn_steps.is_none(),
             "{}: estimate claimed a dynamic-step count it cannot know",
@@ -84,10 +63,9 @@ fn every_catalogue_entry_answers_at_both_ends_of_its_window() {
         assert!(!plans.is_empty(), "{}: no query pairs", w.name);
 
         let guard = built.tree.guard();
-        // Both ends and the middle. The ends are where an off-by-one in ring
-        // sizing shows up: `docs/PHASE1.md`'s ring retains `cap - 1` samples, so
-        // a workload sized for exactly its sample count loses the oldest one —
-        // which is precisely what the window's lower bound points at.
+        // Both ends and the middle: the ring retains `cap - 1` samples
+        // (`docs/PHASE1.md`), so the window's lower bound is where a sizing
+        // off-by-one shows.
         for frac in [0.0, 0.5, 1.0] {
             let stamp: Stamp = Stamp::from_nanos(built.stamp_at(frac));
             let mut answered = 0usize;
@@ -111,11 +89,8 @@ fn every_catalogue_entry_answers_at_both_ends_of_its_window() {
 
 #[test]
 fn every_catalogue_entry_states_a_dynamic_step_count() {
-    // `docs/PHASE1.md` §11.3, normative: "Every reported latency row must state
-    // its dynamic-step count, not just its nominal depth." A workload whose
-    // deepest plan folds to zero dynamic steps is all-static — it would report a
-    // beautiful latency for a path that never touches the sampling code the gate
-    // exists to bound.
+    // `docs/PHASE1.md` §11.3, normative: every latency row states its
+    // dynamic-step count; an all-static workload would time no sampling code.
     for w in workload::CATALOGUE {
         let built = build(w);
         let steps = built
@@ -139,10 +114,8 @@ fn every_catalogue_entry_states_a_dynamic_step_count() {
 
 #[test]
 fn the_fleet_query_actually_crosses_the_fleet() {
-    // The whole reason `fleet_*` exists is that its query leaves one robot's
-    // subtree and enters another's. If it did not, the row would be the `robot`
-    // row with more frames in the arena — the same number, differently labelled,
-    // which is worse than no row.
+    // The query must leave one robot's subtree and enter another's, or the row
+    // is `robot` with more frames.
     let w = workload::by_name("fleet_16").expect("fleet_16 in the catalogue");
     let built = build(w);
     let (target, source) = &built.pairs[0];
@@ -160,10 +133,8 @@ fn the_fleet_query_actually_crosses_the_fleet() {
 
 #[test]
 fn the_robot_workload_is_the_depth_three_chain_the_gate_is_pinned_to() {
-    // `docs/PHASE1.md` §11.3 pins the go/no-go gate to three *dynamic* steps.
-    // `robot` is the continuity anchor for every other row in the suite, so if
-    // it ever stops being that chain, every comparison against a committed
-    // number silently changes meaning.
+    // `docs/PHASE1.md` §11.3 pins the gate to three dynamic steps; `robot` anchors
+    // every other row.
     let w = workload::by_name("robot").expect("robot in the catalogue");
     let built = build(w);
     assert_eq!(built.pairs, vec![("imu_link".to_owned(), "map".to_owned())]);
@@ -174,12 +145,9 @@ fn the_robot_workload_is_the_depth_three_chain_the_gate_is_pinned_to() {
 
 #[test]
 fn every_publisher_edge_can_be_claimed_and_continued() {
-    // The reader harnesses run a live publisher so the seqlock retry path is
-    // exercised. Two ways that silently fails: an edge that cannot be claimed
-    // (population left a writer alive), and a `next_stamp_ns` that is not after
-    // the last populated sample — which `push` rejects as out of order, leaving
-    // a "publisher" that publishes nothing and a reader benchmark back on a
-    // quiescent tree.
+    // The reader harnesses run a live publisher, so an edge must be claimable
+    // and `next_stamp_ns` must be after the last populated sample, or `push`
+    // rejects it as out of order.
     for w in workload::CATALOGUE {
         let built = build(w);
         assert!(

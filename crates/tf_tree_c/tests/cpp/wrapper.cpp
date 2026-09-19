@@ -1,12 +1,6 @@
-// The C++ wrapper, exercised. docs/PHASE4.md §4 and §6.2.
-//
-// Built four ways by `just cpp-check` — {gcc, clang} x {exceptions,
-// -fno-exceptions} — and again at C++17 and C++20, because §6.2 asks for both
-// standards and both compilers and the error-mode split doubles it.
-//
-// There is no test framework on purpose. The wrapper is header-only inline
-// code, so adding a dependency to test it would put more third-party code in
-// the compilation than there is code under test.
+// The C++ wrapper, exercised (docs/PHASE4.md §4, §6.2). Built by `just cpp-check`
+// with {gcc, clang} x {exceptions, -fno-exceptions} at C++17 and C++20. No test
+// framework, by design.
 
 #include "tf_tree.hpp"
 
@@ -15,32 +9,16 @@
 #include <cstring>
 #include <vector>
 
-// The fixture constructor is a `--features test-hooks` symbol and deliberately
-// absent from the shipped headers. Declared by hand, `extern "C"` so the name
-// does not mangle.
+// Test-hooks fixture constructor, absent from the shipped headers.
 extern "C" {
 tft_status tft_test_publishable_tree_create(tft_tree** out);
 tft_status tft_test_tree_create(tft_tree** out);
 tft_status tft_test_domain_tree_create(std::uint8_t domain, tft_tree** out);
 }
 
-// **A linker-level shim that records where the C ABI was told to write.**
-//
-// `run.sh` links this file with `-Wl,--wrap=tft_plan_at`, which redirects the
-// call sites in this translation unit to `__wrap_tft_plan_at` and leaves the
-// real function reachable as `__real_tft_plan_at`. It exists for one assertion
-// — `check_at_writes_into_the_returned_object` — and that assertion cannot be
-// made any other way: the property is that `Plan::at<T>` hands the ABI the
-// address of the object it is about to *return*, and only the callee can see
-// the pointer it was given.
-//
-// **Deliberately not a `--features test-hooks` symbol on the Rust side.** The
-// §7 gate-2 benchmark links the same archive, so recording the pointer inside
-// `tft_plan_at` would put a store into the hot path that the gate measures. A
-// linker wrap is confined to this binary.
-//
-// The shim forwards unconditionally, so every other test in this file calls
-// through it and sees the real function's behaviour.
+// Linker shim (`-Wl,--wrap=tft_plan_at`, see `run.sh`) recording where the ABI is
+// told to write, for `check_at_writes_into_the_returned_object`. It is not a Rust
+// test-hooks symbol because that would put a store in the gate-2 hot path.
 #ifdef TF_TREE_WRAP_PLAN_AT
 extern "C" {
 tft_status __real_tft_plan_at(const tft_plan* plan, std::int64_t stamp, tft_layout layout,
@@ -65,19 +43,9 @@ static int failures = 0;
         }                                                                     \
     } while (0)
 
-// The two error modes return different types, so the test bodies need a shim.
-// Both halves are real assertions, not one real and one nominal:
-//
-//   * no-exceptions — `CHECK_R` tests the `expected`'s bool, and `CHECK_CALL`
-//     evaluates the call and tests its result.
-//   * exceptions — a failure *throws*, and nothing here catches except where
-//     the throw is what is under test. An uncaught `tf_tree::Error` calls
-//     `std::terminate`, so the binary exits non-zero and the test fails. The
-//     assertion is that control reaches the next line.
-//
-// `CHECK_R` takes an already-computed result; `CHECK_CALL` takes an expression
-// that must be evaluated exactly once. Folding them into one macro is what
-// produced `((expr), true)` and a wall of `-Wunused-value`.
+// `CHECK_R` tests an already-computed result; `CHECK_CALL` evaluates its
+// expression exactly once. In exceptions mode an uncaught failure terminates the
+// binary, so reaching the next line is the assertion.
 #ifdef TF_TREE_NO_EXCEPTIONS
 #define VALUE_OF(expr) (*(expr))
 #define CHECK_R(expr, msg) CHECK(static_cast<bool>(expr), msg)
@@ -92,9 +60,6 @@ static int failures = 0;
     } while (0)
 #endif
 
-// ---------------------------------------------------------------------------
-// Layout selection is by type, and it is the right layout
-// ---------------------------------------------------------------------------
 
 static_assert(tf_tree::layout_of<tf_tree::Quat7>::value == TFT_LAYOUT_QVEC7_WXYZ, "");
 static_assert(tf_tree::layout_of<tf_tree::Mat4Row>::value == TFT_LAYOUT_MAT4_ROW, "");
@@ -102,68 +67,30 @@ static_assert(tf_tree::layout_of<tf_tree::Quat7Twist6>::value == TFT_LAYOUT_QVEC
               "");
 
 #ifdef TF_TREE_HAS_EIGEN
-// **The trap §4.2 exists to close.** `Eigen::Isometry3d` is column-major, so
-// selecting `MAT4_ROW` for it would hand back the transpose — a valid rotation
-// pointing the wrong way, with the translation read out of the bottom row as
-// zeros. This assert is the whole reason layouts are chosen by type.
+// The §4.2 trap: `Eigen::Isometry3d` is column-major, so `MAT4_ROW` would return
+// the transpose. This is why layouts are chosen by type.
 static_assert(tf_tree::layout_of<Eigen::Isometry3d>::value == TFT_LAYOUT_MAT4_COL,
               "Eigen::Isometry3d is column-major; MAT4_ROW would be its inverse");
 #endif
 
 #ifdef TF_TREE_HAS_SOPHUS
-// Eigen/Sophus store quaternions (x, y, z, w) even though the constructor takes
-// (w, x, y, z). WXYZ here would be a different, still-unit quaternion.
+// Eigen/Sophus store quaternions (x, y, z, w).
 static_assert(tf_tree::layout_of<Sophus::SE3d>::value == TFT_LAYOUT_QVEC7_XYZW,
               "Sophus stores x,y,z,w; QVEC7_WXYZ would be a different rotation");
 #endif
 
-// ---------------------------------------------------------------------------
-// The working path
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// The two things the header asserts that only a run can check
-// ---------------------------------------------------------------------------
 
-/// **`tf_tree::payload_bytes` must agree with `tft_layout_size`.**
-///
-/// The header needs the sizes at compile time and the C ABI's function is not
-/// `constexpr`, so they are written twice. Two sources of truth for a buffer
-/// size on an FFI boundary is exactly the shape of bug that ends in an overrun,
-/// so this walks every layout and pins them together.
-///
-/// Mutant: change any entry in the header's `payload_bytes` ⇒ fails here, at
-/// the first affected layout.
-/// **The §3.6 ABI check must actually have run, before `main`.**
-///
-/// It did not, for the whole of this file's first life: it lived in a
-/// function-local static called only from `Tree::open()`, which is
-/// `#ifdef TFT_HAVE_SHM` — a macro nothing in the build defines. So the check
-/// was unreachable in every configuration this suite compiles, and no test
-/// noticed, because no test asked.
-///
-/// Mutant: remove `inline const AbiCheck abi_check_instance{};` from the header
-/// ⇒ this fails. Mutant: put it back behind `#ifdef TFT_HAVE_SHM` ⇒ also fails.
+/// `tf_tree::payload_bytes` agrees with `tft_layout_size` for every layout.
+/// The §3.6 ABI check has run before `main`.
 static void check_abi_guard_ran()
 {
     CHECK(tf_tree::detail::abi_check_ran,
           "the §3.6 ABI check did not run; a mismatched ABI would go undetected");
 }
 
-/// **The no-exceptions `expected` must not touch the error machinery on
-/// success.**
-///
-/// It did: `expected<T>` stored a plain `Error`, whose constructor calls
-/// `tft_last_error`, so every successful lookup made an extra FFI call and
-/// copied 320 bytes. That put the `-fno-exceptions` build at 1.064x the raw C
-/// ABI against §7 gate 2's 1.02 — while the exceptions build, which is the one
-/// the benchmark compiled, measured 1.002x and reported a pass.
-///
-/// Constructing an `expected` here and observing that the thread-local error
-/// slot is untouched is the cheap structural version of that measurement.
-///
-/// Mutant: give `expected<T>` a plain `Error error_` again ⇒ the slot is
-/// overwritten with TFT_OK and this fails.
+/// The no-exceptions `expected` does not touch the error machinery on success
+/// (§7 gate 2).
 #ifdef TF_TREE_NO_EXCEPTIONS
 static void check_success_does_not_touch_the_error_slot()
 {
@@ -171,7 +98,7 @@ static void check_success_does_not_touch_the_error_slot()
     CHECK(tft_test_tree_create(&raw) == TFT_OK, "fixture");
     tf_tree::Tree tree = tf_tree::Tree::adopt(raw);
 
-    // Provoke a real failure, so the thread-local slot holds something specific.
+    // Provoke a real failure so the slot holds something specific.
     auto bad = tree.plan("map", "no_such_frame");
     CHECK(!bad, "the provoking call must fail");
 
@@ -180,9 +107,7 @@ static void check_success_does_not_touch_the_error_slot()
     CHECK(tft_last_error(&before) == TFT_OK, "read the slot");
     CHECK(before.code == TFT_ERR_UNKNOWN_FRAME, "the slot holds the failure");
 
-    // A *successful* wrapper call must not disturb it. (`tft_plan_create`
-    // itself clears the slot on entry, so go through a path that succeeds
-    // without calling into the library again: construct the expected directly.)
+    // A successful wrapper call must not disturb it; construct the expected directly.
     {
         const tf_tree::expected<tf_tree::Quat7> ok{tf_tree::Quat7{1, 0, 0, 0, 0, 0, 0}};
         CHECK(static_cast<bool>(ok), "a value-constructed expected is a success");
@@ -205,31 +130,13 @@ static void check_payload_sizes_agree()
               "the header's compile-time payload size disagrees with the library's");
         CHECK(tft_layout_size(l) != 0, "every listed layout must be one the library defines");
     }
-    // An unknown discriminant must be 0 in both, so neither can be used to size
-    // a buffer for a layout this build does not implement.
+    // An unknown discriminant is 0 in both.
     CHECK(tf_tree::payload_bytes(9999) == 0, "unknown layout, header");
     CHECK(tft_layout_size(9999) == 0, "unknown layout, library");
 }
 
-/// **`publishable` must agree with the library about which layouts are
-/// output-only**, or the `static_assert` in `push` is a compile error for a call
-/// that would have worked, or — far worse — absent for one that would not.
-///
-/// The predicate is a mirror of a decision made in `layout::read`, exactly as
-/// `payload_bytes` mirrors `tft_layout_size`, so it gets the same treatment: the
-/// header's compile-time answer is checked against the library's run-time one
-/// for every layout, rather than trusted.
-///
-/// The direction that matters is the second `CHECK`. `push` cannot be *called*
-/// with an unpublishable layout any more — that is the point of the change — so
-/// this drives `tft_publisher_push` directly, which is the only way left to ask
-/// the library what it thinks.
-///
-/// Mutant, run: `publishable` returns `true` for everything (and the two
-/// negative `static_assert`s above are removed, or they fail to compile first)
-/// ⇒ two failures, both "the header says publishable but the library refuses
-/// the layout" — one for each output-only layout. Reverse mutant: teach
-/// `layout::read` to accept the twist layout ⇒ the `else` arm fires instead.
+/// `publishable` agrees with the library about which layouts are output-only,
+/// checked against `tft_publisher_push` directly.
 static void check_publishable_agrees_with_the_library()
 {
     static_assert(!tf_tree::publishable(TFT_LAYOUT_QVEC7_WXYZ_TWIST6),
@@ -245,9 +152,7 @@ static void check_publishable_agrees_with_the_library()
     CHECK_R(pub_r, "claim");
     tf_tree::Publisher pub = std::move(VALUE_OF(pub_r));
 
-    // Big enough for the widest payload, and a valid identity pose for the
-    // layouts that will actually read it — so a refusal is about the layout and
-    // not about the bytes.
+    // A valid identity pose, so a refusal is about the layout.
     double buf[16] = {};
     buf[0] = 1.0;  // qw for the QVEC7 orders
     const tft_layout all[] = {TFT_LAYOUT_QVEC7_WXYZ,       TFT_LAYOUT_QVEC7_XYZW,
@@ -267,26 +172,15 @@ static void check_publishable_agrees_with_the_library()
 }
 
 #ifdef TF_TREE_HAS_EIGEN
-/// **The premise behind `raw_writable<Eigen::Isometry3d>`.**
-///
-/// `Eigen::Isometry3d` is not `std::is_trivially_copyable` — it declares its own
-/// copy constructor — so the wrapper opts it in explicitly. What that opt-in
-/// actually claims is that the object's storage is a plain `double` array
-/// starting at offset 0, which is the property a raw layout write needs and
-/// which no standard trait expresses. It is claimed in a comment in the header;
-/// this is where it is checked.
-///
-/// Mutant: were Eigen ever to add a member before the matrix — a vtable, a
-/// tag — this fails, and `at<Eigen::Isometry3d>` would otherwise be writing 128
-/// bytes over it.
+/// The premise behind `raw_writable<Eigen::Isometry3d>`: its storage is a plain
+/// `double` array at offset 0.
 static void check_eigen_storage_premise()
 {
     Eigen::Isometry3d iso = Eigen::Isometry3d::Identity();
     CHECK(static_cast<const void*>(iso.matrix().data()) == static_cast<const void*>(&iso),
           "Eigen::Isometry3d's storage must start at offset 0 for the raw write to be valid");
     CHECK(sizeof(Eigen::Isometry3d) == 128, "and be exactly the payload, so an array is packed");
-    // An array of them must be contiguous with no gaps, which is what makes the
-    // batch path zero-copy rather than merely convenient.
+    // An array is contiguous, which makes the batch path zero-copy.
     Eigen::Isometry3d arr[3];
     const auto* p0 = reinterpret_cast<const unsigned char*>(&arr[0]);
     const auto* p1 = reinterpret_cast<const unsigned char*>(&arr[1]);
@@ -311,9 +205,7 @@ static void check_read_path()
     CHECK_R(plan_r, "plan map <- sensor");
     tf_tree::Plan plan = std::move(VALUE_OF(plan_r));
 
-    // The same stamp, read through three types. All three must describe the
-    // *same* transform — which is the check that catches a layout mapped to the
-    // wrong enum, since each goes through a different C-side writer.
+    // All three types describe the same transform.
     const std::int64_t t = 300000000;
 
     auto q_r = plan.at<tf_tree::Quat7>(t);
@@ -335,8 +227,7 @@ static void check_read_path()
     auto e_r = plan.at<Eigen::Isometry3d>(t);
     CHECK_R(e_r, "at<Eigen::Isometry3d>");
     const Eigen::Isometry3d iso = VALUE_OF(e_r);
-    // Eigen indexes (row, col) whatever the storage order, so this reads the
-    // same three numbers — and would not if the layout enum were wrong.
+    // Eigen indexes (row, col) whatever the storage order.
     CHECK(std::fabs(iso.translation().x() - q.tx) < 1e-12, "eigen tx");
     CHECK(std::fabs(iso.translation().y() - q.ty) < 1e-12, "eigen ty");
     CHECK(std::fabs(iso.translation().z() - q.tz) < 1e-12, "eigen tz");
@@ -351,39 +242,11 @@ static void check_read_path()
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// The C ABI writes into the object `at<T>` returns — no second copy
-// ---------------------------------------------------------------------------
 
 #if defined(TF_TREE_WRAP_PLAN_AT) && defined(TF_TREE_HAS_EIGEN)
-/// **`Plan::at<T>` must hand `tft_plan_at` the address of the object it
-/// returns**, in both error modes.
-///
-/// This is §7 gate criterion 2 pinned without a stopwatch. When it does not
-/// hold, `out` is an ordinary local: the ABI writes the payload into it and the
-/// compiler copies the whole `expected<T>` into the caller afterwards — 128
-/// bytes of `Eigen::Isometry3d` in eight `movaps` pairs, plus a 328-byte
-/// `memcpy` of the `optional<Error>` storage, which is trivially copyable and
-/// so gets copied whether it is engaged or not. Per successful lookup.
-///
-/// The cause is that NRVO is **all-or-nothing per function**: the compiler
-/// wants one automatic variable that every `return` names, and gives up for the
-/// whole function when another `return` exists. `at` used to have a second one
-/// on the failure path (`TF_TREE_FAIL(s)`, i.e. `return Error(s);`). The
-/// exceptions build fails by `throw`, which is not a `return` — which is the
-/// whole of the asymmetry §0.0 had recorded as unexplained.
-///
-/// This check is compiled only into the four `--wrap` rows of `just cpp-check`
-/// — g++ and clang++ × both error modes — because `-Wl,--wrap` is a GNU-ld/lld
-/// option and the eight §6.2 matrix rows are a *portability* gate that should
-/// not require a linker family. `run.sh`'s `WRAP` note has the argument.
-///
-/// Mutant (applied, and the results below are measured, not predicted): put
-/// `TF_TREE_FAIL(s)` back in `Plan::at`. **Both `--wrap no-exceptions` rows
-/// fail** — g++ and clang++ — and both `--wrap exceptions` rows keep passing,
-/// which is the asymmetry itself reproduced as a test result rather than as a
-/// timing. `just cpp-bench` moves from an interleaved 1.003x to 1.035x against
-/// a 1.02 gate over the same 11-round A/B.
+/// `Plan::at<T>` hands `tft_plan_at` the address of the object it returns, in
+/// both error modes (§7 gate 2 without a stopwatch). Compiled only into the
+/// `--wrap` rows of `just cpp-check`; see `run.sh`.
 static void check_at_writes_into_the_returned_object()
 {
     tft_tree* raw = nullptr;
@@ -394,9 +257,7 @@ static void check_at_writes_into_the_returned_object()
     tf_tree::Plan plan = std::move(VALUE_OF(plan_r));
 
     probe_last_out = nullptr;
-    // The declaration below *is* the result object of the call — not a copy of
-    // one. Routing it through a helper that takes the result by value would
-    // introduce exactly the copy under test and make the check vacuous.
+    // This declaration is the result object; a by-value helper would be vacuous.
 #ifdef TF_TREE_NO_EXCEPTIONS
     const auto r = plan.at<Eigen::Isometry3d>(300000000);
     CHECK(static_cast<bool>(r), "the lookup must succeed, or there is nothing to check");
@@ -412,19 +273,12 @@ static void check_at_writes_into_the_returned_object()
 }
 #endif
 
-// ---------------------------------------------------------------------------
-// TF_TREE_FAIL_INTO behaves the same way in both error modes
-// ---------------------------------------------------------------------------
 
 static bool fail_into_fell_through = false;
 
-/// Shaped exactly like `Plan::at`: fail through the macro, then `return out;`.
-/// The assignment in between stands for whatever a future `Plan::at` might grow
-/// there — a release, an unlock, a counter — and must never run.
-///
-/// `out` is a bare identifier because `TF_TREE_FAIL_INTO`'s contract 2 requires
-/// one; a probe that passed an expression would be testing a use the macro does
-/// not support.
+/// Shaped like `Plan::at`: fail through the macro, then `return out;`. The
+/// assignment between must never run; `out` is a bare identifier per the macro's
+/// contract 2.
 static tf_tree::result<double> fail_into_probe()
 {
     tf_tree::result<double> out = tf_tree::make_result<double>();
@@ -433,28 +287,9 @@ static tf_tree::result<double> fail_into_probe()
     return out;
 }
 
-/// **`TF_TREE_FAIL_INTO` must leave the function immediately, in both error
-/// modes** — contract 1 in `tf_tree.hpp`.
-///
-/// The macro's two expansions do visibly different things: one assigns an
-/// `Error` into the return object, the other throws. Only the observable
-/// control flow has to match, and nothing else in the build enforces that. A
-/// version that assigned and *fell through* compiles clean in both modes, so
-/// `TF_TREE_FAIL_INTO(out, s); unlock(); return out;` would run `unlock()`
-/// under exceptions and skip it under `-fno-exceptions`. Silently, in a header
-/// shipped to callers who compile it either way.
-///
-/// Mutant (applied): drop the `return out;` from the `-fno-exceptions`
-/// expansion, leaving the bare assignment. **The six `-fno-exceptions` rows of
-/// `just cpp-check` fail** on "fell through", g++ and clang++, C++17, C++20 and
-/// `--wrap`; the seven exceptions rows pass. That split is the defect itself: a
-/// bug that exists in one error mode only is exactly what this file is here to
-/// surface.
-///
-/// `check_at_writes_into_the_returned_object` does **not** catch it. `Plan::at`
-/// has nothing between the macro and its `return`, so falling through there is
-/// harmless today and the payload still lands in the return slot. This test
-/// guards the macro; that one guards its one current caller.
+/// `TF_TREE_FAIL_INTO` leaves the function immediately in both error modes
+/// (contract 1 in `tf_tree.hpp`); `check_at_writes_into_the_returned_object`
+/// does not catch a fall-through.
 static void check_fail_into_leaves_the_function()
 {
     fail_into_fell_through = false;
@@ -478,9 +313,6 @@ static void check_fail_into_leaves_the_function()
           "modes no longer agree on control flow");
 }
 
-// ---------------------------------------------------------------------------
-// Batch writes go straight into the caller's array
-// ---------------------------------------------------------------------------
 
 static void check_batch()
 {
@@ -505,15 +337,11 @@ static void check_batch()
         CHECK(std::fabs(e.qw * e.qw + e.qx * e.qx + e.qy * e.qy + e.qz * e.qz - 1.0) < 1e-12,
               "every element is a unit quaternion");
     }
-    // Every element must differ from its neighbour, or a batch that wrote the
-    // first element n times would pass everything above.
+    // Every element differs from its neighbour.
     CHECK(std::fabs(out[0].tx - out[n - 1].tx) > 1e-9,
           "the batch must vary across elements, not repeat the first");
 
-    // **Derivatives reach C++ by type**, which is what makes them reach C++ at
-    // all: `layout_of<Quat7Twist6>` is the only thing that lets the templated
-    // `at`/`at_many` name the layout. Its pose half must be the `Quat7` batch's
-    // bytes — the tail is the only thing that is new.
+    // Derivatives by type: the pose half is the `Quat7` batch's bytes.
     {
         std::vector<tf_tree::Quat7Twist6> d_out;
         CHECK_CALL(plan.at_many(stamps, d_out), "at_many<Quat7Twist6>");
@@ -529,8 +357,7 @@ static void check_batch()
         // Non-vacuity: six zeros would satisfy every assertion above.
         CHECK(moving, "the fixture's twist is zero; this would pass against a stub");
 
-        // ...and the scalar form agrees with the batch, which is the claim the
-        // layout makes about being one computation and not two.
+        // ...and the scalar form agrees with the batch.
         auto one_r = plan.at<tf_tree::Quat7Twist6>(stamps[7]);
         CHECK_R(one_r, "at<Quat7Twist6>");
         const tf_tree::Quat7Twist6 one = VALUE_OF(one_r);
@@ -539,8 +366,7 @@ static void check_batch()
     }
 
 #ifdef TF_TREE_HAS_EIGEN
-    // §4.2's zero-copy claim: `sizeof(Eigen::Isometry3d)` is the payload, so the
-    // stride is the payload and the write is direct.
+    // §4.2 zero-copy: `sizeof(Eigen::Isometry3d)` is the payload and the stride.
     std::vector<Eigen::Isometry3d> eigen_out;
     CHECK_CALL(plan.at_many(stamps, eigen_out), "at_many<Eigen::Isometry3d>");
     CHECK(eigen_out.size() == n, "sized");
@@ -551,9 +377,7 @@ static void check_batch()
               "every element is a rotation");
     }
 
-    // **The write must stay inside the array.** §6.2 asks for guard pages; a
-    // sentinel element either side is the portable equivalent and catches the
-    // same bug — a stride that is wrong by any amount walks into it.
+    // The write stays inside the array: sentinels either side stand in for guard pages.
     std::vector<Eigen::Isometry3d> guarded(n + 2);
     const Eigen::Isometry3d sentinel = Eigen::Isometry3d(Eigen::Translation3d(-999.0, -999.0, -999.0));
     guarded[0] = sentinel;
@@ -564,16 +388,11 @@ static void check_batch()
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// Sophus — the stride case, §4.3
-// ---------------------------------------------------------------------------
 
 #ifdef TF_TREE_HAS_SOPHUS
 static void check_sophus()
 {
-    // The hazard itself: report it, because whether it fires depends on the
-    // user's vectorization flags and a reader of the log should know which
-    // build they got.
+    // Report the hazard: it depends on the user's vectorization flags.
     std::printf("  Sophus::SE3d: sizeof=%zu payload=56 direct=%s\n", sizeof(Sophus::SE3d),
                 tf_tree::detail::sophus_is_directly_writable() ? "yes" : "no");
     CHECK(tf_tree::detail::sophus_is_directly_writable(),
@@ -592,9 +411,7 @@ static void check_sophus()
         stamps[i] = static_cast<std::int64_t>(10000000 + i * 20000000);
     }
 
-    // The whole point of §4.3: sizeof(SE3d) is usually > 56, so a packed write
-    // would corrupt every element after the first. The wrapper passes sizeof(T)
-    // as the stride, so this must come back correct element by element.
+    // §4.3: `sizeof(SE3d)` usually exceeds 56, so the wrapper passes it as the stride.
     std::vector<Sophus::SE3d> out;
     CHECK_CALL(plan.at_many(stamps, out), "at_many<Sophus::SE3d>");
 
@@ -617,18 +434,9 @@ static void check_sophus()
 }
 #endif
 
-// ---------------------------------------------------------------------------
-// Errors, in whichever mode this build uses
-// ---------------------------------------------------------------------------
 
-/// Overwrite the thread-local error slot with a failure that is *not* the one
-/// under test, and return the message it wrote there.
-///
-/// It has to be a real failure. `tft_last_error` reads a slot only a *failing*
-/// call writes, so a successful call — or a pure one like `tft_layout_size`,
-/// which reads no state and writes none — leaves the slot byte-for-byte as it
-/// was and cannot tell a copy from a view. `TFT_ERR_BAD_HANDLE` from a null
-/// plan is the cheapest real one.
+/// Overwrite the thread-local error slot with a real failure (a null plan gives
+/// `TFT_ERR_BAD_HANDLE`) and return the message written.
 static const char* clobber_the_error_slot()
 {
     double scratch[16] = {};
@@ -641,28 +449,9 @@ static const char* clobber_the_error_slot()
     return e.message;
 }
 
-/// **An `Error` keeps the detail of the failure that produced it**, in both
-/// error modes, even after a later `tf_tree` call has overwritten the
-/// thread-local slot it came from.
-///
-/// This is what pays for `expected<T>` carrying a whole `tft_error` — see the
-/// note on `expected` in `tf_tree.hpp` — so it is the assertion that has to be
-/// load-bearing rather than decorative.
-///
-/// The probe is `message()`, **not** `code()`. `Error::fetch` overwrites `code`
-/// with the status the failing call actually returned, precisely so a stale
-/// slot cannot misreport it; that makes `code()` correct whether or not
-/// anything was copied, and therefore useless here. The message comes from the
-/// slot and nowhere else.
-///
-/// Mutant (applied): give `Error::message()` the body
-/// `{ static tft_error live{}; live.struct_size = sizeof(live);
-/// tft_last_error(&live); return live.message; }` — the "view, not a copy"
-/// implementation. **Every row of `just cpp-check` fails** — all thirteen — on
-/// the "must be a copy, not a view" line. The previous version of this test
-/// used `tft_layout_size` as the intervening call and checked `code()`; it
-/// survived that mutant in every row, because neither half of it could
-/// discriminate.
+/// An `Error` keeps the detail of its failure after a later call overwrites the
+/// thread-local slot. The probe is `message()`, not `code()`, which `Error::fetch`
+/// sets from the returned status.
 static void check_errors()
 {
     tft_tree* raw = nullptr;
@@ -704,19 +493,9 @@ static void check_errors()
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// Time domains — docs/decisions/0038
-// ---------------------------------------------------------------------------
 
-/// `Tree::plan_in_domain` is the only way a C++ caller can read a simulated
-/// tree.
-///
-/// `docs/PHASE4.md` §5.5 tells an operator to give such a tree its own domain,
-/// and until `0038` doing so made the arena unreadable from here: `Tree::plan`
-/// means domain 0, so every `at()` came back `TFT_ERR_TIME_DOMAIN` with no
-/// argument this header could pass. Both arms are the test — the tag the
-/// publisher configured reads a transform, and the default one is refused with
-/// the code §5.5 defines, at plan time rather than on every lookup.
+/// `Tree::plan_in_domain` is how C++ reads a simulated tree (`0038`): the
+/// configured tag reads, the default is refused with `TFT_ERR_TIME_DOMAIN` (§5.5).
 static void check_domain()
 {
     tft_tree* raw = nullptr;
@@ -753,22 +532,9 @@ static void check_domain()
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// Extrapolation — docs/decisions/0039
-// ---------------------------------------------------------------------------
 
-/// `Plan::at_extrapolating` hands back the pose and the distance as one value.
-///
-/// The property the record is for survives into C++ better than into C: there
-/// is no member of `Extrapolated<T>` that yields the pose alone, so a caller
-/// who wanted only the pose has to write `.pose` and see the sibling field
-/// beside it. The C entry point can only *ask* for somewhere to put the
-/// distance; this holds the two together.
-///
-/// The third comparison is what earns the check. `Error` refusing and `Hold`
-/// answering would both pass against a wrapper that ignored its policy
-/// argument and always held; only `ConstantTwist != Hold` at the same stamp
-/// says the argument reached the engine.
+/// `Plan::at_extrapolating` returns the pose and the distance as one value
+/// (`0039`); `ConstantTwist != Hold` shows the policy reached the engine.
 static void check_extrapolation()
 {
     tft_tree* raw = nullptr;
@@ -779,8 +545,7 @@ static void check_extrapolation()
     CHECK_R(plan_r, "plan_in_domain map <- sensor");
     tf_tree::Plan plan = std::move(VALUE_OF(plan_r));
 
-    // The fixture publishes 32 samples 10 ms apart, so 310 ms is the newest and
-    // 400 ms is 90 ms past it.
+    // 32 samples 10 ms apart: 310 ms is the newest.
     auto hold_r = plan.at_extrapolating<tf_tree::Quat7>(400000000, TFT_EXTRAP_HOLD);
     CHECK_R(hold_r, "Hold answers past the newest sample");
     const tf_tree::Extrapolated<tf_tree::Quat7> hold = VALUE_OF(hold_r);
@@ -816,9 +581,6 @@ static void check_extrapolation()
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// Publishing
-// ---------------------------------------------------------------------------
 
 static void check_publish()
 {
@@ -859,9 +621,6 @@ static void check_publish()
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// RAII
-// ---------------------------------------------------------------------------
 
 static void check_raii()
 {
@@ -872,9 +631,7 @@ static void check_raii()
     static_assert(!std::is_copy_constructible<tf_tree::Publisher>::value,
                   "Publisher must not be copyable");
 
-    // Moving must leave the source empty, so the destructor of a moved-from
-    // handle is a no-op rather than a second free. ASan is what would catch the
-    // alternative; this catches it without needing ASan.
+    // A moved-from handle is empty, so its destructor is a no-op.
     tft_tree* raw = nullptr;
     CHECK(tft_test_tree_create(&raw) == TFT_OK, "fixture");
     tf_tree::Tree a = tf_tree::Tree::adopt(raw);
@@ -885,8 +642,7 @@ static void check_raii()
     // is the point of this assertion.
     CHECK(!static_cast<bool>(a), "a must be empty after the move, or this double-frees");
 
-    // A plan outliving its tree is the natural C++ ordering as well as the C
-    // one; the Arc underneath is what makes it sound (§3.2).
+    // A plan outlives its tree; the Arc makes it sound (§3.2).
     {
         tft_tree* r2 = nullptr;
         CHECK(tft_test_tree_create(&r2) == TFT_OK, "fixture");
@@ -896,8 +652,7 @@ static void check_raii()
         tf_tree::Plan p = std::move(VALUE_OF(p_r));
         t.~Tree();                   // free the tree first, on purpose
         new (&t) tf_tree::Tree();    // and leave the object valid for its real destructor
-        // The value is checked, not merely the status: a plan reading through a
-        // freed `Arc` could plausibly return zeros and a status of OK.
+        // The value is checked, not merely the status.
         const tf_tree::Quat7 v = VALUE_OF(p.at<tf_tree::Quat7>(300000000));
         CHECK(std::fabs(v.qw * v.qw + v.qx * v.qx + v.qy * v.qy + v.qz * v.qz - 1.0) < 1e-12,
               "the plan still evaluates after its tree was freed");

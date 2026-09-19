@@ -1,23 +1,10 @@
-// Hot-cache lookup benchmarks at depths 1, 3, and 6 over the shared fixture.
+// Hot-cache lookup at depths 1, 3 and 6 over the shared fixture. Setup is outside
+// the timed closure; the depth-3 row is the gate's but this is NOT the official gate
+// (`docs/PHASE1.md` §11.3).
 //
-// Setup (tree build, history population, plan compile, guard) happens outside the
-// timed closure, so each sample measures only plan evaluation against the seqlock
-// rings — the depth-3 row is the one the go/no-go gate cares about. These runs
-// are NOT the official gate: that needs dedicated, core-pinned hardware.
-//
-// **The stamp is `fixture::QUERY_NS`, not `fixture::NOW_NS`, and that is the
-// whole subject of `docs/decisions/0013`.** `NOW_NS` is a knot on all four
-// dynamic grids, so every edge took `SampleRing::sample`'s exact-hit branch and
-// `I::eval` never ran: what this file used to report as "depth-3 lookup" was
-// `bracket` plus the seqlock read, with the interpolator — the thing the gate
-// exists to bound — absent. `QUERY_NS` is 500 µs off every grid; `fixture`'s
-// `the_latency_query_stamp_is_off_every_dynamic_grid` pins that.
-//
-// **This file is still not `docs/PHASE5.md` §9.2's cross-crate row, and cannot
-// be extended into it.** That row needs a denominator compiled *inside*
-// `tf_tree_core`, and every body a bench target here compiles is codegen'd in
-// `tf_tree_bench`. `crates/tf_tree_bench/src/embed.rs` states the reasons in
-// full, under "Why not `benches/lookup.rs`".
+// The stamp is `fixture::QUERY_NS`, not `NOW_NS` (`docs/decisions/0013`): `NOW_NS`
+// is a knot on every dynamic grid, so `I::eval` never ran. Not `docs/PHASE5.md`
+// §9.2's cross-crate row either; see `src/embed.rs`, "Why not `benches/lookup.rs`".
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -87,18 +74,9 @@ fn lookup_benches(c: &mut Criterion) {
         "map",
         InterpPolicy::ScLerp,
     );
-    // The on-grid best case, kept as its own labelled row by `0013`'s Q4.
-    //
-    // `NOW_NS` is an exact multiple of all four dynamic periods, so every edge
-    // takes `SampleRing::sample`'s exact-hit branch and `I::eval` never runs.
-    // This row is therefore `bracket` plus a seqlock read and nothing else —
-    // which is what the depth-3 gate row unknowingly measured for the life of
-    // the gate, ~4.7x faster than the off-grid row directly above it.
-    //
-    // It exists so that gap is a documented property of the engine rather than
-    // a trap for whoever next picks a round-numbered stamp. **It is not a gate
-    // row and must never be quoted as depth-3 lookup latency**; the label says
-    // `exact_hit` for that reason.
+    // The on-grid best case, its own labelled row (`0013`'s Q4): every edge takes
+    // the exact-hit branch, so this is `bracket` plus a seqlock read. Not a gate
+    // row; never quote it as depth-3 lookup latency.
     bench_pair_at(
         c,
         "lookup/depth3/sclerp/exact_hit",

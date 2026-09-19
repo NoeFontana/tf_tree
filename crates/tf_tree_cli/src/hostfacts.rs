@@ -1,18 +1,11 @@
 //! Host facts behind `TFT016` — `docs/PHASE5.md` §6.
 //!
-//! Machine properties that change how an arena behaves and that nothing in the
-//! arena can see: THP for anonymous mappings (§2.3's 2 MiB alignment buys
-//! nothing under `never`), THP for *shmem* mappings (a separate knob; the one
-//! that governs the live arena), and `RLIMIT_MEMLOCK`.
-//!
-//! `tf_tree` never calls `mlock`; the limit is reported for the consumer to act
-//! on (`docs/decisions/0049-the-flag-that-prefaults-the-arena.md`). The check
-//! compares the limit against the *arena* only, so silence is not a clearance:
-//! `mlockall` charges the whole address space.
+//! Machine properties an arena cannot see: THP for anonymous mappings, THP for
+//! shmem mappings (the live arena's knob), and `RLIMIT_MEMLOCK`
+//! (`docs/decisions/0049-the-flag-that-prefaults-the-arena.md`).
 //!
 //! `/proc/self/limits` is read instead of `getrlimit(2)` because the crate is
-//! `#![forbid(unsafe_code)]` with no `libc` (`docs/decisions/0007`). Both parsers
-//! are pure functions over `&str`.
+//! `#![forbid(unsafe_code)]` (`docs/decisions/0007`). Parsers are pure over `&str`.
 
 /// The kernel's transparent-huge-page policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,10 +20,8 @@ pub enum Thp {
     Unknown,
 }
 
-/// The kernel's THP policy **for shmem mappings** — a different sysfs knob
-/// (`shmem_enabled`, stock default `never`) from [`Thp`], and the one that
-/// governs the live arena's `MAP_SHARED` `memfd`. Reading only [`Thp`] reports a
-/// host healthy while `MADV_HUGEPAGE` is a silent no-op.
+/// The kernel's THP policy for shmem mappings (`shmem_enabled`), separate from
+/// [`Thp`]; it governs the live arena's `memfd`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShmemThp {
     /// `always` — every shmem mapping large enough gets huge pages.
@@ -115,8 +106,7 @@ pub fn probe() -> HostFacts {
 
 /// Parse `/sys/kernel/mm/transparent_hugepage/shmem_enabled`.
 ///
-/// Separate from [`parse_thp`]: six policies, and sharing it would map `advise`
-/// and `within_size` to `Unknown`.
+/// Separate from [`parse_thp`]: it has six policies.
 #[must_use]
 pub fn parse_shmem_thp(s: &str) -> ShmemThp {
     match bracketed(s) {
@@ -130,15 +120,13 @@ pub fn parse_shmem_thp(s: &str) -> ShmemThp {
     }
 }
 
-/// The token between `[` and `]`, which is how both `transparent_hugepage`
-/// files mark the active policy.
+/// The token between `[` and `]`, the active policy.
 fn bracketed(s: &str) -> Option<&str> {
     let rest = &s[s.find('[')? + 1..];
     Some(&rest[..rest.find(']')?])
 }
 
 /// Parse `/sys/kernel/mm/transparent_hugepage/enabled` (`always [madvise] never`).
-/// Matches the *bracketed* token; every file contains all three words.
 #[must_use]
 pub fn parse_thp(s: &str) -> Thp {
     match bracketed(s) {
@@ -149,13 +137,8 @@ pub fn parse_thp(s: &str) -> Thp {
     }
 }
 
-/// Parse the `Max locked memory` row of `/proc/self/limits`.
-///
-/// ```text
-/// Limit                     Soft Limit           Hard Limit           Units
-/// Parse the `Max locked memory` row of `/proc/self/limits`.
-///
-/// The limit names contain spaces, so the prefix is stripped before splitting.
+/// Parse the `Max locked memory` row of `/proc/self/limits`; the name contains
+/// spaces, so the prefix is stripped before splitting.
 #[must_use]
 pub fn parse_memlock(s: &str) -> MemLock {
     const NAME: &str = "Max locked memory";
@@ -181,8 +164,6 @@ mod tests {
     use super::*;
 
     /// The active policy is the bracketed one.
-    ///
-    /// Mutant: `s.contains("never")` ⇒ `[always]` and `[madvise]` report `Never`.
     #[test]
     fn thp_parsing_reads_the_bracketed_policy_not_the_menu() {
         assert_eq!(parse_thp("[always] madvise never\n"), Thp::Always);
@@ -193,9 +174,7 @@ mod tests {
         assert_eq!(parse_thp("[bogus]"), Thp::Unknown);
     }
 
-    /// `shmem_enabled` has six policies, not the three of `enabled`.
-    ///
-    /// Mutant: route it through `parse_thp` ⇒ `advise`/`within_size` become `Unknown`.
+    /// `shmem_enabled` has six policies.
     #[test]
     fn shmem_thp_parsing_covers_all_six_policies_not_the_three_of_enabled() {
         assert_eq!(parse_thp("always [madvise] never\n"), Thp::Madvise);
@@ -234,7 +213,6 @@ mod tests {
             assert_eq!(parse_shmem_thp(s), want, "parsing {s:?}");
         }
 
-        // Only these four let MADV_HUGEPAGE do anything.
         for p in [
             ShmemThp::Always,
             ShmemThp::WithinSize,
@@ -247,7 +225,6 @@ mod tests {
             assert!(!p.honours_madvise(), "{p:?} must not honour madvise");
         }
 
-        // `name()` round-trips: operators can write it back into sysfs.
         for p in [
             ShmemThp::Always,
             ShmemThp::WithinSize,
@@ -260,9 +237,7 @@ mod tests {
         }
     }
 
-    /// The limit names contain spaces, so a whitespace split reads the wrong column.
-    ///
-    /// Mutant: strip `"Max locked"` instead of the full name ⇒ `Unknown`.
+    /// The limit name contains spaces.
     #[test]
     fn memlock_parsing_handles_the_multi_word_limit_names() {
         let real = "\

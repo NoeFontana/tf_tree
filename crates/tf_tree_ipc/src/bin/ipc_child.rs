@@ -1,12 +1,8 @@
-//! Child process for the multi-process rendezvous tests.
+//! Child process for the multi-process rendezvous tests (bin `tf_tree_ipc_child`).
 //!
-//! Spawned so tests can `SIGKILL` a lock holder and watch the kernel release
-//! its locks. It opens the lock file **by path**, never from an inherited fd:
-//! OFD locks belong to the open file description, so an inherited fd would share
-//! the parent's locks and make every contention test vacuous.
-//!
-//! Output is line-oriented on stdout, flushed before the child blocks. The bin
-//! is `tf_tree_ipc_child` (see the manifest). Its argv:
+//! Opens the lock file by path, never from an inherited fd: OFD locks belong to
+//! the open file description, so inheriting would share the parent's locks.
+//! Line-oriented stdout, flushed before blocking. Argv:
 //!
 //! ```text
 //! hold-ownership   <lock> [ms]     -> "won" | "lost", then parks
@@ -17,7 +13,7 @@
 //! serve            <sock> <size>   -> "serving", then serves until killed
 //! attach           <sock>          -> "attached <slot> <size> <uuid>" | "error <display>"
 //! ```
-// This binary's stdout IS its protocol — the parent parses it line by line.
+// stdout is this binary's protocol.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -146,8 +142,7 @@ fn main() {
             // A returning server is a bug the parent must see.
             say(&format!("server-stopped {outcome:?}"));
         }
-        // Attach and report, including the received fd's `fstat` size (proof a
-        // real descriptor crossed).
+        // Attach and report; the fd's `fstat` size proves a real descriptor crossed.
         "attach" => {
             let req = HelloRequest {
                 format_version: 2,

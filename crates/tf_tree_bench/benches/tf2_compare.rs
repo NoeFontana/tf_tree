@@ -1,32 +1,13 @@
-// Head-to-head: tf_tree vs ROS 2 `tf2::BufferCore`, same tree, same history,
-// same queries, same process.
+// Head-to-head: tf_tree vs ROS 2 `tf2::BufferCore`, same tree, history and queries,
+// in-process (`-ltf2` alone, no middleware). Needs `--features tf2` and ROS 2;
+// run with `just tf2-bench`.
 //
-// Requires `--features tf2` and a ROS 2 install; run it with `just tf2-bench`.
+// Not equalised: tf_tree compiles the walk once into a `Plan` (`docs/PROJECT.md`
+// §5 D3), tf2 walks per `lookupTransform`. So:
 //
-// # Why this is a fair comparison
-//
-// `tf2::BufferCore` links against `-ltf2` alone — no rclcpp, no DDS, no ROS
-// graph. Both sides are therefore plain in-process libraries doing transform
-// math, driven from the same benchmark loop with the same inputs. Nothing here
-// measures middleware.
-//
-// # What is deliberately NOT equalised
-//
-// tf_tree's headline structural claim is that it compiles the topology walk once
-// into a `Plan` and then only samples (`docs/PROJECT.md` §5 D3), whereas tf2 walks the
-// tree on every `lookupTransform`. Equalising that away would benchmark an engine
-// nobody would ship. So the rows are:
-//
-//   * `lookup_hot`      — tf_tree with a pre-compiled plan vs tf2. The real
-//                         steady-state comparison: this is how each engine is
-//                         meant to be used.
-//   * `lookup_cold`     — tf_tree compiling a fresh plan per query vs tf2. The
-//                         pessimistic bound, isolating how much of the win is
-//                         plan reuse rather than a faster sample path.
-//   * `push`            — publishing one sample.
-//
-// Reading them together shows both what the engine delivers in practice and
-// where the delivery comes from.
+//   * `lookup_hot`  — pre-compiled plan vs tf2, the steady-state comparison.
+//   * `lookup_cold` — a fresh plan per query vs tf2; isolates plan reuse.
+//   * `push`        — publishing one sample.
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use std::hint::black_box;
@@ -60,12 +41,8 @@ fn fixture_load() -> Load {
     let now = fixture::NOW_NS;
     let lo = now - 100_000_000;
 
-    // `camera_optical <- map` is the fixture's longest chain (depth 6), so the
-    // row reflects a real chain rather than a one-edge lookup. The stamps sweep
-    // the whole 100 ms window so the bracket search does real work instead of
-    // hitting one cached pair over and over.
-    // `assert!`, not `debug_assert!`: criterion builds in the release profile,
-    // where a debug assertion is compiled out and would guard nothing.
+    // `camera_optical <- map` is the longest chain (depth 6); stamps sweep the whole
+    // window. `assert!`, not `debug_assert!`: criterion builds in release.
     assert!(
         names.contains(&"camera_optical") && names.contains(&"map"),
         "fixture no longer declares `camera_optical` and `map`; the benchmark's \
@@ -105,17 +82,10 @@ fn replay_load() -> Load {
     }
 }
 
-/// Check, **once and outside every timed loop**, that the pair the rows actually
-/// drive resolves on both engines across the whole stamp range.
-///
-/// Every row below queries `queries[0]`'s target/source pair at all of the query
-/// set's stamps. On the recorded stream that pair is drawn at random
-/// (`QuerySet::draw`, seed `0xBEEF_F00D`); nothing about the seed, the RNG or the
-/// recording guarantees it stays resolvable. An unresolvable pair does not fail
-/// the benchmark, it *corrupts* it silently: tf_tree's `if let Ok` would skip
-/// every sample and measure an empty loop, while tf2 would measure a C++
-/// throw/catch per call (microseconds), and the ratio of the two would be
-/// meaningless. So it is asserted rather than assumed.
+/// Check, once and outside every timed loop, that the pair the rows drive
+/// resolves on both engines across the whole stamp range. On the recorded stream
+/// the pair is drawn at random (`QuerySet::draw`, seed `0xBEEF_F00D`); an
+/// unresolvable pair silently corrupts the ratio (tf_tree skips, tf2 throws).
 fn assert_pair_resolves(load: &Load) {
     let (target, source, _) = &load.queries[0];
     let why = "the benchmark drives this one pair at every stamp; if it does not \
@@ -189,11 +159,9 @@ fn bench_lookup(c: &mut Criterion, load: &Load) {
         });
     });
 
-    // tf2, used as intended: it has no plan concept, so every call walks.
-    // Frame names are converted ONCE, outside the timed loop. `lookup(&str,..)`
-    // heap-allocates a C string per name per call; timing that against
-    // `Plan::at` — which takes no strings and never allocates — would charge
-    // this crate's marshalling to tf2. See `overhead/` below for what remains.
+    // tf2, used as intended: no plan concept, every call walks. Frame names are
+    // converted once, outside the loop, so this crate's marshalling is not
+    // charged to tf2 (see `overhead/`).
     group.bench_function(BenchmarkId::new("tf2", "lookupTransform"), |b| {
         let (t, s, _) = &load.queries[0];
         let (t, s) = (FrameName::new(t).unwrap(), FrameName::new(s).unwrap());
@@ -208,11 +176,8 @@ fn bench_lookup(c: &mut Criterion, load: &Load) {
         });
     });
 
-    // The naive binding, kept as a *control*: `lookup(&str, ..)` converts both
-    // frame names to C strings on every call, which is two heap allocations per
-    // lookup. An earlier revision of this benchmark used it, which charged this
-    // crate's marshalling to tf2. The row stays so the size of that mistake is
-    // measured rather than asserted.
+    // The naive `lookup(&str, ..)` as a control: two heap allocations per lookup,
+    // kept so the size of that bias is measured.
     group.bench_function(BenchmarkId::new("tf2", "lookupTransform_alloc"), |b| {
         let (t, s, _) = &load.queries[0];
         b.iter(|| {
@@ -226,9 +191,8 @@ fn bench_lookup(c: &mut Criterion, load: &Load) {
         });
     });
 
-    // The bridge's own cost: the same FFI crossing and the same
-    // `const char*` -> `std::string` marshalling, with the BufferCore call
-    // removed. Subtract this from the tf2 row to get tf2's own cost.
+    // The bridge's own cost: the FFI crossing and string marshalling without the
+    // BufferCore call; subtract it from the tf2 row.
     group.bench_function(BenchmarkId::new("tf2", "shim_overhead"), |b| {
         let (t, s, _) = &load.queries[0];
         let (t, s) = (FrameName::new(t).unwrap(), FrameName::new(s).unwrap());
@@ -268,14 +232,9 @@ fn bench_lookup(c: &mut Criterion, load: &Load) {
     cold.finish();
 }
 
-/// Publish throughput: one sample onto one edge, at a 1 kHz cadence.
-///
-/// Both sides are **bounded**, which matters or the row would degenerate into a
-/// memory-growth benchmark. They are bounded differently, and that difference is
-/// itself part of what is being compared: tf_tree's ring is count-bounded (a
-/// fixed power-of-two slot count, overwritten in place, no allocation ever), and
-/// tf2's cache is time-bounded (entries older than the cache span are pruned on
-/// insert). A 10 s cache is the realistic ROS default, so that is what is used.
+/// Publish throughput: one sample onto one edge at 1 kHz. Both sides are bounded,
+/// differently: tf_tree's ring is count-bounded and overwritten in place, tf2's
+/// cache is time-bounded (10 s, the ROS default).
 fn bench_push(c: &mut Criterion) {
     let mut group = c.benchmark_group("push");
     group.throughput(Throughput::Elements(1));
@@ -295,11 +254,8 @@ fn bench_push(c: &mut Criterion) {
         });
     });
 
-    // Names converted once, for the same reason as the lookup rows: `push` takes
-    // no strings, so a per-call conversion would charge this bridge to tf2. The
-    // names cross as the `std::string`s the message wants and are assigned into
-    // it — what a native C++ publisher does, and no allocation for names this
-    // short.
+    // Names converted once: `push` takes no strings, so a per-call conversion
+    // would charge this bridge to tf2.
     let buf = Tf2Buffer::new(10.0).unwrap();
     let (mp, od) = (
         FrameName::new("map").unwrap(),
@@ -314,11 +270,7 @@ fn bench_push(c: &mut Criterion) {
         });
     });
 
-    // The naive binding as a *control*, exactly as in the lookup group:
-    // `set_transform(&str, ..)` converts both names per call. An earlier
-    // revision published the tf2 push figure through a path that did this
-    // internally; the row stays so the size of that bias is measured rather than
-    // asserted.
+    // The naive binding as a control, as in the lookup group.
     let alloc_buf = Tf2Buffer::new(10.0).unwrap();
     let mut t3 = 0i64;
     group.bench_function("tf2_alloc", |b| {
@@ -332,25 +284,13 @@ fn bench_push(c: &mut Criterion) {
     group.finish();
 }
 
-/// How each engine scales with tree size and chain depth.
-///
-/// Two axes, varied independently because they stress different things:
-/// **depth** drives how many edges a lookup composes, and **size** drives how
-/// much tree the engine has to navigate to find them. tf_tree's structural claim
-/// is that size should be nearly free once a plan is compiled (the plan is a
-/// flat step array) while depth costs linearly; tf2 walks per call, so it should
-/// pay for both. This row is where that either shows up or doesn't.
+/// How each engine scales with tree size and chain depth, varied independently:
+/// depth drives edges composed, size drives tree navigated. tf_tree's plan is a
+/// flat step array, so size should be nearly free; tf2 pays for both.
 fn bench_scale(c: &mut Criterion) {
-    // (chain_depth, branches_per_link) -> total frames.
-    //
-    // The last shape grows *wide* rather than deeper on purpose: a lookup
-    // composes `chain_depth + 1` steps, and tf_tree caps a compiled plan at
-    // `tf_tree_core::MAX_DEPTH` (32 since `0034`, 16 when this shape was
-    // chosen), so a spine past it is rejected outright with `TreeTooDeep`. tf2
-    // has no such limit. That is a real difference in
-    // what the two engines accept — recorded in `docs/benchmarks/tf2.md` rather
-    // than papered over — but it is not a *performance* difference, so the
-    // scaling row stays inside the budget where both engines can answer.
+    // (chain_depth, branches_per_link) -> total frames. The last shape grows wide,
+    // not deeper: tf_tree caps a plan at `tf_tree_core::MAX_DEPTH` (`TreeTooDeep`),
+    // tf2 does not; recorded in `docs/benchmarks/tf2.md`.
     const SHAPES: &[(usize, usize)] = &[
         (3, 2),   //   ~12 frames — a small mobile base
         (6, 4),   //   ~35 frames — the fixture's scale
@@ -370,8 +310,7 @@ fn bench_scale(c: &mut Criterion) {
             .expect("scale tree");
         let tf2 = replay_tf2::load_tf2(&stream).expect("scale tf2");
 
-        // Query the deepest pair: a leaf sensor under the last spine link, back
-        // to the root. That is the worst case for both engines.
+        // The deepest pair: a leaf under the last spine link, back to the root.
         let target = format!("s_{depth}_0");
         let source = "link_0".to_owned();
         let (lo, hi) = stream.common_window().expect("window");

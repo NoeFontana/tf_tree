@@ -6,27 +6,21 @@
 //! domain: $TF_TREE_DOMAIN, else $ROS_DOMAIN_ID, else 0
 //! name:   $TF_TREE_NAME,   else "default"
 //! ```
-//!
-//! Falling back to `$ROS_DOMAIN_ID` inherits a ROS 2 system's existing
-//! isolation, so `tf_tree` partitions the way the rest of the stack does.
+//! `$ROS_DOMAIN_ID` fallback inherits a ROS 2 system's existing isolation.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{EnvVar, IpcError, NameProblem};
 use crate::runtime_dir::{current_uid, EnvLookup, RuntimeDir, SystemEnv};
 
-/// Longest arena name, in bytes.
-///
-/// Fits a filename with room for `.lock`/`.sock` suffixes.
+/// Longest arena name, in bytes; leaves room for `.lock`/`.sock`.
 pub const MAX_NAME_LEN: usize = 64;
 
 /// The default arena name when `$TF_TREE_NAME` is unset.
 pub const DEFAULT_NAME: &str = "default";
 
 /// A validated arena name: one path component, UTF-8, non-empty, at most
-/// [`MAX_NAME_LEN`] bytes.
-///
-/// Stored inline so it stays `Copy` and can sit inside error values.
+/// [`MAX_NAME_LEN`] bytes. Inline, so it stays `Copy`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ArenaName {
     bytes: [u8; MAX_NAME_LEN],
@@ -51,8 +45,7 @@ impl ArenaName {
             || name.contains('\0')
             || name.contains('\\')
         {
-            // One path component: `../other` would resolve two "agreeing"
-            // processes to different directories (§3.1).
+            // One path component: `../other` would split "agreeing" processes (§3.1).
             Some(NameProblem::NotOneComponent)
         } else {
             None
@@ -72,7 +65,7 @@ impl ArenaName {
     /// The name as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        // The bytes came from a `&str` in `new`, and nothing else writes them.
+        // The bytes came from a `&str` in `new`.
         core::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or(DEFAULT_NAME)
     }
 }
@@ -152,10 +145,8 @@ impl Rendezvous {
         &self.lock_path
     }
 
-    /// `<runtime_dir>/<domain>/<name>.sock`.
-    ///
-    /// Bound by [`crate::OwnerServer::bind_at`], connected by [`crate::attach`];
-    /// derived here because the path is part of the rendezvous identity.
+    /// `<runtime_dir>/<domain>/<name>.sock`, bound by
+    /// [`crate::OwnerServer::bind_at`] and connected by [`crate::attach`].
     #[must_use]
     pub fn sock_path(&self) -> &Path {
         &self.sock_path

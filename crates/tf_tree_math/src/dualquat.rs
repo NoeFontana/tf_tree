@@ -1,49 +1,32 @@
 //! Fast SE(3) screw interpolation via unit dual-quaternion powers.
 //!
-//! The reference geodesic interpolation is `a · exp_se3(s · log_se3(a⁻¹·b))`
-//! (see [`crate::reference::sclerp`]). The screw form here computes the same
-//! result by raising the relative transform's unit dual quaternion
-//! `q̂ = q_r + ε q_d` (`q_r = q`, `q_d = ½·(0,t)⊗q`) to the power `s`, which
-//! scales the screw angle `θ` and pitch translation `d` by `s`.
+//! Equals `a · exp_se3(s · log_se3(a⁻¹·b))` ([`crate::reference::sclerp`]), by
+//! raising the relative transform's unit dual quaternion
+//! `q̂ = q_r + ε q_d` (`q_d = ½·(0,t)⊗q`) to the power `s`.
 //!
-//! # The hot path spends no transcendental at all
+//! # No transcendental on the small-angle path
 //!
-//! With `φ = θ/2` the power needs only `cos(sφ)` and `sin(sφ)`, and two
-//! observations remove every `sqrt`, `atan2`, `sincos` and division by a
-//! vanishing quantity:
-//!
-//! 1. **`sin φ` never appears alone.** `l`, `d` and `m` are singular as `φ → 0`,
-//!    but every product reaching the result (`sin(sφ)·l`, `m·sin(sφ)`,
-//!    `½sd·sin(sφ)`) is finite, because each `1/sin φ` cancels.
-//! 2. **`sin(sφ)/sin(φ)` is the slerp weight** [`crate::interp`] already
-//!    evaluates as a polynomial in `u = φ²`. With `w = sin(sφ)/sin φ` and
-//!    `wa = sin((1−s)φ)/sin φ`, `cos(sφ) = wa + w·cos φ`, an all-positive sum
-//!    for `s ∈ [0,1]` and `cos φ ≥ 0`.
+//! With `φ = θ/2`: `sin φ` never appears alone (every `1/sin φ` cancels in the
+//! result), and `w = sin(sφ)/sin φ` is the slerp weight [`crate::interp`]
+//! already evaluates as a polynomial, with `cos(sφ) = wa + w·cos φ`,
+//! `wa = sin((1−s)φ)/sin φ`.
 
 use crate::interp::{slerp_weight, theta_sq_from_chord};
 use crate::iso3::{exp_se3, log_se3, Iso3, Vec3};
 use crate::quat::Quat;
 use crate::twist::Twist;
 
-/// `sin²(THETA_SLERP_SMALL)` — the fast-path predicate in `sin²(θ/2)` (`‖q_v‖²`,
-/// already in hand). Pinned by `sin_half_theta_small_sq_matches_the_shared_threshold`.
+/// `sin²(THETA_SLERP_SMALL)`; pinned by `sin_half_theta_small_sq_matches_the_shared_threshold`.
 const SIN_HALF_THETA_SMALL_SQ: f64 = 0.022_331_755_437_196_99;
 
-/// Below this `sin²(θ/2)` the dual part underflows, so the degenerate case
-/// routes through the exact `exp_se3(s·log_se3(rel))` fallback.
-///
-/// The regrouped algebra forms no divergent intermediate; the only remaining
-/// hazard is `q_d.w/‖q_v‖²` overflowing as `‖q_v‖²` denormalizes. Validated by
-/// `screw_pow_is_accurate_down_to_the_degenerate_threshold`.
+/// Below this `sin²(θ/2)`, `q_d.w/‖q_v‖²` would overflow: fall back to
+/// `exp_se3(s·log_se3(rel))`. See `screw_pow_is_accurate_down_to_the_degenerate_threshold`.
 const SCREW_DEGENERATE_SQ: f64 = 1e-290;
 
-// Pinned because `crates/tf_tree_bench/examples/bracket_mix.rs` carries a copy
-// (`docs/decisions/0060` step 0a) the compiler cannot check; `SIN_HALF_THETA_SMALL_SQ`
-// is tied to `interp.rs`'s threshold by its own test.
+// Pinned: `crates/tf_tree_bench/examples/bracket_mix.rs` carries a copy (`docs/decisions/0060` step 0a).
 const _: () = assert!(SCREW_DEGENERATE_SQ == 1e-290);
 
-/// The screw decomposition of a transform, in the grouped form that stays finite
-/// as `θ → 0`; shared by [`screw_pow`] and [`screw_pow_with_twist`].
+/// The screw decomposition, grouped to stay finite as `θ → 0`.
 struct ScrewParts {
     q_v: Vec3,
     sh2: f64,
@@ -53,21 +36,16 @@ struct ScrewParts {
     m_sh: Vec3,
 }
 
-/// Either the grouped screw parts, or the degenerate case carrying the
-/// **canonicalized** transform for `log_se3` (a `w < 0` quaternion would land on
-/// the other branch, `θ − 2π`).
+/// The grouped parts, or the degenerate case with the `w ≥ 0` canonicalized transform.
 enum Screw {
     Degenerate(Iso3),
     Regular(ScrewParts),
 }
 
-/// The prologue of the screw power. `#[inline(always)]` is load-bearing: it must
-/// fold into the hot path with no call and no materialized struct
-/// (`interp_cost`).
+/// The screw-power prologue; `#[inline(always)]` is load-bearing (`interp_cost`).
 #[inline(always)]
 fn screw_parts(rel: &Iso3) -> Screw {
-    // Canonicalize to w ≥ 0 so θ/2 ∈ [0, π/2] is the principal branch and
-    // `cos φ ≥ 0` keeps `wa + w·cos φ` cancellation free.
+    // w ≥ 0: principal branch, and `cos φ ≥ 0` keeps `wa + w·cos φ` cancellation free.
     let q = if rel.q.w < 0.0 { rel.q.neg() } else { rel.q };
     let t = rel.t;
 
@@ -76,20 +54,12 @@ fn screw_parts(rel: &Iso3) -> Screw {
     let ch = q.w; // cos(θ/2) ≥ 0
 
     if sh2 < SCREW_DEGENERATE_SQ {
-        // Identity to far beyond f64 resolution; unreachable for physical input.
         return Screw::Degenerate(Iso3::new(q, t));
     }
 
-    // Dual part q_d = ½·(0,t)⊗q. Written out rather than
-    // `(Quat::from_pure(t) * q).scale(0.5)`: LLVM cannot fold the literal `0.0`
-    // operands away without `nnan`/`nsz`, so that form costs a full Hamilton
-    // product (16 multiplies against 12 here).
-    //
-    // **The association is load-bearing and must not be tidied**: it is the
-    // general product's own tree with the `0.0 * b` terms deleted, so the natural
-    // `Vec3::dot`/`cross` spelling is not bit-identical. Residual, intermediate
-    // only: at `t = 0` this `q_d.w` is `-0.0` where the general product gave
-    // `+0.0`; no output differs (compared bit-for-bit over 414 336 cases).
+    // q_d = ½·(0,t)⊗q, written out (12 multiplies, not 16). The association is
+    // the general product's tree minus the `0.0 * b` terms and must not be
+    // tidied: `Vec3::dot`/`cross` is not bit-identical.
     let q_d = Quat::new(
         -(t.x * q.x) - t.y * q.y - t.z * q.z,
         t.x * q.w + t.y * q.z - t.z * q.y,
@@ -98,8 +68,7 @@ fn screw_parts(rel: &Iso3) -> Screw {
     )
     .scale(0.5);
 
-    // k = q_d.w / sin²(θ/2) diverges alone but only ever multiplies `q_v`, so
-    // every product below is finite down to SCREW_DEGENERATE_SQ.
+    // k diverges alone but only multiplies `q_v`: finite down to SCREW_DEGENERATE_SQ.
     let k = q_d.w / sh2;
 
     // m·sin(θ/2) = q_d_v + q_v·k·cos(θ/2).
@@ -137,7 +106,6 @@ impl ScrewParts {
             (cos_sp, sin_sp / sh)
         };
 
-        // Recompose; every `l` and `m` is folded into `w`, `k`, `m_sh`.
         let q_r2 = Quat::new(cos_sh, w * q_v.x, w * q_v.y, w * q_v.z);
         let q_d2_v = m_sh.scale(w).add(q_v.scale(-s * k * cos_sh));
         let q_d2 = Quat::new(s * self.q_d.w * w, q_d2_v.x, q_d2_v.y, q_d2_v.z);
@@ -147,16 +115,9 @@ impl ScrewParts {
         Iso3::new(q_r2, Vec3::new(2.0 * t2q.x, 2.0 * t2q.y, 2.0 * t2q.z))
     }
 
-    /// `ξ = log_se3(rel)` recovered from the parts already in hand
-    /// (`docs/PHASE4.md` §2.3; [`screw_pow`] never materializes `ξ`).
-    ///
-    /// * `ω = (2φ/sin φ)·q_v`.
-    /// * `v = (2φ/sin φ)·m_sh − 2k·q_v`; both `1/sin φ` cancel, keeping it
-    ///   accurate at small angles.
-    ///
-    /// `φ` is the `atan2` the power takes on the large-arc branch, and the
-    /// transcendental-free `sqrt(theta_sq_from_chord(·))` on the small-angle one.
-    /// The branch is a speed choice only; `deriv_cost` is the guard.
+    /// `ξ = log_se3(rel)` from the parts in hand (`docs/PHASE4.md` §2.3):
+    /// `ω = (2φ/sin φ)·q_v`, `v = (2φ/sin φ)·m_sh − 2k·q_v`. The `φ` branch is a
+    /// speed choice only (`deriv_cost`).
     #[inline]
     fn twist(&self) -> Twist {
         let sh = libm::sqrt(self.sh2);
@@ -199,9 +160,8 @@ pub fn screw_pow(rel: &Iso3, s: f64) -> Iso3 {
     }
 }
 
-/// The segment's body twist `ξ = log_se3(rel)` **without** raising `rel` to any
-/// power — `docs/PHASE4.md` §2.3. Taken by [`crate::ScLerp::eval_with_twist`] at
-/// `s ∈ {0, 1}`, the most frequently queried stamps on any edge.
+/// The segment's body twist `ξ = log_se3(rel)` without a power
+/// (`docs/PHASE4.md` §2.3); used by [`crate::ScLerp::eval_with_twist`] at `s ∈ {0, 1}`.
 #[inline]
 #[must_use]
 pub fn screw_twist(rel: &Iso3) -> Twist {
@@ -211,13 +171,9 @@ pub fn screw_twist(rel: &Iso3) -> Twist {
     }
 }
 
-/// [`screw_pow`], plus the segment's body twist `ξ = log_se3(rel)` **per unit
-/// `s`** — `docs/PHASE4.md` §2.3.
-///
-/// Under ScLerp the body twist is constant across the segment (unlike
-/// LerpSlerp, §2.4), so a caller gets per-second velocity by scaling `ξ/Δt`.
-/// The pose equals [`screw_pow`] bit-for-bit
-/// (`screw_pow_with_twist_agrees_bit_for_bit`).
+/// [`screw_pow`], plus the body twist `ξ = log_se3(rel)` per unit `s`
+/// (`docs/PHASE4.md` §2.3); constant across the segment, so velocity is `ξ/Δt`.
+/// The pose equals [`screw_pow`] bit-for-bit.
 #[inline]
 #[must_use]
 pub fn screw_pow_with_twist(rel: &Iso3, s: f64) -> (Iso3, Twist) {
@@ -236,15 +192,14 @@ mod tests {
     use crate::interp::THETA_SLERP_SMALL;
     use crate::reference;
 
-    /// A fixed, deliberately non-axis-aligned unit screw axis.
+    /// A non-axis-aligned unit screw axis.
     const AXIS: Vec3 = Vec3 {
         x: 0.267_261_241_912_424_4,
         y: 0.534_522_483_824_848_8,
         z: 0.801_783_725_737_273_2,
     };
 
-    /// Rotation `theta` about [`AXIS`] with a translation not perpendicular to
-    /// it, exercising the pitch term.
+    /// Rotation `theta` about [`AXIS`] with a non-perpendicular translation.
     fn rot(theta: f64) -> Iso3 {
         let half = theta * 0.5;
         let (s, c) = libm::sincos(half);
@@ -266,7 +221,7 @@ mod tests {
         dq.max(dt)
     }
 
-    /// The `sin²` predicate must agree with the shared angle threshold.
+    /// The `sin²` predicate agrees with the shared angle threshold.
     #[test]
     fn sin_half_theta_small_sq_matches_the_shared_threshold() {
         let expected = libm::sin(THETA_SLERP_SMALL) * libm::sin(THETA_SLERP_SMALL);
@@ -287,7 +242,6 @@ mod tests {
                 assert!(e < 1e-13, "theta={theta:e} s={s} err={e:e}");
                 worst = worst.max(e);
             }
-            // s = 1 must return `rel` to near machine precision.
             let e1 = err(&screw_pow(&rel, 1.0), &rel);
             assert!(e1 < 1e-14, "theta={theta:e} s=1 err={e1:e}");
             theta *= 0.5;
@@ -295,12 +249,9 @@ mod tests {
         assert!(worst < 1e-13, "worst={worst:e}");
     }
 
-    /// Nothing may jump at the series/exact boundary. Comparing just below with
-    /// just above tests only the function's own slope, so the check is that
-    /// *both* branches track the same smooth reference.
+    /// No jump at the series/exact boundary: both branches track the reference.
     #[test]
     fn no_discontinuity_across_the_series_threshold() {
-        // sin²(θ/2) = SIN_HALF_THETA_SMALL_SQ  =>  θ = 2·THETA_SLERP_SMALL.
         let theta_c = 2.0 * THETA_SLERP_SMALL;
         for d in [1e-12, 1e-9, 1e-6, 1e-3] {
             for theta in [theta_c - d, theta_c + d] {
@@ -348,11 +299,7 @@ mod tests {
         }
     }
 
-    /// **The two public entry points must not drift apart**: [`screw_pow`] and
-    /// [`screw_pow_with_twist`] must agree bit-for-bit. It cannot detect a change
-    /// to the *shared* code, which moves both sides equally.
-    ///
-    /// Mutant: make [`screw_pow_with_twist`] return `p.pow(s * 0.999)` ⇒ fails.
+    /// [`screw_pow`] and [`screw_pow_with_twist`] agree bit-for-bit.
     #[test]
     fn screw_pow_with_twist_agrees_bit_for_bit() {
         for k in 0..64 {
@@ -370,12 +317,7 @@ mod tests {
         }
     }
 
-    /// **The recovered twist must equal a full `log_se3`**, swept across nine
-    /// decades of `θ` (a test only at `θ ≈ 1` would pass a formula that loses
-    /// every digit at `1e-8`).
-    ///
-    /// Mutant: drop the `− 2k·q_v` term ⇒ the linear part is wrong for any screw
-    /// with pitch, which is every case here.
+    /// The recovered twist equals `log_se3` across nine decades of `θ`.
     #[test]
     fn recovered_twist_matches_log_se3() {
         let mut worst = 0.0f64;
@@ -399,10 +341,7 @@ mod tests {
         );
     }
 
-    /// **The twist does not depend on `s`** (§2.3), which makes it exact rather
-    /// than a finite difference.
-    ///
-    /// Mutant: make [`ScrewParts::twist`] use `s` anywhere ⇒ fails.
+    /// The twist does not depend on `s` (§2.3).
     #[test]
     fn the_twist_is_constant_across_the_segment() {
         for k in 0..20 {
@@ -415,8 +354,7 @@ mod tests {
         }
     }
 
-    /// The recovered `ξ` must generate the segment: `exp(ξ) == rel`, closing the
-    /// loop through `exp_se3` so a matched pair of sign errors cannot pass.
+    /// `exp(ξ) == rel` for the recovered twist.
     #[test]
     fn exp_of_the_recovered_twist_reproduces_the_segment() {
         for k in 0..20 {
@@ -432,10 +370,7 @@ mod tests {
         }
     }
 
-    /// The degenerate arm must produce a twist, not a zero one: a pure
-    /// translation has `ω = 0`, `v = t`.
-    ///
-    /// Mutant: return `Twist::ZERO` from the `Degenerate` arm ⇒ fails.
+    /// The degenerate arm reports a pure translation as `ω = 0`, `v = t`.
     #[test]
     fn the_degenerate_arm_still_reports_the_translation() {
         let pure = Iso3::new(Quat::IDENTITY, Vec3::new(0.5, -0.3, 0.8));
@@ -448,7 +383,6 @@ mod tests {
             "pure translation twist should be the translation itself, got {:?}",
             xi.v
         );
-        // The pose is the half-way point, so the two halves are consistent.
         assert!((pose.t.x - 0.25).abs() < 1e-15);
     }
 }

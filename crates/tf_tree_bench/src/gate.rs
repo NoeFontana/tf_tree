@@ -1,12 +1,10 @@
 //! One spelling for a gate's outcome, and one exit code per meaning.
 //!
-//! CI reads only the process exit code, so "this host cannot evaluate the
-//! criterion" (`2`) must not arrive byte-identical to "the code regressed" (`1`).
+//! CI reads only the exit code, so "this host cannot evaluate the criterion"
+//! (`2`) must not look like "the code regressed" (`1`).
 //!
-//! [`Outcome::Refused`] is [`Status::Unavailable`] for a whole run. `Pass` and
-//! `Fail` have no `Status` analogue: a row records a measurement, a gate a
-//! verdict. Both refusal constructors quote a probed [`Fitness`] reason, never a
-//! literal, so a refusal cannot be typed to make a job green.
+//! [`Outcome::Refused`] is [`Status::Unavailable`] for a whole run. Both refusal
+//! constructors quote a probed [`Fitness`] reason, never a literal.
 
 use core::fmt;
 
@@ -18,8 +16,7 @@ use crate::report::{Fitness, Ground, Sensitivity};
 pub const EXIT_PASS: i32 = 0;
 /// `1` — the gate was evaluated and the criterion does **not** hold.
 pub const EXIT_FAIL: i32 = 1;
-/// `2` — the gate was **not** evaluated. Never a pass and never a failure of
-/// the code under test.
+/// `2` — the gate was **not** evaluated; neither pass nor failure.
 pub const EXIT_REFUSED: i32 = 2;
 
 /// What a gate binary concluded.
@@ -27,15 +24,13 @@ pub const EXIT_REFUSED: i32 = 2;
 pub enum Outcome {
     /// Evaluated; the criterion holds.
     Pass(String),
-    /// Evaluated; the criterion does not hold. The string is the operator-facing
-    /// reason and should carry the measured number that missed.
+    /// Evaluated; the criterion does not hold. Carries the measured number that missed.
     Fail(String),
-    /// Not evaluated. `ground` is the machine-checked claim this rests on and
-    /// `why` is the probe's own words.
+    /// Not evaluated. `ground` is the machine-checked claim, `why` the probe's words.
     Refused {
         /// The machine-checked claim this refusal rests on.
         ground: Ground,
-        /// The probe's own words for why. Never a literal — see the module doc.
+        /// The probe's own words for why; never a literal.
         why: String,
     },
 }
@@ -43,9 +38,6 @@ pub enum Outcome {
 impl Outcome {
     /// Refused because this host cannot produce a trustworthy number on the
     /// criterion's sensitivity axis, or [`None`] if it can.
-    ///
-    /// Returns `Option` so a fit host (always `HostIndependent`) cannot be
-    /// handed a refusal with an empty reason.
     #[must_use]
     pub fn refused_on_host(fitness: &Fitness, sensitivity: Sensitivity) -> Option<Outcome> {
         let (fit, _axis, why) = fitness.axis(sensitivity);
@@ -58,8 +50,7 @@ impl Outcome {
         })
     }
 
-    /// Refused because the host has fewer physical cores than the criterion
-    /// needs, or [`None`]. Quotes [`Fitness::core_reason`] and nothing else.
+    /// Refused because the host has fewer physical cores than the criterion needs, or [`None`].
     #[must_use]
     pub fn refused_on_cores(fitness: &Fitness) -> Option<Outcome> {
         fitness.core_reason.clone().map(|why| Outcome::Refused {
@@ -80,9 +71,7 @@ impl Outcome {
 
     /// Print the verdict on stdout and leave the process with [`Self::code`].
     ///
-    /// The one exit point a gate binary should have, so it cannot print
-    /// `REFUSED` and then exit `1` through `anyhow`. Uses a locked handle rather
-    /// than `println!`: library modules return a `String`, this is the exception.
+    /// The one exit point a gate binary should have; uses a locked handle, not `println!`.
     pub fn report_and_exit(self) -> ! {
         use std::io::Write;
         let mut out = std::io::stdout().lock();

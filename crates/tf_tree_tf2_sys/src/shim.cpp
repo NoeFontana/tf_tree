@@ -1,10 +1,8 @@
-// extern "C" bridge over `tf2::BufferCore` for the differential and benchmark
-// harnesses. It links `-ltf2` alone: no rclcpp, no DDS. Exceptions never cross
-// the boundary.
+// extern "C" bridge over `tf2::BufferCore` for the differential and benchmark harnesses.
+// Links `-ltf2` alone. Exceptions never cross the boundary.
 //
-// Every pose is a `double[7]` `{qw, qx, qy, qz, tx, ty, tz}`, the order of
-// `tf_tree_math::Iso3::to_bits`. tf2 is w-last; the transposition happens here,
-// once, and is covered by a round-trip test.
+// Every pose is a `double[7]` `{qw, qx, qy, qz, tx, ty, tz}` (`Iso3::to_bits`'s order); the
+// w-last transposition happens here, once.
 
 #include <tf2/buffer_core.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -17,9 +15,7 @@
 
 namespace {
 
-/// The last exception message, per calling thread. Not a `Handle` member: one
-/// buffer is shared by many reader threads, and a shared `std::string` slot would
-/// be a data race.
+/// The last exception message, per calling thread: a shared slot would race across readers.
 thread_local std::string t_last_error;
 
 /// Owns the buffer and nothing else, so it is shareable.
@@ -40,8 +36,7 @@ tf2::TimePoint time_point(std::int64_t stamp_ns) {
 
 extern "C" {
 
-/// Allocate a `BufferCore` whose cache spans `cache_secs`. Returns null on
-/// allocation failure. Free with `tft2_free`.
+/// Allocate a `BufferCore` whose cache spans `cache_secs`; null on failure. Free with `tft2_free`.
 void *tft2_new(double cache_secs) {
   return new (std::nothrow) Handle(cache_secs);
 }
@@ -51,10 +46,8 @@ void tft2_free(void *h) { delete static_cast<Handle *>(h); }
 
 /// Insert `T_parent_child` at `stamp_ns`, using names from `tft2_name_new`.
 ///
-/// `pose` is `{qw, qx, qy, qz, tx, ty, tz}`; `is_static` is `setTransform`'s
-/// static flag. Returns 0 on success, 1 if tf2 rejected the transform (NaN,
-/// self-parent, empty frame id), 2 on an exception. Names are `std::string`s so
-/// no per-call NUL-terminated string is charged to tf2.
+/// `pose` is `{qw, qx, qy, qz, tx, ty, tz}`. Returns 0 on success, 1 if tf2 rejected the
+/// transform, 2 on an exception.
 int tft2_set_pre(void *h, const void *parent, const void *child,
                  std::int64_t stamp_ns, const double *pose, int is_static) {
   Handle *self = static_cast<Handle *>(h);
@@ -89,11 +82,8 @@ int tft2_set_pre(void *h, const void *parent, const void *child,
   }
 }
 
-/// Allocate a persistent `std::string` for a frame name. Free with
+/// Allocate a persistent `std::string` for a frame name (immutable, shareable). Free with
 /// `tft2_name_free`.
-///
-/// Avoids a per-call `std::string` temporary that a benchmark would charge to
-/// tf2. Immutable after construction, so shareable across threads.
 void *tft2_name_new(const char *s) { return new (std::nothrow) std::string(s); }
 
 /// Free a name from `tft2_name_new`. Null is a no-op.
@@ -141,9 +131,8 @@ int tft2_can_transform(void *h, const char *target, const char *source,
 /// Drop every transform, keeping the handle.
 void tft2_clear(void *h) { static_cast<Handle *>(h)->buffer.clear(); }
 
-/// Everything `tft2_lookup_pre` does except the `BufferCore` call, with the same
-/// argument types. Subtracting it isolates the shim's overhead. `volatile` and
-/// the `out` write keep the optimiser from deleting it.
+/// Everything `tft2_lookup_pre` does except the `BufferCore` call; `volatile` and the `out`
+/// write keep the optimiser from deleting it.
 int tft2_lookup_noop(void *h, const void *target, const void *source,
                      std::int64_t stamp_ns, double *out) {
   (void)h;
@@ -159,8 +148,7 @@ int tft2_lookup_noop(void *h, const void *target, const void *source,
   return 0;
 }
 
-/// The most recent failure message on the calling thread, NUL-terminated; valid
-/// until this thread's next failing call. `h` is unused.
+/// The most recent failure message on the calling thread, NUL-terminated; `h` is unused.
 const char *tft2_last_error(void *h) {
   (void)h;  // the slot is per-thread, not per-handle
   return t_last_error.c_str();
