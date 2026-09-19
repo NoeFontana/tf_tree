@@ -67,14 +67,16 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/v}"
-          header="$(grep -m1 -F "## [${tag}]" CHANGELOG.md docs/changelog/"${tag}".md 2>/dev/null | head -1 | sed 's/^[^:]*://' || true)"
+          src=CHANGELOG.md
+          grep -qF "## [${tag}]" "$src" || src="docs/changelog/${tag}.md"
+          header="$([[ -f "$src" ]] && grep -m1 -F "## [${tag}]" "$src" || true)"
           if [[ -z "$header" ]]; then
-            echo "::error::CHANGELOG.md has no '## [${tag}]' section" >&2
+            echo "::error::neither CHANGELOG.md nor docs/changelog/${tag}.md has a '## [${tag}]' section" >&2
             exit 1
           fi
           echo "changelog header: ${header}"
           if grep -qi 'unreleased' <<<"$header"; then
-            echo "::error file=CHANGELOG.md::'${header}' still says unreleased, but v${tag} is being released now. Put the release date in the section header." >&2
+            echo "::error file=${src}::'${header}' still says unreleased, but v${tag} is being released now. Put the release date in the section header." >&2
             exit 1
           fi
 
