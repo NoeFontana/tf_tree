@@ -46,11 +46,17 @@ that can produce it: every other spin in the engine waits on a **store** that a
 running peer is a few instructions from making, while this one waits on a peer
 that may not be running at all.
 
-**`Tree::reparent` faced the same class and answered it differently.** A2's
-topology lock is a kernel lock ([`0029`](./0029-the-topology-lock-is-a-kernel-lock.md)):
-it stopped asking whether the holder is alive and took an OFD byte, so a
-stopped holder blocks rather than being inferred about. The interning path still
-infers, and still spins.
+**`Tree::reparent` faced the same class and answered it differently — at the
+facade, and only there.** A2's topology lock became a kernel lock at the
+`Tree::reparent` layer ([`0029`](./0029-the-topology-lock-is-a-kernel-lock.md)):
+it takes §3.3's byte 1 *before* the arena word, so a stopped holder blocks rather
+than being inferred about. **The in-arena `TopoLockView::acquire` still spins
+`TOPO_LOCK_SPIN_LIMIT` and then calls `is_alive(owner_slot)` and steals** — the
+byte narrows what that inference may authorise, it does not remove it, and
+`PHASE2.md` §0.0 records the path as closed only for a tree that *has* a lock
+file. *This paragraph said A2 "stopped asking whether the holder is alive",
+which is true of `reparent`'s acquisition order and false of the core's.* The
+interning path has no byte at all, and still spins.
 
 ## Decision
 
@@ -63,8 +69,7 @@ The waiter yields to the scheduler after a short pure-spin prefix. **How the
 yield reaches `tf_tree_core` is a seam, not a feature**, and the draft's answer —
 "the same shape `crash-points` already uses" — does not work: that shape is
 sound only because nothing shipped enables `crash-points`. A yield behind a
-default-off feature never reaches a `tf_tree` user and is compiled by no gate
-(`cargo nextest run --workspace` builds default features); a yield behind a
+default-off feature never reaches a `tf_tree` user; a yield behind a
 default-**on** one puts `extern crate std` into every `tf_tree_core` in the graph
 by unification, which is what `lib.rs`'s own comment argues against.
 
@@ -169,20 +174,31 @@ is what this layer can express, and its calibration is the same kind of number
    3 and *Decision* §1). `sync::spin` is unchanged and stays pure for the four
    store-waiters; a second function, used by `frame::wait_for_publish` alone,
    calls an installed yield hook after a pure-spin prefix and pure-spins when
-   none is installed. `tf_tree` installs it. Both functions keep yielding under
+   none is installed. **The prefix is per liveness round, not per wait** —
+   `wait_for_publish` resets its spin counter at every round, so a per-wait
+   reading would enter the scheduler `INTERN_SPIN_LIMIT` times less often and the
+   two differ by that factor. Consequences names the prefix as the knob to turn
+   on a `bench-check` regression, so which one it is has to be stated. `tf_tree` installs it. Both functions keep yielding under
    `cfg(loom)`, or the models stop scheduling the thread they wait on.
    - **Verified by** `just bench-check` against the committed baseline, reported
      rather than assumed; by `just loom`; and by the existing frame tests passing
      unchanged.
-   - **The no-hook build has no gate today, and step 1 owes one.**
-     `stable-tier-check` only compiles `-p tf_tree`, the std facade, and says
-     nothing about `tf_tree_core`; the closest existing pass is
-     `clippy -p tf_tree_core --no-default-features --features crash-points`,
-     which pulls `extern crate std` in through that very feature. There is no
-     `-p tf_tree_core --no-default-features` pass without it and no bare-metal
-     cross-compile anywhere in the justfile. *An earlier version of this step
-     named `stable-tier-check` and "the `no_std` build" as verification; neither
-     checks what it claimed.*
+   - **Two different things, and an earlier version of this step conflated
+     them.** *No hook installed* is a **runtime** state, and it is already
+     exercised: every `tf_tree_core` unit test builds an `ArenaView` with no
+     facade, and `just test` runs them. What has **no gate** is a `no_std`
+     compile of `tf_tree_core` — `stable-tier-check` compiles only `-p tf_tree`,
+     the closest pass is
+     `clippy -p tf_tree_core --no-default-features --features crash-points`
+     which pulls `extern crate std` in through that feature, and there is no
+     bare-metal cross-compile anywhere in the justfile. Step 1 owes that compile
+     gate; it would not have caught the runtime case the earlier text named.
+   - **A hosted direct consumer of `tf_tree_core` keeps the unbounded,
+     non-yielding spin.** It is one of the five publishing crates, so this is a
+     real population, and the seam gives them nothing unless they install a hook
+     themselves. That is a consequence of choosing the seam over a feature and is
+     recorded rather than hidden: the record's subject is a starvation the
+     facade's users stop having.
    - **Two stop points, because the first is only half a check.** If
      `bench-check` moves on a path that does *not* reach `wait_for_publish`, the
      yield leaked into `spin`. And **a test must prove the hook is actually
@@ -191,9 +207,17 @@ is what this layer can express, and its calibration is the same kind of number
      stays green, which is the failure mode `bench-check` structurally cannot
      see.
 2. Both roles count every liveness round; past the limit, `Wait::Contended` →
-   `FrameError::InternContended`. **Report the measured worst-case intern
-   duration and derive N from question 2's rule** — the number is not to be
-   assumed.
+   `FrameError::InternContended`. **Report the measured round cost — the spin *and*
+   the probe syscalls — on both gated architectures, and check N = 8 against it.**
+
+   *An earlier version said "derive N from question 2's rule", which is
+   unfalsifiable as written*: the floor is a constant and the ceiling a
+   control-loop rate, so no measurement outcome can move N. What the measurement
+   *can* do is falsify the **premises** — if a round costs far more than ~0.4 ms
+   because the `/proc` fallback dominates, the ceiling is breached at N = 8 and N
+   must come down toward the floor; if the healthy-intern margin is under two
+   orders of magnitude, the floor's justification is wrong. Those are the
+   outcomes step 2 reports against.
    - **The existing control must be rewritten, and saying it "keeps passing" was
      wrong.** `a_claimant_that_cannot_be_proven_dead_is_never_stolen_from` stages
      exactly this shape and asserts the waiter is *still blocked after 250 ms*
@@ -249,6 +273,19 @@ is what this layer can express, and its calibration is the same kind of number
    two causes need different handling. It is new public surface on a published
    crate and `API.md` §7's checklist; this record takes the cheaper route and
    names it so a reopening starts from the cost.
+
+   **Eight shipped sites, counted rather than sampled.** `FrameError::InternContended`'s
+   variant doc and its `Display`; `LookupError::UnknownFrame`'s "transient";
+   `find_core`'s `# Errors` and `ArenaView::find_frame`'s, both saying the
+   claimant is *anonymous*; `Tree::lookup`'s `# Errors` ("— transient: retry"),
+   which is the one a Rust caller actually reads; `intern_core`'s `# Errors`,
+   which does not mention the variant at all; and **`tf_tree_py`'s
+   `unresolvable_name` message**, which is the shipped Python text telling a
+   caller *"cannot identify … Retry"*. *An earlier version of this step listed
+   four and cited `detached_err`'s rustdoc for the Python site — that one is
+   `pub(crate)` and reaches no wheel user, so the fix would have landed on the
+   invisible copy while the message that actually sends a control loop into an
+   unbounded retry stayed put.*
 4. A `loom` model reaches the bound, with a control that fails when the bound is
    unreachable.
 
@@ -299,10 +336,12 @@ each answer says where the evidence is.
      hash-slot CAS, a record write and a release store — sub-microsecond. One
      round of `INTERN_SPIN_LIMIT` is 10 000 pure spins, ~0.4 ms at 3 GHz, which
      already exceeds a healthy intern by roughly three orders of magnitude. Any
-     N ≥ 2 is therefore unreachable by a claimant that is merely slow.
-   - **Actionable by a control loop.** A robot loop runs at 100–1000 Hz, so a
-     refusal has to arrive inside a period to be worth anything. That puts
-     N × `INTERN_SPIN_LIMIT` in **single-digit milliseconds** — N of about 8.
+     N ≥ 1 is therefore unreachable by a claimant that is merely slow, so this
+     side does not constrain the choice at all.
+   - **Actionable by a control loop.** A robot loop runs at 100–1000 Hz. A
+     refusal cannot always arrive inside a period — see the Ceiling bullet, which
+     is where this constraint is actually stated — but it must arrive in a time a
+     loop can absorb as a dropped cycle rather than a stall.
 
    **The floor is structural, not a duration, and a first version of this answer
    missed it.** `READER_UNRECORDED_ROUNDS` is 4: a reader waits that many rounds
@@ -324,8 +363,12 @@ each answer says where the evidence is.
      is that *one* cycle is lost instead of all of them; the ceiling is therefore
      single-digit milliseconds on x86, and a 1 kHz loop is told plainly that a
      refusal costs it more than one period.
-   - **N = 8** is the value to implement: the smallest multiple of the floor that
-     leaves room for the floor to move, at ~3.2 ms of spinning on x86.
+   - **N = 8** is the value to implement: comfortably above the floor of 5, with
+     room for `READER_UNRECORDED_ROUNDS` to grow before the two collide, at
+     ~3.2 ms of spinning on x86. *An earlier version called it "the smallest
+     multiple of the floor"; 8 is a multiple of 4, not of the floor's 5, so
+     re-applying that derivation at a different `READER_UNRECORDED_ROUNDS` gives
+     whichever of two numbers the reader guesses.*
 
    **Two costs the first two versions of this answer did not price.**
 
