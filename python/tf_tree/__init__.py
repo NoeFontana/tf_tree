@@ -1,4 +1,4 @@
-"""tf_tree — a transform tree engine, a faster and more scalable alternative to ROS ``tf2``.
+"""tf_tree — a faster, more scalable transform tree engine than ROS ``tf2``.
 
 **Stamps are integer nanoseconds.** There is no float-seconds overload (``float64``
 seconds cannot represent 1 kHz intervals at a 2026 epoch). :func:`from_sec` is

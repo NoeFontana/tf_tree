@@ -75,7 +75,8 @@ def test_a_released_claim_can_be_retaken_from_another_process(runtime_dir):
     "ignore:This process .* is multi-threaded:DeprecationWarning"
 )
 def test_a_forked_child_is_refused_rather_than_faulting(runtime_dir):
-    """**`multiprocessing` defaults to `fork` on Linux**, so this is how users meet it."""
+    """**`multiprocessing` defaults to `fork` on Linux**, so this is how users meet
+    it."""
     tree = tf_tree.open(mode="rw", create=EDGES)
     pub = tree.publisher("base", "map")
     pub.push(1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
@@ -297,7 +298,8 @@ def test_opening_a_name_nothing_serves_raises_arena_absent(runtime_dir):
 
 
 def _rendezvous_child() -> pathlib.Path:
-    """The Rust test helper `tf_tree_rendezvous_child`, which the pytest recipes build."""
+    """The Rust test helper `tf_tree_rendezvous_child`, which the pytest recipes
+    build."""
     root = pathlib.Path(__file__).resolve().parents[2]
     target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or root / "target")
     exe = target / "debug" / "tf_tree_rendezvous_child"

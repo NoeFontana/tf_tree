@@ -557,7 +557,8 @@ def test_a_scalar_layout_call_is_the_one_element_batch_bit_for_bit(
 
 
 def test_the_twist_layout_is_the_quat_layout_plus_six(twistable):
-    """``quat_twist`` is ``quat`` with the body twist appended, not a re-derived pose."""
+    """``quat_twist`` is ``quat`` with the body twist appended, not a re-derived
+    pose."""
     p = twistable.plan("map", "base")
     stamps = np.array([1_250_000_000, 1_500_000_000, 1_750_000_000], dtype=np.int64)
     pose = p.at(stamps, layout="quat")
@@ -631,7 +632,8 @@ def test_at_into_refuses_a_float_stamp_with_the_measurement_too(
 def test_the_layout_path_reports_a_bad_stamps_array_exactly_as_at_does(
     twistable, layout, elems, dtype
 ):
-    """The price the two tests around this one charged, pinned so it stays paid on purpose."""
+    """The price the two tests around this one charged, pinned so it stays paid on
+    purpose."""
     p = twistable.plan("map", "base")
     out = np.zeros((1, elems), dtype=dtype)
     bad = np.array([1_500_000_000.0])  # float64, not int64
@@ -957,7 +959,8 @@ def test_from_ros_says_what_it_wanted_when_handed_the_wrong_object():
 
 
 def test_from_sec_still_exists_and_still_names_its_exact_siblings():
-    """`from_sec` is kept and kept lossy (§5.1); what it gains is somewhere to point. The
+    """`from_sec` is kept and kept lossy (§5.1); what it gains is somewhere to point.
+    The
     docstring is the thing a user reads at the moment they are about to use it, so the
     pointer belongs there.
     """

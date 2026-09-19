@@ -97,7 +97,8 @@ def run_consumer(engine: str) -> None:
         tree = tf_tree.open(mode="ro")
         plan = tree.plan("map", "cam")
 
-        # `at_into` a buffer allocated once: a node cannot batch, and `at` allocates per call
+        # `at_into` a buffer allocated once: a node cannot batch, and `at` allocates
+        # per call
         # (224 ns against 173 ns).
         out = np.empty((4, 4))
 
@@ -113,7 +114,8 @@ def run_consumer(engine: str) -> None:
         def rclpy_duration(seconds: float) -> Duration:
             return Duration(seconds=seconds)
 
-        # The structural difference: no shared arena, so this consumer holds its own copy
+        # The structural difference: no shared arena, so this consumer holds its own
+        # copy
         # of the whole history.
         buf = Buffer(cache_time=rclpy_duration(TF2_HISTORY_S + 5.0))
         # Anchored on this consumer's own start; every consumer materialises all of it.
@@ -192,7 +194,8 @@ def run_publisher() -> None:
     t0 = time.perf_counter()
     while True:
         # The tick index is derived from elapsed time and not also incremented: a
-        # catching-up burst laps the ring, and incrementing twice ran ~156 Hz, not `PUB_HZ`.
+        # catching-up burst laps the ring, and incrementing twice ran ~156 Hz, not
+        # `PUB_HZ`.
         now = time.perf_counter()
         i = int((now - t0) / period) + 1
         due = t0 + i * period
@@ -297,7 +300,8 @@ def main() -> None:
                     env=env,
                 )
                 assert pub.stdout is not None
-                # Reading READY synchronises: the arena exists and is being published into.
+                # Reading READY synchronises: the arena exists and is being published
+                # into.
                 assert pub.stdout.readline().strip() == "READY", (
                     "publisher did not start"
                 )
@@ -323,7 +327,8 @@ def main() -> None:
             lo, hi = sweep[0], sweep[-1]
             dn = CONSUMERS[-1] - CONSUMERS[0]
             d_pss = (hi["pss_mib"] - lo["pss_mib"]) / dn
-            # `cpu_pct` is a per-row mean, scaled back to a fleet total before differencing.
+            # `cpu_pct` is a per-row mean, scaled back to a fleet total before
+            # differencing.
             d_cpu = (hi["cpu_pct"] * CONSUMERS[-1] - lo["cpu_pct"] * CONSUMERS[0]) / dn
             print(f"  marginal: {d_pss:.1f} MiB/node, {d_cpu:.2f}% cpu/node")
         print()

@@ -41,7 +41,8 @@ import time
 import numpy as np
 import tf_tree
 
-# Depth 3 after constant folding (`docs/PHASE1.md` §11.3's shape); a one-edge tree times the call, not the fold.
+# Depth 3 after constant folding (`docs/PHASE1.md` §11.3's shape); a one-edge tree
+# times the call, not the fold.
 EDGES = [("map", "odom"), ("odom", "base"), ("base", "imu_link")]
 THREAD_COUNTS = (1, 2, 4, 8)
 # The control-loop batch (`docs/API.md` R2 argues `_into` from n = 64), above §6.1's
@@ -98,7 +99,8 @@ def physical_cores() -> int | None:
     """Physical cores this process can actually use, or `None` if undecidable.
 
 
-    Distinct `(physical id, core id)` pairs (as `tf_tree_bench::report::physical_cores`),
+    Distinct `(physical id, core id)` pairs (as
+    `tf_tree_bench::report::physical_cores`),
     not `os.cpu_count()`, which counts SMT siblings. Counted only over the CPUs in this
     process's affinity mask, per processor, so sibling-paired CPUs are not over-counted;
     [`quota_cores`] is applied as a floor.
@@ -174,12 +176,15 @@ def one_arm(
     def worker(slot: int) -> None:
         try:
             # The `at_into` buffer is per thread and allocated outside both loops (`at`
-            # allocates per call while the GIL is held); shaped by `plan.at(stamps)` so a
+            # allocates per call while the GIL is held); shaped by `plan.at(stamps)` so
+            # a
             # layout change cannot leave it wrong.
             out = np.empty_like(plan.at(stamps)) if into else None
 
-            # Warm-up iterations are not counted; `is_set` is in both loops so it cannot bias
-            # one thread count. Both arms call the binding directly: a shared `call()` adds
+            # Warm-up iterations are not counted; `is_set` is in both loops so it
+            # cannot bias
+            # one thread count. Both arms call the binding directly: a shared `call()`
+            # adds
             # a frame to the published `at` numbers.
             if into:
                 while not go.is_set():
@@ -225,8 +230,10 @@ def one_arm(
     for t in pool:
         t.start()
     time.sleep(warmup)
-    # `started` before `go.set()`: taken after, a descheduled main thread inflates the rate,
-    # more so at higher thread counts, the unsafe direction for a floor. This order errs low.
+    # `started` before `go.set()`: taken after, a descheduled main thread inflates the
+    # rate,
+    # more so at higher thread counts, the unsafe direction for a floor. This order
+    # errs low.
     started = time.perf_counter()
     go.set()
     time.sleep(seconds)
@@ -281,7 +288,8 @@ def main() -> int:
             "flat-curve control, and gating it would report the control as a "
             "regression"
         )
-    # `--gate --call at_into` is refused: §7.3 names `plan.at`, and a criterion re-pointed
+    # `--gate --call at_into` is refused: §7.3 names `plan.at`, and a criterion
+    # re-pointed
     # at the faster call stops meaning anything.
     if args.gate and args.call == "at_into":
         ap.error(
@@ -339,7 +347,8 @@ def main() -> int:
             plan, stamps, n, args.seconds, args.warmup, lock, args.call == "at_into"
         )
         rows.append((n, rate))
-        # ns/sample makes a wrong build profile visible (~300 at `--release`, ~1900 `develop`).
+        # ns/sample makes a wrong build profile visible (~300 at `--release`, ~1900
+        # `develop`).
         per = 1e9 / rate if rate > 0 else float("inf")
         note = ""
         if n == 1:
@@ -358,7 +367,8 @@ def main() -> int:
     base = rows[0][1]
     if base <= 0.0:
         # A 1-thread arm can complete zero calls on legal arguments (`--batch 4000000
-        # --seconds 0.001`); `ZeroDivisionError` would exit 1, indistinguishable from FAIL.
+        # --seconds 0.001`); `ZeroDivisionError` would exit 1, indistinguishable from
+        # FAIL.
         print(
             "  INVALID — the 1-thread arm completed no calls, so there is no "
             "denominator. Lower --batch or raise --seconds; a window shorter than "
@@ -371,7 +381,8 @@ def main() -> int:
         print(f"  1 -> {n:<2d} scaling   {rate / base:6.3f}x")
     print()
 
-    # One-sided: every host unfairness pushes the reading down, so a miss is INVALID, never FAIL.
+    # One-sided: every host unfairness pushes the reading down, so a miss is INVALID,
+    # never FAIL.
     scaling = rows[-1][1] / base
     if cores is None:
         print(
@@ -390,7 +401,8 @@ def main() -> int:
         verdict = "CONTROL"
     elif scaling >= FLOOR:
         margin = (scaling / FLOOR - 1.0) * 100.0
-        # "this run clears it", not "the criterion is met": one clearing run is one observation.
+        # "this run clears it", not "the criterion is met": one clearing run is one
+        # observation.
         print(
             f"  PASS — {scaling:.3f}x over {widest} threads against a floor of "
             f"{FLOOR:g}x, {margin:+.1f}%. This run clears criterion 4's {half} "
@@ -415,9 +427,12 @@ def main() -> int:
             "code."
         )
         if gil:
-            # The host is not the whole story for the GIL arm: the free-threaded half clears the
-            # floor on this host, and `--call at_into` (no per-call allocation) reads higher yet
-            # still short of it. No readings here: `docs/benchmarks/EVIDENCE.md`'s probe row is
+            # The host is not the whole story for the GIL arm: the free-threaded half
+            # clears the
+            # floor on this host, and `--call at_into` (no per-call allocation) reads
+            # higher yet
+            # still short of it. No readings here: `docs/benchmarks/EVIDENCE.md`'s
+            # probe row is
             # their only copy.
             if not into:
                 print(
@@ -466,7 +481,8 @@ def main() -> int:
                 "usable_cpus": len(usable),
                 "quota_cores": quota,
                 "batch": args.batch,
-                # Which call this row measured, so rows taken the other way are not compared.
+                # Which call this row measured, so rows taken the other way are not
+                # compared.
                 "call": args.call,
                 "serialize": args.serialize,
                 "floor": FLOOR,

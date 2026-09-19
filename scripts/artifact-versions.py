@@ -21,7 +21,8 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# `tomllib` is 3.11+ (the package's floor is py310, not this script's): report it rather than a traceback.
+# `tomllib` is 3.11+ (the package's floor is py310, not this script's): report it
+# rather than a traceback.
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -34,12 +35,15 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The five crates this release publishes: the one literal not read from the repository, because `publish` in a manifest is the authority a gate would otherwise compare to itself.
+# The five crates this release publishes: the one literal not read from the repository,
+# because `publish` in a manifest is the authority a gate would otherwise compare to
+# itself.
 PUBLISHABLE = frozenset(
     {"tf_tree", "tf_tree_core", "tf_tree_math", "tf_tree_arena", "tf_tree_ipc"}
 )
 
-# Every file carrying a hand-kept copy of the version; each must yield at least one site.
+# Every file carrying a hand-kept copy of the version; each must yield at least one
+# site.
 VERSION_FILES = (
     "Cargo.toml",
     "pyproject.toml",
@@ -64,20 +68,23 @@ PACKAGE_XML_FILES = (
     "ros/tf_tree_bench_ros/package.xml",
 )
 
-# The manifests outside `[workspace]` cannot inherit `[workspace.package] version`, so they spell it and are compared.
+# The manifests outside `[workspace]` cannot inherit `[workspace.package] version`, so
+# they spell it and are compared.
 EXCLUDED_MANIFESTS = (
     "crates/tf_tree_py/Cargo.toml",
     "crates/tf_tree_tf2_sys/Cargo.toml",
 )
 
-# `project(<name> VERSION <v> ...)`, anchored on the keyword: `cmake_minimum_required(VERSION 3.16)` precedes it.
+# `project(<name> VERSION <v> ...)`, anchored on the keyword:
+# `cmake_minimum_required(VERSION 3.16)` precedes it.
 PROJECT_VERSION_RE = re.compile(
     r"\bproject\s*\(\s*[A-Za-z0-9_]+\s+VERSION\s+([0-9][^\s)]*)"
 )
 
 failures: list[str] = []
 
-# Measurements, as opposed to verdicts: a `check_*` summary asserts its rule and is withheld on failure; these print on every run.
+# Measurements, as opposed to verdicts: a `check_*` summary asserts its rule and is
+# withheld on failure; these print on every run.
 notes: list[str] = []
 
 
@@ -96,7 +103,8 @@ def _git(*args: str) -> str:
     ).stdout
 
 
-# NUL-split so a path with a space survives; sorted; cached so two rules asking for `*.md` see one corpus.
+# NUL-split so a path with a space survives; sorted; cached so two rules asking for
+# `*.md` see one corpus.
 @functools.cache
 def tracked(*globs: str) -> tuple[str, ...]:
     listed = _git("ls-files", "-z", *globs)
@@ -153,7 +161,8 @@ def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
 
     root = load_toml("Cargo.toml")
 
-    # The intra-workspace pins: a publishable crate wired by path alone is unpublishable, so a missing pin is its own failure.
+    # The intra-workspace pins: a publishable crate wired by path alone is
+    # unpublishable, so a missing pin is its own failure.
     for name, dep in sorted(root["workspace"]["dependencies"].items()):
         if not isinstance(dep, dict):
             continue
@@ -198,7 +207,8 @@ def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
     )
 
     for rel in CMAKE_FILES:
-        # Comment lines stripped (as `evidence-audit.sh` does): the comment above `project()` quotes a version.
+        # Comment lines stripped (as `evidence-audit.sh` does): the comment above
+        # `project()` quotes a version.
         body = "\n".join(
             line.split("#", 1)[0] for line in (ROOT / rel).read_text().splitlines()
         )
@@ -262,7 +272,8 @@ def check_versions() -> str:
                 f"is hand-kept."
             )
 
-    # `covered`, not `len(VERSION_FILES)`: the root `Cargo.toml` is both authority and carrier.
+    # `covered`, not `len(VERSION_FILES)`: the root `Cargo.toml` is both authority and
+    # carrier.
     return (
         f"{len(sites)} version sites in {len(covered)} files all read "
         f"{authority} — the root Cargo.toml's [workspace.package] version"
@@ -284,7 +295,8 @@ def check_publishable(authority: str) -> str:
     ).stdout
     packages = json.loads(out)["packages"]
 
-    # `publish = false` is an empty allow-list, "anywhere" is null; a registry allow-list reads as not-publishable (the safe direction).
+    # `publish = false` is an empty allow-list, "anywhere" is null; a registry
+    # allow-list reads as not-publishable (the safe direction).
     publishable = {p["name"] for p in packages if p.get("publish") is None}
 
     if publishable != set(PUBLISHABLE):
@@ -423,7 +435,8 @@ def check_recipe_references() -> str:
                     doc_findings.append((str(rel), line, message))
     for _, _, message in sorted(doc_findings):
         fail(message)
-    # Anti-vacuity, in the shape siblings use (`if not X`, never a magnitude): catches a scan that stopped matching.
+    # Anti-vacuity, in the shape siblings use (`if not X`, never a magnitude): catches
+    # a scan that stopped matching.
     if not doc_files:
         fail(f"DOC_GLOBS {DOC_GLOBS} matched no document; this check scanned nothing")
     if not doc_checked:
@@ -486,7 +499,8 @@ def check_recipe_references() -> str:
 # positive blocks a correct document, so three constructions GFM does not render
 # as tables are guarded:
 #
-#   * a setext H2 (prose containing `|`, then a bare `---`): a delimiter row must contain a `|`;
+#   * a setext H2 (prose containing `|`, then a bare `---`): a delimiter row must
+# contain a `|`;
 #   * a 4-space-indented code block: the threshold is four past the innermost
 #     open list item's content, not the margin (`docs/decisions/0005`);
 #   * an HTML comment, through `-->`.
@@ -500,7 +514,8 @@ MD_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
 # A list marker (moves the indented-code threshold).
 LIST_MARKER_RE = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])(\s+)")
 
-# A blockquote marker, possibly nested, stripped first: tables inside `>` blocks render and truncate like any other.
+# A blockquote marker, possibly nested, stripped first: tables inside `>` blocks render
+# and truncate like any other.
 QUOTE_PREFIX_RE = re.compile(r"^\s*(?:>\s?)+")
 
 
@@ -682,7 +697,8 @@ def check_markdown_tables() -> str:
     )
 
 
-# `](target` — an inline link's destination up to the first whitespace or `)`. Reference definitions are out of scope.
+# `](target` — an inline link's destination up to the first whitespace or `)`.
+# Reference definitions are out of scope.
 MD_LINK_RE = re.compile(r"\]\(\s*([^)\s]+)")
 
 
@@ -835,7 +851,8 @@ DECISION_SETTLED_VERB = re.compile(
     r"[*_`]{0,2}\s+by\s+[*_`]{0,2}\[?[*_`]{0,2}(\d{4})[*_`]{0,2}\]?"
 )
 
-# Leading continuation markers stripped before joining, so a citation split across a blockquote or `//!` block is seen.
+# Leading continuation markers stripped before joining, so a citation split across a
+# blockquote or `//!` block is seen.
 _CONTINUATION = re.compile(r"^\s*(?:>|//!|///|//|#)+\s?")
 
 
@@ -866,7 +883,8 @@ def check_decision_status_citations() -> str:
 
     settled = 0
     for rel in files:
-        # A record may discuss its own state only; the skip is per match, against this file's own id.
+        # A record may discuss its own state only; the skip is per match, against this
+        # file's own id.
         own = rel.rsplit("/", 1)[-1][:4] if rel.startswith("docs/decisions/") else None
         try:
             raw = (ROOT / rel).read_text(encoding="utf-8").splitlines()
@@ -920,7 +938,8 @@ def check_decision_status_citations() -> str:
 # 10. The changelog is not behind the code a user can observe.
 # ---------------------------------------------------------------------------
 
-# Paths whose contents reach somebody who never clones this repository (shipping inside something counts, not `publish = false`).
+# Paths whose contents reach somebody who never clones this repository (shipping inside
+# something counts, not `publish = false`).
 RELEASE_VISIBLE = (
     "crates/tf_tree/src/",
     "crates/tf_tree_arena/src/",
@@ -942,7 +961,8 @@ RELEASE_VISIBLE = (
     "ros/",
 )
 
-# Reported in the summary line: a silently unfailable override is what `0023` step 5 is about.
+# Reported in the summary line: a silently unfailable override is what `0023` step 5 is
+# about.
 NO_CHANGELOG = "[no changelog]"
 
 
@@ -962,7 +982,8 @@ def strip_fenced_blocks(text: str) -> tuple[str, bool]:
             stripped = stripped[1:].lstrip()
         run = len(stripped) - len(stripped.lstrip("`"))
         if run >= 3:
-            # CommonMark: a fence closes only on a run at least as long as the one that opened it.
+            # CommonMark: a fence closes only on a run at least as long as the one that
+            # opened it.
             if opened == 0:
                 opened = run
                 out.append("")
@@ -997,7 +1018,8 @@ def check_line_citations() -> str:
     )
     files = tracked("*.md")
     found: dict[str, int] = {}
-    # The same citation with the prefix optional (the form `CLAUDE.md` names), counted in the same pass.
+    # The same citation with the prefix optional (the form `CLAUDE.md` names), counted
+    # in the same pass.
     bare = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|py):\d+")
 
     total = 0
@@ -1037,7 +1059,9 @@ def check_line_citations() -> str:
     )
     gone = sorted(rel for rel, _, _ in dropped if rel not in files)
 
-    # An empty scan is not a pass: the equality above fails when the pattern stops matching. Assert the pattern's shape: it matches the prefixed form and not the bare form (the documented scope limit).
+    # An empty scan is not a pass: the equality above fails when the pattern stops
+    # matching. Assert the pattern's shape: it matches the prefixed form and not the
+    # bare form (the documented scope limit).
     if not pattern.search("see `crates/tf_tree/src/tree.rs:2182` for it"):
         fail(
             "the `path.rs:LINE` pattern no longer matches a full-path citation; "
@@ -1050,7 +1074,8 @@ def check_line_citations() -> str:
             "the rows must be re-derived in the same commit"
         )
 
-    # A drop is a failure, not a note: a row must be brought down in the commit that shed the citations.
+    # A drop is a failure, not a note: a row must be brought down in the commit that
+    # shed the citations.
     if dropped:
         shed = sum(was - now for _, was, now in dropped)
         listed = ", ".join(f"{rel} {was}->{now}" for rel, was, now in dropped)
@@ -1068,7 +1093,8 @@ def check_line_citations() -> str:
             f"from here. {remedy}: {listed}. A row above its file is headroom "
             f"for a citation nobody had to justify."
         )
-    # The uncounted half is printed, not written down; `bare` is a superset of `pattern`.
+    # The uncounted half is printed, not written down; `bare` is a superset of
+    # `pattern`.
     if wider < total:
         fail(
             f"the wider citation census counted {wider} against the gated "
@@ -1080,7 +1106,8 @@ def check_line_citations() -> str:
             "the wider census pattern no longer matches a bare citation; the "
             "figure it prints is asserting nothing"
         )
-    # A file whose fence never closed is read only to the fence, so both totals are partial.
+    # A file whose fence never closed is read only to the fence, so both totals are
+    # partial.
     partial = (
         f" — PARTIAL: {len(unreadable)} file(s) were read only as far as an "
         f"unclosed fence, so both totals are short"
@@ -1119,7 +1146,8 @@ def check_changelog_freshness() -> str:
     if not order:
         return f"changelog freshness: no commits since {tag}"
 
-    # One walk, two answers: `--name-only` with an empty format prints the hash ahead of that commit's paths.
+    # One walk, two answers: `--name-only` with an empty format prints the hash ahead
+    # of that commit's paths.
     newest: dict[str, str] = {}
     touches_visible: set[str] = set()
     current = ""
@@ -1193,7 +1221,8 @@ def check_changelog_freshness() -> str:
 def main() -> int:
     authority = load_toml("Cargo.toml")["workspace"]["package"]["version"]
 
-    # A check's summary sentence asserts its rule, so it is withheld when the check added a failure (snapshot of `failures` around each call).
+    # A check's summary sentence asserts its rule, so it is withheld when the check
+    # added a failure (snapshot of `failures` around each call).
     lines: list[str] = []
     for call in (
         check_versions,
@@ -1214,10 +1243,12 @@ def main() -> int:
             lines.append(summary)
 
     if failures:
-        # A failing run prints the measurements (`notes`) and the surviving verdicts; a failed check loses its summary.
+        # A failing run prints the measurements (`notes`) and the surviving verdicts; a
+        # failed check loses its summary.
         for line in [*lines, *notes]:
             print(f"artifact-versions: {line}")
-        # stdout is block-buffered under a pipe, so flush before the failure block on stderr.
+        # stdout is block-buffered under a pipe, so flush before the failure block on
+        # stderr.
         sys.stdout.flush()
         print(
             "artifact-versions: the repository disagrees with itself.\n",
