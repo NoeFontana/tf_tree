@@ -431,7 +431,8 @@ def check_changelog(authority: str) -> str:
         text += "\n" + archived.read_text()
     if not re.search(rf"^## \[{re.escape(authority)}\]", text, re.M):
         fail(
-            f"Neither CHANGELOG.md nor docs/changelog/{authority}.md has a `## [{authority}]` section.\n"
+            f"Neither CHANGELOG.md nor docs/changelog/{authority}.md has a "
+            f"`## [{authority}]` section.\n"
             f"    The version moved and the changelog did not. Keep a Changelog 1.1.0 "
             f"is the format the file declares."
         )
