@@ -96,7 +96,6 @@ impl Interp for LerpSlerp {
 
 impl Iso3 {
     /// `self⁻¹ · rhs`, the relative transform from `self` to `rhs`.
-
     #[inline]
     #[must_use]
     fn inv_mul(&self, rhs: &Iso3) -> Iso3 {
