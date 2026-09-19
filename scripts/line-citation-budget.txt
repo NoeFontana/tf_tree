@@ -21,8 +21,3 @@
 # counted a triple backtick written inside an inline code span, and an odd
 # marker count inverts the pairing for the rest of a file — prose blanked, code
 # blocks scanned. The stripper is line-anchored now (`strip_fenced_blocks`).
-5	docs/PHASE4.md
-2	docs/PHASE5.md
-6	docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md
-1	docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md
-12	docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md

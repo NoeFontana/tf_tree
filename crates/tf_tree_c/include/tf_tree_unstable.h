@@ -54,7 +54,6 @@ typedef struct tft_bridge tft_bridge;
 
 /**
  * Bytes one twist occupies: `[ωx ωy ωz vx vy vz]`, `f64`, rad/s and m/s.
- * There is no `tft_twist_layout` enum: the 6-vector order is universal.
  */
 #define TFT_TWIST_BYTES (6 * 8)
 
@@ -90,9 +89,8 @@ typedef struct {
    */
   tft_bridge_on_clock_reset on_clock_reset;
   /**
-   * The time-domain tag the bridge stamps in — `use_sim_time` decides it (§5.5). Every declared
-   * *dynamic* edge must agree or creation fails with [`TFT_ERR_TIME_DOMAIN`]. Must fit in a
-   * `uint8_t`.
+   * The time-domain tag the bridge stamps in (§5.5); every dynamic edge must agree or creation fails
+   * with [`TFT_ERR_TIME_DOMAIN`]. Must fit in a `uint8_t`.
    */
   uint32_t domain;
   /**
@@ -103,12 +101,9 @@ typedef struct {
    * Rendezvous name for a **shared** arena, or NULL for a private heap arena
    * (`docs/decisions/0015`).
    *
-   * When non-NULL any process may attach read-only with [`tft_tree_open`](crate::tft_tree_open).
-   * Not [`tft_bridge_options::domain`]: the *rendezvous* domain is `$TF_TREE_DOMAIN`, else
-   * `$ROS_DOMAIN_ID`, else 0 (`docs/decisions/0019` §3).
-   *
-   * Failure is [`TFT_ERR_ARENA_UNAVAILABLE`](crate::TFT_ERR_ARENA_UNAVAILABLE) and **never falls
-   * back to a heap arena**. A library built without `--features shm` refuses a non-NULL value.
+   * Failure is [`TFT_ERR_ARENA_UNAVAILABLE`](crate::TFT_ERR_ARENA_UNAVAILABLE), never a heap
+   * fallback. Its rendezvous domain is `$TF_TREE_DOMAIN`, else `$ROS_DOMAIN_ID`, else 0
+   * (`docs/decisions/0019` §3).
    */
   const char *arena_name;
 } tft_bridge_options;
@@ -116,27 +111,22 @@ typedef struct {
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Which topic a sample arrived on; the bridge is told because `/tf_static` stamps are meaningless
- * (§5.7).
+ * Which topic a sample arrived on (§5.7).
  */
 typedef int32_t tft_bridge_topic;
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * One `geometry_msgs/TransformStamped`, in the ABI's terms.
- *
- * `pose` is `[qw qx qy qz tx ty tz]` (`docs/PHASE1.md` §3.1), **not** `geometry_msgs`' `x y z w`.
+ * One `geometry_msgs/TransformStamped`; `pose` is `[qw qx qy qz tx ty tz]`, not `x y z w`.
  */
 typedef struct {
   /**
-   * `sizeof(tft_bridge_sample)` in the caller's build (§3.6). A size predating
-   * `received_steady_nanos` is accepted as a prefix; see [`tft_bridge_offer`].
+   * `sizeof(tft_bridge_sample)` in the caller's build (§3.6).
    */
   uint32_t struct_size;
   /**
-   * Parent frame, NUL-terminated UTF-8, **exactly as it arrived**: §5.6's normalization is the
-   * bridge's job.
+   * Parent frame, NUL-terminated UTF-8, as it arrived.
    */
   const char *frame_id;
   /**
@@ -144,8 +134,7 @@ typedef struct {
    */
   const char *child_frame_id;
   /**
-   * Stamp, nanoseconds, in the bridge's own time domain (§5.5): the publisher's number, compared
-   * only against `received_steady_nanos`.
+   * Stamp, nanoseconds, in the bridge's own time domain (§5.5).
    */
   int64_t stamp_nanos;
   /**
@@ -153,20 +142,8 @@ typedef struct {
    */
   double pose[7];
   /**
-   * A reading of a local **steady (monotonic)** clock, in nanoseconds, taken when the message
-   * carrying this transform arrived. `0` for "none".
-   *
-   * A ROS caller reads `rclcpp::Clock(RCL_STEADY_TIME).now().nanoseconds()` **once per
-   * `TFMessage`** at callback entry. Not `node->get_clock()`: under `use_sim_time` that is
-   * `/clock`, the clock under test.
-   *
-   * §5.5 measures `stamp_nanos - received_steady_nanos` per publisher (its
-   * `transform_tolerance`); a step in it agreed on by two or more publishers is the fallback
-   * evidence that the clock moved. `0` drops only that corroborated verdict; per-edge
-   * monotonicity still holds.
-   *
-   * **Do not pass `stamp_nanos` here**: it zeroes the difference and reintroduces the
-   * `transform_tolerance` false positive.
+   * A local steady-clock reading in nanoseconds, taken when the message arrived; `0` for none. Read
+   * `rclcpp::Clock(RCL_STEADY_TIME)` once per `TFMessage`. **Never pass `stamp_nanos`** (§5.5).
    */
   int64_t received_steady_nanos;
 } tft_bridge_sample;
@@ -188,16 +165,11 @@ typedef int32_t tft_bridge_reason;
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * What the bridge decided, and everything needed to print a sentence about it.
- *
- * Every `const char *` is borrowed from the handle, valid until the next call on it, and never
- * NULL: a field that does not apply is `""`.
+ * What the bridge decided. Every `const char *` is borrowed until the next call on the handle; `""` if not applicable.
  */
 typedef struct {
   /**
-   * `sizeof(tft_bridge_outcome)` in the caller's build (§3.6). **Exact equality**, unlike
-   * `tft_bridge_options` and `tft_bridge_sample`: this is an `out` parameter (see
-   * `read_options`).
+   * `sizeof(tft_bridge_outcome)` in the caller's build (§3.6). **Exact equality**: an `out` parameter.
    */
   uint32_t struct_size;
   /**
@@ -209,31 +181,20 @@ typedef struct {
    */
   tft_bridge_reason reason;
   /**
-   * The engine status, when `action` is [`TFT_BRIDGE_REJECTED`]; otherwise
-   * [`TFT_OK`].
+   * The engine status when `action` is [`TFT_BRIDGE_REJECTED`], else [`TFT_OK`].
    */
   tft_status status;
   /**
-   * `1` the first time this edge produced this outcome, `0` afterwards — §5.6's "warn once" and
-   * §5.4's rate limit.
-   *
-   * Also set on [`TFT_BRIDGE_HALT`] and [`TFT_BRIDGE_RECREATE`]; both latch and every later
-   * offer replays the action with `first_time = 0`.
+   * `1` the first time this edge produced this outcome (§5.4, §5.6); also set on HALT and RECREATE.
    */
   uint8_t first_time;
   /**
-   * How far time went **backwards**, as a positive magnitude; `0` when it did not.
-   *
-   * Not merged with [`tft_bridge_outcome::delta_nanos`]: this is a distance, that a signed
-   * displacement, and they differ on a forward jump.
+   * How far time went **backwards**, as a positive magnitude; `0` otherwise.
    */
   int64_t by_nanos;
   /**
-   * The parent frame. Normalized (§5.6) where the pipeline named an edge; **as it arrived** for
-   * `TFT_BRIDGE_DROPPED`, `TFT_BRIDGE_HALT` and `TFT_BRIDGE_RECREATE`.
-   *
-   * **Empty when the outcome is not about an arriving transform**: a `STRICT` window close, and
-   * a reported jump ([`tft_bridge_note_time_jump`]).
+   * The parent frame: normalized (§5.6) where the pipeline named an edge, else as it arrived; empty
+   * for a window close or a reported jump.
    */
   const char *parent;
   /**
@@ -261,26 +222,15 @@ typedef struct {
    */
   const char *detail;
   /**
-   * How far time moved, and **which way**: new time minus old, so a rewind is **negative**; `0`
-   * where it does not apply.
-   *
-   * Set for [`TFT_BRIDGE_REASON_CLOCK_RESET`], [`TFT_BRIDGE_RECREATE`] and (as the negation of
-   * `by_nanos`) [`TFT_BRIDGE_REASON_NON_MONOTONIC`]. Same convention as
-   * `rcl_time_jump_t::delta`.
+   * New time minus old (a rewind is **negative**); `0` where not applicable.
    */
   int64_t delta_nanos;
   /**
-   * **Which rung of §5.5's ladder concluded the clock moved** — a `TFT_BRIDGE_EVIDENCE_*` code.
-   * A reported jump is a fact (look at the bag or simulator); a common-mode step is an inference
-   * (look at those nodes).
+   * A `TFT_BRIDGE_EVIDENCE_*` code: which rung of §5.5's ladder concluded the clock moved.
    */
   int32_t clock_evidence;
   /**
-   * Read according to `clock_evidence`:
-   *
-   * * [`TFT_BRIDGE_EVIDENCE_REPORTED`] — the [`tft_bridge_jump_kind`] reported.
-   * * [`TFT_BRIDGE_EVIDENCE_COMMON_MODE`] — how many distinct publishers agreed (≥ 2).
-   * * [`TFT_BRIDGE_EVIDENCE_NONE`] — `0`.
+   * Per `clock_evidence`: the [`tft_bridge_jump_kind`] (reported), the publisher count (common-mode), or `0`.
    */
   uint32_t clock_evidence_detail;
 } tft_bridge_outcome;
@@ -288,15 +238,11 @@ typedef struct {
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * One row of §5.6's remap table: a frame name as it arrives, and the name the arena knows it by.
- *
- * Both strings are borrowed until the next [`tft_bridge_get_remap`] call; [`tft_bridge_offer`]
- * does not invalidate them.
+ * One row of §5.6's remap table; both strings are borrowed until the next [`tft_bridge_get_remap`] call.
  */
 typedef struct {
   /**
-   * `sizeof(tft_bridge_remap)` in the caller's build (§3.6). Exact equality,
-   * for the reason [`tft_bridge_outcome::struct_size`] gives.
+   * `sizeof(tft_bridge_remap)` in the caller's build (§3.6); exact equality.
    */
   uint32_t struct_size;
   /**
@@ -312,18 +258,14 @@ typedef struct {
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Which way, and in what sense, the time source said its clock jumped —
- * [`tft_bridge_note_time_jump`]. Mirrors `rcl_time_jump_t`; `delta` is *"the new time minus the
- * last time before the jump"*.
+ * Which way the time source said its clock jumped ([`tft_bridge_note_time_jump`]); mirrors `rcl_time_jump_t`.
  */
 typedef int32_t tft_bridge_jump_kind;
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * §5.9's counters, plus the two the C layer alone can see.
- *
- * The ledger balances; a mismatch means some path returns without counting:
+ * §5.9's counters, plus two only the C layer sees. The ledger balances:
  *
  * ```text
  * applied + rejected_by_arena + static_verified
@@ -335,8 +277,7 @@ typedef int32_t tft_bridge_jump_kind;
  */
 typedef struct {
   /**
-   * `sizeof(tft_bridge_stats)` in the caller's build (§3.6). Exact equality,
-   * for the reason [`tft_bridge_outcome::struct_size`] gives.
+   * `sizeof(tft_bridge_stats)` in the caller's build (§3.6); exact equality.
    */
   uint32_t struct_size;
   /**
@@ -348,7 +289,7 @@ typedef struct {
    */
   uint64_t transforms;
   /**
-   * Transforms **the arena took**: the pipeline's approvals minus `rejected_by_arena`.
+   * Transforms the arena took.
    */
   uint64_t applied;
   /**
@@ -360,8 +301,7 @@ typedef struct {
    */
   uint64_t dropped_authority;
   /**
-   * Transforms **the clock rules refused** (§5.5): an edge's stamp going backwards at any
-   * magnitude, and the sample that completed a common-mode step (which may be monotone).
+   * Transforms the clock rules refused (§5.5).
    */
   uint64_t dropped_non_monotonic;
   /**
@@ -373,28 +313,23 @@ typedef struct {
    */
   uint64_t dropped_kind_change;
   /**
-   * Dropped because the topology config does not declare the edge (§5.8).
-   * **The counter to look at first** when a lookup returns no path.
+   * Dropped because the topology config does not declare the edge (§5.8). Look here first when a lookup has no path.
    */
   uint64_t dropped_undeclared;
   /**
-   * Dropped because the pose was not a transform (NaN, or a non-unit
-   * quaternion). `tf2` has no equivalent check and no equivalent counter.
+   * Dropped because the pose was not a transform (NaN, non-unit quaternion).
    */
   uint64_t dropped_bad_pose;
   /**
-   * The pipeline approved the write and the arena refused it — a revoked claim, or a writer
-   * poisoned by a `fork()`.
+   * The pipeline approved the write and the arena refused it.
    */
   uint64_t rejected_by_arena;
   /**
-   * Offers refused because the bridge had already stopped — after a
-   * [`TFT_BRIDGE_HALT`] *or* a [`TFT_BRIDGE_RECREATE`], both of which latch.
+   * Offers refused after a `HALT` or `RECREATE`, both of which latch.
    */
   uint64_t refused_after_halt;
   /**
-   * Clock resets concluded (§5.5) — **promotions**, not regressions; a lone publisher's
-   * regression is counted in `dropped_non_monotonic` only. Under `HALT` this is 0 or 1.
+   * Clock resets concluded (§5.5): promotions, not regressions. Under `HALT` this is 0 or 1.
    */
   uint64_t clock_resets;
   /**
@@ -402,13 +337,11 @@ typedef struct {
    */
   uint64_t static_conflicts;
   /**
-   * The **deepest** the subscription queue has been, as reported by
-   * [`tft_bridge_note_queue_depth`].
+   * The deepest the subscription queue has been ([`tft_bridge_note_queue_depth`]).
    */
   uint32_t queue_high_water;
   /**
-   * The subscription's configured depth, so the high-water mark reads as a
-   * fraction. `100` per §5.2.
+   * The subscription's configured depth (`100`, §5.2).
    */
   uint32_t queue_capacity;
 } tft_bridge_stats;
@@ -417,8 +350,7 @@ typedef struct {
 /**
  * How [`tft_tree_inherit_ownership`] resolved. Mirrors `tf_tree::Inheritance`.
  *
- * A value you do not recognise means this process is not the owner; only
- * `TFT_INHERITED` says otherwise.
+ * Only `TFT_INHERITED` means this process is now the owner.
  */
 typedef uint8_t tft_inheritance;
 
@@ -438,8 +370,7 @@ typedef int32_t tft_bridge_evidence;
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * `/tf_static` — latched, **transient_local**, `KeepLast(100)` (§5.2); a volatile subscription
- * misses earlier publishers.
+ * `/tf_static` — latched, **transient_local**, `KeepLast(100)` (§5.2).
  */
 #define TFT_BRIDGE_TOPIC_TF_STATIC 1
 #endif
@@ -460,11 +391,7 @@ typedef int32_t tft_bridge_evidence;
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Refuse to start if a conflict is detected within the startup window. For CI.
- *
- * Conflicts in the window are dropped and counted; the bridge halts once at its close
- * (`docs/decisions/0011`), reporting all of them. Outside the window this is `FIRST_WRITER_WINS`
- * plus counters.
+ * Halt at the startup window's close if it recorded conflicts (`docs/decisions/0011`). For CI.
  */
 #define TFT_BRIDGE_AUTHORITY_STRICT 2
 #endif
@@ -492,8 +419,7 @@ typedef int32_t tft_bridge_evidence;
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * A `/tf_static` value matching the declared constant. Nothing to write; the
- * arena already holds it (§5.7 idempotent, §5.8 verification).
+ * A `/tf_static` value matching the declared constant; nothing to write (§5.7, §5.8).
  */
 #define TFT_BRIDGE_STATIC_VERIFIED 1
 #endif
@@ -507,16 +433,14 @@ typedef int32_t tft_bridge_evidence;
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * A transform for an edge the topology config does not declare (§5.8).
- * `parent`, `child` and `first_time` are set.
+ * An edge the topology config does not declare (§5.8); `parent`, `child`, `first_time` are set.
  */
 #define TFT_BRIDGE_UNDECLARED 3
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * A `/tf_static` value that disagrees with the one on file (§5.7); `owner`, `intruder`, `existing`
- * and `offered` are set.
+ * A `/tf_static` value disagreeing with the one on file (§5.7); `existing`, `offered` are set.
  */
 #define TFT_BRIDGE_STATIC_CONFLICT 4
 #endif
@@ -530,16 +454,14 @@ typedef int32_t tft_bridge_evidence;
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * The clock moved under `RECREATE`: the caller must tear this bridge down and
- * build a fresh one. `delta_nanos` says how far, and which way.
+ * The clock moved under `RECREATE`: build a fresh bridge.
  */
 #define TFT_BRIDGE_RECREATE 6
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * The pipeline said write and **the arena refused**. `status` carries the
- * engine's status code, which is the one an operator can act on.
+ * The pipeline approved the write and the arena refused; `status` carries the engine's code.
  */
 #define TFT_BRIDGE_REJECTED 7
 #endif
@@ -560,16 +482,14 @@ typedef int32_t tft_bridge_evidence;
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Another publisher owns the edge (§5.4). `parent`, `child`, `owner`, `intruder` and `first_time`
- * are set.
+ * Another publisher owns the edge (§5.4); `owner` and `intruder` are set.
  */
 #define TFT_BRIDGE_REASON_NOT_THE_OWNER 2
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * **This edge's** stamp went backwards (§5.5); `delta_nanos` is negative. Dropped and counted; a
- * lone regression is never promoted to [`TFT_BRIDGE_REASON_CLOCK_RESET`].
+ * **This edge's** stamp went backwards (§5.5); `delta_nanos` is negative. Dropped and counted.
  */
 #define TFT_BRIDGE_REASON_NON_MONOTONIC 3
 #endif
@@ -583,98 +503,78 @@ typedef int32_t tft_bridge_evidence;
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * `STRICT`, and a conflict was recorded on an edge (§5.4). Per-sample: `owner`, `intruder`,
- * `parent` and `child` name it. The window closing is [`TFT_BRIDGE_REASON_STARTUP_CONFLICTS`].
+ * `STRICT`, and a conflict was recorded on an edge (§5.4); `owner`, `intruder`, `parent`, `child` name it.
  */
 #define TFT_BRIDGE_REASON_AUTHORITY_CONFLICT 5
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * The clock was judged to have moved (§5.5). `delta_nanos` is by how much (**negative for a
- * rewind**); `detail` names which rung of §5.5's ladder fired:
- *
- * * *"the time source reported it"* — [`tft_bridge_note_time_jump`]; a fact.
- * * *"N publishers stepped together"* — the fallback; an inference from two or more publishers'
- *   offsets stepping together.
- *
- * A single publisher regressing is never this. `parent`/`child` name the edge that completed a
- * common-mode step and are **empty** for a reported jump.
+ * The clock was judged to have moved (§5.5); see `clock_evidence` and `delta_nanos`.
  */
 #define TFT_BRIDGE_REASON_CLOCK_RESET 6
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * The pose was not a transform: NaN, infinity, or a quaternion that is not a
- * unit quaternion. Checked **before** the pipeline — see [`tft_bridge_offer`].
+ * NaN, infinity or a non-unit quaternion; checked before the pipeline ([`tft_bridge_offer`]).
  */
 #define TFT_BRIDGE_REASON_BAD_POSE 7
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * The bridge had already halted; the halt that caused it was reported on an earlier outcome.
+ * The bridge had already halted; the cause was reported earlier.
  */
 #define TFT_BRIDGE_REASON_ALREADY_HALTED 8
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * `STRICT`'s startup window closed with conflicts recorded in it (§5.4), so the bridge refused to
- * start (`docs/decisions/0011` step 6).
- *
- * A judgment about a *set* of edges, authority (§5.4) and static-value (§5.7) alike. `detail`
- * states both counts and enumerates **every** recorded edge with both publishers (§5.4's
- * amendment). `owner`, `intruder`, `parent` and `child` are **empty**.
+ * `STRICT`'s startup window closed with conflicts recorded (§5.4, `docs/decisions/0011`); `detail`
+ * lists every edge.
  */
 #define TFT_BRIDGE_REASON_STARTUP_CONFLICTS 9
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * The clock *source* changed (`use_sim_time` switched at runtime); the delta compares two time
- * bases and is not a duration.
+ * The clock *source* changed (`use_sim_time` switched); the delta is not a duration.
  */
 #define TFT_BRIDGE_JUMP_CLOCK_TYPE_CHANGED 0
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Time moved backwards: a bag loop, a sim reset, an NTP step back.
- * `delta_nanos` is negative.
+ * Time moved backwards; `delta_nanos` is negative.
  */
 #define TFT_BRIDGE_JUMP_BACKWARD 1
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Time moved forwards past the source's threshold: a bag seek, sim fast-forward, NTP step.
- * `delta_nanos` is positive. Only the authoritative path sees this cheaply.
+ * Time moved forwards past the source's threshold; `delta_nanos` is positive.
  */
 #define TFT_BRIDGE_JUMP_FORWARD 2
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * No clock judgment was made on this outcome; `clock_evidence_detail` is `0`. Every outcome starts
- * here (`tft_bridge_outcome::blank`).
+ * No clock judgment was made; `clock_evidence_detail` is `0`.
  */
 #define TFT_BRIDGE_EVIDENCE_NONE 0
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * The time source itself reported the jump, through [`tft_bridge_note_time_jump`];
- * `clock_evidence_detail` is the [`tft_bridge_jump_kind`].
+ * The time source itself reported the jump; `clock_evidence_detail` is the [`tft_bridge_jump_kind`].
  */
 #define TFT_BRIDGE_EVIDENCE_REPORTED 1
 #endif
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Two or more distinct publishers' stamp-to-receipt offsets stepped by the same amount inside one
- * correlation window; `clock_evidence_detail` is how many. The fallback rung.
+ * Two or more publishers' offsets stepped together (the fallback); `clock_evidence_detail` is how many.
  */
 #define TFT_BRIDGE_EVIDENCE_COMMON_MODE 2
 #endif
@@ -685,14 +585,13 @@ typedef int32_t tft_bridge_evidence;
 #define TFT_INHERITED 0
 
 /**
- * `tft_tree_owner_lost` would have answered `false`, so nothing was attempted.
- * Not final while it keeps answering `true` (`0057` Decision 3): call again.
+ * `tft_tree_owner_lost` would have answered `false`; nothing was attempted.
+ * Not final (`0057` Decision 3): call again.
  */
 #define TFT_OWNER_ALIVE 1
 
 /**
- * The ownership byte was taken by another survivor or a fresh open. This
- * process kept its slot and keeps reading. Not final: call again.
+ * Another survivor or a fresh open took the ownership byte. Not final: call again.
  */
 #define TFT_CONTENDED 2
 
@@ -702,42 +601,30 @@ typedef int32_t tft_bridge_evidence;
 #define TFT_READ_ONLY 3
 
 /**
- * Nothing to inherit from: a heap tree, a frozen `.tft`, or a tree this
- * process already owns.
+ * A heap tree, a frozen `.tft`, or a tree this process already owns.
  */
 #define TFT_NOT_APPLICABLE 4
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Build a bridge over the topology described by `config_toml`, and the arena that topology
- * declares.
+ * Build a bridge over the topology `config_toml` declares (text, not a path; `docs/decisions/0004`),
+ * and its arena.
  *
- * The config is text, not a path. The engine has no runtime edge declaration
- * (`docs/decisions/0004`, §5.8's amendment), so everything the bridge will write must be in it.
- * Creates the arena, claims every declared dynamic edge, and refuses to start if any of that
- * fails. The calling thread **owns** the bridge.
- *
- * `opts->struct_size` selects the layout; the one predating `arena_name` is accepted as a prefix
- * (§3.6) and keeps its private heap arena.
+ * Claims every declared dynamic edge and refuses to start if any fails. The calling thread **owns**
+ * the bridge. `opts->struct_size` selects the layout; the pre-`arena_name` one is a prefix (§3.6).
  *
  * # Blocking
  *
- * With a non-NULL `opts->arena_name` this goes through `tf_tree::Open` and may block up to
- * `DEFAULT_OPEN_TIMEOUT` (5 s). A NULL `arena_name` does not.
+ * A non-NULL `opts->arena_name` may block up to `DEFAULT_OPEN_TIMEOUT` (5 s).
  *
  * # Errors
  *
- * * [`TFT_ERR_BAD_CONFIG`] — the file does not parse, **declares no edges**, declares a cycle, or
- *   describes a topology the engine will not build.
- * * [`TFT_ERR_TIME_DOMAIN`] — a declared dynamic edge's domain is not `opts->domain` (§5.5,
- *   NORMATIVE, at startup by design).
- * * [`TFT_ERR_ALREADY_CLAIMED`](crate::TFT_ERR_ALREADY_CLAIMED) and the rest of the claim family —
- *   another participant holds a declared edge.
- * * [`TFT_ERR_ARENA_UNAVAILABLE`](crate::TFT_ERR_ARENA_UNAVAILABLE) — a non-NULL
- *   `opts->arena_name` could not be served (name held, unusable runtime directory, no `shm`
- *   feature); **no heap fallback**.
- * * [`TFT_ERR_BAD_STRUCT_SIZE`] — `opts->struct_size` is neither this build's size nor the one
- *   before it.
+ * * [`TFT_ERR_BAD_CONFIG`] — unparsable, no edges, a cycle, or will not build.
+ * * [`TFT_ERR_TIME_DOMAIN`] — a dynamic edge's domain is not `opts->domain` (§5.5).
+ * * The claim family — another participant holds a declared edge.
+ * * [`TFT_ERR_ARENA_UNAVAILABLE`](crate::TFT_ERR_ARENA_UNAVAILABLE) — `arena_name` could not be
+ *   served; no heap fallback.
+ * * [`TFT_ERR_BAD_STRUCT_SIZE`] — `opts->struct_size` is not a known size.
  *
  * # Safety
  *
@@ -752,11 +639,8 @@ tft_status tft_bridge_create(const char *config_toml,
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * A [`tft_tree`] handle onto the arena this bridge writes, for reading.
- *
- * Independently owned: it shares the refcount, so freeing either does not disturb the other. Free
- * it with [`tft_tree_free`](crate::tft_tree_free) exactly once. `Send + Sync`, so reader threads
- * may use it while the executor ingests.
+ * A [`tft_tree`] handle onto this bridge's arena, for reading. Independently owned; free it with
+ * [`tft_tree_free`](crate::tft_tree_free). `Send + Sync`.
  *
  * # Safety
  *
@@ -768,8 +652,7 @@ tft_status tft_bridge_tree(tft_bridge *b, tft_tree **out);
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Release the bridge, its claims and its arena reference. Freeing NULL is a
- * no-op.
+ * Release the bridge, its claims and its arena reference. Freeing NULL is a no-op.
  *
  * # Safety
  *
@@ -783,32 +666,28 @@ void tft_bridge_free(tft_bridge *b);
 /**
  * Offer one transform: run every §5 table, then write the arena.
  *
- * `gid` is the publisher's `rmw_message_info_t::publisher_gid` (16 bytes) or NULL. An unresolved
- * GID is not an error (§5.3): the publisher is `<unknown publisher>`, a missing one
- * `<unattributed>`.
+ * `gid` is `rmw_message_info_t::publisher_gid` (16 bytes) or NULL; an unresolved GID is not an error
+ * (§5.3).
  *
  * # The return value answers a different question from the outcome
  *
- * The status says whether the *call* was well-formed. Everything that happened to the sample,
- * including rejection, is in `*out`, which is filled before anything can fail.
+ * The status says whether the *call* was well-formed; what happened to the sample is in `*out`.
  *
  * # Orderings
  *
- * The pose is validated before the pipeline runs, so a garbage first message cannot take an edge
- * under `FirstWriterWins`. A halted bridge refuses everything: the ABI cannot stop the caller's
- * process, so this is what stopping means.
+ * The pose is validated before the pipeline, so a garbage first message cannot take an edge. A
+ * halted bridge refuses everything.
  *
  * # `TFT_BRIDGE_RECREATE` is a report, not an action
  *
- * This ABI will not build a fresh arena: every plan and `tft_tree` handle points into the current
- * one. The caller tears the bridge down, rebuilds it, and re-plans.
+ * The caller tears the bridge down, rebuilds it, and re-plans.
  *
  * # An older caller's sample still works
  *
- * A `struct_size` naming the pre-`received_steady_nanos` layout is accepted as a prefix (§3.6); a
- * *larger* size is refused ([`tft_check_abi`](crate::tft_check_abi)). The missing field is filled
- * from this library's own steady clock, never from `stamp_nanos`, which would reintroduce
- * inference over the signal under suspicion.
+ * The pre-`received_steady_nanos` size is a prefix (§3.6); a larger size is refused
+ * ([`tft_check_abi`](crate::tft_check_abi)). The missing field comes from this library's steady
+ * clock, never `stamp_nanos`.
+ *
  *
  * # Safety
  *
@@ -826,11 +705,8 @@ tft_status tft_bridge_offer(tft_bridge *b,
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Record that `gid` belongs to `node_name` — §5.3's cache, filled from the node's graph-change
- * handler.
- *
- * A known GID's name is **replaced**. An all-zero `gid` is refused with
- * [`TFT_ERR_BAD_ENUM`](crate::TFT_ERR_BAD_ENUM): it is what an RMW leaves when it has no GID.
+ * Record that `gid` belongs to `node_name` (§5.3); a known GID's name is **replaced**. An all-zero
+ * `gid` is refused with [`TFT_ERR_BAD_ENUM`](crate::TFT_ERR_BAD_ENUM).
  *
  * # Safety
  *
@@ -842,10 +718,7 @@ tft_status tft_bridge_attribute(tft_bridge *b, const uint8_t *gid, const char *n
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Read row `index` of §5.6's remap table, or report that there is no such row.
- *
- * §5.6: *"A silent remap is worse than no remap."* The table is complete before the first message;
- * walk it right after create:
+ * Read row `index` of §5.6's remap table; the table is complete before the first message.
  *
  * ```c
  * tft_bridge_remap r = { .struct_size = sizeof r };
@@ -853,8 +726,7 @@ tft_status tft_bridge_attribute(tft_bridge *b, const uint8_t *gid, const char *n
  *     RCLCPP_INFO(log, "tf_tree: frame %s is declared as %s", r.from, r.to);
  * ```
  *
- * An empty table returns [`TFT_ERR_NO_DATA`](crate::TFT_ERR_NO_DATA) on the first call, the loop's
- * termination condition.
+ * An empty table returns [`TFT_ERR_NO_DATA`](crate::TFT_ERR_NO_DATA) on the first call.
  *
  * # Errors
  *
@@ -870,8 +742,7 @@ tft_status tft_bridge_get_remap(tft_bridge *b, uint32_t index, tft_bridge_remap 
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Note that a `TFMessage` arrived, whatever it contained (§5.9); the ratio to `transforms` shows
- * batching versus spamming.
+ * Note that a `TFMessage` arrived (§5.9).
  *
  * # Safety
  *
@@ -884,28 +755,24 @@ tft_status tft_bridge_note_message(tft_bridge *b);
 /**
  * **The time source itself said its clock jumped** — §5.5's authoritative path.
  *
- * Feed it `rcl_time_jump_t` from `rcl_clock_add_jump_callback`: no threshold, no corroboration, so
- * it applies [`TFT_BRIDGE_ON_CLOCK_RESET_HALT`] or [`TFT_BRIDGE_ON_CLOCK_RESET_RECREATE`]
- * directly. `delta_nanos` is `rcl_time_jump_t::delta.nanoseconds` (new minus old; a rewind is
- * **negative**), unnegated; `kind` collapses `rcl_clock_change_t` onto the three
- * [`tft_bridge_jump_kind`] codes.
+ * Feed it `rcl_time_jump_t` from `rcl_clock_add_jump_callback`. `delta_nanos` is
+ * `delta.nanoseconds` unnegated (a rewind is negative).
  *
  * # Not from the jump callback
  *
- * rclcpp's jump callback does not run on the bridge's thread. The callback must record the jump
- * into a slot the ingest thread drains, and call this from there.
+ * rclcpp's jump callback runs off the bridge's thread: record the jump there and call this from the
+ * ingest thread.
  *
  * # Charges no counter
  *
- * It is not a transform, so no ledger term moves, even on a stopped bridge; `clock_resets` does
- * increment.
+ * No ledger term moves; `clock_resets` does increment.
  *
  * # Errors
  *
  * * [`TFT_ERR_BAD_ENUM`](crate::TFT_ERR_BAD_ENUM) — `kind` is not one of the three codes.
  *
- * A stopped bridge is **not** an error: `*out` replays the latched action with
- * [`TFT_BRIDGE_REASON_ALREADY_HALTED`], as [`tft_bridge_offer`] does.
+ * A stopped bridge is not an error: `*out` replays the latched action with
+ * [`TFT_BRIDGE_REASON_ALREADY_HALTED`].
  *
  * # Safety
  *
@@ -920,37 +787,26 @@ tft_status tft_bridge_note_time_jump(tft_bridge *b,
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Close `STRICT`'s startup window (§5.4), halting once if conflicts were recorded in it.
- *
- * The **primary** mechanism §5.4's amendment names (`docs/decisions/0011` step 6); otherwise the
- * window closes only on the 4096-transform backstop.
+ * Close `STRICT`'s startup window (§5.4), halting once if conflicts were recorded in it
+ * (`docs/decisions/0011` step 6). Charges no counter.
  *
  * # Closing too early costs the policy
  *
- * A window that closes before the conflicting sample arrives reports nothing, and `STRICT`
- * degrades to `FirstWriterWins` plus counters for the life of the process. `/tf_static` samples
- * can land seconds after start, so the duration chosen trades coverage, not just start-up latency;
- * the caller owns it.
- *
- * It charges no counter, like [`tft_bridge_note_time_jump`].
+ * A window closing before the conflicting sample arrives reports nothing, and `STRICT` degrades to
+ * `FirstWriterWins` plus counters; the caller owns the duration.
  *
  * # Outcomes
  *
  * * **Conflicts recorded** — [`TFT_BRIDGE_HALT`] with [`TFT_BRIDGE_REASON_STARTUP_CONFLICTS`];
- *   `detail` enumerates every edge with both publishers. The bridge is latched.
- * * **None, or not `STRICT`** — [`TFT_BRIDGE_DROPPED`] with [`TFT_BRIDGE_REASON_NONE`] (the blank
- *   outcome).
- * * **Called twice** — never an error: replays [`TFT_BRIDGE_REASON_ALREADY_HALTED`] if the first
- *   call halted, else the "none" arm (`Ingest::close_startup_window` is idempotent).
- * * **Already halted** — [`TFT_BRIDGE_REASON_ALREADY_HALTED`], as [`tft_bridge_note_time_jump`]
- *   does.
+ *   latched.
+ * * **None, or not `STRICT`** — the blank outcome.
+ * * **Called twice, or already halted** — replays [`TFT_BRIDGE_REASON_ALREADY_HALTED`] if halted,
+ *   else the blank outcome.
  *
  * # Bridge thread only
  *
- * §3.2's affinity applies. A `create_wall_timer` with no `callback_group` lands in the node's
- * default group and fires on the wrong thread: a debug build aborts, a release build returns
- * [`TFT_ERR_WRONG_THREAD`](crate::TFT_ERR_WRONG_THREAD) and the window is never closed.
- * `ros/tf_tree_ros/src/bridge_handle.cpp` spins its own group for this reason.
+ * §3.2's affinity applies: a timer in the node's default callback group fires on the wrong thread
+ * and the window never closes (`ros/tf_tree_ros/src/bridge_handle.cpp`).
  *
  * # Safety
  *
@@ -973,10 +829,8 @@ tft_status tft_bridge_note_queue_depth(tft_bridge *b, uint32_t depth);
 
 #if defined(TFT_HAVE_BRIDGE)
 /**
- * Copy §5.9's counters into `out`.
- *
- * Named `get_stats` because a `tft_bridge_stats` function would collide with the struct's typedef
- * in C.
+ * Copy §5.9's counters into `out`. Named `get_stats` because a `tft_bridge_stats` function would
+ * collide with the struct's typedef in C.
  *
  * # Safety
  *
@@ -993,24 +847,17 @@ tft_status tft_bridge_get_stats(tft_bridge *b, tft_bridge_stats *out);
  * [`TFT_TWIST_BYTES`]. Either may be NULL, and that half is then not written.
  *
  * [`crate::TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] puts both halves in `out_pose`
- * (`docs/API.md` §3.3's `(N, 13)`); the stable `tft_plan_at` and
- * `tft_plan_at_many` accept it too.
- *
- * The twist is a body twist in the plan's **source** frame: for
- * `plan("map", "base_link")` it is the robot's own velocity in its own frame.
+ * (`docs/API.md` §3.3). The twist is a body twist in the plan's **source** frame.
  *
  * # Errors
  *
- * * `TFT_ERR_NO_DERIVATIVES` — an edge on the path interpolates with
- *   `LerpSlerp` (§2.4).
- * * `TFT_ERR_NO_SEGMENT` — an edge has a pose at this stamp but no segment to
- *   differentiate.
+ * * `TFT_ERR_NO_DERIVATIVES` — an edge interpolates with `LerpSlerp` (§2.4).
+ * * `TFT_ERR_NO_SEGMENT` — no segment to differentiate at this stamp.
  *
  * # Safety
  *
- * `plan` must be a live handle. `out_pose`, when non-NULL, must point to at
- * least `tft_layout_size(layout)` writable bytes; `out_twist`, when non-NULL,
- * to at least [`TFT_TWIST_BYTES`].
+ * `plan` must be live; a non-NULL `out_pose` needs `tft_layout_size(layout)`
+ * writable bytes, a non-NULL `out_twist` [`TFT_TWIST_BYTES`].
  */
 tft_status tft_plan_at_with_derivatives(const tft_plan *plan,
                                         int64_t stamp,
@@ -1021,12 +868,10 @@ tft_status tft_plan_at_with_derivatives(const tft_plan *plan,
 /**
  * How many frames this tree has declared, including tombstoned ones.
  *
- * Valid frame ids are `1 ..= tft_tree_frame_count()` (append-only, never
- * recycled; `docs/PROJECT.md` §5). Id `0` is the root sentinel, so passing it to
- * [`tft_tree_frame_name`] is `TFT_ERR_UNKNOWN_FRAME`.
+ * Valid frame ids are `1 ..= tft_tree_frame_count()` (append-only; id `0` is the
+ * root sentinel, `TFT_ERR_UNKNOWN_FRAME` in [`tft_tree_frame_name`]).
  *
- * Returns `0` for a NULL or dead handle, indistinguishable from an empty tree:
- * a count has no error channel.
+ * Returns `0` for a NULL or dead handle, as for an empty tree.
  *
  * # Safety
  *
@@ -1038,8 +883,7 @@ uint32_t tft_tree_frame_count(const tft_tree *tree);
  * How many edges this tree has declared, including tombstoned ones.
  *
  * Valid edge ids are `1 ..= tft_tree_edge_count()`, as for
- * [`tft_tree_frame_count`]. The arena header stores `declared + 1`
- * (`TreeBuilder` reserves index 0); this function subtracts the reservation.
+ * [`tft_tree_frame_count`].
  *
  * # Safety
  *
@@ -1048,15 +892,12 @@ uint32_t tft_tree_frame_count(const tft_tree *tree);
 uint32_t tft_tree_edge_count(const tft_tree *tree);
 
 /**
- * Copy frame `id`'s name into `buf` as a NUL-terminated string.
+ * Copy frame `id`'s name into `buf`, NUL-terminated.
  *
- * Returns `TFT_ERR_BUFFER_TOO_SMALL` without writing anything when the name
- * plus its NUL does not fit, and sets the error detail's `requested` to the
- * bytes needed.
+ * Returns `TFT_ERR_BUFFER_TOO_SMALL` without writing when the name plus its NUL
+ * does not fit, with the error detail's `requested` set to the bytes needed.
  *
- * The arena stores at most 48 bytes of a frame name (`FrameRecord::name`), so
- * two longer names sharing a 48-byte prefix are distinct frames reporting the
- * same string. 64 bytes fits any name the arena can hold.
+ * The arena keeps at most 48 bytes of a name, so 64 bytes always fits.
  *
  * # Safety
  *
@@ -1065,11 +906,9 @@ uint32_t tft_tree_edge_count(const tft_tree *tree);
 tft_status tft_tree_frame_name(const tft_tree *tree, uint32_t id, char *buf, size_t buf_len);
 
 /**
- * Copy this tree's 16-byte arena instance UUID into `out`. Two processes with
- * the same UUID are looking at the same arena instance.
+ * Copy this tree's 16-byte arena instance UUID into `out`.
  *
- * A heap arena has no UUID (`docs/PHASE2.md` §1, A1): this returns
- * `TFT_ERR_NO_DATA` and writes nothing.
+ * A heap arena has none (`docs/PHASE2.md` §1, A1): `TFT_ERR_NO_DATA`, nothing written.
  *
  * # Safety
  *
@@ -1081,17 +920,15 @@ tft_status tft_tree_instance_uuid(const tft_tree *tree, uint8_t *out);
 /**
  * Join a shared arena by name, **read-write** if asked (`0044`).
  *
- * * `name` — NULL for the environment's default, as `tft_tree_open` resolves it.
- * * `read_write` — `false` is the consumer default (D18); pass `true` only for a
- *   process that publishes, reaps, or must be able to inherit the owner role.
+ * * `name` — NULL for the environment's default, as `tft_tree_open`.
+ * * `read_write` — `false` is the consumer default (D18); `true` only to
+ *   publish, reap, or inherit the owner role.
  *
- * Never creates (`CreatePolicy::Never`): a missing arena is
- * `TFT_ERR_ARENA_UNAVAILABLE`. A C creator is `tft_bridge_create`.
+ * Never creates: a missing arena is `TFT_ERR_ARENA_UNAVAILABLE`.
  *
  * # Safety
  *
- * `name` must be NULL or a NUL-terminated string valid for the call; `out` must
- * point to a writable `*mut tft_tree`.
+ * `name` must be NULL or NUL-terminated; `out` must be writable.
  */
 tft_status tft_tree_open_named(const char *name, bool read_write, tft_tree **out);
 #endif
@@ -1100,14 +937,10 @@ tft_status tft_tree_open_named(const char *name, bool read_write, tft_tree **out
 /**
  * Has the process that owns this arena gone away (`docs/PHASE2.md` §3.5)?
  *
- * One non-blocking `poll` of the attach socket, plus, once that reports a
- * hangup, one `F_OFD_GETLK` on the ownership byte: it answers "the arena has no
- * owner" (`0043`), and is `false` for anything that is not a joined rendezvous
- * attachment. A dying owner is seen at the end of its exit (`0057`;
- * `docs/PHASE2.md` §3.5 and §3.7 step 9, NORMATIVE).
+ * Answers "the arena has no owner" (`0043`); `false` for anything but a joined
+ * rendezvous attachment. Non-blocking (`0057`).
  *
- * Nothing calls this for you (`0019`): pair it with
- * [`tft_tree_inherit_ownership`] in your own loop.
+ * Caller-driven (`0019`): pair it with [`tft_tree_inherit_ownership`].
  *
  * # Safety
  *
@@ -1121,8 +954,8 @@ tft_status tft_tree_owner_lost(const tft_tree *tree, bool *out);
  * Inherit the owner role from a departed owner and begin serving
  * (`docs/PHASE2.md` §3.5; `0044`).
  *
- * Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values; none is a
- * reason to stop reading. On failure the process stays a plain participant.
+ * Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. On failure
+ * the process stays a plain participant.
  *
  * # Safety
  *
@@ -1134,25 +967,15 @@ tft_status tft_tree_inherit_ownership(const tft_tree *tree, tft_inheritance *out
 
 #if defined(TFT_HAVE_SHM)
 /**
- * Collect what dead participants left behind, and report how many records were
- * freed.
+ * Free what dead participants left behind and write how many records were
+ * freed: stale claim leases (`Tree::reap_dead`) plus participant records
+ * (`Tree::reap_participants`). Needed after a dead owner, which has no hangup
+ * (`docs/PHASE2.md` §6.3).
  *
- * Both sweeps, summed: claim leases no live process holds (`Tree::reap_dead`)
- * and participant records whose lock bytes the kernel has released
- * (`Tree::reap_participants`).
+ * A process tree containing a `build_shared` participant with no socket is out
+ * of contract (`0031`): sweeping frees *live* publishers' claims.
  *
- * Usually there is nothing to do: the owner's hangup callback already revokes a
- * dead participant's claims. A dead owner (or any participant killed after it,
- * which nobody watches) has no hangup, and this is the collector
- * (`docs/PHASE2.md` §0.0 *Reaping (§6.3)*; §6.3: "reaping must not be
- * owner-only").
- *
- * The other unwatched producer, a `build_shared` participant with no socket, is
- * **out of contract** (`docs/decisions/0031-the-participant-record-with-no-byte.md`,
- * `0028` step 0b): sweeping in a process tree that contains one frees the
- * records and claims of *live* publishers.
- *
- * Writes `0` for a read-only tree, a heap tree, or a tree with no rendezvous.
+ * Writes `0` for a read-only, heap or rendezvous-less tree.
  *
  * # Safety
  *

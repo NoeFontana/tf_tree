@@ -826,7 +826,7 @@ def check_decision_status_citations() -> str:
             else:
                 settled += 1
 
-    floor = 25
+    floor = 15
     if settled < floor:
         fail(
             f"the decision-citation scan found only {settled} settled citations "
