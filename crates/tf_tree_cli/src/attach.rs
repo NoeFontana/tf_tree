@@ -1,13 +1,5 @@
-//! Attaching the CLI to a **live** arena — `docs/decisions/0005` step 11.
-//!
-//! # Read-only by default, and it is not a nicety
-//!
-//! `--rw` is opt-in and `--create` defaults to `never`. A diagnostic tool that
-//! attaches read-write to a robot's tree can corrupt it with any bug it happens
-//! to have; the MMU is what stops that, and only if the mapping is `PROT_READ`
-//! (D18). Defaulting to *create* would be worse still — a `doctor` run against a
-//! typo'd domain would silently bring an empty arena into existence and then
-//! report it as healthy.
+//! Attaching the CLI to a live arena (`docs/decisions/0005` step 11): read-only
+//! by default (D18), and never creating unless asked.
 
 use anyhow::{Context, Result};
 use clap::Args;
@@ -26,23 +18,11 @@ pub struct AttachArgs {
     /// Arena name. Defaults to `$TF_TREE_NAME`, then `default`.
     #[arg(long, global = true)]
     pub name: Option<String>,
-    /// Map read-write. **Off by default** — a diagnostic tool has no business
-    /// being able to write to a robot's tree (D18).
+    /// Map read-write. Off by default (D18).
     #[arg(long, global = true)]
     pub rw: bool,
-    /// Create the arena if it is absent. Off by default: a `doctor` run against
-    /// a mistyped domain must say "nothing there", not conjure an empty arena
-    /// and pronounce it healthy.
-    ///
-    /// **`requires = "rw"`** (`docs/decisions/0019` plan step 1). A read-only
-    /// attach that asks to create is now `OpenError::ReadOnlyCannotCreate`, so
-    /// without this clap would accept `--create` alone and the open would refuse
-    /// it one layer down, with a message about a combination the user never
-    /// knowingly wrote. Kept rather than deleted — this crate has no
-    /// `layout_if_creating` today, so `--create --rw` still cannot create
-    /// anything and reports `NoLayoutToCreate`, but the flag is what
-    /// `tf_tree serve` (§1) grows into, and deleting a flag that a later
-    /// subcommand re-adds is churn a user sees twice.
+    /// Create the arena if it is absent. Off by default; requires `--rw`
+    /// (`docs/decisions/0019` plan step 1).
     #[arg(long, global = true, requires = "rw")]
     pub create: bool,
     /// Seconds to wait for a contended rendezvous to settle.
@@ -55,10 +35,7 @@ impl AttachArgs {
     ///
     /// # Errors
     ///
-    /// Any rendezvous or attach failure, with the resolved domain and name in
-    /// the context — "no arena" is a question about *which* arena, and the
-    /// answer is almost always that the domain or name differs from the
-    /// publisher's.
+    /// Any rendezvous or attach failure, naming the resolved domain and name.
     pub fn open(&self) -> Result<Tree> {
         let mut open = tf_tree::Open::new()
             .mode(if self.rw {
@@ -93,7 +70,7 @@ impl AttachArgs {
     }
 
     /// The rendezvous these flags name, for commands that read the lock file
-    /// **without** the arena (§3.3).
+    /// without the arena (§3.3).
     ///
     /// # Errors
     ///

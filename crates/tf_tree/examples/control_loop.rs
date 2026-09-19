@@ -1,56 +1,24 @@
-//! A 1 kHz control loop against a 200 Hz state estimate — the runtime path, end
-//! to end, in the order a node actually does it.
+//! A 1 kHz control loop against a 200 Hz state estimate: the shape of a node's
+//! inner loop, not a benchmark.
 //!
 //! ```sh
 //! cargo run --release -p tf_tree --features shm --example control_loop
 //! ```
 //!
-//! # Why this file exists
+//! It fills `docs/API.md` §8.4's missing executor for the tail: it runs the query
+//! under a concurrent writer and reports p99.9 (`docs/PHASE1.md` §11.2). It is not
+//! the §11.3 gate, which needs core-pinned hardware.
 //!
-//! The pitch is *"fast enough to sit inside a control loop"*, and until this
-//! example there was nothing to copy. The README's worked example is an offline
-//! dataloader — deliberately, because that is the adoption wedge that asks
-//! nobody to change their robot — but it shows none of the discipline a runtime
-//! consumer needs, and every one of those disciplines is a place to get it
-//! wrong. So this is the other half: **read it as the shape of a node's inner
-//! loop, not as a benchmark.**
-//!
-//! It also carries the second job `docs/API.md` §8.4 admits is unfilled. That
-//! section states the real-time envelope and then says plainly that only the
-//! allocation claim has an executor. This one runs the query under a concurrent
-//! writer and reports the **tail**, which is the number a deadline is set
-//! against — `docs/PHASE1.md` §11.2: *"p99.9 is the number that matters, not the
-//! mean."* It is not the §11.3 gate, which needs core-pinned hardware; it is an
-//! honest reading on whatever host runs it.
-//!
-//! # The five things this shows, and why each one is a trap
-//!
-//! 1. **Compile the plan once, outside the loop** (R1, D3). `Tree::lookup`
-//!    resolves names on every call and is the convenience tier; a hot loop that
-//!    uses it is paying for a hash and a topology walk per cycle.
-//! 2. **Hoist the `Guard`** — one per *cycle*, not one per query. A control
-//!    cycle usually needs several transforms, and one guard covers all of them:
-//!    it pins a topology generation, so they see one consistent view and pay the
-//!    validation once. This loop asks for two, under one guard.
-//! 3. **Ask past the newest sample on purpose.** A 1 kHz controller against a
-//!    200 Hz estimator is *always* extrapolating; refusing is not an answer a
-//!    controller can act on. `ExtrapPolicy::ConstantTwist` extends the screw
-//!    twist the last two samples imply, and `Extrapolated::by_ns` says how far
-//!    it reached — which is the number to gate on, not a wall-clock guess.
-//!
-//!    **And it is the *slowest edge on the route* that sets it.** The two routes
-//!    below make that visible: `odom -> lidar` crosses only the 200 Hz edge, and
-//!    `map -> lidar` also crosses the 10 Hz one, so the second is an order of
-//!    magnitude staler at the same instant for the same reason a map-relative
-//!    query always is. A budget belongs to a route, not to a robot.
-//! 4. **Treat `SlotContended` as data, not as an error to log and forget.** It
-//!    is the bounded worst case of the seqlock read (`docs/API.md` §8.2): a
-//!    writer was mid-publish and the reader gave up after a fixed number of
-//!    retries rather than blocking. Reusing the previous cycle's pose is
-//!    correct; blocking would not be.
-//! 5. **Never allocate inside the loop.** The histogram below is pre-sized
-//!    before the first cycle, for the same reason the engine's own hot path
-//!    allocates nothing: a `realloc` inside a control cycle is a deadline miss.
+//! 1. **Compile the plan once**, outside the loop (R1, D3); `Tree::lookup` is the
+//!    convenience tier.
+//! 2. **One `Guard` per cycle**, covering every query in it.
+//! 3. **Ask past the newest sample.** A 1 kHz controller on a 200 Hz estimator
+//!    always extrapolates; `ExtrapPolicy::ConstantTwist` extends the last twist and
+//!    `Extrapolated::by_ns` is the number to gate on. The slowest edge on the route
+//!    sets it: `map -> lidar` also crosses the 10 Hz edge, so a budget belongs to a route.
+//! 4. **`SlotContended` is data** (`docs/API.md` §8.2): a writer was mid-publish;
+//!    reuse the previous pose rather than block.
+//! 5. **Never allocate inside the loop**; the histogram is pre-sized.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 fn main() {
@@ -71,28 +39,19 @@ fn run() {
         TreeBuilder,
     };
 
-    /// The controller's rate. One query per cycle.
+    /// The controller's rate.
     const CONTROL_HZ: u64 = 1_000;
-    /// The state estimator's rate — five times slower, which is the ordinary
-    /// case and the reason extrapolation is not an edge case here.
+    /// The estimator's rate; extrapolation is the ordinary case.
     const ESTIMATE_HZ: u64 = 200;
-    /// How long to run. Long enough for a p99.9 to mean something.
+    /// Long enough for a p99.9 to mean something.
     const CYCLES: usize = 200_000;
-    /// What each route may be extrapolated by before the controller must
-    /// degrade rather than steer on it. **Per route, because staleness is set by
-    /// the slowest edge on the route** — these two differ by the ratio of the
-    /// estimator rates, and that is the point rather than a tuning accident.
-    /// The numbers are a robot's to choose; these are one estimator period plus
-    /// a margin.
+    /// Per-route extrapolation budget before the controller must degrade; staleness
+    /// is set by the slowest edge on the route.
     const FAST_BUDGET_NS: i64 = 10_000_000; // 10 ms, over the 200 Hz route
     const FULL_BUDGET_NS: i64 = 150_000_000; // 150 ms, over the 10 Hz one
 
-    // ---- declare the topology, once, at startup ---------------------------
-    //
-    // Capacities are per edge and are sized in *time*, not in slots:
-    // `Capacity::history(rate, secs)` is how long a consumer may lag before the
-    // ring laps it. One global capacity would either starve the fast edge or
-    // waste the slow one.
+    // Declare the topology once. Capacities are per edge and sized in time
+    // (`Capacity::history(rate, secs)`): how long a consumer may lag before the ring laps it.
     let tree = Arc::new(
         TreeBuilder::new()
             .default_interp(InterpPolicy::ScLerp)
@@ -107,11 +66,7 @@ fn run() {
                 EdgeCfg::new(Capacity::history(ESTIMATE_HZ as f64, 2.0))
                     .nominal_rate_hz(ESTIMATE_HZ as f64),
             )
-            // A sensor mount is *static*: it is folded into a constant at plan
-            // time and costs the loop nothing. Publishing it as a dynamic edge
-            // — which is what a latched topic amounts to — would put a binary
-            // search and an interpolation in the loop for a number that never
-            // changes.
+            // Static: folded into a constant at plan time, free in the loop.
             .static_edge(
                 "base_link",
                 "lidar",
@@ -122,12 +77,8 @@ fn run() {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
-    // **One clock origin, shared.** The writer and the control loop both stamp
-    // against this. Taking an `Instant::now()` in each — which this example did
-    // until a review caught it — makes the reader's stamps trail the writer's by
-    // however long startup took, so `by_ns` measures that startup gap rather
-    // than the age of the estimate, and the number the example exists to teach
-    // becomes an artefact of when two threads happened to begin.
+    // One clock origin for writer and loop; separate `Instant::now()`s would make
+    // `by_ns` measure startup skew.
     let t0 = Instant::now();
 
     // ---- the estimator, publishing on its own thread ----------------------
@@ -135,8 +86,7 @@ fn run() {
         let tree = Arc::clone(&tree);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            // `t0` is `Copy`, and it is the *same* origin the control loop below
-            // stamps against.
+            // Same `t0` as the control loop.
             let odom = tree.frame("odom").unwrap();
             let map = tree.frame("map").unwrap();
             let base = tree.frame("base_link").unwrap();
@@ -147,8 +97,7 @@ fn run() {
             let mut n: i64 = 0;
             while !stop.load(Ordering::Relaxed) {
                 let t = t0.elapsed().as_nanos() as i64;
-                // A body moving on a smooth screw, so `ConstantTwist` has
-                // something real to extend and the two policies differ.
+                // A smooth screw so `ConstantTwist` has something to extend.
                 let s = t as f64 * 1e-9;
                 fast.push(
                     t,
@@ -181,10 +130,7 @@ fn run() {
     // The same route minus the 10 Hz edge. Compiled once, like the other.
     let fast_plan = tree.plan(odom, lidar).expect("compile the fast plan");
 
-    // ---- the loop ---------------------------------------------------------
-    //
-    // Everything above this line happens once. Everything below happens 1000
-    // times a second and allocates nothing.
+    // Everything above happens once; everything below allocates nothing.
     let mut lat_ns: Vec<u64> = Vec::with_capacity(CYCLES); // pre-sized: see §5
     let mut stale_fast: Vec<i64> = Vec::with_capacity(CYCLES);
     let mut stale_full: Vec<i64> = Vec::with_capacity(CYCLES);
@@ -198,20 +144,16 @@ fn run() {
 
     for _ in 0..CYCLES {
         next += period;
-        // The stamp a controller wants is *now*, which is past the newest
-        // sample by up to one estimator period. That is the normal case.
+        // The stamp is now, past the newest sample by up to one estimator period.
         let now_ns = t0.elapsed().as_nanos() as i64;
         let t = Stamp::<SystemDomain>::from_nanos(now_ns);
 
-        // **One guard for the whole cycle**, covering both transforms. That is
-        // the hoisting this example is about: two queries, one topology
-        // validation, one consistent view.
+        // One guard for both transforms.
         let started = Instant::now();
         let g = tree.guard();
         let fast = fast_plan.at_extrapolating(&g, t, ExtrapPolicy::ConstantTwist);
         let full = plan.at_extrapolating(&g, t, ExtrapPolicy::ConstantTwist);
-        // Both queries and the guard, timed together — that is the per-cycle
-        // cost a deadline is actually set against.
+        // Both queries and the guard, timed together.
         lat_ns.push(started.elapsed().as_nanos() as u64);
 
         for (answer, budget, stale) in [
@@ -222,24 +164,19 @@ fn run() {
                 Ok(e) => {
                     stale.push(e.by_ns);
                     if e.by_ns > budget {
-                        // Degrade. The pose is well-formed; it is just further
-                        // from real data than this route's budget allows, and
-                        // `by_ns` is what makes that judgeable at all.
+                        // Degrade: `by_ns` makes the staleness judgeable.
                         too_stale += 1;
                     } else {
                         last_good = e.pose;
                     }
                 }
-                // The bounded worst case, not a failure: a writer was
-                // mid-publish and the reader returned instead of blocking. One
-                // cycle of the previous pose is right for a controller.
+                // Bounded worst case, not a failure: reuse the previous pose.
                 Err(LookupError::SlotContended { .. }) => contended += 1,
                 // Before the estimator's first samples, or after it dies.
                 Err(LookupError::NoData { .. } | LookupError::Extrapolation { .. }) => {
                     no_data += 1;
                 }
-                // Anything else is a real fault and names the edge it is about;
-                // `Tree::describe` resolves that id to a frame name.
+                // A real fault; `Tree::describe` resolves the edge id to names.
                 Err(other) => println!("unexpected: {}", tree.describe(other)),
             }
         }

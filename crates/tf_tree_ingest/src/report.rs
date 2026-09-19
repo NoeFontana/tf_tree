@@ -1,24 +1,9 @@
 //! The ingest report — `docs/PHASE5.md` §3.2.
 //!
-//! > *"The ingest report is a first-class output, not log noise: emit it as JSON
-//! > alongside the `.tft` and summarize it to the terminal. For many users the
-//! > ingest report will be the first thing `tf_tree` ever tells them about their
-//! > data, and it should be worth reading."*
-//!
-//! Two renderings of one structure: [`IngestReport::to_json`] for the file that
-//! sits next to the `.tft`, and [`IngestReport::summary`] for the terminal.
-//! Neither computes anything the other does not — a summary that quietly
-//! rounded, or a JSON that carried a field the summary never showed, is how the
-//! two drift into disagreeing about the same recording.
-//!
-//! # JSON without a JSON dependency
-//!
-//! Written by hand, the same choice `tf_tree`'s CBOR manifest writer makes and
-//! for the same reason: this is one flat document with no user-controlled
-//! structure, and the only thing that needs escaping is a frame name. The
-//! escaper is `push_json_string` and it is tested against the characters that
-//! actually appear in a bag — a Windows path in `source`, and a frame name with
-//! a quote in it.
+//! Two renderings of one structure: [`IngestReport::to_json`] for the file beside
+//! the `.tft` and [`IngestReport::summary`] for the terminal. The JSON is written
+//! by hand, as `tf_tree`'s CBOR manifest writer is; `push_json_string` is the
+//! escaper.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -27,14 +12,6 @@ use crate::ingest::{FillStats, Frames, Survey};
 
 /// The JSON document's schema tag. Bumped only for a breaking change, so a
 /// consumer can pin it.
-///
-/// `/1` -> `/2` on 2026-09-06: the key `undecodable_channels` was the sum of the
-/// channels this build cannot decode **and** the channels the operator's own
-/// `--tf-topic` excluded, so it named one of its two terms and reported the
-/// operator's narrowing as a defect in the recording. It is replaced by
-/// `filtered_channels` and `non_cdr_channels`, which have different remedies.
-/// The terminal summary was already correct and still prints one row for the
-/// pair.
 pub const REPORT_SCHEMA: &str = "tf_tree.ingest/2";
 
 /// What one ingest did, as data.
@@ -66,24 +43,14 @@ pub struct IngestReport {
     pub remaps: Vec<(String, String)>,
     /// Dynamic edges that ended with no samples.
     pub edges_without_samples: Vec<String>,
-    /// §3.2's static-conflict row, with **both** values — one row per
-    /// contradicted edge.
-    ///
-    /// [`crate::Anomalies::static_conflicts`] counts the contradicting *messages*;
-    /// this names the edge and carries the two poses, which is what the row asks
-    /// for and what an operator holding two URDFs needs.
-    ///
-    /// **The two are spelled apart on purpose** — see
-    /// [`crate::Survey::static_conflict_details`], which records the day they
-    /// were not.
+    /// §3.2's static-conflict row, with **both** values — one row per contradicted
+    /// edge ([`crate::Anomalies::static_conflicts`] counts messages).
     pub static_conflict_details: Vec<StaticConflictRow>,
 }
 
 /// One contradicted static edge in the report, with frame names resolved.
 ///
-/// The report's own shape of [`crate::StaticConflict`]: that type names frames by
-/// [`crate::FrameId`], because a `Copy` survey cannot own strings; a report is
-/// rendered and so it carries the names.
+/// [`crate::StaticConflict`] with names instead of [`crate::FrameId`]s.
 #[derive(Clone, Debug)]
 pub struct StaticConflictRow {
     /// Parent frame name.
@@ -113,10 +80,8 @@ pub struct EdgeRow {
     pub is_static: bool,
     /// Samples the source contained, after pass one's drops.
     pub samples: u64,
-    /// Oldest stamp **in the source** — not the manifest's `oldest_ns`, which
-    /// §2.3's amendment defines as the oldest still retained in the ring. §3.1's
-    /// counting pass is the only thing that knows this number, which is exactly
-    /// why that amendment says the counting pass can supply it.
+    /// Oldest stamp **in the source**, not the manifest's ring-retained
+    /// `oldest_ns` (§2.3's amendment).
     pub source_oldest_ns: Option<i64>,
     /// Newest stamp in the source.
     pub source_newest_ns: Option<i64>,
@@ -129,12 +94,7 @@ impl IngestReport {
     /// Build a report from a completed survey and fill.
     #[must_use]
     pub fn new(path: &Path, survey: &Survey, frames: &Frames, fill: FillStats) -> IngestReport {
-        // Canonical order, **by calling the same function `ingest::fill` calls**
-        // rather than by repeating its comparator here. A report whose rows moved
-        // when the recording's message order moved would be undiffable between
-        // two ingests of the same data; a report whose rows were sorted by a
-        // second, separately-maintained copy of the rule would agree with the
-        // arena until someone edited one of them.
+        // Canonical order, via the function `ingest::fill` calls.
         let order = crate::ingest::canonical_order(survey, frames);
         let edges: Vec<EdgeRow> = order
             .iter()
@@ -142,9 +102,7 @@ impl IngestReport {
             .map(|e| {
                 let rate = match (e.source_oldest_ns, e.source_newest_ns) {
                     (Some(lo), Some(hi)) if hi > lo && e.samples > 1 => {
-                        // `samples - 1` intervals over the span, not `samples`:
-                        // ten samples one second apart span nine seconds, and
-                        // dividing by ten reports 1.11 Hz for a 1 Hz edge.
+                        // `samples - 1` intervals over the span.
                         let secs = (hi - lo) as f64 / 1e9;
                         Some((e.samples - 1) as f64 / secs)
                     }
@@ -163,8 +121,7 @@ impl IngestReport {
             })
             .collect();
         let mut anomalies = survey.anomalies.clone();
-        // Duplicates are only knowable after the sort, so pass two owns the
-        // count and the report is where the two halves meet.
+        // Duplicates are only knowable after the sort, so pass two owns the count.
         anomalies.duplicate_stamps = fill.duplicates;
         IngestReport {
             source: path.display().to_string(),
@@ -304,9 +261,7 @@ impl IngestReport {
             push_opt_i64(&mut s, e.source_newest_ns);
             s.push_str(",\"rate_hz\":");
             match e.rate_hz {
-                // Non-finite has no JSON spelling, and emitting `NaN` produces a
-                // document `json.load` refuses. A rate that is not a number is
-                // not a rate.
+                // Non-finite has no JSON spelling.
                 Some(r) if r.is_finite() => {
                     let _ = write!(s, "{r:.6}");
                 }
@@ -338,8 +293,7 @@ impl IngestReport {
         }
         s.push(']');
 
-        // §3.2's "report both values". The count is in `anomalies` above and this
-        // is the payload: a consumer diffing two URDFs reads it from here.
+        // §3.2's "report both values"; the count is in `anomalies` above.
         s.push_str(",\"static_conflict_details\":[");
         for (i, c) in self.static_conflict_details.iter().enumerate() {
             if i > 0 {
@@ -363,12 +317,8 @@ impl IngestReport {
         s
     }
 
-    /// The terminal summary.
-    ///
-    /// Ordered so the first three lines answer "did it work, over what, and how
-    /// much", and every anomaly line is **omitted when its count is zero** — a
-    /// report that always prints ten zeroes trains the reader to skip it, which
-    /// is the opposite of §3.2's requirement that it be worth reading.
+    /// The terminal summary. The first three lines answer "did it work, over what,
+    /// and how much"; every anomaly line is omitted when its count is zero.
     #[must_use]
     pub fn summary(&self) -> String {
         let mut s = String::new();
@@ -403,9 +353,7 @@ impl IngestReport {
                 self.fill.passes, self.fill.peak_buffer_bytes
             );
         }
-        // Its own line, and not folded into the one above: a re-read costs time,
-        // a spill costs *disk*, and a user who has to find room for it needs the
-        // number rather than an inference from "passes > 1".
+        // Its own line: a spill costs disk, not time.
         if self.fill.spilled_runs > 0 {
             let _ = writeln!(
                 s,
@@ -423,18 +371,14 @@ impl IngestReport {
                 let _ = writeln!(s, "  ! {text}");
             }
         };
-        // First among the anomaly rows, because it changes what every other
-        // number in this report means: they describe a prefix of the recording,
-        // not the recording.
+        // First: every other number then describes a prefix.
         row(
             a.truncated,
             "the recording ends mid-record and was read up to that point; \
              every count below covers only the part that exists"
                 .to_owned(),
         );
-        // Beside `truncated` and for the same reason: a skipped chunk means the
-        // counts below cover only part of the recording. The span is what makes it
-        // actionable — a bare count tells an operator nothing they can do.
+        // Like `truncated`, the counts cover only part; the span makes it actionable.
         row(
             a.bad_chunks > 0,
             match a.bad_chunk_span_ns {
@@ -454,10 +398,7 @@ impl IngestReport {
                 ),
             },
         );
-        // A subset of the row above, and the only skip with a remedy: those chunks
-        // were sound and this reader declined to allocate for them. Without this
-        // line the operator reads "unreadable" about a recording that is merely
-        // larger than a default, and the flag that fixes it appears nowhere.
+        // A subset of the row above and the only skip with a remedy (a flag).
         row(
             a.chunks_over_limit > 0,
             format!(
@@ -468,22 +409,8 @@ impl IngestReport {
                 a.chunks_over_limit
             ),
         );
-        // Beside the chunk rows, because it is the same kind of fact: a piece of
-        // the file this reader declined to look at, with a flag that would have
-        // read it.
-        //
-        // **It named the record kind and promised the transform stream was whole
-        // until 2026-09-05, and could support neither.** The sentence read "N
-        // record(s) this reader does not read (an attachment, a metadata block)
-        // were larger than --max-record-size and were stepped over; no transform
-        // was lost". The reader never parses the record, so "an attachment" is a
-        // guess; and it steps over the length the record itself declares, so a
-        // corrupt one can land on a later record boundary with whole chunks of
-        // transforms inside the span — measured, by
-        // `a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so`,
-        // which is where that sentence stopped being defensible.
-        // What is left is what this run actually knows: it did not look, and
-        // which flag makes it look.
+        // States only what is known: this run did not look, and which flag makes it
+        // (`a_skip_that_lands_on_a_later_boundary_loses_transforms_and_says_so`).
         row(
             a.oversized_records_skipped > 0,
             format!(
@@ -532,12 +459,8 @@ impl IngestReport {
             ),
         );
         row(a.static_conflicts > 0, {
-            // **Both values, indented under the count.** §3.2's row says "report
-            // both values" and the count alone does not: a conflict is two URDFs
-            // disagreeing, and the operator's next move is to work out which one
-            // is installed. Full precision on purpose — `StaticStore` calls two
-            // poses the same within 1e-12, so a rounded rendering can print two
-            // identical-looking numbers under a line claiming they differ.
+            // Both values, at full precision: `StaticStore` treats poses within
+            // 1e-12 as equal, so rounding could print identical-looking numbers.
             let mut t = format!(
                 "{} /tf_static messages contradicted an already-declared value; the first won",
                 a.static_conflicts
@@ -570,11 +493,7 @@ impl IngestReport {
                 a.empty_names
             ),
         );
-        // **One row over two fields, deliberately.** The JSON keeps them apart
-        // because they have different remedies; a terminal summary is a list of
-        // things worth looking at, and "some TF channels were not read" is one
-        // of those whichever reason applies. The two numbers are named so the
-        // reader can tell which they have without opening the JSON.
+        // One row over two fields; the JSON keeps them apart (different remedies).
         row(
             a.filtered_channels + a.non_cdr_channels > 0,
             format!(
@@ -598,10 +517,7 @@ impl IngestReport {
 
 /// A canonical `[qw qx qy qz tx ty tz]` pose as a JSON array.
 ///
-/// Non-finite components become `null`, for the reason `rate_hz` does: JSON has no
-/// spelling for `NaN`, and a document containing one is refused by `json.load`.
-/// A pose comes off a recording through a CDR decode, so a component that is not a
-/// number is reachable without anything in this crate being wrong.
+/// Non-finite components become `null`, as for `rate_hz`: JSON has no `NaN`.
 fn push_pose(s: &mut String, p: &[f64; 7]) {
     s.push('[');
     for (i, v) in p.iter().enumerate() {
@@ -641,10 +557,8 @@ fn push_kv_str(s: &mut String, key: &str, value: &str) {
 
 /// Write `v` as a JSON string literal.
 ///
-/// Escapes what RFC 8259 requires and nothing else: quote, backslash, and every
-/// control character below 0x20 (as `\u00XX`, since only some of them have short
-/// forms). A Windows path in `source` is the backslash case and it is not
-/// hypothetical.
+/// Escapes what RFC 8259 requires: quote, backslash, and control characters
+/// below 0x20 (as `\u00XX`).
 fn push_json_string(s: &mut String, v: &str) {
     s.push('"');
     for c in v.chars() {
@@ -668,16 +582,8 @@ fn push_json_string(s: &mut String, v: &str) {
 mod tests {
     use super::*;
 
-    /// A rate that is not a number is emitted as `null`, because JSON has no
-    /// spelling for `NaN` and a document containing one is refused by every
-    /// parser — including `json.load`, which is what a user will reach for.
-    ///
-    /// The row is built by hand rather than through an ingest because no
-    /// recording this crate can read produces a non-finite rate; the guard
-    /// exists for the arithmetic, not for a fixture.
-    ///
-    /// Mutant: drop the `is_finite` guard from the `rate_hz` arm — applied, and
-    /// this test failed with `"rate_hz":NaN`.
+    /// A non-finite rate is emitted as `null`. Built by hand: no readable
+    /// recording produces one.
     #[test]
     fn non_finite_rate_is_null() {
         let row = EdgeRow {
@@ -711,22 +617,9 @@ mod tests {
         assert!(!json.contains("NaN"), "{json}");
     }
 
-    /// **A ceiling refusal is reported as one, not merely as an unreadable chunk.**
-    ///
-    /// The `bad_chunks` row calls every skip "unreadable" and offers
-    /// `--on-bad-chunk=halt`. For a chunk the reader simply declined to allocate
-    /// for, that is a true sentence with the wrong subject — the recording is fine
-    /// — and the flag that would have read it appears nowhere in the report.
-    ///
-    /// Built by hand rather than through an ingest because the condition needs a
-    /// recording whose chunks exceed a ceiling, which
-    /// `ingest::a_recording_over_every_ceiling_names_the_flag_not_an_empty_recording`
-    /// covers end to end; what is asserted here is the rendering, and only the
-    /// rendering.
-    ///
-    /// Mutant: delete the `chunks_over_limit` row from `summary` — applied, and the
-    /// `--max-chunk-size` assertion failed. Nothing else in the crate noticed,
-    /// which is why this test exists rather than being folded into an ingest test.
+    /// A ceiling refusal is reported as one, naming the flag, not as an
+    /// unreadable chunk. Rendering only; end to end is
+    /// `ingest::a_recording_over_every_ceiling_names_the_flag_not_an_empty_recording`.
     #[test]
     fn a_ceiling_refusal_is_reported_apart_from_damage() {
         let with_limit = |over: u64| {
@@ -763,8 +656,7 @@ mod tests {
             "and the report must say the chunks were sound: {text}"
         );
 
-        // Zero is silent, like every other anomaly row: a report that always prints
-        // the line trains the reader to skip it.
+        // Zero is silent, like every other anomaly row.
         assert!(
             !with_limit(0).contains("--max-chunk-size"),
             "{}",
@@ -772,11 +664,7 @@ mod tests {
         );
     }
 
-    /// The characters that actually break a hand-written encoder are escaped.
-    ///
-    /// Mutant: delete the `'\\' => s.push_str("\\\\")` arm — applied, and the
-    /// Windows-path assertion failed (`C:\bags` came out with a lone backslash,
-    /// which is an invalid escape rather than a literal one).
+    /// Quotes, backslashes (Windows paths) and control characters are escaped.
     #[test]
     fn strings_are_escaped() {
         let mut s = String::new();

@@ -1,34 +1,19 @@
 //! Does an interpolation-seeded bracket search actually work on real data?
 //!
-//! [`docs/design/fast-path.md`](../../../docs/design/fast-path.md) §5 proposes
-//! replacing the bracket search's `log2(n)` dependent probes with a single
-//! interpolated guess plus a fixed, small number of branchless corrections:
+//! [`docs/design/fast-path.md`](../../../docs/design/fast-path.md) §5 proposes replacing the bracket
+//! search's `log2(n)` dependent probes with one interpolated guess plus a few branchless corrections:
 //!
 //! ```text
 //! guess = lo + (t − t_lo)·(hi − lo)/(t_hi − t_lo)
 //! ```
 //!
-//! That is exact for perfectly isochronous stamps and degrades with jitter, so
-//! §10 makes it conditional: *"Falsified if real recorded streams are jittery
-//! enough that the seeded guess misses often — measure the correction-step
-//! distribution on `indoor_atelier.tfstream` before committing."*
+//! Exact for isochronous stamps and degrading with jitter, so §10 makes it conditional: measure the
+//! correction-step distribution on `indoor_atelier.tfstream`. This is a **pure analysis of stamp
+//! sequences**: it touches no engine internals.
 //!
-//! This is that measurement, and it is deliberately a **pure analysis of stamp
-//! sequences**: the guess quality depends only on the stamps and the query, not
-//! on any engine internals, so nothing here has to touch the ring or be kept in
-//! sync with it.
-//!
-//! Two seeds are compared, because the cheap one is not obviously the right one:
-//!
-//! * **global** — interpolate across the whole retained window `[lo, hi]`. One
-//!   division, no state. Wrong whenever the *rate* varies across the window.
-//! * **local** — interpolate using the mean period of the newest few samples.
-//!   Robust to slow rate drift, useless under burstiness.
-//!
-//! Reported as a distribution of `|guess − true|` in index units, because the
-//! mean is the wrong statistic: a seed that is perfect 99% of the time and 400
-//! off in the tail is worse than one that is always within 3, and only the
-//! quantiles show that.
+//! Two seeds are compared: **global** (interpolate across the whole window; wrong when the rate varies)
+//! and **local** (mean period of the newest few samples; useless under burstiness). Reported as
+//! quantiles of `|guess − true|` in index units, because a mean hides a 400-off tail.
 //!
 //! Run: `cargo run --release -p tf_tree_bench --example search_seed`
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
@@ -41,8 +26,7 @@ use tf_tree_bench::replay::TfStream;
 /// Queries drawn per edge.
 const QUERIES: usize = 20_000;
 
-/// The last index `i` with `stamps[i] <= t`, by binary search — the answer the
-/// seeded search has to reproduce.
+/// The last index `i` with `stamps[i] <= t`, by binary search — the answer the seed must reproduce.
 fn true_index(stamps: &[i64], t: i64) -> usize {
     let (mut lo, mut hi) = (0usize, stamps.len() - 1);
     while lo + 1 < hi {
@@ -79,8 +63,7 @@ fn seed_local(stamps: &[i64], t: i64, k: usize) -> usize {
     if period <= 0.0 {
         return hi;
     }
-    // `ceil`, not truncation: we want the last index whose stamp is <= t (the
-    // *lower* bracket), and truncating toward zero lands one past it.
+    // `ceil`: we want the *lower* bracket, and truncating toward zero lands one past it.
     let back = ((stamps[hi] - t) as f64 / period).ceil() as i64;
     (hi as i64 - back).clamp(0, hi as i64) as usize
 }

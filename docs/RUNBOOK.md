@@ -1,36 +1,21 @@
 # tf_tree — operator runbook
 
 > Required by [`PHASE2.md`](./PHASE2.md) §13. Every row below names a distinct
-> error type and, where one exists today, the `tf_tree doctor` check that
-> detects it.
+> error type and, where one exists, the `tf_tree doctor` check that detects it.
 
-This document is for whoever is on call when a robot's transform tree
-misbehaves. It is organised by **symptom**, because that is what you have when
-you arrive.
+Organised by **symptom**, because that is what you have when you arrive.
 
 **Implementation status.** Phase 2's rendezvous and lifecycle are implemented
-(decision [`0005`](./decisions/0005-the-shared-memory-seam.md)); the recorder
-and `/tf` ingest are not. **There is no `tf_treed`, and there will not be** —
-[`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) replaces
-it with `tf_tree serve`, and more usefully removes the reason the rows below
-used to point at a daemon at all. **`tf_tree serve` is not built either** —
-`docs/PHASE2.md` §0.0 records it as not implemented, and `0019` makes it an
-escalation rather than a prerequisite — so nothing below may name it as a
-remedy. Any row you find still marked *(needs `tf_treed`)*, or pointing at
-`tf_tree serve`, is a defect in this document: it is telling you to run a
-program that does not exist. The `doctor` checks Phase 1 shipped are `cycle`,
-`unclaimed-dynamic`, `multi-writer`, `short-buffer`, `inconsistent-rate`,
-`unreachable`, `out-of-order` — **and every one of them has a `TFT` id now**
-(`TFT012`, `TFT017`, `TFT001`, `TFT011`, `TFT008`, `TFT012`, `TFT018`; the
-mapping is the table in `crates/tf_tree_cli/src/catalogue.rs`'s module docs, and
-`PHASE5.md` §6 has since added checks that were never in this list). The ids are
-what `--suppress` takes and what `--json` emits; these names appear here because
-they are what older documents and this file's own §3.2 rows say.
+([`0005`](./decisions/0005-the-shared-memory-seam.md)); the recorder and `/tf`
+ingest are not. There is no `tf_treed`, and `tf_tree serve`
+([`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)) is not
+built (`PHASE2.md` §0.0): nothing below may name either as a remedy. Check ids are
+in `crates/tf_tree_cli/src/catalogue.rs`'s module docs (`--suppress` and `--json`
+use them) and `PHASE5.md` §6.
 
-**`multi-writer` (`TFT001`) and `short-buffer` (`TFT011`) go blind when `doctor`
-is attached to a live arena**, and it says so on every run rather than implying a
-clean bill of health it did not earn: both need a recorded push stream, and a
-ring retains stamps but not who wrote each one or how late it arrived. See
+**`multi-writer` and `short-buffer` go blind when `doctor` is attached to a live
+arena**, and it says so on every run: both need a recorded push stream, and a
+ring retains stamps but not who wrote each or how late it arrived. See
 [Attaching to a running robot](#attaching-to-a-running-robot).
 
 ---
@@ -44,22 +29,11 @@ tf_tree echo <target> <source> --attach --rate
 tf_tree participants         # who is attached — works even with no arena
 ```
 
-Without `--attach` these commands operate on an in-process fixture, which is
-useful for seeing what healthy output looks like and useless for diagnosing a
-robot. **`tf_tree participants` is the one to reach for first when nothing else
-works**: it reads the lock file and never maps the arena, so it still answers
-when the segment is gone, when its layout does not match your build, or when the
-owner is wedged.
-
-Two habits worth forming:
-
-- **Read the edge name in the error.** Every `tf_tree` error that *can* name an
-  edge *does* name one — that is a deliberate design decision
-  ([`PHASE1.md`](./PHASE1.md) §9), and it exists because "lookup would require
-  extrapolation into the future" without saying which edge is the single
-  most-complained-about thing about tf2.
-- **`doctor` before `strace`.** Most of what goes wrong here is a configuration
-  or startup-ordering problem that a check already names.
+Without `--attach` these operate on an in-process fixture. **`tf_tree
+participants` is the one to reach for first**: it reads the lock file and never
+maps the arena, so it answers when the segment is gone, its layout does not match,
+or the owner is wedged. Every error that can name an edge does
+([`PHASE1.md`](./PHASE1.md) §9); and run `doctor` before `strace`.
 
 ---
 
@@ -67,63 +41,40 @@ Two habits worth forming:
 
 ### `NoData { edge }`
 
-Nothing has ever been published to that edge.
-
-Almost always **startup ordering**: the consumer began querying before the
-publisher started. Confirm with `tf_tree tree` — the edge will show a head of 0.
-If the publisher *is* running, it has not claimed the edge; see
-`unclaimed-dynamic` below.
+Nothing has ever been published to that edge: almost always **startup ordering**
+(`tf_tree tree` shows head 0). If the publisher runs, it has not claimed the edge;
+see `unclaimed-dynamic`.
 
 ### `Extrapolation { edge, requested, oldest, newest }`
 
-The requested stamp falls outside the edge's retained window. The error carries
-all four numbers, so compare them before theorising:
-
-- `requested > newest` — you are asking for the future. Either the consumer's
-  clock is ahead of the publisher's, or the publisher has stalled. Check
-  `newest` against wall time.
-- `requested < oldest` — the sample aged out. The ring is too shallow for the
-  gap between publish and query. Raise that edge's capacity; `doctor`'s
-  `short-buffer` check warns before this becomes an outage.
-
-Extrapolation is refused by default rather than silently invented, which is the
-right default for a control loop. `ExtrapPolicy::Hold` and `ConstantTwist` exist
-if a caller genuinely wants the other behaviour.
+The stamp is outside the retained window; compare the four numbers.
+`requested > newest`: the consumer's clock is ahead or the publisher stalled.
+`requested < oldest`: the ring is too shallow; raise that edge's capacity
+(`short-buffer` warns first). Refused by default; `ExtrapPolicy::Hold` and
+`ConstantTwist` exist for callers who want otherwise.
 
 ### `Disconnected { target, source, cut_at }`
 
-No path between the two frames. `cut_at` names where the walk ran out of parent.
-Usually a publisher for one link has not started, so a subtree is detached —
-cross-reference `doctor`'s `unreachable` check, which lists every frame not
-reachable from the main root component.
+No path between the frames; `cut_at` is where the walk ran out of parent, usually
+a link whose publisher has not started. See `unreachable`.
 
 ### `TopologyChanged { plan, current }`
 
-Your compiled `Plan` predates a topology mutation. **This is a legitimate,
-actionable error, not a failure to hide with a retry loop** — recompile the plan
-and continue. If it fires repeatedly in steady state, something is re-parenting
-frames continuously, which is a bug in the publisher: topology should be
-near-static after startup.
+Your `Plan` predates a topology mutation: recompile, do not retry-loop. Repeats in
+steady state mean a publisher is re-parenting continuously, a bug.
 
 ### `TimeDomainMismatch { expected, got }`
 
-A lookup crossed a time-domain boundary (e.g. system clock vs sensor clock).
-Domains are separated at the type level on purpose; the alignment machinery is
-Phase 6. Until then, do not mix them in one plan.
+A lookup crossed a time-domain boundary; do not mix domains in one plan
+(alignment is Phase 6).
 
 ### `SlotContended` / `SlotRecycled`
 
-The reader lost a race with the writer.
-
-- `SlotContended` — a slot stayed mid-write for `SEQ_RETRY_LIMIT` attempts. In
-  practice this means the writer was descheduled at exactly the wrong moment.
-- `SlotRecycled` — the ring lapped the reader mid-read. With 4096 samples at
-  1 kHz there is four seconds of slack, so this indicates a severe stall, or a
-  ring far too shallow for the publish rate.
-
-Both are returned rather than retried internally, because only the caller knows
-whether a retry is meaningful. Raise the edge's capacity; `doctor` warns at 80%
-occupancy.
+The reader lost a race with the writer: `SlotContended` — a slot stayed mid-write
+for `SEQ_RETRY_LIMIT` attempts (writer descheduled); `SlotRecycled` — the ring
+lapped the reader (a severe stall, or a ring too shallow). Both are returned, not
+retried, because only the caller knows whether a retry is meaningful. Raise the
+edge's capacity; `doctor` warns at 80% occupancy.
 
 ---
 
@@ -131,98 +82,48 @@ occupancy.
 
 ### `EdgeAlreadyClaimed { owner_slot }`
 
-Two nodes are configured to publish the same edge. This is a **genuine
-configuration error**, and `tf_tree` reports it rather than silently averaging
-the two streams into garbage the way a multi-publisher `/tf` topic does.
-The error names the edge and the owning **participant slot**, not a pid: the
-facade's `ClaimApiError::AlreadyClaimed { edge, cause }` carries both, and so
-does C's `tft_error` from `tft_tree_claim` (and the C++ wrapper over it) —
-`edge`, and the slot in `frame_a`. **`tft_bridge_create` is the exception**: it
-fills `edge` but overwrites `frame_a`/`frame_b` with the refused link's parent and
-child `FrameId`s, so on a bridge `frame_a` is a frame, not a slot. To turn the
-slot into a process, `tf_tree participants` prints one line per slot with its
-pid, and `tf_tree tree`'s writer column shows the holder's pid for each claimed
-edge. `doctor`'s `multi-writer` check (`TFT001`) is **not** the tool here: it
-counts writer pids in a recorded push history, and a refused claim never
-publishes, so it cannot see this collision.
-
-Decide which node owns the edge and stop the other. If you are bridging from
-ROS, the ingest bridge's conflict policy (`FirstWriterWins` by default) is where
-this surfaces first.
+Two nodes are configured to publish the same edge, a configuration error. The
+error names the edge and the owning **participant slot**, not a pid
+(`ClaimApiError::AlreadyClaimed`; C's `tft_error` carries `edge` and the slot in
+`frame_a`, **except `tft_bridge_create`**, which overwrites `frame_a`/`frame_b`
+with the refused link's `FrameId`s). `tf_tree participants` maps slot to pid.
+`multi-writer` (`TFT001`) is **not** the tool: a refused claim never publishes.
+Decide which node owns the edge and stop the other; from ROS the bridge's conflict
+policy (`FirstWriterWins` by default) is where it surfaces.
 
 ### `NonMonotonicStamp { edge, last, got }`
 
 A push arrived with a stamp older than the edge's newest. Equal stamps are
-accepted — that is required for idempotent replay — but going backwards is not.
+accepted (idempotent replay); going backwards is not. Usually a publisher
+restarting without resetting its clock, or two sources on one edge. `doctor`'s
+`out-of-order` (`TFT018`) reports it from observed history.
 
-Usually a publisher restarting without resetting its clock, or two sources
-merged into one edge. `doctor`'s `out-of-order` check (`TFT018`) reports it from
-observed history.
+**Check the edge's domain first.** A *burst* on a **`SystemDomain`** edge (wall
+clock, tag 0) is usually a `CLOCK_REALTIME` step (NTP, leap second) that makes
+invariant 6 reject every stamp until the clock catches up, not a publisher fault;
+restarting the publisher will not help. `TFT019` makes that call, *when it has a
+recorded push stream*.
 
-**Before you go looking for the publisher, check the edge's domain.** A *burst*
-of these on an edge in the **`SystemDomain`** (wall clock, tag 0) is usually not
-a publisher fault at all: `CLOCK_REALTIME` is not monotone, and an NTP step or a
-leap second moves it backwards. Invariant 6 then rejects every stamp until the
-clock catches up — correct behaviour that looks exactly like a broken node.
-`doctor`'s `TFT019` makes that call for you *when it has a recorded push stream
-to make it from*: same evidence as `TFT018`, plus the domain tag, reported as a
-clock step rather than as a publisher fault. Restarting the publisher will not
-help; the data lost during the step is gone either way. Read to the end of this
-section before you reach for it on a running robot — **the source it needs is a
-recording, not an attach**, and that is stated below rather than left to be
-discovered.
+- It fires on a **run** of at least eight consecutive rejected pushes (this
+  implementation's number, not the specification's); below that it passes with a
+  `note:` and `TFT018` still reports them. On any other tag it **skips and names
+  the tag** (`Domain` is an open trait), leaving `TFT018` alone.
 
-**It fires on a run, not on one inversion.** A single stamp out of place on a
-wall-clock edge is a publisher fault, so `TFT019` needs a *burst*: at least eight
-consecutive pushes that invariant 6 would have rejected — a step of eight publish
-periods, so 8 ms at 1 kHz or 80 ms at 100 Hz. Below that it passes and says so in
-a `note:` line, and `TFT018` still reports the rejected pushes. **Eight is this
-implementation's number, not the specification's.**
-
-On any other tag `TFT019` **skips and says which tag** rather than guessing —
-`Domain` is an open trait and a user-declared tag carries no way to state that
-its clock can step. There, `TFT018` alone is the answer and the publisher is the
-place to look. When *some* of the affected edges are on tag 0 and others are not,
-it fires on whichever of the tag-0 edges cleared the run length above, and names
-everything it did not attribute — the other tags, and any tag-0 edge whose
-rejections were too scattered — in the report's `note:` lines, which is the only
-place a check that ran can say what it did not cover.
-
-**Point it at a recording. That is the source these two checks need:**
+**Point it at a recording — the source these two checks need:**
 
 ```
 tf_tree doctor --from-bag run.mcap
 ```
 
-A recording is written in log order, so a stamp that went backwards is *in the
-file* at the position it arrived at — which is exactly what invariant 6 would
-have rejected and exactly what these two checks are about. The §3.2 ingest report
-goes to stderr, so `--json` still gives you a document to pipe.
+A recording is in log order, so a backwards stamp is *in the file*. **Neither
+`--attach` nor `--from-file` can answer these checks**: a live ring is read while
+written, so a slot at the old end can hold the next lap's sample (an inversion the
+publisher never made), and a frozen `.tft` holds only pushes `SampleRing::push`
+*accepted*. Both skips say so; **their silence on an arena is not an all-clear.**
 
-**Neither `--attach` nor `--from-file` can answer them, and the two fail
-differently.**
-
-* On a **live arena** the push stream is reconstructed from a ring being written
-  while it is read, so a slot at the old end can already hold the next lap's
-  sample — an inversion the publisher never made.
-* On a **frozen `.tft`** there is no writer and the read is exact, and it still
-  cannot answer: an arena's ring holds only the pushes the engine *accepted*.
-  `SampleRing::push` refuses an out-of-order stamp, so the arrival these checks
-  report was never stored. Running there would pass every `.tft` ever written.
-
-Both skips say so in the report. **Their silence on an arena is not an
-all-clear**, it is the absence of the evidence — which is why the skip reason
-names `--from-bag` rather than merely stating a limitation.
-
-`tf_tree ingest` remains the tool for a clock step **past** the reset threshold,
-because such a recording does not ingest at all and so never reaches `doctor`:
-
-```
-tf_tree ingest --bag run.mcap
-```
-
-Its clock guard is per edge, and a jump backwards past
-`--clock-reset-threshold` (default 100 ms) halts with, verbatim:
+`tf_tree ingest --bag run.mcap` is the tool for a step **past** the reset
+threshold (such a recording does not ingest): its per-edge clock guard halts on a
+jump backwards past `--clock-reset-threshold` (default 100 ms) with, verbatim:
 
 ```
 Error: edge odom -> base_link jumped 150000000 ns backwards at stamp 9850000000,
@@ -231,48 +132,25 @@ is where to cut it. Raise --clock-reset-threshold if this publisher is merely la
 rather than replayed
 ```
 
-— the edge by name, the size of the step, and the recorder's own monotone log
-time, which is the coordinate `ros2 bag`/`mcap` cut on and the one that is still
-meaningful after a rewind. Smaller regressions are not a halt; they are counted
-in the same report as *"N transforms arrived out of stamp order"*.
-
-The fix is a domain that cannot step. Anything published **at rate** should use a
-steady or PTP-disciplined domain rather than the system wall clock: declare the
-edge with `SteadyDomain` (tag 3), or — `Domain` being an open trait — with your
-own unit struct and `TAG` if the clock is PTP-disciplined and you want to say so.
-Reserve `SystemDomain` for stamps that genuinely have to be comparable to
-wall-clock time outside the process.
-
-`TFT019` still fires only on tag 0 and so still skips a `SteadyDomain` edge —
-correctly, because a steady clock cannot step, so a run of rejections there *is*
-a publisher fault and `TFT018` alone is the honest answer.
-
-Sim time is a different problem — a `/clock` reset from a bag loop or a sim
-restart — and is handled by the bridge's authoritative jump signal, not by this
-section.
+**The fix is a domain that cannot step**: publish at rate on `SteadyDomain` (tag
+3), or your own `Domain` if the clock is PTP-disciplined; reserve `SystemDomain`
+for stamps comparable to outside wall-clock time. `TFT019` skips `SteadyDomain`,
+correctly. Sim-time `/clock` resets are the bridge's authoritative jump signal's.
 
 ### `ClaimRevoked { edge }`
 
-This writer was judged dead and its claim reaped, then it resumed. The process
-was stalled — investigate scheduling, a GC pause, or a page fault against a slow
-device. The correct response in code is to stop publishing and re-claim.
-
-> Under [`PHASE2.md`](./PHASE2.md) §6.1 this becomes very rare by construction: a
-> stalled writer still holds its kernel lock and therefore cannot be reaped while
-> alive. Seeing it at all is worth investigating as a possible bug in the
-> `ClaimRecord` path.
+This writer was judged dead and its claim reaped, then it resumed (a stall:
+scheduling, GC pause, slow-device page fault). Stop publishing and re-claim; never
+retry the push, which would put two writers on a single-writer ring. Under
+[`PHASE2.md`](./PHASE2.md) §6.1 a stalled writer still holds its kernel lock, so
+this is very rare: suspect the `ClaimRecord` path.
 
 ### `ReadOnly` on `claim` / `reparent` / `frame`
 
-This process attached read-only. That is the **default for consumers and the
-only real safety boundary in the system** — a read-only participant is
-incapable of corrupting the tree, enforced by the MMU rather than by convention.
-
-If the process genuinely needs to publish, attach with `AttachMode::ReadWrite`.
-If it does not, this error just saved you from a bug.
-
-Note that a read-only participant can *resolve* any frame the creator declared;
-it can only fail to **intern a new one**, because interning writes.
+This process attached read-only, the **default for consumers and the only real
+safety boundary** (enforced by the MMU). To publish, attach with
+`AttachMode::ReadWrite`. A read-only participant can resolve any declared frame but
+not **intern a new one**.
 
 ---
 
@@ -280,12 +158,8 @@ it can only fail to **intern a new one**, because interning writes.
 
 ### `ReparentError::LockContended { owner_slot }`
 
-Another participant holds the arena's topology lock and is still alive, so this
-re-parent could not proceed. `owner_slot` is `Some(slot)` naming the holder,
-which `tf_tree doctor` resolves to a pid.
-
-**Retry it.** This is contention, not a fault, and it is the one `reparent` error
-that a caller is expected to loop on:
+Another live participant holds the topology lock (a dead holder's is released).
+Contention, not a fault, and the one `reparent` error a caller loops on:
 
 ```rust
 loop {
@@ -297,344 +171,192 @@ loop {
 }
 ```
 
-A bare `reparent(..).unwrap()` will panic the first time two processes mutate
-topology at once, which is why the loop is written out here rather than left to
-be discovered.
+Sustained contention is a design smell ([`PHASE2.md`](./PHASE2.md) §1, A2).
 
-The lock is released or stolen automatically when its holder is **dead**, so
-seeing this means a live process is mutating topology concurrently. Sustained
-contention is a design smell rather than a fault: topology should be near-static
-after startup ([`PHASE2.md`](./PHASE2.md) §1, A2).
+**`owner_slot` can be `None`**: the holder has not yet published which slot holds
+it (an OFD lock reports `l_pid = -1`, §3.3). Retry; if it persists, `tf_tree
+doctor` and `tf_tree top` list every live participant.
 
-**`owner_slot` can be `None`, and that is not missing information.** The holder is
-between the lock file's topology byte and the arena word — a window a few
-instructions wide — so it holds the lock but has not yet published *which* slot
-holds it. An OFD lock cannot name its holder (the kernel reports `l_pid = -1`,
-§3.3), so nothing can fill the slot in, and the message says so rather than
-printing a number. Retry, exactly as above; if it persists, `tf_tree doctor` and
-`tf_tree top` list every live participant and one of them is the holder.
-
-**When it will not clear.** A `fork` child inherits its parent's open file
-description and therefore any byte the parent held at the moment of the fork
-(§6.2), so a *dead* parent's topology lock stays held for as long as that child
-lives. This needs a `fork` from one thread while another is inside `reparent` —
-microseconds — so it is far rarer than the same hazard on a **claim** byte, which
-is held for a publisher's whole life. `tf_tree doctor` reports the inheritance as
-`TFT014`; the remedy is that check's, and it is to stop the child or start
-workers with a start method that inherits no descriptors, such as
-multiprocessing's `spawn`.
+**When it will not clear.** A `fork` child inherits the parent's open file
+description and any byte held at the fork (§6.2), so a *dead* parent's topology
+lock stays held while the child lives. `doctor` reports it as `TFT014`; stop the
+child, or start workers with `spawn`.
 
 ### `ReparentError::TopologyLease { raw_os_error }`
 
-The lock file's topology byte could not be asked about at all — `fcntl` failed
-for a reason that is not contention. Unlike `LockContended` this is **not**
-retryable: no peer is doing anything, the lock file itself is unusable. Check
-that the runtime directory still exists and is on a local filesystem
-([`PHASE2.md`](./PHASE2.md) §3.1 refuses NFS and CIFS for exactly this class of
-reason), and that the process has not exhausted its descriptors.
+`fcntl` on the topology byte failed for a reason that is not contention; **not**
+retryable. Check the runtime directory exists on a local filesystem
+([`PHASE2.md`](./PHASE2.md) §3.1) and the process has descriptors left.
 
 ### `HandshakeRejected`
 
 A **live, serving owner** answered the rendezvous socket and refused this attach.
-The message names the status and the owner's side of the comparison, and stops
-there:
+The message names the status and the owner's side of the comparison, and stops:
 
 ```text
 the arena owner refused this attach: LayoutMismatch (owner format_version 3, layout_hash 0x3D104195) (HandshakeRejected)
 ```
 
-**The remedy is this table, and it left the message on 2026-09-18** (see the Erratum in [`PHASE2.md` §3.7](./PHASE2.md#37-attach); [`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md) step 7).
-
-**Two of these statuses share a name with a check below and are not that check.**
-`VersionMismatch` and `LayoutMismatch` here are the **owner's** comparison
-against the attach request, made before this process ever saw the segment, which
-is why `found`/`expected` do not appear.
-
-**The message prints the owner's hash and not this build's, and
-[`PHASE2.md`](./PHASE2.md) §3.7 asks for both.** See the Erratum in `PHASE2.md` §3.7. **It does not change the remedy** — rebuilding every participant from
-one release is the fix whichever pair of numbers you are holding — and where
-this build's own constants *are* printed is `tf_tree doctor --explain-version`,
-**run from the refused binary's build**, not from whichever `tf_tree` is on the
-path. A hash from a different build is a third number, not the missing one. The sections under those names below are this process validating a
-header it has already mapped against its own build constant — which also happens
-where there is no owner and no handshake at all, opening a frozen `.tft`.
+**The remedy is this table** ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
+step 7; Erratum in [`PHASE2.md` §3.7](./PHASE2.md#37-attach)). The message prints
+the owner's hash, not this build's; rebuild every participant from one release
+whichever pair you hold, and print this build's constants with `tf_tree doctor
+--explain-version` **run from the refused binary's build**. The `VersionMismatch`
+and `LayoutMismatch` sections below are a different check: a process validating a
+mapped header against its own constant, as when opening a frozen `.tft`.
 
 | `status` | What the owner compared | What to do |
 |---|---|---|
-| `VersionMismatch` | this binary's `FORMAT_VERSION` against the running arena's, **first**, because a version difference makes every later field's meaning uncertain | rebuild every participant from one release and restart them together. There is no partial upgrade path |
-| `LayoutMismatch` | same version, a different record layout | rebuild every participant, as above. The owner's `layout_hash` is in the message; this binary's is a build constant, printed by `tf_tree doctor --explain-version` **built from the same commit as the refused process** — see the note above this table before comparing two numbers |
-| `BootIdMismatch` | the boot id in the attach request against the one in the **arena header** | **not "the arena outlived a reboot"** — a serving owner is proof it did not, and the segment would not have survived one. The two processes disagree about which boot this is, and the kernel has one boot id per host with no per-namespace variant ([`PHASE2.md`](./PHASE2.md) §3.3), so one of them did not read the real value: either the read failed and it substituted all-zeros (both sides do, so it takes exactly one failure), or something presents a different `/proc/sys/kernel/random/boot_id` to it — a sandbox that masks `/proc/sys`, or a `/proc` overlay. **And there is a third way, which needs no failure at all: the two sides parse that file with different code.** The joiner sends `tf_tree_ipc::procstat::boot_id`, which rejects a UUID with trailing junk; the arena header was written by `tf_tree::tree::boot_id`, which ignores it. On a file neither of them should ever see, the strict one substitutes all-zeros and the lenient one does not — so reading the file from both processes can show it identical and the ids still disagree. Check the file first, and if it is well formed and identical, the mismatch is that divergence and is a bug to report |
-| `NoParticipantSlots` | every slot, against **both** its tables: the owner's assigner walks the arena's participant records *and* the lock bytes, and grants a slot only where both are free | the *`ParticipantTableFull` / `NoParticipantSlots`* section below is the triage, and the reason it is there rather than here is that the two tables need two different commands to read. A read-only consumer holds a byte and writes no record, so neither table alone is the answer. **There is no `--participants` flag and never was**: capacity is fixed at construction ([`PROJECT.md`](./PROJECT.md) §5 D4) |
-| `ModeNotPermitted` | **nothing in this workspace sends it.** A rejection has three sources and none of them produces this one. `OwnerServer::serve` answers a datagram it cannot decode with `Malformed` and nothing else — that is the row below. `OwnerServer::check` returns `VersionMismatch`, `LayoutMismatch` or `BootIdMismatch` and nothing else. The `assign` closure a caller hands `serve` may return **any** `HelloStatus` — that is how `NoParticipantSlots` is sent — but `tf_tree::open`'s assigner returns only `NoParticipantSlots`. So the only route is somebody else's `assign`. | attach read-only, which is the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18). **Who refused you decides the rest.** Against an owner built on `tf_tree_ipc` with its own `assign`, this is that policy and its author is who to ask. Against a `tf_tree` owner, no code path produces it, so report it. |
-| `Malformed` | nothing — it could not decode the request | **or it refused for a reason this build has no name for.** Every unknown status code decodes to `Malformed` (`HelloStatus::from_u32`), deliberately, so a newer owner's newer refusal arrives here. The two are indistinguishable on the wire, so confirm both sides are the same release before reading this as corruption |
+| `VersionMismatch` | this binary's `FORMAT_VERSION` against the running arena's, **first**, because a version difference makes every later field uncertain | rebuild every participant from one release and restart them together. There is no partial upgrade path |
+| `LayoutMismatch` | same version, a different record layout | rebuild every participant, as above. The owner's `layout_hash` is in the message; this binary's is printed by `tf_tree doctor --explain-version` **built from the same commit as the refused process** |
+| `BootIdMismatch` | the boot id in the attach request against the one in the **arena header** | **not "the arena outlived a reboot"** — a serving owner proves it did not. The two processes disagree about which boot this is ([`PHASE2.md`](./PHASE2.md) §3.3): either one failed to read `/proc/sys/kernel/random/boot_id` and substituted all-zeros, or something presents a different one to it (a sandbox masking `/proc/sys`, a `/proc` overlay). **A third way needs no failure**: `tf_tree_ipc::procstat::boot_id` rejects a UUID with trailing junk and the arena header's writer, `tf_tree::tree::boot_id`, ignores it. Check the file from both processes first; if it is well formed and identical, the divergence is a bug to report |
+| `NoParticipantSlots` | every slot, against **both** tables: the assigner walks the arena's participant records *and* the lock bytes and grants a slot only where both are free | triage is the *`ParticipantTableFull` / `NoParticipantSlots`* section below, because the two tables need two different commands. A read-only consumer holds a byte and writes no record. **There is no `--participants` flag**: capacity is fixed at construction ([`PROJECT.md`](./PROJECT.md) §5 D4) |
+| `ModeNotPermitted` | **nothing in this workspace sends it**: `OwnerServer::serve` answers an undecodable datagram with `Malformed`, `OwnerServer::check` returns only the three mismatches, and `tf_tree::open`'s `assign` returns only `NoParticipantSlots`. Only somebody else's `assign` closure can | attach read-only, the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18). Against an owner built on `tf_tree_ipc` with its own `assign`, this is that policy and its author is who to ask; against a `tf_tree` owner no code path produces it, so report it |
+| `Malformed` | nothing — it could not decode the request | **or it refused for a reason this build has no name for**: every unknown status decodes to `Malformed` (`HelloStatus::from_u32`), so a newer owner's newer refusal arrives here. Confirm both sides are the same release before reading this as corruption |
 
-`Ok` never appears in this message: it is the acceptance, and no error is built
-from it. **Adding a `HelloStatus` fails to build the tests** — `status_is_a_refusal`
-in `tf_tree_ipc`'s `error.rs` is a total `match` kept for exactly that, since
-safe Rust cannot enumerate an enum and `HelloStatus::from_u32`'s catch-all arm
-absorbs a new variant without complaint. It is in `#[cfg(test)]`, so a plain
-`cargo check -p tf_tree_ipc` still passes and `--all-targets` is what fails;
-`just build` and `just lint` both pass that flag. Whoever fixes that match is the person
-who owes this table a row; that the row *exists* and says something is
-`tf_tree_cli`'s `tests/runbook.rs`, which reads this section.
+`Ok` has no row. **Adding a `HelloStatus` fails the tests** (`status_is_a_refusal`
+in `tf_tree_ipc`'s `error.rs`, under `--all-targets`); whoever fixes it owes this
+table a row, which `tf_tree_cli`'s `tests/runbook.rs` checks.
 
 ### `LayoutMismatch { found, expected }`
 
-Two binaries were built from different commits and their arena struct layouts
-disagree. **Rebuild every participant.** A layout change requires a full restart;
-there is no partial upgrade path.
-
-This is the one operators actually hit, and the raw symptom — attach failing on
-a machine where everything else looks fine — is otherwise a multi-hour debugging
-session. Both hashes are printed for exactly that reason.
-
-**This is the mapped header's check, not the owner's.** A refusal that never got
-as far as a segment prints `LayoutMismatch` with one hash and ends
-`(HandshakeRejected)`; that one is *`HandshakeRejected`* above, and the remedy is
-the same rebuild for a different reason.
+Binaries built from different commits disagree on arena layout. **Rebuild every
+participant**; there is no partial upgrade. Both hashes are printed. This is the
+mapped header's check; a refusal that never reached a segment ends
+`(HandshakeRejected)` and is that section.
 
 ### `VersionMismatch { found, expected }`
 
-The segment was written by a different `FORMAT_VERSION`. Version 1 arenas cannot
-be attached by a version 2 build: the Phase 2 amendments changed the header and
-region table. Recreate the arena.
-
-Also the mapped header's check. The owner's version comparison at the rendezvous
-handshake is *`HandshakeRejected`* above, and it prints only the owner's number.
+The segment was written by a different `FORMAT_VERSION`; recreate the arena. The
+owner's comparison is *`HandshakeRejected`* above.
 
 ### `HeaderInconsistent`
 
-The header's region offsets do not match the geometry its own capacities imply.
-Distinct from `LayoutMismatch`, which compares against a build constant — this
-catches a header that is internally inconsistent, from a peer bug, a scribbled
-byte, or a build sharing this one's record sizes but not its capacities. Treat
-it as corruption and recreate the arena.
+The header's region offsets do not match the geometry its capacities imply (unlike
+`LayoutMismatch`, which compares a build constant): a peer bug, a scribbled byte,
+or a build with the same record sizes but other capacities. Treat as corruption and
+recreate the arena.
 
 ### `Unsealed`
 
-A peer offered a segment without `F_SEAL_SHRINK`/`F_SEAL_GROW`. Refused, because
-an unsealed segment can be truncated under a reader and fault it with `SIGBUS`
-inside a lookup — unrecoverable, mid-control-loop. A peer that hands you one is
-either buggy or hostile and the two are indistinguishable from here.
+A peer offered a segment without `F_SEAL_SHRINK`/`F_SEAL_GROW`; refused, because
+it could be truncated under a reader and `SIGBUS` it mid-lookup. The peer is buggy
+or hostile.
 
 ### `ParticipantTableFull` / `NoParticipantSlots`
 
-More than `max_participants` processes attached. **There is no flag for this**,
-and the first thing to look for is a leak — a participant that exited without
-releasing its slot.
+More than `max_participants` processes attached. **There is no flag**; first look
+for a leak, a participant that exited without releasing its slot.
 
-**Two commands, two different tables, and only one of them is the table that ran
-out.** `tf_tree participants` reads the **lock file and nothing else**: it walks
-the lock's byte slots, prints `live` where the kernel still holds the byte and
-`stale` where it does not, and never opens the arena's participant table. That
-finds the ordinary leak — a `SIGKILL`ed rendezvous participant leaves a `stale`
-row — and it is blind to the class that needs no lock byte at all. A
-`TreeBuilder::build_shared` creator registers a `LIVE` arena record and takes no
-byte, because such a tree has no lock file
-([`0031`](./decisions/0031-the-participant-record-with-no-byte.md));
-against one of those this command prints *"no lock file: nothing has ever
-attached to this domain/name"* while the slot is spent. **The command that reads
-the arena's own table is `tf_tree doctor --attach`**, whose `TFT014` walks the
-participant records, says how many slots are spent of how many, and names each
-pid — see its row in *Diagnostics* below for what reclaims one. Its own
-detection limits are written where it is implemented (`tft014`,
-`crates/tf_tree_cli/src/checks.rs`): a claim left by a dead owner or by a
-`build_shared` participant is invisible to it, because neither has a socket
-hangup anybody sees.
+**Two commands, two tables.** `tf_tree participants` reads the **lock file only**
+(`live` where the kernel holds the byte, `stale` where not): it finds the ordinary
+leak and is blind to a `TreeBuilder::build_shared` creator, which registers a
+`LIVE` arena record and takes no byte
+([`0031`](./decisions/0031-the-participant-record-with-no-byte.md)); against one it
+prints *"no lock file: nothing has ever attached to this domain/name"* while the
+slot is spent. **`tf_tree doctor --attach` reads the arena's table**: `TFT014`
+says how many slots are spent and names each pid (see *`doctor` checks*). Its
+limits are in `tft014` (`crates/tf_tree_cli/src/checks.rs`): a claim left by a dead
+owner or a `build_shared` participant is invisible to it.
 
-**And a record with no lock byte is worse than invisible — it is accused.**
-A `doctor --attach` reached the arena through the
-rendezvous, so it has
-one and it probes: the byte-less record reads free, no lock-file identity names
-it, and `TFT014` reports **`a record left behind — … the lock byte is free`**
-about a process that is running and publishing. If you are looking at that
-finding, do not read it as "the process is gone" — check whether the pid it
-names is alive before you act on it.
+**A record with no lock byte is accused**: `doctor --attach` reports **`a record
+left behind — … the lock byte is free`** about a process that is running and
+publishing. Check the pid is alive before acting.
 
-**Those two blind spots are not the same kind of thing, and what you do about
-them differs.** A dead **owner** is in contract, and `tf_tree doctor` simply
-cannot see what it left — a surviving read-write peer's sweep is the collector
-([`PHASE2.md` §3.9](./PHASE2.md#39-teardown), *A participant dies*). A byte-less
-`build_shared` participant is **out of contract** where it is published into a
-rendezvous by hand ([`0031`](./decisions/0031-the-participant-record-with-no-byte.md);
-[`PHASE2.md` §3.1](./PHASE2.md#31-the-sharing-boundary-is-the-runtime-directory--normative)).
-So a byte-less record in a served
-arena is a report about the *application*, not about this tool: something called
-`TreeBuilder::build_shared` and then bound an `OwnerServer` over the fd, where
-`tf_tree::Open` is the supported way to create and serve. Until that is fixed,
-**do not sweep**: `Tree::reap_dead` / `Tree::reap_participants` in Rust,
-`tft_tree_reap_dead` in C and `Tree.reap_dead()` in Python will free the records
-and take the claims of publishers that are running. No `tf_tree` subcommand
-sweeps — `doctor` reports and reclaims nothing — so the tool is safe to run
-either way.
+A dead **owner** is in contract; a surviving read-write peer's sweep is the
+collector ([`PHASE2.md` §3.9](./PHASE2.md#39-teardown)). A byte-less
+`build_shared` participant is **out of contract** where published into a
+rendezvous by hand
+([`PHASE2.md` §3.1](./PHASE2.md#31-the-sharing-boundary-is-the-runtime-directory--normative)):
+the application should use `tf_tree::Open`. Until fixed, **do not sweep**
+(`Tree::reap_dead` / `reap_participants`, `tft_tree_reap_dead`,
+`Tree.reap_dead()`): it frees the records and takes the claims of running
+publishers. No `tf_tree` subcommand sweeps.
 
-*Two errata on the paragraphs above, kept because each records a wrong answer an
-operator could have acted on. The **`tf_tree participants` / `doctor --attach`**
-paragraph read "a participant that exited without releasing its slot, which
-`tf_tree participants` names" until 2026-09-05 — one command, no scope, and the
-wrong table for the byte-less class. It then ended by sending the byte-less
-class to the `unknown` byte row, which is a fact about a run that read no lock
-file and not about the record; corrected 2026-09-19, and what it had been
-telling you to do was treat a live publisher's slot as abandoned.*
-
-Capacity is fixed at
-construction by design ([`PROJECT.md`](./PROJECT.md) §5 D4): the value comes from
-`tf_tree_arena::layout::DEFAULT_MAX_PARTICIPANTS`, every `ArenaLayout`
-constructor uses it, and header validation refuses a segment whose header
-disagrees — so raising it means changing that constant, rebuilding every
-participant from one commit and restarting them together.
-
-### `SIGBUS` inside a lookup
-
-**Structurally impossible with sealing.** If it ever happens, the segment was not
-sealed — file a bug rather than working around it.
+Capacity comes from `tf_tree_arena::layout::DEFAULT_MAX_PARTICIPANTS` and header
+validation refuses a disagreeing segment: raising it means changing that constant
+and rebuilding and restarting every participant together.
 
 ### Attaching to a running robot
 
 `tf_tree <cmd> --attach` joins the arena that `$TF_TREE_RUNTIME_DIR`,
-`$TF_TREE_DOMAIN` and `$TF_TREE_NAME` resolve to — override any of them with
-`--domain` / `--name`. **The commonest mistake is a domain mismatch**, and its
-dangerous form is silent in other systems: you attach to the wrong domain and are
-shown a perfectly plausible tree. Here it fails, because a domain is a different
-directory and a different lock file. `tf_tree participants --domain N` confirms
-which one has anything in it.
+`$TF_TREE_DOMAIN` and `$TF_TREE_NAME` resolve to (override with `--domain` /
+`--name`). **The commonest mistake is a domain mismatch**;
+`tf_tree participants --domain N` confirms which domain has anything in it.
 
-Attach is **read-only** and **will not create**. `--rw` and `--create` exist and
-are opt-in: a diagnostic tool that can write to a robot's tree can corrupt it
-with any bug it happens to have (D18), and a tool that creates on a typo will
-conjure an empty arena and then report it healthy.
-
-`doctor --attach` prints which checks it could not run. `multi-writer`
-(`TFT001`) and `short-buffer` (`TFT011`) need a recorded push stream —
-`multi-writer` cannot see a writer that has already been replaced, and
-`short-buffer` needs each sample's arrival lateness, which nothing in the arena
-records. Neither can fire on a live arena, so neither is claimed. The report's
-`not run:` block is the list for the run in front of you; no count of it is
-written here, because the set moves with the source and with the arena.
+Attach is **read-only** and **will not create**; `--rw` and `--create` are opt-in
+(D18). `doctor --attach` prints which checks it could not run: `multi-writer`
+cannot see a writer already replaced, and `short-buffer` needs arrival lateness,
+which nothing in the arena records. The report's `not run:` block is the list.
 
 ### Why `doctor --from-bag` reports `TFT010` and `TFT011` as *not run*
 
-Because they have nothing to read, and saying so is the point.
-
-Both are built on the `docs/PHASE5.md` §5 counters, and those are incremented by
-**lookups**. An arena built from a recording has been written and never read —
-the ingest publishes into it and asks it nothing — so every counter is zero. A
-zero extrapolation count is also exactly what a healthy, heavily-used arena
-looks like, so a `pass` there would be an all-clear about instrumentation nobody
-had exercised. `doctor` skips instead and names the reason.
-
-**This is not specific to `--from-bag`.** The same skip appears on the built-in
-fixture, and on a live arena you attach to *before its first consumer has done a
-lookup* — which is the most likely moment to run `doctor` at bringup. Run one
-consumer, then re-run `doctor`, and both checks come back.
-
-To get a verdict on extrapolation, point `doctor` at the arena the consumers are
-actually using:
-
-```
-tf_tree doctor --attach          # after consumers have been running
-```
-
-`TFT011` is two checks under one id and skips only when both halves are blind;
-where one half still has evidence it runs and the report's `note:` lines say
-which half could not fire.
+Both are built on the `docs/PHASE5.md` §5 counters, which **lookups** increment.
+An arena built from a recording, the built-in fixture, or a live arena attached
+before its first consumer's lookup has all-zero counters, also what a healthy
+arena can look like, so `doctor` skips rather than pass. Run one consumer and
+re-run. `TFT011` skips only when both its halves are blind; `note:` lines say
+which could not fire.
 
 ### Why `doctor --from-bag` warns `TFT017` on every edge
 
-An arena built from a recording has **no writer at all** — the ingest's claims
-are released when it finishes — so *dynamic edge with no live writer* is true of
-every dynamic edge in it. The report says so in a `note:` line: the finding
-names the arena, not any edge in it.
-
-It is a warning rather than a skip on purpose. A fleet whose publishers have all
-stopped produces the identical arena state, and that is the fault this check
-exists to name. On a recording, ignore it; on an `--attach`, do not.
+A recording's arena has **no writer** (the ingest's claims are released), so
+*dynamic edge with no live writer* is true of every edge, as the `note:` line
+says. It is a warning, not a skip, because a fleet whose publishers all stopped
+looks identical: ignore it on a recording, not on an `--attach`.
 
 ### Reading `tf_tree participants`
 
 | column | meaning |
 |---|---|
-| `state = live` | the kernel still holds this slot's lock byte. A `SIGSTOP`ped process reads **live**, correctly — it has not died, and reaping it would be wrong |
-| `state = stale` | the byte is released but the identity record remains: the process is gone and left a record behind. A reaper will collect it; `tf_tree doctor --attach --rw` forces one |
-| `comm = <no record>` | the byte is held but no record has been written — a participant caught between taking its slot and describing itself. Momentary; re-run |
-| `mode = ro` | attached read-only. It cannot publish and cannot corrupt anything |
+| `state = live` | the kernel still holds this slot's lock byte. A `SIGSTOP`ped process reads **live**, correctly; reaping it would be wrong |
+| `state = stale` | the byte is released but the identity record remains: the process is gone. A reaper will collect it; `tf_tree doctor --attach --rw` forces one |
+| `comm = <no record>` | the byte is held but no record written yet — momentary; re-run |
+| `mode = ro` | attached read-only; cannot publish or corrupt anything |
 
-An empty machine prints "no lock file" and **exits zero**. That is an answer, not
-a failure, and the exit code says so.
+An empty machine prints "no lock file" and **exits zero**: an answer, not a
+failure.
 
 ### A writer stopped publishing and `push` returns `ClaimRevoked`
 
-Its claim was reaped: something judged the process dead while it was stopped or
-stalled, and the edge is now free or owned by somebody else. The correct response
-is to stop publishing and re-claim — never to retry the push, which is the one
-thing that would put two writers on a single-writer ring.
-
-This is by design (A4). A process that was `SIGSTOP`ped long enough for its
-*kernel lock* to be released cannot have been merely slow — the lock is released
-by process death, not by a timeout — so if this fires, the process really did
-die and come back, or somebody reaped by hand.
+See `ClaimRevoked` above. The kernel lock is released by process death, not a
+timeout (A4), so the process really did die and come back, or somebody reaped by
+hand.
 
 ### The tree works in the parent and everything fails in a forked child
 
-Errors will be `ChildDetached` from every entry point. A shared arena is mapped
-`MADV_DONTFORK`, so the child has no mapping where the arena was; the handle it
-inherited names memory it does not have.
+Errors are `ChildDetached` from every entry point. A shared arena is mapped
+`MADV_DONTFORK`, so the child has no mapping where the arena was. Open a new tree
+in the child, or `exec`; there is no repair. Python's `multiprocessing` defaults to
+`fork` on Linux, the likeliest way to meet this: use `spawn`, or open inside the
+worker.
 
-Open a new tree in the child, or `exec`. There is no repair — this is not a
-transient. Python's `multiprocessing` defaults to `fork` on Linux, so this is the
-single most likely way to meet it; use the `spawn` start method, or open inside
-the worker.
+**The child is also holding a participant slot.** `fork` shares the open file
+descriptions, so the child keeps the parent's rendezvous socket *and* lock byte:
+the owner never sees a `HUP` and the kernel keeps answering "held". `doctor
+--attach` reports it as the second `TFT014` shape (*byte still HELD*), the one leak
+nothing may reclaim. The slot returns when the last inheritor exits.
 
-**And the child is holding a participant slot while it does this.** `fork` shares
-the open file descriptions, not just the mapping-shaped hole in them, so the
-child keeps the parent's rendezvous socket *and* its participant lock byte alive
-— which means the owner never sees a `HUP` when the parent dies, and the kernel
-keeps answering "held" for a slot nobody can use. `doctor --attach` reports it as
-the second `TFT014` shape in the table below (*byte still HELD*), and it is the
-one leak nothing may reclaim: the kernel is right, and the fix is upstream of it.
-The slot returns when the last inheritor exits.
+**A participant in another PID namespace** produced this report until
+[`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md); on an
+older build, run `doctor` from **inside** its namespace.
 
-**A participant in a different PID namespace produced this same report until
-[`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md), and it
-is worth knowing because the remediations are opposite.** A recorded pid is
-namespace-local, so a healthy participant inside a container or an
-`unshare --fork --pid` recorded a pid that names a different process — or none —
-in the observer's `/proc`, and `doctor` printed the *stop the child* advice about
-a process that is running normally. Since `0033` the identity record carries the
-namespace its pid was drawn from and `doctor` says nothing rather than saying
-that. If you are on a build that predates it, run `doctor` from **inside** the
-participants' namespace and compare: a report that appears only from outside is
-this, not a fork.
-
-**It is reported whether or not the parent was a writer**, which matters because
-the ordinary Python worker is not one. A read-only participant — the consumer
-default (D18), and what `Tree::open`/`attach` gives you unless you ask for more —
-takes a lock byte and writes **no** arena participant record at all, so the slot
-its inheritor is holding shows an empty record. `doctor` reports it from the two
-facts such a slot does have, the byte and the lock file's identity record, and
-says so in the finding: *the record is FREE (no arena record: a read-only
-participant, D18)*. `tf_tree participants` shows the same slot as `live` with the
-dead parent's pid beside it, which is the corroborating view — the byte really is
-held, by a description the parent no longer owns.
+**It is reported whether or not the parent was a writer**: a read-only participant
+(D18) takes a byte and writes **no** arena record, so `doctor` reports *the record
+is FREE (no arena record: a read-only participant, D18)* and `tf_tree participants`
+shows the slot `live` with the dead parent's pid.
 
 ### The arena's owner died
 
-Existing participants are fine — lookups keep being served from a segment whose
-owner is gone, which is what [`PHASE2.md`](./PHASE2.md) §3.5 promises and has
-always delivered. The question is whether anything can *join* it again.
+Existing participants are fine ([`PHASE2.md`](./PHASE2.md) §3.5); the question is
+whether anything can *join* again.
 
-**Since 2026-08-28 it can, and the recovery is one call rather than a fleet
-restart.** A surviving **read-write** participant inherits the owner role: it
+**A surviving read-write participant inherits the owner role in one call.** It
 notices the hangup with `Tree::owner_lost()` and promotes itself with
 `Tree::inherit_ownership()`, which takes the ownership byte on the file
 description its session already holds and binds the rendezvous socket over the
-**existing** segment. Nothing is copied, nothing is re-created, no lookup pauses,
-and every survivor keeps its slot. This section used to be headed *"…and nothing
-new can join"* and told you to stop every attached process; that was true until
-2026-08-27, when §3.5's first takeover half was deleted as unsound (#275,
-[`0037`](./decisions/0037-a-takeover-is-not-a-second-open.md)), and it is kept
-here rather than overwritten because a fleet that has not adopted the call below
-is still in exactly that state.
+**existing** segment ([`0037`](./decisions/0037-a-takeover-is-not-a-second-open.md)).
+Nothing is copied, no lookup pauses, every survivor keeps its slot.
 
 ```rust
 // In a read-write participant's own loop — between control cycles is fine.
@@ -653,266 +375,140 @@ if tree.owner_lost() {
 
 **Write it exactly like that — no latch, no backoff, no "only once" flag.**
 `owner_lost()` asks whether the arena has an owner, not whether *this* socket is
-dead, so on a fleet of *N* read-write survivors the *N−1* that do not inherit
-stop paying anything after the winner binds: the `poll` reports a hangup, one
-`F_OFD_GETLK` reports byte 0 held, and the call returns `false` without touching
-the ownership lock. That was not true before 2026-08-29
-([`0043`](./decisions/0043-owner-lost-is-a-question-about-the-owner.md)), when it
-answered `true` for the life of the process and this loop re-attempted an
-`F_OFD_SETLK` every cycle — so **if you already wrote a latch around this call to
-stop that, delete it**: a latched survivor cannot inherit when the *second* owner
-dies, and the live probe handles that case by itself. In a healthy deployment the
-whole thing is one non-blocking `poll` that answers `false`.
+dead ([`0043`](./decisions/0043-owner-lost-is-a-question-about-the-owner.md)), so
+the *N−1* losers pay nothing after the winner binds: one `poll` reports a hangup,
+one `F_OFD_GETLK` reports byte 0 held, and it returns `false` without touching the
+ownership lock. **If you wrote a latch to stop the old behaviour, delete it**: a
+latched survivor cannot inherit when the *second* owner dies.
 
-**The catch, and it decides whether your fleet can recover at all: nothing calls
-this for you.** See [`PHASE2.md` §3.5](./PHASE2.md#35-ownership-migrates-the-data-plane-never-pauses--normative), *The trigger is the caller's*.
-Three things to check when owner death has wedged a live system:
+**Nothing calls this for you, and that decides whether your fleet can recover**
+([`PHASE2.md` §3.5](./PHASE2.md#35-ownership-migrates-the-data-plane-never-pauses--normative),
+*The trigger is the caller's*). Check:
 
 - **Is any survivor read-write?** `inherit_ownership()` answers
-  `Inheritance::ReadOnly` on a read-only attachment and does nothing else. An
-  owner writes the participant table on every grant and a `PROT_READ` mapping
-  cannot, which is D18 working rather than failing — so **a fleet of read-only
-  consumers cannot rescue itself.** Read-only is the consumer default:
-  `tf_tree::open()` and `Open::new()` both start at `AttachMode::ReadOnly`
-  (`crates/tf_tree/src/open.rs:886`) and you get read-write only by asking for it.
-  If every survivor is a consumer, the recovery below (stop everything) is still
-  the only one you have — **and that is a reason to open one process read-write**
-  even if it never publishes, since read-write is what makes a survivor eligible
-  rather than what makes it a writer.
-
-  **That is necessary and not sufficient, and this sentence used to stop here**
+  `Inheritance::ReadOnly` on a read-only attachment, so **a fleet of read-only
+  consumers cannot rescue itself** (D18). Read-only is the default
+  (`crates/tf_tree/src/open.rs:886`); open one process read-write even if it never
+  publishes. **Necessary and not sufficient**
   ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
-  part 1, step 1). A read-write attachment that never calls `owner_lost()` is
-  **not** recovery capacity — the next two bullets say so as facts, and a reader
-  who acted on this bullet alone satisfied the remedy as written and wedged
-  anyway. The process you open read-write has to *poll*, on some cadence of its
-  own, and it has to be attached **before** the owner dies: capacity is whatever
-  was attached and eligible at the instant the role fell vacant, and it can only
-  shrink from there. `PHASE2.md` §3.5 states the property NORMATIVE, with the
-  three ways to be ineligible. Pinned by
-  `a_read_only_survivor_reports_that_it_cannot_inherit`
-  (`crates/tf_tree/tests/rendezvous.rs`), which also shows the consumer reading
-  straight through the owner's death.
-- **What language is that survivor written in?** Until 2026-08-29 the answer had
-  to be Rust, and if it was not, the fleet could not recover at all: the whole
-  recovery surface was Rust-only, and worse, a C consumer could not even hold a
-  read-write attachment —  `tft_tree_open` was the entire opening surface of the
-  C ABI and it is `tf_tree::open()`, read-only. ROS 2 nodes are C++ and Python.
+  part 1): it must *poll* `owner_lost()` and be attached **before** the owner dies;
+  capacity is whoever was attached, eligible and polling when the role fell vacant,
+  and only shrinks. Pinned by `a_read_only_survivor_reports_that_it_cannot_inherit`
+  (`crates/tf_tree/tests/rendezvous.rs`).
+- **What language is that survivor written in?** Since
   [`0044`](./decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)
-  closed it: **C and C++** get `tft_tree_open_named`, `tft_tree_owner_lost`,
+  **C and C++** have `tft_tree_open_named`, `tft_tree_owner_lost`,
   `tft_tree_inherit_ownership` and `tft_tree_reap_dead` in the *unstable* header
-  (`#define TFT_ENABLE_UNSTABLE`); **Python** gets `tree.owner_lost()`,
-  `tree.inherit_ownership()` — which returns the outcome's name as a string —
-  and `tree.reap_dead()`, with `tf_tree.open(mode="rw")` for the attachment.
-  A node built against an older release still cannot, which is the next bullet.
-- **Does that survivor call it?** A publisher built against a release before
-  2026-08-28, or one that simply never polls, is indistinguishable from one that
-  cannot. `tf_tree participants` shows you who is attached; it cannot show you
-  who is looking.
-- **Did it try and fail?** Every error path inside `inherit_ownership()` restores
-  the attachment and hands the ownership byte back, so a failed inheritance
-  leaves a plain participant rather than a byte-0 holder with nothing listening.
-  That failure is recoverable — another survivor, or the same one on its next
-  pass, can take it.
+  (`#define TFT_ENABLE_UNSTABLE`); **Python** has `tree.owner_lost()`,
+  `tree.inherit_ownership()` (returns the outcome's name) and `tree.reap_dead()`,
+  with `tf_tree.open(mode="rw")`. A node built before 2026-08-28 cannot.
+- **Does that survivor call it?** One that never polls is indistinguishable from
+  one that cannot; `tf_tree participants` shows who is attached, not who is looking.
+- **Did it try and fail?** Every error path restores the attachment and hands the
+  byte back, so the next pass, or another survivor, can take it.
 
-**When no survivor can or will inherit, the older remedy still applies: stop
-every attached participant** and start again. It is written out under
-`ArenaHeldButUnreachable` below, and two notes belong here:
-
-- **`SIGTERM` is enough to stop one.** The kernel releases the lock byte and
-  drops the mapping whatever kills the process, so no handler is needed to free
-  the segment. It is still not a *clean* exit — nothing installs a handler and
-  the default disposition skips every destructor — so it leaks the arena record
-  of any participant you stop while the arena survives (the `TFT014` row below).
-- **`CreatePolicy::Always` abandons the arena rather than recovering it.** It
-  creates a *second* one beside the first, leaving the survivors publishing into
-  a segment nobody else can reach — the "two processes see different data" state.
-  Its full consequences are under `ArenaHeldButUnreachable` below; read them
-  before reaching for it, and reach for inheritance first.
+**When no survivor can or will inherit, stop every attached participant** and
+start again. `SIGTERM` is enough (the kernel releases the byte and mapping) but
+leaks the arena record of a participant stopped while the arena survives (the
+`TFT014` row). `CreatePolicy::Always` abandons the arena and creates a second one
+(see `ArenaHeldButUnreachable`); reach for inheritance first.
 
 #### An owner is not dead until its exit ends
 
-**When a survivor learns of it.** `owner_lost()` answers `true` once the
-survivor's attach connection has hung up and the last open file description
-holding byte 0 has closed — [`PHASE2.md`](./PHASE2.md) §3.5's NORMATIVE sentence,
-in its words. For a dying owner that is the **end of its exit**: the kernel
-writes any core dump and tears down the address space *first*, and releases the
-socket and byte 0 after. An owner whose `fork` child outlives it keeps both until
-that child exits (*The tree works in the parent and everything fails in a forked
-child*, above). tf_tree adds no delay to that event, and nothing it lets a
-survivor do shortens it ([`0057`](./decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
+`owner_lost()` answers `true` once the survivor's attach connection has hung up and
+the last open file description holding byte 0 has closed ([`PHASE2.md`](./PHASE2.md)
+§3.5, NORMATIVE). For a dying owner that is the **end of its exit**: the kernel
+writes any core dump and tears down the address space first. An owner whose `fork`
+child outlives it keeps both until the child exits. Nothing shortens it
+([`0057`](./decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
 
-**What the window does.** Lookups and existing publishers carry on. Nobody
-inherits, and no fresh join can complete: an `open()` blocks for the window, and
-one whose timeout ends inside it is refused with `ArenaHeldButUnreachable` naming
-the dying owner (`ownership_held: true`) — it is still holding the byte. Edges the
-dying owner had claimed stay refused past the window, until a survivor calls
-`reap_dead`.
+**During the window** lookups and existing publishers carry on; nobody inherits and
+no fresh join completes (`open()` blocks, then is refused with
+`ArenaHeldButUnreachable` with `ownership_held: true`). Edges the owner had claimed
+stay refused until a survivor calls `reap_dead`.
 
-**The trade, and it is yours to make per process: a crash dump, or recovery
-bounded by the process's teardown.** Make it for **every process that may hold
-the role**, not only today's owner: ownership migrates, so the next heir is the
-next owner ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)),
-and suppressing dumps on the current owner alone protects one handover.
+**The trade, per process: a crash dump, or recovery bounded by teardown.** Make it
+for **every process that may hold the role**, since ownership migrates
+([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)).
 
-- **The dump window is the crash helper's run, which can grow with the size of
-  the dump.** No figure is given here, because it belongs to your host:
-  `cat /proc/sys/kernel/core_pattern`, where a leading `|` means dumps are piped
-  to a helper (apport, systemd-coredump). To time it on your host, run the
-  program in `0057`'s *Reproduction* — somewhere a crash report left behind is
-  acceptable.
-- **To suppress dumps for chosen processes only**, give them a core limit of
-  **1 byte**, which the kernel treats as *no dump* for a piped `core_pattern`:
-  - `prlimit --core=1:1 -- <cmd>` — **measured**, on one 6.8 kernel piping to
-    apport (`0057`'s `AN` arm);
-  - `LimitCORE=1` in the process's systemd unit;
-  - the same limit, `setrlimit(RLIMIT_CORE, {1, 1})`, in a launch wrapper before
-    it `exec`s the process.
-
-  Only the first was measured; the other two set the same limit, so confirm it
-  on the running process: `grep 'core file' /proc/<pid>/limits` should read `1`
-  and `1` bytes. **`ulimit -c 0` is not it when the host pipes its dumps**: a soft
-  limit of 0 is the ordinary shell default, and on both hosts `0057` looked at,
-  aborts under it still dumped through the pipe.
-- **systemd-coredump's `Storage=` and `ProcessSizeMax=`** (`coredump.conf`) are
-  the host-wide knobs. Whether `Storage=none` or `ProcessSizeMax=0` shortens the
-  window without per-process limits has **not been measured**; do not rely on
-  either without timing it.
-- **The teardown is not a setting.** Even with no dump, a process's socket and
-  byte 0 are released only after its address space is torn down: about
-  **100 ms per GiB of dirty 4 KiB anonymous memory** on the host `0057` measured,
-  whether the process was killed or aborted. Under
-  `transparent_hugepage=always` the same resident size tears down far faster. A
-  large perception or planning process that holds the role pays it on every
-  death.
+- **The dump window is the crash helper's run** and grows with the dump. Check
+  `/proc/sys/kernel/core_pattern` (a leading `|` pipes to apport or
+  systemd-coredump); to time it, run `0057`'s *Reproduction*.
+- **To suppress dumps**, give the process a core limit of **1 byte**:
+  `prlimit --core=1:1 -- <cmd>` (**measured**), `LimitCORE=1` in the systemd unit,
+  or `setrlimit(RLIMIT_CORE, {1, 1})` in a launch wrapper; confirm with
+  `grep 'core file' /proc/<pid>/limits`. **`ulimit -c 0` is not it** when the host
+  pipes dumps. systemd-coredump's `Storage=`/`ProcessSizeMax=` are **not measured**.
+- **The teardown is not a setting**: about **100 ms per GiB of dirty 4 KiB
+  anonymous memory** on the host `0057` measured; far less under
+  `transparent_hugepage=always`.
 - **A supervisor's `SIGKILL` of a dumping owner ends the window and forfeits the
-  core.** That is stated so you know the effect of a stop timeout, **not
-  recommended as a procedure**: it is inferred rather than measured on an owner,
-  and nothing can tell a dump worth interrupting from an exit that is nearly
-  over.
+  core.** Inferred and not measured; **not recommended**.
 
 ### `ArenaHeldButUnreachable`
 
-Somebody holds a live arena and nothing is serving it, so
-[`PHASE2.md`](./PHASE2.md) §3.4's split-brain check refuses to create a second
-one. A stopped or wedged participant is one cause. **The ordinary cause is not a
-fault at all**: the owner exited and a perfectly healthy survivor still has the
-arena mapped, so every process that tries to open the rendezvous meets the check
-and times out for as long as any survivor lives. See *The arena's owner died*
-above. **If the owner has just died, the refusals last at least until its exit ends** —
-any core dump and its address-space teardown come first; see *An owner is not
-dead until its exit ends*, above.
+Somebody holds a live arena and nothing serves it, so [`PHASE2.md`](./PHASE2.md)
+§3.4's split-brain check refuses to create a second. **The ordinary cause is not a
+fault**: the owner exited and a healthy survivor still has the arena mapped, so
+every open times out while any survivor lives (*The arena's owner died*). If the
+owner has just died, refusals last at least until its exit ends.
 
 ```bash
 tf_tree participants   # the holders, by slot and pid — reads the lock file, never maps the arena
 ```
 
-**Reach for inheritance before you reach for a restart.** Since 2026-08-28 a
-surviving **read-write** participant can end this state by itself, without
-stopping anything: `Tree::owner_lost()` sees the hangup and
-`Tree::inherit_ownership()` binds the rendezvous over the segment that is already
-there, after which the joiner that was timing out simply succeeds. **What it
-needs is a survivor that is read-write *and* actually calls it** — there is no
-daemon polling on anyone's behalf
-([`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)), and a
-read-only consumer is told `Inheritance::ReadOnly` and cannot serve (D18). A
-fleet of consumers, or one that predates the call, is in the pre-2026-08-28
-state, and for it the paragraph below is still the whole recovery.
+**Reach for inheritance before a restart**: a surviving read-write participant
+that calls `owner_lost()` / `inherit_ownership()` ends this state without stopping
+anything ([`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md):
+no daemon polls for you; D18: a read-only consumer cannot serve). Whether you have
+such a survivor was decided before you got here
+([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)):
+while any participant byte is held no process can *join*, so **nothing you start
+now can become the heir**. Provision read-write pollers in advance.
 
-**And whether you have such a survivor was decided before you got here**
-([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md);
-`PHASE2.md` §3.5 states it NORMATIVE). This state *is* the door being shut: while any participant byte is held, no new
-process can *join* this arena, so **nothing you start now can become its heir**.
-The candidates are whoever was attached, read-write **and** polling at the
-instant the role fell vacant, and that set can only shrink.
-
-Two consequences for triage. First, a `tf_tree participants` listing tells you
-who is attached and not who is *looking*, so it cannot distinguish "an heir
-exists and has not got to it yet" from "no heir exists at all" — provisioning
-read-write pollers is something a fleet does in advance, not during an incident.
-Second, **starting a new process is not useless here — it just cannot inherit.**
-`CreatePolicy::Always` is the one thing that still creates in this state (the
-table below is which states it passes), and what it creates is a *fresh* arena
-over the same rendezvous name: it abandons this one, leaving its survivors
-publishing where nobody can reach them. That is a recovery of the *name*, not of
-the arena, which is why the warning above says to reach for inheritance first.
-
-**When there is no heir, the recovery is to stop every participant**, read-only
-consumers and any `tf_tree top --attach` included. Each process's lock byte is
-released by the kernel when it dies, and the segment is freed when its last
-mapping drops (§3.9), so once the last one is gone the next `open()` creates
-cleanly. Restarting the publisher alone does not help: it is not the survivor, so
-it takes the same split-brain path everything else does.
+**When there is no heir, stop every participant**, read-only consumers and
+`tf_tree top --attach` included. The kernel releases each lock byte on death and
+frees the segment when its last mapping drops (§3.9), so the next `open()` creates
+cleanly. Restarting the publisher alone does not help.
 
 If a holder must keep running and its arena is written off, the escape hatch is
-**`CreatePolicy::Always`** — [`PHASE2.md`](./PHASE2.md) §3.4 calls it
-`--force-new`, and it is a policy on the process that creates the arena, not a
-flag on `tf_tree`. There is no such flag; §0.0 records why.
+**`CreatePolicy::Always`** — [`PHASE2.md`](./PHASE2.md) §3.4's `--force-new`, a
+policy on the creating process and **not** a flag on `tf_tree` (§0.0). It creates
+a *fresh* arena over the same name and abandons this one: it recovers the *name*,
+not the arena.
 
-**This next table is about the *hatch*, not about your remedy — the remedy table
-is below it.** It answers one question: given what is held, does a forced create
-pass? Read it if you are considering `CreatePolicy::Always`; read the eight-row
-table further down to decide what to do.
-
-**It is not unconditional, and which holder is stuck decides whether it can help
-at all.** A forced create skips §3.4's participant scan and nothing else, so it
-still takes the ownership byte and still takes participant byte **0** — the
-creator's slot, which the owner holds for its whole life while joiners are
-assigned `>= 1`. Three states, and they need different remedies:
+**Whether a forced create passes is decided by what is held.** It skips §3.4's
+participant scan and nothing else, so it still takes the ownership byte and
+participant byte **0** (the creator's slot, held by the owner for its whole life
+while joiners get `>= 1`):
 
 | what is held | forced create |
 |---|---|
-| only slots `>= 1`, nothing else | **creates.** This is the case the hatch is for: the owner is gone, ordinary consumers survived |
-| slot **0** | **refuses**, identically to an ordinary open. Byte 0 is the creator's slot — usually the owner, but `Session::release_ownership` can leave a live non-owner there. Stop that process. If it was the *only* holder, an ordinary open then creates and no force is needed; if slots `>= 1` are still held, you land on row 1 and the forced create is the remedy |
+| only slots `>= 1`, nothing else | **creates.** The case the hatch is for: the owner is gone, ordinary consumers survived |
+| slot **0** | **refuses**, like an ordinary open. Byte 0 is usually the owner's, but `Session::release_ownership` can leave a live non-owner there. Stop that process; if it was the only holder an ordinary open then creates, otherwise you land on row 1 |
 | the ownership byte, by a process that is not serving | **refuses.** Something took ownership and never bound its socket; stop it, then re-open |
 
-**The error tells you which of the three you are in — as facts, not as a
-remedy, since `0055` step 6.** It prints the participant mask, the lowest held
-slot and its pid, and whether the ownership byte is held, and then ends with
-`(ArenaHeldButUnreachable)`. Match those against **the eight-row table below**,
-which is the remedy this section owns.
-
-`tf_tree participants` covers the first two rows of the table above — it walks
-the participant bytes, so a held slot 0 shows up there as `live` — but it does
-**not** show the ownership byte at all, which is why that is a bit
-(`ownership_held`) on the error rather than something to go and look up.
-
-**The message states facts and ends with its own name; the remedy is here, and
-that split is deliberate** ([`0055`](./decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md)
-part 4, step 6). The message is printed by a process that is *being refused an
-attachment* — it can see which lock bytes are held and cannot see who holds
-them, so it cannot tell one process holding two bytes from two holding one
-each, and a remedy that guesses is wrong in whichever state it did not guess.
-It guessed wrong three times in a day before the split. You can see the
-processes; it cannot. Read your row off the two facts it gives you:
+**The error gives facts, not a remedy** (`0055` step 6): the participant mask, the
+lowest held slot and its pid, and whether the ownership byte is held, ending
+`(ArenaHeldButUnreachable)`. A refused process sees which bytes are held and not
+who holds them, so it cannot tell one process holding two bytes from two holding
+one each. `tf_tree participants` shows participant bytes but **not** the ownership
+byte, hence the `ownership_held` bit. Read your row off the two facts:
 
 | participant bytes | ownership byte | what to do |
 |---|---|---|
-| lowest slot is 0, nothing else | free | stop the process on slot 0; an ordinary open then creates. Slot 0 is the creator's, so a forced create cannot pass it either — `CreatePolicy::Always` takes slot 0 or nothing |
-| lowest slot is 0, nothing else | held | **usually the same process holds both** — a creator takes the ownership byte and slot 0 on one file description — so stopping it releases both. Check with `tf_tree participants`; if the ownership byte stays held afterwards, a second process has it and goes too |
-| lowest slot is 0, others too | free | stop slot 0's holder first; the rest are ordinary participants and §3.4's hatch then applies to them |
+| lowest slot is 0, nothing else | free | stop the process on slot 0; an ordinary open then creates. `CreatePolicy::Always` takes slot 0 or nothing |
+| lowest slot is 0, nothing else | held | **usually one process holds both** (a creator takes both on one file description); stopping it releases both. If the ownership byte stays held, a second process has it and goes too |
+| lowest slot is 0, others too | free | stop slot 0's holder first; the rest are ordinary participants and §3.4's hatch then applies |
 | lowest slot is 0, others too | held | the ownership byte and slot 0 both have to be free, in either order, and one process may hold both; the hatch then applies to what is left |
-| lowest slot is 1 or above | free | the stranded-participant case §3.4's hatch is for: `CreatePolicy::Always` **abandons** this arena and creates a fresh one, leaving the survivors publishing where nobody can reach them. Reach for inheritance first |
-| lowest slot is 1 or above | held | **two things are held, so stopping one is not enough**: the ownership byte's holder took it and never bound a socket, and the participant bytes are still held too. A forced create cannot pass this either — it must take the ownership byte before the participant bytes it may skip. Stop the ownership holder, then you are on row 5 |
+| lowest slot is 1 or above | free | the stranded-participant case the hatch is for: `CreatePolicy::Always` **abandons** this arena, leaving the survivors publishing where nobody can reach them. Reach for inheritance first |
+| lowest slot is 1 or above | held | **two things are held, so stopping one is not enough**: the ownership holder never bound a socket, and participant bytes are held too. A forced create cannot pass this either. Stop the ownership holder, then you are on row 5 |
 | `nobody attached` … `held for the whole open timeout` | held | nobody is attached and ownership was held throughout by a process that never served; nothing was created. Stop that process |
-| `no byte was held at the open deadline` | — | the blocker let go while you were timing out. Retry; this is the one state that clears itself |
+| `no byte was held at the open deadline` | — | the blocker let go while you were timing out. Retry; the one state that clears itself |
 
-**Two states are not in this table, and cannot reach you.** The
-`first_slot: None` arm with a non-empty mask prints *"no participant byte held,
-yet ownership could not be taken before the deadline"* for both ownership
-readings, and the rendezvous derives `first_slot` from the mask, so it never
-constructs that pair. The unit gate sweeps it because the variant's fields are
-`pub` and the arm is reachable by construction — not because an operator can
-meet it.
-
-**A forced create needs two more things besides the policy**, and the message
-no longer says so because it says nothing procedural: a layout to build from,
-since [`0004`](./decisions/0004-builder-time-edge-declaration.md) sizes an
-arena from its declared edges, and a read-write mode. Through the `tf_tree`
-facade those are `Open::layout_if_creating` and `AttachMode::ReadWrite`;
-without them the forced create fails with `NoLayoutToCreate` or
-`ReadOnlyCannotCreate` rather than creating. That was the defect `0055` step 2
-fixed in the message, and it is the reason this paragraph exists here.
+**A forced create needs a layout and read-write mode**
+([`0004`](./decisions/0004-builder-time-edge-declaration.md)), else
+`NoLayoutToCreate` / `ReadOnlyCannotCreate`:
 
 ```rust
 // `tf_tree::Open` is behind `features = ["shm"]`, Linux only.
@@ -923,181 +519,88 @@ tf_tree::Open::new()
     .open()?
 ```
 
-Use it **only** when the holder is confirmed unrecoverable, because it does
-exactly what §3.4 exists to prevent, and know what it leaves behind:
+Use it **only** when the holder is confirmed unrecoverable:
 
-- **The old arena stays alive.** Survivors keep their mappings, keep reading, and
-  keep publishing into a segment nobody else can reach. Two arenas, two
-  `instance_uuid`s — the next section of this runbook, arrived at deliberately.
+- **The old arena stays alive.** Survivors keep publishing into a segment nobody
+  else can reach: two arenas, two `instance_uuid`s.
 - **It spends participant slots and never recovers one.** Survivors still hold
-  their bytes in the *same* lock file, and the new owner's slot assigner skips a
-  byte the kernel reports held, so those slot indices are unavailable to the
-  replacement arena until the survivors exit. That also makes it the wrong
-  instrument for a participant table that has filled up
-  (`ParticipantTableFull` / `NoParticipantSlots` above): abandoning an arena
-  discards every writer's data to reclaim a *rendezvous*, which is a different
-  problem from reclaiming the slot of a participant that died.
-- **The survivors' claim leases alias the new arena's.** A claim lease is a byte
-  at `CLAIM_BASE + edge_id` in that same lock file (§6.1), and the replacement
-  numbers its edges from zero again — so a writer that claims an id a survivor
-  still holds gets `LeaseContended` on an edge the new arena reports free, and
-  retrying cannot clear it while the survivor runs. Expect it on whichever edge
-  ids the old topology used first.
-- **It does *not* leave the creator's lock byte and arena record disagreeing, and
-  an earlier revision of this bullet said it did.** The correction is kept here
-  because the wrong version is the intuitive one. Those two indices are the same
-  integer everywhere in the engine, and #201 is about the paths that break it —
-  but this is not one of them, measured rather than reasoned: an owner plus two
-  read-write survivors holds bytes `[0, 1, 2]`, and `SIGKILL`ing the owner leaves
-  `[1, 2]`, so the forced creator asks for byte **0** and
-  its fresh arena registers it at record **0**. They agree — and since `0035` the
-  creator *takes* byte 0 rather than scanning for a free one, so it is refused
-  outright if that byte is held rather than handed a different number. The kernel frees
-  exactly the byte the new arena reuses, because the owner held record 0 and byte
-  0 for its whole life and the owner-side assigner skips slot 0 for every joiner —
-  so no survivor can be holding byte 0 when the owner dies.
-
-  What #201 needs is a **live holder of byte 0 that is not the arena owner**, and
-  there is one. `tf_tree_ipc::Session::release_ownership` gives up the ownership
-  byte while keeping participant byte 0 — exactly what §3.5 asks of it, "give up
-  the owner role while staying attached" — so it leaves a live non-owner on byte
-  0 from a documented call on a published crate. The state was
-  reproduced through published API on 2026-08-19 and is pinned by
-  `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`.
-
-  **So a forced create is refused against such a holder, and this is the error an
-  operator will actually see.** The create never reaches the divergence: since
-  `0035` a creator takes byte 0 with one `F_OFD_SETLK` and that acquire *is* the
-  check, so a live holder of byte 0 makes it contended, the opener yields and
-  backs off, and `open()` times out with
+  their bytes in the *same* lock file and the new assigner skips held bytes, so it
+  is the wrong instrument for a full participant table.
+- **The survivors' claim leases alias the new arena's.** A lease is a byte at
+  `CLAIM_BASE + edge_id` in that lock file (§6.1) and the replacement numbers its
+  edges from zero, so claiming an id a survivor holds gives `LeaseContended` on an
+  edge the new arena reports free, until the survivor exits.
+- **Against a live non-owner holder of byte 0 it is refused, and this is the error
+  an operator sees.** `Session::release_ownership` can leave one (§3.5); a creator
+  takes byte 0 with one `F_OFD_SETLK` that *is* the check, and `open()` times out
+  with
 
   ```text
   ArenaHeldButUnreachable { holder_slots: 0x1, first_slot: Some(0), first_pid: <the holder>, ownership_held: false }
   ```
 
-  — which reads *"arena alive but unreachable: participant bytes 0x1 held,
-  lowest slot 0 (pid N, the creator's), ownership byte free
-  (ArenaHeldButUnreachable)"*. That is row 1 of this section's remedy table
-  above: stop the process on slot 0 and an ordinary open then creates.
+  Row 1 of the remedy table: stop the process on slot 0. **Do not retry**: a second
+  forced create is refused identically. The refusal runs before the owner server
+  binds and spends no slot. The divergence #201 needs is pinned by
+  `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`;
+  `ParticipantSlotDiverged` is unreachable from the create path since `0035`
+  (`PHASE2.md` §0.0). On `0.0.3` and earlier the same call returns a `Tree`
+  ([`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) step 0c).
 
-
-  **An earlier revision of this paragraph told you to expect
-  `OpenError::ParticipantSlotDiverged` here, and grepping your logs for it will
-  find nothing** (#257). That was true between `0028` step 0c and `0035`: the
-  forced creator took byte **1** against arena record **0** and the facade
-  compared the two before publishing. `0035` moved the refusal one layer down, to
-  the acquire, and `ParticipantSlotDiverged` is now unreachable from the create
-  path — the guard stays where it was, as an assertion, and its one remaining
-  producer is hand-rolled `tf_tree_ipc::Open` + `TreeBuilder::build_shared`
-  construction. `0035`'s *Consequences* named a second, the takeover arm; #275
-  deleted that arm, so the hand-rolled route is now the only one
-  (`PHASE2.md` §0.0).
-
-  **Do not retry**: a second forced create against the same holder is refused
-  identically. Stop the process still holding byte 0 (`tf_tree participants`
-  names it from the lock file's identity records), or open with
-  `CreatePolicy::IfAbsent` and diagnose the wedge rather than create over it. The
-  refusal costs nothing and leaves nothing: it runs before the owner server
-  binds, so no peer ever saw the arena, and the participant and ownership bytes
-  are released with the session — the slot the bullet above says this policy
-  spends is not spent by an attempt that is refused.
-
-  **On a build without that check — `0.0.3` and earlier — the same call returns a
-  `Tree` instead**, and every predicate it answers about record 0 is really about
-  the holder's byte: `participant_alive(0)` reads `false` about a process that is
-  live, holds record 0, and has just pushed a sample. That is `0.0.3`'s *Known
-  issues* entry; [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md)
-  plan step 0c is the check that closed it.
-
-It joins rather than replaces when a server *is* reachable: `open()` probes the
-socket before it takes the ownership byte, so the policy abandons an unreachable
-arena, never one that is being served.
+`open()` probes the socket before taking the ownership byte, so the policy
+abandons an unreachable arena, never a served one.
 
 ### Two processes see different data
 
-Should be impossible; it means two `instance_uuid`s exist. `doctor` prints the
-uuid and the resolved runtime dir on both. Almost always a runtime-directory or
-domain mismatch — different container mounts, or different `ROS_DOMAIN_ID`.
+Two `instance_uuid`s exist; `doctor` prints the uuid and runtime dir on both.
+Almost always a runtime-directory or domain mismatch (container mounts,
+`ROS_DOMAIN_ID`).
 
 ### `open()` created an arena when one was expected
 
-**On a build carrying
-[`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) this
-should no longer be reachable, and that is the first thing to check.** `Open`'s
-defaults are now the *consumer* — `AttachMode::ReadOnly` plus
-`CreatePolicy::Never` — and the two are no longer independently settable into an
-incoherent pair: a read-only attach combined with any creating policy is refused
-with `OpenError::ReadOnlyCannotCreate`, before the runtime directory is even
-resolved. `tf_tree::open()` creates nothing.
-
-So a process that created an arena asked for it explicitly, with both
-`AttachMode::ReadWrite` and a `CreatePolicy` other than `Never`, and supplied
-the `TreeBuilder` that sized it. Find that call. Either it is a consumer that
-was written against the pre-`0019` defaults and still names them, in which case
-delete both and let it wait for the publisher with `Open::await_open`, or it is
-a second copy of a legitimate publisher, in which case it wants
-`Open::require_create(true)` — which turns "an arena is already live" into
-`OpenError::ArenaAlreadyLive` instead of a silent join.
-
-If the process genuinely predates `0019`, its `open()` did default to
-`CreatePolicy::IfAbsent` and would create on an empty machine; rebuild it.
+Since [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) `Open`
+defaults to the consumer (`ReadOnly` + `CreatePolicy::Never`), read-only with a
+creating policy is `OpenError::ReadOnlyCannotCreate`, and `tf_tree::open()` creates
+nothing. So the process asked for it (`ReadWrite`, a non-`Never` policy, a
+`TreeBuilder`): a consumer should use `Open::await_open`, a second publisher
+`Open::require_create(true)` (`OpenError::ArenaAlreadyLive`). Pre-`0019` builds
+defaulted to `IfAbsent`; rebuild.
 
 ### Rendezvous misbehaving on a shared filesystem
 
-The runtime directory is on NFS or CIFS. File locks there have subtly different
-semantics and the whole rendezvous depends on them being exact, so `open()`
-rejects those filesystems. Point `TF_TREE_RUNTIME_DIR` at local storage.
+NFS and CIFS lock semantics are unusable, so `open()` rejects them. Point
+`TF_TREE_RUNTIME_DIR` at local storage.
 
 ### `FrameNotDeclared`
 
-A read-only participant asked for a frame nobody has declared yet. This is a
-startup-ordering problem, not a typo — and there are two distinct causes, which
-want opposite responses.
+A read-only participant asked for a frame nobody has declared yet: a
+startup-ordering problem, with two causes that want opposite responses.
 
-**First, check the consumer is not the process that created the arena.** A
-consumer that passes `CreatePolicy::IfAbsent` **and** a layout, and starts before
-any publisher, creates the arena itself — with *its* topology, permanently, since
-capacity and edges are fixed at creation. It then looks healthy and finds
-nothing, forever. `tf_tree participants` showing a single read-only participant
-on an arena with no edges is the signature.
-[`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md) §2 makes
-it unrepresentable: a read-only attach *implies* `CreatePolicy::Never`, and the
-builder's own default is now `Never`. On a build that predates that, pass it
-explicitly. (An earlier revision of this row said the *default* silently created
-an empty arena. It did not — without a layout that combination fails
-`NoLayoutToCreate`. The hazard needed a caller that also passed
-`layout_if_creating`.)
+**First, check the consumer did not create the arena.** A consumer passing
+`CreatePolicy::IfAbsent` **and** a layout, starting before any publisher, creates
+the arena with *its* topology, permanently, and then finds nothing forever.
+`tf_tree participants` showing a single read-only participant on an arena with no
+edges is the signature. [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)
+§2 makes it unrepresentable (read-only implies `CreatePolicy::Never`); on an older
+build pass it explicitly.
 
-**Otherwise the publisher genuinely has not started yet, and the answer is to
-wait rather than to fail.** `Tree::await_frames(["map", "base_link"], deadline)`
-blocks until the frames exist or the deadline passes, and returns their ids.
-Reach for it in a consumer's startup path instead of planning immediately.
+**Otherwise the publisher has not started, and the answer is to wait.**
+`Tree::await_frames(["map", "base_link"], deadline)` blocks until the frames exist
+and returns their ids; use it in a consumer's startup path.
 
-**If frames arrive during operation rather than at startup** — per-detection
-frames, a sensor that appears late — that is `frame_headroom` / `edge_headroom`,
-sized at build time. Exhaustion is a typed error naming the knob.
-
-A supervised deployment that wants none of this ambiguity pre-declares the whole
-static structure up front, in the topology config
-(`crates/tf_tree_bridge/src/config.rs`'s schema) that
-`ros/tf_tree_ros` starts a bridge from, `tf_tree topology --discover` writes, and
-Python's `build`/`open` accept
-([`0041`](./decisions/0041-python-declares-a-topology-the-way-everything-else-does.md)).
-Whichever process creates the arena passes it as `layout_if_creating`, and every
-consumer can then plan before any publisher runs.
-
-**This paragraph used to say `tf_tree serve --config`, and there is no such
-subcommand.** [`0019`](./decisions/0019-one-binary-and-topology-you-can-wait-for.md)
-proposes `tf_tree serve` — a subcommand that owns a topology and stays running —
-in place of §9's `tf_treed`, and `docs/PHASE2.md` §0.0 records it as **not
-implemented**. Naming it here as the remedy sent an operator to a command that
-does not exist; the remedy is the config, which does, and which `serve` would
-merely be a place to put.
+**Frames arriving during operation** (per-detection frames, a late sensor) are
+`frame_headroom` / `edge_headroom`, sized at build time; exhaustion is a typed
+error naming the knob. To remove the ambiguity, pre-declare the static structure
+in the topology config (`crates/tf_tree_bridge/src/config.rs`'s schema, which
+`ros/tf_tree_ros` and Python's `build`/`open` accept
+([`0041`](./decisions/0041-python-declares-a-topology-the-way-everything-else-does.md))
+and `tf_tree topology --discover` writes) and pass it as `layout_if_creating`.
+`tf_tree serve` does not exist (`PHASE2.md` §0.0).
 
 ### `TopologyChurn`
 
-The topology mutated `TOPO_BLOCKS` times during a single plan compilation.
-Almost certainly a bug — topology should be near-static after startup.
+The topology mutated `TOPO_BLOCKS` times during one plan compilation. Almost
+certainly a bug: topology should be near-static after startup.
 
 ---
 
@@ -1105,54 +608,40 @@ Almost certainly a bug — topology should be near-static after startup.
 
 | Check | What it means | Response |
 |---|---|---|
-| `cycle` | A parent chain that never reaches a root | A publisher re-parented a frame under its own descendant. The mutation should have been rejected; if `doctor` sees one, file a bug |
+| `cycle` | A parent chain that never reaches a root | A publisher re-parented a frame under its own descendant. The mutation should have been rejected; file a bug |
 | `unclaimed-dynamic` | A dynamic edge with no live writer | The publisher never started, or exited without releasing. Expected briefly at startup; sustained means a dead node |
-| `multi-writer` | More than one PID published to one edge | Configuration error — two nodes own the same edge. Both PIDs are named |
-| `short-buffer` | Ring shorter than the observed publish latency | Raise that edge's capacity. This is the warning that precedes `Extrapolation`/`SlotRecycled` outages |
-| `inconsistent-rate` (`TFT008`) | A frame published at a wildly varying rate — the spread of its inter-arrival intervals about their own centre, **not** a comparison against a declared rate; that is `TFT007` | Often benign (a genuinely event-driven publisher), sometimes a struggling node. Compare against the rate you expect. It reports **not run** in two states rather than passing: no edge has retained enough intervals to measure a spread, or every edge that had has stopped publishing — in the second, read `TFT009`, which names the silence |
-| `TFT009` | A gap between two retained stamps far above that edge's own median, and the gap that **has not ended** — no sample since, on a live arena | A publisher dropped samples, or stopped. It reports **not run** rather than passing whenever it judged no edge at all, and the reason names which of three things every edge fell into: too few retained intervals (wait for the ring to fill, or size it above four intervals — an edge sized `rate_hz * secs <= 4` never gets there), a stamp that goes backwards (read `TFT018`; a gap measured across an inversion is a dropout that never happened), or every retained stamp at one instant |
-| `TFT013` | An edge declared dynamic that nothing has ever published to | The publisher never started. It reports **not run** in three states rather than passing: inside a grace period measured against how long the arena's longest-running publisher has been going, so a `doctor` at bringup does not accuse every edge; on an arena where nothing has published at all, because that is bringup and a total outage at once; and on an arena whose publishers **exist** but from which no edge yields the two samples a median period needs. That last reason **names which arena it printed on**, because the remedy is not the same for all of them: a ring too small to hold two (`rate_hz * secs <= 2` rounds to a ring retaining one sample for the life of the arena) is a sizing fix; a large ring holding one — `doctor --attach` at bringup, or a recording carrying one dated record for the edge — needs only more data; and a full ring with no positive cadence is `TFT009`'s and `TFT018`'s subject, not this one's. `TFT017` is the id for an edge whose writer is gone |
-| `unreachable` | Frames not reachable from the main root | A subtree is detached — usually a missing static declaration or a publisher that has not started |
+| `multi-writer` | More than one PID published to one edge | Configuration error: two nodes own the same edge. Both PIDs are named |
+| `short-buffer` | Ring shorter than the observed publish latency | Raise that edge's capacity. This warning precedes `Extrapolation`/`SlotRecycled` outages |
+| `inconsistent-rate` (`TFT008`) | A frame published at a wildly varying rate — the spread of its inter-arrival intervals about their own centre, **not** a comparison against a declared rate (that is `TFT007`) | Often benign (an event-driven publisher), sometimes a struggling node. Reports **not run** when no edge has enough intervals, or every edge that had has stopped publishing — then read `TFT009` |
+| `TFT009` | A gap between two retained stamps far above that edge's own median, and the gap that **has not ended** — no sample since, on a live arena | A publisher dropped samples, or stopped. **Not run** when it judged no edge: too few retained intervals (an edge sized `rate_hz * secs <= 4` never gets there), a stamp that goes backwards (read `TFT018`), or every stamp at one instant |
+| `TFT013` | An edge declared dynamic that nothing has ever published to | The publisher never started. **Not run** inside a grace period measured against the longest-running publisher, so bringup is not accused; where nothing has published at all; and where publishers exist but no edge yields the two samples a median needs — the report names which: a ring too small for two (`rate_hz * secs <= 2`) is a sizing fix, a large ring holding one needs more data, and a full ring with no positive cadence is `TFT009`'s and `TFT018`'s subject. `TFT017` is the id for an edge whose writer is gone |
+| `unreachable` | Frames not reachable from the main root | A subtree is detached: a missing static declaration or a publisher that has not started |
 | `out-of-order` (`TFT018`) | Stamps arriving non-monotonically | A publisher restarted without resetting its clock, or two sources feed one edge |
-| `TFT014` — *slot N pid P, byte free* | A participant record nothing will reassign: the kernel has released its lock byte while the arena record still says `LIVE` (or `RESERVED`). **Usually the process is gone; check before you act on it.** A publisher that never took a byte reads identically while it is running — see *ParticipantTableFull* above, and [`0031`](./decisions/0031-the-participant-record-with-no-byte.md). The finding's own text says which pid to check | **Three things reclaim it, and none of them is `doctor`.** The owner's slot assigner collects it when a grant walks past that index; the owner's socket-hangup callback collects it when a participant's connection closes; and **any read-write participant can sweep the whole table with `Tree::reap_participants()`**, which is the only one that reaches the *owner's own* slot. So the usual response to this finding is to attach a read-write consumer and sweep — not to stop the fleet. Count how many the finding says are spent (`N of 64`); at 64 every further attach fails `NoParticipantSlots` until something collects. **Two cases still have no repair**: a slot whose byte is *held* by a fork inheritor (that is the separate fork finding, and the kernel's answer is *held* — see [`0030`](./decisions/0030-the-atfork-handler-and-inherited-descriptors.md)), and an arena whose owner has died **with no read-write survivor that calls `Tree::inherit_ownership`** — §3.5's inheritance shipped on 2026-08-28, but it is caller-driven and a read-only survivor is refused with `Inheritance::ReadOnly`, so an all-consumer fleet still cannot be joined (see *The arena's owner died*). For those, stopping every attached process so the segment is freed is still the recovery — and `SIGTERM` is not one, because nothing installs a handler and the default disposition skips every destructor. `tf_tree participants` shows the same slots as `stale`. See [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) |
-| `TFT014` — *slot N pid P, byte still HELD* | The **fork** case: a forked child inherited the parent's open file descriptions, so the lock byte is still held on behalf of a process that no longer exists. Reported for a read-only parent too, where there is no arena record at all — the finding then reads *the record is FREE (no arena record: a read-only participant, D18)*. **It is not reported for a participant in another PID namespace** ([`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md)): that used to render the identical sentence about a healthy process, so if a build predating `0033` shows you this for a containerised worker, check the namespace before acting on it | Different fault, different fix — **do not go looking for a reaper**, and nothing may run one: the kernel's own answer for this slot is *held*, and overruling it with a `/proc` guess is what would evict a running participant. Stop the child, and start workers with a start method that inherits no descriptors — `multiprocessing`'s `spawn` (Python defaults to `fork` on Linux), or fork+exec. The byte comes back on its own when the last inheritor exits. Same root cause as *The tree works in the parent and everything fails in a forked child*, above |
-| `TFT014` — *slot N, no pid recorded, byte free* | The same shape with **no process named at all**: the lock file yielded no identity record for the slot — none written, or none readable — and the arena record's pid field is still zero, which is what `fill_slot` leaves when a registrant dies between claiming the slot and publishing into it | There is nothing here to check and the finding says so: it prints no pid and no *check the pid* instruction. Reclaimed exactly as the `byte free` row above — a read-write peer's `Tree::reap_participants()`. If you are seeing these repeatedly, something is being killed inside registration |
-| `TFT014` — *slot N pid P, byte not probed* | The same record-left-behind shape, seen by a run with **no kernel answer about the byte**. Usually that is a run which opened no lock file — `--from-bag`, or the built-in fixture — and the verdict is an inference about the process alone. **An `--attach` run reaches it too**, for any slot whose `F_OFD_GETLK` returned an error: a failed probe is deliberately not reported as *free*, because that would be an accusation | Read it as a weaker claim than the `byte free` row, not a different fault. If you ran `--from-bag` or the fixture, run `doctor --attach` against the live domain — that is the only source that opens the rendezvous. **If you were already attached**, the probe failed rather than answered: check fd limits and the runtime directory's mount, and re-run before concluding anything about the slot |
-| `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena. Point it at a recording (`tf_tree doctor --from-bag run.mcap`): both reach a verdict there |
+| `TFT014` — *slot N pid P, byte free* | A participant record nothing will reassign: the kernel released its lock byte while the arena record still says `LIVE` (or `RESERVED`). **Usually the process is gone; check before you act.** A publisher that never took a byte reads identically while running ([`0031`](./decisions/0031-the-participant-record-with-no-byte.md)) | **Three things reclaim it, none of them `doctor`**: the owner's assigner when a grant walks past that index; the owner's socket-hangup callback; and **any read-write participant's `Tree::reap_participants()`**, the only one that reaches the *owner's own* slot. So attach a read-write consumer and sweep, not stop the fleet. Count the spent slots (`N of 64`); at 64 every attach fails `NoParticipantSlots`. **Two cases have no repair**: a slot *held* by a fork inheritor (the separate fork finding; [`0030`](./decisions/0030-the-atfork-handler-and-inherited-descriptors.md)), and an owner that died **with no read-write survivor calling `Tree::inherit_ownership`** (*The arena's owner died*). For those, stop every attached process; `SIGTERM` is not one, because nothing installs a handler. `tf_tree participants` shows the slots as `stale`. See [`0028`](./decisions/0028-the-slot-a-killed-participant-keeps.md) |
+| `TFT014` — *slot N pid P, byte still HELD* | The **fork** case: a forked child inherited the open file descriptions, so the byte is held on behalf of a process that no longer exists. Reported for a read-only parent too, where there is no arena record (*the record is FREE (no arena record: a read-only participant, D18)*). **Not reported for a participant in another PID namespace** ([`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md)); on a build predating it, check the namespace before acting | **Do not look for a reaper**, and nothing may run one: the kernel's answer is *held*, and overruling it with a `/proc` guess would evict a running participant. Stop the child and start workers with a method that inherits no descriptors: `multiprocessing`'s `spawn`, or fork+exec. The byte returns when the last inheritor exits. Same root cause as *The tree works in the parent and everything fails in a forked child* |
+| `TFT014` — *slot N, no pid recorded, byte free* | The same shape with **no process named**: no identity record was written or readable and the arena record's pid is zero, which is what `fill_slot` leaves when a registrant dies between claiming the slot and publishing into it | Nothing to check; the finding prints no pid. Reclaimed as the `byte free` row: a read-write peer's `Tree::reap_participants()`. If repeated, something is being killed inside registration |
+| `TFT014` — *slot N pid P, byte not probed* | The same shape, seen by a run with **no kernel answer about the byte**: usually one that opened no lock file (`--from-bag`, the fixture); **an `--attach` run reaches it too** for any slot whose `F_OFD_GETLK` errored, since a failed probe is not reported as *free* | A weaker claim than `byte free`. After `--from-bag` or the fixture, run `doctor --attach`, the only source that opens the rendezvous. **If already attached**, the probe failed: check fd limits and the runtime directory's mount and re-run |
+| `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault: the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena. Use `tf_tree doctor --from-bag run.mcap` |
 
 ---
 
 ## Performance triage
 
-If lookups are slower than expected:
-
-1. **Check the depth, not the frame count.** Cost is ~5 ns fixed plus ~70 ns per
-   *dynamic* step; static edges constant-fold away at plan compilation. A
-   "depth 6" chain that is five static edges and one dynamic one is cheap.
-2. **Reuse the `Plan`.** Compiling one costs about as much as evaluating it
-   twice. `tree.lookup(...)` caches per-thread; the expert path compiles once.
-3. **Check the interpolation policy.** `ScLerp` (the default, and the correct
-   one) costs ~44 ns per evaluation against `LerpSlerp`'s ~16. If a plan is
-   latency-critical and tf2 compatibility is what you need,
-   `EdgeCfg::interp(InterpPolicy::LerpSlerp)` is the cheaper choice.
-4. **Pin before you measure.** Unpinned benchmark runs migrate cores and swing
-   by more than 30% — enough to invent a regression in code that did not change.
-   See [`benchmarks/tf2.md`](./benchmarks/tf2.md).
+Cost is ~5 ns fixed plus ~70 ns per *dynamic* step (static edges constant-fold), so
+count dynamic edges, not frames. Reuse the `Plan`: compiling costs about two
+evaluations. `ScLerp` (default) costs ~44 ns per evaluation, `LerpSlerp` ~16. Pin
+before measuring; unpinned runs swing by more than 30%
+([`benchmarks/tf2.md`](./benchmarks/tf2.md)).
 
 ---
 
 ## How big is my arena, and how much of it did I over-declare?
 
-`Capacity` is denominated in **slots**; tf2 evicts by **time**. Those are not the
-same knob, and the translation is where over-declaration happens:
-`Capacity::history(1000.0, 10.0)` asks for ten seconds of a 1 kHz stream — 10 000
-slots — and reserves **16 384**, because `mask == capacity - 1` is the ring's hot
-index and a mask is only a mask at a power of two. Run the same declaration
-against a 10 Hz publisher and that ring retains **27 minutes** of history.
-
-The rounding is not removable. What it is, is *visible*: both `tf_tree doctor`
-and `tf_tree top` print the declaration in bytes, whole-tree in the header and
-per-edge in `top --edge <id>`:
+`Capacity` is denominated in **slots**; tf2 evicts by **time**.
+`Capacity::history(1000.0, 10.0)` asks for 10 000 slots and reserves **16 384**
+(`mask == capacity - 1` is the ring's hot index); against a 10 Hz publisher that
+ring retains **27 minutes**. `tf_tree doctor` and `tf_tree top` print the
+declaration in bytes (`top --edge <id>` per edge):
 
 ```text
 rings: 19072 slots declared = 1.31 MiB over 4 edge(s); 12600 used = 885.9 KiB (66%);
@@ -1160,11 +649,8 @@ rings: 19072 slots declared = 1.31 MiB over 4 edge(s); 12600 used = 885.9 KiB (6
 arena = 16704 B fixed + 320 B/edge + 144-176 B/frame + 72 B/slot
 ```
 
-"At most" is the honest word. The pre-rounding request is **not stored** — the
-edge record carries the capacity after `next_pow2` — so a ring of capacity `C`
-was declared with some count in `[C/2 + 1, C]` and this figure is the upper bound
-of that bracket, not a measurement. A publisher that asked for exactly 16 384
-wasted nothing and looks identical here.
+"At most" because the pre-rounding request is **not stored**: a ring of capacity
+`C` was declared with a count in `[C/2 + 1, C]`.
 
 ### The sizing formula
 
@@ -1176,52 +662,12 @@ arena = 16 704 B fixed          header + participant table + participant counter
 ```
 
 The per-frame term is a range because the intern table is `next_pow2(2 x frames)`
-slots of 16 B — exactly 32 B/frame at a power-of-two frame count, up to 64 B/frame
-just above one. On a *small* tree add up to 384 B of fixed `align64` region
-padding, which is why a 1-frame arena measures 384 B/frame against a stated 144.
-On the benchmark fixture the formula reproduces the arena size the tools report,
-by an independent path — `tree.arena_size_bytes()` comes from the built arena,
-not from this arithmetic:
+slots of 16 B. Constants are checked against `crates/tf_tree_arena/src/layout.rs`
+by `crates/tf_tree_cli/src/sizing.rs`'s tests.
 
-```text
-16 704 fixed + 320 x 24 edge slots + 3 904 for 25 frames + 72 x 19 072 sample slots
-  = 1 401 472 B = 1368 KiB     (`tf_tree top` prints "arena 1368 KiB")
-```
+### What over-declaring costs
 
-The frame term is 3 904 rather than 144 x 25 = 3 600 for two reasons, both of
-which are why the per-frame figure is a range: 25 is not a power of two, so the
-intern table takes 64 slots for 50 names (1 024 B, not 800), and each of the four
-topology blocks rounds 300 B up to 320. That is 156 B/frame, inside the stated
-144-176.
-
-Every constant is checked against `crates/tf_tree_arena/src/layout.rs` by
-differencing two real `ArenaLayout`s rather than transcribed from it — see
-`crates/tf_tree_cli/src/sizing.rs`'s tests. They change when
-`docs/PHASE5.md` §1 changes a region, and the test is what notices.
-
-### What over-declaring actually costs
-
-Since [`0021`](./decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md) the heap
-arena reaches `calloc`, so slots you declared and never wrote are demand-faulted
-pages that never become resident: **over-declaration costs no resident memory**.
-It still costs *reservation* — address space, the `.tft` file on disk, the bytes
-a segment transfer copies, and the headroom a machine under strict overcommit
-must have. Treat the numbers above as capacity planning, not as a memory leak,
-and note that neither tool warns on them: there is no threshold here it would be
-honest to fire on, so this is a display and not a `TFT0xx` check.
-
----
-
-## What this system deliberately does not do
-
-Worth knowing before you go looking for it:
-
-- **It does not average multiple publishers on one edge.** It reports the
-  conflict. `tf2` averages them into garbage; surfacing it is the feature.
-- **It does not extrapolate by default.** A control loop must not act on
-  invented data.
-- **It does not grow capacity at runtime.** Growth means remapping, which would
-  invalidate every reader's mapping.
-- **It is not a sandbox.** A read-write participant can corrupt the arena, and no
-  checksum changes that. The read-only attach is the real boundary, which is why
-  it is the default for consumers.
+Since [`0021`](./decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md)
+unwritten slots are demand-faulted and never resident, but they cost *reservation*
+(address space, the `.tft` file, segment transfers, strict-overcommit headroom).
+This is capacity planning, not a leak, and no `TFT0xx` check fires on it.

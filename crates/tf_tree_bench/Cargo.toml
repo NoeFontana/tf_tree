@@ -8,11 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-# Harness, not a library: fixtures, the tf2 differential, and the `docs/PHASE5.md`
-# §9 report. §9.3 requires the harness to live in this repository ("no private
-# benchmark"), which it does — but nobody `cargo add`s a benchmark harness, and
-# publishing one would drag `libc` and the ROS-adjacent optional dependency onto
-# crates.io for no consumer.
+# Harness, not a library (`docs/PHASE5.md` §9.3): nobody `cargo add`s it.
 publish = false
 
 [lints]
@@ -20,158 +16,69 @@ workspace = true
 
 [features]
 default = ["counters", "ingest-compression", "ingest-fixture"]
-# Passthrough, so `counter_cost` can measure both sides of §5.5's switch from
-# one crate. Without it, `cfg!(feature = "counters")` here reads *this* crate's
-# features and reports OFF while the engine is counting.
+# Passthrough, so `counter_cost` can measure both sides of §5.5's switch from one crate.
 counters = ["tf_tree/counters"]
-# **The zstd decoder `docs/PHASE5.md` §12 gate 5's corpus needs, as a
-# passthrough and not as a direct `features = ["compression"]` on the dependency
-# below.** rosbag2 and Foxglove write zstd chunks by default, so a gate whose
-# corpus was uncompressed would measure the faster path and publish the
-# flattering number.
-#
-# It is a *feature* rather than an edge because
-# `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader` asserts
-# that `cfg!(feature = "compression")` in the CLI equals
-# `tf_tree_ingest::compression_compiled_in()`, and `tf_tree_cli` names this
-# crate as a normal dependency. Turning the codec on unconditionally here would
-# switch the reader under `cargo nextest run -p tf_tree_cli
-# --no-default-features` and fail that test — which is exactly the "some
-# dependency is re-enabling it through its own defaults" case it names, and
-# which `tf_tree_bench` has already done once, to `counters`. The workspace
-# declares this crate `default-features = false`, so a **default-on** feature
-# here reaches `--workspace` and `-p tf_tree_bench` builds and reaches the CLI's
-# dependency edge not at all.
+# The zstd decoder `docs/PHASE5.md` §12 gate 5's corpus needs (rosbag2 and Foxglove write zstd
+# chunks by default). A default-on feature, not a dependency feature, so `tf_tree_cli`'s edge
+# (declared `default-features = false`) does not switch the reader:
+# `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader`.
 ingest-compression = ["tf_tree_ingest/compression"]
-# **The corpus writer `docs/PHASE5.md` §12 gate 5 generates its recording with,
-# as a passthrough for the same reason `ingest-compression` is one.**
-# `tf_tree_ingest`'s `fixture` feature is off by default there because it
-# fabricates recordings and is not a product surface. Writing
-# `features = ["fixture"]` on the dependency below turns it on for every build
-# that reaches this crate — and `tf_tree_cli` names this crate as a **normal**
-# dependency, so the fabricator lands in the shipped `tf_tree` binary's graph.
-# A default-on feature here does not: the workspace declares this crate
-# `default-features = false`, so `--workspace` and `-p tf_tree_bench` builds get
-# it and the CLI's dependency edge does not. `just ingest-check` asserts both
-# directions against `cargo tree`.
+# The corpus writer for gate 5, a passthrough for the same reason: `tf_tree_ingest`'s `fixture`
+# must not reach the shipped `tf_tree` binary's graph. `just ingest-check` asserts both directions.
 ingest-fixture = ["tf_tree_ingest/fixture"]
-# The `tf2::BufferCore` differential path. Requires a ROS 2 install and the C++
-# FFI shim described in `src/tf2.rs`; deliberately *not* built on the host used
-# for this PR (there is no ROS 2 here). Enabling it without the shim is expected
-# to fail to link — that is the honest signal the ROS toolchain is absent.
+# The `tf2::BufferCore` differential path. Needs ROS 2 and the FFI shim in `src/tf2.rs`; without
+# them it fails to link.
 tf2 = ["dep:tf_tree_tf2_sys"]
-# Phase 2 shared memory: the multi-process integration test and benchmark.
-# Linux-only; needs `tf_tree`'s `shm` feature for `build_shared`/`attach_shared`.
+# Shared memory: needs `tf_tree`'s `shm` feature for `build_shared`/`attach_shared`.
 shm = ["tf_tree/shm"]
-# **`docs/PHASE2.md` §11.4's "a random crash point armed in 10% of children".**
-# The children of `shm_torture` are this same binary, so arming a site means
-# *this* build carries them — hence a passthrough rather than a runtime switch.
-# Default-off, like every other fault-injection knob: a soak that aborts a tenth
-# of its children on purpose is not the soak an operator runs to measure an
-# arena, and §11.3's own module doc says the sites must cost nothing when off.
+# `docs/PHASE2.md` §11.4's random crash point armed in 10% of children. The children are this
+# binary, so it must carry the sites; default-off like every fault-injection knob.
 crash-points = ["tf_tree/crash-points", "tf_tree_core/crash-points"]
-# **`docs/decisions/0015`'s *Invariants to maintain* — the C ABI half of the fork
-# test.** `fork_child`'s fourth mode drives `tft_bridge_offer`,
-# `tft_bridge_get_stats` and `tft_bridge_free` on a handle inherited across
-# `fork()`, which needs the seam itself and therefore this crate edge.
-#
-# **It costs `tf_tree_core`'s dependency budget nothing**, and that is a statement
-# about direction rather than a hope: the arrow points *from* the benchmark crate
-# *to* the C ABI, `tf_tree_bench` is `publish = false`, and nothing in
-# `crates/tf_tree_core` — or in `tf_tree`, or in `tf_tree_c` — gains a dependency
-# because a harness took one. `libc` is already here for the `fork()` itself.
-#
-# Implies `shm`: the property under test is a `MADV_DONTFORK` mapping the child
-# has no page of, and a private heap arena has no hole to fall into. Enabling
-# `bridge` without it would compile a mode that silently tests nothing.
+# `docs/decisions/0015`'s *Invariants to maintain*: `fork_child`'s fourth mode drives
+# `tft_bridge_offer`, `tft_bridge_get_stats` and `tft_bridge_free` across `fork()`. The edge points
+# from this `publish = false` crate to the C ABI, so no shipped crate gains a dependency.
+# Implies `shm`: the property under test is a `MADV_DONTFORK` mapping.
 bridge = ["shm", "dep:tf_tree_c"]
-# `docs/PHASE5.md` §9.2's embedding row needs an **in-crate** column, and the
-# crate in question is `tf_tree_core`. Default-off for the same reason
-# `tf_tree_core/bench-probe` is: nothing that ships enables it. `just
-# embed-cost-check` is what compiles, lints and tests this configuration —
-# `cargo nextest run --workspace` builds default features and therefore does
-# not, exactly like `shm`.
+# `docs/PHASE5.md` §9.2's in-crate column. Default-off; `just embed-cost-check` compiles and tests it.
 embed-probe = ["tf_tree_core/bench-probe"]
-# **The C ABI boundary probe.** `abi_attached` needs `tft_test_plan_at_unguarded`
-# to price `catch_unwind` by subtraction on a real, non-inlinable call, and that
-# lives behind `tf_tree_c/test-hooks`. Its own feature rather than widening
-# `bridge`, because `bridge` is a *shipped* configuration (`docs/decisions/0015`)
-# and must not drag test hooks into anything that builds it.
+# The C ABI boundary probe: `abi_attached` needs `tft_test_plan_at_unguarded`. Its own feature so
+# `bridge`, a shipped configuration (`docs/decisions/0015`), never carries test hooks.
 abi-probe = ["bridge", "tf_tree_c/test-hooks"]
 
 [dependencies]
-# `features = ["unstable"]` — `docs/API.md` §2.6. The harnesses measure the
-# arena itself (`footprint`, `soak`, `shm_torture`, `contended_scaling`) and
-# reach it through `Tree::arena_view`. A benchmark crate is exactly the consumer
-# the unstable tier is for: `publish = false`, rebuilt with the engine.
+# `unstable` (`docs/API.md` §2.6): the harnesses reach the arena through `Tree::arena_view`.
 tf_tree = { workspace = true, features = ["unstable"] }
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true
 anyhow.workspace = true
-# `fork()` and `waitpid()` for `src/bin/fork_child.rs`; there is no other way to
-# produce a child that inherits an address space and its open file descriptions.
+# `fork()` and `waitpid()` for `src/bin/fork_child.rs`.
 libc.workspace = true
-# `fork_child` probes the claim lease from an *independent* open file
-# description, which is the only vantage point an OFD lock is visible from.
+# `fork_child` probes the claim lease from an independent open file description.
 tf_tree_ipc.workspace = true
-# Optional, and outside the workspace on purpose (see the root manifest): this
-# is the only edge that reaches ROS 2, and it is pulled in solely by `--features tf2`.
+# Optional, outside the workspace on purpose (see the root manifest); pulled in only by `--features tf2`.
 tf_tree_tf2_sys = { path = "../tf_tree_tf2_sys", optional = true }
-# Optional, behind `bridge`, for `src/bin/fork_child.rs`'s fourth mode — the C
-# ABI half of `docs/decisions/0015`'s *Invariants to maintain*.
-#
-# **`features = ["bridge", "shm"]` on the dependency, not on the parent.** The
-# entry points under test are `tf_tree_c/bridge`'s and the arena they hold must
-# be a shared one, so both are properties this edge needs and neither is
-# something the workspace should acquire on its behalf: an optional dependency
-# that is not activated contributes no features at all, so a plain
-# `cargo build --workspace` and `cargo nextest run --workspace` still compile
-# `tf_tree_c` with its own defaults (both off) and compile this binary's fourth
-# mode out entirely — the same situation `shm` is already in, and `just test`'s
-# comment in the justfile says the same thing about the same build.
-#
-# A path dependency rather than a `workspace = true` one because `tf_tree_c` is
-# not in `[workspace.dependencies]`; it is nobody's published dependency, for the
-# reason its own manifest gives.
+# Optional, behind `bridge`, for `fork_child`'s fourth mode. The features are on the dependency
+# because an unactivated optional dependency contributes none, so `--workspace` builds `tf_tree_c`
+# with its own defaults. A path dependency: `tf_tree_c` is not in `[workspace.dependencies]`.
 tf_tree_c = { path = "../tf_tree_c", optional = true, features = ["bridge", "shm"] }
 
-# **Reading** the committed baseline (`src/baseline.rs`), and nothing else —
-# `results.json` is still *written* by hand, for the schema-stability reason
-# `src/report.rs` gives. A hand-rolled parser for somebody else's committed file
-# would fail open, which is the one failure mode a regression gate cannot have.
-#
-# It costs the workspace nothing: `criterion`, already a dev-dependency here,
-# pulls the identical `serde_json` version into the lockfile, and this crate is
-# `publish = false`. It is a normal dependency rather than a dev one because
-# `[[bin]]` targets do not see dev-dependencies and the gate lives in
-# `bench_report`.
+# Reads the committed baseline (`src/baseline.rs`) only. A normal dependency because `[[bin]]`
+# targets do not see dev-dependencies and the gate lives in `bench_report`.
 serde_json.workspace = true
 
-# `report::worse_entries` states the arena memory floor as arithmetic on the
-# layout rather than a measurement, so the layout math has to be reachable from
-# the library, not only from the relocation gate's dev-dependency.
+# `report::worse_entries` states the memory floor as arithmetic on the layout.
 tf_tree_arena.workspace = true
 
-# **`docs/PHASE5.md` §12 gate 5's ingest throughput — a new edge for this crate,
-# and `docs/decisions/0050` records it.** `src/bin/ingest_throughput.rs` needs
-# both halves: `tf_tree_ingest::run` is the thing being timed, and
-# `tf_tree_ingest::fixture` is what writes the corpus it is timed on.
-#
-# **No `features = [...]` here**: `fixture` arrives through the `ingest-fixture`
-# passthrough above, for the reason that feature's own comment gives. A
-# dependency-level feature travels the `tf_tree_cli -> tf_tree_bench` normal
-# edge and lands in the shipped binary's graph.
-#
-# A normal dependency rather than a dev one: `[[bin]]` targets do not see
-# dev-dependencies, and the gate lives in a binary.
+# `docs/PHASE5.md` §12 gate 5 (`docs/decisions/0050`): `tf_tree_ingest::run` is timed on the corpus
+# `tf_tree_ingest::fixture` writes. No `features` here: `fixture` arrives through `ingest-fixture`.
+# A normal dependency because `[[bin]]` targets do not see dev-dependencies.
 tf_tree_ingest.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 
-# Criterion benches (harness = false, driven by `criterion_group!`/`main!`). These
-# compile and run on any machine, but they are *not* the official go/no-go gate,
-# which needs dedicated, core-pinned hardware (see `docs/PHASE1.md` §11.3).
+# Criterion benches (`harness = false`). Not the official go/no-go gate, which needs core-pinned
+# hardware (`docs/PHASE1.md` §11.3).
 [[bench]]
 name = "lookup"
 harness = false
@@ -188,11 +95,7 @@ harness = false
 name = "push"
 harness = false
 
-# **The paired A/B for the `0036` receipt-time sampler.** Not a `bench_report`
-# row: `push_sampler` answers "what did the sampler cost", which is a *delta*,
-# and this host fails the report's fitness probe, so only a delta measured
-# against its own control in the same process survives here. See the bench's
-# module doc.
+# Paired A/B for the `0036` receipt-time sampler; a delta against its own control, not a `bench_report` row.
 [[bench]]
 name = "push_sampler"
 harness = false
@@ -201,119 +104,86 @@ harness = false
 name = "read_scaling"
 harness = false
 
-# The head-to-head against ROS 2 tf2. `required-features` keeps it out of a
-# normal `cargo bench`, so the suite still builds on hosts without ROS.
+# The head-to-head against ROS 2 tf2; `required-features` keeps ROS out of a normal `cargo bench`.
 [[bench]]
 name = "tf2_compare"
 harness = false
 required-features = ["tf2"]
 
-# Concurrent read-scaling harness. A binary rather than a criterion bench because
-# `docs/PHASE1.md` §11.2 wants p99.9 per *lookup*, and criterion reports the distribution
-# of batch times, which hides exactly the outliers a lock introduces.
+# A binary because `docs/PHASE1.md` §11.2 wants p99.9 per lookup, not criterion's batch distribution.
 [[bin]]
 name = "tf2_scaling"
 path = "src/bin/tf2_scaling.rs"
 required-features = ["tf2"]
 
-# Memory footprint and instructions-per-lookup. No `required-features`: the
-# tf_tree-side modes must run on a host without ROS, so the tf2 modes are gated
-# inside the binary instead of excluding the whole target.
+# Memory footprint and instructions-per-lookup; the tf2 modes are gated inside the binary.
 [[bin]]
 name = "footprint"
 path = "src/bin/footprint.rs"
 
-# The arena owner for `docker/tf2/native_ratio.sh`. It serves the fixture over
-# the rendezvous — `tft_tree_open` attaches and cannot create (D18) — so the C++
-# harness can measure `tf_tree` through the C ABI against a native tf2, with no
-# Rust binding on either arm. Needs `shm` for the same reason `shm_child` does.
+# The arena owner for `docker/tf2/native_ratio.sh`: serves the fixture over the rendezvous
+# (`tft_tree_open` cannot create, D18).
 [[bin]]
 name = "native_arena"
 path = "src/bin/native_arena.rs"
 required-features = ["shm"]
 
-# `docs/benchmarks/tf2.md`'s owed split: the middle arm between native Rust on a
-# heap arena and a C++ caller on a `memfd` one. Needs `shm` because the arm under
-# test *is* `build_shared` — without the feature there is no second backing to
-# compare against and the binary would measure a heap arena twice.
+# `docs/benchmarks/tf2.md`'s owed split: needs `shm` because the arm under test is `build_shared`.
 [[bin]]
 name = "arena_backing"
 path = "src/bin/arena_backing.rs"
 required-features = ["shm"]
 
-# **PHASE5 §12 gate 4**, which nothing had ever run: 16 workers sharing one
-# `.tft`, total Pss within 1.2x of one worker. Needs `shm` because the frozen
-# backend (`Tree::open_frozen`, `Tree::freeze_to`) is `#[cfg]`-ed on it — which
-# is also why `just bench-report` has always printed this row UNAVAILABLE.
-# Re-execs itself as the worker, so it is one binary rather than two.
+# `docs/PHASE5.md` §12 gate 4: 16 workers sharing one `.tft`, total Pss within 1.2x of one worker.
+# `shm` because the frozen backend is `#[cfg]`-ed on it; re-execs itself as the worker.
 [[bin]]
 name = "frozen_workers"
 path = "src/bin/frozen_workers.rs"
 required-features = ["shm"]
 
-# **`docs/PHASE5.md` §12 gate criterion 2**: `.tft` open time under 10 ms for a
-# 233 MB index. `required-features = ["shm"]` for the same reason as the binary
-# above — `Tree::open_frozen` is `#[cfg(all(feature = "shm", target_os =
-# "linux"))]`, so without the feature there is nothing here to time. A separate
-# binary from `frozen_workers` rather than a mode on it: `docs/benchmarks/EVIDENCE.md`'s
-# Gates table is one artifact per criterion, and gate 4's `--gate` refusals are
-# arguments about gate 4's two worker arms that a third meaning would blur.
+# `docs/PHASE5.md` §12 gate criterion 2: `.tft` open under 10 ms for a 233 MB index. `shm` because
+# `Tree::open_frozen` needs it. Its own binary: `EVIDENCE.md`'s Gates table is one artifact per criterion.
 [[bin]]
 name = "frozen_open"
 path = "src/bin/frozen_open.rs"
 required-features = ["shm"]
 
-# **`docs/PHASE5.md` §12 gate criterion 5**: ingest throughput >= 10x real time.
-#
-# **No `required-features`, and that is the point rather than an omission.**
-# Ingesting into an in-process `Tree` needs no frozen backend and no shared
-# memory — `crates/tf_tree_ingest/Cargo.toml`'s own `shm` comment says so — so
-# this binary and `tests/ingest_throughput.rs` are built and run by
-# `cargo nextest run --workspace`, i.e. by `just test`, on every pull request.
-# Copying `frozen_workers`'s manifest stanza would have moved the red test into
-# `just shm-check` for no reason.
+# `docs/PHASE5.md` §12 gate criterion 5: ingest throughput >= 10x real time. No `required-features`:
+# ingest needs no shared memory, so `just test` runs this and `tests/ingest_throughput.rs` per PR.
 [[bin]]
 name = "ingest_throughput"
 path = "src/bin/ingest_throughput.rs"
 
-# **Is the C ABI's +101 ns on a shared arena the ABI, or the C++ caller?**
-# Calls `tft_plan_at` from Rust on the same arena a C++ probe measures at 302 ns,
-# so the caller is the only variable left. Needs `bridge` (which implies `shm`
-# and pulls `tf_tree_c`).
+# Is the C ABI's +101 ns on a shared arena the ABI or the C++ caller? Calls `tft_plan_at` from
+# Rust on the arena a C++ probe measures at 302 ns. Needs `bridge`.
 [[bin]]
 name = "abi_attached"
 path = "src/bin/abi_attached.rs"
 required-features = ["abi-probe"]
 
-# **PHASE2 §12's attach rows**, which had never been measured — and the number
-# `report.rs`'s `attach_latency` entry has been missing since it was written.
-# Needs `shm` because attaching *is* the thing under test.
+# PHASE2 §12's attach rows (`report.rs`'s `attach_latency`). Needs `shm`.
 [[bin]]
 name = "attach_bench"
 path = "src/bin/attach_bench.rs"
 required-features = ["shm"]
 
-# Reader child for the multi-process test and benchmark. It attaches to a shared
-# arena over an inherited fd, so it must be a separate executable.
+# Reader child for the multi-process test and benchmark; attaches over an inherited fd.
 [[bin]]
 name = "shm_child"
 path = "src/bin/shm_child.rs"
 required-features = ["shm"]
 
-# Needs a real `memfd`, so it only builds with `shm` — otherwise
-# `--workspace --all-targets` tries to compile it and fails.
+# Needs a real `memfd`, so only builds with `shm`.
 [[example]]
 name = "heap_vs_shared"
 required-features = ["shm"]
 
-# Same reason: the whole point is the `MAP_SHARED` memfd mapping, whose
-# huge-page policy is the one `transparent_hugepage/shmem_enabled` governs.
+# Same reason: the `MAP_SHARED` memfd mapping is what `transparent_hugepage/shmem_enabled` governs.
 [[example]]
 name = "hugepage_grant"
 required-features = ["shm"]
 
-# The workspace's only `fork()`. See the file header for why `unsafe` here is a
-# recorded exception (`docs/decisions/0005` step 9) rather than an oversight.
+# The workspace's only `fork()`; its `unsafe` is a recorded exception (`docs/decisions/0005` step 9).
 [[bin]]
 name = "fork_child"
 path = "src/bin/fork_child.rs"
@@ -336,28 +206,18 @@ name = "shm_scaling"
 path = "src/bin/shm_scaling.rs"
 required-features = ["shm"]
 
-# **`docs/PHASE2.md` §11.4's `shm_torture`**, which `docs/PHASE5.md` §10 wants
-# running nightly. Deliberately **no** `required-features`: the binary compiles
-# everywhere and, without `shm`, exits non-zero saying there is no shared arena
-# to torture. `just shm-torture-self-test` runs it in `cargo nextest run
-# --workspace`'s build, and a target that vanished from the default build would
-# take that gate with it.
+# `docs/PHASE2.md` §11.4's `shm_torture`, run nightly per `docs/PHASE5.md` §10. No
+# `required-features`: without `shm` it exits non-zero, and `just shm-torture-self-test` runs it.
 [[bin]]
 name = "shm_torture"
 path = "src/bin/shm_torture.rs"
 
-# The torture harness's own gate. `required-features` keeps it out of
-# `cargo nextest run --workspace` (which builds without `shm`, where the binary
-# has nothing to torture); `just shm-torture-self-test` is where it runs, and
-# `just shm-check` calls that.
+# The torture harness's own gate; run by `just shm-torture-self-test`, which `just shm-check` calls.
 [[test]]
 name = "torture"
 required-features = ["shm"]
 
-# **`frozen_workers`'s exit status.** `required-features` for the same reason as
-# `torture` above: the driver carries `required-features = ["shm"]`, so
-# `cargo nextest run --workspace` builds no `CARGO_BIN_EXE_frozen_workers` for
-# this target to spawn. `just shm-check` runs it.
+# `frozen_workers`'s exit status; `required-features` as for `torture`. `just shm-check` runs it.
 [[test]]
 name = "gate4"
 required-features = ["shm"]
@@ -366,117 +226,71 @@ required-features = ["shm"]
 name = "py_parity"
 harness = false
 
-# **PHASE5 §5.7's required measurement.** Not a criterion bench: the question is
-# a ratio between two loop shapes and a contention curve, not a distribution,
-# and criterion's per-iteration setup would sit inside the thing being measured.
+# PHASE5 §5.7's measurement: a ratio between two loop shapes and a contention curve, not a criterion distribution.
 [[bin]]
 name = "counter_cost"
 
-# **PHASE5 §9's artifact.** One command, one `report/` directory. It orchestrates
-# measurements that live elsewhere rather than reimplementing them, and refuses
-# to write a report that breaks §9.3 (see `src/report.rs`).
+# PHASE5 §9's artifact: one command, one `report/` directory; refuses a report that breaks §9.3.
 [[bin]]
 name = "bench_report"
 path = "src/bin/bench_report.rs"
 
-# **PHASE5 §9.2's embedding row.** `required-features`, because the row's
-# in-crate column is `tf_tree_core::bench_probe` and that module is compiled
-# only under `tf_tree_core/bench-probe`. The out-of-crate column is ordinary code
-# here — the *point* is that the two bodies are identical and only their crate
-# differs — so the binary is useless without the feature and says so at build
-# time rather than by silently measuring one column twice.
-#
-# It is a `bin` rather than a criterion bench because the row is a *program*:
-# two columns timed back to back inside one round so the per-round quotients
-# pair, a JSON handshake between two processes built under two `[profile.*]`
-# sections, and provenance checks on the pair. Criterion estimates one routine
-# at a time and owns the process and the output. Not the profile — `cargo bench`
-# accepts `--profile`; `crates/tf_tree_bench/src/embed.rs` states the reasons
-# `benches/lookup.rs` cannot be extended into this row.
+# PHASE5 §9.2's embedding row. `required-features` because the in-crate column is
+# `tf_tree_core::bench_probe`, compiled only under `bench-probe`. A `bin`, not a criterion bench:
+# two columns are timed back to back in one round across two `[profile.*]` builds (`src/embed.rs`).
 [[bin]]
 name = "embed_cost"
 path = "src/bin/embed_cost.rs"
 required-features = ["embed-probe"]
 
-# **The A/B differ.** Deliberately no `required-features`: it reads two JSON
-# files and compares them, so it must build — and be testable — in the same
-# plain `--workspace` build the harnesses that need `shm` cannot appear in.
-# A comparison tool that only exists in the configuration that produces the
-# heaviest measurements is one nobody reaches for on the light ones.
+# The A/B differ. No `required-features`: it compares two JSON files and must build in a plain `--workspace`.
 [[bin]]
 name = "bench_ab"
 path = "src/bin/bench_ab.rs"
 
-# Reader/writer child for `contended_scaling`. It attaches to a shared arena over
-# an inherited fd and is placed on a core by `taskset`, so it must be a separate
-# executable — the same reason `shm_child` and `mp_consumer` are.
+# Reader/writer child for `contended_scaling`, placed on a core by `taskset`.
 [[bin]]
 name = "load_child"
 path = "src/bin/load_child.rs"
 required-features = ["shm"]
 
-# **`docs/PHASE1.md` §11.2's read-scaling row, with the writers and the pinning
-# it actually specifies.** Every other reader benchmark here runs against a
-# quiescent tree; this one does not, which is the whole reason it exists.
+# `docs/PHASE1.md` §11.2's read-scaling row, with the writers and pinning it specifies.
 [[bin]]
 name = "contended_scaling"
 path = "src/bin/contended_scaling.rs"
 required-features = ["shm"]
 
-# **The extreme-scale sweep.** No `required-features`: every axis it measures —
-# width, ring depth, publish fan-out, and the arena's own limits — is a
-# single-process property, so it must run on a host with neither ROS nor shared
-# memory. That is the same reasoning `footprint` uses.
+# The extreme-scale sweep; single-process, so no `required-features`.
 [[bin]]
 name = "scale_sweep"
 path = "src/bin/scale_sweep.rs"
 
-# **The long-duration soak.** Single process, so no `shm` and no ROS; it watches
-# a healthy system for drift over minutes to hours, which is a different question
-# from `shm_torture`'s (correctness under `SIGKILL`) and is not answerable by
-# running that one for longer.
+# The long-duration soak: watches a healthy system for drift, a different question from `shm_torture`'s.
 [[bin]]
 name = "soak"
 path = "src/bin/soak.rs"
 
-# **The Rust half of the §9.1 end-to-end comparison.** It generates the inputs
-# (so the publisher, the bridge config and the query set all come from one
-# workload entry rather than three hand-written files) and aggregates the
-# outputs. No `required-features`: `emit-config` must run wherever the container
-# is driven from, and the aggregation is text processing.
+# The Rust half of the §9.1 end-to-end comparison: generates the inputs and aggregates the outputs.
+# No `required-features`.
 [[bin]]
 name = "dds_report"
 path = "src/bin/dds_report.rs"
 
-# **Which consumer build does the gated headline ratio speak for?**
-# `just tf2-bench-report` builds the gated row with `cargo run --release`, i.e.
-# this workspace's `lto = "thin"`; a `cargo add tf_tree` consumer gets cargo's
-# release defaults, which `[profile.embedder]` spells out and which do not
-# enable LTO. Same paired harness as `ratio.rs`, one row, built twice —
-# `just tf2-ratio-profiles`. `required-features` for `tf2_scaling`'s reason.
+# Which consumer build does the gated headline ratio speak for? Same paired harness as `ratio.rs`,
+# built under `[profile.embedder]` by `just tf2-ratio-profiles`.
 [[bin]]
 name = "tf2_ratio"
 path = "src/bin/tf2_ratio.rs"
 required-features = ["tf2"]
 
-# **`docs/PHASE2.md` §12.2's two ownership-migration rows, and §12.3 gate 4b** —
-# the normative criterion that had no artifact. §3.5's migration landed on
-# 2026-08-28 with correctness tests in `crates/tf_tree/tests/rendezvous.rs`, but
-# nothing under this crate referenced `owner_lost` or `inherit_ownership`, so the
-# gate's number could not be produced at all. Needs `shm` because ownership is a
-# rendezvous concept and the rendezvous is Linux + `shm`.
+# `docs/PHASE2.md` §12.2's two ownership-migration rows and §12.3 gate 4b. Needs `shm`.
 [[bin]]
 name = "owner_migration"
 path = "src/bin/owner_migration.rs"
 required-features = ["shm"]
 
-# **`docs/decisions/0023` step 5's instrument.** The §7 ABI gate's own harness is
-# an *example of `tf_tree_c`*, and `tf_tree_bench` depends on `tf_tree_c`, so it
-# cannot call `mp::require_quiet_machine` without a dependency cycle. This is the
-# entry point `just abi-cost` brackets the run with instead of the second copy of
-# the sampler that the alternative would have been. No `required-features`:
-# `/proc/stat` needs neither `shm` nor ROS, and the recipe that calls it builds
-# `tf_tree_c` with default features.
+# `docs/decisions/0023` step 5's instrument: `tf_tree_c`'s ABI gate cannot call
+# `mp::require_quiet_machine` without a dependency cycle, so `just abi-cost` brackets the run with this.
 [[bin]]
 name = "quiet_check"
 path = "src/bin/quiet_check.rs"

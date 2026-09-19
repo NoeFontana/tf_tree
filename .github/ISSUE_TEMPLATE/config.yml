@@ -1,45 +1,8 @@
-# Issue-template chooser configuration.
-#
-# ## Blank issues stay on
-#
-# `blank_issues_enabled: false` is the usual setting for a project drowning in
-# low-quality reports. This one has the opposite problem: it has no users yet,
-# and the single most valuable thing anyone can send is an observation that does
-# not fit a form — `docs/PHASE4.md` §1.2's log is a log of *surprises*, and a
-# surprise that fits a template is not the interesting kind. Turning blank
-# issues off would make the first person to hit something we did not anticipate
-# choose between mis-filing it and not filing it. Revisit when the volume is a
-# problem rather than a hope.
-#
-# ## Two of the four labels these forms set do not exist yet
-#
-# GitHub's own documentation for the `labels` key: "If a label does not already
-# exist in the repository, it will not be automatically added to the issue."
-# Silently — no error when the form is saved, no note on the issue. So the
-# roster below is checked rather than assumed. Measured with
-# `gh label list -R NoeFontana/tf_tree` on 2026-08-16:
-#
-#   bug            bug.yml                     EXISTS (GitHub's default set)
-#   question       question.yml                EXISTS (GitHub's default set)
-#   surprise-log   surprise.yml                MISSING — will be dropped
-#   needs-triage   surprise.yml, bug.yml       MISSING — will be dropped
-#
-# The two missing ones, in the spelling the forms use:
-#
-#   gh label create surprise-log --color 0e8a16 \
-#     --description "An entry in the docs/PHASE4.md §1.2 surprise log"
-#   gh label create needs-triage --color fbca04 \
-#     --description "Read but not yet reproduced or classified"
-#
-# Until they exist the forms still work and the label is simply absent, which is
-# the quiet half of this failure: a surprise-log entry that carries no
-# surprise-log label is invisible to the one query that matters.
-#
-# ## One coupling to keep
-#
-# surprise.yml's J-row dropdown copies `docs/PHASE7.md` §4's table. That table
-# says of itself "Rows will be added"; when one is, the dropdown gets the same
-# row in the same commit.
+# Blank issues stay on: the most valuable report is a surprise that fits no form
+# (`docs/PHASE4.md` §1.2).
+# GitHub silently drops labels that do not exist: `surprise-log` and `needs-triage`
+# (surprise.yml, bug.yml) must be created with `gh label create`.
+# surprise.yml's J-row dropdown copies `docs/PHASE7.md` §4's table; change both together.
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability — do not open an issue
@@ -55,7 +18,7 @@ contact_links:
     about: >-
       A single-maintainer, pre-1.0 project with honestly scoped timelines: Linux first, the
       current release only, and a per-kind triage expectation. It is also where the platform
-      answers are, and they are not all the same answer. Note that CI has produced no run
+      answers are, and they are not all the same answer.
       since 2026-07-23, so a green check on a pull request is not evidence of anything.
   - name: Propose a change the documents do not already cover
     url: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/README.md

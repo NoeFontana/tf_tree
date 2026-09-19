@@ -1,13 +1,7 @@
 //! C ABI overhead against native Rust — `docs/PHASE4.md` §7, gate criterion 1.
 //!
-//! # What this measures
-//!
-//! The profile it is built at and the pinned comparands: `docs/decisions/0023`.
-//!
-//! # What it reports
-//!
-//! A ladder, each rung differing from the one below by exactly one thing, all
-//! five arms interleaved within every round so drift is common-mode:
+//! Profile and pinned comparands: `docs/decisions/0023`. A ladder of five arms,
+//! interleaved within every round so drift is common-mode:
 //!
 //! | rung | what it adds |
 //! |---|---|
@@ -17,35 +11,15 @@
 //! | the ABI, no panic guard | the boundary, minus `catch_unwind` |
 //! | `tft_plan_at` | the shipped call |
 //!
-//! and gates three quotients between them rather than one quotient across all
-//! of them, because R1 (the ABI) and R3 (the signature) have different owners
-//! and rolling them together makes neither diagnosable. The allowances and the
-//! argument for replacing §7's single 1.05 with them are `docs/decisions/0023`,
-//! **draft**.
+//! Three quotients are gated (R1 ABI, R2 panic guard, R3 signature); the
+//! allowances are `0023`'s, **draft**. Also reported, not gated: `catch_unwind`
+//! in isolation (§3.4), the batch paths incl. `Layout::QuatTwist`, and the
+//! publish-path ablation.
 //!
-//! Also reported, none of them gates:
-//!
-//! * **`catch_unwind` in isolation.** §3.4 asserts it is free on the happy path
-//!   because it emits landing pads rather than a runtime check. Measured twice:
-//!   `tft_layout_size` against `tft_guarded_noop` (both small enough to inline
-//!   cross-crate, so ~+0.1 ns *in inlined code*), and `tft_publisher_push`
-//!   against `tft_test_push_unguarded` (+0.6 ns on a call too large to inline —
-//!   the number that actually supports §3.4 for the shipped ABI).
-//! * **The batch paths**, where the boundary is amortized over n, including
-//!   `Layout::QuatTwist`'s monotone-cursor batch and its strided variant.
-//! * **What the publish path costs, and why.** 2.5x against native is the kind
-//!   of number that should be explained rather than left to be discovered; the
-//!   ablation rows are there because three separate hypotheses about it were
-//!   measured and all three were wrong.
-//!
-//! Run through `just abi-cost`, which pins to a core: an unpinned run migrates
-//! cores and swings by >30%, which is more than any allowance here.
+//! Run through `just abi-cost`, which pins a core.
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::expect_used)]
-// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
-// exercise or measure it** (`docs/decisions/0048`: a kind is a property, not a
-// crate name). The posture is declared here rather than inherited:
-// `crates/tf_tree_c/src/lib.rs` does not govern this file, because an example
-// is a **separate crate root**. `0048` step 4 is what this closes.
+// 0007 rule 1, kind 5 (our own C ABI, called from Rust); 0048: an example is a
+// separate crate root, so the posture is declared here.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -60,105 +34,35 @@ const ROUNDS: usize = 41;
 
 // --- §7 gate criterion 1, rung by rung ----------------------------------
 //
-// **These allowances are a proposal, not yet the spec.** §7's gate table says
-// "C ABI within 5% of native", one quotient, and `docs/decisions/0023` is the
-// draft that would replace it with the three rungs below. The numbers here are
-// what this host measures at `[profile.embedder]` plus headroom; each is
-// justified where it is declared, and `0023` records how it was chosen and what
-// would falsify it. A human accepts or rejects them by merging that record.
-//
-// The old 1.05 is deliberately not reused for any of them. It was a figure for
-// a quotient nobody could reproduce, and carrying it forward would smuggle in a
-// threshold that had never been measured against a real boundary.
+// These allowances are a proposal: `docs/decisions/0023` (draft) would replace
+// §7's single 1.05 with the three rungs below.
 
-/// **R1 — what the C ABI itself costs**, over a native caller written in the
-/// shape the C signature forces (a guard per lookup, behind a call the compiler
-/// cannot inline). This is the tight one: everything between these two arms is
-/// the boundary — magic-word check, null checks, layout enum dispatch, the
-/// output slice, and `catch_unwind`.
+/// **R1 — what the C ABI itself costs** over a native caller shaped as the C
+/// signature forces (a guard per lookup behind a non-inlinable call): magic-word
+/// and null checks, layout dispatch, output slice, `catch_unwind`.
 ///
-/// **Measured 1.025–1.038 at `[profile.embedder]`**, twelve runs, `taskset -c 2`,
-/// on a host whose absolute baseline wandered 217–248 ns across the same twelve
-/// (a busy neighbour: another project was building). That is the point of a
-/// ratio here — `report.rs`'s `Fitness` refuses absolute timing rows on this
-/// machine and `fair_for_ratios` is the weaker axis that survives, because a
-/// noisy round lands on both arms of an interleaved pair.
-///
-/// 1.10 is about two and a half times the largest measured excess over 1.0. It is loose
-/// on purpose: this row must not go red for noise, or it joins the recipes
-/// people learn to re-run until green. It would still catch a doubling of any
-/// single check the boundary performs. Falsified by a run at this profile on a
-/// quiet host that lands above 1.10 with the ABI unchanged — or, in the other
-/// direction, by a quiet host showing the spread is small enough to justify
-/// tightening it, which is the better outcome and the one `0023` invites.
+/// Measured 1.025–1.038 at `[profile.embedder]`. 1.10 is loose on purpose so the
+/// row does not go red for noise, yet still catches a doubling of any one check.
 const ABI_OVER_GUARDED: f64 = 1.10;
 
-/// **R2 — `catch_unwind` on the happy path.** §3.4 asserts this is ~zero, and
-/// the ABI's own body with the guard removed (`tft_test_plan_at_unguarded`) is
-/// the subtraction that says so on a real call. Measured 0.999–1.006 across the
-/// same nine runs, i.e. indistinguishable from free. 1.05 fails if the landing
-/// pads ever stop being free on this target.
+/// **R2 — `catch_unwind` on the happy path**, by subtraction on a real call
+/// (`tft_test_plan_at_unguarded`). §3.4 asserts ~zero; measured 0.999–1.006.
 const PANIC_GUARD: f64 = 1.05;
 
-/// **R3 — what a guard per lookup costs**, against one hoisted out of the loop.
-/// This is not the ABI's cost, it is the *signature's*, and it is
-/// `docs/decisions/0022`'s subject. It is gated anyway because it is the larger
-/// of the two and because `0022`'s whole argument rests on its size: at
-/// `[profile.embedder]` the guard is ~45 ns on the §11.1 fixture (`just
-/// abi-attached`) and **~16 ns here** — measured 1.059–1.075 across nine runs on
-/// a three-edge heap tree, which is ~6.5% of a ~245 ns lookup.
+/// **R3 — what a guard per lookup costs**, against one hoisted out of the loop:
+/// the *signature's* cost, `docs/decisions/0022`'s subject. Measured 1.059–1.075
+/// (~16 ns of ~245 ns) on this three-edge heap tree.
 ///
-/// **This comment used to guess that the difference was the shared arena
-/// ("whatever makes the shared case ~3x dearer is `0022`'s to find"). It is
-/// not, and the guess is retracted.** `just guard-cost` measures both backings
-/// on the *same* fixture in one binary at this profile: heap +34.4 ns, memfd
-/// +35.8 ns, counters off. The backing is worth ~1.4 ns; the **fixture** is
-/// worth the rest. The mechanism is that a fresh `Guard`'s cursor is the
-/// `EdgeId(0)` sentinel, so every step restarts its bracket search at the window
-/// midpoint, and `docs/design/fast-path.md` §12 measures that as a cache cliff
-/// in the *stamp* array — flat below L1d, ~17 ns/sample at capacity 16384, which
-/// is what §11.1's 1 kHz edge is. The tree built below has 256-slot rings, i.e.
-/// 2 KiB of stamps per edge: it sits on the flat part of that curve, so it
-/// prices `Guard`'s constructor and almost none of the cold search a real robot
-/// pays.
-///
-/// **That reading has since been measured paired, and it holds — with more in it
-/// than the argument accounted for.** `just abi-split`'s *0023 q3* block builds
-/// this file's three-edge tree beside the §11.1 fixture in one binary at this
-/// profile, both heap-backed, alternating which leads each round: **15.6–18.7 ns
-/// here against 48.2–62.5 ns there, a paired difference of 30–44 ns over three
-/// runs.** The three-edge column reproduces the ~16 ns above tightly; the
-/// predicted difference was ~18 ns and the measured one is roughly double, so
-/// the stamp-array cliff explains perhaps half of the fixture effect and **the
-/// rest is not attributed** — deliberately, because attributing it by
-/// subtraction is the mistake this file's neighbourhood has already made
-/// several times.
-///
-/// **`docs/PHASE4.md` §7 now measures R3 on the §11.1 fixture, and the 1.25
-/// below did not move with it.** 1.25 is an allowance for *this* numerator and
-/// carrying it across would be setting a threshold by transcription; §11.1's
-/// figures also span 14.3 ns run to run, which is not a spread a threshold
-/// should be derived from on this host. So R3 is **reported and not gated**
-/// until a host that can resolve it exists. The constant below still gates the
-/// three-edge row, which is what it was derived for.
-///
-/// The allowance is set to catch a *regression* rather than to assert a target —
-/// if `Guard` acquires new per-construction work, this is the row that moves.
-/// **It is not a row anybody intends to lower:** `0022` is `ready` and declines
-/// the `tft_guard` handle, answering the per-call guard with `tft_plan_at_many`
-/// (~41 ns of a ~302 ns scalar call at n = 256) rather than with new API.
+/// This tree has 256-slot rings, so it prices `Guard`'s constructor and little of
+/// the cold bracket search a §11.1 fixture pays (`docs/design/fast-path.md` §12;
+/// `just abi-split`'s *0023 q3* block); the rest of that gap is unattributed.
+/// R3 is reported, not gated, on the §11.1 fixture; this constant gates only the
+/// three-edge row and exists to catch a regression, not to be lowered.
 const PER_CALL_GUARD: f64 = 1.25;
 
-/// **C — the control**, and the reason this file can gate at all. If the
-/// compiler still specialised the comparand per call site, rung 1 and its twin
-/// would disagree. The allowance is a *symmetric* band — |ratio - 1| < 0.02 —
-/// because either direction is the same failure.
-///
-/// **2% is more than twice the spread these two arms actually show**: twelve
-/// runs gave 0.992–1.002, and the widest excursion was 0.8%. It is deliberately much
-/// tighter than the rungs it protects, because the failure it looks for is not
-/// subtle — when the comparand was unpinned, one unrelated call site moved it
-/// **43%**. A control loose enough to miss that would be decoration.
+/// **C — the control**: rung 1 and its twin must agree, or per-call-site
+/// specialisation is back. Symmetric band |ratio - 1| < 0.02: measured
+/// 0.992–1.002, while an unpinned comparand once moved 43%.
 const CONTROL: f64 = 1.02;
 
 fn verdict(ok: bool) -> &'static str {
@@ -189,21 +93,10 @@ fn bench(mut run: impl FnMut() -> f64) -> f64 {
     )
 }
 
-/// Measure every arm **once per round, in the same order**, and return one
-/// vector of per-round ns/lookup per arm.
-///
-/// `bench` above runs an arm to completion before the next one starts, so a
-/// frequency step or a noisy neighbour that arrives halfway through the run
-/// lands on one arm and not the other. Here every round contains every arm, so
-/// such drift is common-mode and divides out of a per-round quotient. This is
-/// the same construction `tf_tree_bench`'s `report.rs` calls
-/// `Sensitivity::Ratio` and the reason `just cpp-bench`'s gate stopped
-/// flapping; `abi_cost` cannot depend on that crate (it is a `tf_tree_c`
-/// example), so the construction is repeated rather than shared.
-///
-/// The arms are `&mut dyn FnMut` because they close over different buffers and
-/// therefore have different types; the dynamic dispatch is one indirect call
-/// per **round**, not per lookup, so it is 1/4096th of anything measured.
+/// Measure every arm once per round, in the same order, and return per-round
+/// ns/lookup per arm, so drift is common-mode (`report.rs`'s
+/// `Sensitivity::Ratio`, repeated because an example cannot depend on that
+/// crate). Arms are `&mut dyn FnMut`: one indirect call per round.
 fn ladder(arms: &mut [(&'static str, &mut dyn FnMut() -> f64)]) -> Vec<Vec<f64>> {
     for _ in 0..8 {
         for (_, run) in arms.iter_mut() {
@@ -221,41 +114,19 @@ fn ladder(arms: &mut [(&'static str, &mut dyn FnMut() -> f64)]) -> Vec<Vec<f64>>
     out
 }
 
-/// The median of the **per-round** quotients, not the quotient of the medians.
-///
-/// They differ exactly when the two arms drift together, which is the case this
-/// function exists for: a round in which both arms were slow contributes a ratio
-/// near the true one, while a quotient of medians would compare a slow round of
-/// one arm against a fast round of the other.
+/// The median of the **per-round** quotients, not the quotient of the medians,
+/// which would compare a slow round of one arm against a fast round of the other.
 fn ratio(num: &[f64], den: &[f64]) -> f64 {
     median(num.iter().zip(den).map(|(a, b)| a / b).collect())
 }
 
 // --- the pinned native comparands ---------------------------------------
 //
-// **These three functions are the fix for a gate that could not gate** — the
-// module doc's failure 2, also recorded in `docs/PHASE4.md` §7.
-//
-// Each is `#[inline(never)]` with `black_box` on the stamp going in and on the
-// scalar coming out, so:
-//
-// * the loop that calls it cannot hoist, vectorise or partially evaluate it —
-//   the compiler must assume the stamp is unknown and the result is observed;
-// * every call site in this file shares **one** machine-code body, so adding a
-//   call site cannot re-specialise anything. That is the structural half of the
-//   argument; the empirical half is in `docs/PHASE4.md` §7, where the same
-//   unrelated edit was applied again after this pin and the baseline held.
-//
-// **An opaque call is also the honest native shape at `lto = false`.** A real
-// embedder calls `Plan::at` across a crate boundary, and `PHASE5.md` §9.2's
-// embedding row is the measurement of what that costs. Pinning does not
-// manufacture a handicap for the denominator; it stops the denominator being
-// given an optimisation no embedder gets.
-//
-// The bodies are duplicated rather than factored through a shared helper on
-// purpose: a `#[inline(never)]` helper called by another `#[inline(never)]`
-// helper would charge the outer arm an extra real call, and the whole point of
-// the ladder is that adjacent rungs differ by exactly one thing.
+// Each is `#[inline(never)]` with `black_box` on the stamp and the result, so
+// every call site shares one machine-code body and cannot be re-specialised
+// (`docs/PHASE4.md` §7). An opaque call is also the honest native shape at
+// `lto = false` (`PHASE5.md` §9.2). Bodies are duplicated, not factored: a
+// nested `#[inline(never)]` helper would charge the outer arm an extra call.
 
 /// Rung 0: a lookup through a guard the caller already holds.
 #[inline(never)]
@@ -275,12 +146,8 @@ fn native_hoisted(
     black_box(buf[0])
 }
 
-/// Rung 1: the same, with the guard built inside the call.
-///
-/// This is the shape the C signature forces — `tft_plan_at` takes a plan and a
-/// stamp and has nowhere to keep a guard between calls, so it builds one every
-/// time (`lib.rs`, `h.share.tree.guard()`). `docs/decisions/0022` is about
-/// giving the C tier somewhere to keep one.
+/// Rung 1: the same, with the guard built inside the call — the shape
+/// `tft_plan_at` is forced into (`docs/decisions/0022`).
 #[inline(never)]
 fn native_per_call_guard(
     plan: &tf_tree::Plan,
@@ -299,17 +166,9 @@ fn native_per_call_guard(
     black_box(buf[0])
 }
 
-/// **The pin's self-check, measured on every run.**
-///
-/// A structural twin of [`native_per_call_guard`]: same work, different symbol,
-/// different call site, so a disagreement is per-call-site specialisation
-/// returning ([`CONTROL`]). They are printed side by side and their difference
-/// is the ladder's own error bar.
-///
-/// It reads `buf[15]` rather than `buf[0]` **so that identical-code folding
-/// cannot merge the two symbols**, which would make the control vacuous by
-/// construction. `write_mat4` has already written all sixteen lanes, so the two
-/// bodies do the same amount of work.
+/// The pin's self-check: a structural twin of [`native_per_call_guard`] under a
+/// different symbol, so a disagreement means per-call-site specialisation
+/// ([`CONTROL`]). Reads `buf[15]` so identical-code folding cannot merge the two.
 #[inline(never)]
 fn native_per_call_guard_twin(
     plan: &tf_tree::Plan,
@@ -328,21 +187,9 @@ fn native_per_call_guard_twin(
     black_box(buf[15])
 }
 
-/// The cargo profile directory this executable is running out of, if it is
-/// running out of one.
-///
-/// Cargo lays an example out at `<target>/[<triple>/]<profile-dir>/examples/`,
-/// so the path component immediately before `examples` is the profile
-/// directory — `release` for `--release`, `embedder` for `--profile embedder`.
-/// The optional `<triple>` component when cross-compiling is why this searches
-/// for `examples` from the right rather than counting from `target`.
-///
-/// This is the same fact `tf_tree_bench`'s `build.rs` gets from `OUT_DIR`, read
-/// a weaker way: `OUT_DIR` is what cargo told the build, while this is where the
-/// file ended up, so a copied binary answers `None` here and `build.rs`'s answer
-/// would have travelled with it. `None` is the honest reply for a copied binary,
-/// and the weaker mechanism is the right trade for a published crate that should
-/// not grow a build script to serve one benchmark example.
+/// The cargo profile directory this executable runs out of (`release`,
+/// `embedder`), found by searching for `examples` from the right; `None` for a
+/// copied binary.
 fn profile_dir_of_this_binary() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let parts: Vec<String> = exe
@@ -367,8 +214,7 @@ fn main() {
         TFT_OK
     );
 
-    // The identical tree and plan, natively. Built the same way so the two sides
-    // walk the same topology and read the same rings.
+    // The identical tree and plan, natively.
     let cfg = tf_tree::EdgeCfg::new(tf_tree::Capacity::slots(256));
     let mount = tf_tree::exp_se3([0.3, -0.7, 0.2, 0.11, -0.05, 0.37]);
     let native = tf_tree::TreeBuilder::new()
@@ -406,17 +252,9 @@ fn main() {
         .map(|i| 10_000_000 + ((i * 7919) % 600_000_000) as i64)
         .collect();
 
-    // **The profile is half of a boundary measurement**, so it is printed — and
-    // since it also decides *whether this run gates at all* (see the exit-status
-    // comment far below), argv[1] is a claim that gets checked against where
-    // cargo actually put this binary.
-    //
-    // It used to be only a claim: `just abi-cost` passes `release` to one build
-    // and `embedder` to the other, and the binary believed whichever string it
-    // got. Swapping those two lines of the recipe would have moved the gate onto
-    // the `lto = "thin"` run, where the boundary is erased, and nothing in the
-    // output would have said so — the same shape as the two wrong attributions
-    // `docs/PHASE4.md` §0.0 records.
+    // The profile decides whether this run gates, so argv[1] is checked against
+    // where cargo put this binary (a swapped `just abi-cost` line would otherwise
+    // gate the `lto = "thin"` run, where the boundary is erased).
     let claimed = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "unstated".to_owned());
@@ -429,9 +267,7 @@ fn main() {
              ratios mean, so a wrong label here is worse than no measurement."
         );
     }
-    // A binary copied out of its target directory cannot vouch for its profile,
-    // and an unvouched `embedder` must not gate: an unverifiable claim is not
-    // evidence. `boundary_real` therefore needs *both* halves.
+    // A copied binary cannot vouch for its profile; an unvouched `embedder` must not gate.
     let boundary_real = claimed == "embedder" && measured.is_some();
     let profile = claimed;
 
@@ -452,28 +288,16 @@ fn main() {
 
     // --- the ladder ---------------------------------------------------------
     //
-    // Every arm writes the same 128 bytes and evaluates the same plan on the
-    // same tree at the same stamps, so adjacent rungs differ by exactly one
-    // thing. `[f64; 16]` rather than `[u8; 128]` on the native side because
-    // `write_mat4` wants `&mut [f64]` and building one from a byte array would
-    // need an alignment the type does not promise — the same 128 bytes either
-    // way.
-    //
-    // **One buffer per arm**, and this is not tidiness. The first version of
-    // this ladder shared `nbuf` between the native arms; letting it escape into
-    // an `#[inline(never)]` callee forced it to memory for *every* arm including
-    // the baseline, which went 133 -> 190 ns and made the gate appear to pass.
-    // The instrument had moved the thing it measures. Here every arm passes a
-    // buffer to an `#[inline(never)]` callee, so that cost is paid uniformly and
-    // is part of every rung rather than a difference between two of them.
+    // Every arm writes the same 128 bytes from the same plan at the same stamps.
+    // One buffer per arm: sharing `nbuf` between native arms forced it to memory
+    // for every arm and moved the baseline 133 -> 190 ns.
     let mut nbuf = [0.0f64; 16];
     let mut lbuf = [0.0f64; 16];
     let mut tbuf = [0.0f64; 16];
     let mut cbuf = [0u8; 128];
     let mut ubuf = [0u8; 128];
 
-    // Rung 0. The guard is built once per *round* — 4096 lookups — so its cost
-    // is 1/4096th of anything below.
+    // Rung 0. The guard is built once per round.
     let mut arm_hoisted = || {
         let g = native.guard();
         let mut acc = 0.0;
@@ -498,9 +322,7 @@ fn main() {
         }
         acc
     };
-    // Rung 2. The ABI's own body with `catch_unwind` removed and nothing else
-    // changed, so the panic guard is a subtraction on a real, non-inlinable
-    // call.
+    // Rung 2. The ABI's own body minus `catch_unwind`.
     let mut arm_unguarded = || {
         let mut acc = 0.0;
         for &t in &stamps {
@@ -624,16 +446,9 @@ fn main() {
         );
     }
 
-    // **The exit status gates, and only at the profile where the boundary
-    // exists.** The `release` run is a contrast, not a criterion: failing on it
-    // would make the recipe red for a reason that is about LLVM's inliner. The
-    // control is included — if the pin stops holding, the ladder's numbers stop
-    // meaning anything and a green run would be worse than a red one.
-    //
-    // **Both halves of that were run, not asserted.** With `ABI_OVER_GUARDED`
-    // temporarily set to 1.00 the `embedder` binary exits 1 and the `release`
-    // binary exits 0 on the same measured 1.016 — which is the profile guard
-    // doing its job, not the threshold being unreachable.
+    // The exit status gates only at the profile where the boundary exists
+    // (`release` is a contrast), and includes the control: a broken pin makes
+    // the ladder meaningless.
     let gate_failed = boundary_real
         && !(r_abi < ABI_OVER_GUARDED
             && r_panic < PANIC_GUARD
@@ -665,18 +480,9 @@ fn main() {
 
     // --- the twist layout's batch, where the monotone cursor is the point ---
     //
-    // **Ascending stamps, deliberately.** `Layout::QuatTwist`'s batch fold has
-    // a monotone-cursor branch that turns the per-step bracket search from
-    // `O(log n)` into `O(1)` amortized, and `docs/API.md` §3.3's n = 1024
-    // ML/perception batch is the caller it exists for. `tft_plan_at_many` used
-    // to evaluate this layout with a scalar `at_with_derivatives` per element,
-    // which cannot reach that branch — these rows are what says whether it does
-    // now, and the native row beside them is what separates "the boundary" from
-    // "derivatives cost twice a pose".
-    //
-    // The strided row is the second half of the same question: a caller writing
-    // into an array of its own structs cannot be handed the batch's buffer
-    // directly, so it takes the chunked path instead of the zero-copy one.
+    // Ascending stamps, deliberately: `Layout::QuatTwist`'s batch fold has an
+    // O(1)-amortised monotone-cursor branch (`docs/API.md` §3.3). The strided row
+    // is the chunked path for a caller writing into its own structs.
     let sorted: Vec<i64> = (0..N)
         .map(|i| 10_000_000 + (i as i64 * 600_000_000) / N as i64)
         .collect();
@@ -747,9 +553,7 @@ fn main() {
 
     // --- catch_unwind, isolated ---
     //
-    // Same trivial body, called through `guard` and directly. §3.4 claims this is
-    // zero on the happy path; anything else means the landing pads are not free
-    // on this target.
+    // Same trivial body through `guard` and directly (§3.4: zero on the happy path).
     let unguarded = bench(|| {
         let mut acc = 0.0;
         for _ in 0..N {
@@ -774,12 +578,8 @@ fn main() {
 
     // --- the publish path, and what the thread-affinity check costs ---
     //
-    // §3.2 requires `tft_publisher` to refuse a thread that does not own it.
-    // That is one thread-local load and a compare on every publish, so it is
-    // measured rather than waved through. The native side pushes the same
-    // transforms through `EdgeWriter::push` — the same call the C ABI ends up
-    // making — so the difference is the boundary, the layout read, and the
-    // affinity check, and nothing else.
+    // §3.2's affinity check is a thread-local load and compare per publish. The
+    // native side pushes through `EdgeWriter::push`, as the ABI does.
     let mut ptree: *mut tft_tree = ptr::null_mut();
     assert_eq!(
         // SAFETY: `ptree` is a live local.
@@ -795,15 +595,11 @@ fn main() {
         TFT_OK
     );
 
-    // Identity quaternion, `[qw qx qy qz tx ty tz]`. The layout read for QVEC7
-    // is a bounds-checked copy plus a norm check, which is the cheapest of the
-    // five and therefore the one that shows the boundary most clearly.
+    // Identity quaternion `[qw qx qy qz tx ty tz]`; QVEC7 is the cheapest layout read.
     let mut payload = [0u8; 56];
     payload[..8].copy_from_slice(&1.0f64.to_ne_bytes());
 
-    // A push is only valid with a non-decreasing stamp, so each round needs a
-    // fresh monotone run. The counter is carried across rounds rather than
-    // reset, which costs nothing and keeps every push on the accepted path.
+    // Each push needs a non-decreasing stamp; the counter carries across rounds.
     let mut stamp = 1i64;
     let abi_push_ns = bench(|| {
         for _ in 0..N {
@@ -847,15 +643,9 @@ fn main() {
         nstamp as f64
     });
 
-    // The same push, decoding the pose from the identical 56 bytes the C side
-    // reads. **This row is why the first comparison is not the whole story**:
-    // the row above hoists a constant `Iso3` out of the loop and never pays to
-    // materialize one, while the C side decodes a foreign buffer every time.
-    // Reporting only the first would charge the decode to "the boundary", which
-    // it is not — a Rust caller publishing from wire bytes pays it too.
-    // Continues the same monotone run — the writer above already advanced past
-    // its own stamps, and a push that goes backwards is refused (which is how
-    // this was found: `NonMonotonicStamp { last: 200705, got: 2 }`).
+    // The same push decoding the pose from the same 56 bytes the C side reads:
+    // the row above hoists a constant `Iso3`, so alone it would charge the decode
+    // to "the boundary". Continues the monotone run (a backwards push is refused).
     let mut nstamp2 = nstamp + 1;
     let native_decode_ns = bench(|| {
         for _ in 0..N {
@@ -873,9 +663,7 @@ fn main() {
         nstamp2 as f64
     });
 
-    // The same native push behind `#[inline(never)]`. Every native row above is
-    // inlined into its loop; `tft_publisher_push` is a cross-crate `extern "C"`
-    // call and cannot be. This row is what says whether that matters.
+    // The same native push behind `#[inline(never)]`, as `tft_publisher_push` is not inlinable.
     #[inline(never)]
     fn opaque_push(w: &tf_tree::EdgeWriter<'_>, stamp: i64, iso: &tf_tree::Iso3) {
         w.push(stamp, iso).unwrap();
@@ -889,10 +677,8 @@ fn main() {
         ostamp as f64
     });
 
-    // The ABI's own body with `guard` removed and nothing else changed, so the
-    // panic guard's cost on a **real, non-inlinable** call is a subtraction
-    // rather than an inference. (`tft_guarded_noop` above is small enough for
-    // rustc to inline cross-crate, so that row measures inlined code.)
+    // The ABI's own body minus `guard`: the panic guard's cost on a real,
+    // non-inlinable call (`tft_guarded_noop` above is inlined).
     let mut astamp = ostamp + 1;
     let unguarded_push_ns = bench(|| {
         for _ in 0..N {
@@ -968,8 +754,7 @@ fn main() {
         tft_tree_free(tree);
     }
 
-    // The free calls above run first on purpose: a gate failure should not
-    // also look like a leak to whatever runs this under a sanitizer.
+    // Freed before the gate exit so a failure does not look like a leak.
     if gate_failed {
         println!("\n§7 gate criterion 1: FAIL — see the rung marked FAIL above");
         std::process::exit(1);

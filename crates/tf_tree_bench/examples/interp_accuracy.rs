@@ -1,5 +1,4 @@
-//! What `ScLerp` buys over `LerpSlerp`, as a function of publish rate — the
-//! measurement D5 demands and nobody had taken.
+//! What `ScLerp` buys over `LerpSlerp`, as a function of publish rate — the measurement D5 demands.
 //!
 //! ```sh
 //! cargo run --release -p tf_tree_bench --example interp_accuracy
@@ -7,47 +6,21 @@
 //!
 //! # Why this exists
 //!
-//! `docs/PROJECT.md` §5 **D5** makes `ScLerp` the default and ends: *"`LerpSlerp`
-//! stays available for bit-compatible differential testing against `tf2` and for
-//! latency-critical plans. **Do not** remove `LerpSlerp`; **do not** make it the
-//! default without a measurement justifying it."*
+//! `docs/PROJECT.md` §5 **D5** makes `ScLerp` the default: do not make `LerpSlerp` the default without a
+//! measurement. `interp_cost` measures the **cost**; this measures the **accuracy** they differ by: at
+//! my publish rate, does the default cost anything measurable, and would switching lose anything?
 //!
-//! The second half of that sentence has always been read as a rule about
-//! *changing* the default. It is also a standing obligation on the default that
-//! shipped: `ScLerp` is the default, it costs more than `LerpSlerp`, and the
-//! measurement justifying the trade did not exist. `examples/interp_cost.rs`
-//! measures the **cost** of each policy in three regimes; this measures the
-//! **accuracy** they differ by, so the two together answer the question a
-//! deployment actually asks:
+//! # What is being compared
 //!
-//! > *At the rate my estimator publishes, does the default cost me anything I
-//! > can measure — and would switching lose me anything I care about?*
-//!
-//! # What is being compared, and which one is right
-//!
-//! `ScLerp` **is** the SE(3) geodesic: for a body moving on a constant screw —
-//! rotating about an axis while translating along it, which is what any rigid
-//! body doing a smooth motion is doing between two close samples — screw-linear
-//! interpolation reproduces the true intermediate pose exactly. So `ScLerp` is
-//! not one approximation among two here; it is the ground truth, and what is
-//! measured is how far `LerpSlerp` departs from it.
-//!
-//! `LerpSlerp` SLERPs the rotation and LERPs the translation *independently*.
-//! The rotation half is the same geodesic, so the two agree there. The
-//! translation half is a straight line through space where the truth is a helix,
-//! and a chord is shorter than its arc — which is why the error below is a pure
-//! position error, grows with the angle turned between samples, and grows with
-//! the **lever arm**: how far the frame sits from the axis it is turning about.
-//!
-//! A sensor bolted 0.5 m off a robot's turn centre is exactly that lever arm,
-//! which is why the sweep below carries one rather than rotating in place.
+//! `ScLerp` **is** the SE(3) geodesic for a body on a constant screw, so it is the ground truth; what
+//! is measured is how far `LerpSlerp` departs. Its rotation half agrees; its translation half is a
+//! chord where the truth is a helix, so the error is a pure position error growing with the angle
+//! turned and the **lever arm** (distance from the turn axis). The sweep carries a 0.5 m lever arm.
 #![allow(clippy::unwrap_used, clippy::print_stdout)]
 
 use tf_tree_math::{Interp, Iso3, LerpSlerp, Quat, ScLerp, Vec3};
 
-/// Samples of `s` across one segment. The maximum deviation is interior — both
-/// policies agree at the endpoints by construction — so the grid has to be fine
-/// enough to find it rather than to sample near it.
+/// Samples of `s` across one segment; the maximum deviation is interior (endpoints agree by construction).
 const STEPS: usize = 512;
 
 /// A rotation of `theta` about a unit axis.
@@ -61,16 +34,10 @@ fn axis_angle(theta: f64, x: f64, y: f64, z: f64) -> Quat {
     }
 }
 
-/// One segment of a body turning `theta` about the world `z` axis while sitting
-/// `lever` metres off that axis, and climbing slightly — a constant screw.
-///
-/// Returned as the pair of endpoint poses a ring would hold for two adjacent
-/// samples, which is exactly what the sampler hands `Interp::eval`.
+/// One segment of a body turning `theta` about the world `z` axis, `lever` metres off it and climbing
+/// slightly (a constant screw), as the pair of endpoint poses the sampler hands `Interp::eval`.
 fn segment(theta: f64, lever: f64) -> (Iso3, Iso3) {
-    // `Iso3::new` rather than a struct literal. The reason written here was that
-    // the type carried a private `_pad` a consumer could not fill; `0042`
-    // removed it, so the literal compiles now. `new` stays because it is the
-    // constructor the rest of this crate uses.
+    // `Iso3::new`, the constructor the rest of this crate uses.
     let pose_at = |a: f64| {
         Iso3::new(
             axis_angle(a, 0.0, 0.0, 1.0),
@@ -95,9 +62,7 @@ fn deviation(a: &Iso3, b: &Iso3) -> (f64, f64) {
             truth.t.z - approx.t.z,
         );
         dt = dt.max(d.norm());
-        // Angle of the relative rotation, via the quaternion dot — the `acos`
-        // form is fine here because this is an offline characterisation and not
-        // the hot path D12 is about.
+        // Angle of the relative rotation via the quaternion dot; `acos` is fine off the hot path (D12).
         let dot = (truth.q.w * approx.q.w
             + truth.q.x * approx.q.x
             + truth.q.y * approx.q.y
@@ -110,8 +75,7 @@ fn deviation(a: &Iso3, b: &Iso3) -> (f64, f64) {
 }
 
 fn main() {
-    // 180 deg/s — `interp_cost`'s "brisk" body, so the two files describe the
-    // same motion and their rows can be read side by side.
+    // 180 deg/s — `interp_cost`'s "brisk" body, so rows read side by side.
     const OMEGA: f64 = core::f64::consts::PI;
     const LEVER: f64 = 0.5; // a sensor half a metre off the turn centre
 

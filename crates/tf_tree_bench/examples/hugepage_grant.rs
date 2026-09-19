@@ -1,33 +1,21 @@
 //! Did the kernel *grant* the huge pages the arena asked for?
 //!
-//! `MappedArena::attach` issues `MADV_HUGEPAGE` (`mapped.rs`), and
-//! `docs/PHASE5.md` §2.3 aligns a frozen arena to 2 MiB specifically so that
-//! advice is meaningful — citing the arithmetic, a 115 MB index needs ~28 000
-//! TLB entries on 4 KiB pages and 55 on 2 MiB ones. Nothing anywhere checks
-//! whether the advice was **taken**.
-//!
-//! It usually is not. A live arena is a sealed `memfd` mapped `MAP_SHARED` —
-//! shmem, not anonymous memory — and shmem huge pages are governed by a
-//! *different* sysfs knob whose stock default is `never`:
+//! `MappedArena::attach` issues `MADV_HUGEPAGE` and `docs/PHASE5.md` §2.3 aligns a frozen arena to
+//! 2 MiB for it, but nothing checks the advice was **taken**. It usually is not: a live arena is
+//! shmem, governed by a different sysfs knob whose stock default is `never`:
 //!
 //! ```text
 //! /sys/kernel/mm/transparent_hugepage/enabled        always [madvise] never
 //! /sys/kernel/mm/transparent_hugepage/shmem_enabled  always within_size advise [never] deny force
 //! ```
 //!
-//! So the request is issued, the kernel declines it silently, and every reader
-//! of `PHASE5.md` §2.3 believes the arena is on 2 MiB pages.
+//! So the request is issued and declined silently.
 //!
 //! # What this measures
 //!
-//! For the arena's own address range, read from `/proc/self/smaps`:
-//!
-//! * `ShmemPmdMapped` — bytes actually backed by huge pages. **This is the
-//!   grant.** Zero means the advice was declined.
-//! * `Rss` — how much of the mapping is resident at all, so a zero grant on an
-//!   untouched mapping is not mistaken for a refused one.
-//!
-//! and alongside it a lookup latency, so the two can be read together.
+//! For the arena's address range in `/proc/self/smaps`: `ShmemPmdMapped` (bytes on huge pages; **the
+//! grant**, zero means declined) and `Rss` (so zero on an untouched mapping is not read as a
+//! refusal), alongside a lookup latency.
 //!
 //! # Running the counterfactual
 //!
@@ -39,9 +27,7 @@
 //! echo never  | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled
 //! ```
 //!
-//! The arena must be **large** for this to mean anything: huge pages come in
-//! 2 MiB units, so a 300 KiB arena can never receive one however the host is
-//! configured. The default here is sized past that by a wide margin.
+//! The arena must be **large**: huge pages come in 2 MiB units.
 #![allow(
     missing_docs,
     clippy::unwrap_used,
@@ -57,17 +43,11 @@ use tf_tree::{Capacity, EdgeCfg, InterpPolicy, Stamp, SystemDomain, Tree, TreeBu
 use tf_tree_bench::fixture::dynamic_pose;
 use tf_tree_core::EdgeId;
 
-/// Dynamic edges. Wide rather than deep: `MAX_DEPTH` caps a *compiled* chain at
-/// 32 and `MAX_PATH_EDGES` the walk at 64, and the point is arena *size*, so the
-/// frames fan out from one root.
+/// Dynamic edges. Wide rather than deep (`MAX_DEPTH` 32, `MAX_PATH_EDGES` 64): the point is arena *size*.
 const EDGES: usize = 64;
-/// Slots per ring. 64 edges x 16384 slots x 72 B/sample is ~75 MiB of arena —
-/// well past the 2 MiB huge-page unit, and past the 32 MiB L3 too.
+/// Slots per ring: 64 edges x 16384 slots x 72 B is ~75 MiB, past the 2 MiB huge-page unit.
 const SLOTS: u32 = 16_384;
-/// Samples pushed per edge — the whole ring. Residency is the point: a huge
-/// page is 2 MiB of *contiguous* memory, so a sparsely touched mapping cannot
-/// receive one however the host is configured, and a partial fill would
-/// under-report the grant rather than measure it.
+/// Samples pushed per edge — the whole ring: a sparsely touched mapping cannot receive a huge page.
 const FILL: usize = SLOTS as usize - 1;
 const N: usize = 4_096;
 const ROUNDS: usize = 21;
@@ -75,9 +55,8 @@ const ROUNDS: usize = 21;
 /// Huge-page and residency facts for one mapping, in kB as `smaps` reports them.
 #[derive(Default, Debug, Clone, Copy)]
 struct MapFacts {
-    /// The mapping's start address — the fact that decides whether a huge page
-    /// is even *possible*. Shmem THP needs `vaddr` congruent to the file offset
-    /// modulo 2 MiB, and `mmap(NULL, ..)` promises only page alignment.
+    /// The mapping's start address, which decides whether a huge page is possible: shmem THP needs
+    /// `vaddr` congruent to the file offset modulo 2 MiB, and `mmap(NULL, ..)` promises only page alignment.
     start: usize,
     size_kb: u64,
     rss_kb: u64,
@@ -87,13 +66,8 @@ struct MapFacts {
     found: bool,
 }
 
-/// The `smaps` entry covering `addr`.
-///
-/// `/proc/self/smaps` is a sequence of `start-end perms ...` headers, each
-/// followed by `Field:  N kB` lines. Selecting by *address* rather than by name
-/// matters: a `memfd` shows up as `/memfd:tf_tree.… (deleted)`, an anonymous
-/// mapping shows nothing, and a `.tft` shows its path — so matching on the name
-/// would work for one backing and silently return zeros for the others.
+/// The `smaps` entry covering `addr`. Selected by *address*: a `memfd`, an anonymous mapping and a
+/// `.tft` show three different names.
 fn map_facts(addr: usize) -> MapFacts {
     let mut out = MapFacts::default();
     let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else {
@@ -139,21 +113,10 @@ fn map_facts(addr: usize) -> MapFacts {
 
 /// The `/proc/vmstat` counters named by `keys`, in order; `None` for any absent.
 ///
-/// **This is what separates the two ways a grant can be zero**, and without it
-/// the harness can only say "no huge pages" and leave the reader to guess:
-///
-/// * `thp_*_fallback` rising ⇒ the kernel *tried* and could not find a
-///   contiguous 2 MiB block. That is memory fragmentation, a host condition that
-///   comes and goes.
-/// * every counter flat ⇒ the kernel never tried at all. That is policy, or a
-///   kernel that does not support it here — permanent, and not something the
-///   arena can influence.
-///
-/// Matches the **whole** field name rather than a prefix, and reads the file
-/// once. `/proc/vmstat` carries both `thp_fault_fallback` and
-/// `thp_fault_fallback_charge`, and the former is a strict prefix of the latter,
-/// so a `strip_prefix` match returns whichever the kernel happens to print
-/// first — a silently wrong number rather than a missing one.
+/// This separates the two ways a grant can be zero: `thp_*_fallback` rising means the kernel tried and
+/// found no contiguous 2 MiB block (fragmentation, transient); every counter flat means it never
+/// tried (policy, permanent). Matches the **whole** field name: `thp_fault_fallback` is a prefix of
+/// `thp_fault_fallback_charge`.
 fn vmstat_all(keys: &[&str]) -> Vec<Option<u64>> {
     let text = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
     keys.iter()
@@ -204,8 +167,7 @@ fn build(shared: bool) -> (Tree, Vec<String>) {
     (tree, names)
 }
 
-/// Median ns per lookup, cycling across every edge so the whole arena is
-/// touched rather than one hot ring.
+/// Median ns per lookup, cycling across every edge so the whole arena is touched.
 fn latency(tree: &Tree, names: &[String]) -> f64 {
     let root = tree.frame(&names[0]).unwrap();
     let plans: Vec<_> = (0..EDGES)
@@ -244,9 +206,7 @@ fn latency(tree: &Tree, names: &[String]) -> f64 {
 }
 
 fn report(label: &str, tree: &Tree, names: &[String]) {
-    // Any address inside the arena identifies its mapping, and an edge record
-    // is one — reached through the ordinary read API, so this needs no unsafe
-    // and no new accessor on the facade.
+    // Any address inside the arena identifies its mapping; an edge record is one, reached via the read API.
     let guard = tree.guard();
     let addr = core::ptr::from_ref(guard.view().edge(EdgeId(1)).expect("edge 1")) as usize;
     let f = map_facts(addr);

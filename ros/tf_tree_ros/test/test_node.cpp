@@ -1,10 +1,6 @@
-// `docs/PHASE4.md` §5.8 forms 1 and 2 — the parameter surface, which is the
-// only thing they add to form 3.
-//
-// The component machinery itself is rclcpp's to test; that a
-// `RCLCPP_COMPONENTS_REGISTER_NODE` produces a plugin and an executable is
-// checked as an artifact by `ros/build.sh`. What is this package's to get
-// wrong, and what is here, is every parameter that can silently do nothing.
+// `docs/PHASE4.md` §5.8 forms 1 and 2 — the parameter surface, the only thing
+// they add to form 3. That the component registers is checked by `ros/build.sh`;
+// what is here is every parameter that can silently do nothing.
 
 #include <chrono>
 #include <memory>
@@ -53,14 +49,11 @@ tf2_msgs::msg::TFMessage message_at(int64_t stamp_ns)
   return msg;
 }
 
-/// The topic parameters are the ones that fail *invisibly*: a bridge that
-/// ignored `tf_topic` would subscribe to `/tf`, receive nothing on a namespaced
-/// or replayed stream, and report a perfectly healthy zero.
+/// The topic parameters fail invisibly (a bridge on `/tf` hears nothing on a
+/// namespaced stream and reports a healthy zero).
 ///
-/// **Mutant:** in `BridgeNode`'s constructor, replace the `tf_topic` parameter
-/// read with the literal `"/tf"`. The bridge then listens on `/tf` while this
-/// test publishes on `/tf_node_test`, nothing is ever applied, and the wait
-/// times out. Applied; it dies.
+/// Mutant: replace the `tf_topic` read in `BridgeNode`'s constructor with `"/tf"`;
+/// nothing is applied and the wait times out.
 TEST(BridgeNodeTest, the_topic_parameters_are_the_topics_the_bridge_subscribes_to)
 {
   auto node = std::make_shared<tf_tree_ros::BridgeNode>(
@@ -89,42 +82,23 @@ TEST(BridgeNodeTest, the_topic_parameters_are_the_topics_the_bridge_subscribes_t
   EXPECT_GE(node->bridge().stats().applied, 1u);
 }
 
-/// A node with no topology declares nothing, so it can never write anything —
-/// §5.8's amendment, `docs/decisions/0004`, D4.
+/// No topology is refused (§5.8's amendment, `docs/decisions/0004`, D4). This
+/// asserts the parameter surface; the empty topology itself is refused in
+/// `tft_bridge_create` (`IngestTest.form_3_refuses_a_topology_that_declares_no_edges`).
 ///
-/// What this asserts is the *parameter* surface: "neither parameter set" is
-/// indistinguishable from an empty string by the time it reaches C, and this is
-/// where an operator gets told which parameter to set. The empty topology
-/// itself is refused one layer down, in `tft_bridge_create`, so all three of
-/// §5.8's deployment forms inherit the refusal —
-/// `IngestTest.form_3_refuses_a_topology_that_declares_no_edges` is the same
-/// property asserted against form 3.
-///
-/// **Mutant:** delete the `throw` in the both-or-neither check. Construction
-/// reaches `tft_bridge_create("")`, which now refuses it, so a `BridgeError`
-/// comes out instead — a different type from the `std::invalid_argument` this
-/// expects, and `EXPECT_THROW` reports the mismatch. Applied; it dies.
-/// (This test's first docstring predicted exactly that `BridgeError` and was
-/// wrong at the time, because `tft_bridge_create("")` then returned `TFT_OK`.
-/// It is true now because that was fixed, not because the prediction was.)
+/// Mutant: delete the both-or-neither `throw`; a `BridgeError` comes out instead
+/// of `std::invalid_argument`.
 TEST(BridgeNodeTest, a_node_given_no_topology_at_all_refuses_to_start)
 {
   EXPECT_THROW(
     std::make_shared<tf_tree_ros::BridgeNode>(rclcpp::NodeOptions()), std::invalid_argument);
 }
 
-/// Both topology parameters set is equally refused: there is no rule for which
-/// one wins that an operator could predict.
+/// Both topology parameters set is equally refused. The file is `/dev/null` so
+/// `read_file`'s own refusal cannot make this pass vacuously.
 ///
-/// The file is `/dev/null` on purpose. A path that does not exist would make
-/// this test pass through `read_file`'s own refusal even with the check gone —
-/// a test that holds for a reason other than the one it is named for.
-///
-/// **Mutant:** delete the `throw` in the both-or-neither check. `/dev/null`
-/// reads as an empty config, `config_file` wins the ternary below it, and
-/// `tft_bridge_create` refuses that with a `BridgeError` — not the
-/// `std::invalid_argument` this expects, so `EXPECT_THROW` fails on the type.
-/// Applied; it dies.
+/// Mutant: delete the both-or-neither `throw`; `tft_bridge_create` refuses the
+/// empty config with a `BridgeError`, the wrong type.
 TEST(BridgeNodeTest, a_node_given_two_topologies_refuses_to_start)
 {
   EXPECT_THROW(
@@ -137,15 +111,9 @@ TEST(BridgeNodeTest, a_node_given_two_topologies_refuses_to_start)
     std::invalid_argument);
 }
 
-/// A misspelled `authority` is refused rather than defaulted.
+/// A misspelled `authority` is refused rather than defaulted (§5.4).
 ///
-/// §5.4 documents `last_writer_wins` as chaotic and `strict` as the CI policy,
-/// so a typo quietly becoming `first_writer_wins` is an operator believing the
-/// bridge enforces something it does not.
-///
-/// **Mutant:** make `parse_authority` return `Authority::FirstWriterWins` for an
-/// unknown string instead of throwing. Nothing throws and `EXPECT_THROW` fails.
-/// Applied; it dies.
+/// Mutant: make `parse_authority` return `FirstWriterWins` for an unknown string.
 TEST(BridgeNodeTest, an_unknown_authority_policy_is_refused_rather_than_defaulted)
 {
   EXPECT_THROW(
@@ -158,33 +126,14 @@ TEST(BridgeNodeTest, an_unknown_authority_policy_is_refused_rather_than_defaulte
     std::invalid_argument);
 }
 
-/// An `arena_name` whose whitespace an operator cannot see is refused rather
-/// than published.
+/// An `arena_name` whose whitespace an operator cannot see is refused. `""` vs
+/// `"  "` is private arena vs a rendezvous nobody guesses; `" spaced"` vs
+/// `"spaced"` is two arenas, and the ABI accepts them all. Every other malformed
+/// name is the ABI's to refuse.
 ///
-/// This is the *only* content rule this layer applies to `arena_name`, and the
-/// reason is the one `BridgeNode`'s constructor gives at the parameter: a
-/// consumer selects the arena by exact name, so two names that read the same in
-/// a launch file and resolve to different rendezvous are a consumer that waits
-/// forever with nothing in any log to say why. Both cases below are that:
-/// `""` versus `"  "` is "private arena" versus a published rendezvous nobody
-/// will guess, and `" spaced"` versus `"spaced"` is two arenas. `ArenaName`
-/// accepts all three of the non-empty ones — they are ordinary valid
-/// single-component names — so the ABI cannot make this call. Every other
-/// malformed name — too long, `../escape`, a NUL — is the ABI's to refuse and it
-/// does, with the name in the message.
-///
-/// **Mutant:** delete the whitespace check in `BridgeNode`'s constructor. Both
-/// names then reach `tft_bridge_create`, which accepts them, and the node
-/// constructs — nothing throws and `EXPECT_THROW` fails. Applied; it dies.
-/// (Should the surrounding environment make the *arena* unbuildable, the throw
-/// becomes a `BridgeError` instead, which `EXPECT_THROW` also reports as a
-/// failure because the type does not match. The test cannot pass with the check
-/// gone.)
-///
-/// **Mutant:** narrow the check back to "entirely whitespace"
-/// (`find_first_not_of(...) == std::string::npos`). The `"  "` case still dies;
-/// the `" spaced"` case survives, which is exactly the gap this widening
-/// closed. Applied; the surrounded name fails.
+/// Mutant: delete the whitespace check in `BridgeNode`'s constructor; nothing
+/// throws. Mutant: narrow it to "entirely whitespace"; the `" spaced"` case
+/// survives.
 TEST(BridgeNodeTest, an_unseeable_whitespace_arena_name_is_refused_rather_than_published)
 {
   for (const std::string & name : {std::string("  "), std::string(" spaced")}) {

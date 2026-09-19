@@ -1,48 +1,19 @@
 //! What one [`Ingest::offer`] costs, in instructions — `docs/PHASE4.md` §7.
 //!
-//! # Instructions, not time, and that is not a compromise
+//! Instructions, not time: this host fails `Fitness::probe` (SMT, unreadable
+//! governor, `perf_event_paranoid` 4). `cachegrind`'s simulated `Ir` is exact
+//! under load but is not a latency figure.
 //!
-//! This host fails `tf_tree_bench`'s `Fitness::probe` for two reasons that do
-//! not go away by trying harder: four physical cores with SMT on, and a governor
-//! it cannot read. Every timing row in `crates/tf_tree_bench/baseline/results.json`
-//! is `unavailable` in consequence, and `/proc/sys/kernel/perf_event_paranoid` is
-//! `4`, so hardware counters are denied outright.
+//! As in `tf_tree_bench::bin::footprint`: `N = 0` does setup only, so
+//! `Ir(N) - Ir(0)` isolates the offers; no clock reads in the loop (receipt
+//! stamps are synthesised); one mode per process.
 //!
-//! `cachegrind` **simulates**, so its `Ir` is exact under load, independent of
-//! the governor, the scheduler and the SMT sibling. It is the only cost-shaped
-//! quantity this machine can state as a fact. It is emphatically **not** a
-//! latency figure and it does not convert into one: cachegrind models no
-//! out-of-order execution, no prefetch and no store buffer.
+//! The edge count is swept because a one-key `BTreeMap` never compares
+//! anything: `ByEdge` cost is `O(log E)` descents times the shared name prefix,
+//! so `Ir` per offer should rise with edges before an index exists and be flat
+//! after. Both `short` (4 shared bytes) and `ros` (15) names are reported.
 //!
-//! # Three properties copied from `tf_tree_bench::bin::footprint`
-//!
-//! 1. **`N = 0` performs setup and no offers**, so `Ir(N) - Ir(0)` removes
-//!    construction, teardown and process startup *exactly*.
-//! 2. **No clock reads inside the loop.** The receipt stamp is synthesised
-//!    arithmetically. This is the one place it diverges deliberately from
-//!    `crates/tf_tree_c/examples/bridge_cost.rs`, which reads the real clock
-//!    because it is measuring time and this is not.
-//! 3. **One mode per process**, so allocator state cannot leak between subjects.
-//!
-//! # Why it sweeps the edge count, which is the whole point
-//!
-//! A `BTreeMap` with one key never compares anything. A single-edge measurement
-//! would report descents that do no work, which is exactly the trap
-//! `crates/tf_tree_c/examples/bridge_cost.rs` records in its own header. The
-//! sweep is what turns "it got faster" into a *shape*: the `ByEdge` tables cost
-//! `O(log E)` descents times `O(shared prefix)` per `memcmp`, so `Ir` per offer
-//! should **rise with the edge count** before an index is introduced and be
-//! **flat** after. If it does not rise before, the premise of the refactor is
-//! wrong and this binary is how that would be discovered.
-//!
-//! Name style matters for the same reason and is swept for the same reason:
-//! `link0`..`link99` share a four-byte prefix, while a real robot's
-//! `robot1/arm/wrist_1_link` shares fifteen or more and costs proportionally
-//! more per node visited. Both rows are reported; quoting only the long-name row
-//! would be picking the flattering measurement.
-//!
-//! Run: `just bridge-footprint` (needs the container — `valgrind` is not
-//! installed on the host).
+//! Run: `just bridge-footprint` (container; needs `valgrind`).
 // This binary's entire output *is* its result.
 #![allow(
     clippy::unwrap_used,
@@ -58,8 +29,7 @@ use tf_tree_bridge::{Action, Ingest, Publisher, Sample, SteadyNanos, Topic, Topo
 
 /// `docs/PHASE4.md` §7's row is "1 kHz × 20 edges", so 20 is the headline.
 const EDGES_DEFAULT: usize = 20;
-/// Never zero: `SteadyNanos(0)` is the "no receipt clock" sentinel and would
-/// leave the offset table dormant, measuring a path no robot takes.
+/// Never zero: `SteadyNanos(0)` is the "no receipt clock" sentinel.
 const T0: i64 = 5_000_000_000_000;
 const STAMP0: i64 = 10_000_000_000;
 const MS: i64 = 1_000_000;
@@ -99,45 +69,31 @@ fn topology(edges: usize, style: Names) -> String {
 enum Mode {
     /// The accepted `/tf` transform. The path a healthy robot spends its life on.
     Declared,
-    /// An edge the config does not declare. A different table, and a path with
-    /// its own allocation budget.
+    /// An edge the config does not declare.
     Undeclared,
-    /// A publisher replaying stamps from five seconds ago, forever. Refused
-    /// every time, and — by design — never latching, so a stuck node occupies
-    /// this path indefinitely at full rate. `steady_state_alloc.rs` records that
-    /// this is where a real two-allocation-per-message defect once hid with
-    /// every other test green.
+    /// A publisher replaying stamps from five seconds ago: refused every time, never latching.
     Regressing,
 }
 
-/// The only loop. Both the counted and the timed entry points reach it, so the
-/// two cannot drift about what work is being measured.
+/// The only loop; the counted and timed entry points share it.
 #[inline(never)]
 fn run(mode: Mode, edges: usize, style: Names, n: usize) -> u64 {
     let cfg = TopologyConfig::parse(&topology(edges, style)).unwrap();
     let mut ingest = Ingest::new(&cfg);
     let publisher = Publisher::named(&tf_tree_bridge::gid_for_name("/ekf"), "/ekf");
 
-    // **Built before the loop, and this is not a detail.** Assigning
-    // `s.frame_id = p.clone()` inside the loop would put a `String` allocation
-    // and a memcpy into the instruction count and charge them to `offer`. An
-    // `rclcpp` caller does not do that either: it holds the `TransformStamped`
-    // the message already owns.
+    // Built before the loop: a per-iteration `String` clone would be charged to `offer`.
     let mut samples: Vec<Sample> = Vec::with_capacity(edges);
     for i in 0..edges {
         let (p, c) = match mode {
-            // Deliberately absent from the config, and distinct per index so the
-            // undeclared table is exercised rather than one key being re-probed.
+            // Absent from the config, distinct per index.
             Mode::Undeclared => (format!("ghost{i}"), format!("ghost{}", i + 1)),
             _ => edge_names(style, i),
         };
         samples.push(Sample::identity(&p, &c, STAMP0).received_at(SteadyNanos(T0)));
     }
 
-    // **Warm-up outside the counted window.** An edge's first sighting
-    // legitimately interns, allocates its counter row and seeds its offset
-    // baseline; charging that to the steady state would flatter whichever
-    // variant amortises it better.
+    // Warm-up outside the counted window: first sightings intern and allocate.
     let mut stamp = STAMP0;
     let mut received = T0;
     for k in 0..(edges * 4) {
@@ -152,9 +108,7 @@ fn run(mode: Mode, edges: usize, style: Names, n: usize) -> u64 {
         let _ = ingest.offer(Topic::Tf, &s, &publisher);
     }
 
-    // The regressing fixture rewinds five seconds and stays there: every offer
-    // from here is past the threshold, refused, and — with one publisher — never
-    // promoted to a reset.
+    // Regressing: rewind five seconds and stay there.
     let base_stamp = if mode == Mode::Regressing {
         stamp - 5_000 * MS
     } else {
@@ -188,31 +142,10 @@ fn run(mode: Mode, edges: usize, style: Names, n: usize) -> u64 {
     black_box(accepted)
 }
 
-/// Wall-clock cost per offer, over `threads` **independent** bridges.
-///
-/// # Why independent bridges, and what that does and does not test
-///
-/// `Ingest::offer` takes `&mut self` and the C ABI is thread-affine —
-/// `tft_bridge_offer` is legal only on the thread that created the bridge — so
-/// there is no such thing as N threads sharing one `Ingest`, and a harness that
-/// pretended otherwise would be measuring a configuration the design forbids.
-/// N threads here is N bridges, which is the shape a multi-robot host actually
-/// runs.
-///
-/// So this does **not** measure lock contention; there are no locks. What it
-/// does measure, and what a single-threaded instruction count structurally
-/// cannot see, is whether the change is bought back by the allocator or by
-/// memory bandwidth once several bridges run at once. An interning refactor
-/// trades a scattered `BTreeMap` walk for a denser table, and denser tables
-/// share a last-level cache.
-///
-/// # The statistic
-///
-/// Min of `ROUNDS` rounds. Every source of noise on this host **adds** time and
-/// none removes it, so the fastest round is the closest thing to the work
-/// itself — the same argument `crates/tf_tree_c/examples/bridge_cost.rs` makes.
-/// The figure is ns per offer *per thread*, so a perfectly scaling change holds
-/// it flat as `threads` rises and a bandwidth-bound one does not.
+/// Wall-clock ns per offer per thread, over `threads` **independent** bridges
+/// (`Ingest::offer` is `&mut self` and thread-affine, so none share one).
+/// Measures allocator and bandwidth effects, not lock contention. Min of
+/// `ROUNDS` rounds, since noise only adds time.
 fn time(mode: Mode, edges: usize, style: Names, n: usize, threads: usize) {
     const ROUNDS: usize = 7;
     let mut best = f64::INFINITY;
@@ -254,15 +187,12 @@ fn main() {
         _ => Names::Short,
     };
 
-    // A `threads` argument switches from the counted mode to the timed one.
-    // They share `run`, so the two cannot measure different work.
+    // A `threads` argument switches to the timed mode.
     if let Some(threads) = a.get(5).and_then(|s| s.parse::<usize>().ok()) {
         time(mode, edges, style, n, threads.max(1));
         return;
     }
     let accepted = run(mode, edges, style, n);
-    // One line, so `just bridge-footprint` can prefix it with the cachegrind
-    // ledger without reformatting. `accepted` is printed so a run that silently
-    // stopped doing work cannot masquerade as a fast one.
+    // One line for `just bridge-footprint`; `accepted` shows the run did work.
     println!("offer_cost n={n} edges={edges} accepted={accepted}");
 }

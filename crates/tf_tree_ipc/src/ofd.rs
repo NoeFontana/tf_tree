@@ -1,65 +1,32 @@
 //! Open file description locks — `F_OFD_SETLK` / `F_OFD_GETLK`.
 //!
-//! `docs/PHASE2.md` §3.3 is unambiguous about which lock flavour the rendezvous
-//! is built on, and the distinction is not cosmetic:
-//!
-//! * **Classic POSIX locks** (`F_SETLK`) are owned by the *process*, and the
-//!   kernel drops every one of them when **any** file descriptor to that file is
-//!   closed anywhere in the process. A library that shares an address space with
-//!   code it does not control cannot defend against that: an unrelated crate
-//!   that opens and closes the lock file — a config reader, a `doctor`
-//!   command — silently releases this crate's ownership lock, and two processes
-//!   then both believe they own the arena. There is no way to detect it after
-//!   the fact.
-//! * **OFD locks** (`F_OFD_SETLK`, Linux ≥ 3.15) are owned by the open file
-//!   description. They survive an unrelated `open`/`close` of the same path,
-//!   they are released exactly when the last descriptor referring to *that*
-//!   description closes — which the kernel does on process death, including
-//!   `SIGKILL` — and two descriptions conflict even inside one process.
+//! `docs/PHASE2.md` §3.3 requires OFD locks. Classic POSIX locks are owned by the
+//! process and dropped when *any* descriptor to the file closes, so an unrelated
+//! crate opening the lock file would silently release ownership. OFD locks
+//! (Linux ≥ 3.15) belong to the open file description, release when its last
+//! descriptor closes (including on `SIGKILL`), and conflict even inside one
+//! process.
 //!
 //! # Why `libc::fcntl`
 //!
-//! `rustix` 1.1 exposes `flock` (whole file), `fcntl_lock` (classic `F_SETLK`,
-//! whole file) and `fcntl_getlk` (classic `F_GETLK`). None of the three can take
-//! an OFD lock, and byte-range OFD locking is exactly what §3.3's layout needs.
-//! So this module calls `fcntl` through `libc` — a **documented deviation from
-//! §2's "no libc crate"**, argued in full in the block comment below. It is one
-//! of the two `unsafe` sites in this crate; the other is `fork`'s
-//! `pthread_atfork` shim.
+//! `rustix` 1.1 has no OFD locking, so this module calls `fcntl` through `libc`:
+//! a deviation from §2's "no libc crate", which exists to avoid a C build step
+//! that `libc` does not introduce. It is one of two `unsafe` sites in this crate;
+//! the other is `fork`'s `pthread_atfork` shim.
 //!
 //! # SAFETY (module invariant)
 //!
-//! [`fcntl_flock`] performs the `fcntl` syscall with a pointer to a `libc::flock`
-//! owned by its caller's stack frame for the duration of the call. The kernel
-//! reads it for `F_OFD_SETLK` and reads *and writes* it for `F_OFD_GETLK`, never
-//! retains it, and never touches any other user memory. Every caller in this
-//! module passes `&mut libc::flock`, so the pointer is valid, aligned, unaliased
-//! and sized correctly by construction; `libc::flock` is `libc`'s own
-//! definition, which is the kernel's `struct flock` on every target `libc`
-//! supports.
+//! [`fcntl_flock`] passes `fcntl` a `&mut libc::flock` owned by the caller's
+//! frame for the call. The kernel reads it (and writes it for `F_OFD_GETLK`),
+//! never retains it, and touches no other user memory; the pointer is valid,
+//! aligned and unaliased, and `libc::flock` is the kernel's `struct flock`.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use rustix::io::Errno;
 
-// `struct flock`, the `F_OFD_*` command numbers, and the `fcntl` syscall number
-// are all architecture- and ABI-dependent in ways that bite: 32-bit targets need
-// `flock64` and `fcntl64`, and sparc and hppa renumber `F_RDLCK`/`F_WRLCK`/
-// `F_UNLCK`. `libc` carries the correct definitions for every target Rust
-// supports, which is why this module uses them rather than its own.
-//
-// **This is a documented deviation from `docs/PHASE2.md` §2**, which names
-// `rustix` and says "no libc crate". rustix 1.1.4 has no OFD locking at all —
-// its `fcntl_lock` is *classic* `F_SETLK` and whole-file, which §3.3 rejects by
-// name, and `flock` is whole-file too. So the choice was between hand-rolling
-// the syscall and taking `libc`.
-//
-// Hand-rolling was tried first and rejected on review: it pinned the syscall
-// number and `struct flock` layout by hand and `compile_error!`d on every
-// architecture except x86-64 and aarch64 — including riscv64 and ppc64le. A
-// lock primitive that the entire rendezvous depends on is the wrong place to
-// carry a hand-maintained ABI, and §2's rationale is "no C build step", which
-// `libc` does not introduce: it is declarations, not compilation.
+// `libc` carries the correct `struct flock`, `F_OFD_*` numbers and `fcntl`
+// syscall for every target (32-bit `flock64`, sparc/hppa renumbering).
 
 /// `F_OFD_GETLK` — query without taking. Reports only *conflicting* locks, so a
 /// lock held by the querying description itself always reads as free.
@@ -83,17 +50,13 @@ pub(crate) enum LockKind {
 /// `SEEK_SET`: offsets in [`Range`] are absolute file offsets.
 const SEEK_SET: i16 = 0;
 
-/// A byte range of the lock file.
-///
-/// Ranges are single bytes almost everywhere in §3.3 — the point of a byte range
-/// is not to protect data (the file holds none at these offsets) but to give the
-/// kernel a *name* for a lock, one per role and per slot.
+/// A byte range of the lock file. Ranges are single bytes: the range names a
+/// lock, it does not protect data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Range {
     /// First byte of the range.
     pub start: u64,
-    /// Length in bytes. Never 0 here: `l_len == 0` means "to end of file",
-    /// which would make every range collide with every other.
+    /// Length in bytes. Never 0: `l_len == 0` means "to end of file".
     pub len: u64,
 }
 
@@ -119,17 +82,12 @@ pub enum LockAttempt {
 /// What `F_OFD_GETLK` reports about a range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LockProbe {
-    /// Whether a *conflicting* lock is held. Locks held by the querying
-    /// descriptor itself are invisible here — the kernel reports conflicts, and
-    /// nothing conflicts with itself.
+    /// Whether a *conflicting* lock is held; the querying description's own locks
+    /// are invisible.
     pub held: bool,
-    /// The `l_pid` the kernel filled in. `-1` for an OFD lock, which is the
-    /// documented (`docs/PHASE2.md` §3.3) consequence of an OFD lock belonging
-    /// to a file description rather than a process — nobody can be named. `0`
-    /// when nothing is held.
-    ///
-    /// The lock file therefore answers *"is anyone alive?"*, and *"who?"* comes
-    /// from the identity records, which is why those exist as plain data.
+    /// The `l_pid` the kernel filled in: `-1` for an OFD lock (nobody can be
+    /// named, `docs/PHASE2.md` §3.3), `0` when nothing is held. Names come from
+    /// the identity records.
     pub holder_pid: i32,
 }
 
@@ -144,15 +102,12 @@ pub(crate) fn try_lock(
         l_whence: SEEK_SET,
         l_start: range.start as i64,
         l_len: range.len as i64,
-        // NORMATIVE for the OFD commands: `fcntl(2)` requires `l_pid` to be zero
-        // on input, and returns EINVAL otherwise.
+        // NORMATIVE: `fcntl(2)` requires `l_pid == 0` on input for OFD commands.
         l_pid: 0,
     };
     match fcntl_flock(fd, F_OFD_SETLK, &mut lock) {
         Ok(()) => Ok(LockAttempt::Acquired),
-        // EAGAIN is what Linux returns; POSIX permits EACCES and some
-        // filesystems use it. Treating only one of them as contention would
-        // turn a lost race into a hard failure.
+        // Linux returns EAGAIN; POSIX permits EACCES.
         Err(e) if e == Errno::AGAIN || e == Errno::ACCESS => Ok(LockAttempt::Contended),
         Err(e) => Err(e),
     }
@@ -161,8 +116,7 @@ pub(crate) fn try_lock(
 /// Ask whether anyone *else* holds a conflicting lock on `range`.
 pub(crate) fn probe(fd: BorrowedFd<'_>, range: Range) -> Result<LockProbe, Errno> {
     let mut lock = libc::flock {
-        // Ask about an exclusive lock: it conflicts with both shared and
-        // exclusive holders, so this reports any holder at all.
+        // An exclusive query conflicts with any holder.
         l_type: LockKind::Exclusive as i16,
         l_whence: SEEK_SET,
         l_start: range.start as i64,
@@ -170,8 +124,7 @@ pub(crate) fn probe(fd: BorrowedFd<'_>, range: Range) -> Result<LockProbe, Errno
         l_pid: 0,
     };
     fcntl_flock(fd, F_OFD_GETLK, &mut lock)?;
-    // The kernel signals "no conflict" by overwriting `l_type` with F_UNLCK and
-    // leaving the rest of the structure alone.
+    // No conflict: the kernel overwrites `l_type` with F_UNLCK.
     let held = lock.l_type != LockKind::Unlock as i16;
     Ok(LockProbe {
         held,
@@ -182,10 +135,8 @@ pub(crate) fn probe(fd: BorrowedFd<'_>, range: Range) -> Result<LockProbe, Errno
 /// `fcntl(fd, cmd, &mut flock)`, returning the kernel's errno on failure.
 fn fcntl_flock(fd: BorrowedFd<'_>, cmd: i32, lock: &mut libc::flock) -> Result<(), Errno> {
     // SAFETY: `fcntl` with an `F_OFD_*` command reads (and, for `F_OFD_GETLK`,
-    // writes) exactly one `struct flock` through the pointer, and does not
-    // retain it. `lock` is a live, aligned, uniquely-borrowed `libc::flock` —
-    // libc's own definition, so the layout is the kernel's by construction — and
-    // the descriptor is borrowed for the whole call.
+    // writes) one `struct flock` through the pointer without retaining it; `lock`
+    // is live, aligned and uniquely borrowed, and the fd is borrowed for the call.
     let ret = unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), cmd, lock as *mut libc::flock) };
     if ret < 0 {
         return Err(Errno::from_raw_os_error(
@@ -203,14 +154,8 @@ mod tests {
 
     #[test]
     fn flock_matches_the_kernel_abi() {
-        // If this ever drifts, every lock in the crate is placed at a garbage
-        // offset and the failure mode is silent.
-        // libc owns the layout now, so pinning field offsets here would only
-        // re-assert libc's own definition. What this crate still relies on is
-        // that the OFD commands exist and are distinct from the classic ones —
-        // if a target ever aliased them, `F_OFD_SETLK` would silently become a
-        // process-owned `F_SETLK` and every liveness guarantee in §3.3 would
-        // quietly evaporate.
+        // OFD commands must exist and differ from the classic ones; an alias would
+        // silently make locks process-owned.
         assert_ne!(libc::F_OFD_SETLK, libc::F_SETLK);
         assert_ne!(libc::F_OFD_GETLK, libc::F_GETLK);
         assert_ne!(libc::F_OFD_SETLK, libc::F_OFD_GETLK);
@@ -218,14 +163,9 @@ mod tests {
 
     #[test]
     fn a_bad_descriptor_reports_ebadf_rather_than_succeeding() {
-        // Proves the errno decode works end to end: an unopened fd must come
-        // back as EBADF, not as a spurious `Acquired`. (`borrow_raw(-1)` is not
-        // an option — std asserts on it — so use a number no test process has
-        // open.)
-        //
-        // SAFETY: fd 4096 is not open in this process; the `BorrowedFd` is only
-        // handed to a syscall that will reject it, and is never used to close,
-        // read, or write anything.
+        // An unopened fd must decode to EBADF, not a spurious `Acquired`.
+        // SAFETY: fd 4096 is not open here; the `BorrowedFd` only goes to a syscall
+        // that rejects it.
         let bad = unsafe { BorrowedFd::borrow_raw(4096) };
         let err = try_lock(bad, Range::byte(0), LockKind::Exclusive).unwrap_err();
         assert_eq!(err, Errno::BADF);

@@ -1,37 +1,19 @@
-//! Atomics abstraction: one import surface for both the production build and the
-//! `loom` model-checking build.
-//!
-//! Every concurrency primitive in this crate imports its atomics from
-//! `crate::sync`, **never** from `core::sync::atomic` directly. Under a normal
-//! build these are the real `core` atomics; under `--cfg loom` they are
-//! `loom`'s instrumented atomics, which the model checker uses to explore
-//! interleavings. The publish/read/claim/intern algorithms are written once
-//! against this surface and compile unchanged in both modes.
+//! Atomics abstraction: every concurrency primitive imports its atomics from
+//! `crate::sync`, never `core::sync::atomic`, so the same code compiles against
+//! real atomics or `loom`'s (`--cfg loom`).
 
 #[cfg(not(loom))]
 pub(crate) use core::sync::atomic::{fence, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
-// `AtomicU16` backs the topology `depth` field (2 of the block's 12 B per frame; stride in PHASE1 §4.3, field layout §5.2).
-// It is only used by the production arena view, which is itself
-// `#[cfg(not(loom))]`, so it is not re-exported under loom (loom need not model
-// it — the topology loom test uses a bespoke wider model).
+// `AtomicU16` backs the topology `depth` field; production arena view only, not modelled by loom.
 #[cfg(not(loom))]
 pub(crate) use core::sync::atomic::AtomicU16;
 
 #[cfg(loom)]
 pub(crate) use loom::sync::atomic::{fence, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
-/// A spin hint that yields to the model checker under `loom` and emits a plain
-/// CPU spin hint otherwise.
-///
-/// Waits that spin on another thread — the interning publish-then-spin
-/// (`frame::wait_for_publish`, bounded between liveness checks by A8), the
-/// topology mutation lock's bounded acquire spin (A2), plan compilation's
-/// snapshot retry, and the pose-slot seqlock retry in `buffer::read_slot` —
-/// must call this so `loom` schedules the thread they are waiting on rather
-/// than spinning forever inside a single interleaving. The odd generation the
-/// *topology* once used is gone: A1 removed that state entirely, and the only
-/// surviving odd/even sequence is the per-slot one in `buffer`.
+/// Spin hint that yields to the model checker under `loom`. Every wait on
+/// another thread must call it so loom schedules the awaited thread.
 #[cfg(not(loom))]
 #[inline]
 pub(crate) fn spin() {

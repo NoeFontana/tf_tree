@@ -1,32 +1,17 @@
 //! `tf_tree topology` — obtain, validate and explain a bridge topology file.
 //!
-//! `docs/PHASE4.md` §5.8's amendment: the bridge takes its topology from a
-//! config file up front, because the engine has no runtime edge declaration,
-//! *"and a `--discover` mode that subscribes, collects and prints a config file
-//! is how an operator obtains that file"*.
-//!
-//! Two modes, and they are the two halves of that sentence:
+//! `docs/PHASE4.md` §5.8's amendment: the bridge takes its topology from a config
+//! file, and `--discover` is how an operator obtains it.
 //!
 //! * `--discover <source>` — read a recorded `/tf` stream, print the config it
-//!   implies, and report what the stream contains that a config **cannot**
-//!   (a child with two parents; an edge on both topics).
-//! * `--config <file.toml>` — parse it, build the arena it describes, and print
-//!   what the bridge will accept. This is the pre-flight: a file that fails
-//!   here fails at bridge startup, and failing on a laptop is cheaper.
+//!   implies, and report what a config cannot express (a child with two parents;
+//!   an edge on both topics).
+//! * `--config <file.toml>` — parse it, build the arena, print what the bridge
+//!   will accept: a pre-flight for bridge startup.
 //!
-//! # Why the source is a `.tfstream` and not a subscription
-//!
-//! `--discover`'s value does not depend on a live ROS 2 graph: the collector in
-//! [`tf_tree_bridge::Discovery`] takes `(topic, sample)` pairs and does not
-//! know where they came from. The `rclcpp` half feeds it from a subscription;
-//! this feeds it from a recording, and both print the same file.
-//!
-//! **Not because ROS 2 is unavailable.** ROS 2 is in `docker/tf2`,
-//! `ros/tf_tree_ros` builds against it, and `just ros-test` is its gate. The
-//! reason is the one above: a collector that takes `(topic, sample)` pairs is
-//! testable without a graph, which is also what makes §6.3 and §6.4
-//! self-contained — the corpus in `testdata/tfstream/` is a real robot's
-//! `/tf`, not a fixture somebody invented (see its `ATTRIBUTION.md`).
+//! The source is a `.tfstream` because [`tf_tree_bridge::Discovery`] takes
+//! `(topic, sample)` pairs and needs no live ROS 2 graph; the corpus in
+//! `testdata/tfstream/` is a real robot's `/tf` (see its `ATTRIBUTION.md`).
 
 use std::path::Path;
 
@@ -38,28 +23,10 @@ use tf_tree_bridge::{Discovery, EdgeShape, Sample, Topic, TopologyConfig};
 
 /// Read a `.tfstream`, collect its topology, and return the config it implies.
 ///
-/// # Why every sample's receipt time is [`tf_tree_bridge::SteadyNanos::UNKNOWN`]
-///
-/// §5.5's common-mode detector needs a reference clock that is *independent of
-/// the clock under test* — online that is the local steady clock read once per
-/// `TFMessage`, offline it is the recorder's log time. **A `.tfstream` carries
-/// neither.** Its grammar (see [`tf_tree_bench::replay`]) is `S`/`D` lines with
-/// a rebased header stamp and nothing else: the converter that produced it
-/// discarded the bag's log times, and the stamps that remain are the very
-/// signal a receipt clock exists to corroborate.
-///
-/// So this passes the sentinel and says so, rather than passing a silent zero
-/// or — the tempting error — `stamp_nanos`. Substituting the stamp would make
-/// every publisher's offset identically zero, which re-enables inference over
-/// the signal under suspicion and resurrects the defect that per-publisher
-/// offsets were introduced to remove.
-///
-/// It costs nothing here. [`Discovery::observe`] normalizes names and records
-/// edge shape; it never consults a clock guard, an offset table or a stamp
-/// beyond storing it. The sentinel is only load-bearing for callers that feed
-/// [`tf_tree_bridge::Ingest`], where it means the common-mode layer is absent
-/// and a lone regression degrades to a per-edge drop — which is the ladder's
-/// bottom rung behaving exactly as designed.
+/// Every sample's receipt time is [`tf_tree_bridge::SteadyNanos::UNKNOWN`]: a
+/// `.tfstream` carries no log time, and passing `stamp_nanos` instead would make
+/// every offset zero and re-enable inference over the signal under suspicion
+/// (§5.5). [`Discovery::observe`] never consults a clock, so nothing is lost here.
 ///
 /// # Errors
 ///
@@ -72,29 +39,17 @@ pub fn discover_from_tfstream(
 ) -> Result<Discovery> {
     let stream = TfStream::load(path)?;
     let mut d = Discovery::new(history_secs);
-    // §5.6's `tf_prefix` belongs here and not only in the bridge: a discovered
-    // config keyed on `base_link` while the bridge that will read it keys on
-    // `robot1/base_link` declares every edge and matches none.
+    // §5.6: the prefix must match the bridge's, or every edge is declared and none match.
     if let Some(p) = tf_prefix {
         d = d.with_prefix(p);
     }
     if let Some(i) = interp {
         d = d.with_interp(i);
     }
-    // Statics first, matching the wire: `/tf_static` is transient-local, so a
-    // late-joining bridge receives the latched set before the first `/tf`
-    // message it sees. Feeding them in the other order would let a static edge
-    // be discovered as dynamic and mask §5.7's kind clash — the collector
-    // resolves a clash to whichever topic it saw first, so the order it is fed
-    // is part of what it reports.
+    // Statics first, matching the wire (`/tf_static` is latched); the collector
+    // resolves a §5.7 kind clash to the first topic seen.
     for (parent, child, iso) in &stream.static_edges {
-        // `Sample::identity` and then the pose, rather than a struct literal:
-        // `Sample` is not `#[non_exhaustive]` and gained `received` once
-        // already, so a literal here breaks this file every time a field is
-        // appended for a reason that has nothing to do with `--discover`.
-        //
-        // `received` stays at `SteadyNanos::UNKNOWN` — see the note above
-        // `discover_from_tfstream`.
+        // `Sample::identity`, not a literal: `Sample` is not `#[non_exhaustive]`.
         let mut sample = Sample::identity(parent, child, 0);
         sample.pose = pose_of(iso);
         d.observe(Topic::TfStatic, &sample);
@@ -133,18 +88,11 @@ pub fn cmd_discover(
     let config = d.to_config();
     let text = config.to_toml();
 
-    // Re-read what is about to be written. `Discovery` and the parser now share
-    // `frame_name_ok`, so this should never fire — which is exactly why it is
-    // here: the "a discovered config reparses" contract was asserted by three
-    // tests and enforced at no boundary, and the boundary is the one place an
-    // operator would otherwise meet the failure, on the robot.
+    // Boundary check that a discovered config reparses; should never fire.
     TopologyConfig::parse(&text)
         .map_err(|e| anyhow!("the discovered config does not reparse: {e}"))?;
 
-    // The findings go to **stderr**, always, so `--discover > topology.toml`
-    // produces a usable file and still tells the operator what it could not
-    // represent. Putting them in the file as comments would be worse: a config
-    // is edited and re-emitted, and the warning would survive the fix.
+    // Findings go to stderr so `--discover > topology.toml` stays a usable file.
     for (child, rejected) in d.multi_parent() {
         eprintln!(
             "warning: frame {child:?} has more than one parent in this recording; \
@@ -170,10 +118,7 @@ pub fn cmd_discover(
             d.dropped_bad_name()
         );
     }
-    // The per-edge sample count is what tells an operator whether a ring size
-    // is worth trusting: an edge sized from four samples got a rate measured
-    // over three intervals, and the number in the file looks exactly as
-    // confident as one measured over ten thousand.
+    // The sample count tells an operator how far to trust each edge's ring size.
     for (parent, child, n) in d.sample_counts() {
         eprintln!("  {parent} -> {child}: {n} samples");
     }
@@ -202,25 +147,18 @@ pub fn cmd_discover(
 pub fn cmd_check(path: &Path, domain: Option<u8>) -> Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    // `ConfigError` borrows from `text`, so it is rendered here rather than
-    // returned — that is the trade `Copy`, allocation-free errors make, and it
-    // is the right one for a type the bridge's hot path also holds.
+    // `ConfigError` borrows from `text`, so it is rendered here, not returned.
     let config = match TopologyConfig::parse(&text) {
         Ok(c) => c,
         Err(e) => bail!("{}: {e}", path.display()),
     };
-    // §5.5's NORMATIVE startup refusal, run here rather than only at bridge
-    // startup — the whole point of this command is that a file which fails on
-    // the robot should have failed on a laptop first.
+    // §5.5's NORMATIVE startup refusal, run here so it fails before the robot.
     if let Some(d) = domain {
         if let Err(e) = config.check_domain(d) {
             bail!("{}: {e}", path.display());
         }
     }
-    // Ask the config before asking the builder. The builder finds the same
-    // cycle and names it `FrameId(1)` — a number that indexes an arena which
-    // was never built, and which an operator holding a text file cannot map
-    // back to anything.
+    // Before the builder, which would name the cycle by an unmappable `FrameId`.
     if let Some(child) = config.cycle_child() {
         bail!(
             "{}: the declared topology has a cycle through frame {child:?} — \

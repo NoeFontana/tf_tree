@@ -1,15 +1,7 @@
 """Type stubs for the `tf_tree` extension module.
 
-Hand-written, not generated (`docs/PHASE3.md` §9). Generated stubs cannot
-express the scalar-vs-array return overloads on `Plan.at`, and those overloads
-are the most important thing a user needs to see: they are what makes the
-vectorised path the obvious one.
-
-The standing hazard with hand-written stubs is not that they are wrong on day
-one — it is that a method added in Rust never reaches them. `tests/python/
-test_stubs.py` closes that: it asserts every public symbol of the built module
-appears here. Signatures are ours; *existence* is checkable, and that is the
-half that rots.
+Hand-written (`docs/PHASE3.md` §9); `tests/python/test_stubs.py` asserts every
+public symbol of the built module appears here.
 """
 
 import os
@@ -20,22 +12,16 @@ from numpy.typing import NDArray
 
 class TfTreeError(Exception): ...
 
-# **Attributes exist only on instances the library raises**
-# (`docs/decisions/0058`). Each class below annotates its attributes precisely,
-# with no `| None` a raised instance never takes, and sets no class-level
-# default: an instance a caller constructs, such as a test double's
-# `side_effect`, has none of them and raises `AttributeError` on a read. An id
-# is never an integer: an edge is its stored `(parent, child)` frame names,
-# the shape `Tree.edges()` returns, and a frame its stored name, each `None`
-# where the arena holds no usable record at that id.
+# Attributes exist only on instances the library raises (`docs/decisions/0058`);
+# a caller-constructed instance raises `AttributeError` on a read. An id is never
+# an integer: an edge is its stored `(parent, child)` names, a frame its stored
+# name, each `None` where the arena holds no usable record.
 
 class ExtrapolationError(TfTreeError):
     """The requested stamp lies outside an edge's retained history.
 
-    The attributes exist only on instances the library raises. `requested`,
-    `oldest` and `newest` are integer nanoseconds on the clock `domain` names,
-    which is the query's time-domain tag (`tf_tree.SYSTEM_DOMAIN` and its
-    siblings, or a declared integer).
+    `requested`, `oldest` and `newest` are integer nanoseconds on the clock
+    `domain` names (the query's time-domain tag).
     """
 
     edge: tuple[str, str] | None
@@ -47,9 +33,7 @@ class ExtrapolationError(TfTreeError):
 class DisconnectedError(TfTreeError):
     """No path joins the two frames.
 
-    The attributes exist only on instances the library raises: the frame the
-    plan was compiled toward, the one it was compiled from, and the frame the
-    chain stopped at.
+    Attributes: the target frame, the source frame, and where the chain stopped.
     """
 
     target: str | None
@@ -57,29 +41,21 @@ class DisconnectedError(TfTreeError):
     cut_at: str | None
 
 class NoDataError(TfTreeError):
-    """An edge on the path has no samples yet.
-
-    `edge` exists only on instances the library raises.
-    """
+    """An edge on the path has no samples yet."""
 
     edge: tuple[str, str] | None
 
 class TopologyChangedError(TfTreeError):
     """The tree was re-parented after this plan was compiled; call `plan` again.
 
-    The one error a correct program attached to a shared arena routinely meets:
-    a peer re-parented a frame. The attributes exist only on instances the
-    library raises.
+    The error a correct program on a shared arena routinely meets.
     """
 
     plan_generation: int
     current_generation: int
 
 class FrameNotDeclaredError(TfTreeError):
-    """No such frame in this arena.
-
-    `name` exists only on instances the library raises. See `docs/PHASE3.md` §4.4.
-    """
+    """No such frame in this arena (`docs/PHASE3.md` §4.4)."""
 
     name: str | None
 
@@ -89,8 +65,7 @@ class TimeDomainMismatchError(TfTreeError):
     """A stamp's time domain is not the path's.
 
     Raised at plan time by `Tree.plan(..., domain=)` and per query by
-    `Tree.lookup(..., domain=)`: one class for both. The attributes exist only
-    on instances the library raises. See `docs/PHASE3.md` §4.4.
+    `Tree.lookup(..., domain=)` (`docs/PHASE3.md` §4.4).
     """
 
     expected: int
@@ -99,13 +74,9 @@ class TimeDomainMismatchError(TfTreeError):
 class NonMonotonicStampError(TfTreeError):
     """A pushed stamp is older than the newest one already published on its edge.
 
-    Raised by `Publisher.push`, `Publisher.push_many` and `tf_tree.push`. Equal
-    stamps are accepted, so this means strictly older. The attributes exist
-    only on instances the library raises: `last` is the newest published stamp
-    and `got` the refused one, both integer nanoseconds, and `edge` is the
-    arena's stored `(parent, child)` pair, which for a name longer than 48
-    bytes is the truncated one `Tree.edges()` lists. `push_many` publishes the
-    samples before the refused one; its message names the index.
+    Raised by `Publisher.push`, `Publisher.push_many` and `tf_tree.push`; equal
+    stamps are accepted. `last` and `got` are integer nanoseconds. `push_many`
+    publishes the samples before the refused one; its message names the index.
     """
 
     edge: tuple[str, str] | None
@@ -115,13 +86,10 @@ class NonMonotonicStampError(TfTreeError):
 class EdgeAlreadyClaimedError(TfTreeError):
     """Another publisher holds this edge's claim: one writer per edge.
 
-    Raised by `Tree.publisher` and `tf_tree.push`. The holder must release the
-    edge, or be reaped, first. The attributes exist only on instances the
-    library raises (see `docs/PHASE3.md` §4.4): `owner_slot` is the holder's
-    participant **slot**, not a pid — `tf_tree participants` lists the held
-    slots and `tf_tree doctor` names the process behind one. `owner_slot` is
-    `None` while the holder's claim is still being taken, or was abandoned
-    mid-claim, which records no slot yet.
+    Raised by `Tree.publisher` and `tf_tree.push`. `owner_slot` is the holder's
+    participant **slot**, not a pid (`tf_tree participants` lists slots,
+    `tf_tree doctor` names the process); `None` while the claim is being taken
+    or was abandoned mid-claim.
     """
 
     edge: tuple[str, str] | None
@@ -131,17 +99,10 @@ class ArenaHeldButUnreachableError(TfTreeError):
     """Participants still hold an arena's lock bytes, but nothing serves it.
 
     Raised by `tf_tree.open` after its open timeout, typically when an owner
-    died and no survivor has called `Tree.inherit_ownership` yet. Retrying is
-    the first response; `except (ArenaAbsentError,
-    ArenaHeldButUnreachableError)` is the retry loop's clause. Registered on
-    every platform; only a Linux `open` raises it.
-
-    The attributes exist only on instances the library raises:
-    `holder_slots` is the held participant slots, ascending, and
-    `ownership_held` whether the ownership byte was held when the timeout
-    expired. No pid is carried — a recorded pid can name an unrelated process
-    from another pid namespace. `tf_tree participants` lists the held slots,
-    and `tf_tree doctor` names the process behind one.
+    died and no survivor has called `Tree.inherit_ownership`. Retry on
+    `except (ArenaAbsentError, ArenaHeldButUnreachableError)`. Only a Linux
+    `open` raises it. `holder_slots` is the held slots, ascending;
+    `ownership_held` is whether the ownership byte was held at timeout.
     """
 
     holder_slots: tuple[int, ...]
@@ -150,41 +111,25 @@ class ArenaHeldButUnreachableError(TfTreeError):
 class ArenaAbsentError(TfTreeError):
     """No arena is serving under this name, and `open` was not asked to create.
 
-    Raised at once by `tf_tree.open` without `create=` when nothing serves the
-    name: there is no timeout to wait out, because none could change the answer.
-    A supervisor waiting for its robot to start retries on it, and on its
-    sibling: `except (ArenaAbsentError, ArenaHeldButUnreachableError)`. It
-    carries no attributes. Registered on every platform; only a Linux `open`
-    raises it.
+    Raised at once by `tf_tree.open` without `create=`. Carries no attributes.
+    Only a Linux `open` raises it.
     """
 
 class ChildProcessDetachedError(TfTreeError):
     """This handle was inherited across a `fork()` and cannot be used.
 
-    The shared mapping is `MADV_DONTFORK`, so a forked child has no arena where
-    its inherited `Tree`, `Plan` or `Publisher` points, and every call on one
-    that reaches the arena raises this rather than faulting (`docs/PHASE3.md`
-    §8.1, whose amendment lists the few that answer from the handle). It is not
-    retryable and not repairable: open a new tree in the child, or use
-    `multiprocessing`'s `"spawn"` or `"forkserver"` start method.
-
-    A subclass of `TfTreeError`, so a handler catching that still catches this.
-    A retry loop around the retryable `TfTreeError`s should catch this *first*
-    and stop.
+    The shared mapping is `MADV_DONTFORK`, so every call that reaches the arena
+    raises this (`docs/PHASE3.md` §8.1). Not retryable: open a new tree in the
+    child, or use the `"spawn"` or `"forkserver"` start method. A retry loop
+    around other `TfTreeError`s should catch this first.
     """
 
 class DerivativesUnavailableError(TfTreeError):
     """This edge's interpolator has no exact derivative.
 
-    Raised only by `layout="quat_twist"`: `LerpSlerp` is `tf2`'s interpolator
-    and has no exact body twist, so it is refused rather than
-    finite-differenced. Declare the edge `ScLerp` — which is the default — or
-    ask for a pose layout.
-
-    A property of the *edge*, so it fires at element 0 of a batch and does not
-    go away on its own. Its sibling `NoSegmentError` is the opposite.
-
-    `edge` exists only on instances the library raises.
+    Raised only by `layout="quat_twist"` on a `LerpSlerp` edge. Declare the edge
+    `ScLerp` (the default) or ask for a pose layout. A property of the edge, so
+    it fires at element 0 of a batch.
     """
 
     edge: tuple[str, str] | None
@@ -192,18 +137,10 @@ class DerivativesUnavailableError(TfTreeError):
 class NoSegmentError(TfTreeError):
     """A pose exists at this stamp, but no segment to differentiate.
 
-    The other refusal `layout="quat_twist"` adds over the pose layouts, and the
-    one that is **transient**: the edge retains a single sample, or the two
-    samples bracketing the stamp carry equal stamps (which is legal — stamps are
-    non-decreasing, not strictly increasing). Publish another sample, or ask
-    again later.
-
-    Distinct from `NoDataError`, which means the edge is empty. Here the
-    transform is perfectly well defined and only the derivative is not, so being
-    told "no data" would send you to the wrong problem. A property of the
-    *stamp*, so it can fire partway through a batch.
-
-    `edge` exists only on instances the library raises.
+    Raised by `layout="quat_twist"` and **transient**: the edge retains one
+    sample, or the samples bracketing the stamp carry equal stamps. Unlike
+    `NoDataError`, the transform is defined. A property of the stamp, so it can
+    fire partway through a batch.
     """
 
     edge: tuple[str, str] | None
@@ -217,19 +154,17 @@ F64Layout = Literal["mat4", "quat", "quat_twist"]
 Layout = Literal["mat4", "quat", "affine32", "quat_twist"]
 """How a transform is written into memory. Stated, never inferred.
 
-`"mat4"` is `(4, 4)` / `(N, 4, 4)` float64; `"quat"` is `(7,)` / `(N, 7)`
-float64 as `[qw qx qy qz tx ty tz]`; `"affine32"` is `(12,)` / `(N, 12)`
-**float32**, row-major 3x4, GPU-facing; `"quat_twist"` is `(13,)` / `(N, 13)`
-float64, `"quat"` with the body twist `[wx wy wz vx vy vz]` appended.
+`"mat4"`: `(4, 4)` / `(N, 4, 4)` float64. `"quat"`: `(7,)` / `(N, 7)` float64
+`[qw qx qy qz tx ty tz]`. `"affine32"`: `(12,)` / `(N, 12)` **float32**, row-major
+3x4. `"quat_twist"`: `(13,)` / `(N, 13)` float64, `"quat"` plus body twist
+`[wx wy wz vx vy vz]`.
 """
 
 ExtrapPolicy = Literal["error", "hold", "constant_twist"]
 """What `Plan.at_extrapolating` does past the newest published sample.
 
-`"error"` refuses (what `at` does); `"hold"` returns the newest pose; and
-`"constant_twist"` extends the screw the two newest samples imply. A closed
-set, unlike the domain tags: this one is dispatched on inside the engine rather
-than declared by a driver, so a string vocabulary is complete by construction.
+`"error"` refuses (what `at` does); `"hold"` returns the newest pose;
+`"constant_twist"` extends the screw the two newest samples imply.
 """
 
 class Plan:
@@ -237,20 +172,11 @@ class Plan:
 
     @overload
     def at(self, stamps: int | np.int64, /) -> NDArray[np.float64]:
-        """One stamp in, one `(4, 4)` float64 transform out.
-
-        The default layout is `"mat4"`, which is float64 — so this returns
-        `NDArray[np.float64]`, not a union a caller has to narrow. Only
-        `layout="affine32"` produces float32, and it has its own overload.
-        """
+        """One stamp in, one `(4, 4)` float64 transform out."""
 
     @overload
     def at(self, stamps: NDArray[np.int64], /) -> NDArray[np.float64]:
-        """`(N,)` stamps in, `(N, 4, 4)` float64 out — the path to prefer.
-
-        A Python loop over the scalar form costs ~200 ns per iteration; this
-        amortises to near-native.
-        """
+        """`(N,)` stamps in, `(N, 4, 4)` float64 out: the path to prefer."""
 
     @overload
     def at(
@@ -268,13 +194,9 @@ class Plan:
     ) -> NDArray[np.float64]:
         """`layout=` selects what is written per stamp (see `Layout`).
 
-        Keyword-only; `stamps` stays positional-only, which is where the
-        measured 29 ns of `METH_FASTCALL` lives.
-
-        `layout="quat_twist"` is `at_with_derivatives` as a batch: it appends
-        the body twist, in the plan's **source** frame, angular part first. It
-        is the only layout that can raise `DerivativesUnavailableError` or
-        `NoSegmentError`.
+        `layout="quat_twist"` appends the body twist in the plan's **source**
+        frame, angular part first; it alone can raise
+        `DerivativesUnavailableError` or `NoSegmentError`.
         """
 
     @overload
@@ -285,12 +207,7 @@ class Plan:
         *,
         layout: Layout | None = ...,
     ) -> NDArray[np.float64] | NDArray[np.float32]:
-        """The fallback, for a `layout` whose value is not statically known.
-
-        Passing a variable of type `Layout` cannot resolve to one dtype, so this
-        is the only overload that hands back a union — and it is reached only by
-        a caller who genuinely does not know which layout they are asking for.
-        """
+        """Fallback for a `layout` not statically known; returns a union."""
 
     @overload
     def at_into(
@@ -298,12 +215,7 @@ class Plan:
     ) -> None:
         """Evaluate one stamp into a caller-provided `(4, 4)` float64 array.
 
-        **The allocation-free scalar path, for a control loop.** A node does one
-        lookup per tick and cannot batch, so `at`'s per-call array allocation is
-        paid every tick forever. Measured on a depth-3 chain, release build:
-        `at` 224 ns against `at_into` **173 ns**, and nothing allocated.
-
-        Allocate `out` once, outside the loop.
+        The allocation-free scalar path for a control loop; allocate `out` once.
         """
 
     @overload
@@ -312,45 +224,20 @@ class Plan:
     ) -> None:
         """Evaluate into a caller-provided `(N, 4, 4)` float64 array.
 
-        With `layout=`, `out` is `(N, layout_elems)` — or `(layout_elems,)` for
-        a scalar stamp — and `float32` for `"affine32"`, `float64` otherwise.
-        Every batch entry point has an `_into` form (`API.md` R2), so a layout
-        reachable only through the allocating call would be a batch path with
-        no allocation-free tier.
+        With `layout=`, `out` is `(N, layout_elems)` (`(layout_elems,)` for a
+        scalar stamp), `float32` for `"affine32"`, else `float64`. Allocates
+        nothing. `out` must be C-contiguous and exactly the right shape; it is
+        validated before any element is written.
 
-        Allocates nothing. `out` must be C-contiguous and exactly the right
-        shape; it is validated completely *before* any element is written, so a
-        rejected call leaves it untouched.
+        Raises `BufferError` on a wrong shape, dtype or stride; non-contiguous
+        input is refused, not copied. A bad `stamps` raises numpy's or PyO3's own
+        conversion `TypeError`, as `at` does.
 
-        Raises `BufferError` on a wrong shape, dtype or stride. Non-contiguous
-        input is refused rather than silently copied — a silent copy would
-        defeat the point of this method while appearing to work.
-
-        **With `layout=`, a bad `stamps` is reported the way `at` reports it**
-        — numpy's or PyO3's own conversion `TypeError` ("only integer scalar
-        arrays can be converted to a scalar index" for a float64 array) rather
-        than a `BufferError` naming `(N,) int64`. That is the trade for the two
-        things it bought: an `np.int64` scalar is accepted, and a `float` stamp
-        meets the `TypeError` carrying the 238 ns measurement instead of a
-        complaint about a buffer. **The default `mat4` path answers the same
-        way since 2026-09-14**; until then it refused `np.int64` and reported a
-        `float` as a `BufferError`, which `docs/PHASE3.md` §3 forbids.
-
-        `out` is typed `object` rather than `NDArray` because the device check
-        below accepts anything and then refuses it by message. **Only
-        `numpy.ndarray` is written to** (subclasses included); a `memoryview`,
-        or a pinned torch or CuPy allocation, is refused whatever its layout.
-        `PHASE3.md` §5.5 describes those as qualifying and that is **not
-        implemented** — `np.asarray(...)` first.
-
-        **Device memory is refused** with a message naming the fix: a CPU store
-        to a `cudaMalloc` pointer is undefined, not slow.
-
-        A genuine `numpy.ndarray` skips the device check, because its data
-        pointer is host memory by construction; CuPy and torch arrays are not
-        numpy subclasses, so they still pay for it. The probe is a Python method
-        call — `__dlpack_device__()` — and running it on every numpy call cost
-        ~120 ns of a ~173 ns lookup.
+        `out` is typed `object` because device memory is accepted then refused
+        by message (a CPU store to a `cudaMalloc` pointer is undefined). Only
+        `numpy.ndarray` (subclasses included) is written to; a `memoryview` or
+        pinned torch/CuPy allocation is refused (`PHASE3.md` §5.5 is not
+        implemented) — call `np.asarray(...)` first.
         """
 
     def adaptive(
@@ -365,8 +252,7 @@ class Plan:
         """Knots whose linear interpolation stays within `lin` m / `ang` rad.
 
         Returns `(stamps, poses)` of shapes `(K,)` and `(K, 4, 4)`, strictly
-        increasing. LERP between adjacent knots on whatever device they live
-        on; the reconstruction error is bounded by construction.
+        increasing.
         """
 
     @overload
@@ -391,11 +277,8 @@ class Plan:
     ) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
         """`(N,)` stamps in; `((N, 4, 4)` float64, `(N,)` int64) out.
 
-        `by_ns` is an **array**, one distance per stamp. The distance is
-        `max(0, stamp - newest_common)`, so a batch straddling the newest
-        sample has interpolated elements (`0`) and extrapolated ones in the
-        same call; a scalar would be a `max` that marks fresh elements stale or
-        a `min` that marks stale ones fresh.
+        `by_ns` is an array: `max(0, stamp - newest_common)` per stamp, so one
+        batch can mix interpolated (`0`) and extrapolated elements.
         """
 
     @overload
@@ -409,28 +292,13 @@ class Plan:
     ) -> tuple[NDArray[np.float64], int | NDArray[np.int64]]:
         """Evaluate past the newest sample, and learn how far past that was.
 
-        `at` refuses a stamp newer than every published sample. A controller
-        running faster than its state estimate is always asking for one, and
-        the honest answer is a bounded prediction with its bound attached.
-
-        Returns `(poses, by_ns)`, and **there is no spelling that returns the
-        pose alone**: the danger in extrapolation is a pose that looks fresh,
-        so ignoring the distance takes a deliberate `[0]`.
-
-        `policy` is required — extrapolation is opt-in per query. `"error"` is
-        what `at` does, with the distance attached on success; `"hold"` is the
-        newest pose, for a latched or displayed value; `"constant_twist"`
-        extends the screw the two newest samples imply, which is what a control
-        loop wants. Raises `ExtrapolationError` under `"error"`.
-
-        `mat4` by default and `quat` with `layout=`; an f32 or twist layout is
-        refused. The edge that ran out of data is not carried — this
-        binding resolves edge ids to names before a caller sees them, and doing
-        that per query would be an arena walk on this path. `Plan.edges()` and
-        `tf_tree doctor` are where the per-edge breakdown lives.
-
-        The batch is a loop over the scalar form under one guard, not the
-        engine's batch fold, which carries no policy.
+        Returns `(poses, by_ns)`; there is no spelling that returns the pose
+        alone. `policy` is required: `"error"` is `at` with the distance
+        attached on success (raises `ExtrapolationError` past the newest sample),
+        `"hold"` the newest pose, `"constant_twist"` the screw the two newest
+        samples imply. `mat4` by default, `quat` with `layout=`; f32 and twist
+        layouts are refused. The edge that ran out of data is not carried; see
+        `Plan.edges()` and `tf_tree doctor`. A batch loops the scalar form.
         """
 
     def at_extrapolating_into(
@@ -445,19 +313,9 @@ class Plan:
     ) -> None:
         """`at_extrapolating` writing into two caller-provided arrays.
 
-        `poses` takes the shape the allocating form would have returned —
-        `(4, 4)` or `(layout_elems,)` for a scalar stamp, `(N, 4, 4)` or
-        `(N, layout_elems)` for an array — and `by_ns` is `()`-shaped or
-        `(N,)` int64.
-
-        Allocate both once, outside the loop. `docs/API.md` R2 makes an `_into`
-        form NORMATIVE for every batch entry point and justifies it with this
-        caller: the allocation is half the call at n = 64, and n = 64 is the
-        control loop.
-
-        **A failure part-way leaves the buffers part-written**, the same
-        contract `at_into` carries. A caller who needs all-or-nothing uses the
-        allocating form and pays the allocation for it.
+        `poses` takes the shape the allocating form returns; `by_ns` is
+        `()`-shaped or `(N,)` int64. Allocate both once. A failure part-way
+        leaves the buffers part-written (as `at_into` does).
         """
 
     def latest(self) -> NDArray[np.float64]:
@@ -469,17 +327,11 @@ class Plan:
     def edges(self) -> list[tuple[str, str]]:
         """The **dynamic** edges this plan samples, as `(parent, child)` pairs.
 
-        In fold order — the order the compositions happen, which is the order
-        the plan is.
+        In fold order. Shorter than `depth()` when the path crosses a static
+        edge: static runs fold into one constant at compile time. Use
+        `Tree.edges()` for the topology.
 
-        Shorter than `depth()` when the path crosses a static edge. A static
-        edge (or a whole run of them) is folded into one constant transform at
-        compile time and its identity does not survive the fold, so a plan
-        cannot list what it no longer knows. Use `Tree.edges()` for the
-        topology; this is what *this path samples at evaluation time*.
-
-        Raises `ChildProcessDetachedError` on a tree inherited across a
-        `fork()`.
+        Raises `ChildProcessDetachedError` on a tree inherited across a `fork()`.
         """
 
 class Publisher:
@@ -502,28 +354,14 @@ class Tree:
     """A transform tree. Obtain with `tf_tree.open()` or `tf_tree.build()`."""
 
     def plan(self, target: str, source: str, /, *, domain: int = ...) -> Plan:
-        """Compile a path from `source` to `target`.
+        """Compile a path from `source` to `target`; compile once and reuse.
 
-        Compile once and reuse: the path walk and per-edge metadata lookup
-        happen here, not per sample.
-
-        `domain` is the **time domain** every query on the returned plan will
-        carry — `SYSTEM_DOMAIN` (the default, `0`), `SENSOR_DOMAIN`,
-        `SIM_DOMAIN`, `STEADY_DOMAIN`, or an integer from `4` up that a driver
-        declared for its own clock. A tree under `use_sim_time` is read with
-        `domain=tf_tree.SIM_DOMAIN`.
-
-        A disagreement with the path's own domain raises
-        `TimeDomainMismatchError` **here**,
-        naming both frames, rather than on every `at()` — a domain is a property
-        of a route, not of an instant, so it cannot legitimately vary between
-        two queries on one plan.
-
-        The default is `0` and not the path's own domain, deliberately:
-        defaulting to the path's would make a mistaken caller silently correct
-        as well as a correct one.
-
-        Not `open(domain=...)`, which selects which *arena* to attach to.
+        `domain` is the time domain every query on the plan carries:
+        `SYSTEM_DOMAIN` (default, `0`), `SENSOR_DOMAIN`, `SIM_DOMAIN`,
+        `STEADY_DOMAIN`, or an integer from `4` up a driver declared. A
+        mismatch with the path's own domain raises `TimeDomainMismatchError`
+        here, naming both frames. Not `open(domain=...)`, which selects the
+        arena.
         """
 
     def publisher(self, child: str, parent: str, /) -> Publisher:
@@ -540,12 +378,8 @@ class Tree:
     ) -> NDArray[np.float64]:
         """One transform, without compiling a plan first.
 
-        The plan is cached per *thread*. Prefer `tree.plan(...)` in a loop —
-        this pays a cache probe per call and a compiled plan pays nothing.
-
-        `domain` is `plan`'s, with the same default and the same meaning. It is
-        checked per call here rather than once, because there is no handle to
-        hang the check on.
+        The plan is cached per thread; prefer `tree.plan(...)` in a loop.
+        `domain` is `plan`'s, checked per call.
         """
 
     def freeze(
@@ -553,128 +387,63 @@ class Tree:
     ) -> None:
         """Write this tree to `path` as a frozen `.tft` (`PHASE5.md` §2.3).
 
-        The file *is* the arena: `open_file` maps it back with no parse and no
-        fixups, and the lookups it answers are bit-identical to this tree's.
-
-        Replacing `path` is atomic — the bytes land in a sibling temporary and
-        are renamed over it — so an interrupted freeze leaves the previous index
-        intact instead of a half-written one under the name somebody will open
-        next week.
-
-        `source` is the recording these poses came from; it is recorded in the
-        manifest as `null` when there is none. Linux only.
-
-        The GIL is released for the copy, so a background freeze does not stall
-        the threads servicing your progress bar or socket.
+        `open_file` maps it back with no parse, bit-identical. Replacing `path`
+        is atomic. `source` is the recording these poses came from, recorded in
+        the manifest (`null` if none). Linux only. Releases the GIL.
         """
 
     @property
     def source(self) -> dict[str, object] | None:
         """The recording this tree was ingested from, or `None`.
 
-        `None` for a tree built in Python or opened with `open_file` — neither
-        has a recording to name — **and `None` again once `publisher()` has been
-        called on it**, because from that moment the tree may hold samples the
-        recording does not and the digest would be asserting something false.
-
-        Keys: `path`, `digest` (BLAKE3 of the recording's bytes, hex),
-        `transforms`, `edges_without_samples`, `recording_start_ns` and
-        `recording_end_ns`.
-
-        **`recording_*`, not `span_*`.** These bound the *recording*; the
-        interval this tree can answer is at most that and usually narrower,
-        because a ring retains what fits. Use `span(target, source)` to plan
-        queries — taking the upper stamp from here and querying it is how this
-        distinction was found.
+        `None` for a tree built in Python or opened with `open_file`, and again
+        once `publisher()` has been called on it. Keys: `path`, `digest` (BLAKE3
+        hex), `transforms`, `edges_without_samples`, `recording_start_ns`,
+        `recording_end_ns`. These bound the recording, not what the tree can
+        answer; use `span` to plan queries.
         """
 
     def span(self, target: str, source: str, /) -> tuple[int, int] | None:
         """The interval, in nanoseconds, over which `plan(target, source)` answers.
 
-        `LatestCommon` generalised to a range: the *intersection* of every
-        dynamic edge's retained window, so the lower end is a `max` and the
-        upper end a `min`. It is the query to reach for when a lookup fails at
-        a stamp, because the answer is nearly always "one edge on the path had
-        not started yet".
-
-        Three distinct answers:
+        The intersection of every dynamic edge's retained window:
 
         * `(t0, t1)` with `t0 <= t1` — answerable there, nowhere else.
-        * `(t0, t1)` with `t0 > t1` — the windows do not overlap. That is a real
-          answer, not an error: `t0 <= t <= t1` is correctly false everywhere.
-        * `None` — every step on the path is static (or the path is empty), so
-          the plan answers at *any* stamp and there is no finite interval.
+        * `(t0, t1)` with `t0 > t1` — the windows do not overlap.
+        * `None` — every step is static (or the path is empty); any stamp works.
 
-        Raises `NoDataError`, naming the edge's two **frames**, when an edge on
-        the path has no samples at all — which is a different situation from a
-        non-overlapping window and calls for a different fix. Raises
-        `TopologyChangedError` if the tree was re-parented under the call.
-
-        On a live tree the answer is a snapshot that ages immediately, exactly
-        as `Plan.latest` does.
+        Raises `NoDataError` when an edge has no samples at all, and
+        `TopologyChangedError` if the tree was re-parented under the call. A
+        snapshot on a live tree.
         """
 
     def frames(self) -> list[str]:
         """The frame names on this tree, in declaration order.
 
-        The cheap way to see what is in an arena without shelling out to
-        `tf_tree doctor`. Frame identity is append-only, so a name that appears
-        here will never be removed or renumbered — but on a *live* shared arena
-        a peer process can add one under you, so treat the list as a snapshot,
-        exactly as `Plan.latest` and `Tree.span` already are.
+        Append-only, but a snapshot on a live arena. Names over 48 bytes are
+        returned truncated. May contain duplicates (a rescued intern leaves the
+        same name at two ids), so `len()` is an upper bound.
 
-        A name longer than 48 bytes was truncated when it was interned; the
-        stored form is what comes back.
-
-        **The list is not guaranteed to be free of duplicates.** If a peer
-        process stalls mid-intern and another rescues the slot, the loser's
-        record stays written but unreferenced, so the same name can appear at
-        two ids. Rare — it needs the rescue path — but it means `len()` is an
-        upper bound and `dict(zip(tree.frames(), ...))` can lose an entry.
-
-        Raises `ChildProcessDetachedError` on a tree inherited across a
-        `fork()` — the child's mapping is gone, so there is nothing to list.
+        Raises `ChildProcessDetachedError` on a tree inherited across a `fork()`.
         """
 
     def edges(self) -> list[tuple[str, str]]:
         """The edges on this tree, as `(parent, child)` name pairs.
 
-        `(parent, child)` is the order `tf_tree.build` and `tf_tree.open(
-        create=...)` take. It is deliberately *not* `Tree.publisher`'s
-        `(child, parent)` order: an edge list silently reversed builds a tree
-        that is upside down and still perfectly valid.
+        This is the order `tf_tree.build` and `open(create=...)` take, not
+        `Tree.publisher`'s `(child, parent)`. The list omits static-vs-dynamic
+        and `build` cannot declare a static edge, so a round trip turns each
+        static edge into a dynamic one with no samples. Names only: rate and
+        counts are `PHASE5.md` §4.2's.
 
-        **This is the parent/child graph, not a round trip.** The list does not
-        say whether an edge is static or dynamic, and `tf_tree.build` has no way
-        to declare a static one — so feeding it back reproduces the graph, but
-        every static edge comes back as a dynamic edge with no samples, and a
-        lookup crossing one raises `NoDataError` instead of returning the
-        constant it had. On a tree you built with `tf_tree.build` every edge is
-        already dynamic and the distinction cannot arise; on a `.tft` or on an
-        arena a Rust or C peer created, it can.
-
-        **Names only** — no rate, no jitter, no gaps, no sample count. Those are
-        `PHASE5.md` §4.2's `ds.edges()` and are held back until the counting
-        pass that can answer them honestly exists: a ring knows what it
-        *retained*, which is not what the publisher produced, and a rate derived
-        from the one and reported as the other is worse than no rate at all.
-
-        Raises `ChildProcessDetachedError` on a tree inherited across a
-        `fork()`.
+        Raises `ChildProcessDetachedError` on a tree inherited across a `fork()`.
         """
 
     def instance_uuid(self) -> str:
-        """Which arena instance this is, as 32 hex characters.
-
-        All-zero in-process. Two processes that resolved the same *name* can
-        still hold different segments; this is what tells them apart.
+        """Which arena instance this is, as 32 hex characters (all-zero in-process).
 
         Raises `ChildProcessDetachedError` on a tree inherited across a
-        `fork()`, rather than returning the all-zero value the child's poison
-        mapping holds — which is the spelling that means "in-process", so two
-        peers chasing a split brain would conclude they had never been shared.
-        `repr()` does not raise; it prints `detached-by-fork` in place of the
-        instance.
+        `fork()`; `repr()` prints `detached-by-fork` instead.
         """
 
     def is_shared(self) -> bool:
@@ -686,22 +455,12 @@ class Tree:
     def owner_lost(self) -> bool:
         """Has the process that owns this arena gone away (`PHASE2` §3.5)?
 
-        One non-blocking `poll` of the attach socket, plus — only once that
-        reports a hangup — one `F_OFD_GETLK` on the ownership byte. So it
-        answers *"the arena has no owner"* rather than *"my socket is dead"*,
-        and a survivor that did not inherit stops being told to try.
-
-        `False` for anything that is not a joined shared attachment: an
-        in-process tree, a frozen `.tft`, or a tree this process already owns.
-        Always `False` off Linux, where shared arenas do not exist.
-
-        **Nothing calls it for you** — no background thread, no daemon — so an
-        arena whose survivors never ask stays ownerless and wedges new joiners.
-
-        **A dying owner is seen at the end of its exit, not at its signal**
-        (`PHASE2` §3.5, NORMATIVE): once the attach connection has hung up and
-        the last open file description holding the ownership byte has closed.
-        See `docs/decisions/0057`.
+        Answers "the arena has no owner", not "my socket is dead": one
+        non-blocking `poll` of the attach socket, plus one `F_OFD_GETLK` on the
+        ownership byte once it reports a hangup. `False` for anything not a
+        joined shared attachment, and always off Linux. **Nothing calls it for
+        you**; an arena whose survivors never ask stays ownerless. A dying owner
+        is seen at the end of its exit (`docs/decisions/0057`).
 
             if tree.owner_lost():
                 tree.inherit_ownership()
@@ -711,56 +470,27 @@ class Tree:
         """Inherit the owner role from a departed owner and begin serving.
 
         Returns `"Inherited"`, `"OwnerAlive"`, `"Contended"`, `"ReadOnly"` or
-        `"NotApplicable"`. **Anything but `"Inherited"` means this process is
-        not the owner, and none of them is a reason to stop reading** — lookups
-        are unaffected by ownership in every one of these states, and during a
-        takeover as well. **`"OwnerAlive"` and `"Contended"` are not final**
-        while `owner_lost()` keeps answering `True`: a fresh open holds the
-        ownership byte briefly on its way through and gives it back, so call
-        again on the next pass.
+        `"NotApplicable"`. Anything but `"Inherited"` means this process is not
+        the owner; lookups are unaffected either way. `"OwnerAlive"` and
+        `"Contended"` are not final while `owner_lost()` is `True`: call again.
+        `"ReadOnly"`: a read-only mapping cannot write the participant table;
+        open with `mode="rw"` to be able to inherit.
 
-        `"ReadOnly"` is the one to watch on a consumer fleet: an owner writes
-        the participant table on every grant and a read-only mapping cannot, so
-        a fleet of read-only consumers cannot rescue itself. Open with
-        `mode="rw"` if a process must be able to inherit.
-
-        Raises `TfTreeError` if the `fcntl` fails or the rendezvous socket
-        cannot be bound. On every failure this process keeps its participant
-        slot, its byte and its mapping, so the arena is left ownerless rather
-        than with an owner that is not serving, and another survivor can try.
+        Raises `TfTreeError` if the `fcntl` fails or the rendezvous socket cannot
+        be bound; the arena is then left ownerless and another survivor can try.
         """
 
     def reap_dead(self) -> int:
         """Collect what dead participants left behind; how many were freed.
 
-        Both sweeps, summed: claim leases no live process holds, and participant
-        records whose lock bytes the kernel has released.
-
-        **Usually `0`, and that is the design.** The owner's socket-hangup
-        callback already revokes a dead participant's claims and frees its
-        record, so an ordinary killed-and-restarted publisher needs no reaper.
-        Two producers have no hangup for anyone to observe — a dead *owner*, and
-        a participant that never joined through the rendezvous — and this is
-        their only collector.
-
-        **Only one of those is a shape this project supports, and the other
-        makes this call dangerous.** A dead owner is ordinary: nothing sees its
-        hangup, so something has to sweep what it left. It is wider than the
-        owner itself — once the owner is dead nobody watches any peer, so a
-        participant that dies after it leaves claims only a sweep collects.
-
-        A participant that never joined through the rendezvous holds no lock
-        byte, so nothing can tell it apart from a dead one, and calling this
-        frees the records and takes the claims of processes that are
-        **running**. Reaching that state needs an arena created with the Rust
-        `TreeBuilder.build_shared` and then published by hand, which decision
-        record 0031 put *out of contract* on 2026-09-18; no Python program can
-        build one, because `open_arena` always joins through the rendezvous. So:
-        safe from Python alone, and not safe in a process tree where some Rust
-        component served an arena that way. See `docs/RUNBOOK.md`,
-        *ParticipantTableFull*.
-
-        `0` for a read-only tree, an in-process tree, or one with no rendezvous.
+        Sums two sweeps: claim leases no live process holds, and participant
+        records whose lock bytes the kernel released. Usually `0`: the owner's
+        hangup callback already handles a killed publisher. Its real work is
+        after a dead owner. **Dangerous** where a Rust component served an arena
+        with `build_shared` and published by hand (out of contract, `0031`): such
+        a participant holds no lock byte and this frees a *running* process's
+        records. Safe from Python alone (`docs/RUNBOOK.md`, *ParticipantTableFull*).
+        `0` for a read-only, in-process or rendezvous-less tree.
         """
 
 def build(
@@ -772,32 +502,14 @@ def build(
 ) -> Tree:
     """An in-process tree from `(parent, child)` edges, or from a topology config.
 
-    `edges` takes **either** a list of `(parent, child)` pairs — every edge
-    dynamic, all sharing `capacity` — **or** a `str` holding topology-config
-    text, which is the same schema the ROS bridge starts from and
-    `tf_tree topology --discover` writes. Only the config form can declare a
-    **static** edge, a per-edge size, a declared rate, or a per-edge domain, so
-    it is the one to use for anything shaped like a robot.
+    `edges` is a list of `(parent, child)` pairs (all dynamic, sharing
+    `capacity`) or a `str` of topology-config text, the only form that can
+    declare a static edge, per-edge size, rate or domain. `capacity=` and
+    `interp=` are refused beside a config. Topology is builder-time (`0004`).
 
-    `capacity=` and `interp=` are **refused** beside a config: it carries both,
-    per edge, and there would be no saying which won.
-
-    Topology is builder-time (decision `0004`), so there is no `declare_*` on a
-    live tree: the layout is a property of the arena, fixed when it is created.
-
-    `interp` defaults to `"sclerp"` — the SE(3) screw geodesic, which is the
-    engine's own default and the only policy with an exact derivative, so
-    `plan.at(stamps, layout="quat_twist")` works on a tree built this way.
-
-    Pass `interp="lerpslerp"` for `tf2`-bit-compatible interpolation
-    (translation LERP + rotation SLERP). It is not right-invariant —
-    interpolating `T0 @ C, T1 @ C` is not `interp(T0, T1) @ C` — and it has no
-    exact body twist, so `layout="quat_twist"` over such an edge raises
-    `DerivativesUnavailableError`.
-
-    This binding hard-coded `"lerpslerp"` until now, diverging from Rust with no
-    measurement behind it; `PROJECT.md` §5 D5 requires one, so the default moved
-    rather than the rule.
+    `interp` defaults to `"sclerp"`, the only policy with an exact derivative
+    (`layout="quat_twist"`). `"lerpslerp"` is `tf2`-bit-compatible, not
+    right-invariant, and `quat_twist` over it raises `DerivativesUnavailableError`.
     """
 
 def push(
@@ -810,9 +522,8 @@ def push(
 ) -> None:
     """Publish `[qw, qx, qy, qz, tx, ty, tz]` onto an edge at `stamp_ns`.
 
-    Takes the engine's own representation rather than a 4x4: a *nearly* rigid
-    matrix — which is what arrives after any floating-point round trip — has no
-    exact conversion back, only a projection.
+    Takes the engine's representation, not a 4x4: a nearly rigid matrix has no
+    exact conversion back.
     """
 
 def open_arena(
@@ -827,32 +538,15 @@ def open_arena(
 ) -> Tree:
     """Attach to a running arena. Exported as `tf_tree.open`.
 
-    `mode="ro"` by default and `create=None`: a consumer must be incapable of
-    corrupting a robot's tree (the MMU enforces it), and a notebook started
-    before the robot must fail loudly rather than create an empty arena the
-    real publisher then refuses to join.
+    `mode="ro"` and `create=None` by default, so a consumer cannot corrupt a
+    robot's tree or create an empty arena the real publisher refuses to join.
+    `create=` takes `build`'s `edges` (pairs or config text), **requires
+    `mode="rw"`**, and creates the arena when absent. `capacity` and `interp`
+    are `build`'s, refused beside a config; `interp` is validated even without
+    `create`.
 
-    Pass `create=` the same thing `build`'s `edges` takes: a list of
-    `(parent, child)` pairs, or the text of a topology config. `capacity` and
-    `interp` are refused beside a config, which carries both.
-
-    The list form — the same edge list `build` takes —
-    to create the arena when it is absent. An arena is sized from its declared
-    edges, so there is no way to create one without saying what is in it; that
-    is why this is an edge list rather than a boolean. **It requires
-    `mode="rw"`** and is refused otherwise, so a read-only consumer still
-    cannot bring an arena into existence.
-
-    `domain` here is the **rendezvous** domain — which arena to attach to,
-    `$ROS_DOMAIN_ID`'s analogue — and is not `Tree.plan`'s `domain`, which is
-    the time-domain tag of the edges inside it. Two unrelated numbers that share
-    a word; this one selects the arena, that one selects the clock.
-
-    `capacity` and `interp` describe the edges being created **from a pair
-    list**; both are `build`'s, with the same defaults, and both are refused
-    beside a config. Without `create` they describe nothing — but `interp` is
-    still validated, so a misspelling raises here exactly as it does in `build`
-    rather than being silently discarded.
+    `domain` is the **rendezvous** domain (which arena, like `$ROS_DOMAIN_ID`),
+    not `Tree.plan`'s time-domain tag.
     """
 
 def ingest_bag(
@@ -867,53 +561,31 @@ def ingest_bag(
 ) -> Tree:
     """Read an MCAP recording into an in-memory `Tree` (`PHASE5.md` §3).
 
-    Returns the **same** `Tree` `open_file` returns, so `plan`, `at`, `span`,
-    `frames`, `edges` and `freeze` all work on it unchanged — there is no
-    parallel offline API to learn.
+    Returns the same `Tree` `open_file` returns. It carries the recording in
+    `source`, so `ingest_bag(p).freeze(out)` is the whole bag-to-index path.
 
-    The tree carries the recording in `source`, and `freeze` writes that
-    recording's BLAKE3 digest into the `.tft`. So `ingest_bag(p).freeze(out)`
-    is the whole bag-to-index path and the resulting file is traceable to `p`
-    with nothing extra to remember; there is deliberately no `freeze_bag`
-    beside it.
+    `static_topics` and `tf_topics` override the `/tf_static` and `/tf` defaults;
+    `tf_prefix` prepends to every frame name; `max_memory_mb` bounds the second
+    pass's sort buffers, not the arena; `max_record_bytes` raises the 256 MiB
+    per-record ceiling. Also hashes the recording, one extra sequential pass.
 
-    `static_topics` and `tf_topics` override which topics carry transforms
-    (`/tf_static` and `/tf` by default); `tf_prefix` prepends to every frame
-    name; `max_memory_mb` bounds the sort buffers of the second pass, not the
-    arena, which is the output and cannot be capped; `max_record_bytes` raises
-    the 256 MiB ceiling on one top-level record.
-
-    Reading the recording also hashes it, which is one extra sequential pass —
-    a minority of an ingest that reads the same file at least twice and
-    decompresses it.
-
-    Raises `FileNotFoundError` (and its `OSError` siblings) for a path problem,
-    and `TfTreeError` for a file that is not a readable MCAP — including a
-    `.db3` rosbag2 bag, which is named as such with the `ros2 bag convert`
-    remedy rather than reported as a corrupt MCAP.
+    Raises `FileNotFoundError` (and `OSError` siblings) for a path problem, and
+    `TfTreeError` for a file that is not a readable MCAP, including a `.db3`
+    rosbag2 bag (the message names `ros2 bag convert`).
     """
 
 def open_file(path: str | os.PathLike[str], /) -> Tree:
     """Open a frozen `.tft` and read it as an ordinary `Tree` (`PHASE5.md` §4.1).
 
-    Opening is an `mmap`, so it costs microseconds and no parse — and it hands
-    back the **same** `Tree` a live arena does. `plan`, `at`, `at_into`,
-    `adaptive`, `latest` and `span` are the objects that were already there,
-    with the same semantics and bit-identical results. There is no offline API
-    to learn.
+    An `mmap`: microseconds, no parse, bit-identical results. Permanently
+    read-only: `is_writable()` is `False` and `publisher()` refuses.
 
-    The tree is permanently read-only: `is_writable()` is `False` and
-    `publisher()` refuses, because the mapping is `PROT_READ` and a store
-    through it would be a fault rather than an error.
+    Raises `FileNotFoundError` (and `OSError` siblings) for a path problem, and
+    `TfTreeError` for an unreadable `.tft`; a layout or format mismatch names
+    both values and says to re-freeze.
 
-    Raises `FileNotFoundError` (and its `OSError` siblings) for a path problem,
-    and `TfTreeError` for a file that is not a readable `.tft` — a layout or
-    format mismatch names both values and says to re-freeze, since a `.tft` is a
-    cache and not an archive.
-
-    **Dataloader pattern (§4.3).** Documented, not shipped: a
-    `torch.utils.data.Dataset` subclass would bind this package to a framework
-    version for no benefit, and the pattern is four lines::
+    **Dataloader pattern (§4.3).** Open in the worker, not the parent: a `Tree`
+    cannot be pickled, and `spawn`/`forkserver` pickle the dataset::
 
         class Frames(Dataset):
             def __init__(self, path):
@@ -924,22 +596,8 @@ def open_file(path: str | os.PathLike[str], /) -> Tree:
                     self.ds = tf_tree.open_file(self.path)
                 ...
 
-    Open it **in the worker, not in the parent**. A `Tree` cannot be pickled,
-    and a `DataLoader` with `num_workers > 0` sends the dataset object to its
-    workers — by pickle under `spawn` and `forkserver`, which is CPython 3.14's
-    default start method on Linux. The lazy `None` is what keeps the object
-    picklable.
-
-    Under a plain `fork` an inherited `.tft` mapping does keep working: it is
-    `MAP_PRIVATE | PROT_READ` and is deliberately *not* poisoned at fork, unlike
-    a shared-memory attach. So the rule is about picklability, not about the
-    arena going away — §4.3 gives the fork-poisoning reason and that reason does
-    not apply to a frozen file.
-
-    Sixteen workers that each open the same file share one set of clean
-    page-cache pages, so the marginal cost per worker is about zero. That is the
-    entire argument for `.tft` (§2.2), and opening once in the parent and
-    passing poses down instead gives it up.
+    Workers opening the same file share clean page-cache pages. A `.tft`
+    mapping is not poisoned by `fork`.
     """
 
 def from_sec(seconds: float, /) -> int:
@@ -952,20 +610,15 @@ def from_sec(seconds: float, /) -> int:
 def from_parts(sec: int, nanosec: int, /) -> int:
     """Exact nanoseconds from a `(sec, nanosec)` pair.
 
-    Raises `ValueError` for a `nanosec` outside `[0, 1e9)` — **refused, not
-    normalised** — and for a sum outside `int64` — **refused, not wrapped**.
-    Both alternatives produce a stamp that looks perfectly well formed, which
-    is the failure this converter exists to prevent.
+    Raises `ValueError` for a `nanosec` outside `[0, 1e9)` (refused, not
+    normalised) or a sum outside `int64` (refused, not wrapped).
     """
 
 def from_ros(stamp: object, /) -> int:
     """Exact nanoseconds from a ROS 2 `builtin_interfaces/Time`.
 
-    Never via `to_sec()`: the message is `{int32 sec, uint32 nanosec}` and
-    converts exactly. Duck-typed on `.sec` and `.nanosec`, so `rclpy` is not a
-    dependency of this wheel and must not become one.
-
-    Refusals are `from_parts`'s.
+    Duck-typed on `.sec` and `.nanosec`; `rclpy` is not a dependency. Refusals
+    are `from_parts`'s.
     """
 
 def has_shared_memory() -> bool:
@@ -974,11 +627,7 @@ def has_shared_memory() -> bool:
 SYSTEM_DOMAIN: int
 """Wall clock — `CLOCK_REALTIME`, ROS `/clock` off. Tag `0`, and the default.
 
-The four names exist so a caller writes one rather than a magic number. They
-are plain `int`s and not an enum because the domain trait is **open**: tags
-from `4` up belong to whoever declares them, so a closed set standing in for an
-open one would either make a driver's own tag unrepresentable or hand it back
-as an `int` that compares equal to nothing in the enum.
+Plain `int`s, not an enum: tags from `4` up belong to whoever declares them.
 """
 
 SENSOR_DOMAIN: int
@@ -987,8 +636,7 @@ SENSOR_DOMAIN: int
 SIM_DOMAIN: int
 """Simulated time — ROS `use_sim_time`, `/clock`. Tag `2`.
 
-The tag a simulated tree is given so a consumer can tell it from a real-time
-one. Reading such a tree needs `plan(..., domain=tf_tree.SIM_DOMAIN)`.
+Reading such a tree needs `plan(..., domain=tf_tree.SIM_DOMAIN)`.
 """
 
 STEADY_DOMAIN: int
@@ -997,30 +645,20 @@ STEADY_DOMAIN: int
 __version__: str
 """This extension's version, compiled in from the crate manifest.
 
-`importlib.metadata.version("transform_tree")` is the canonical answer and reads a
-different file — `pyproject.toml`'s `[project] version` against this one's
-`Cargo.toml`. `tests/python/test_version.py` asserts the two agree, which is
-the only thing that keeps them from drifting.
+`importlib.metadata.version("transform_tree")` is canonical (reads `pyproject.toml`);
+`tests/python/test_version.py` asserts the two agree.
 """
 
 def arena_format_version() -> int:
     """This build's arena format version — the *set of fields* in the header.
 
-    3 as of `PHASE5.md` §1. A different one is never compatible: there is no
-    conversion layer, so every participant is rebuilt from one commit and
-    restarted together.
+    3 as of `PHASE5.md` §1. A different one is never compatible.
     """
 
 def arena_layout_hash() -> int:
     """This build's arena layout hash — the *geometry*.
 
-    Checked on attach beside `arena_format_version()`, and a mismatch on either
-    is refused. Two builds agreeing on the version and disagreeing on the hash
-    disagree about *where* things are, which is worse than disagreeing about
-    what they are.
-
-    An `int`, because it is compared rather than read. For a report write
-    `f"0x{tf_tree.arena_layout_hash():08X}"` — the literal `0x` matters, since
-    Python's `{:#010X}` produces `0X…` and would not match what
-    `tft doctor --explain-version` prints.
+    Checked on attach beside `arena_format_version()`; a mismatch on either is
+    refused. For a report write `f"0x{tf_tree.arena_layout_hash():08X}"`, which
+    matches `tft doctor --explain-version`.
     """

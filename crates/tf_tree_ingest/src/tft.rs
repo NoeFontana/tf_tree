@@ -1,21 +1,5 @@
-//! Recording → `.tft`, the shape §3 and §2 were designed to meet in.
-//!
-//! §2's frozen container already exists and `Tree::freeze_to` already writes it.
-//! What this module adds is the two things a *bag*-sourced `.tft` has that a
-//! `--from-live` one cannot: a real `source_digest`, and a report.
-//!
-//! # `source_digest` is what makes a `.tft` traceable
-//!
-//! §2.3: *"`source_digest` makes a `.tft` traceable to the recording it came
-//! from, which matters the first time a training result cannot be reproduced."*
-//! It is BLAKE3 of the recording's bytes — the file, not the transforms — so it
-//! answers "was this index built from *that* file" without needing to re-ingest.
-//! `--from-live` writes all-zero here because a live arena has no recording; a
-//! bag ingest has no excuse to.
-//!
-//! The digest is computed in a streaming pass over the file rather than by
-//! reading it in, for the same reason the reader streams: the recording is
-//! allowed to be larger than memory.
+//! Recording → `.tft`: a real `source_digest` (BLAKE3 of the recording's bytes,
+//! streamed; §2.3) and a report, which a `--from-live` `.tft` cannot have.
 
 use std::path::Path;
 
@@ -25,9 +9,7 @@ use crate::{IngestError, IngestOptions, Ingested};
 
 /// Ingest `source` and write the result to `out` as a `.tft`.
 ///
-/// Returns the ingest alongside the container header that was written, so a
-/// caller can print both the report and the file's geometry without re-opening
-/// it.
+/// Returns the ingest alongside the header that was written.
 ///
 /// # Errors
 ///

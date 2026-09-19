@@ -1,8 +1,7 @@
 [package]
 name = "tf_tree_core"
 description = "no_std+alloc single-process transform tree engine: interning, topology, arena buffers, plans."
-# Per-crate front page for crates.io; see `tf_tree_math`'s manifest for why this
-# is not inherited from the workspace.
+# Per-crate front page for crates.io (not inherited; see `tf_tree_math`).
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -14,8 +13,7 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# `cfg(loom)` is registered in the root `[workspace.lints.rust]` (unexpected_cfgs),
-# so this crate can inherit the full lint set normally.
+# `cfg(loom)` is registered in the root `[workspace.lints.rust]`.
 [lints]
 workspace = true
 
@@ -24,80 +22,29 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-# **Default-on** (`docs/PHASE5.md` §5.5). Disabling it removes the counter
-# fields, the increments and the `Guard` destructor — what executes is then
-# provably nothing, which is what a safety-certified or minimal-embedded build
-# needs. The arena *regions* remain either way (D34), so the layout hash does
-# not fork and the two builds still attach to each other.
+# Default-on (`docs/PHASE5.md` §5.5). Off removes the counter fields, increments
+# and `Guard` destructor; the arena regions remain (D34), so layout hash and
+# attachability are unchanged.
 default = ["counters"]
 counters = []
-# **The pure-Rust BLAKE3 backend, so a consumer asks this crate rather than
-# reaching around it.** `blake3` declares `cc` as an *unconditional*
-# `[build-dependencies]`, so no feature removes it from the graph — what `pure`
-# changes is that `build.rs` stops *invoking* a C compiler for the target.
-#
-# On Linux targets that is invisible: blake3 probes for a compiler and falls
-# back to Rust intrinsics on its own, so the build succeeds either way (measured
-# with `CC=/nonexistent`, and cross-compiling to `aarch64-unknown-linux-gnu`).
-# **On `*-apple-darwin` and `*-windows-msvc` it is not**, and this is the whole
-# reason the feature exists — measured at `d955a44`:
-#
-#     cargo check -p tf_tree_core --target x86_64-apple-darwin
-#       error: failed to run custom build command for `blake3 v1.8.5`
-#     cargo check -p tf_tree_core --target x86_64-apple-darwin --features pure-hash
-#       Finished `dev` profile in 2.78s
-#
-# Same both ways for `x86_64-pc-windows-msvc`. Without this feature a consumer
-# cross-compiling to either target has to take its own `blake3` dependency and
-# turn `pure` on there — reaching around the crate that owns the dependency.
-#
-# **It cannot change a hash, and therefore cannot change a `.tft`.** BLAKE3 is a
-# specified function: every backend computes the same digest, so `blake3_64`,
-# the frame-hash region and `layout_hash` are unaffected. This is a build-time
-# knob, not a format one.
-#
-# `ci.yml`'s `bindings-non-linux` job says a cross-check "dies in a dependency
-# before reaching this crate" and uses native runners because of it; issue #180
-# names the same C-toolchain requirement as what blocks cross-compiling the
-# x86_64 macOS wheel once `macos-15-intel` retires. Both are about this.
+# Pure-Rust BLAKE3 backend. `blake3` has an unconditional `cc` build-dependency;
+# `pure` stops `build.rs` invoking a C compiler. Linux falls back on its own, but
+# `*-apple-darwin` and `*-windows-msvc` cross-checks fail without it (issue #180,
+# `ci.yml`'s `bindings-non-linux`). It cannot change a hash or a `.tft`.
 pure-hash = ["blake3/pure"]
-# Route libm through its soft-float paths. Needed **only** under Miri, whose
-# interpreter cannot execute the x86 inline `sqrt` asm libm's default `arch`
-# feature emits. `just miri` turns it on explicitly.
-#
-# This is deliberately NOT a dev-dependency feature: cargo's feature resolution
-# unifies dev-dependency features with the normal dependency whenever dev-deps
-# are built, so `cargo build --workspace --all-targets`, `cargo nextest run` and
-# any workspace-wide `cargo bench` would all have compiled libm — and therefore
-# every `sqrt`/`sin`/`cos` in the shipped binaries and the benchmarks — with
-# soft floats, silently invalidating the perf gate.
+# libm soft-float paths, only for Miri (which cannot run libm's x86 `sqrt` asm);
+# `just miri` enables it. Not a dev-dependency feature: unification would build
+# every workspace binary and benchmark with soft floats.
 miri-soft-float = ["libm/force-soft-floats", "tf_tree_math/miri-soft-float"]
-# **Default-off benchmark hook**, and the only thing it adds is `bench_probe`:
-# *one* `#[inline(never)]` wrapper around `Plan::at`, compiled *in this crate* so
-# `docs/PHASE5.md` §9.2's embedding row has an in-crate column to gate the
-# separate-crate one against. Its twin is `tf_tree_bench::embed::one` — the same
-# three lines compiled in the other crate — and the two living in two crates is
-# the entire experiment, not an accident of layout. No shipped crate enables it — `tf_tree`,
-# `tf_tree_c`, `tf_tree_py` and `tf_tree_cli` do not mention it — and it is the
-# same shape as `tf_tree_c`'s `test-hooks`, which exists so `abi_cost.rs` can
-# measure the `catch_unwind` boundary. `just embed-cost-check` is its gate.
+# Default-off: adds `bench_probe`, one `#[inline(never)]` wrapper around
+# `Plan::at`, the in-crate column for `docs/PHASE5.md` §9.2's embedding row (twin:
+# `tf_tree_bench::embed::one`). No shipped crate enables it; gate is
+# `just embed-cost-check`.
 bench-probe = []
-# **Fault injection, `docs/PHASE2.md` §11.3 — default-off, and nothing shipped
-# turns it on.** It places the named abort sites §11.3 requires (`crash::SITES`)
-# in this crate's mutation protocols, armed at run time by
-# `TF_TREE_CRASH_AT=<name>:<nth_hit>`. With the feature off `crash_point!`
-# expands to nothing, so a default build has no call, no branch and no atomic
-# load on the push path.
-#
-# **It has no `[dependencies]` entry because what it needs is `std`, and it takes
-# that for itself**: reading an environment variable needs `std`, so
-# `lib.rs` carries `#[cfg(any(test, feature = "crash-points"))] extern crate
-# std;` — the same shape the crate already used to give its test suite `std`
-# without becoming a `std` crate. Deliberately *not* a `std` feature: a feature
-# is unified across the graph, so one crate in a workspace build turning it on
-# would silently make everybody's `tf_tree_core` link `std`, and the `no_std`
-# guarantee this crate exists to keep would be decided by somebody else's
-# dependency. `#![no_std]` in `lib.rs` stays unconditional.
+# Fault injection, `docs/PHASE2.md` §11.3, default-off. Places `crash::SITES`
+# abort sites, armed by `TF_TREE_CRASH_AT=<name>:<nth_hit>`; off, `crash_point!`
+# expands to nothing. Takes `std` for itself via `extern crate std` in `lib.rs`,
+# not a `std` feature, which would unify across the graph and undo `no_std`.
 crash-points = []
 
 [dependencies]

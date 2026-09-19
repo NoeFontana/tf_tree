@@ -1,22 +1,9 @@
-//! Where the C ABI's measured +52% over native Rust actually goes.
+//! Splits the C ABI's +52% over native Rust (`docs/benchmarks/tf2.md`: 306.7 ns
+//! against ~201.5 ns) into arena backing, link mode and per-call ABI work.
 //!
-//! `docs/benchmarks/tf2.md` reports a C++ caller against `libtf_tree_c.so` at
-//! **306.7 ns** where native Rust measures ~**201.5 ns**, on a run that changed
-//! two variables together: the call crosses a shared-library boundary, *and* the
-//! arena is a `MAP_SHARED` `memfd` rather than a private heap allocation.
-//!
-//! **Neither is the cause.** [`tf_tree_bench::backing`] measures the mapping
-//! (<= 9.6 ns, paired) and — with `--attach` — the cross-process read-only
-//! attach (-0.7 ns). The link mode was measured separately by building
-//! `tests/cpp/bench.cpp` against the `.a` and the `.so`: 245.4 against 244.4 ns.
-//! What is left is the C ABI's own per-call work, ~99.5 ns of it, which
-//! `tft_plan_at_many` partly amortizes (302.0 -> 261.0 ns).
-//!
-//! **The residue row below is a subtraction, not a measurement**, and that is
-//! exactly how this binary first led to a wrong conclusion: an earlier version
-//! measured the mapping, found it free, and attributed everything else to the
-//! linker without measuring the linker. The row is labelled in the output for
-//! that reason.
+//! [`tf_tree_bench::backing`] measures the mapping (<= 9.6 ns, paired) and, with
+//! `--attach`, the cross-process attach. The residue row is a subtraction from a
+//! recorded figure, not a measurement, and is labelled so in the output.
 //!
 //! ```text
 //! just abi-split                       # the paired heap-vs-memfd rungs
@@ -27,20 +14,12 @@
 
 use anyhow::Result;
 
-/// The C++ arm from `docker/tf2/native_ratio.sh`, for the subtraction.
-///
-/// A literal, and that is a real weakness rather than a shortcut: it is a
-/// figure from a different run on a different day, so the residue below is a
-/// decomposition of *recorded* numbers rather than a measurement. Treating that
-/// residue as if it had been measured is precisely how this file's first version
-/// concluded "it is the linker", which is wrong by a factor of ~100. The rungs
-/// this binary measures itself are paired; the output says which is which.
+/// The C++ arm from `docker/tf2/native_ratio.sh`: a recorded figure, so the residue
+/// derived from it is a subtraction, not a measurement.
 const CPP_ABI_NS: f64 = 306.7;
 
 fn main() -> Result<()> {
-    // `--attach NAME` is the cross-process rung of the ladder, and it needs an
-    // arena somebody else is already serving (`native_arena --name NAME`), so it
-    // cannot be folded into the default run.
+    // `--attach NAME` needs an arena already served by `native_arena --name NAME`.
     let mut attach: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -58,11 +37,8 @@ fn main() -> Result<()> {
     let run = tf_tree_bench::backing::measure()?;
     println!("{}", run.verdict_line());
 
-    // **The bound, not the point estimate, is what the split rests on.** The
-    // sign of a ~2 ns effect measured on this host resolves in some runs and not
-    // in others; the band's upper edge barely moves. Since the residue being
-    // attributed is ~100 ns, "the mapping accounts for at most this" settles the
-    // question either way, and it settles it without needing a quiet host.
+    // The upper bound, not the point estimate, carries the split: the sign of a
+    // ~2 ns effect is noisy, the band's upper edge is not.
     let bound = run.backing_ns_bound();
     let total = CPP_ABI_NS - run.heap_ns;
     let boundary_min = total - bound;
@@ -94,11 +70,8 @@ fn main() -> Result<()> {
         100.0 * boundary_min / total
     );
 
-    // **Residency, since `0021`.** The heap arena is now demand-faulted, so
-    // declared-but-unpublished slots cost it nothing; the shared one pre-faults
-    // every declared slot in `populate_hot`. This prices that difference, which
-    // is the whole remaining resident gap on an over-declared arena and which
-    // nothing measured before — `scale_sweep`'s `rss_over_arena` is heap-only.
+    // Residency (0021): the heap arena is demand-faulted, the shared one pre-faults
+    // every declared slot in `populate_hot`.
     let (heap_kib, shm_kib, arena_bytes) = tf_tree_bench::backing::residency_both()?;
     let declared_kib = arena_bytes as f64 / 1024.0;
     println!();
@@ -123,11 +96,7 @@ fn main() -> Result<()> {
         shm_kib as i64 - heap_kib as i64
     );
 
-    // What a per-call guard costs on each backing, with no C ABI anywhere in
-    // the loop. This is what `tft_plan_at` is forced into by its signature, and
-    // it is also what refuted `0022`'s first question 4: the heap and shared
-    // rows are within noise of each other, so the `is_shared()` fork check is
-    // not the differentiator it was assumed to be.
+    // Per-call guard cost on each backing (0022 question 4).
     let (heap_g, shm_g) = tf_tree_bench::backing::guard_cost_both(run.rounds, 40, 60_000)?;
     println!();
     println!("Tree::guard() per lookup vs hoisted (safe Rust, no C ABI):");
@@ -150,12 +119,7 @@ fn main() -> Result<()> {
         shm_g.guard_ns() - heap_g.guard_ns()
     );
 
-    // `docs/decisions/0023` open question 3's falsifier: the same guard cost on
-    // the three-edge fixture `abi_cost.rs` gates R3 on, against §11.1's, in one
-    // binary with the two interleaved. The claim under test is that the toy
-    // fixture understates R3 because the cursor's cost is a stamp-array
-    // working-set effect, and the evidence for it was 16 vs 34.4 ns from two
-    // different binaries.
+    // 0023 open question 3's falsifier: guard cost on the three-edge fixture vs §11.1's.
     let (small_g, big_g) = tf_tree_bench::backing::guard_cost_fixture_pair(run.rounds, 40, 60_000)?;
     println!();
     println!("0023 q3 — per-call guard by FIXTURE, paired and interleaved, both heap:");
@@ -170,8 +134,6 @@ fn main() -> Result<()> {
     );
 
     if let Some(name) = attach {
-        // Same rounds/sweeps as the paired run, so the two `Rust native` rungs
-        // are the same loop and differ only in which process built the arena.
         let (ns, per_call_ns) = tf_tree_bench::backing::measure_attached(
             &name,
             tf_tree_bench::backing::ROUNDS,

@@ -1,39 +1,21 @@
 //! Body-frame twists and the SE(3) adjoint — `docs/PHASE4.md` §2.2.
 //!
-//! # The convention, stated once and carried by the type name
+//! A [`Twist`] is a **body-frame (right) twist**, `V^b = (T⁻¹ Ṫ)^∨`, paired with
+//! the right-perturbation convention of [`log_se3`](crate::log_se3)
+//! (`lib.rs` convention 5). Order is `[ω, v]`, angular first, as
+//! [`log_se3`](crate::log_se3) returns and [`exp_se3`](crate::exp_se3) consumes.
 //!
-//! A [`Twist`] is a **body-frame (right) twist**, `V^b = (T⁻¹ Ṫ)^∨`, matching
-//! the right-perturbation convention this crate already fixes for [`log_se3`](crate::log_se3)
-//! (`lib.rs` convention 5) and that `docs/PHASE1.md` §3.1 fixes for covariance.
-//! Component order is `[ω, v]` — angular first — the same order [`log_se3`](crate::log_se3)
-//! returns and [`exp_se3`](crate::exp_se3) consumes.
-//!
-//! Everyone gets this wrong once. The two things worth knowing before using it:
-//!
-//! * **Body, not spatial.** `V^b` is expressed in the *moving* frame. The
-//!   spatial (left) twist is `Ad(T)·V^b`, which is what [`Twist::to_spatial`]
-//!   returns. They are different vectors and neither is "the velocity" without
-//!   a frame named alongside it.
-//! * **The pairing is fixed.** `V^b` pairs with `T = T̂·exp(ξ^)`; a left-
-//!   perturbation library (`T = exp(ξ^)·T̂`) will disagree with every number
-//!   here by exactly `Ad(T)`.
-//!
-//! # Why there is no 6×6 matrix
-//!
-//! `docs/PHASE4.md` §2.3 describes the fold as "one 6×6 adjoint application per
-//! plan step". That is the *identity*, not a required representation. For
-//! `T = (q, t)` the two forms below need two [`Quat::rotate`](crate::Quat::rotate) calls and one
-//! [`Vec3::cross`] — against 36 multiply-adds plus a rotation-matrix extraction
-//! that a literal 6×6 would first have to build:
+//! * **Body, not spatial.** The spatial twist is `Ad(T)·V^b`
+//!   ([`Twist::to_spatial`]); a left-perturbation library disagrees by `Ad(T)`.
+//! * **No 6×6.** `docs/PHASE4.md` §2.3's "6×6 adjoint" is an identity, not a
+//!   representation; the closed forms below are checked against a dense 6×6 by
+//!   `adjoint_matches_a_dense_6x6` and
+//!   `adjoint_inv_matches_a_dense_6x6_of_the_inverse`:
 //!
 //! ```text
 //! Ad(T⁻¹)·[ω; v] = [ q*·ω ;  q*·(v − t × ω) ]
 //! Ad(T) ·[ω; v]  = [ q·ω  ;  t × (q·ω) + q·v ]
 //! ```
-//!
-//! Both are verified against a dense 6×6 built from the same transform by
-//! `adjoint_matches_a_dense_6x6` and
-//! `adjoint_inv_matches_a_dense_6x6_of_the_inverse` below.
 
 use crate::iso3::{Iso3, Vec3};
 use bytemuck::{Pod, Zeroable};
@@ -41,9 +23,7 @@ use bytemuck::{Pod, Zeroable};
 /// A body-frame (right) twist: angular velocity `ω` (rad/s) and linear velocity
 /// `v` (m/s), both expressed in the **moving** frame.
 ///
-/// See the [module docs](self) for the convention and why it is load-bearing.
-/// 48 bytes, `repr(C)`, no interior padding — so it is [`Pod`] and a `&[Twist]`
-/// can be handed to a C ABI as `[ωx ωy ωz vx vy vz]` pairs without a copy.
+/// See the [module docs](self). 48 bytes, `repr(C)`, no padding: [`Pod`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Twist {
@@ -95,8 +75,7 @@ impl Twist {
         ]
     }
 
-    /// Scale both parts. Used to turn a per-unit-`s` screw twist into a
-    /// per-second one: `ξ / Δt`.
+    /// Scale both parts.
     #[inline]
     #[must_use]
     pub const fn scale(self, k: f64) -> Self {
@@ -106,7 +85,7 @@ impl Twist {
         }
     }
 
-    /// Component-wise sum — the `+ V_bc^c` of the composition identity.
+    /// Component-wise sum.
     #[inline]
     #[must_use]
     pub const fn add(self, rhs: Self) -> Self {
@@ -135,10 +114,8 @@ impl Twist {
 
     /// The **spatial** (left) twist of the same motion: `Ad(T)·V^b`.
     ///
-    /// `t` is the pose the body twist was taken at — normally the pose returned
-    /// alongside it. Getting this argument wrong produces a valid-looking twist
-    /// in the wrong frame, which is the failure mode this method exists to make
-    /// explicit rather than to let a caller open-code.
+    /// `t` is the pose the body twist was taken at; a wrong one gives a
+    /// valid-looking twist in the wrong frame.
     #[inline]
     #[must_use]
     pub fn to_spatial(&self, t: &Iso3) -> Self {
@@ -166,8 +143,7 @@ impl Twist {
 impl Iso3 {
     /// `Ad(T)·x` — map a body twist at this pose to the spatial frame.
     ///
-    /// `[ω; v] ↦ [q·ω ; t × (q·ω) + q·v]`. See the [module docs](self) for why
-    /// this is not a 6×6.
+    /// `[ω; v] ↦ [q·ω ; t × (q·ω) + q·v]`.
     #[inline]
     #[must_use]
     pub fn adjoint(&self, x: &Twist) -> Twist {
@@ -180,10 +156,7 @@ impl Iso3 {
 
     /// `Ad(T⁻¹)·x`, without materializing `T⁻¹`.
     ///
-    /// `[ω; v] ↦ [q*·ω ; q*·(v − t × ω)]`. This is the form the plan fold uses
-    /// on every step, so it saves the [`Iso3::inverse`] that
-    /// `t.inverse().adjoint(x)` would build — one rotation and a negation pass
-    /// per step, on a path whose whole justification is that it is nearly free.
+    /// `[ω; v] ↦ [q*·ω ; q*·(v − t × ω)]`; the plan fold's per-step form.
     #[inline]
     #[must_use]
     pub fn adjoint_inv(&self, x: &Twist) -> Twist {
@@ -200,12 +173,8 @@ mod tests {
     use super::*;
     use crate::{exp_se3, log_se3};
 
-    /// A dense 6×6 `Ad(T)` built the textbook way, as an independent oracle.
-    ///
-    /// Deliberately constructed from the **rotation matrix**, not from the
-    /// quaternion, so it shares no code with the thing it checks. If both used
-    /// `Quat::rotate` a sign error in `rotate` would cancel and the test would
-    /// pass on a broken adjoint.
+    /// Dense 6×6 `Ad(T)` from the rotation matrix, sharing no code with
+    /// `Quat::rotate`.
     fn dense_adjoint(t: &Iso3) -> [[f64; 6]; 6] {
         let r = rot_matrix(t);
         let tx = [
@@ -256,8 +225,7 @@ mod tests {
         Twist::from_se3(o)
     }
 
-    /// A small deterministic spread of transforms and twists — no proptest
-    /// dependency needed for a claim this mechanical.
+    /// Deterministic spread of transforms and twists.
     fn cases() -> impl Iterator<Item = (Iso3, Twist)> {
         (0..40).map(|i| {
             let f = i as f64;
@@ -281,14 +249,9 @@ mod tests {
         })
     }
 
-    /// **The quaternion adjoint must equal the dense 6×6.**
+    /// The quaternion adjoint equals the dense 6×6 (`docs/PHASE4.md` §2.3).
     ///
-    /// This is the test that licenses `docs/PHASE4.md` §2.3's amendment. If it
-    /// fails, the cheap form is wrong and the fold has to build the matrix.
-    ///
-    /// Mutant: drop the `t × (q·ω)` term from [`Iso3::adjoint`] ⇒ the linear
-    /// row is wrong for every transform with a non-zero translation, which is
-    /// all of them here.
+    /// Mutant: drop the `t × (q·ω)` term from [`Iso3::adjoint`].
     #[test]
     fn adjoint_matches_a_dense_6x6() {
         let mut worst = 0.0f64;
@@ -301,12 +264,9 @@ mod tests {
         assert!(worst < 1e-14, "Ad(T) disagrees with a dense 6x6: {worst:e}");
     }
 
-    /// `Ad(T⁻¹)` must equal the dense adjoint of the inverse — *not* merely the
-    /// numeric inverse of `Ad(T)`, which would be a weaker claim satisfied by
-    /// two cancelling errors.
+    /// `Ad(T⁻¹)` equals the dense adjoint of the inverse.
     ///
-    /// Mutant: use `self.q` instead of `self.q.conjugate()` in
-    /// [`Iso3::adjoint_inv`] ⇒ fails on every rotated case.
+    /// Mutant: use `self.q` instead of `self.q.conjugate()` in [`Iso3::adjoint_inv`].
     #[test]
     fn adjoint_inv_matches_a_dense_6x6_of_the_inverse() {
         let mut worst = 0.0f64;
@@ -322,8 +282,7 @@ mod tests {
         );
     }
 
-    /// `Ad(T⁻¹)·Ad(T) = I`, the round trip a caller actually performs when it
-    /// converts to spatial and back.
+    /// `Ad(T⁻¹)·Ad(T) = I`.
     #[test]
     fn adjoint_round_trips() {
         for (t, x) in cases() {
@@ -335,11 +294,7 @@ mod tests {
         }
     }
 
-    /// `to_spatial` must be `Ad(T)`, not `Ad(T⁻¹)`.
-    ///
-    /// Worth its own test because swapping them yields a perfectly plausible
-    /// twist that is wrong by exactly the pose — the class of bug the module
-    /// docs open with.
+    /// `to_spatial` is `Ad(T)`, not `Ad(T⁻¹)`.
     #[test]
     fn to_spatial_is_the_forward_adjoint() {
         for (t, x) in cases() {
@@ -357,8 +312,7 @@ mod tests {
         }
     }
 
-    /// `[ω, v]` ordering must match [`log_se3`]/[`exp_se3`], or every twist in
-    /// the system is silently transposed.
+    /// `[ω, v]` ordering matches [`log_se3`]/[`exp_se3`].
     #[test]
     fn se3_array_ordering_matches_log_and_exp() {
         let xi = [0.1, -0.2, 0.3, 4.0, -5.0, 6.0];
@@ -366,12 +320,10 @@ mod tests {
         assert_eq!(tw.omega, Vec3::new(0.1, -0.2, 0.3));
         assert_eq!(tw.v, Vec3::new(4.0, -5.0, 6.0));
         assert_eq!(tw.to_se3(), xi);
-        // And the round trip through the group agrees with the array form.
         assert_eq!(log_se3(exp_se3(xi)).len(), 6);
     }
 
-    /// 48 bytes with no interior padding, or the `Pod` derive is a lie and the
-    /// C ABI cannot hand out `&[Twist]`.
+    /// 48 bytes, no padding, so the C ABI can hand out `&[Twist]`.
     #[test]
     fn layout_is_two_packed_vec3s() {
         assert_eq!(core::mem::size_of::<Twist>(), 48);
@@ -379,15 +331,9 @@ mod tests {
         assert_eq!(core::mem::size_of::<Vec3>(), 24);
     }
 
-    /// `neg` must negate **both** parts, and the inverse identity is what pins it.
+    /// `neg` negates both parts: `V_{T⁻¹} = −Ad(T)·V_T` (`docs/PHASE4.md` §2.3).
     ///
-    /// Found by review: `neg` was public API with no test and no caller, so its
-    /// sign was constrained by nothing. It is load-bearing — `V_{T⁻¹} = −Ad(T)·V_T`
-    /// (`docs/PHASE4.md` §2.3) — and a `neg` that negated only `omega` would give
-    /// an inverse whose linear velocity points the wrong way while its angular
-    /// velocity is right, which reads as a plausible physical motion.
-    ///
-    /// Mutant: negate only `omega` (or only `v`) ⇒ fails.
+    /// Mutant: negate only `omega` (or only `v`).
     #[test]
     fn neg_negates_both_parts_and_satisfies_the_inverse_identity() {
         for (t, x) in cases() {
@@ -395,15 +341,13 @@ mod tests {
             assert_eq!(n.omega, x.omega.scale(-1.0));
             assert_eq!(n.v, x.v.scale(-1.0));
             assert_eq!(n.neg(), x, "neg is not an involution");
-            // V_{T^-1} = -Ad(T) V_T, checked against the dense oracle.
             let want = apply(&dense_adjoint(&t), &x).neg();
             let got = t.adjoint(&x).neg();
             assert!(got.sub(want).amax() < 1e-13 * want.amax());
         }
     }
 
-    /// `sub` is `add` of the negation, and `add`/`sub` are component-wise.
-    /// Cheap, and it stops a transposed field assignment in either one.
+    /// `add`/`sub` are component-wise and consistent.
     #[test]
     fn add_and_sub_are_component_wise_and_mutually_consistent() {
         let a = Twist::new(Vec3::new(1.0, 2.0, 3.0), Vec3::new(4.0, 5.0, 6.0));

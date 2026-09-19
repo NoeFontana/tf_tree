@@ -1,152 +1,97 @@
 # Contributing
 
-Thanks for your interest in contributing to tf_tree. This document is the
-human-facing guide; agents should also read [`CLAUDE.md`](./CLAUDE.md).
+Human-facing guide; agents also read [`CLAUDE.md`](./CLAUDE.md) (its *Project
+shape* annotates each crate's unsafe and dependency budget). The crate tree is in
+[`README.md`](./README.md#workspace).
 
-## Repository layout
-
-```
-Cargo.toml                 workspace root: shared metadata, lints, deps
-rust-toolchain.toml        stable channel, pinned
-justfile                   single task surface
-deny.toml                  cargo-deny configuration
-crates/ ros/ xtask/        the crate tree: README.md, Workspace
-docs/PROJECT.md            overview, roadmap, decision log D1–D22 (§5)
-docs/PHASE1.md             normative Phase 1 spec (implemented whole)
-docs/PHASE2.md             normative Phase 2 spec; §1 = Phase 1 amendments A1–A8
-docs/decisions/            architectural decision records (process, kept for new decisions)
-```
-
-The crate tree is in [`README.md`](./README.md#workspace); `CLAUDE.md`'s
-*Project shape* is the same tree annotated with each crate's
-unsafe and dependency budget.
-
-`docs/PROJECT.md` and `docs/PHASE1.md` are the contract — read them in that
-order before proposing a change. `docs/PHASE2.md` §1 lists amendments A1–A8 to
-Phase 1, **all of which are now applied**; read them before altering a
-concurrency protocol, because they are why several orderings look the way they
-do. §0.0 is the live status table and outranks this file.
+`docs/PROJECT.md` and `docs/PHASE1.md` are the contract — read them in that order
+before proposing a change. `docs/PHASE2.md` §1 lists Phase 1 amendments A1–A8
+(all applied); read them before altering a concurrency protocol. Each spec's §0.0
+status table outranks this file.
 
 `tf_tree_core` is the source of truth. `tf_tree_math` and `tf_tree_arena` are
-separately publishable and separately testable — keeping the math crate free of
-`unsafe` and of the arena is what makes it cheap for Miri to interpret as a
-callee. **Its own tests are not run under Miri**: `just miri` names
-`tf_tree_arena`, `tf_tree_core` and `tf_tree`, never `tf_tree_math`. Phase 3 is implemented: the Python bindings live in `crates/tf_tree_py`
-and are *excluded* from the cargo workspace, because they link libpython — so
-`cargo build --workspace` never sees them and `just py-test` / `just py-lint`
-are their gate.
+separately publishable; `just miri` covers `tf_tree_arena`, `tf_tree_core` and
+`tf_tree`, never `tf_tree_math`. The Python bindings (`crates/tf_tree_py`) are
+excluded from the cargo workspace because they link libpython; `just py-test` /
+`just py-lint` are their gate.
 
 ## Prerequisites
 
-- Rust (stable, pinned by `rust-toolchain.toml`) via `rustup`; a `nightly`
-  toolchain with the `miri` component for `just miri`.
-- [`just`](https://github.com/casey/just) for the task surface.
-- `cargo-nextest` (`cargo install cargo-nextest --locked`).
-- `cargo-deny` (`cargo install cargo-deny --locked`).
+Rust (stable, pinned by `rust-toolchain.toml`) via `rustup`, plus `nightly` with
+`miri` for `just miri`; [`just`](https://github.com/casey/just);
+`cargo-nextest` and `cargo-deny` (`cargo install <name> --locked`).
 
 ## Quickstart
 
-```sh
-just build            # cargo build --workspace --all-targets
-just test             # cargo nextest + doctests + ingest-check
-just lint             # fmt --check, then a clippy -D warnings pass per feature config
-just audit            # cargo deny check (NOT part of `just lint`)
-just fmt              # auto-format + clippy --fix
-just loom             # concurrency model checking
-just miri             # UB checking (arena + core + the facade's one unsafe)
-just bench            # benchmark suite + go/no-go gate
-```
-
-`just lint` runs several prerequisite recipes before it lints, and one
-`clippy -D warnings` pass per feature configuration the workspace pass compiles
-out.
+`just build`, `just test` (nextest + doctests + ingest-check), `just lint` (fmt
+`--check`, then a clippy `-D warnings` pass per feature config), `just audit`
+(cargo deny; **not** part of `just lint`), `just fmt`, `just loom`, `just miri`
+(arena + core + the facade's one unsafe), `just bench` (suite + go/no-go gate).
 
 ## Workflow for significant changes
 
-Work already scoped by `docs/PHASE1.md` (or, later, `docs/PHASE2.md`) is
-implemented directly against that spec — cite the section number in the PR.
-
-Anything *not* covered there that touches the public API, crate boundaries, build
-system, or release process starts as a **decision document** in
-`docs/decisions/`. The process below is retained for exactly those cases:
+Work scoped by a phase spec is implemented directly against it — cite the section
+number in the PR. Anything else that touches the public API, crate boundaries,
+build system or release process starts as a **decision document**:
 
 1. Copy [`docs/decisions/template.md`](./docs/decisions/template.md) to
-   `docs/decisions/NNNN-kebab-case-title.md` (next sequential number).
-2. Fill it in; status starts as `draft`.
-3. Open a PR with **just the decision document**; address review until the open
-   questions are resolved, then flip the status to `ready` — the decision is now
-   the implementation contract.
-4. Implement under PRs that link the decision number; each PR maps to one step of
-   the *Implementation plan*.
-5. When all PRs merge, flip the status to `implemented` and list the PR numbers.
+   `docs/decisions/NNNN-kebab-case-title.md` (next number); status starts `draft`.
+2. Open a PR with **just the decision document**; when the open questions are
+   resolved, flip the status to `ready` — now the implementation contract.
+3. Implement under PRs that link the number; each maps to one step of the
+   *Implementation plan*.
+4. When all merge, flip the status to `implemented` and list the PR numbers.
    This is the immutability lock.
 
-Bug fixes, behavior-preserving refactors, and dependency bumps do not need a
-decision document — just open a PR.
+Bug fixes, behavior-preserving refactors and dependency bumps need no record.
 
 ## Changelog entries
 
-`CHANGELOG.md`'s `[Unreleased]` section says **what changed, whether it breaks
-anything, the PR number, and where the argument lives** — a decision record, a
-spec section, or the module the reasoning is written on. It does not reproduce
-that argument, restate a record's measured numbers, or re-litigate a trade-off
-that already has a home; every argument keeps exactly one. A fact with no other
-home stays in the entry, or moves to the document that should own it.
+`CHANGELOG.md`'s `[Unreleased]` says **what changed, whether it breaks anything,
+the PR number, and where the argument lives** — not the argument itself.
 
 ## Pull-request checklist
 
 - [ ] `just lint` is clean.
-- [ ] `just test` passes (and `just loom` / `just miri` if you touched the
+- [ ] `just test` passes (and `just loom` / `just miri` if you touched
       concurrency or arena code).
-- [ ] `just audit` is clean (or the failure is explained in the PR).
+- [ ] `just audit` is clean (or the failure is explained).
 - [ ] The `CHANGELOG.md` entry links its argument rather than repeating it.
-- [ ] Public Rust items have doc comments (`missing_docs` is a warn lint, and CI
-      builds docs with `-D warnings`).
-- [ ] Every `unsafe` block has its own `// SAFETY:` comment naming the invariant
-      it relies on; `unsafe` stays within its budgeted crates/modules.
-      `clippy::undocumented_unsafe_blocks` fails a block with no comment, but
-      only in a configuration some clippy line compiles: `just lint` for the
-      default features, `just shm-check` for anything behind `shm` (all of
-      `tf_tree_arena`'s mapped and frozen files), `just py-compile` for
-      `tf_tree_py`, the container-only `just tf2-check` for
-      `tf_tree_tf2_sys` — `scripts/unsafe-budget.sh`'s *What it does NOT
-      prove* lists the rest. It never fails a comment that names nothing; that
-      half is yours.
-- [ ] If the change is architectural, it cites the `docs/PHASE1.md` /
-      `docs/PHASE2.md` section it implements, or a linked decision that is
-      `ready` or `implemented`.
+- [ ] Public Rust items have doc comments (`missing_docs` warns; CI builds docs
+      with `-D warnings`).
+- [ ] Every `unsafe` block has a `// SAFETY:` comment naming its invariant, and
+      `unsafe` stays within its budgeted crates/modules.
+      `clippy::undocumented_unsafe_blocks` fails a missing comment only in a
+      configuration some clippy line compiles (`just lint`; `just shm-check` for
+      `shm`-gated files; `just py-compile`; the container-only `just tf2-check`);
+      `scripts/unsafe-budget.sh`'s *What it does NOT prove* lists the rest. It
+      never fails a comment that names nothing; that half is yours.
+- [ ] An architectural change cites the spec section it implements, or a linked
+      `ready`/`implemented` decision.
 
 ## Releasing
 
-`release.yml` and `wheels.yml` both fire on a `v*` tag and publish irreversibly —
-crates.io and PyPI each refuse a re-upload of a version. The gates that matter
-run on the tag, but two things are the maintainer's:
+`release.yml` and `wheels.yml` fire on a `v*` tag and publish irreversibly. Two
+things are the maintainer's:
 
 **Signed tags.** `docs/PHASE5.md` §10 lists this as the one open
-release-automation item. The workflow checks whether the tag object carries a
-signature and, by default, **warns**: the gate exists before a key does, and
-making it a refusal today would block a release on something only you can create.
-One-time setup:
+release-automation item. The workflow **warns** on an unsigned tag until a key
+exists. One-time setup:
 
 ```sh
-# SSH signing needs no keyserver and reuses a key you already have.
 git config --global gpg.format ssh
 git config --global user.signingkey ~/.ssh/id_ed25519.pub
 git config --global tag.gpgSign true       # sign every annotated tag
 ```
 
-Then add the same public key to your GitHub account **as a signing key** (it is a
-separate list from authentication keys), and set the repository variable
-`REQUIRE_SIGNED_TAGS` to `true`. From that tag onward an unsigned tag is refused
-rather than warned about. `git verify-tag v0.0.6` checks locally; GitHub's
-"Verified" badge is what checks the signature against the key on the account,
-which a runner cannot do because it does not have your public key.
+Add the same public key to your GitHub account **as a signing key** (separate
+from authentication keys), and set the repository variable `REQUIRE_SIGNED_TAGS`
+to `true`; from then on an unsigned tag is refused. `git verify-tag v0.0.6`
+checks locally.
 
-**The SBOM** is generated for you — `scripts/sbom.py` from `cargo metadata`,
-attached to the release and covered by `SHA256SUMS`. `just sbom <version>` writes
-the same file locally. It walks the graph from the crates that actually ship over
-`normal` edges only, so a dev-dependency never appears in a bill of materials for
-something that does not contain it.
+**The SBOM** is generated by `scripts/sbom.py` from `cargo metadata` over the
+shipped crates' `normal` edges, attached to the release and covered by
+`SHA256SUMS`; `just sbom <version>` writes it locally.
 
 ## License
 

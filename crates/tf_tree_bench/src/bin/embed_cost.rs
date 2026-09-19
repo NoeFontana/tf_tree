@@ -1,23 +1,13 @@
 //! `docs/PHASE5.md` §9.2's embedding measurements.
 //!
-//! Two modes:
-//!
 //! ```text
 //! embed_cost --json target/embed-cost/embedder.json   # measure this build
 //! embed_cost --compare target/embed-cost              # print both measurements
 //! ```
 //!
-//! `just embed-cost` runs all of it; run that rather than this. The measurement
-//! is only worth as much as the pinning and the profile flags the recipe
-//! supplies, and both are easy to leave off by hand.
-//!
-//! A single `--json` run already contains **§9.2's gated row**: the crate
-//! boundary is measured inside one build, by timing two identical bodies that
-//! differ only in which crate they were compiled in. `--compare` adds the
-//! **exploratory** half, which needs the second build: what the embedder's own
-//! `[profile.*]` costs. The design behind both is in
-//! [`tf_tree_bench::embed`] — in particular why the in-crate column has to live
-//! in `tf_tree_core` and why the profile comparison is not gated.
+//! Run `just embed-cost`, which supplies the pinning and profiles. One `--json` run
+//! holds §9.2's gated row; `--compare` adds the exploratory profile comparison.
+//! Design: [`tf_tree_bench::embed`].
 // This binary's output *is* its result.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -52,9 +42,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // A debug build of this probe measures a different program, and the whole
-    // measurement is a statement about generated code. Refusing is cheaper than
-    // explaining the number later.
     if cfg!(debug_assertions) {
         bail!(
             "this is a debug build: debug_assertions are on, so the timing describes a \
@@ -106,12 +93,6 @@ fn report(pair: &Pair) {
          link time, so a ratio near 1.00 here is the mechanism working, not a passing gate.\n"
     );
 
-    // The two profiles' `lto` / `codegen-units` are deliberately **not** spelled
-    // out here. They are stated in exactly one place — the report row's note in
-    // `tf_tree_bench::report` — and a test reads them back out of the workspace
-    // manifest and checks that note against them. A second copy printed here
-    // would be a second thing to keep true, and the profile *directory* on each
-    // line below is already provenance `build.rs` derived rather than a label.
     println!("EXPLORATORY — what the embedder's own [profile.*] costs, not gated\n");
     println!(
         "  out-of-crate at [profile.embedder] {:>8.1} ns",

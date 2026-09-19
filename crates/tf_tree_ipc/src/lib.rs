@@ -6,31 +6,18 @@
 //! different arenas.** This crate is the substrate that makes that true:
 //! `docs/PHASE2.md` §3.1–§3.4 and §5.1.
 //!
-//! # The design principle
+//! # Design
 //!
-//! **Do not implement leader election — borrow the kernel's.** A rendezvous
-//! needs exactly three properties: mutual exclusion, automatic release when the
-//! holder dies, and a way to ask whether anyone holds it. Linux open file
-//! description locks provide all three, maintained by the kernel, with no
-//! timeouts, no heartbeats, and no stale state that can survive a `SIGKILL`.
-//! Every distributed-consensus-flavoured problem in this area dissolves into one
-//! `fcntl` call.
+//! Do not implement leader election; borrow the kernel's. Linux open file
+//! description locks give mutual exclusion, release on holder death, and a way
+//! to ask whether anyone holds it — no timeouts, no heartbeats, no stale state.
 //!
-//! Concretely, that buys three things that a heartbeat protocol cannot have at
-//! any price:
-//!
-//! * A dead participant's lock, `SIGKILL`ed or crashed, is released *by the
-//!   kernel, immediately at the end of its exit* — after any core dump and the
-//!   teardown of its address space, which is when the kernel closes a dying
-//!   process's files
+//! * A dead participant's lock is released by the kernel at the end of its exit,
+//!   after any core dump
 //!   ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
-//!   There is no timeout to tune and no state left behind to reap.
-//! * A `SIGSTOP`ped participant **still holds its lock**, so it can never be
-//!   mistaken for a dead one. A liveness heuristic that is wrong once in a
-//!   thousand hours is exactly the kind of bug that ships.
-//! * "Is anyone alive?" is a kernel fact rather than an inference, so
-//!   `/proc` parsing and PID-reuse defence leave the correctness path entirely
-//!   (§5.1) and survive only as diagnostics.
+//! * A `SIGSTOP`ped participant still holds its lock, so it is never mistaken
+//!   for a dead one.
+//! * `/proc` parsing and PID-reuse defence are diagnostics only (§5.1).
 //!
 //! # The sharing boundary
 //!
@@ -41,10 +28,6 @@
 //! <runtime_dir>/<domain>/<name>.lock     # rendezvous + kernel-managed liveness
 //! <runtime_dir>/<domain>/<name>.sock     # SOCK_SEQPACKET, owner-bound, FD passing
 //! ```
-//!
-//! Sharing that directory between containers is a volume mount; not sharing it
-//! is complete isolation. Either way the boundary is inspectable with `ls`,
-//! which is why it is a directory and not an abstract socket namespace.
 //!
 //! # What is implemented here
 //!
@@ -60,41 +43,20 @@
 //! | §3.6 `memfd` creation, and wiring this into `tf_tree::open()` | **not yet** — `docs/decisions/0005` step 5 |
 //! | §6.1 claim leases: [`LockFile::try_take_claim`] and friends | implemented; the arena-side two-phase acquire is `docs/decisions/0005` step 7 |
 //!
-//! [`Open::open`] takes a [`ServerProbe`] rather than calling [`attach`] itself,
-//! and keeps doing so now that §3.7 has landed — [`SocketProbe`] is the real
-//! probe, [`NoServer`] the test one. That is not a placeholder for the
-//! interesting part: the interesting part is the lock-file half, where every
-//! race in §3.4 lives, and injecting the probe is what makes the split-brain
-//! race reproducible on demand instead of once in a thousand runs.
+//! [`Open::open`] takes a [`ServerProbe`] so the split-brain race in §3.4 is
+//! reproducible on demand.
 //!
 //! # Platform
 //!
-//! Linux only (§2), on any architecture Rust and `libc` support.
-//!
-//! OFD locks reach the kernel through `libc`'s `fcntl`, which is a **documented
-//! deviation from §2's "no libc crate"**: `rustix` 1.1 has no OFD locking at
-//! all, and the classic whole-file locks it does offer are rejected by name in
-//! §3.3, because they are dropped when *any* descriptor to the file closes
-//! anywhere in the process.
-//!
-//! The first implementation issued the syscall by hand and was restricted to
-//! x86-64 and aarch64 by a `compile_error!`, because `struct flock`'s layout and
-//! the syscall numbering are not the same everywhere. That was the wrong trade
-//! for the primitive the entire rendezvous rests on: `libc` maintains those
-//! definitions for every target, and it introduces no C build step, which is
-//! what §2's rule was actually protecting against.
+//! Linux only (§2). OFD locks reach the kernel through `libc`'s `fcntl`, a
+//! documented deviation from §2's "no libc crate": `rustix` has no OFD locking,
+//! and classic locks are rejected in §3.3.
 // `unsafe` boundary: the OS (one `pthread_atfork` shim). See `docs/decisions/0007`.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg(target_os = "linux")]
 #![deny(missing_docs)]
 
-// **The crates.io front page, wired to the doctest harness.** `README.md`'s one
-// fence is `text` — the two paths under the runtime directory — and a `rust`
-// example here would need a live Linux arena, so there is nothing to run today.
-// The module is what makes sure that stays a choice rather than an accident: no
-// recipe parses a README, so an example added later would be published
-// documentation that nothing compiles. `cfg(doctest)` keeps it out of `cargo
-// doc`, which renders the module docs above.
+// Wires `README.md`'s fences to the doctest harness; `cfg(doctest)` keeps it out of `cargo doc`.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme {}

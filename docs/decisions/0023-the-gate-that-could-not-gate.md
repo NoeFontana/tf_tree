@@ -7,60 +7,41 @@ question 3's falsifier has been built and run (`just abi-split`'s
 *0023 q3* block, `backing::guard_cost_fixture_pair`), and `docs/PHASE4.md` §7's
 gate list is edited to the wording under *Decision*.
 
-**All four open questions carry a written recommendation with its argument**
-(§*Open questions*), and all four are adopted. Two change what the *Decision*
-means and are called out here rather than left at the bottom: **R3 becomes the
-primary criterion and is measured on the §11.1 fixture rather than the three-edge
-one** (question 3), and **R1's 1.10 allowance is provisional, set on a host that
-was not quiet** (question 4) — it is adopted *as provisional*, which is a
-statement in §7 and not a number anyone should defend.
-
-**Question 3 was the one that could have gone either way, and it was settled by
-building its own falsifier rather than by argument.** The record's evidence for
-moving R3 was 16 ns against 34.4 ns *from two different binaries*, which it
-correctly refused to call a measurement. The paired version now exists and is
-reported below: the effect is **real and about twice the size the record
-predicted**. That is a confirmation with a caveat attached, not a clean win, and
-the caveat is written into the threshold work rather than dropped.
+All four open questions carry a recommendation and all four are adopted; two
+change what the *Decision* means: **R3 becomes the primary criterion, measured on
+the §11.1 fixture** (question 3, settled by building its falsifier: the effect is
+real and about twice the size predicted), and **R1's 1.10 is provisional**
+(question 4).
 
 ## Context
 
-`docs/PHASE4.md` §7 gate criterion 1 reads: **"C ABI within 5% of native for
-depth-3 lookup."** One quotient, one threshold. It has never gated anything, for
-two compounding reasons that were found separately and are the same defect.
+`docs/PHASE4.md` §7 gate criterion 1 reads **"C ABI within 5% of native for
+depth-3 lookup."** One quotient, one threshold; it never gated anything, for two
+compounding reasons that are the same defect.
 
 **The profile erased the boundary.** `crates/tf_tree_c/examples/abi_cost.rs` was
-built at the workspace `release` profile, which is `lto = "thin"`. That inlines
-`tft_plan_at` into a Rust caller, so the C boundary the criterion exists to price
-was not present in the binary pricing it. `report.rs`'s PHASE5 §9.2 embedding row
-had already recorded that exact trap in those words — thin LTO "is exactly what
-erases the boundary" — and `[profile.embedder]` (`lto = false`) exists *because*
-of it. Nothing had applied either to §7. Measured, the erasure is worth about
-half the answer: the same ABI prices at **1.016–1.019×** with the boundary gone
-and **1.025–1.038×** with it present.
+built at the workspace `release` profile (`lto = "thin"`), which inlines
+`tft_plan_at` into a Rust caller, so the boundary the criterion prices was not in
+the binary pricing it (`[profile.embedder]`, `lto = false`, exists because of this
+trap). The same ABI prices at **1.016-1.019x** with the boundary gone and
+**1.025-1.038x** with it present.
 
-**The denominator was at LLVM's discretion.** Adding a second, wholly unrelated
-`Tree::guard()` call site to `abi_cost.rs` moved the native baseline from
-**133 ns to 190 ns (43%)** and flipped the verdict FAIL → PASS. The ABI arm never
-moved: 194–196 ns in every variant. With `tft_plan_at` inlined, both arms
-collapse into one optimisable blob and the ratio turns on how well LLVM
-specialises the comparand. Neither the old FAIL nor the subsequent PASS was a
-statement about the C ABI.
+**The denominator was at LLVM's discretion.** Adding a second, unrelated
+`Tree::guard()` call site to `abi_cost.rs` moved the native baseline from **133 ns
+to 190 ns (43%)** and flipped the verdict FAIL -> PASS while the ABI arm stayed at
+194-196 ns. With `tft_plan_at` inlined, the ratio turns on how well LLVM
+specialises the comparand.
 
-**And this host cannot escape into absolute nanoseconds.** `report.rs`'s
-`Fitness` refuses `Sensitivity::AbsoluteTiming` rows here — SMT on, unreadable
-governor, four physical cores — and `fair_for_ratios` is the deliberately weaker
-axis that survives, because common-mode drift lands on both arms of an
-interleaved pair. During the measurements below the absolute baseline wandered
-**217–248 ns** (a neighbouring project was building) while the quotients moved by
-under one percentage point. Absolute is not available; the criterion has to stay
-a ratio, which means the denominator must be made non-optimisable **on purpose**.
+**This host cannot escape into absolute nanoseconds:** `report.rs`'s `Fitness`
+refuses `Sensitivity::AbsoluteTiming` rows here (SMT on, unreadable governor);
+`fair_for_ratios` survives, since common-mode drift lands on both arms of an
+interleaved pair. The criterion has to stay a ratio, so the denominator must be
+non-optimisable **on purpose**.
 
 ## Decision
 
 **Replace §7 gate criterion 1's single quotient with three, measured at
 `[profile.embedder]`, plus a control that fails if the instrument stops working.**
-
 §7's gate list becomes, for criterion 1:
 
 > 1. C ABI, measured at `[profile.embedder]` (`lto = false`) by `just abi-cost`:
@@ -69,9 +50,8 @@ a ratio, which means the denominator must be made non-optimisable **on purpose**
 >    lookup over one hoisted out of the loop < **1.25**; and **C**, the control,
 >    within **±0.02** of 1.
 
-The ladder each is taken from — five arms, all interleaved within every round so
-drift is common-mode, each rung differing from the one below by exactly one
-thing:
+The ladder, five arms interleaved within every round so drift is common-mode, each
+rung differing from the one below by one thing:
 
 | rung | arm | what it adds |
 |---|---|---|
@@ -83,369 +63,141 @@ thing:
 
 R1 = rung 3 / rung 1. R2 = rung 3 / rung 2. R3 = rung 1 / rung 0. C = control /
 rung 1.
-
-**The comparands are pinned.** Every native arm is an `#[inline(never)]` function
-with `black_box` on the stamp going in and the scalar coming out, so no call site
-can hoist, vectorise or partially evaluate it, and all call sites share one
-machine-code body.
-
-**The control is permanent and measured every run.** It is a structural twin of
-rung 1: same work, separate symbol, separate call site, reading `buf[15]` instead
-of `buf[0]` purely so identical-code folding cannot merge the two and make the
-control vacuous. If the compiler ever specialises a comparand per call site
-again, these two disagree and the run goes red before any rung is believed.
-
-**`just abi-cost` builds and runs both profiles and gates only the `embedder`
-one.** The `release` run is kept for the contrast, and its verdicts are printed
-with a banner saying they are not the gate.
+**The comparands are pinned:** every native arm is an `#[inline(never)]` function
+with `black_box` on the stamp in and the scalar out, so all call sites share one
+machine-code body. **The control is permanent and measured every run:** a
+structural twin of rung 1 (separate symbol and call site, reading `buf[15]` not
+`buf[0]` so identical-code folding cannot merge them); if the compiler ever
+specialises a comparand per call site the run goes red first. **`just abi-cost` builds and runs both profiles and gates only the
+`embedder` one;** the `release` run is a labelled contrast.
 
 ## Rationale
 
-**Why three rungs rather than one quotient.** R1 is the C *ABI*: handle
-validation, layout dispatch, the output slice, the `catch_unwind` landing pad.
-R3 is the C *signature*: `tft_plan_at` takes a plan and a stamp and has nowhere
-to keep a guard between calls, so it builds one every time. Both are real costs a
-C caller pays and both belong in §7 — but they have different owners (R1 is
-`tf_tree_c`'s, R3 is `0022`'s) and different futures — **`0022` has since gone `ready`
-declining the guard handle, so neither row is expected to
-move and both are regression detectors.** Rolled into
-one number they move together and neither is diagnosable: a single ratio only
-says *something* changed. This is the same reasoning that made `abi_cost` a
-ladder in the first place; this record only finishes the job by gating the rungs
-rather than the sum.
+**Three rungs, not one quotient.** R1 is the C *ABI* (handle validation, layout
+dispatch, output slice, `catch_unwind` pad); R3 is the C *signature* (`tft_plan_at`
+has nowhere to keep a guard between calls). Different owners (`tf_tree_c`, `0022`),
+and rolled together neither is diagnosable. `0022` declined the guard handle, so
+both rows are regression detectors, not targets. **Not absolute nanoseconds** (this
+host forbids it) and **not 1.05** (a figure for a quotient nobody could
+reproduce). The §7-as-written quotient (rung 3 over rung 0, R1 x R3) is still
+*printed*, at **1.098-1.108x**, so the re-cut cannot hide a regression.
 
-**Why not gate absolute nanoseconds instead.** That was the other candidate fix
-and this host forbids it — see `report.rs`'s `Sensitivity` and the `Fitness`
-split. Gating what the machine cannot measure would produce a criterion that is
-either always red or permanently forced.
-
-**Why not keep 1.05.** Because 1.05 was a figure for a quotient nobody could
-reproduce, and reusing it would smuggle an unmeasured threshold into a measured
-gate. Each allowance below is set from what this host actually shows, with its
-falsifier stated. The §7-as-written quotient (rung 3 over rung 0, i.e. R1 × R3)
-is still *printed* — it measures **1.098–1.108×** at `embedder` — so nobody has
-to take on faith that the re-cut is not hiding a regression behind a
-decomposition.
-
-**How each threshold was chosen, and what falsifies it.**
-
-| gate | measured (embedder, 12 runs, `taskset -c 2`) | allowance | why that number |
+| gate | measured (embedder, 12 runs, `taskset -c 2`) | allowance | why |
 |---|---|---|---|
-| R1 | 1.025–1.038 | **1.10** | ~2.5× the largest measured excess over 1. Loose on purpose: a row that goes red for noise becomes a row people re-run until green. Still catches a doubling of any single check the boundary performs. **Provisional — the twelve runs were taken on a contended host; see open question 4** |
-| R2 | 0.999–1.006 | **1.05** | §3.4 predicts ~0 and that is what it measures. Fails if the landing pads stop being free on this target |
-| R3 | 1.059–1.075 | **1.25** | a *regression* detector, not a target: if `Guard` acquires new per-construction work this is the row that moves. `0022` is `ready` and declines the `tft_guard` handle, so R3 is a permanent regression detector rather than a number somebody intends to move. It is also measured on the wrong fixture; see open question 3 |
-| C | 0.992–1.002 | **±0.02** | more than twice the 0.8% widest excursion, and deliberately far tighter than the rungs it protects — the failure it hunts moved the comparand **43%** |
-
-All four are falsified in the useful direction by a *quiet* host: if the spread
-there is much smaller than what a contended machine showed, R1 in particular
-should be tightened. This record invites that; it does not pretend 1.10 is a
-performance target.
+| R1 | 1.025-1.038 | **1.10** | ~2.5x the largest excess over 1; loose on purpose (a row red for noise gets re-run until green). **Provisional: taken on a contended host (question 4)** |
+| R2 | 0.999-1.006 | **1.05** | §3.4 predicts ~0. Fails if the landing pads stop being free |
+| R3 | 1.059-1.075 | **1.25** | a *regression* detector on `Guard`'s construction cost. Measured on the wrong fixture (question 3) |
+| C | 0.992-1.002 | **±0.02** | over twice the 0.8% widest excursion, far tighter than the rungs it protects (the failure it hunts moved the comparand 43%) |
 
 ## Consequences
 
-- **`just abi-cost` becomes red-on-failure**, at the `embedder` profile only.
-  The recipe previously said "wire the exit status in the commit that fixes the
-  regression"; the regression turned out to be in the instrument, and that is
-  the commit.
-- **Two builds, two target directories.** `abi-cost` now compiles the example at
-  `release` and at `embedder`, as `just embed-cost` already does. The
-  `embedder` directory is shared with `embed-cost` (measured at 166 MiB there).
-- **§7's criterion 1 becomes four numbers instead of one.** A reader wanting "the
-  ABI's cost" reads R1. A reader wanting the old shape reads the printed
-  reference quotient. The delta table in `docs/API.md` §6 is untouched: nothing
-  about the *surface* changes.
-- **The control is load-bearing.** If it fails, no rung on that run means
-  anything, and it is included in the exit status for that reason.
-- **What is now measurable that was not:** whether a change to the C ABI's
-  validation costs anything. The old gate could not have detected a 2× regression
-  in `tft_plan_at`'s handle checks, because the noise in its denominator was an
-  order of magnitude larger.
+- **`just abi-cost` is red-on-failure**, at the `embedder` profile only; it
+  compiles at `release` and `embedder` (the latter directory shared with
+  `embed-cost`, 166 MiB).
+- **§7's criterion 1 is four numbers;** R1 is "the ABI's cost" and the reference
+  quotient is printed. `docs/API.md` §6 is untouched.
+- **The control is load-bearing** and is in the exit status: if it fails no rung
+  on that run means anything.
 
 ## Implementation plan
 
-1. **Pin the comparands and interleave the arms** in `abi_cost.rs`; add the
-   control arm — verified by `just abi-cost` printing row C within ±0.02 on a
-   run at both profiles. *Landed.*
-2. **Build and run at `[profile.embedder]`** from `just abi-cost`, gating only
-   that arm; keep the `release` run as a labelled contrast — verified by the two
-   banners in the recipe's output and by R1 differing between them (1.016 vs
-   1.038). *Landed.*
-3. **Demonstrate the pin holds** by re-applying the edit that broke the old
-   gate — an unrelated extra `Tree::guard()` call site — measuring, and
-   reverting. *Landed*: the ratios moved ≤0.4 pp (R1 1.028→1.029, R3
-   1.064→1.059) while the host moved the absolute baseline 14% in the same
-   window; reverting the edit did **not** restore the old absolute number, which
-   is what says the 14% was the host and not the edit. Recorded in
-   `docs/PHASE4.md` §7.
-4. **On acceptance**, edit `docs/PHASE4.md` §7's gate list to the wording under
-   *Decision* — verified by the gate table naming a profile, which no row in it
-   does today. *Landed.*
-5. **Re-measure on a quiet host** and re-derive R1 by open question 4's rule —
-   verified by twelve runs each recording busy ≤ `mp::QUIET_ENOUGH`, which
-   requires `abi_cost.rs` to measure and print a busy fraction (it does not
-   today).
-
-   **This step said "Blocked on a machine this repository does not have", and
-   that is false.** The requirement is `busy ≤ mp::QUIET_ENOUGH`, which is
-   **0.10**, and `crate::mp::busy_fraction` on the development host reads
-   **0.000–0.021** at rest — measured 2026-09-11 through `Fitness::probe` in a
-   release build, three readings. The same host records `fair_for_ratios: true`,
-   and R1 is a ratio.
-
-   What the step is blocked on is the **instrument**, which its own last clause
-   already said is blocked on nothing: `abi_cost.rs` does not measure or print a
-   busy fraction, so no run can be *shown* to have been quiet. The committed
-   `baseline/results.json`'s `busy_fraction: 0.15` is what made this look like a
-   host property — that is one run's reading, above the threshold, and the two
-   permanent faults this host does have (SMT on, no cpufreq sysfs) reach the
-   timing axis and **not** the ratio axis.
-
-   **Two corrections to what "build the printing half" means, both of which would
-   have made it print an unusable number.**
-
-   *The sample must be taken **before** the run, not during it.*
-   `mp::busy_fraction` reads `/proc/stat`'s aggregate line, which includes the
-   measuring process — and `QUIET_ENOUGH`'s own doc justifies 0.10 by the mp
-   harness's load being *"a fraction of one core"*. `abi_cost` saturates one core,
-   which on 8 logical CPUs is ~12.5 %, so a fraction sampled inside its timed loop
-   can **never** satisfy the threshold, for a reason that has nothing to do with
-   the host. `mp::require_quiet_machine` is the shape to copy: one 300 ms sample
-   before anything starts, an error naming the top consumers, and
-   `TF_TREE_BENCH_FORCE` as the documented override.
-
-   *And the sampler is in the wrong crate to just call.* It is
-   `tf_tree_bench::mp`, while `abi_cost.rs` is an example of `tf_tree_c`, which
-   has no dependency on `tf_tree_bench` — dev or otherwise.
-
-   **This step said it "cannot gain one without a cycle, since `tf_tree_bench`
-   depends on `tf_tree_c`", and that is false.** Cargo *permits* a
-   dev-dependency cycle: dev-dependencies do not participate in the library's
-   own build graph, so a package's may depend back on it. Measured on
-   2026-09-11 rather than reasoned about — a two-crate scratch workspace in
-   exactly this shape (`a` dev-depends on `b`, `b` depends on `a`, an **example**
-   of `a` calls into `b`) compiles. So the dev-dependency was available and the
-   record ruled it out on a rule that does not exist.
-
-   The conclusion survives on two reasons that do hold, and they are weaker and
-   worth stating as such: a dev-dependency pulls `tf_tree_bench` and its whole
-   tree into every `tf_tree_c` example build for a 300 ms read of `/proc/stat`;
-   and — the load-bearing one — the sampler must not run **inside the measured
-   process**, which is the paragraph above this one and is a property of *where
-   the sample is taken*, not of which crate owns the code. So the printing
-   half is one of: a small `tf_tree_bench` entry point that `just abi-cost`
-   brackets the run with, or a second implementation of the sampler. The first
-   keeps one spelling and is what this step should do; the second is the defect
-   `docs/PROJECT.md` §6 names. Either way it is a **crate-boundary** choice and not
-   a two-line print, which is what calling it "the printing half" concealed.
-
-   **And "quiet" is a real cost on this host rather than a formality.** This
-   record's own host note records the machine as shared with other tenants at load
-   average 1.3–2.5 *during its own runs*, and the committed baseline was cut at
-   15 %. Sampled during review: 0.22 over 2 s and 0.96 over 300 ms, with an
-   unrelated `cargo-clippy` running. The step wants **twelve** runs each at or
-   below 0.10, so the honest statement is not "a run to discard" — it is that the
-   twelve have to be collected in a window when nothing else on the box is
-   building, and that a multi-tenant host may not offer one on demand. What is
-   still true is that this is a scheduling problem and not a missing machine.
-
-   **The instrument landed 2026-09-11; the twelve readings did not.** The
-   crate-boundary choice above was taken the way this step names it — one entry
-   point, not a second copy of the sampler: `tf_tree_bench`'s `quiet_check` bin
-   calls `mp::require_quiet_machine` and `just abi-cost` brackets the two
-   `abi_cost` runs with it (`before`, then `after` once the binary has exited so
-   its own core is out of the window). It exits **2**, where `abi_cost` exits 1
-   for a missed ratio, so a loud host cannot be read as the ABI regressing —
-   `docs/PROJECT.md` §6's *INVALID is not FAIL*. All three branches were
-   exercised on 2026-09-11: QUIET at 1.7 %, NOT QUIET at 15.6 % and at 100 %
-   (exit 2, naming the top consumers), and the `TF_TREE_BENCH_FORCE` override at
-   100 %, which passes and **says so in the line** — an override that is silently
-   unfailable is the defect this record is named after, one layer down.
-
-   What is still owed is the *measurement*: twelve runs each recording
-   `busy <= 0.10`. That needs a window in which nothing else on this box is
-   building, and this session's own agents put the host at 15.6 % while the check
-   was being written. The step stays open on that, and it is now open on
-   something a log can settle rather than on an instrument that did not exist.
-
-   **A bound worth stating rather than discovering later**: `busy_fraction` reads
-   `/proc/stat`'s aggregate line, while `abi_cost` is `taskset -c 2`. A machine
-   at 8 % aggregate could in principle be one neighbour pinned to CPU 2, which
-   the check would pass and the run would feel. `QUIET_ENOUGH` at 0.10 of 8 CPUs
-   is 0.8 of a core, so the case is narrow and real; per-CPU sampling is not
-   built and is not claimed.
-
-**Steps 6 and 7 are what the open questions' recommendations would add, listed
-here so a ratifier sees the whole cost. They are proposals, like everything else
-under *Decision*.**
-
-6. **Pair the two fixtures in one binary before moving R3.** *Landed*:
-   `backing::guard_cost_fixture_pair`, reported by `just abi-split`. The stated
-   falsifier was "the paired difference reproduces ~18 ns, and if it does not,
-   question 3's recommendation is withdrawn". It came out at **30–44 ns over
-   three runs** — same sign, same conclusion, about double the magnitude. Read
-   strictly, the falsifier's *number* missed; read for what it was guarding
-   against — that the two-binary comparison was an artifact and the fixture makes
-   no difference — it passed decisively. The recommendation is kept and the
-   unexplained half is recorded as unexplained. **The literal reading is noted
-   rather than quietly dropped**, because a falsifier one reinterprets after
-   seeing the result is not a falsifier.
-7. **Move R3 onto the §11.1 fixture and re-derive its allowance there** —
-   verified by `just abi-cost` reporting R3 against a numerator ~2.5× larger and
-   by the new allowance being derived by the same rule as R1's, not carried
-   across from 1.25.
+1. **Pin the comparands, interleave the arms, add the control** in `abi_cost.rs`.
+   *Landed.*
+2. **Build and run at `[profile.embedder]`** from `just abi-cost`, gating only that
+   arm, `release` as labelled contrast (R1 1.016 vs 1.038). *Landed.*
+3. **Demonstrate the pin holds** by re-applying the edit that broke the old gate.
+   *Landed:* ratios moved <= 0.4 pp (R1 1.028 -> 1.029, R3 1.064 -> 1.059) while
+   the host moved the absolute baseline 14%. Recorded in `docs/PHASE4.md` §7.
+4. **Edit `docs/PHASE4.md` §7's gate list** to the wording under *Decision*.
+   *Landed.*
+5. **Re-measure on a quiet host and re-derive R1 by question 4's rule**: twelve
+   runs each with busy <= `mp::QUIET_ENOUGH` (**0.10**). **Open.** The instrument
+   landed 2026-09-11: `tf_tree_bench`'s `quiet_check` bin calls
+   `mp::require_quiet_machine`, and `just abi-cost` brackets the two `abi_cost`
+   runs with it. It exits **2**, where `abi_cost` exits 1 for a missed ratio, so a
+   loud host cannot read as the ABI regressing (`docs/PROJECT.md` §6's *INVALID is
+   not FAIL*); the `TF_TREE_BENCH_FORCE` override prints that it fired.
+   - **The sample is taken before the run, never during it** (`abi_cost`
+     saturates one core, ~12.5% of 8 CPUs, so a fraction sampled inside its loop
+     could never satisfy 0.10), and through **one entry point** (`quiet_check`),
+     not a second copy of the sampler or a dev-dependency cycle on
+     `tf_tree_bench` (permitted by cargo, but it pulls the bench tree into every
+     example build).
+   - **Still owed: the twelve readings**, needing a window when nothing else on
+     the box is building (a scheduling problem; the host reads 0.000-0.021 at rest).
+   - **A bound:** `busy_fraction` reads `/proc/stat`'s aggregate line while
+     `abi_cost` is `taskset -c 2`, so 8% aggregate could be one neighbour pinned to
+     CPU 2. Per-CPU sampling is not built.
+6. **Pair the two fixtures in one binary before moving R3.** *Landed:*
+   `backing::guard_cost_fixture_pair`, reported by `just abi-split`. Its falsifier
+   ("the paired difference reproduces ~18 ns, else question 3 is withdrawn") came
+   out at **30-44 ns**: same sign, about double. The *number* missed; what it
+   guarded against (the two-binary comparison being an artifact) passed decisively.
+   The literal reading is recorded because a falsifier reinterpreted after the
+   result is not one.
+7. **Move R3 onto the §11.1 fixture and re-derive its allowance there**, by the
+   same rule as R1's, not carried across from 1.25. Verified by `just abi-cost`
+   reporting R3 against a numerator ~2.5x larger. **Open.**
 
 ## Open questions
 
-Each carries a **recommendation** written in below.
+Each recommendation predates the measurements in steps 3, 5 and 6; where a later
+step contradicts one, the step is what happened.
 
-**This preamble described a record that no longer exists, in both of its halves,
-and is corrected in place rather than deleted.** It read *"They are
-recommendations and not decisions because this record is `draft`: a human
-ratifies by merging, and until then `docs/PHASE4.md` §7's normative gate list is
-untouched."* This record's `**Status:**` line says **`ready`**, not `draft` — and
-§7's gate list is **not** untouched: implementation step 4 is *"edit
-`docs/PHASE4.md` §7's gate list to the wording under *Decision*"* and it is
-marked *Landed*, which the Implementation line above repeats. So the sentence
-asserted a status the header contradicts and a spec state its own plan
-contradicts.
+1. **Is rung 1 the right denominator for R1?** It charges the ABI only for what the
+   boundary does and the per-call guard to R3; rung 0 would make R1 include a cost
+   the C *signature* forces (`0022`'s subject).
 
-What survives is the distinction it was reaching for: the recommendations under
-each question below were written before the measurements in steps 3, 5 and 6, and
-where a later step contradicts one, **the step is what happened and the
-recommendation is what was expected**. Step 6 is the worked example: its falsifier
-named ~18 ns, the measurement came out at 30–44 ns, and both readings are kept.
-
-1. **Is rung 1 the right denominator for R1?** It charges the ABI only for what
-   the boundary does, and charges the per-call guard to R3. The alternative —
-   keep rung 0 as the denominator, as §7's current wording implies — makes R1
-   include a cost the C *signature* forces rather than the ABI's implementation,
-   which is `0022`'s subject and not `tf_tree_c`'s to fix. Both are reported; the
-   decision is which one carries the pass/fail. This is the one question that has
-   to be settled before `ready`.
-
-   **Recommendation: keep rung 1 as R1's denominator, and make R3 the primary
-   criterion — the row a reader is pointed at, and the row whose movement is
-   expected to be the interesting one.** R1 stays gated and stays as specified;
-   what changes is which of the two §7 calls *the* criterion.
-
-   The argument is where the money is. R1 measures 1.025–1.038 — about **6–9 ns**
-   on a ~245 ns lookup — and is a health check on handle validation, layout
-   dispatch and the output slice. R3 measures the per-call guard, which
-   [`0022`](./0022-the-per-call-guard-and-the-unwatched-gate.md) amendment 3
-   prices at **~48 of the ~56 ns** a C++ caller pays over native Rust, i.e. ~85%
-   of the whole thing. A §7 whose headline is R1 puts the reader's eye on the
-   smaller term. That is also the *asymmetry* argument for keeping rung 1 as the
-   denominator: with rung 0 underneath, R1 would be R1 × R3 and would move
-   whenever the guard moved, which is exactly the non-diagnosability this record
-   exists to remove.
-
-   **The objection this has to answer** is that R3 is not `tf_tree_c`'s to fix,
-   so gating it makes §7 red for a cost another crate owns. Two replies. First,
-   §7 is Phase 4's gate on *what a C caller pays*, not on `tf_tree_c`'s source;
-   a C caller pays the guard. Second, `0022` is now `ready` with the decision
-   **not** to lower R3 — the answer there is `tft_plan_at_many`, not a
-   `tft_guard` handle — so R3 is no longer a number waiting to be improved by
-   somebody else's work. It is a **regression detector on `Guard`'s
-   construction**, permanently, and that is a stabler thing to gate than a
-   quotient somebody intends to move. `0023`'s own R3 doc comment in
-   `abi_cost.rs` says "it is the row `0022` intends to *lower*, and lowering it
-   is the win"; **that sentence is now false** and should be corrected in the
-   commit that ratifies this record.
-
-2. **Should R3 exist at all in §7**, or move to `0022` as that record's own
-   gate? It is here because it is the larger of the two costs and because a §7
-   that reports only R1 would let the total drift upward with nothing red.
-
-   **Recommendation: R3 stays in §7, and question 1's answer is why.** `0022` is
-   `ready` and builds nothing, so it has no implementation to hang a gate on and
-   no recipe of its own; a gate parked in a record that ships no code is a gate
-   nobody runs — which is the *original* defect this record was written to fix
-   (`abi_cost.rs` was executed by no recipe for years). §7 is where the recipe
-   is.
-
+   **Recommendation: keep rung 1, and make R3 the primary criterion.** R1 measures
+   1.025-1.038, about **6-9 ns** on a ~245 ns lookup, a health check. R3 measures
+   the per-call guard, which
+   [`0022`](./0022-the-per-call-guard-and-the-unwatched-gate.md) amendment 3 prices
+   at **~48 of the ~56 ns** a C++ caller pays over native Rust (~85%). With rung 0
+   under it, R1 would be R1 x R3 and move whenever the guard moved. *Objection:* R3
+   is not `tf_tree_c`'s to fix. *Reply:* §7 gates what a C caller pays, and `0022`
+   declines to lower R3 (the answer is `tft_plan_at_many`), so it is a permanent
+   regression detector on `Guard`'s construction. `abi_cost.rs`'s R3 comment ("the
+   row `0022` intends to *lower*") is now false.
+2. **Should R3 exist in §7, or move to `0022`?** **Stays:** `0022` builds nothing,
+   so a gate parked there is one nobody runs, the original defect (`abi_cost.rs`
+   ran in no recipe for years).
 3. **Does the heap-tree fixture understate R3?** `just abi-attached` measures the
-   per-call guard at ~45 ns on an arena attached read-only across a process
-   boundary; this file measures ~16 ns on a three-edge heap tree. Both are at
-   `[profile.embedder]`. The difference is unexplained and belongs to `0022`
-   amendment 4's open list, but if §7 gates R3 it should probably gate the
-   dearer configuration.
+   per-call guard at ~45 ns on a read-only cross-process arena; `abi_cost.rs`
+   ~16 ns on a three-edge heap tree.
 
-   **Recommendation: yes, it understates it; gate the dearer configuration; and
-   the difference is no longer unexplained.** The mechanism is a **working set**,
-   it is the *stamp* array and not the arena as a whole, and every number below
-   was already in the tree — nobody had put the three tables side by side.
+   **Recommendation: yes; gate the dearer configuration.** The variable is the
+   **fixture**, not the backing: `0022` amendment 5 measured the §11.1 fixture in
+   one binary, **heap +34.4 ns, memfd +35.8 ns** (backing ~1.4 ns; fixture 16 ->
+   34.4 ns).
 
-   **First, the variable is the fixture, not the backing.** `0022` amendment 5
-   measured the per-call guard on the §11.1 fixture at `[profile.embedder]`,
-   counters off, on both backings in one binary: **heap +34.4 ns, memfd
-   +35.8 ns**. So changing the backing and holding the fixture is worth ~1.4 ns,
-   while changing the fixture and holding the backing (heap, `embedder`) is
-   16 → 34.4 ns. **Whatever this is, it is not "shared memory is dearer"** —
-   which is what `abi_cost.rs`'s R3 comment currently guesses ("whatever makes
-   the shared case ~3× dearer"), and it is wrong. That comment is corrected in
-   the same commit as this paragraph.
-
-   **Second, the mechanism.** `Guard` carries the per-step bracket-search cursor
-   (`plan.rs`, `Guard::cursor`), and a fresh guard initialises it to the
-   `EdgeId(0)` sentinel — the source comment says it outright: *"a fresh guard
-   matches no edge and every step takes the cold path once"*. So a per-call guard
-   does not merely cost its constructor; it makes **every step of every lookup
-   restart its bracket search at the window midpoint** instead of resuming beside
-   the previous answer. `docs/design/fast-path.md` §12 measured what that costs
-   and found it is a cache cliff in the **stamp array**, not a probe curve:
-   `sample(exact)` is flat at 12.8–14.4 ns from capacity 64 to 1024, then steps
-   to 32.5 at capacity 4096 — whose stamp array is 32 KiB, this host's L1d — and
-   43.3 at 16384. The cursor is worth **58.54 → 41.37 ns/sample at capacity
-   16384** on a monotone sweep, and the pose array's size costs nothing (the
-   `Hold` control is flat to 1% across a 256× range).
-
-   **Third, the arithmetic on the two fixtures**, from `ArenaLayout::compute`
-   (64 B/slot poses, 8 B/slot stamps, capacities rounded to powers of two):
+   The mechanism is a **working set** in the *stamp* array. A fresh `Guard` starts
+   its bracket-search cursor at the `EdgeId(0)` sentinel, so a per-call guard
+   restarts every step's search at the window midpoint. `docs/design/fast-path.md`
+   §12 measured the cache cliff: `sample(exact)` flat at 12.8-14.4 ns from capacity
+   64 to 1024, then 32.5 ns at 4096 (32 KiB of stamps, this host's L1d) and 43.3 at
+   16384.
 
    | | `abi_cost.rs`'s tree | the §11.1 fixture |
    |---|---|---|
-   | dynamic edges on the measured path | 2 × 256 slots | 512 + 2048 + **16384** slots |
+   | dynamic edges on the path | 2 x 256 slots | 512 + 2048 + **16384** slots |
    | stamp bytes searched, per edge | 2 KiB | 4 / 16 / **128 KiB** |
-   | pose bytes, per edge | 16 KiB | 32 / 128 / **1024 KiB** |
    | whole arena | **~54 KiB** | **~1.34 MiB** |
-   | vs this host (L1d 32 KiB, L2 512 KiB) | every hot array in L1 | the 1 kHz edge's stamps are **4× L1d** |
+   | vs L1d 32 KiB, L2 512 KiB | every hot array in L1 | the 1 kHz edge's stamps are **4x L1d** |
 
-   So the three-edge tree's searched arrays are 2 KiB and sit on the flat part of
-   §12's curve, where a cold search costs a couple of nanoseconds more than a warm
-   one; §11.1's 1 kHz edge sits past the cliff, where §12 measures the cursor at
-   **~17 ns/sample**. Predicted difference in R3's absolute cost between the two
-   fixtures: ~17 ns. Measured: 34.4 − 16 = **~18 ns**. The prediction and the
-   measurement are made from independent runs and agree; **the working-set
-   reading is supported, not asserted.**
+   Predicted difference ~17 ns; measured 34.4 - 16 = ~18 ns from independent runs.
+   The ~9 ns between §11.1 heap in-process (34.4) and attached cross-process
+   (43-47) is a cross-harness difference, **not attributed, and must not be
+   attributed by subtraction**.
 
-   **What is still not attributed, and must not be attributed by subtraction.**
-   §11.1 heap in-process is 34.4 ns and §11.1 attached read-only cross-process is
-   43–47 ns. That ~9 ns is a *cross-harness* difference (`arena_backing` vs
-   `abi_attached`, different sweep shapes, counters compiled in but flushing
-   nothing on a read-only arena) and this record does not claim to know what it
-   is. It is smaller than the effect above and does not change the
-   recommendation.
+   **For the gate:** a three-edge tree that fits in L1 is not what a robot runs;
+   §11.1 (a 1 kHz edge with 10 s of history) is the fixture the whole suite, the
+   tf2 differential harness and the CLI demo share. **Move R3 onto it**
+   (`abi_attached` builds that ladder) and re-derive its allowance (1.25 was set
+   against a ~16 ns numerator; §11.1's is ~2.5x larger). R1, R2 and C price the
+   boundary, which `0022` amendment 4 found fixture-independent (~7 ns).
 
-   **What follows for the gate.** A three-edge tree that fits in L1 is not what a
-   robot runs — §11.1 is the fixture the whole benchmark suite, the tf2
-   differential harness and the CLI demo already share, and its 1 kHz edge with
-   10 s of history is an ordinary IMU. Gating R3 on the toy fixture gates the
-   configuration in which the cost being gated is mostly absent. **Move R3's
-   measurement onto the §11.1 fixture** — `abi_attached` already builds that
-   ladder — and re-derive its allowance there rather than carrying 1.25 across,
-   because 1.25 was set against a ~16 ns numerator and the §11.1 one is ~2.5×
-   larger against a similar denominator. R1, R2 and C are unaffected: they price
-   the boundary, and `0022` amendment 4 found the boundary's own terms
-   (validation, layout store, `catch_unwind`) fixture-independent at ~7 ns
-   combined.
-
-   **The measurement that would make this airtight** — both fixtures' guard cost
-   in one binary, one profile, interleaved — **has now been run**, and it was the
-   first thing the ratifying commit did. `backing::guard_cost_fixture_pair`
-   builds `abi_cost.rs`'s three-edge tree beside the §11.1 fixture, sweeps both
-   with identical code, alternates which leads every round, and takes the median
-   of the per-round *differences*. Both heap-backed, `[profile.embedder]`, three
-   runs:
+   **Paired measurement** (`backing::guard_cost_fixture_pair`; heap-backed,
+   `[profile.embedder]`, median of per-round differences):
 
    | run | three-edge, 256 slots | §11.1 fixture | paired difference |
    |---|---|---|---|
@@ -453,68 +205,29 @@ named ~18 ns, the measurement came out at 30–44 ns, and both readings are kept
    | 2 | +15.6 ns | +52.0 ns | **+36.4 ns** |
    | 3 | +18.7 ns | +62.5 ns | **+43.9 ns** |
 
-   **The recommendation stands and the arithmetic behind it does not fully.**
-   The direction is confirmed — the toy fixture understates R3, decisively — and
-   the three-edge column reproduces the ~16 ns this record argued from, tightly
-   (15.6–18.7). But the predicted difference was **~18 ns** and the measured one
-   is **30–44 ns**, roughly double. So `fast-path.md` §12's stamp-array cliff
-   accounts for perhaps half of the fixture effect and something else accounts
-   for the rest; **that remainder is not attributed here, and must not be
-   attributed by subtraction** — the same discipline this record applies to the
-   ~9 ns above. Naming a mechanism for it would be the fourth wrong attribution
-   in this file's neighbourhood.
+   The direction is confirmed and the three-edge column reproduces ~16 ns, but the
+   predicted ~18 ns became **30-44 ns**: the stamp-array cliff accounts for perhaps
+   half and **the remainder is not attributed**. The §11.1 column is noisy (14.3 ns
+   span against 3.1 ns), so R3's new allowance carries the same *provisional*
+   label as R1's.
+4. **Is 1.10 the right allowance for R1?**
 
-   Note also which column is noisy. The three-edge figures span 3.1 ns and
-   §11.1's span 14.3 ns — a 30% spread. **That is an argument about the
-   threshold, not about the move**: R3's new allowance has to be derived with
-   that spread in hand, which is why step 7 says derive rather than carry 1.25
-   across, and why the allowance lands with the same *provisional* label question
-   4 puts on R1's 1.10.
+   **Recommendation: no, it is provisional.** The twelve runs were taken while a
+   neighbouring project built (absolute baseline 217-248 ns, ~14%). An allowance of
+   "~2.5x the largest excess seen on a contended machine" is sized by the
+   contention, not the ABI: at 1.10 against 1.025-1.038, R1 would sit still for a
+   **three-fold** increase in everything the boundary does.
 
-4. **Is 1.10 the right allowance for R1?** *(Added by this revision; it was
-   implicit in the threshold table's falsifier column and deserves to be a
-   question, because it is the number most likely to be wrong.)*
+**Tighten it on a quiet host.** "Quiet" is defined in code:
+`tf_tree_bench::mp::QUIET_ENOUGH`, **<= 10% busy** over 300 ms immediately before
+the run (`require_quiet_machine`), which `report.rs`'s `Fitness` folds into
+`fair_for_ratios` (a ratio needs only that axis; `fair_for_timing` also wants no
+SMT and a `performance` governor, which this host cannot pass).
 
-   **Recommendation: no — 1.10 is provisional, and it was set on a host that was
-   not quiet.** Say so plainly rather than letting the table read as a
-   performance target. The twelve runs behind it were taken while a neighbouring
-   project was building: the *absolute* baseline wandered **217–248 ns**, ~14%,
-   in that window. The quotients held to under a percentage point, which is the
-   whole reason this criterion is a ratio — but an allowance chosen as "~2.5× the
-   largest excess I saw on a contended machine" is an allowance sized by the
-   contention, not by the ABI. At 1.10 against a measured 1.025–1.038, R1 would
-   sit still for a **three-fold** increase in everything the boundary does. That
-   is loose enough to miss a real regression, and calling it "loose on purpose"
-   is only half true: the other half is that nobody knows how tight it could be.
-
-   **Tighten it on a quiet host before ratification.** "Quiet" is not a mood
-   here, it has a definition in the code: `tf_tree_bench::mp::QUIET_ENOUGH` —
-   **≤ 10% busy**, sampled over 300 ms immediately before the run
-   (`require_quiet_machine`), which `report.rs`'s `Fitness` folds into
-   `fair_for_ratios` along with "not a debug build". (`fair_for_timing`
-   additionally wants no SMT and a `performance` governor; this host has SMT on
-   and an unreadable governor and therefore **cannot** pass it — see *Context*.
-   `fair_for_ratios` is the axis available here, and it is the axis a ratio
-   needs.)
-
-   Two consequences, both concrete:
-
-   - **`abi_cost.rs` measures no busy fraction today and should.** It lives in
-     `tf_tree_c`, which cannot depend on `tf_tree_bench` — so it reads
-     `/proc/stat` itself, in ~20 lines, and *prints* the busy fraction beside
-     each verdict. It must not refuse on it: the whole point of the ratio
-     construction is that it survives a busy host. What a printed number buys is
-     that a reader can tell a 1.09 taken at 60% busy from a 1.09 taken at 2%,
-     which is the difference between "fine" and "the gate is about to be
-     useless".
-   - **The re-derivation rule, stated in advance so it cannot be chosen after
-     seeing the data:** twelve runs at `[profile.embedder]`, `taskset -c 2`, each
-     with busy ≤ 10%, and set R1's allowance to **1 + 2.5 × (max observed excess
-     over 1)** — the same factor 1.10 was built from, so only the *input* changes
-     — floored at 1.02, which is the control's own band and the tightest a row
-     over two timed arms can honestly be. On the numbers this contended host
-     shows (max excess 0.038) the rule returns ~1.095, i.e. **if a quiet host
-     reproduces 1.038 then 1.10 is vindicated and stays**; if a quiet host shows
-     1.015 it returns 1.04, and R1 becomes a gate that could actually catch
-     something. Writing the rule before the run is what stops the second outcome
-     being argued away when it arrives.
+**The re-derivation rule, fixed in advance so it cannot be chosen after seeing
+   the data:** twelve runs at `[profile.embedder]`, `taskset -c 2`, each busy
+   <= 10%; R1's allowance = **1 + 2.5 x (max observed excess over 1)**, floored at
+   **1.02** (the control's own band, the tightest a row over two timed arms can
+   honestly be). On today's max excess of 0.038 the rule returns ~1.095, so a quiet
+   host reproducing 1.038 vindicates 1.10; one showing 1.015 returns 1.04 and R1
+   becomes a gate that could catch something.

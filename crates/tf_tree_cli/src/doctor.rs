@@ -1,13 +1,10 @@
 //! `tf_tree doctor` — the seven Phase 1 health checks (`docs/PHASE1.md` §12
 //! *CLI*).
 //!
-//! Each check is a pure function over a captured [`Snapshot`] of the tree plus,
-//! where the condition is only visible in history, the [`Observations`] stream of
-//! observed pushes. Splitting detection from a live `Tree` this way is what makes
-//! every check independently testable — including conditions a *safe* live tree
-//! can never reach on its own (a topology cycle is rejected by the builder; a
-//! second writer is rejected by the claim table), which the tests exercise by
-//! constructing the offending snapshot directly.
+//! Each check is a pure function over a captured [`Snapshot`] plus, where the
+//! condition is only visible in history, the [`Observations`] stream. Tests
+//! build offending snapshots directly, including ones a safe live tree cannot
+//! reach.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,13 +50,8 @@ impl Check {
 }
 
 /// How serious a finding is.
-///
-/// Distinct from [`crate::catalogue::Severity`], which is the *reporting*
-/// vocabulary and carries an `Info` level this layer has no use for. The two
-/// meet in one place — `From<Severity> for crate::catalogue::Severity` — so
-/// that a check's severity is declared once, here, next to the code that knows
-/// why the condition is serious, instead of being restated by whatever maps the
-/// finding into the catalogue.
+/// Distinct from [`crate::catalogue::Severity`]; the two meet in
+/// `From<Severity> for crate::catalogue::Severity`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     /// Worth attention but not necessarily broken.
@@ -75,8 +67,7 @@ pub struct Finding {
     pub check: Check,
     /// How serious it is.
     pub severity: Severity,
-    /// A human-readable explanation (this is the print layer's crate, so a
-    /// `String` here is fine — the engine's errors stay `Copy`).
+    /// A human-readable explanation.
     pub message: String,
 }
 
@@ -143,58 +134,24 @@ pub struct EdgeInfo {
     /// Whether a live writer currently holds the claim.
     pub claimed: bool,
     /// Whether the claim record was caught **mid-handoff** (the `CLAIMING`
-    /// sentinel) rather than actually held.
-    ///
-    /// Separate from `claimed`/`owner_slot` because both of those collapse it
-    /// into "claimed by nobody", which is also what a genuinely leaked claim
-    /// looks like. The snapshot now carries a liveness source
-    /// ([`Snapshot::participants`]) and it still cannot separate these two:
-    /// `CLAIMING` names no slot, so there is nobody to ask about. `TFT014` uses
-    /// this to stay silent instead of guessing.
+    /// sentinel), which names no slot; `TFT014` stays silent rather than guess.
     pub claiming: bool,
-    /// The participant slot the claim word names, or `None` when the edge is
-    /// unclaimed or its record was caught mid-handoff.
-    ///
-    /// The claim's link into [`Snapshot::participants`], and the only honest
-    /// route from an edge to its owner's liveness: `docs/PHASE2.md` §5.1 says a
-    /// participant record describes *who* a slot belongs to and never whether
-    /// it is running, so the question has to be put to the slot rather than
-    /// answered from the claim.
+    /// The participant slot the claim word names (the link into
+    /// [`Snapshot::participants`]), or `None` when unclaimed or mid-handoff.
     pub owner_slot: Option<u32>,
-    /// The current claim owner's PID (`0` if unclaimed).
-    ///
-    /// Resolved through `ParticipantTable::identity`, which answers only for a
-    /// `LIVE` record — so this is `state`, **and `state` is not liveness**
-    /// (`docs/PHASE2.md` §5.1). A writer killed without running `Drop` leaves a
-    /// `LIVE` record behind, and until something clears it this keeps answering
-    /// with that dead pid, which is how `TFT014` came to be blind in the state
-    /// it is named for (decision `0028`). This is a label to print;
-    /// `owner_slot` and [`ParticipantInfo::alive`] are the answer to ask.
+    /// The current claim owner's PID (`0` if unclaimed). A label, not liveness
+    /// (`docs/PHASE2.md` §5.1, decision `0028`); ask `owner_slot` and
+    /// [`ParticipantInfo::alive`].
     pub owner_pid: u32,
     /// Newest published stamp, if any samples exist.
     pub newest_stamp: Option<i64>,
-    /// The publisher's clock offset — host wall clock minus header stamp, both
-    /// taken at the same push — or `None` when this edge has recorded none.
-    ///
-    /// `Option` rather than the raw `0`, for the reason `nominal_rate_mhz`
-    /// below gives about its own sentinel: the two answers send `TFT004` in
-    /// opposite directions, and a `0` that a caller forgets to test is a
-    /// publisher reported as perfectly synchronised when in truth it has never
-    /// been measured. **The arena cannot produce a `0` for any other reason** —
-    /// `EdgeWriter`'s sampler stores `1` for an offset that computes to exactly
-    /// zero, precisely so this mapping is lossless
-    /// (`docs/decisions/0036`).
+    /// The publisher's clock offset (host wall clock minus header stamp), or
+    /// `None` when none was recorded. The arena never stores `0` for a computed
+    /// zero (`docs/decisions/0036`), so the mapping is lossless.
     pub clock_offset_nanos: Option<i64>,
     /// The rate this edge was **declared** to publish at, in milli-hertz, or
-    /// `None` when nothing declared one (`EdgeRecord::nominal_rate_mhz == 0`).
-    ///
-    /// `Option` rather than the raw `0` sentinel because the two answers send
-    /// `TFT007` in opposite directions: a declared rate is something to compare
-    /// against, and an absent one is a reason to say nothing at all. A `u32`
-    /// here invites `rate != 0` to be forgotten at one call site, and the
-    /// failure that produces — every undeclared edge reported as deviating from
-    /// 0 Hz by infinity — is a fabricated finding on every edge of a correct
-    /// arena.
+    /// `None` when `EdgeRecord::nominal_rate_mhz == 0`; an absent rate means
+    /// `TFT007` says nothing.
     pub nominal_rate_mhz: Option<u32>,
 }
 
@@ -210,104 +167,60 @@ impl EdgeInfo {
     }
 }
 
-/// What the kernel says about a participant slot's **lock byte** — the fact
-/// `docs/PHASE2.md` §5.1 calls authoritative.
+/// What the kernel says about a participant slot's **lock byte**
+/// (`docs/PHASE2.md` §5.1). Three answers, because "nobody asked" is not
+/// "free".
 ///
-/// Three answers, not two, and the third is the one that keeps a check honest:
-/// a `doctor` run that never opened a lock file has not learnt the byte is
-/// free, it has learnt nothing, and collapsing those into `Free` is how a warn
-/// starts firing on every arena `doctor` can reach without a rendezvous.
-///
-/// The byte is the *only* liveness fact in this model; [`RecordedProcess`] is a
-/// `/proc` inference carried beside it rather than composed with it, for the
-/// reason [`Snapshot::probe_lock_facts`] gives.
+/// The byte is the only liveness fact; [`RecordedProcess`] is a `/proc`
+/// inference carried beside it (see [`Snapshot::probe_lock_facts`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockByte {
     /// `F_OFD_GETLK` reported a conflicting lock: somebody's open file
-    /// description holds this slot. Note *somebody's* — an OFD lock names no
-    /// process (`LockProbe::holder_pid` is `-1`), which is exactly why the fork
-    /// case needs a second fact.
+    /// description holds this slot (an OFD lock names no process).
     Held,
-    /// `F_OFD_GETLK` reported no conflict. On a rendezvous arena this is the
-    /// leak signature when the record is not `FREE`
-    /// (`docs/decisions/0028`, *The ordering*).
+    /// No conflict. On a rendezvous arena this is the leak signature when the
+    /// record is not `FREE` (`docs/decisions/0028`, *The ordering*).
     Free,
-    /// Nobody asked, or the kernel would not answer: there is no lock file for
-    /// this arena (the fixture, `--from-bag`), or the `fcntl` failed. **Not**
-    /// evidence in either direction (§6.2's fail-safe rule).
+    /// Nobody asked, or the kernel would not answer. **Not** evidence either
+    /// way (§6.2's fail-safe rule).
     Unknown,
 }
 
 /// What `/proc` says about the process a slot's lock-file identity record
 /// names.
 ///
-/// **A diagnostic inference, never a protocol decision** (`docs/PHASE2.md`
-/// §5.1). It exists to say "slot 3's record names pid 1841, which is gone" —
-/// the sentence `tf_tree_ipc::Identity::matches_running_process` was written
-/// for — and it is three-valued where that method is two-valued for one
-/// reason: that method maps *every* read failure to `false`, so on a host with
-/// no `/proc` mounted, or one where a `hidepid` mount or an `EMFILE` makes the
-/// read fail, every participant reads as gone — and the fork arm of
-/// [`crate::checks::slot_leak`] would then fire on every healthy slot in the
-/// table. `docs/decisions/0028` works that inversion through in
-/// *"the fail-safe claim is false on this code"*; [`Self::Unknown`] is the
-/// answer it says is owed.
-///
-/// **This is the classification, and there is not a second one.**
+/// A diagnostic inference, never a protocol decision (`docs/PHASE2.md` §5.1).
+/// Three-valued because `Identity::matches_running_process` maps every read
+/// failure to `false`, which would make [`crate::checks::slot_leak`] fire on
+/// every slot without a usable `/proc` (`docs/decisions/0028`).
 /// `crate::recorded_given` is the only place a `/proc` answer becomes one of
-/// these three, and it is `tf_tree`'s `alive_given` transposed: same arms, same
-/// bias. *Cannot tell* is [`Self::Unknown`] there and here, never
-/// [`Self::Gone`].
-///
-/// **It is no longer the same three inputs, and the two that
-/// `docs/decisions/0033` added are a different kind of input.** The original
-/// three — the stored start time, what the read came back as, whether this
-/// host's `/proc` answers at all — all ask what `/proc` says about a pid. The
-/// added two ask whether the pid is a number this `/proc` can be asked about:
-/// the namespace the record was written in against the observer's own, and
-/// whether the observer's `/proc` describes the observer's own namespace.
-/// Until they were there, a healthy participant in another PID namespace read
-/// as [`Self::Gone`] and `TFT014` told the operator to stop it — the opposite
-/// remediation to the one that fault wants.
+/// these; *cannot tell* is [`Self::Unknown`], never [`Self::Gone`].
+/// PID-namespace inputs: `docs/decisions/0033`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordedProcess {
-    /// `/proc` has an entry for the recorded pid whose start time matches the
-    /// record's. The process that took this slot is still running.
+    /// `/proc` has an entry for the recorded pid whose start time matches.
     Running,
-    /// The recorded process is provably gone: either `/proc` has no entry for
-    /// its pid *on a host that would have shown one*, or it has an entry whose
-    /// start time differs — a recycled pid, which is a different process.
+    /// Provably gone: no `/proc` entry on a host that would show one, or a
+    /// different start time (recycled pid).
     Gone,
-    /// No identity record to ask about, or `/proc` would not say — an
-    /// unreadable entry, a malformed `stat` line, or an `ENOENT` on a host
-    /// whose `/proc` answers `ENOENT` for everybody. **Never evidence of
-    /// death**: `record_is_alive`'s doc calls a false death corruption, and
-    /// this is the value that keeps one out of an operator tool.
+    /// No identity record, or `/proc` would not say. **Never evidence of
+    /// death.**
     Unknown,
 }
 
 /// The lock file's facts about one participant slot, as
-/// [`Snapshot::probe_lock_facts`] merges them in.
-///
-/// A struct rather than a tuple because three of the four fields are about
-/// *different* processes and a positional `(u32, LockByte, RecordedProcess)`
-/// invited exactly the confusion `docs/decisions/0028` plan step 6 shipped
-/// with: the pid the `/proc` evidence is about is the **lock file's**, and it
-/// is not the pid in the arena record beside it.
+/// [`Snapshot::probe_lock_facts`] merges them in. A struct because the pid here
+/// is the **lock file's**, not the arena record's (`docs/decisions/0028` plan
+/// step 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotFacts {
     /// What the kernel said about the slot's lock byte.
     pub byte: LockByte,
     /// What `/proc` said about the process the slot's identity record names.
     pub recorded: RecordedProcess,
-    /// The pid that identity record names, or `None` if no record has ever
-    /// been written for this slot (or no lock file was read at all).
-    ///
-    /// **The pid [`Self::recorded`] is about.** A finding that prints
-    /// [`ParticipantInfo::pid`] beside a `/proc` sentence is printing a
-    /// different process's number: on a `RESERVED` slot the arena record's pid
-    /// field is still zero, and `doctor` shipped
-    /// *"slot 8 pid 0 … /proc has no running process for it"* because of it.
+    /// The pid the identity record names, or `None` if none was written or no
+    /// lock file was read. **The pid [`Self::recorded`] is about**; not
+    /// [`ParticipantInfo::pid`], which is zero on a `RESERVED` slot.
     pub recorded_pid: Option<u32>,
 }
 
@@ -323,119 +236,61 @@ impl SlotFacts {
     }
 }
 
-/// What a participant slot's `state` word says (`docs/PHASE2.md` §5.1).
-///
-/// Carried as three named states rather than the raw word so that no consumer
-/// can compare it against a constant and call the answer liveness. Whether the
-/// participant is *running* is [`ParticipantInfo::alive`], and it comes from
-/// somewhere else entirely.
+/// What a participant slot's `state` word says (`docs/PHASE2.md` §5.1). Not
+/// liveness; see [`ParticipantInfo::alive`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotState {
     /// Nobody holds this slot.
     Free,
-    /// A registrant won the slot and has not published its identity yet — a
-    /// handful of instructions on a healthy joiner.
+    /// A registrant won the slot and has not published its identity yet.
     Reserved,
     /// An identity is published here. **Says nothing about whether the process
     /// it names still exists.**
     Live,
 }
 
-/// One participant slot in a captured [`Snapshot`].
-///
-/// **Four fields, because four is what the checks read.** The arena's
-/// `ParticipantRecord` carries two more — `start_time` and `incarnation` — and
-/// both were captured here at first. Neither was ever read, and the doc comment
-/// on `incarnation` promised a discrimination the encoding forbids: the claim
-/// owner word is `(epoch << 16) | (slot + 1)` where `epoch` is the
-/// `ClaimRecord`'s **own per-edge counter** (`tf_tree_core::edge::pack_owner`),
-/// not the participant's incarnation, so the two are not comparable and no join
-/// between them can be written. A captured field nothing reads is a claim
-/// nobody maintains, and that one had already gone false; the silence it was
-/// supposed to cover is named in `TFT014`'s doc comment instead. `Snapshot` is
-/// what the checks read, not a mirror of the arena — no operator-facing surface
-/// in this crate shows either field, `tf_tree top` discards both from
-/// `identity`'s tuple, and `tf_tree participants` never opens the arena at all.
+/// One participant slot in a captured [`Snapshot`]. Carries only the fields the
+/// checks read; `start_time` and `incarnation` are omitted (the claim owner's
+/// epoch is per-edge, so no join with `incarnation` exists).
 #[derive(Clone, Debug)]
 pub struct ParticipantInfo {
-    /// Slot index — also the lock-file byte (`docs/PHASE2.md` §3.7), which is
-    /// what makes [`Self::alive`] answerable at all.
+    /// Slot index, also the lock-file byte (`docs/PHASE2.md` §3.7).
     pub slot: u32,
     /// The record's `state` word.
     pub state: SlotState,
-    /// The recorded process id.
-    ///
-    /// **A label, not an identity.** The record's `start_time` is what makes a
-    /// pid reuse-proof, and it is deliberately not captured beside it (see the
-    /// note on this struct): composing `(pid, start_time)` against `/proc` here
-    /// would be a second liveness spelling in a layer that must have exactly
-    /// one, which is `docs/decisions/0028` §6.2's rule and the reason
-    /// `TFT014`'s fork case is a silence rather than a finding.
+    /// The recorded process id. A label, not an identity: composing `(pid,
+    /// start_time)` here would be a second liveness spelling
+    /// (`docs/decisions/0028` §6.2).
     pub pid: u32,
     /// Whether the participant is still running, from
-    /// [`Tree::participant_alive`] — `F_OFD_GETLK` on this slot's lock byte for
-    /// a tree obtained from `tf_tree::open`, a `/proc` inference otherwise, and
-    /// never the `state` word above on its own.
-    ///
-    /// `false` for a [`SlotState::Free`] or [`SlotState::Reserved`] record as
-    /// well, because that predicate folds `state == LIVE` in ahead of the
-    /// probe.
-    ///
-    /// **It is the composed answer, and [`Self::byte`] is the fact underneath
-    /// it.** Both are carried because a check that has only this one cannot
-    /// tell a healthy joiner mid-attach from one that died there — the record
-    /// is `RESERVED` and this is `false` in both cases — which is the silence
-    /// `docs/decisions/0028` plan step 6 exists to close.
+    /// [`Tree::participant_alive`] (`F_OFD_GETLK` on the lock byte for a tree
+    /// from `tf_tree::open`, a `/proc` inference otherwise). `false` for
+    /// `Free`/`Reserved`. It cannot tell a joiner mid-attach from one that died
+    /// there; [`Self::byte`] can (`docs/decisions/0028` plan step 6).
     pub alive: bool,
-    /// What the kernel said about this slot's lock byte, or
-    /// [`LockByte::Unknown`] if nothing asked.
-    ///
-    /// Filled by [`Snapshot::probe_lock_facts`], never by
-    /// [`Snapshot::capture`]: the byte lives in the lock file and a `Snapshot`
-    /// is taken from the arena. `tf_tree top` merges the same file into its own
-    /// capture for the same reason (`crate::top::Capture::merge_lock_rows`).
+    /// The lock byte, or [`LockByte::Unknown`] if nothing asked. Filled by
+    /// [`Snapshot::probe_lock_facts`], never [`Snapshot::capture`].
     pub byte: LockByte,
-    /// What `/proc` said about the process this slot's lock-file identity
-    /// record names, or [`RecordedProcess::Unknown`] if nothing asked.
-    ///
-    /// **The identity record, not [`Self::pid`].** §3.3 writes the lock-file
-    /// identity *before* the byte is taken, so it is populated for a joiner
-    /// still in `RESERVED` — where the arena record's `pid` field is either
-    /// zero or the previous occupant's, because `fill_slot` writes the identity
-    /// fields *after* its `FREE -> RESERVED` CAS (`docs/decisions/0028`,
-    /// *"`RESERVED` is not a word this predicate may act on"*). Judging a
-    /// `RESERVED` slot from `pid` would be judging somebody else.
-    ///
-    /// It is also populated for a slot whose arena record is `FREE` and always
-    /// will be: a read-only participant takes a byte and writes an identity
-    /// record and **no** arena record at all (D18), so the identity is the only
-    /// name that slot has.
+    /// What `/proc` said about the lock-file identity record's process, or
+    /// [`RecordedProcess::Unknown`]. Judged from the identity record, not
+    /// [`Self::pid`]: on a `RESERVED` slot `pid` is zero or the previous
+    /// occupant's (`docs/decisions/0028`), and a read-only participant (D18)
+    /// has no arena record at all.
     pub recorded: RecordedProcess,
-    /// The pid the lock-file identity record names — the pid [`Self::recorded`]
-    /// is an answer about — or `None` when no record was read.
-    ///
-    /// Carried beside [`Self::pid`] rather than replacing it because the two
-    /// are different facts about different tables and a finding may need
-    /// either: the `/proc` evidence is about this one, and the arena record's
-    /// occupancy is about that one. They agree on an ordinary `LIVE` slot and
-    /// diverge on exactly the rows `TFT014` reports.
+    /// The pid the identity record names (the pid [`Self::recorded`] is about),
+    /// or `None`. Differs from [`Self::pid`] on the rows `TFT014` reports.
     pub recorded_pid: Option<u32>,
 }
 
 /// A point-in-time, read-only capture of a tree's topology, edges, claims and
 /// participant slots.
-///
-/// Built from a live [`Tree`] via [`Snapshot::capture`], or by hand in tests to
-/// exhibit a specific condition.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     /// All frames, id order.
     pub frames: Vec<FrameInfo>,
     /// All edges, id order.
     pub edges: Vec<EdgeInfo>,
-    /// Every participant slot in the table, slot order — the free ones
-    /// included, so `participants.len()` is the table's capacity and a finding
-    /// can say how much of a fixed budget a leak has spent.
+    /// Every participant slot, free ones included.
     pub participants: Vec<ParticipantInfo>,
 }
 
@@ -443,9 +298,8 @@ impl Snapshot {
     /// The captured slot `slot`, or `None` if this snapshot has no such slot.
     #[must_use]
     pub fn participant(&self, slot: u32) -> Option<&ParticipantInfo> {
-        // Not `participants[slot]`: a hand-built snapshot carries the slots its
-        // case needs rather than a dense table, and an out-of-range claim word
-        // must resolve to "no such participant" rather than panic.
+        // Not `participants[slot]`: hand-built snapshots are sparse, and out of
+        // range means `None`.
         self.participants.iter().find(|p| p.slot == slot)
     }
 
@@ -456,71 +310,27 @@ impl Snapshot {
         let header = view.header();
         let topo = view.topology();
 
-        // **`Relaxed`, because no stronger ordering on *this* load would mean
-        // anything.** `tf_tree_core::frame`'s `finish` does
-        // `frame_count.fetch_add` *first*, then `write_record`, then the Release
-        // publish into the intern table. An `Acquire` load here would therefore
-        // order this thread against everything the interner did *before* it took
-        // its id — and against nothing it did after, which is precisely the
-        // record about to be read. Acquire would read like a guarantee and buy
-        // none, so `Relaxed` is the honest spelling.
-        //
-        // **What it does not buy is a race-free read, and nothing here does.**
-        // `FrameRecord`'s own documentation states the rule: its fields are
-        // plain integers, so "a reader sees the record only after
-        // `ids[slot].load(Acquire) != ID_UNPUBLISHED`" — the publication edge is
-        // keyed by *name*, through the intern table, and there is no per-id
-        // signal at all. An enumeration keyed by id, which is what every caller
-        // that wants to list the frames must do, therefore has no edge to
-        // acquire and can materialize a record a concurrent interner is still
-        // writing. The `name_hash != 0` filter below is not that missing edge
-        // and is not claimed to be. Against a genuinely concurrent interner
-        // this walk — and its three siblings — is best-effort, and the
-        // consolidation onto `Tree` noted below is where the ordering can be
-        // stated once and checked by `just loom`.
+        // `Relaxed`: `finish` bumps `frame_count` before writing the record, so
+        // `Acquire` would order against nothing useful. This walk is
+        // best-effort against a concurrent interner; the `name_hash != 0`
+        // filter below is not a synchronisation edge.
         let frame_count = header.frame_count.load(Ordering::Relaxed);
         let mut frames = Vec::with_capacity(frame_count as usize);
         for id in 1..=frame_count {
-            // Three checks, the strictest set applied by any copy of this walk.
-            // **The consolidation this comment used to file has happened**:
-            // `tf_tree::Tree::frames` now carries exactly these three, with the
-            // ordering argument stated once, in the crate `just loom` and
-            // `just miri` can see.
-            //
-            // This copy did not collapse onto it and will not: `Tree::frames`
-            // answers *names*, and a `FrameInfo` needs `parent`, `depth` and
-            // `edge_of_child` out of the topology block as well — `doctor` is
-            // the consumer the arena-shaped view exists for. What it stops
-            // being is a *divergent* copy: the three checks below and the
-            // `Relaxed` load above are now the facade's, verbatim, so a change
-            // to either has one obvious other place to go.
-            // `tf_tree_py::offline::frames_impl` and
-            // `tf_tree_c::unstable::tft_tree_frame_name` are still their own
-            // walks and can now forward.
-            //
-            //  1. `FrameId::new` rejects 0, the root sentinel.
-            //  2. `id <= frame_count` — *this loop's bound*, and load-bearing
-            //     rather than incidental: `frame_record` bounds against
-            //     `max_frames`, which is `frame_count + 1 + frame_headroom`, so
-            //     walking to `max_frames` would hand back zeroed headroom slots
-            //     as though they were frames.
-            //  3. `name_hash != 0`, below.
+            // The three checks of `tf_tree::Tree::frames`, kept as its own walk
+            // because a `FrameInfo` needs `parent`, `depth` and
+            // `edge_of_child`: (1) `FrameId::new` rejects 0; (2) `id <=
+            // frame_count`, since walking to `max_frames` would return zeroed
+            // headroom slots; (3) `name_hash != 0`.
             let Some(fid) = FrameId::new(id) else {
                 continue;
             };
             let Some(rec) = view.frame_record(fid) else {
                 continue;
             };
-            // **The count is bumped before the record is written**, so an
-            // interner in another process can be counted here one instant
-            // before its name exists and the slot still reads as zeros. A
-            // written record's `name_hash` is BLAKE3 of the name — non-zero
-            // even for the empty string — so a zero hash means "not written
-            // yet". Skipping it lists that frame one `doctor` run later;
-            // taking it prints a frame with an empty name, which reads as our
-            // bug rather than as a race lost by a microsecond. This is a
-            // *filter on the value read*, not a synchronisation edge — see the
-            // ordering note above for what that does and does not buy.
+            // The count is bumped before the record is written, so a zero
+            // `name_hash` (BLAKE3 is non-zero even for "") means "not written
+            // yet"; skip it.
             if rec.name_hash == 0 {
                 continue;
             }
@@ -551,16 +361,9 @@ impl Snapshot {
             };
             let kind = EdgeKind::from_u8(rec.kind);
             let owner_word = claim.owner.load(Ordering::Relaxed);
-            // **The owner word is `(epoch << 16) | (slot + 1)`, not `slot + 1`**
-            // (`tf_tree_core::edge::pack_owner`, A3 plus decision 0005 §6's
-            // "one acquisition, not just one slot"). `claim` starts the epoch at
-            // 1, so `word - 1` is never a slot for any real claim — it is
-            // `epoch << 16` and resolves to no participant at all. Decoding it
-            // by hand is what produced `pid 0` for every live writer.
-            //
-            // `slot_of` returns `u32::MAX` for an unclaimed record and for one
-            // caught mid-claim; both become `None` here, so a claim in flight
-            // names no participant rather than naming a plausible wrong one.
+            // The owner word is `(epoch << 16) | (slot + 1)`
+            // (`tf_tree_core::edge::pack_owner`); `slot_of` returns `u32::MAX`
+            // for unclaimed or mid-claim, both `None`.
             let owner_slot = match owner_word {
                 0 => None,
                 w => match tf_tree_core::edge::slot_of(w) {
@@ -583,11 +386,9 @@ impl Snapshot {
                 claimed: owner_word != 0,
                 claiming: tf_tree_core::edge::is_claiming(owner_word),
                 owner_slot,
-                // A3: the claim names a *participant slot*, not a PID, so the
-                // pid to print is resolved through the participant table. A
-                // slot that resolves to no `LIVE` identity prints as pid 0 — a
-                // label, not a verdict, for the reason the field's doc gives;
-                // `participants` below is where the verdict comes from.
+                // The claim names a slot, not a PID; resolve through the
+                // participant table. No `LIVE` identity prints as pid 0, a
+                // label not a verdict.
                 owner_pid: owner_slot
                     .and_then(|slot| view.participants().identity(slot))
                     .map_or(0, |(pid, _start, _inc)| pid),
@@ -603,14 +404,8 @@ impl Snapshot {
             });
         }
 
-        // **The participant table, and the one liveness answer per slot that
-        // both halves of `TFT014` read.** Captured here rather than recomputed
-        // in the check because `Tree::participant_alive` is a syscall on a live
-        // arena: asking it once per slot and joining the claims against the
-        // result is 64 probes instead of one per claimed edge, and — the part
-        // that is not about speed — it makes "is slot 7 alive?" have a single
-        // answer in a report, so an edge finding and a slot finding cannot
-        // disagree about the same process.
+        // Captured once per slot: `participant_alive` is a syscall, and one
+        // answer per slot keeps edge and slot findings consistent.
         let table = view.participants();
         let capacity = table.capacity();
         let mut participants = Vec::with_capacity(capacity);
@@ -619,16 +414,9 @@ impl Snapshot {
             let Some(rec) = table.get(slot) else {
                 continue;
             };
-            // **Two reads of the state word, either side of the probe, and
-            // they have to agree.** A clean detach is `LIVE -> FREE` and a
-            // reuse is `FREE -> RESERVED -> LIVE(incarnation + 1)`; either can
-            // land inside the `F_OFD_GETLK` this brackets, and the combination
-            // it leaves behind — `LIVE` from the first load, byte free from the
-            // probe — is indistinguishable from a leak. The word carries the
-            // incarnation, which `fill_slot` only ever increments, so an
-            // unchanged word is proof this is the same occupancy throughout.
-            // A word that moved is a slot in active use, and the fail-safe
-            // direction for that (§6.2) is alive.
+            // Two reads of the state word bracket the probe and must agree: a
+            // detach or reuse landing inside `F_OFD_GETLK` looks like a leak. A
+            // moved word means active use; fail safe to alive (§6.2).
             let before = rec.state.load(Ordering::Acquire);
             let alive = tree.participant_alive(slot);
             let after = rec.state.load(Ordering::Acquire);
@@ -640,10 +428,8 @@ impl Snapshot {
             participants.push(ParticipantInfo {
                 slot,
                 state,
-                // Read unconditionally, unlike `identity`, which withholds it
-                // unless the record is `LIVE`. A leaked slot's whole value to an
-                // operator is the pid that is *supposed* to be there, and that
-                // is precisely the record `identity` would decline to open.
+                // Read unconditionally, unlike `identity`: a leaked slot's
+                // value is the pid that should be there.
                 pid: rec.pid.load(Ordering::Relaxed),
                 alive: alive || before != after,
                 byte: unasked.byte,
@@ -659,33 +445,14 @@ impl Snapshot {
         }
     }
 
-    /// Ask the lock file about every captured slot, and fold its answers into
+    /// Ask the lock file about every captured slot and fold its answers into
     /// the rows.
     ///
-    /// # Why the probe is a callback, and why that is the read-order pin
-    ///
-    /// The state word is read by [`Self::capture`] and the byte by `probe`, and
-    /// `docs/decisions/0028` piece 2's third constraint says the word must be
-    /// read **first**: under word-then-byte the `Acquire` load of a live word
-    /// synchronises-with `fill_slot`'s publishing `Release` store, so a probe
-    /// sequenced after it must see the byte held. Reversed, a sweep can see a
-    /// byte free before a registrant takes it and then read the record it
-    /// published — `loom` erases a published record that way in 0.00 s, in
-    /// `tf_tree`'s model of `reclamation_verdict`, which is where that argument
-    /// is *proved*.
-    ///
-    /// **What is pinned here is the call order, and it is pinned by this
-    /// signature.** `probe` is handed the already-captured
-    /// [`ParticipantInfo`] for the slot it is about — not a slot number — so
-    /// there is no value for a caller to compute before `capture` and no way to
-    /// hoist the probe above it that type-checks. An earlier revision passed a
-    /// precomputed `&[(u32, LockByte, RecordedProcess)]`, and moving its one
-    /// producer above `Snapshot::capture` compiled, ran, and passed every test
-    /// in the suite. *Which* read the kernel performed first is not observable
-    /// in any sequence of stable states — that is `loom`'s job, in `tf_tree` —
-    /// but which call the program makes first is, and this is where it is
-    /// fixed. `doctor::tests::the_probe_is_handed_the_word_that_was_read_first`
-    /// keeps the signature meaningful.
+    /// `docs/decisions/0028` piece 2 requires the state word be read **before**
+    /// the byte. `probe` receives the already-captured [`ParticipantInfo`], so
+    /// the call cannot be hoisted above `capture` and still type-check;
+    /// `doctor::tests::the_probe_is_handed_the_word_that_was_read_first` keeps
+    /// that meaningful.
     ///
     /// # It does **not** overwrite [`ParticipantInfo::alive`], and `top` does
     ///
@@ -758,8 +525,7 @@ impl Snapshot {
 }
 
 /// The observed stream of pushes, in arrival order — the input to the four
-/// history-dependent checks (multi-writer, short-buffer, inconsistent-rate,
-/// out-of-order).
+/// history-dependent checks.
 #[derive(Clone, Debug, Default)]
 pub struct Observations {
     /// Every recorded push, in the order it was observed.
@@ -782,22 +548,11 @@ impl Observations {
 
     /// Reconstruct what can be reconstructed from a **live** arena's rings.
     ///
-    /// Nobody was watching when those samples arrived, so this is strictly less
-    /// than the fixture knows, and the difference is not cosmetic. Two of the
-    /// seven checks are **structurally unable to fire** on the result, and
-    /// `doctor` discloses both rather than printing a clean bill of health it
-    /// did not earn — `TFT001` skips outright, and `TFT011` carries a note:
-    ///
-    /// * **multi-writer** — a ring remembers the *current* claim owner, not the
-    ///   sequence of processes that wrote into it. Every sample therefore
-    ///   carries the same pid and the distinct-pid count is always one.
-    /// * **short-buffer** — `arrival_delay_ns` is how late a sample arrived
-    ///   relative to its own stamp, which is a fact about the *publisher's*
-    ///   clock at push time. Nothing in the arena records it; it is set to zero
-    ///   here, and zero latency never exceeds any buffer span.
-    ///
-    /// What does survive is every stamp the rings still retain, in order, which
-    /// is what the rate, ordering and reachability checks run on.
+    /// Two checks are structurally unable to fire on the result, and `doctor`
+    /// discloses both (`TFT001` skips, `TFT011` notes): **multi-writer** (a
+    /// ring remembers only the current claim owner) and **short-buffer**
+    /// (`arrival_delay_ns` is not in the arena and is set to zero). Stamps,
+    /// hence rate, ordering and reachability, survive.
     #[must_use]
     pub fn from_arena(tree: &Tree, snap: &Snapshot) -> Observations {
         let view = tree.arena_view();
@@ -807,8 +562,8 @@ impl Observations {
                 continue;
             };
             let head = ring.head.load(Ordering::Acquire);
-            // The oldest logical index a reader may touch — `head - capacity`
-            // is the slot currently being overwritten, not a retained sample.
+            // The oldest retained index; `head - capacity` is the slot being
+            // overwritten.
             let retained = ring.retained().min(head);
             for i in (head - retained)..head {
                 events.push(PushSample {
@@ -839,8 +594,8 @@ impl Observations {
 }
 
 /// (1) A parent chain that never reaches a root within the frame budget is a
-/// cycle. The builder rejects cycles, so on a live tree this is always clean;
-/// the check exists to catch a corrupted or hand-built topology.
+/// cycle. Always clean on a live tree; catches a corrupted or hand-built
+/// topology.
 #[must_use]
 pub fn check_cycles(snap: &Snapshot) -> Vec<Finding> {
     let max_id = snap.frames.iter().map(|f| f.id).max().unwrap_or(0);
@@ -896,9 +651,8 @@ pub fn check_unclaimed_dynamic(snap: &Snapshot) -> Vec<Finding> {
     out
 }
 
-/// (3) More than one writer PID seen publishing to a single edge — the
-/// single-writer invariant was violated (only observable via history; the claim
-/// table forbids it on a live tree).
+/// (3) More than one writer PID seen publishing to a single edge (only
+/// observable via history).
 #[must_use]
 pub fn check_multi_writer(obs: &Observations) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -957,21 +711,13 @@ pub fn check_short_buffers(snap: &Snapshot, obs: &Observations) -> Vec<Finding> 
     out
 }
 
-/// Intervals an edge must have retained before its spread means anything.
-///
-/// **Named rather than inlined because `TFT008`'s skip reason quotes it**, and a
-/// message in `tf_tree_cli::checks` carrying a second copy of this number is how
-/// a report comes to state a threshold the rule does not use.
+/// Intervals an edge must have retained before its spread means anything. Named
+/// because `TFT008`'s skip reason quotes it.
 pub(crate) const SPREAD_MIN_INTERVALS: usize = 3;
 
-/// What [`check_inconsistent_rates`] found, **and what it looked at**.
-///
-/// The second half is not bookkeeping. A coefficient of variation is only a
-/// verdict about the edges it was computed over, so an empty finding list means
-/// either "every edge publishes evenly" or "there was nothing to measure", and
-/// those are opposite answers. `TFT008` turns the second into a stated skip
-/// rather than a `pass` — the rule `docs/PHASE5.md` §6's `TFT007` amendment
-/// already established for a rate compared against nothing.
+/// What [`check_inconsistent_rates`] found, **and what it looked at**: an empty
+/// finding list means either "every edge is even" or "nothing to measure", and
+/// `TFT008` reports the second as a stated skip (`docs/PHASE5.md` §6).
 pub struct RateSpread {
     /// One finding per edge whose spread is above the threshold.
     pub findings: Vec<Finding>,
@@ -981,16 +727,13 @@ pub struct RateSpread {
     pub withheld: usize,
 }
 
-/// (5) A frame whose inter-sample intervals vary widely (coefficient of variation
-/// above a threshold) is publishing at an inconsistent rate.
+/// (5) A frame whose inter-sample intervals vary widely (coefficient of
+/// variation above a threshold) is publishing at an inconsistent rate.
 ///
-/// `stopped` names the edges whose publisher has stopped — `tf_tree_cli::checks`
-/// computes it, because deciding that needs a clock and a source and this module
-/// has neither. They are **withheld, not judged**: a publisher that died leaves a
-/// full ring of perfectly spaced samples, whose coefficient of variation is ~0,
-/// so judging it would print a healthy cadence beside `TFT009` reporting the
-/// same edge as silent. The set is empty for every caller that has no such
-/// evidence, which is the state this function shipped in.
+/// `stopped` names edges whose publisher has stopped (computed by
+/// `tf_tree_cli::checks`, which has the clock). They are **withheld, not
+/// judged**: a dead publisher's ring is perfectly spaced. Empty when the caller
+/// has no such evidence.
 #[must_use]
 pub fn check_inconsistent_rates(obs: &Observations, stopped: &BTreeSet<u32>) -> RateSpread {
     /// Coefficient-of-variation threshold above which a rate is "inconsistent".
@@ -1101,49 +844,31 @@ pub struct OutOfOrderRun {
     pub edge: u32,
     /// How many adjacent arrivals carried a stamp older than their predecessor.
     pub regressions: usize,
-    /// The largest single step backwards, in nanoseconds. Always positive when
-    /// `regressions > 0`; saturates at [`i64::MAX`] rather than wrapping, since
-    /// a stamp is whatever an arbitrary publisher wrote.
+    /// The largest single step backwards, in nanoseconds; positive when
+    /// `regressions > 0`, saturating at [`i64::MAX`].
     pub worst_backstep_ns: i64,
     /// The longest run of **consecutive** arrivals that `docs/PHASE1.md` §2
-    /// invariant 6 would have rejected — each one carrying a stamp strictly
-    /// older than the newest *accepted* before it.
-    ///
-    /// This is the "concentration" half of the evidence, and it is a different
-    /// question from `regressions`. A clock that steps back by Δ against a
-    /// publisher running at *f* rejects about Δ·*f* arrivals in one unbroken
-    /// burst while producing a single adjacent regression; one misplaced sample
-    /// produces a single adjacent regression too, and a rejected run of one.
-    /// [`crate::checks`]'s `TFT019` is the consumer that needs to tell those
-    /// apart. `regressions > 0` and `longest_rejected_run > 0` are equivalent
-    /// conditions, so carrying this changes nothing about when `TFT018` fires.
-    ///
-    /// Counted in **arrivals**, not in seconds: the stamps are the quantity
-    /// under suspicion and the stream carries no independent arrival clock.
+    /// invariant 6 would have rejected (each strictly older than the newest
+    /// *accepted* before it). Unlike `regressions`, it separates a clock step
+    /// (one burst) from one misplaced sample; [`crate::checks`]'s `TFT019`
+    /// needs that. Counted in arrivals.
     pub longest_rejected_run: usize,
 }
 
-/// The per-edge out-of-order evidence, in edge order. Empty when every observed
-/// stream is monotone.
+/// The per-edge out-of-order evidence, in edge order; empty when every stream
+/// is monotone.
 ///
-/// **One producer, two consumers, and that is the point.**
-/// [`check_out_of_order`] reports this as `TFT018` and
-/// [`crate::checks::ClockStepEvidence`] attributes it to a clock step.
-/// `docs/PHASE5.md` §6's amendment requires the second to fire on *exactly* the
-/// first's evidence — "an attribution, not a second detector" — and a second
-/// scan of `obs` written to the same rule is precisely how that stops being
-/// true after one refactor. One walk therefore computes both what `TFT018`
-/// reports (`regressions`, `worst_backstep_ns`) and the concentration fact only
-/// `TFT019` reads (`longest_rejected_run`).
+/// One walk feeds both consumers: [`check_out_of_order`] (`TFT018`) and
+/// [`crate::checks::ClockStepEvidence`], which `docs/PHASE5.md` §6 requires to
+/// fire on *exactly* the first's evidence.
 #[must_use]
 pub fn out_of_order_runs(obs: &Observations) -> Vec<OutOfOrderRun> {
     let mut out = Vec::new();
     for (edge, samples) in obs.by_edge() {
         let mut regressions = 0usize;
         let mut worst: i128 = 0;
-        // The engine's own state, replayed: `newest` is what invariant 6 would
-        // have compared against, which only an *accepted* push advances. Equal
-        // stamps are accepted (replay is idempotent), so the test is `<`.
+        // Replays the engine: only an *accepted* push advances `newest`, and
+        // equal stamps are accepted, so the test is `<`.
         let mut newest = i64::MIN;
         let mut run = 0usize;
         let mut longest_rejected_run = 0usize;
@@ -1152,8 +877,8 @@ pub fn out_of_order_runs(obs: &Observations) -> Vec<OutOfOrderRun> {
             let stamp = s.stamp_ns;
             if let Some(p) = prev.filter(|&p| stamp < p) {
                 regressions += 1;
-                // In `i128`: two stamps at opposite ends of `i64` differ by more
-                // than `i64` holds, and both are values a publisher can write.
+                // In `i128`: stamps at opposite ends of `i64` differ by more
+                // than `i64` holds.
                 worst = worst.max(i128::from(p) - i128::from(stamp));
             }
             if stamp < newest {
@@ -1196,24 +921,16 @@ pub fn check_out_of_order(obs: &Observations) -> Vec<Finding> {
 }
 
 /// The observed publish rate (Hz) of a per-edge event slice, from its median
-/// interval. `None` exactly where [`median_period`] is `None`.
-///
-/// One definition, two consumers — `TFT007`'s comparison against the declared
-/// nominal and the `edges` command's rate column — because "the rate this edge
-/// publishes at" must be one number. A second copy is free to lose the
-/// non-positive-median guard, and a backwards stream then reports a *negative*
-/// rate: printed in one place, and compared against a nominal in the other.
+/// interval; `None` exactly where [`median_period`] is `None`. Shared by
+/// `TFT007` and the `edges` command so there is one rate.
 pub(crate) fn observed_rate_hz(samples: &[&PushSample]) -> Option<f64> {
     median_period(samples).map(|ns| 1e9 / ns as f64)
 }
 
 /// The median inter-sample interval (nanoseconds) of a per-edge event slice.
 ///
-/// `None` when the median is not a usable period. Intervals are raw stamp
-/// differences, so an edge whose stamps arrive out of order (check 7's condition)
-/// can have a **negative** median; letting that through made `capacity × period`
-/// negative and flagged every dynamic edge as a short buffer, burying the real
-/// finding under noise.
+/// `None` when the median is not a usable period; out-of-order stamps can make
+/// it negative.
 pub(crate) fn median_period(samples: &[&PushSample]) -> Option<i64> {
     if samples.len() < 2 {
         return None;
@@ -1232,12 +949,8 @@ pub(crate) fn median_period(samples: &[&PushSample]) -> Option<i64> {
 
 /// Every Phase 1 finding over a captured snapshot and observed history.
 ///
-/// There is deliberately no `Report`/`is_healthy`/`has_error` wrapper here.
-/// `crate::catalogue::Report` is the one the `--exit-code` gate consults, and a
-/// second type with the same name and near-identical methods one module away is
-/// a trap: a reader landing on `has_error` has no way to tell which gate it
-/// feeds. The catalogue routes each of these findings to a `TFT` id (or to
-/// `Uncatalogued`), so this returns the raw list and lets that layer decide.
+/// Returns the raw list; `crate::catalogue::Report` is the one gate
+/// `--exit-code` consults.
 #[must_use]
 pub fn all_findings(snap: &Snapshot, obs: &Observations) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -1245,9 +958,8 @@ pub fn all_findings(snap: &Snapshot, obs: &Observations) -> Vec<Finding> {
     findings.extend(check_unclaimed_dynamic(snap));
     findings.extend(check_multi_writer(obs));
     findings.extend(check_short_buffers(snap, obs));
-    // No `stopped` set: this aggregate is handed no clock and no source, so it
-    // cannot decide that a publisher has stopped. `TFT008` is the caller that
-    // can, and does.
+    // No `stopped` set: this aggregate has no clock or source; `TFT008` is the
+    // caller that does.
     findings.extend(check_inconsistent_rates(obs, &BTreeSet::new()).findings);
     findings.extend(check_unreachable(snap));
     findings.extend(check_out_of_order(obs));
@@ -1304,27 +1016,12 @@ mod tests {
         }]
     }
 
-    /// **The byte probe cannot run before the word was read, and this is what
-    /// keeps the signature that says so meaningful.**
+    /// The probe is called **once per captured row**, and each call is handed
+    /// *that row* with its word already populated, so the read order documented
+    /// on [`Snapshot::probe_lock_facts`] cannot be hoisted.
     ///
-    /// [`Snapshot::probe_lock_facts`]'s doc carries the ordering argument
-    /// (`docs/decisions/0028` piece 2's third constraint) and why only the call
-    /// order, not the kernel's read order, is pinnable from this crate. The
-    /// revision this replaced took a precomputed
-    /// `&[(u32, LockByte, RecordedProcess)]` built by a free function of the
-    /// lock file alone. Hoisting that function's call above `Snapshot::capture`
-    /// compiled and passed all eleven attach tests — the order was asserted in
-    /// two doc comments and pinned by nothing.
-    ///
-    /// This asserts the two properties the signature is worth: the probe is
-    /// called **once per captured row**, and each call is handed *that row*,
-    /// word already populated. A slot the capture never emitted cannot be
-    /// probed, and a row the capture emitted cannot be skipped.
-    ///
-    /// Mutant: probe only rows whose `state` is `Live`. Applied: the
-    /// `RESERVED` and `FREE` rows vanish from `seen` and the first assertion
-    /// fails — which is also the read-only fork inheritor going unreported,
-    /// since its row is the `FREE` one.
+    /// Mutant: probe only rows whose `state` is `Live` ⇒ the `RESERVED` and
+    /// `FREE` rows vanish from `seen` and the first assertion fails.
     #[test]
     fn the_probe_is_handed_the_word_that_was_read_first() {
         let row = |slot: u32, state: SlotState| ParticipantInfo {
@@ -1348,9 +1045,7 @@ mod tests {
 
         let mut seen = Vec::new();
         snap.probe_lock_facts(|p| {
-            // The probe's whole input is the captured row, which is the point:
-            // it cannot be called with a slot number the capture did not emit,
-            // and it cannot be called before there is a row to hand it.
+            // The probe's whole input is the captured row.
             seen.push((p.slot, p.state));
             SlotFacts {
                 byte: LockByte::Held,
@@ -1487,11 +1182,8 @@ mod tests {
         assert!(check_short_buffers(&snap, &obs).is_empty());
     }
 
-    /// Regression: `median_period` is a median of raw stamp differences, so a
-    /// stream that arrives out of order has a **negative** one. Using it made
-    /// `capacity × period` negative, so `max_latency > span` held for every
-    /// dynamic edge and one bad stream turned into a ShortBuffer warning on all
-    /// of them — burying check 7's real finding.
+    /// Regression: out-of-order stamps give a **negative** `median_period`,
+    /// which flagged every dynamic edge as a short buffer.
     #[test]
     fn out_of_order_stamps_do_not_fake_short_buffers() {
         let snap = Snapshot {
@@ -1536,20 +1228,15 @@ mod tests {
             Observations::from_samples((0..10).map(|k| sample(1, 1, k * 10_000_000, 0)).collect());
         let spread = check_inconsistent_rates(&obs, &BTreeSet::new());
         assert!(spread.findings.is_empty());
-        // **Non-vacuity, and it is the whole reason `judged` exists.** An empty
-        // finding list is also what "there was nothing to measure" produces, and
-        // `TFT008` turns those two into opposite answers.
+        // Non-vacuity: an empty list also means "nothing to measure"; `judged`
+        // tells them apart.
         assert_eq!(spread.judged, 1);
     }
 
     /// **An edge whose publisher has stopped is withheld rather than judged.**
     ///
-    /// The same flawless stream, twice: measured it is clean, and named as
-    /// stopped it is not measured at all. `TFT008` needs the second so it cannot
-    /// print a healthy cadence for an edge `TFT009` is reporting as silent.
-    ///
-    /// Mutant: drop the `stopped.contains(&edge)` arm. Applied: `judged` reads
-    /// 1 and `withheld` 0, and both assertions below fail.
+    /// Mutant: drop the `stopped.contains(&edge)` arm ⇒ `judged` reads 1 and
+    /// `withheld` 0.
     #[test]
     fn a_stopped_publisher_is_withheld_from_the_spread() {
         let obs =
@@ -1610,24 +1297,15 @@ mod tests {
         assert!(check_out_of_order(&obs).is_empty());
     }
 
-    /// **`longest_rejected_run` replays invariant 6, which is not the same
-    /// question as counting adjacent inversions.**
+    /// **`longest_rejected_run` replays invariant 6, not adjacent inversions.**
+    /// A rejected push does not advance the newest-accepted mark.
     ///
-    /// A rejected push does not advance the newest-accepted mark, so one step
-    /// backwards rejects everything until the publisher climbs back over it,
-    /// however monotone those arrivals are among themselves.
+    /// Stream: 0, 10, 20, 5, 15, 25 — one adjacent inversion, two rejected
+    /// arrivals.
     ///
-    /// The stream here is 0, 10, 20, then a 15-back step, then the publisher
-    /// carrying on at 10: 5, 15, 25. `5` and `15` are below the newest accepted
-    /// `20`; `25` is not. One adjacent inversion, two rejected arrivals.
-    ///
-    /// Mutant: move `newest = stamp;` out of the `else` arm so every arrival
-    /// advances it. Applied: `left: 1`, `right: 2` — with the mark advancing on
-    /// a rejected push, the run collapses to the adjacent-inversion count and
-    /// the two numbers stop being different questions.
-    /// Mutant B: `if stamp < newest` -> `if stamp <= newest`. Applied:
-    /// `left: 3`, `right: 2` — the equal stamp at the end of the second stream
-    /// is counted as rejected, though invariant 6 accepts it.
+    /// Mutant: move `newest = stamp;` out of the `else` arm ⇒ `left: 1`,
+    /// `right: 2`. Mutant B: `<` to `<=` ⇒ `left: 3`, `right: 2` (an equal
+    /// stamp counted as rejected).
     #[test]
     fn a_rejected_run_is_measured_against_the_newest_accepted_stamp() {
         let stream = |stamps: &[i64]| {
@@ -1640,24 +1318,17 @@ mod tests {
         assert_eq!(runs[0].longest_rejected_run, 2);
         assert_eq!(runs[0].worst_backstep_ns, 15);
 
-        // Equal stamps are accepted (replay is idempotent), so the arrival that
-        // lands exactly on the newest accepted stamp ends the run.
+        // Equal stamps are accepted, so an arrival exactly on the newest ends
+        // the run.
         let runs = out_of_order_runs(&stream(&[0, 10, 20, 5, 15, 20]));
         assert_eq!(runs[0].longest_rejected_run, 2);
     }
 
-    /// **A live writer's claim must resolve to that writer's pid.**
-    ///
-    /// The owner word packs the acquisition epoch above the slot
-    /// (`(epoch << 16) | (slot + 1)`), and `claim` starts the epoch at 1, so a
-    /// hand-rolled `word - 1` never names a slot. It produced `pid 0` for every
-    /// claimed edge — which reads as "the writer is gone", is what the `tree`
-    /// command printed in its writer column, and is the exact condition
-    /// `TFT014` reports as a leaked claim.
+    /// **A live writer's claim must resolve to that writer's pid.** The owner
+    /// word is `(epoch << 16) | (slot + 1)`, so `word - 1` never names a slot.
     ///
     /// Mutant: decode with `u32::try_from(owner_word - 1).ok()` instead of
-    /// `slot_of`. Applied: `owner_pid` is 0 for all four claimed edges and the
-    /// assertion fails.
+    /// `slot_of` ⇒ `owner_pid` is 0 for all four claimed edges.
     #[test]
     fn a_held_claim_resolves_to_the_writers_pid() {
         let tree = tf_tree_bench::fixture::build_tree().expect("build fixture");
@@ -1679,39 +1350,13 @@ mod tests {
     }
 
     /// **`Snapshot::capture` must not report a reserved headroom slot as a
-    /// frame.**
+    /// frame.** `frame_record` bounds against `max_frames` (`frame_count + 1 +
+    /// frame_headroom`), so the `1..=frame_count` bound matters; this fixture
+    /// has headroom.
     ///
-    /// `ArenaView::frame_record` bounds an id against `max_frames`, which is
-    /// `frame_count + 1 + frame_headroom` — *not* against `frame_count`. So the
-    /// `1..=frame_count` bound is the check, not a convenience: walking to
-    /// `max_frames` hands back zeroed reserved slots, which `frame_record`
-    /// returns happily and which would print as frames with an empty name.
-    /// `tf_tree_c::unstable::tft_tree_frame_name` shipped exactly that bug, and
-    /// the test that missed it used a zero-headroom fixture, which makes the two
-    /// bounds coincide. This one has headroom.
-    ///
-    /// **The two guards are redundant against *this* state, and no single
-    /// mutation fails this test — which is stated rather than hidden.** A
-    /// headroom slot is both out of `1..=frame_count` and zeroed, so either
-    /// check alone excludes it. Both are kept because they are justified
-    /// independently: the bound is the semantic one (`frame_count` is what a
-    /// frame id may reach), while `name_hash != 0` filters the *value* a race
-    /// the bound cannot touch produces — `frame_count` is bumped **before** the
-    /// record is written, so an interner in another process can be counted one
-    /// instant before its name exists. It filters rather than closes: nothing
-    /// here orders that record's stores against this reader, and the ordering
-    /// note on `capture` says what does and does not follow from that. The
-    /// window needs two processes and is **not** asserted anywhere here.
-    ///
-    /// Mutant: change the loop bound to `1..=header.max_frames`. Applied: still
-    /// `PASS` — the `name_hash` filter absorbs it, which is how it was found
-    /// that the bound alone is not what this test pins.
-    /// Mutant B: delete the `name_hash == 0` filter. Applied: still `PASS` —
-    /// the bound absorbs it. That is the pre-change state.
-    /// Mutant C: both together. Applied: `left: ["map", "odom", "base", "", "",
-    /// "", ""]` against `right: ["map", "odom", "base"]` — the four reserved
-    /// slots print as frames with an empty name, which is the failure this
-    /// guards.
+    /// The bound and the `name_hash != 0` filter are redundant against this
+    /// state, so no single mutation fails it. Mutant C, both removed ⇒ `["map",
+    /// "odom", "base", "", "", "", ""]` against `["map", "odom", "base"]`.
     #[test]
     fn capture_does_not_report_reserved_frame_slots_as_frames() {
         let tree = tf_tree::TreeBuilder::new()
@@ -1737,8 +1382,7 @@ mod tests {
             "the four reserved headroom slots are not frames"
         );
 
-        // Non-vacuity: a name interned at runtime *does* appear, so the bound
-        // excludes empty slots rather than everything past the declaration.
+        // Non-vacuity: a runtime-interned name does appear.
         tree.frame("laser").expect("intern into the headroom");
         let snap = Snapshot::capture(&tree);
         assert_eq!(

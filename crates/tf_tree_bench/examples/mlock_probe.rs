@@ -1,33 +1,20 @@
 //! What `mlock` actually does to an arena-shaped mapping — `docs/API.md` §8.3's
 //! executor, and [`0049`](../../../docs/decisions/0049-the-flag-that-prefaults-the-arena.md)'s.
-//!
-//! §8.3 asserts syscall behaviour and, until `0049`, reproduced no probe —
-//! against `PHASE2.md`'s own preamble rule that *"where a syscall behaviour is
-//! asserted, it has been verified on Linux 6.18; the probe is reproduced in
-//! Appendix B"*. One of its assertions was wrong and one was a policy
-//! conclusion in the grammar of a mechanism fact, and neither could be doubted
-//! by anyone without a C compiler and an afternoon. This is the afternoon,
-//! committed.
+//! §8.3 asserts syscall behaviour that `PHASE2.md`'s preamble says must be backed by a reproduced
+//! probe; this is that probe.
 //!
 //! # It is a probe and never a gate
 //!
-//! It prints and exits 0. Every arm's answer is a property of the running
-//! kernel, the cgroup the process is in, and whether the host has swap; a
-//! recipe asserting any of them would be a gate about the machine rather than
-//! about this code. `docs/benchmarks/EVIDENCE.md` registers it as a probe, and
-//! the numbers `0049` quotes are dated readings from it rather than live
-//! claims.
+//! It prints and exits 0: every arm's answer is a property of the kernel, cgroup and swap, so a
+//! recipe asserting one would gate the machine. `docs/benchmarks/EVIDENCE.md` registers it as a
+//! probe; the numbers `0049` quotes are dated readings.
 //!
 //! # The mapping under test
 //!
-//! A `memfd`, `ftruncate`d and mapped `MAP_SHARED` — the shape
-//! `tf_tree_arena::mapped` gives a live arena — populated with
-//! `MADV_POPULATE_WRITE`, which is what `PHASE2.md` §7.1 and
-//! [`0024`](../../../docs/decisions/0024-population-is-per-edge-at-take-up.md)
-//! already do per edge at take-up. It is deliberately **not** a `tf_tree` arena:
-//! the questions here are about the kernel's treatment of shmem pages, and
-//! building a tree would put a claim protocol between the syscall and the
-//! answer.
+//! A `memfd`, `ftruncate`d and mapped `MAP_SHARED` (the shape `tf_tree_arena::mapped` gives a live
+//! arena), populated with `MADV_POPULATE_WRITE` as `PHASE2.md` §7.1 and
+//! [`0024`](../../../docs/decisions/0024-population-is-per-edge-at-take-up.md) do. Deliberately **not**
+//! a `tf_tree` arena: a claim protocol would sit between the syscall and the answer.
 //!
 //! # Running it
 //!
@@ -36,20 +23,11 @@
 //! cargo run --release -p tf_tree_bench --example mlock_probe -- retention
 //! ```
 //!
-//! With no argument it runs every arm, each in a **child process**, because
-//! `mlockall(2)` is process-wide and an arm that calls it would contaminate
-//! every arm after it.
+//! With no argument it runs every arm, each in a **child process**: `mlockall(2)` is process-wide.
 //!
-//! # What it cannot answer, and the arm that says so
-//!
-//! `MADV_PAGEOUT` is a **directed** reclaim: it isolates the named folios by
-//! address and forces `reclaim_pages()`. The LRU scanner selects by pressure.
-//! So the `retention` arm establishes that the teardown *mechanism* is not
-//! blocked by swaplessness and establishes nothing about whether a kernel under
-//! organic pressure would choose these folios. The `pressure` arm is the
-//! organic half and it needs a memory cgroup to be meaningful — run it under
-//! one, and read its file-backed positive control before believing its shmem
-//! result:
+//! `MADV_PAGEOUT` is a **directed** reclaim, so the `retention` arm shows the teardown *mechanism* is
+//! not blocked by swaplessness and nothing about organic pressure. The `pressure` arm is the organic
+//! half; it needs a memory cgroup, and its file-backed positive control must be read first:
 //!
 //! ```sh
 //! systemd-run --user --scope -p MemoryMax=96M -q \
@@ -68,33 +46,21 @@
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss
 )]
-// **`docs/decisions/0007` rule 1, kind 2 — the OS**, and the posture is declared
-// here rather than inherited: `crates/tf_tree_bench/src/lib.rs` is
-// `#![forbid(unsafe_code)]` and an example is a **separate crate root**, so that
-// attribute governs none of this file.
-// [`0049`](../../../docs/decisions/0049-the-flag-that-prefaults-the-arena.md)
-// is why the file exists and
-// [`0048`](../../../docs/decisions/0048-a-kind-is-not-a-crate-name.md) is why it
-// is eligible: a kind is a property, and `mmap`/`mlock2`/`mlockall`/`madvise`
-// are the OS boundary wherever they are called from.
+// **`docs/decisions/0007` rule 1, kind 2 — the OS**, declared here because an example is a separate
+// crate root that `crates/tf_tree_bench/src/lib.rs`'s `forbid` does not govern (`0048`; `0049` is why
+// the file exists).
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// SAFETY (module invariant): every `unsafe` block below is a libc call on a
-// mapping this file created and still owns. `LEN` is the length passed to
-// `ftruncate` and to `mmap`, and it is the length passed to every subsequent
-// `mlock2`/`munlock`/`madvise`, so no call names a byte outside the mapping.
-// The mappings are never unmapped: each arm is a short-lived process and exit
-// is what releases them, which is also why no arm frees before it prints.
+// SAFETY (module invariant): every `unsafe` block is a libc call on a mapping this file created and
+// owns; `LEN` is the length given to `ftruncate`, `mmap` and every later `mlock2`/`munlock`/`madvise`,
+// so no call names a byte outside it. Mappings are never unmapped: each arm is a short-lived process.
 
 use std::io::Write;
 
-/// 64 MiB — sixteen 2 MiB huge-page units, and enough that `Rss` in kB is
-/// legible at a glance. Nothing here depends on the exact size.
+/// 64 MiB — sixteen 2 MiB huge-page units. Nothing depends on the exact size.
 const LEN: usize = 64 << 20;
-/// The page size every arm strides by. Read rather than assumed would be more
-/// portable; this file is `cfg`-ed to Linux and 4 KiB is what it runs on, and a
-/// wrong value here changes only how many of the mapping's pages are touched.
+/// The page size every arm strides by; this file is `cfg`-ed to Linux, where 4 KiB is what it runs on.
 const PAGE: usize = 4096;
 
 #[cfg(not(target_os = "linux"))]
@@ -132,10 +98,7 @@ mod linux {
     use std::ffi::CString;
     use std::io::{BufRead, BufReader};
 
-    /// Every arm the no-argument run drives, each in its own process.
-    ///
-    /// `mlockall(2)` is process-wide, so the two arms that call it must not
-    /// share an address space with anything measured afterwards.
+    /// Every arm the no-argument run drives, each in its own process (`mlockall(2)` is process-wide).
     const ARMS: [&str; 6] = [
         "onfault",
         "retention",
@@ -168,11 +131,8 @@ mod linux {
         );
     }
 
-    /// `Rss:` in kB for the mapping starting at `p`, read from `/proc/self/smaps`.
-    ///
-    /// Keyed on the start address so a second mapping in the same process is not
-    /// mistaken for this one — which matters in the two `mlockall` arms, where
-    /// the point is precisely that a *second* mapping behaves differently.
+    /// `Rss:` in kB for the mapping starting at `p`, read from `/proc/self/smaps` and keyed on the start
+    /// address so a second mapping in the same process is not mistaken for it.
     fn rss_kb(p: *mut libc::c_void) -> i64 {
         let want = p as usize;
         let Ok(f) = std::fs::File::open("/proc/self/smaps") else {
@@ -198,9 +158,8 @@ mod linux {
         -1
     }
 
-    /// A `memfd`, `ftruncate`d to `LEN` and mapped `MAP_SHARED` — a live arena's
-    /// shape. `populate` runs §7.1's own `MADV_POPULATE_WRITE` over the whole of
-    /// it.
+    /// A `memfd`, `ftruncate`d to `LEN` and mapped `MAP_SHARED` — a live arena's shape; `populate` runs
+    /// §7.1's own `MADV_POPULATE_WRITE` over all of it.
     fn arena(populate: bool) -> *mut libc::c_void {
         let name = CString::new("mlock_probe").unwrap_or_default();
         // SAFETY: `name` is a live NUL-terminated string for the duration of the
@@ -337,11 +296,8 @@ mod linux {
         );
     }
 
-    /// What a refault costs, which is the quantity §8.3 exists to protect.
-    ///
-    /// **The accumulator is read after the loop.** A warm-read loop whose result
-    /// is discarded compiles away at `-O2`, and a comparator taken that way
-    /// reports single-digit microseconds for work that cannot be done in them.
+    /// What a refault costs, the quantity §8.3 exists to protect. **The accumulator is read after the
+    /// loop**: a discarded warm-read loop compiles away at `-O2`.
     pub(crate) fn refault_cost() {
         let p = arena(true);
         let base = p.cast::<u8>();
@@ -382,11 +338,8 @@ mod linux {
         );
     }
 
-    /// `(minor, major)` faults for this process, from `/proc/self/stat`.
-    ///
-    /// Fields 10 and 12, one-based, after the `comm` field — which is
-    /// parenthesised and may contain spaces, so the split starts after the last
-    /// `)`.
+    /// `(minor, major)` faults for this process, from `/proc/self/stat` fields 10 and 12; the split starts
+    /// after the last `)` because `comm` may contain spaces.
     fn fault_counts() -> (u64, u64) {
         let Ok(s) = std::fs::read_to_string("/proc/self/stat") else {
             return (0, 0);
@@ -400,11 +353,9 @@ mod linux {
         (get(7), get(9))
     }
 
-    /// Whether `TFT016`'s comparison predicts `mlockall`'s outcome.
-    ///
-    /// It compares `RLIMIT_MEMLOCK` against the **arena**; `mlockall` charges the
-    /// process's whole address space. Run against a limit comfortably above a
-    /// small arena and the call still fails.
+    /// Whether `TFT016`'s comparison predicts `mlockall`'s outcome: it compares `RLIMIT_MEMLOCK` against
+    /// the **arena**, but `mlockall` charges the whole address space, so the call can fail under a limit
+    /// comfortably above a small arena.
     pub(crate) fn memlock_limit(argv: &[String]) {
         let limits: Vec<u64> = if argv.len() > 2 {
             argv[2..].iter().filter_map(|a| a.parse().ok()).collect()
@@ -434,8 +385,7 @@ mod linux {
         );
     }
 
-    /// One `setrlimit` + `mlockall` measurement, in a process of its own because
-    /// both are irreversible for the caller.
+    /// One `setrlimit` + `mlockall` measurement, in its own process because both are irreversible.
     pub(crate) fn memlock_limit_child(argv: &[String]) {
         let lim: u64 = argv.get(2).and_then(|a| a.parse().ok()).unwrap_or(0);
         let onfault = argv.get(3).map(String::as_str) == Some("1");
@@ -462,12 +412,9 @@ mod linux {
         );
     }
 
-    /// The organic half of the reclaim question: does a kernel under real
-    /// pressure choose these folios?
+    /// The organic half of the reclaim question: does a kernel under real pressure choose these folios?
     ///
-    /// `file` swaps the `memfd` for a file-backed mapping, which is the
-    /// **positive control**: it has a backing store, so if the instrument can
-    /// see organic PTE teardown at all it sees it there. Read that arm before
+    /// `file` swaps the `memfd` for a file-backed mapping, the **positive control**: read that arm before
     /// believing the shmem one.
     pub(crate) fn pressure(file: bool) {
         let (p, kind) = if file {
@@ -540,8 +487,7 @@ mod linux {
             eprintln!("mlock_probe: cannot size {}: {e}", path.display());
             std::process::exit(2);
         }
-        // The file is unlinked immediately: the mapping keeps it alive, and a
-        // run that is OOM-killed leaves nothing behind.
+        // Unlinked immediately: the mapping keeps it alive and an OOM-killed run leaves nothing.
         let _ = std::fs::remove_file(&path);
         use std::os::fd::AsRawFd;
         // SAFETY: `f` is open for the duration of the call and the mapping keeps

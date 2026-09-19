@@ -1,130 +1,62 @@
-//! **`docs/PHASE5.md` §12 gate 2**, which nothing had ever run: *`.tft` open
-//! time under 10 ms for a 233 MB index.*
+//! **`docs/PHASE5.md` §12 gate 2**: *`.tft` open time under 10 ms for a 233 MB
+//! index.*
 //!
-//! # What the criterion is actually claiming
+//! The claim is **complexity**: every step of [`tf_tree::Tree::open_frozen`] is
+//! O(1) in the index size, so a 338 MiB `.tft` and a 2 MiB one cost the same. The
+//! binary gates on both the **budget** (open fits in 10 ms at gate scale) and
+//! **scale invariance** (a fixture two orders of magnitude smaller opens within
+//! `SCALE_BOUND`x).
 //!
-//! Its parenthesis is the claim: *"it is an `mmap` plus header validation;
-//! anything more means work is happening that should not"*. That is a statement
-//! about **complexity**, not about a duration — every step of
-//! [`tf_tree::Tree::open_frozen`] is O(1) in the index size, so the open of a
-//! 338 MiB `.tft` and the open of a 2 MiB one should cost the same. The 10 ms
-//! is a budget that a size-proportional step would blow through; it is not a
-//! latency target anybody is optimising towards.
+//! # Cache states
 //!
-//! So this binary measures two things and gates on both:
+//! Evicted = page cache dropped, resident = warm; each open's major-fault count is
+//! printed. **The evicted arm is REPORTED, the resident arm is GATED**
+//! (`docs/PHASE5.md` §12 criterion 2), and evicted numbers print with the host's
+//! CPU and the fixture's filesystem.
 //!
-//! * the **budget** — the open must fit in 10 ms at gate scale;
-//! * **scale invariance** — the same measurement on a fixture two orders of
-//!   magnitude smaller must come out within a small factor, which is the half
-//!   that is a claim about `open_frozen` rather than about this host.
+//! # Absolute durations on an unfit host
 //!
-//! # Two cache states, and only one of them is a claim about this code
+//! `docs/PHASE5.md` §9.3's *one-sided budget with a stated margin* amendment admits
+//! this: every check [`tf_tree_bench::report::Fitness::probe`] applies can only make
+//! an open slower, so a PASS is conservative and a FAIL is not attributable to the
+//! code. The verdict line prints the fitness reasons either way. A debug build is
+//! likewise not refused (a debug PASS is stronger; a debug FAIL is not
+//! attributable, and the profile is printed). `just gate2` builds `--release`;
+//! `crates/tf_tree_bench/tests/gate2.rs` drives the debug binary to prove wiring.
 //!
-//! Evicted = the file's page cache dropped, resident = warm; the binary prints
-//! each open's major-fault count (1 vs 0 at both sizes).
-//! `docs/PHASE5.md` §12 criterion 2, *Only the resident arm gates, and the reason
-//! is in the fault counts*.
+//! # Vacuous passes avoided
 //!
-//! **The evicted arm is therefore REPORTED and the resident arm is GATED**, and
-//! the evicted numbers are printed with this host's CPU and the fixture's
-//! filesystem beside them so nobody quotes one without them.
+//! Two floors are checked before any verdict and **refuse** rather than pass: the
+//! gated fixture is at least `GATE_INDEX_FLOOR_BYTES`, and the fixtures differ by
+//! at least `SCALE_SPAN`x. The evicted arm verifies its own premise, with the
+//! child's major-fault count as witness (`POSIX_FADV_DONTNEED` cannot evict a page
+//! another mapping holds). **A `--gate` run whose eviction did not take REFUSES;
+//! an ungated one voids the arm.** The usual cause is a RAM-backed filesystem
+//! (`$TMPDIR` is often tmpfs), which is why `tests/gate2.rs` puts fixtures in the
+//! cargo target directory.
 //!
-//! # Why a gate here may publish an absolute duration when `bench_report` will
-//! not
+//! # `--gate`
 //!
-//! `docs/PHASE5.md` §9.3's `Sensitivity::AbsoluteTiming` axis refuses a
-//! duration on a host that fails [`tf_tree_bench::report::Fitness::probe`], and
-//! this host fails it. §9.3's *"a one-sided budget with a stated margin"*
-//! amendment is what admits this measurement anyway, and the argument is in the
-//! direction of the error: every timing check the probe applies — SMT, a busy
-//! machine, an unreadable governor — can only make a measured open **slower**,
-//! so a PASS with margin on an unfit host is a conservative claim, and a FAIL
-//! is not attributable to the code. It buys a PASS and not a FAIL, which is why
-//! the verdict line prints the fitness reasons whichever way it goes, and why
-//! the gated arm is the resident one: its margin against the budget is two
-//! orders of magnitude, where the evicted arm's is a factor of four and one
-//! seek on a slower device would eat it.
-//!
-//! **A debug build is not refused, and that is the direction argument again
-//! rather than an exception to it.** §9.3 says a debug build reaches every axis
-//! because it is a different program rather than a slower one, and that is
-//! right for a row compared against a committed baseline. Against a *budget* a
-//! debug build is strictly conservative: it is slower, so a debug PASS is a
-//! stronger statement than a release one. What a debug build cannot support is
-//! a **FAIL**, which is not attributable to the code — so the profile is
-//! printed on every run and the FAIL line says so. `just gate2` builds
-//! `--release`, which is what makes the wired gate a release measurement;
-//! `crates/tf_tree_bench/tests/gate2.rs` drives the same binary in debug, where
-//! what it proves is the wiring and the arithmetic rather than a duration.
-//!
-//! # The vacuous passes this deliberately avoids
-//!
-//! An `mmap` of a small file is fast for reasons that have nothing to do with
-//! this design, so two floors are checked before any verdict: the gated fixture
-//! must be at least `GATE_INDEX_FLOOR_BYTES`, the criterion's own "233 MB
-//! index", and the two fixtures must differ in size by at least `SCALE_SPAN`x,
-//! or the scale-invariance arm is comparing two files of the same size. Both
-//! **refuse** rather than passing, because a check whose subject set is empty is
-//! green exactly when the measurement did not happen.
-//!
-//! Likewise the evicted arm verifies its own premise: `dd oflag=nocache` is
-//! asked to drop the file's cache and the child's own major-fault count is the
-//! witness. This is not hypothetical — a "cold" loop that keeps an earlier
-//! mapping alive reports the resident number and calls it cold, because
-//! `POSIX_FADV_DONTNEED` cannot evict a page another mapping still holds.
-//!
-//! **A `--gate` run whose eviction did not take REFUSES; an ungated one voids
-//! the arm and says so.** The evicted arm gates nothing, so a report that loses
-//! it still carries every gated number — but a gate that loses it did not
-//! measure what it names. The common cause is not a broken `dd`: it is a
-//! **filesystem whose pages are RAM**, where nothing can evict. `$TMPDIR` is a
-//! tmpfs on many hosts, which is why `tests/gate2.rs` puts its fixtures beside
-//! this binary in the cargo target directory — the filesystem `just gate2`
-//! itself writes to — rather than under `std::env::temp_dir()`.
-//!
-//! # `--gate` — the caller says whether this run is a gate
-//!
-//! `src/bin/frozen_workers.rs`'s shape, for its reason: printing FAIL and
-//! exiting 0 is the failure `docs/benchmarks/EVIDENCE.md` exists to prevent.
-//! Unlike gate 4 there is no second arm to defer, so `--gate` refuses no **mode**
-//! — in particular it does **not** refuse `--prefault`, which is this gate's
-//! falsifier and must be able to turn it red. What it does refuse is a *run it
-//! cannot evaluate*: a fixture under the criterion's own scale, two fixtures too
-//! close in size to compare, an evicted arm whose eviction was not witnessed,
-//! and a run that would PASS against a `--budget-ms` **above** the criterion's
-//! own. Those are refusals rather than verdicts, and they are a different thing
-//! from declining a flag pair. The third is a refusal **only under `--gate`** —
-//! see the evicted arm's premise above. Gate 4 refuses `--gate --no-touch`
-//! because that control produces a meaningless *pass*; a control that produces
-//! a real FAIL is the opposite case and gating on it is the point.
-//!
-//! The fourth is that rule applied to a threshold rather than to a mode. Gate 4
-//! has no threshold flag at all, and a gate whose comparison a caller can move
-//! in the loosening direction is a gate a caller can green.
+//! As `src/bin/frozen_workers.rs`: printing FAIL and exiting 0 is what
+//! `docs/benchmarks/EVIDENCE.md` exists to prevent. `--gate` refuses no mode (not
+//! `--prefault`, the falsifier). It refuses a run it cannot evaluate: a fixture
+//! under the criterion's scale, two fixtures too close in size, an unwitnessed
+//! eviction (only under `--gate`), and a PASS against a `--budget-ms` **above** the
+//! criterion's, because a gate whose comparison a caller can loosen can be greened.
 //!
 //! # The falsifier
 //!
-//! `--prefault` reads every byte of the `.tft` inside the timed region. It is a
-//! stand-in for the live regression this gate exists to catch — a `populate_hot`
-//! arm reaching the frozen backing, which
-//! `crates/tf_tree/src/tree.rs`'s `populate_edge_rings` today refuses by
-//! matching on the backing rather than by discipline — and it edits no
-//! threshold: it is the gate's own arithmetic on an open that does
-//! size-proportional work. `--budget-ms` exists too and is the **weaker** of the
-//! two, because moving a threshold proves only that the comparison is wired;
-//! under `--gate` a raised budget that would produce a PASS is refused, per the
-//! section above.
+//! `--prefault` reads every byte of the `.tft` inside the timed region, standing in
+//! for a `populate_hot` arm reaching the frozen backing
+//! (`crates/tf_tree/src/tree.rs`'s `populate_edge_rings` refuses it today). It edits
+//! no threshold; `--budget-ms` is the weaker control. Fault counts are printed as
+//! corroboration only, since `mmap(MAP_POPULATE)` generates no counted minor faults;
+//! the verdict is on time.
 //!
-//! A fault-count assertion would *not* catch that regression in every form:
-//! prefaulting inside `mmap(MAP_POPULATE)` costs the time and generates no
-//! counted minor faults. The fault counts are printed as corroboration; the
-//! verdict is on time.
+//! # Not covered
 //!
-//! # What this gate does not cover
-//!
-//! §2.2 is explicit that a `.tft` is deliberately not prefaulted, so a fast open
-//! is by design and the cost is deferred to first touch. A gate on the open
-//! alone cannot see work *moved* into the first lookup, and does not claim to.
+//! §2.2: a `.tft` is deliberately not prefaulted, so this gate cannot see work moved
+//! into the first lookup.
 //!
 //! # Usage
 //!
@@ -151,45 +83,26 @@ use tf_tree_bench::workload::{Backing, QuerySpec, Topology, Workload};
 const BUDGET_MS: f64 = 10.0;
 
 /// §12 gate 2's "233 MB index", as a floor on the gated fixture.
-///
-/// Decimal MB, because §2.5's sizing arithmetic that produces the figure is in
-/// decimal MB (115 + 92 + 26).
+/// Decimal MB: §2.5's sizing arithmetic (115 + 92 + 26).
 const GATE_INDEX_FLOOR_BYTES: u64 = 233_000_000;
 
-/// How much bigger the gated fixture must be than the small one for the
-/// scale-invariance arm to be about scale.
+/// Minimum size ratio of gated to small fixture.
 const SCALE_SPAN: u64 = 8;
 
-/// The factor the two fixtures' open times must agree within.
-///
-/// Not a tuned number: `open_frozen` does the same O(1) work at both sizes, so
-/// the honest expectation is 1.0 and everything above it is this host's noise
-/// at the tens-of-microseconds scale the resident arm measures. It is set far
-/// enough above that noise that a run does not flap, and far enough below the
-/// regression it guards — any step proportional to the index moves this by the
-/// size ratio, which the fixtures hold at `SCALE_SPAN`x or more — that the
-/// distance is orders of magnitude rather than a margin.
+/// The factor the two fixtures' open times must agree within. `open_frozen` is
+/// O(1), so the expectation is 1.0; the bound sits above host noise and orders of
+/// magnitude below the size ratio any proportional step would produce.
 const SCALE_BOUND: f64 = 4.0;
 
-/// §12 gate 2's criterion, as one expression the verdict line and the exit
-/// status are both taken from.
+/// §12 gate 2's criterion, one expression for the verdict line and exit status.
 fn within_budget(worst_ms: f64, budget_ms: f64) -> bool {
     worst_ms <= budget_ms
 }
 
-/// The other half of the criterion: the open does not grow with the index.
-///
-/// **Taken over each arm's *best* open, where the budget is taken over its
-/// worst, and the asymmetry is deliberate.** A budget is a worst-case claim, so
-/// it reads the worst. A ratio is an estimate of a fixed cost, and the noise on
-/// this host is one-sided — a descheduled process is slower, never faster — so
-/// the minimum of N is the least contaminated estimate of what an open costs,
-/// while a quotient of two worsts multiplies two independent noise draws.
-/// Measured on the development host: over ten runs of eight rounds the
-/// best/best ratio spanned **1.02-1.42** against a bound of 4, while an earlier
-/// five-run sitting on the same fixtures measured worst/worst at **0.63-1.90** —
-/// twice the spread, in both directions, off the same opens. The control fails
-/// it by more than an order of magnitude either way.
+/// The other half: the open does not grow with the index. Taken over each arm's
+/// *best* open (the budget reads the worst): noise is one-sided, so the minimum is
+/// the least contaminated cost estimate and a quotient of worsts doubles the noise.
+/// The control fails it by more than an order of magnitude.
 fn scale_invariant(large_ms: f64, small_ms: f64) -> bool {
     large_ms <= small_ms * SCALE_BOUND
 }
@@ -302,7 +215,7 @@ enum Mode {
     Drive,
 }
 
-/// Everything the driver was asked for, as one value.
+/// Everything the driver was asked for.
 struct Drive {
     path: PathBuf,
     small: PathBuf,
@@ -317,15 +230,9 @@ struct Drive {
     gate: bool,
 }
 
-/// A fixture at §12 gate 2's own scale.
-///
-/// The shape is `frozen_workers`'s `Fleet`, and the two binaries name it
-/// separately rather than sharing one function: this one needs the shape at
-/// *two* sizes, gate 4's needs the one size its arithmetic (`S >= 74p`) is
-/// calibrated for, and lifting gate 4's private `spec()` into the library to
-/// serve gate 2 would edit the gate-4 binary for gate 2's benefit. What is
-/// shared is the thing that matters — `workload::Workload` itself, which is the
-/// one path either binary has to build a tree.
+/// A fixture at §12 gate 2's scale. Same shape as `frozen_workers`'s `Fleet` but
+/// named separately: this binary needs two sizes. Both go through
+/// `workload::Workload`.
 fn spec(name: &'static str, robots: usize, history: f64) -> Workload {
     Workload {
         name,
@@ -344,8 +251,7 @@ fn build(path: &Path, robots: usize, history: f64) -> Result<()> {
     }
     let w = spec("gate2_fleet", robots, history);
     let built = w.build(tf_tree::InterpPolicy::LerpSlerp, Backing::Heap)?;
-    // `source_digest` all-zero and `source` None: a synthesized workload, not a
-    // recording — the `--from-live` case `freeze_to` documents.
+    // All-zero `source_digest`, `source` None: synthesized, not recorded.
     built
         .tree
         .freeze_to(path, None, [0u8; 32], 0)
@@ -359,24 +265,18 @@ fn build(path: &Path, robots: usize, history: f64) -> Result<()> {
     Ok(())
 }
 
-/// One child: one timed `Tree::open_frozen`, its own fault counts, one line out.
-///
-/// **A fresh process per open, and that is not incidental.** Within one process
-/// the second open of the same file costs a fraction of the first, and a `p50`
-/// over in-process repeats reports the number that costs nothing while never
-/// reporting the one that does. §12 says "open time"; a gate is a worst-case
-/// claim, so the driver takes the worst of N fresh processes.
+/// One child: one timed `Tree::open_frozen`, its fault counts, one line out. A
+/// fresh process per open, because a repeat in-process costs a fraction of the
+/// first and the gate is a worst-case claim.
 fn open_once(path: &Path, prefault: bool) -> Result<()> {
     let before = faults()?;
     let started = Instant::now();
     let tree = Tree::open_frozen(path).map_err(|e| anyhow!("opening {}: {e:?}", path.display()))?;
-    // **The control, inside the timed region.** Any step of `open_frozen` that
-    // was proportional to the index would land exactly here.
+    // The control, inside the timed region.
     let read = if prefault { read_whole(path)? } else { 0 };
     let elapsed = started.elapsed();
     let after = faults()?;
-    // The tree is dropped after the clock stops, so an unmap does not land in
-    // the measurement.
+    // Dropped after the clock stops, so unmap is not measured.
     drop(tree);
     println!(
         "ns={} minflt={} majflt={} prefaulted={}",
@@ -388,12 +288,8 @@ fn open_once(path: &Path, prefault: bool) -> Result<()> {
     Ok(())
 }
 
-/// Read every byte of the file, returning how many.
-///
-/// The `--prefault` control: a `read(2)` walk rather than a page-touch walk of
-/// the mapping, because the property under test is that no step of an open is
-/// proportional to the index, and the mechanism by which a proportional step
-/// would arrive does not change whether it fits in 10 ms.
+/// Read every byte of the file, returning how many (the `--prefault` control,
+/// via `read(2)`).
 fn read_whole(path: &Path) -> Result<u64> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path)?;
@@ -408,19 +304,15 @@ fn read_whole(path: &Path) -> Result<u64> {
     }
 }
 
-/// `(minflt, majflt)` from `/proc/self/stat`.
-///
-/// Fields 10 and 12, parsed after the last `)` because the second field is the
-/// executable name and may contain spaces and parentheses — the same care
-/// `crate::mp`'s CPU-time reader takes with fields 14 and 15 of the same line.
+/// `(minflt, majflt)` from `/proc/self/stat`, fields 10 and 12, parsed after the
+/// last `)` because the executable name may contain spaces.
 fn faults() -> Result<(u64, u64)> {
     let stat = std::fs::read_to_string("/proc/self/stat").context("reading /proc/self/stat")?;
     let rest = stat
         .rsplit_once(')')
         .ok_or_else(|| anyhow!("/proc/self/stat has no `)` — not a Linux stat line"))?
         .1;
-    // After the `)` the fields are 3..; `state` is the first, so minflt is at
-    // index 7 and majflt at index 9 of what remains.
+    // After the `)`: `state` is first, so minflt is index 7, majflt index 9.
     let f: Vec<&str> = rest.split_whitespace().collect();
     let get = |i: usize, what: &str| -> Result<u64> {
         f.get(i)
@@ -431,20 +323,11 @@ fn faults() -> Result<(u64, u64)> {
     Ok((get(7, "minflt")?, get(9, "majflt")?))
 }
 
-/// Drop `path`'s page cache, and say whether the request was even made.
-///
-/// **`dd` rather than `posix_fadvise`.** `tf_tree_bench`'s library is
-/// `#![forbid(unsafe_code)]` and `CLAUDE.md`'s unsafe budget routes a *new kind*
-/// of `unsafe` to a decision record; `src/bin/contended_scaling.rs` and
-/// `src/bin/load_child.rs` both take the same way out for the same reason, by
-/// reaching for a process (`taskset -c N`) instead of a syscall. GNU `dd`'s
-/// `oflag=nocache conv=notrunc,fdatasync count=0` is the documented idiom for
-/// dropping one file's cache, and the `fdatasync` half closes the hazard that a
-/// `posix_fadvise` alone would leave: `DONTNEED` does not write back dirty
-/// pages, so on a fixture this run has just frozen the eviction could quietly
-/// no-op.
-///
-/// Nothing here trusts it. The witness is the child's own major-fault count.
+/// Drop `path`'s page cache, and say whether the request was made. `dd
+/// oflag=nocache conv=notrunc,fdatasync count=0` rather than `posix_fadvise`: no
+/// new `unsafe` kind (as `contended_scaling.rs`, `load_child.rs`), and `fdatasync`
+/// writes back dirty pages `DONTNEED` would skip. Nothing trusts it; the witness is
+/// the child's major-fault count.
 fn evict(path: &Path) -> Result<()> {
     let out = Command::new("dd")
         .arg(format!("of={}", path.display()))
@@ -500,18 +383,15 @@ impl Arm {
 }
 
 /// Which cache state an arm is measured in.
-///
-/// `Evicted { requested: false }` is the control: the arm that is *about* an
-/// evicted page cache, run without evicting, so the witness below has something
-/// to catch.
+/// `Evicted { requested: false }` is the control: evicted arm without evicting,
+/// so the witness has something to catch.
 #[derive(Clone, Copy)]
 enum Cache {
     Evicted { requested: bool },
     Resident,
 }
 
-/// Run one arm: `rounds` fresh processes, each preceded by whatever cache state
-/// this arm is about.
+/// Run one arm: `rounds` fresh processes, each after this arm's cache state.
 fn measure(exe: &Path, path: &Path, rounds: usize, cache: Cache, prefault: bool) -> Result<Arm> {
     let mut worst = f64::MIN;
     let mut best = f64::MAX;
@@ -585,7 +465,7 @@ fn drive(d: &Drive) -> Result<()> {
     let large_bytes = std::fs::metadata(&d.path)?.len();
     let small_bytes = std::fs::metadata(&d.small)?.len();
 
-    // **The two floors, checked before anything is measured.**
+    // The two floors, checked before anything is measured.
     if d.gate && large_bytes < GATE_INDEX_FLOOR_BYTES {
         bail!(
             "{} is {large_bytes} B and PHASE5 §12 gate 2 is stated over a 233 MB index. An \
@@ -657,11 +537,8 @@ fn drive(d: &Drive) -> Result<()> {
     if !d.evict {
         println!("  --no-evict: the evicted arm's cache was left resident (the control)");
     }
-    // Without `--gate` the floors above are not refusals, so say it here rather
-    // than letting a PASS read as a PASS of the criterion. **Both floors get a
-    // line**: the scale-invariance one had none, so an ungated run over two
-    // fixtures of the same size printed a line prefixed `GATED` over a
-    // comparison that is structurally green.
+    // Without `--gate` the floors are not refusals; print a line for **both** so an
+    // ungated PASS does not read as one of the criterion.
     if !d.gate && large_bytes < GATE_INDEX_FLOOR_BYTES {
         println!(
             "  NOT AT GATE SCALE: {large_bytes} B is under §12 gate 2's 233 MB index, so this \
@@ -691,15 +568,9 @@ fn drive(d: &Drive) -> Result<()> {
         );
     }
 
-    // **The evicted arm's premise, checked rather than assumed.** A gated run
-    // REFUSES: a gate that cannot establish its own premise must not publish.
-    // An ungated run degrades and says so, which is
-    // `src/bin/contended_scaling.rs`'s shape when its `taskset` helper is
-    // unavailable; the header says why that asymmetry is not a softening.
-    //
-    // The ordinary way this fires is not a bug in `dd` — it is a filesystem
-    // that cannot evict, because its pages are RAM: `$TMPDIR` is a tmpfs on
-    // many hosts, and a container can have a RAM-backed workdir.
+    // The evicted arm's premise is checked, not assumed: a gated run REFUSES, an
+    // ungated one degrades and says so (`contended_scaling.rs`'s shape). Usual cause:
+    // a RAM-backed filesystem that cannot evict.
     let evicted_premise = evicted_large.all_major() && evicted_small.all_major();
     if !evicted_premise {
         let why = format!(
@@ -732,14 +603,9 @@ fn drive(d: &Drive) -> Result<()> {
     let scale_ok = scale_invariant(resident_large.best_ms, resident_small.best_ms);
     let ratio = resident_large.best_ms / resident_small.best_ms;
 
-    // **A loosened budget may not produce a gated PASS.** `SCALE_BOUND` is a
-    // constant, `--budget-ms` is not, and the verdict is a conjunction of the
-    // two, so a raised budget can only ever help a run pass. Refused in the
-    // loosening direction only, and before any verdict line is printed: a
-    // refusal must publish nothing. Lowering it stays legal, which is what
-    // `tests/gate2.rs` uses to drive the budget half red on its own; so does
-    // raising it *while the run still fails*, which is how that file isolates
-    // the scale half.
+    // **A loosened budget may not produce a gated PASS**, refused before any verdict
+    // line. Lowering stays legal (`tests/gate2.rs` drives the budget half red), as
+    // does raising while the run still fails (isolating the scale half).
     if d.gate && budget_ok && scale_ok && d.budget_ms > BUDGET_MS {
         bail!(
             "REFUSED — --budget-ms {:.4} is above PHASE5 §12 gate 2's own {BUDGET_MS:.4} ms, \
@@ -805,10 +671,8 @@ fn drive(d: &Drive) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// **The gate's arithmetic can say no.** `frozen_workers`'s
-    /// `gate_arithmetic_is_not_vacuous` in the same crate, for the same reason:
-    /// a comparison that has never been observed to fail is a comparison
-    /// nobody has tested.
+    /// **The gate's arithmetic can say no**, as `frozen_workers`'s
+    /// `gate_arithmetic_is_not_vacuous`.
     #[test]
     fn the_budget_comparison_is_not_vacuous() {
         assert!(within_budget(2.5, BUDGET_MS));
@@ -819,8 +683,7 @@ mod tests {
         assert!(!within_budget(126.8, BUDGET_MS));
     }
 
-    /// The other half, separately — a union of two checks is where one of them
-    /// stops being read.
+    /// The other half separately: a union of two checks hides one of them.
     #[test]
     fn the_scale_comparison_is_not_vacuous() {
         assert!(scale_invariant(0.09, 0.10));
@@ -829,7 +692,7 @@ mod tests {
         assert!(!scale_invariant(20.0, 0.15), "a size-proportional open");
     }
 
-    /// The two floors are what stop a small fixture passing trivially.
+    /// The two floors stop a small fixture passing trivially.
     #[test]
     fn the_gate_scale_floor_is_the_criterions_own_number() {
         assert_eq!(GATE_INDEX_FLOOR_BYTES, 233_000_000);

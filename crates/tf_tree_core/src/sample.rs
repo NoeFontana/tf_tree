@@ -1,51 +1,28 @@
-//! Bracket search over an edge's sample ring.
+//! Bracket search over an edge's sample ring: locate the two published samples
+//! that bracket a query stamp and interpolate.
 //!
-//! Given a query stamp `t`, locate the two published samples that bracket it and
-//! interpolate. The search is over **logical** indices with `& mask` applied on
-//! every probe: searching the physical array directly is wrong once the ring has
-//! wrapped, and is a classic off-by-one source (`docs/PHASE1.md` §6.4). The trailing
-//! revalidation makes the read wait-free in practice — it fails only if the ring
-//! lapped the reader mid-read, which cannot happen within the buffer's time-slack
-//! under any sane configuration. **What it covers is narrower than that sentence
-//! reads**: see the two hazards below.
-//!
-//! The searched window is `[head - n, head - 1]` where `n = min(head,
-//! `[`SampleRing::retained`]`)` — and `retained` is `capacity - 1`, **not**
-//! `capacity`. Logical index `head - capacity` shares a physical slot with the
-//! sample `push` is writing right now, so including it means reading a slot
-//! mid-overwrite. Both the window and the trailing revalidation use the same
-//! bound; keep them in step.
+//! The search runs over **logical** indices with `& mask` applied on every probe
+//! (`docs/PHASE1.md` §6.4). The window is `[head - n, head - 1]` with
+//! `n = min(head,` [`SampleRing::retained`]`)`, and `retained` is `capacity - 1`:
+//! logical `head - capacity` shares a slot with the sample `push` is writing.
+//! The window and the trailing revalidation use the same bound; keep them in step.
 //!
 //! # Two hazards the trailing revalidation does **not** cover
 //!
-//! Both were found on 2026-08-29 while closing a third — six short-circuit arms
-//! that skipped the revalidation entirely — and both are older than that change.
-//! Neither is closed here, because closing either is a hot-path cost with its own
-//! measurement; they are written down so the next reader does not conclude the
-//! check is stronger than it is.
+//! Both are open (closing either is a hot-path cost).
 //!
-//! **1. The search itself can be corrupted by one concurrent push.** `SampleRing::bracket`
-//! is a binary search over `stamp_at`, which is a `Relaxed` load of an
-//! array the writer overwrites in place. The searched window's oldest index is
-//! `head - retained`, and `push` destroys logical `head - capacity` — one index
-//! below it — so **two** pushes during a search reach the window and the stamps
-//! stop being monotone inside it. A binary search over a non-monotone array
-//! returns an arbitrary index, and if that index is still *inside* the window the
-//! trailing `head - i > retained` check passes: the caller is handed a blend of
-//! two samples that do not bracket its request, with no error. Closing it means
-//! re-reading `t_i`/`t_j` after the trailing check and confirming they still
-//! bracket `t` — two extra `Relaxed` loads on the interpolating path.
+//! **1.** `bracket` binary-searches `stamp_at`, a `Relaxed` load of an array the
+//! writer overwrites in place. Two pushes during a search reach the window and
+//! the stamps stop being monotone; the search then returns an arbitrary index, and
+//! if it is still inside the window the trailing check passes and the caller gets
+//! a blend of two samples that do not bracket its request.
 //!
-//! **2. [`SampleRing::newest_stamp`] can report a stamp from a later lap.** It
-//! loads `head`, then loads `stamps[(head - 1) & mask]`, with nothing between
-//! them: if the ring laps in that gap the slot holds a *newer* sample's stamp.
-//! So it is an estimate of the frontier, not a bound on it — which is why it is
-//! not usable as a baseline for judging whether some other read was stale, and
-//! why a test that tried failed for reasons that had nothing to do with what it
-//! was testing.
+//! **2.** [`SampleRing::newest_stamp`] loads `head`, then the stamp at
+//! `head - 1`; if the ring laps in between it reports a later lap's stamp. It is
+//! an estimate of the frontier, not a bound, and is no baseline for judging
+//! staleness.
 //!
-//! This module is `unsafe`-free: it drives the [`SampleRing`] atomics through the
-//! safe `push`/`read_slot` surface exposed by [`crate::buffer`].
+//! This module is `unsafe`-free.
 
 use core::marker::PhantomData;
 
@@ -81,19 +58,10 @@ pub enum ExtrapPolicy {
 
 /// One seqlocked read of an edge's bracket, before any interpolation.
 ///
-/// [`SampleRing::read_from`] returns this and [`SampleRing::sample_from`]
-/// immediately folds it with [`Interp::eval`]. Splitting the two is what
-/// `docs/decisions/0060` calls the *phase buffering*, and §10.1 of that record
-/// measured it as the whole of the batch fold's 23–25%: a chunk's reads run as
-/// one loop with no interpolation between them, and the arithmetic runs as a
-/// second loop with no atomic load, no bracket search and no branch on a policy
-/// between its elements.
-///
-/// **It is not an optimisation of the arithmetic.** Whichever variant comes
-/// back, evaluating it produces exactly the bits the per-stamp fold produced,
-/// because it is exactly the same call on exactly the same values — which is
-/// the property `crates/tf_tree/tests/batch_phases.rs` asserts by `to_bits` and
-/// not by tolerance.
+/// [`SampleRing::read_from`] returns this; [`SampleRing::sample_from`] folds it
+/// immediately with [`Interp::eval`]. The split is `docs/decisions/0060`'s phase
+/// buffering. Evaluating a bracket yields exactly the bits the per-stamp fold
+/// yields (`crates/tf_tree/tests/batch_phases.rs`, by `to_bits`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Bracket {
     /// A pose that needs no interpolation: an exact stamp hit, or the answer an
@@ -111,17 +79,9 @@ pub(crate) enum Bracket {
 }
 
 impl Bracket {
-    /// Fold this bracket under interpolation policy `I`.
-    ///
-    /// **Through [`Interpolated`], deliberately.** This is what the batch's
-    /// phase 2 calls and `Interpolated` is what the scalar read builds
-    /// directly, so routing both through one pair of constructors leaves
-    /// exactly one place that decides what an exact bracket folds to and one
-    /// that decides what an interpolating one folds to. Writing `I::eval` here
-    /// as well would be a second spelling of the same arithmetic
-    /// (`docs/PROJECT.md` §6), and the first symptom of the two drifting apart
-    /// would be a batch row disagreeing with `Plan::at` — which is the one
-    /// property this whole restructure is not allowed to break.
+    /// Fold this bracket under interpolation policy `I`, through [`Interpolated`]
+    /// so the scalar and batch reads share one pair of constructors
+    /// (`docs/PROJECT.md` §6).
     #[inline]
     pub(crate) fn eval<I: Interp>(&self) -> Iso3 {
         match *self {
@@ -131,38 +91,13 @@ impl Bracket {
     }
 }
 
-/// What [`SampleRing::read_from`] turns a bracket into — chosen by the caller,
-/// at the type level, so there is one read body and no caller pays for a shape
-/// it does not want.
+/// What [`SampleRing::read_from`] turns a bracket into, chosen at the type level:
+/// the batch instantiates [`Bracket`], the scalar path [`Interpolated<I>`].
 ///
-/// # This is what "one read body" cost, and how it was bought back
-///
-/// The batch fold wants the bracket itself: phase 1 stores it and phase 2
-/// interpolates later, which is the whole of `docs/decisions/0060` Decision A.
-/// The scalar fold wants the pose, immediately. Having `read_from` return
-/// [`Bracket`] and `sample_from` fold it looks like the obvious way to share
-/// one body, and it is a real regression on `Plan::at`: a `Bracket` is 128
-/// bytes — as wide as its interpolating variant — and the scalar path then
-/// carries one through a `Result` on every sample of every step. Measured
-/// against `2524667`, interleaved paired runs, 9 reps, `taskset`-pinned:
-///
-/// | `lookup/*` row | `[profile.bench]` | `[profile.embedder]` |
-/// | --- | --- | --- |
-/// | `depth1/sclerp` | +2.65% | **+14.62%** |
-/// | `depth3/sclerp` | +1.52% | **+14.13%** |
-/// | `depth3/lerpslerp` | +5.56% | **+10.76%** |
-/// | `depth6/sclerp` | +2.32% | **+15.33%** |
-/// | `depth3/sclerp/exact_hit` | +7.40% | **+12.67%** |
-///
-/// `#[inline]` and `#[inline(always)]` on `read_from` move that cost between
-/// the scalar and batch paths and do not remove it; the attribute's own note
-/// carries those rows.
-///
-/// So the *return type* is the parameter. `read_from` is generic over this
-/// trait, the batch instantiates it at [`Bracket`] and the scalar path at
-/// [`Interpolated<I>`], which is 56 bytes and never builds an enum — and the
-/// search, the seqlocked slot reads and the trailing lap check stay in exactly
-/// one function, which is what `0060`'s open question 3 asked for.
+/// Returning a 128-byte [`Bracket`] through the scalar path's `Result` cost
+/// +10..15% on `lookup/*` under `[profile.embedder]`, and `#[inline]` only moves
+/// it (`docs/decisions/0060` §10.1). Search, slot reads and lap check stay in one
+/// function.
 pub(crate) trait FromBracket {
     /// A pose that needs no interpolation.
     fn exact(p: Iso3) -> Self;
@@ -197,36 +132,13 @@ impl<I: Interp> FromBracket for Interpolated<I> {
 }
 
 /// Nanoseconds from `from` to `to` as an `f64`, for a pair the caller has
-/// already ordered so that `from <= to`.
+/// already ordered `from <= to`.
 ///
-/// **The subtraction is done in `u64`, and that is load-bearing rather than a
-/// micro-optimisation.** Every caller here has established its ordering — the
-/// bracket precondition `t_i <= t < t_j`, or two adjacent ring samples, or the
-/// forward-extrapolation branch's `t > t_new > t_prev` — so the difference is
-/// mathematically non-negative in all of them. It still does not *fit* an `i64`
-/// once the two stamps are more than `i64::MAX` apart, and the signed
-/// subtraction was reached with exactly that:
-///
-/// * in a checked build it panicked — `attempt to subtract with overflow`;
-/// * in a release build it wrapped, and the wrap is the worse half. A negative
-///   `t_j - t_i` makes `s` negative, so `Interp::eval` runs *backwards past* the
-///   older sample and returns a pose from outside the bracket. No error, no
-///   panic, wrong answer, on the hot path.
-///
-/// Casting through `u64` first makes the result exact for every ordered `i64`
-/// pair: `wrapping_sub` on the bit patterns *is* the true distance, not a
-/// truncation of it, and for `(i64::MIN, i64::MAX)` it yields `u64::MAX`.
-///
-/// Two samples 292 years apart is malformed data, and this is not an endorsement
-/// of it. But the defensible answers to malformed data are an error naming the
-/// edge or a correct interpolation of it; a silently wrong pose is neither, and
-/// removing that was the point. If a bound on segment width is wanted it belongs
-/// upstream in `push`, as a `LookupError` that names the edge (R5), not here as
-/// an accident of two's complement.
-///
-/// `from > to` is a caller bug and yields a nonsense magnitude rather than a
-/// panic; every call site in this module is directly preceded by the comparison
-/// that rules it out.
+/// The subtraction is in `u64` on purpose: an `i64` subtraction overflows when
+/// the stamps are more than `i64::MAX` apart (panic in a checked build, a wrapped
+/// negative `s` and a pose from outside the bracket in release). `wrapping_sub`
+/// on the bit patterns is the exact distance for every ordered pair. `from > to`
+/// yields a nonsense magnitude, not a panic.
 #[inline]
 fn span_ns(from: i64, to: i64) -> f64 {
     (to as u64).wrapping_sub(from as u64) as f64
@@ -302,9 +214,7 @@ impl SampleRing<'_> {
             I::eval(&a, &b, s)
         };
 
-        // Revalidate: if the ring lapped past `i` while we read, the endpoints we
-        // used may be stale. Return the error rather than looping; the caller
-        // knows whether a retry makes sense.
+        // Revalidate: a lap past `i` makes the endpoints stale; the caller decides on retry.
         if self.head.load(Ordering::Acquire) - i > retained {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
@@ -312,22 +222,9 @@ impl SampleRing<'_> {
     }
 
     /// Hand back `v` unless the ring lapped past logical index `i` while it was
-    /// being read.
-    ///
-    /// **One spelling of the check, because there are seven places that need it
-    /// and six of them did not have it.** The interpolating tail of
-    /// [`Self::sample`] and the main path of [`Self::constant_twist`] performed
-    /// it inline; every arm that *short-circuits* — `Hold`, an exact hit on the
-    /// newest stamp, `constant_twist`'s single-sample case — returned
-    /// `read_slot` directly, so a reader descheduled long enough for the ring to
-    /// lap got a pose belonging to a different stamp. Silently, and next to a
-    /// path that returns [`LookupError::SlotRecycled`] for the same race four
-    /// lines away.
-    ///
-    /// The exact-newest arms are the sharp ones: a caller that named a stamp can
-    /// be handed the pose of a different one, where naming an *interior* stamp
-    /// is refused. A 64-slot ring — `Capacity::slots(64)`, which the ABI cost
-    /// fixture uses — laps in 64 ms at 1 kHz, which is one ordinary preemption.
+    /// being read. Every arm that short-circuits (`Hold`, an exact hit on the
+    /// newest stamp, `constant_twist`'s single sample) must use it, or a
+    /// descheduled reader gets the pose of a different stamp.
     ///
     /// [`Self::revalidated`] with no payload, for the test that pins its bound.
     #[cfg(test)]
@@ -346,77 +243,17 @@ impl SampleRing<'_> {
     /// Read the bracket at stamp `t`, resuming the search from `cursor`, and
     /// return it **without interpolating**.
     ///
-    /// For a monotone non-decreasing sweep of stamps the galloping resume turns
-    /// the per-query `O(log n)` binary search into `O(1)` amortized: each call
-    /// gallops from the previous result rather than restarting at the window
-    /// midpoint. `cursor` is updated to the lower bracket index found, so the
-    /// next call resumes there. Pass a `cursor` seeded to `0` for the first
-    /// call.
+    /// For monotone stamps the galloping resume is `O(1)` amortized. `cursor` is
+    /// updated to the lower bracket index found; seed it to `0`.
     ///
-    /// # This is the one read body, and the lap check moved with it
+    /// This is the one read body: [`Self::sample_from`] adds one [`Interp::eval`],
+    /// and `Plan`'s batch fold runs it per chunk (`docs/decisions/0060` step 2).
+    /// The trailing `head - i > retained` check runs after the slot reads, so for
+    /// `B = Bracket` it precedes the arithmetic; it judges only values already
+    /// copied out, so that loses nothing.
     ///
-    /// [`Self::sample_from`] is this function plus one [`Interp::eval`], and
-    /// `Plan`'s chunked batch fold is this function for a whole chunk and then
-    /// one [`Interp::eval`] per element. `docs/decisions/0060` step 2 requires
-    /// exactly that — *"`sample_from` expressed through the bracket read, so
-    /// the scalar path runs the same lap check in the same position"* — because
-    /// the alternative is a second copy of the galloping search and the seqlock
-    /// retry living beside this one.
-    ///
-    /// The trailing `head - i > retained` check sits after the slot reads and
-    /// before the return, which is where `sample_from` always had it —
-    /// `Interpolated::between` interpolates *as the bracket is built*, so on
-    /// the scalar path the check still runs after the `Interp::eval`, in the
-    /// same position, on the same values. **Nothing moved for `Plan::at`.**
-    ///
-    /// For the batch instantiation it does move, because there is no
-    /// interpolation left to put it after: `B = Bracket` stores the endpoints
-    /// and phase 2 folds them a chunk later. That is not a weakening of what
-    /// the check proves. It asks whether logical index `i` is still inside the
-    /// readable window, and the values it judges are the ones
-    /// [`Self::read_slot`](crate::buffer::SampleRing::read_slot) already copied
-    /// out; no arithmetic performed afterwards can change them. A lap that
-    /// completes strictly after the last `read_slot` returned overwrote a slot
-    /// this call had already finished with, so catching it was a false refusal,
-    /// not a save.
-    ///
-    /// **What does shrink for the batch is a probabilistic window, and it was
-    /// never a guarantee at either position.** `push` writes the slot and
-    /// *then* stores `head`. A reader that reads the freshly overwritten slot
-    /// and then loads `head` before that store lands passes the check and
-    /// returns a pose from the wrong lap — at the old position too, which
-    /// merely gave the writer one `Interp::eval` more in which to land the
-    /// store. That interleaving is this module's hazard 1 wearing different
-    /// clothes; it is open, it is documented there, and neither position
-    /// closes it.
-    ///
-    /// # `#[inline(always)]`, which `nm` decided and not a preference
-    ///
-    /// `#[inline]` is a hint and **LLVM declines it here**: built with the
-    /// plain attribute, `<SampleRing>::read_from` is still a defined symbol in
-    /// the `at_many` bench binary — phase 1 calls it once per lane, which is
-    /// exactly the site whose cost model says "too big to inline sixteen
-    /// times" — while the `lookup` binary, which calls it once, has none.
-    /// Under `#[inline(always)]` neither binary has one. That is the whole
-    /// argument, and it shows up where it should:
-    ///
-    /// | row, vs `2524667`, `[profile.bench]` | `#[inline]` | `#[inline(always)]` |
-    /// | --- | --- | --- |
-    /// | `at_many/into_mat4_1024` | −7.81% | **−17.06%** |
-    /// | `at_many/monotone_1024` | −17.70% | −19.17% |
-    /// | `at_many_recorded/mixed_at_many_1024` | −29.79% | −31.16% |
-    /// | `lookup/depth3/sclerp` | −1.12% | −0.88% |
-    /// | `lookup/depth3/sclerp/exact_hit` | −4.91% | +1.22% |
-    ///
-    /// Interleaved paired runs of three arms, 7 reps, `taskset`-pinned,
-    /// medians. The cost is ~1–2% on two scalar rows, against ~9 points on the
-    /// batch row where the hint was refused, and the refusal is a property of a
-    /// cost model that can change under the crate rather than of the code.
-    ///
-    /// **`docs/API.md` §2.3's rule is that a placement is measured, not
-    /// assumed**, and the negative result is kept here for the same reason
-    /// `Plan::fold_at_cursors` keeps its own: the obvious attribute did
-    /// something other than what it says.
+    /// `#[inline(always)]` is load-bearing: LLVM declines plain `#[inline]` at the
+    /// batch's per-lane call site (`at_many/into_mat4_1024` −7.8% vs −17.1%).
     ///
     /// # Errors
     ///
@@ -494,20 +331,9 @@ impl SampleRing<'_> {
         Ok(result)
     }
 
-    /// Sample at stamp `t` like [`Self::sample`], but resume the bracket search
-    /// from the logical index in `cursor` using an exponential (galloping)
-    /// search.
-    ///
-    /// The result is identical to [`Self::sample`] for the same `t`; only the
+    /// [`Self::sample`], resuming the search from the logical index in `cursor`
+    /// by an exponential (galloping) search. The result is identical; only the
     /// search path differs.
-    ///
-    /// One `read_from` — the crate-private body that the batch fold also uses,
-    /// so the galloping search, the seqlocked slot reads and the trailing lap
-    /// check exist once — instantiated so that it interpolates under `I` as it
-    /// reads. The batch instantiates the same body to hand back the bracket
-    /// instead and fold it a chunk later; nothing about this call's arithmetic,
-    /// its result or the position of its lap check differs from before that was
-    /// true.
     ///
     /// # Errors
     ///
@@ -521,19 +347,10 @@ impl SampleRing<'_> {
         Ok(self.read_from::<Interpolated<I>>(t, policy, cursor)?.0)
     }
 
-    /// Load the stamp at a logical index (masked to physical). Relaxed is correct:
-    /// the `head` Acquire load in [`Self::sample`] already ordered every stamp of
-    /// a published sample into view, and the stamp arrays are atomic so even a
-    /// racing overwrite of a since-lapped slot is not a data race.
-    ///
-    /// **That edge is pinned by a model, and was not until 2026-09-08**:
-    /// `head_publishes_every_stamp_below_it` (`loom_tests.rs`) is the test that
-    /// fails when `push`'s `head` store is weakened to `Relaxed`. Before it,
-    /// weakening that store passed the whole loom suite, so the sentence above
-    /// rested on nothing an automated check could see — and this is the load
-    /// that would have gone wrong: a stale stamp under an advanced `head`
-    /// brackets against the wrong pair and returns a finite, plausible, wrong
-    /// pose.
+    /// Load the stamp at a logical index (masked to physical). `Relaxed` is
+    /// correct because the `head` Acquire load already ordered every stamp of a
+    /// published sample into view; the edge is pinned by
+    /// `head_publishes_every_stamp_below_it` (`loom_tests.rs`).
     #[inline]
     fn stamp_at(&self, logical: u64) -> i64 {
         self.stamps[(logical & self.mask()) as usize].load(Ordering::Relaxed)
@@ -541,91 +358,21 @@ impl SampleRing<'_> {
 
     /// Last logical index in `[lo, hi]` whose stamp is `<= t`.
     ///
-    /// This line used to end **"branchlessly"**. It is not — see below.
+    /// Caller guarantees `stamp[lo] <= t < stamp[hi]`, so the result is `< hi`
+    /// and `i + 1` is a valid upper bracket.
     ///
-    /// Caller guarantees `stamp[lo] <= t < stamp[hi]`, which `sample` and
-    /// `sample_from` establish before calling. Under that precondition the
-    /// result is always `< hi`, so `i + 1` is a valid index for the upper
-    /// bracket.
-    ///
-    /// # This loop is not branchless, and this section used to say it was
-    ///
-    /// The textbook form is `if stamp <= t { lo = mid } else { hi = mid }`,
-    /// whose branch is by construction a coin flip: a binary search able to
-    /// predict its own comparisons would not need to make them. This form
-    /// instead writes the update as a mask — `base += half & (0 - cmp)` — and
-    /// shrinks `len` unconditionally.
-    ///
-    /// **Only the second half of that survives codegen.** The trip count really
-    /// does depend on the window size alone. The mask does not: LLVM folds
-    /// `x & sext(cmp)` back into a `select`, and because that select sits on the
-    /// loop-carried dependency chain the x86 cmov-conversion pass expands it
-    /// into control flow. Every inlined copy of this loop in the shipped
-    /// `--release` rlib is `cmpq` / `jle` / `xorl` over the loaded stamp — no
-    /// `cmov`, no `and`. The disassembly is the instrument, and it takes about
-    /// two seconds:
-    ///
-    /// ```text
-    /// cargo rustc -p tf_tree_core --release --lib -- --emit asm -C debuginfo=2
-    /// F=$(ls -t target/release/deps/tf_tree_core-*.s | head -1)
-    /// ID=$(awk '/^\t\.file\t[0-9]+ .*sample\.rs"/ {print $2; exit}' "$F")
-    /// LN=$(grep -n '^ *base = base.wrapping_add(half &' crates/tf_tree_core/src/sample.rs | cut -d: -f1)
-    /// grep -c -P "\\.loc\\t$ID $LN " "$F"                       # inlined copies of this line
-    /// grep -B12 -A4 -P "\\.loc\\t$ID $LN " "$F" | grep -c cmov  # 0
-    /// ```
-    ///
-    /// So the cost of this line *is* a function of the stamp distribution, and
-    /// on `soak --workload robot` it is the largest single source of mispredicts
-    /// in the whole process.
-    /// [`0053`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0053-the-branchless-bracket-that-branches.md)
-    /// carries the cachegrind table, the three alternative spellings that were
-    /// measured against it, and why none of them has landed.
-    ///
-    /// **CORRECTION.** This block used to keep the mask over the `if` on the
-    /// grounds that it "does not depend on the optimizer continuing to choose
-    /// `cmov` across future edits" and that "its cost is independent of the
-    /// stamp distribution", and it used to report that "LLVM already compiled
-    /// that `if` to a `cmov`, so the two forms were nearly the same machine
-    /// code". All three were read off the source rather than off the object
-    /// code. On the toolchain this repository pins, neither form emits a `cmov`;
-    /// `0053` measures the `if` as the cheaper of the two on both instructions
-    /// and mispredicts, so the sentence that justified the rewrite is the one
-    /// that argues against it.
-    ///
-    /// The serial dependent-load chain also remains — each probe's address
-    /// depends on the previous result. **Which of the two dominates is not
-    /// settled here.** "At ~1.7 ns/probe the search is latency-bound, not
-    /// branch-bound" stood in this paragraph and was inferred on the assumption
-    /// that there was no branch left to be bound by; `perf_event_paranoid=4` on
-    /// the development host means nobody has timed the alternative.
-    ///
-    /// (Every mispredict figure in `0053` and in `docs/benchmarks/tf2.md` comes
-    /// from cachegrind, whose branch predictor is a simple two-level model, not
-    /// a Zen 3 TAGE. It is sound for comparing two builds under the *same*
-    /// model, which is all either document does with it, and should not be read
-    /// as the count a real CPU incurs.)
-    ///
-    /// # Why not an interpolated seed
-    ///
-    /// `docs/design/fast-path.md` §5 proposed seeding from
-    /// `lo + (t − t_lo)(hi − lo)/(t_hi − t_lo)` instead, which is exact for
-    /// isochronous stamps. Its §10 made that conditional on measuring real data
-    /// first, and `cargo run --example search_seed` did: on the recorded stream
-    /// the seed lands a **median of 11–48 indices** from the answer, because a
-    /// real robot's `/tf` publishing is intermittent — 29–44 gaps covering
-    /// 50–71% of the timeline — so sample density is nowhere near uniform. That
-    /// is more correction steps than binary search needs probes in total. The
-    /// lever is falsified; this one subsumes its intent without assuming
-    /// anything about the stamp distribution.
+    /// The mask update (`base += half & (0 - cmp)`) is **not** branchless after
+    /// codegen: LLVM folds it back to a `select` and the cmov-conversion pass
+    /// expands it to control flow. `docs/decisions/0053` owns the measurement and
+    /// the rejected spellings; the interpolated seed of `docs/design/fast-path.md`
+    /// §5 is falsified by `examples/search_seed`.
     #[inline]
     fn bracket(&self, lo: u64, hi: u64, t: i64) -> u64 {
         let mut base = lo;
         let mut len = hi - lo + 1;
         while len > 1 {
             let half = len / 2;
-            // Mask, not multiply — but the backend turns it back into control
-            // flow too. Do not restore a branchlessness claim here without
-            // re-running the disassembly above.
+            // The backend turns this mask back into control flow (0053); do not claim branchlessness.
             let cmp = u64::from(self.stamp_at(base + half) <= t);
             base = base.wrapping_add(half & 0u64.wrapping_sub(cmp));
             len -= half;
@@ -633,41 +380,15 @@ impl SampleRing<'_> {
         base
     }
 
-    /// [`Self::bracket`], but seeded from `hint` by an exponential (galloping)
-    /// search instead of restarted at the window midpoint.
+    /// [`Self::bracket`], seeded from `hint` by a galloping search.
     ///
-    /// Caller guarantees the same precondition [`Self::bracket`] wants,
-    /// `stamp[lo_logical] <= t < stamp[newest]`, and it is what makes the
-    /// gallop safe to seed with anything: both arms exist only to hand
-    /// `bracket` a sub-interval that still brackets `t`, so a stale, clamped or
-    /// nonsensical `hint` costs probes and can never change the answer. That is
-    /// the property `Guard::cursor` relies on.
+    /// Caller guarantees `stamp[lo_logical] <= t < stamp[newest]`; a stale,
+    /// clamped or nonsensical `hint` then costs probes and never changes the
+    /// answer (`Guard::cursor` relies on this). Both twist and pose samplers
+    /// share it.
     ///
-    /// # One implementation, two samplers
-    ///
-    /// [`Self::sample_from`] and [`Self::sample_with_twist_from`] both come
-    /// here. They differ in what they do with the bracket — one interpolates a
-    /// pose, the other also differentiates the segment — never in how they find
-    /// it. A second copy of this would be a second place for the
-    /// `saturating_sub` arithmetic in the downward arm to be wrong, and that
-    /// arm is unreachable from the in-tree callers (they seed cursors to `0`),
-    /// so a divergence would sit untested until somebody's stamps descended.
-    ///
-    /// # Why `inline(always)` and not `inline`
-    ///
-    /// **Measured, and the difference is not small.** This code used to be
-    /// written out inside `sample_from`, which is where `Plan::at`'s scalar
-    /// lookup reaches it through `Guard::sample_hinted`. Hoisting it behind a
-    /// plain `#[inline]` cost **12 %** on `examples/abi_cost.rs`'s depth-3
-    /// lookup — 188.5 -> 210 ns native, 194.6 -> 223 ns through the C ABI, over
-    /// three pinned runs each that agreed to 1 ns. `inline(always)` returns it
-    /// to 188.5 / 194.6, i.e. to the byte-for-byte inline form.
-    ///
-    /// The likely reason is that `sample_from` is generic over `I: Interp` and
-    /// this is not, so one shared body faces two monomorphized call sites and
-    /// the inliner declines. Whatever the mechanism, the attribute is load
-    /// bearing: **do not weaken it to `#[inline]`** without re-running that
-    /// example pinned, because nothing else in the suite will notice.
+    /// `inline(always)` is load-bearing: plain `#[inline]` cost 12% on
+    /// `examples/abi_cost.rs`'s depth-3 lookup.
     #[inline(always)]
     fn bracket_from(&self, lo_logical: u64, newest: u64, t: i64, hint: u64) -> u64 {
         let hint = rebase_hint(hint, lo_logical, newest).clamp(lo_logical, newest);
@@ -691,9 +412,7 @@ impl SampleRing<'_> {
         self.bracket(lo, hi, t)
     }
 
-    /// The oldest logical index a reader may still touch, and the newest, for a
-    /// ring known to be non-empty. Test-only; the sampling paths compute both
-    /// from the `head` they already loaded rather than loading it twice.
+    /// Oldest and newest readable logical index, for a non-empty ring. Test-only.
     #[cfg(test)]
     pub(crate) fn window_for_test(&self) -> (u64, u64) {
         let h = self.head.load(Ordering::Acquire);
@@ -701,30 +420,18 @@ impl SampleRing<'_> {
         (h - n, h - 1)
     }
 
-    /// Sample at `t` **and** the body twist there, in units of 1/second —
-    /// `docs/PHASE4.md` §2.3.
+    /// Sample at `t` **and** the body twist there, in units of 1/second
+    /// (`docs/PHASE4.md` §2.3). ScLerp only; `Guard::sample_with_twist` refuses
+    /// `LerpSlerp` before reaching here.
     ///
-    /// ScLerp only. The caller (`Guard::sample_with_twist`) refuses `LerpSlerp`
-    /// before reaching here, so this is not generic over [`Interp`]: there is
-    /// exactly one policy with a derivative worth reporting, and making the
-    /// signature pretend otherwise would invite someone to add the wrong one.
-    ///
-    /// # The four bracket-less outcomes, which the spec does not cover
-    ///
-    /// `Plan::at` has cases that produce a pose without a segment, and each
-    /// needs an answer here rather than a plausible-looking zero:
+    /// # Bracket-less outcomes
     ///
     /// | case | pose | twist |
     /// |---|---|---|
-    /// | `t > t_new`, [`ExtrapPolicy::Hold`] | newest, held | **zero** — held *is* stationary |
+    /// | `t > t_new`, [`ExtrapPolicy::Hold`] | newest, held | **zero** |
     /// | `t > t_new`, [`ExtrapPolicy::ConstantTwist`] | extrapolated | the extended segment's twist |
     /// | `t == t_new`, ≥ 2 samples | newest | the *preceding* segment's twist |
     /// | one sample, or a zero-length segment | fine | [`LookupError::NoSegment`] |
-    ///
-    /// The last row is why [`LookupError::NoSegment`] exists rather than reusing
-    /// [`LookupError::NoData`]: the pose is well defined and only the derivative
-    /// is missing, and telling a caller "no data" when there is data sends them
-    /// to the wrong problem.
     ///
     /// # Errors
     ///
@@ -737,17 +444,9 @@ impl SampleRing<'_> {
         self.sample_with_twist_seeking(t, policy, |s, lo, hi, t| s.bracket(lo, hi, t))
     }
 
-    /// [`Self::sample_with_twist`], resuming the bracket search from `cursor`
-    /// by the same galloping search [`Self::sample_from`] uses.
-    ///
-    /// This is [`Self::sample_from`]'s counterpart for the derivative path, and
-    /// it exists for the same reason: `Plan::at_many_into(Layout::QuatTwist)`
-    /// is the n = 1024 batch `docs/API.md` §3.3 is written for, and without it
-    /// that layout is the only one paying an `O(log n)` binary search per stamp
-    /// per plan step while every pose layout pays `O(1)` amortized.
-    ///
-    /// `cursor` is updated to the lower bracket index found, so the next call
-    /// resumes there; seed it to `0` for the first.
+    /// [`Self::sample_with_twist`], resuming the search from `cursor` as
+    /// [`Self::sample_from`] does (for `Plan::at_many_into(Layout::QuatTwist)`).
+    /// `cursor` is updated to the lower bracket index; seed it to `0`.
     ///
     /// # Errors
     ///
@@ -765,18 +464,9 @@ impl SampleRing<'_> {
         })
     }
 
-    /// The body of [`Self::sample_with_twist`] and
-    /// [`Self::sample_with_twist_from`], parameterized on how the bracket is
-    /// found.
-    ///
-    /// `seek` is a distinct type at each of the two call sites, so each gets
-    /// exactly the code it had — the cursor variant does not put a branch, a
-    /// pointer or a spare compare into the cursor-less one, which is the scalar
-    /// `at_with_derivatives` path.
-    ///
-    /// It is called only from the interpolating arm. The extrapolation arms and
-    /// the `t == t_new` left-limit arm reach their index without a search at all,
-    /// so a cursor passed through them is left where it was — still a valid hint.
+    /// Body of [`Self::sample_with_twist`] and [`Self::sample_with_twist_from`],
+    /// generic over `seek` so the cursor-less path gains no branch. `seek` runs
+    /// only in the interpolating arm; other arms leave a cursor where it was.
     #[inline]
     fn sample_with_twist_seeking<F>(
         &self,
@@ -823,8 +513,7 @@ impl SampleRing<'_> {
                     return self.revalidated(newest, retained, (p, Twist::ZERO));
                 }
                 ExtrapPolicy::ConstantTwist => {
-                    // Degraded to Hold: a pose to extend from but no segment to
-                    // extend *along*, which is exactly `NoSegment`.
+                    // One sample: a pose to extend from, no segment to extend along.
                     if newest == lo_logical {
                         return Err(LookupError::NoSegment { edge: self.edge });
                     }
@@ -833,15 +522,11 @@ impl SampleRing<'_> {
             }
         }
 
-        // `t` is inside `[t_old, t_new]`, so a segment exists unless the ring
-        // retains a single sample.
+        // Inside `[t_old, t_new]` a segment exists unless one sample is retained.
         if newest == lo_logical {
             return Err(LookupError::NoSegment { edge: self.edge });
         }
-        // At the newest stamp there is no forward segment; the body twist is
-        // piecewise-constant per segment, so the value there is the left limit —
-        // the segment that *ends* at that knot. Everywhere else `bracket`
-        // returns `i < newest`, so `i + 1` is in range.
+        // At the newest stamp the twist is the left limit: the segment ending there.
         let i = if t == t_new {
             newest - 1
         } else {
@@ -851,8 +536,7 @@ impl SampleRing<'_> {
         let t_j = self.stamp_at(i + 1);
         let dt = span_ns(t_i, t_j);
         if dt == 0.0 {
-            // Equal stamps are legal (invariant 6) but span no time, so the
-            // velocity would be infinite rather than merely unknown.
+            // Equal stamps are legal (invariant 6) but span no time.
             return Err(LookupError::NoSegment { edge: self.edge });
         }
         let a = self.read_slot((i & self.mask()) as usize)?;
@@ -860,7 +544,7 @@ impl SampleRing<'_> {
         let s = span_ns(t_i, t) / dt;
         let (pose, xi) = ScLerp::eval_with_twist(&a, &b, s);
 
-        // As in `sample`: a lap past `i` makes both the pose and the twist stale.
+        // A lap past `i` makes both pose and twist stale.
         if self.head.load(Ordering::Acquire) - i > retained {
             return Err(LookupError::SlotRecycled { edge: self.edge });
         }
@@ -869,31 +553,14 @@ impl SampleRing<'_> {
     }
 
     /// [`ExtrapPolicy::ConstantTwist`] extrapolation past the newest sample,
-    /// returning the extrapolated pose **and** the twist it was extended along.
+    /// returning the pose **and** the twist it was extended along.
     ///
-    /// # One decomposition, one revalidation
+    /// Both come from one [`ScLerp::eval_with_twist`] on one read of the two
+    /// newest slots, covered by one trailing `head - prev > retained` check;
+    /// `read_slot`'s seqlock proves each pose consistent, never that two poses
+    /// share an era. `Twist::ZERO` accompanies the single-sample case; callers
+    /// distinguish it via `newest == lo_logical`.
     ///
-    /// Both outputs come from a single [`ScLerp::eval_with_twist`] on a single
-    /// read of the two newest slots. That is not a micro-optimization; it is what
-    /// makes the read sound. An earlier split — `constant_twist` for the pose and
-    /// a separate `segment_twist` for the twist — read the same two slots twice
-    /// and revalidated only the first pair, so a writer that lapped the ring
-    /// between them produced a pose that was correctly rejected beside a twist
-    /// that was silently wrong. `read_slot`'s seqlock proves each pose is
-    /// internally consistent, never that two poses came from the same era; only
-    /// the trailing `head - prev > retained` check does that, and it has to cover
-    /// every slot the result depends on.
-    ///
-    /// `Twist::ZERO` accompanies the degraded single-sample case: there is a pose
-    /// to hold but no segment to differentiate. Callers that need to distinguish
-    /// "held, so stationary" from "extended along a real twist" check
-    /// `newest == lo_logical` themselves, as [`Self::sample_with_twist`] does.
-    ///
-    /// The screw route here is the same one [`ScLerp`] uses everywhere else,
-    /// rather than the `log_se3`/`exp_se3` reference form this used to take —
-    /// so `sample` and `sample_with_twist` agree bit-for-bit under this policy,
-    /// and the extrapolation now costs one screw decomposition instead of a full
-    /// log and exp.
     fn constant_twist(
         &self,
         lo_logical: u64,
@@ -914,9 +581,7 @@ impl SampleRing<'_> {
             // Equal stamps span no time: nothing to extend along.
             (b, Twist::ZERO)
         } else {
-            // Constant screw twist of a->b, extended to `t`. `param > 1` walks
-            // past `b` along the same screw; at `t == t_new` it is exactly 1 and
-            // reproduces `b`.
+            // Extend a->b's screw twist to `t`; `param == 1` at `t_new` reproduces `b`.
             let param = span_ns(t_prev, t) / dt;
             let (pose, xi) = ScLerp::eval_with_twist(&a, &b, param);
             (pose, xi.scale(NANOS_PER_SEC / dt))
@@ -928,55 +593,27 @@ impl SampleRing<'_> {
     }
 }
 
-/// Lift a hint whose high bits may have been discarded back onto the live
-/// window.
+/// Lift a hint whose high bits were discarded back onto the live window.
 ///
-/// # Why a hint arrives truncated
+/// [`Guard`](crate::plan::Guard) stores the cursor as the low 32 bits of a
+/// logical index. `head` is never masked, so past 2^32 pushes (49.7 days at
+/// 1 kHz) every stored hint is below `lo_logical` and a plain clamp pins it to
+/// the oldest sample forever: correct but permanently slow.
 ///
-/// [`Guard`](crate::plan::Guard) packs a per-step search cursor and its edge tag
-/// into one `u64` cell, so the cursor it stores is the low 32 bits of a logical
-/// index. `head` is monotone for the life of the arena and is never masked, so
-/// once an edge passes 2^32 pushes — 49.7 days of unbroken 1 kHz publishing —
-/// every stored hint is smaller than `lo_logical`, and a plain
-/// `clamp(lo_logical, newest)` pins it to the *oldest* retained sample on every
-/// call thereafter. The resumed gallop then walks the whole window from the far
-/// end: still correct (a hint can never change a result), but permanently worse
-/// than the midpoint restart it was added to beat, and permanently past the
-/// point where any test would notice. That is a cliff, not a decay — before
-/// 2^32 the cursor is exact and after it, it is inert forever.
-///
-/// # Why the lift is exact rather than a heuristic
-///
-/// The readable window is `retained` wide and `retained = capacity - 1` with
-/// `capacity: u32` ([`EdgeRecord::capacity`](crate::edge::EdgeRecord)), so the window is
-/// *strictly* narrower than 2^32 and can straddle at most one multiple of it.
-/// A truncated index therefore has exactly one preimage in the window: the one
-/// in `newest`'s 2^32 block, or — when the window straddles the boundary and the
-/// hint's low bits sit above `newest`'s — the one in the block below. Both are
-/// recovered here with two arithmetic operations and no load.
-///
-/// # Why this is not a behaviour change below 2^32
-///
-/// The lift is reached only when `hint < lo_logical`, and while `head < 2^32`
-/// the block base of `newest` is `0`, so `lifted == hint` and the subsequent
-/// clamp pins it to `lo_logical` exactly as before. Every existing caller —
-/// including [`SampleRing::sample_from`]'s public cursor contract, which is an
-/// absolute logical index — sees identical behaviour until the regime where the
-/// old behaviour was already useless.
+/// The lift is exact: the window is `capacity - 1 < 2^32` wide, so a truncated
+/// index has exactly one preimage in it, in `newest`'s 2^32 block or the one
+/// below. Below 2^32 `lifted == hint` and behaviour is unchanged.
 #[inline(always)]
 pub(crate) fn rebase_hint(hint: u64, lo_logical: u64, newest: u64) -> u64 {
     /// One more than the largest value `Guard`'s packed cursor can represent.
     const BLOCK: u64 = 1 << 32;
     if hint >= lo_logical {
-        // Already absolute and inside (or ahead of) the window; the caller's
-        // clamp handles the `> newest` end. This is the hot case — a warm
-        // cursor from the previous query on the same edge — so it costs one
-        // predictable compare.
+        // Already absolute (the hot, warm-cursor case); the caller clamps `> newest`.
         return hint;
     }
     let lifted = (newest & !(BLOCK - 1)) | (hint & (BLOCK - 1));
     if lifted > newest {
-        // This hint belongs to the block below the straddled 2^32 boundary.
+        // The hint belongs to the block below the straddled 2^32 boundary.
         // `newest >= lifted - BLOCK` cannot underflow: `lifted` and `newest`
         // share a block base, so `lifted > newest` implies `newest >= BLOCK`.
         lifted - BLOCK

@@ -1,31 +1,13 @@
-//! Helper **process** for `tests/bridge_shared.rs` — `docs/decisions/0015`.
-//!
-//! The record's claim is that a bridge fills an arena *another process* can
-//! read, and a second `tf_tree::Open` inside the test process does not show
-//! that. The attach itself is genuine either way — it goes through the
-//! rendezvous socket and receives the segment by fd passing — but "another
-//! process" is a claim about **process** boundaries, and only a process can
-//! carry it: this one shares no address space, no mapping and no open file
-//! description with the bridge, and finds the arena from nothing but
-//! `$TF_TREE_RUNTIME_DIR`, `$TF_TREE_DOMAIN` and the name on its command line.
-//!
-//! It is `tf_tree_c`'s rather than a reuse of `tf_tree`'s `rendezvous_child`,
-//! because `CARGO_BIN_EXE_*` is set only for the tests of the package that
-//! declares the binary. It deliberately does **not** link the C ABI: a consumer
-//! of a bridge-filled arena is an ordinary `tf_tree` consumer, which is the
-//! record's *"no new consumer API"*, and a reader built out of the same crate
-//! the bridge lives in would not demonstrate that.
-//!
-//! Output is one line on stdout, so the parent parses rather than guesses:
+//! Helper **process** for `tests/bridge_shared.rs` (`docs/decisions/0015`): attaches
+//! read-only through the rendezvous, knowing only `$TF_TREE_RUNTIME_DIR`,
+//! `$TF_TREE_DOMAIN` and the name on its command line. Deliberately does not link
+//! the C ABI: a bridge-filled arena's consumer is an ordinary `tf_tree` consumer.
 //!
 //! ```text
 //! bridge_reader <name> <target> <source> <stamp_nanos>
 //!   -> "ok <16-hex-word>:<...>"   the lookup, as bit patterns
 //!   -> "error <display>"          attach or lookup failed
 //! ```
-//!
-//! Bit patterns rather than formatted floats: a comparison that rounds is a
-//! comparison that can agree while the memory does not.
 
 // This binary's stdout IS its protocol — the parent parses it line by line.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -49,8 +31,7 @@ fn main() {
         std::process::exit(2);
     };
 
-    // `Open::new()`'s defaults are the consumer (`docs/decisions/0019` §2a):
-    // read-only, never create. Spelling neither is the point.
+    // `Open::new()` defaults are the consumer: read-only, never create (0019 §2a).
     let tree = match tf_tree::Open::new()
         .name(name)
         .and_then(tf_tree::Open::open)
@@ -91,8 +72,7 @@ fn main() {
     }
 }
 
-// `required-features = ["shm"]` in Cargo.toml means this is the arm no build
-// reaches; it exists so the file is still a valid binary on a non-Linux host.
+// Unreachable under `required-features`; keeps the file a valid binary elsewhere.
 #[cfg(not(all(feature = "shm", target_os = "linux")))]
 fn main() {
     eprintln!("bridge_reader needs --features shm on Linux");

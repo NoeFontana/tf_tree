@@ -51,123 +51,31 @@ typedef struct tft_publisher tft_publisher;
 #define TFT_ABI_VERSION_MAJOR 0
 
 /**
- * Minor ABI version. The runtime's may be **≥** the compiled-against value.
+ * Minor ABI version. The runtime's may be **≥** the compiled-against value (§3.6).
  *
- * `1` → `2`: the §5 bridge seam gained an entry point
- * (`tft_bridge_note_time_jump`), a field appended to `tft_bridge_sample`
- * (`received_steady_nanos`), and three appended to `tft_bridge_outcome`
- * (`delta_nanos`, `clock_evidence`, `clock_evidence_detail`). **Every one of
- * them is an append**, which is exactly what a minor bump means under §3.6 —
- * no existing field moved, changed type, or changed meaning, so a caller built
- * against `0.1` reads the same bytes out of the same offsets.
+ * Every bump is an append (nothing moved, changed type or changed meaning), and
+ * the minor answers "can I name this symbol?", so a new function or enumerator
+ * bumps it even in the unstable tier:
  *
- * The rule finally has an implementation behind it as well as a sentence:
- * `tft_bridge_offer` reads a caller's shorter `tft_bridge_sample` as the prefix
- * it is, instead of refusing it with `TFT_ERR_BAD_STRUCT_SIZE`. Until that
- * landed, appending a field would have locked every older caller out of every
- * call — which is the precise case §3.6 exists to prevent.
- *
- * `2` → `3`: one appended `tft_layout` enumerator,
- * [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`], carrying `at_with_derivatives` as a layout
- * (`docs/API.md` §3.3) — accepted by [`tft_plan_at`] and [`tft_plan_at_many`],
- * which is why it is in the frozen header rather than the unstable one. §3.6
- * names this case explicitly: an older caller never spells the new value, and
- * every entry point that takes a `tft_layout` rejects a discriminant it does
- * not define rather than computing a size from it — so a `0.2` caller against
- * a `0.3` library is unchanged in every byte it can observe. No struct grew,
- * nothing moved, and no existing enumerator changed meaning.
- *
- * `3` → `4`: two appended entry points, [`tft_stamp_from_parts`] and
- * [`tft_stamp_from_timespec`] (`docs/API.md` §5.1), and the one status code
- * they can return, [`TFT_ERR_BAD_STAMP`]. **This is the additive case §3.6's
- * rule is for, and why a new *function* is a minor bump rather than no bump at
- * all**: the minor is exactly the number a caller compares to find out whether
- * the symbols its header declares are present in the library it linked. Adding
- * a symbol without moving it would let a caller compiled against this header
- * link against a `0.3` library, pass `tft_check_abi`, and then fail at the
- * dynamic loader — or, on a static link, not build. Nothing existing moved,
- * changed type or changed meaning, so the major does not move.
- *
- * `TFT_ERR_BAD_STAMP` rides along for the reason its own documentation gives:
- * only the two new functions return it, so a `0.3` caller cannot receive a
- * code it cannot name.
- *
- * `4` → `5`: one appended field on `tft_bridge_options`, `arena_name`
- * (`docs/decisions/0015`), and the one status code it can produce,
- * [`TFT_ERR_ARENA_UNAVAILABLE`]. The append is a minor bump on the same terms
- * as `1` → `2`'s: nothing moved, changed type or changed meaning, and
- * `tft_bridge_create` now reads a shorter `tft_bridge_options` as the prefix it
- * is instead of refusing it — the §3.6 rule that had, until this bump, an
- * implementation for `tft_bridge_sample` alone.
- *
- * **The new status code's argument is tighter than `TFT_ERR_BAD_STAMP`'s.**
- * That one rests on an older caller never *calling* the two new functions;
- * this one rests on an older caller being unable to *express* the request. The
- * code is reachable only when `arena_name` is non-NULL, and a caller whose
- * `struct_size` names the `0.4` layout has no such field — its bytes end where
- * the field begins, and `read_options` zero-fills the rest. So a `0.4` caller
- * provably cannot receive it, rather than merely being expected not to.
- *
- * `5` → `6`: one appended entry point, [`tft_plan_create_in_domain`]
- * (`docs/decisions/0038`). It is `3` → `4`'s case exactly — a new *symbol*, so
- * the minor has to move. Nothing moved, changed type or changed meaning:
- * [`tft_plan_create`] keeps its signature and its meaning, which `0038`
- * defines as this function with `domain = 0`.
- *
- * **What a `0.5` caller can observe is a refusal arriving earlier**, and only
- * on an arena where it was already receiving that refusal. On a tree whose
- * dynamic edges carry a non-zero domain, `tft_plan_create` used to return
- * `TFT_OK` and then answer [`TFT_ERR_TIME_DOMAIN`] to every lookup for the
- * life of the plan; it now returns that same code from the plan call. No
- * program that got an answer before stops getting one — there was no such
- * program, which is the defect `0038` exists to fix — and the alternative
- * (leaving the check to the hot loop) throws away the frame names.
- *
- * `6` → `7`: one appended entry point, [`tft_plan_at_extrapolating`], with
- * the two values it needs — [`tft_extrap_policy`] and [`tft_extrapolated`]
- * (`docs/decisions/0039`). A new *symbol*, so `3` → `4`'s argument applies
- * unchanged.
- *
- * **No existing declaration moves, and no status code is added.** The
- * refusal a caller can now ask *not* to receive, [`TFT_ERR_EXTRAPOLATION`],
- * has been in this header since 1.0 — which is what keeps this bump smaller
- * than `4` → `5`'s: there is no code an older caller could be handed and
- * could not name. [`tft_plan_at`] keeps its signature and its meaning.
- *
- * **A `0.6` caller can observe nothing at all.** Unlike `5` → `6`, which
- * moved a refusal earlier on arenas that were already failing, nothing here
- * changes the behaviour of any call that existed before: the new policy is
- * reachable only through a symbol an older caller cannot name.
- *
- * **`7` → `8`: `tft_bridge_close_startup_window` and
- * `TFT_BRIDGE_REASON_STARTUP_CONFLICTS`.** `docs/decisions/0011`
- * implementation step 6.
- *
- * The bump is for an added **unstable** symbol, and the precedent for doing
- * that is `1` → `2`, which bumped for `tft_bridge_note_time_jump` — also a
- * bridge entry point, also unstable-tier. The rule this follows is the one
- * `3` → `4` states: the minor version answers *"can I name this symbol?"*, and
- * a caller that needs the answer cannot get it from a tier, because the tier is
- * a statement about whether the symbol may later be **withdrawn** and not about
- * whether it is there.
- *
- * **Unlike `6` → `7`, a `0.7` caller CAN observe this one through a call it
- * already makes, and the retest it may owe is one `switch` arm.** A `STRICT`
- * startup halt used to be reported as
- * `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` (5) — the closest true code, and the
- * wrong name whenever the record contained a §5.7 static-value disagreement,
- * which is a config-versus-robot fault and not an authority one. It is now
- * `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` (9).
- *
- * That halt reaches a `0.7` caller through **`tft_bridge_offer`**, whose
- * signature and every other outcome are unchanged: on `STRICT`, with a conflict
- * recorded, the 4096-transform backstop closes the window from inside an offer.
- * So a `0.7` caller that reached the backstop did receive 5 and now receives 9,
- * and one that switched on 5 to print it falls through to its default arm. The
- * action is `TFT_BRIDGE_HALT` either way and the `detail` string carries the
- * diagnosis, so nothing a caller *does* changes — but "observes nothing" was
- * false, and this paragraph asserted it directly above the sentences that refute
- * it. Nothing else here is reachable without naming a new symbol.
+ * * `1` → `2`: `tft_bridge_note_time_jump`; fields appended to
+ *   `tft_bridge_sample` and `tft_bridge_outcome`. `tft_bridge_offer` reads a
+ *   shorter `tft_bridge_sample` as the prefix it is.
+ * * `2` → `3`: [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] (`docs/API.md` §3.3).
+ * * `3` → `4`: [`tft_stamp_from_parts`], [`tft_stamp_from_timespec`] (`docs/API.md`
+ *   §5.1) and [`TFT_ERR_BAD_STAMP`], which only they return.
+ * * `4` → `5`: `tft_bridge_options::arena_name` (`docs/decisions/0015`) and
+ *   [`TFT_ERR_ARENA_UNAVAILABLE`], reachable only when `arena_name` is non-NULL;
+ *   `tft_bridge_create` reads a shorter `tft_bridge_options` as its prefix.
+ * * `5` → `6`: [`tft_plan_create_in_domain`] (`docs/decisions/0038`).
+ *   [`tft_plan_create`] is it with `domain = 0`, and now returns
+ *   [`TFT_ERR_TIME_DOMAIN`] at plan time instead of on every lookup.
+ * * `6` → `7`: [`tft_plan_at_extrapolating`], [`tft_extrap_policy`] and
+ *   [`tft_extrapolated`] (`docs/decisions/0039`).
+ * * `7` → `8`: `tft_bridge_close_startup_window` and
+ *   `TFT_BRIDGE_REASON_STARTUP_CONFLICTS` (`docs/decisions/0011` step 6). A
+ *   `STRICT` startup halt reached through `tft_bridge_offer` now reports 9
+ *   where it reported `TFT_BRIDGE_REASON_AUTHORITY_CONFLICT` (5); the action is
+ *   `TFT_BRIDGE_HALT` either way.
  */
 #define TFT_ABI_VERSION_MINOR 8
 
@@ -195,72 +103,43 @@ typedef uint32_t tft_layout;
  * What to do when the requested stamp is newer than every published sample on
  * the route.
  *
- * A `uint32_t` typedef with named constants rather than a C `enum`, matching
- * [`tft_layout`] exactly — §3.6 needs the width of every ABI value stated, and
- * a C `enum`'s underlying type is the implementation's business. Every entry
- * point that takes one **rejects a discriminant it does not define** with
- * [`TFT_ERR_BAD_ENUM`], for [`layout::payload_bytes`]'s reason: an unknown
- * policy from a newer header must be an error, never a silent fallback to the
- * one this build happens to think is safest.
+ * A `uint32_t` typedef with named constants, like [`tft_layout`] (§3.6 needs
+ * every ABI value's width stated). Every entry point that takes one rejects an
+ * undefined discriminant with [`TFT_ERR_BAD_ENUM`].
  */
 typedef uint32_t tft_extrap_policy;
 
 /**
  * How far past the route's newest common sample an answer was extrapolated.
  *
- * **The caller has to pass one of these to get a pose at all**, and that is
- * the whole design rather than an out-parameter that happened to be
- * convenient (`docs/decisions/0039` §1). In Rust the property is a type with
- * no pose-only accessor; C has no such enforcement, so the closest honest
- * analogue is a *required* out-parameter — [`tft_plan_at_extrapolating`]
- * returns [`TFT_ERR_NULL_ARG`] when `info` is NULL and writes nothing. There
- * is deliberately no second spelling of that call without this argument, so
- * "forgot to check the staleness" is not reachable by omission; it takes a
- * caller who read `by_ns` and ignored it.
- *
- * `struct_size` is §3.6's append mechanism, and it is checked exactly as
- * [`tft_error`]'s is: set it to `sizeof(tft_extrapolated)` before the call or
- * the call returns [`TFT_ERR_BAD_STRUCT_SIZE`]. It is written back on success,
- * so the struct a caller passes twice needs setting once per *object*, not
- * once per call.
+ * The caller must pass one to get a pose at all (`docs/decisions/0039` §1):
+ * [`tft_plan_at_extrapolating`] returns [`TFT_ERR_NULL_ARG`] for a NULL `info`,
+ * and there is no second spelling without it. `struct_size` is §3.6's append
+ * mechanism, checked as [`tft_error`]'s is: set it to `sizeof(tft_extrapolated)`
+ * or the call returns [`TFT_ERR_BAD_STRUCT_SIZE`].
  */
 typedef struct {
   /**
-   * `sizeof(tft_extrapolated)` at the time this build was compiled — §3.6.
+   * `sizeof(tft_extrapolated)` — §3.6.
    */
   uint32_t struct_size;
   /**
-   * Nanoseconds past the newest stamp that **every** dynamic edge on this
-   * plan has data for.
-   *
-   * `0` means every edge bracketed the query: the answer was interpolated
-   * between published samples, not invented past them, and the policy did
-   * not come into it. A positive value is the worst case over the route,
-   * because the edge that runs out of data first is what bounds how invented
-   * a composed answer is (`docs/decisions/0039` §3).
+   * Nanoseconds past the newest stamp that every dynamic edge on this plan has
+   * data for; `0` means every edge bracketed the query. Otherwise the worst
+   * case over the route (`docs/decisions/0039` §3).
    */
   int64_t by_ns;
   /**
-   * The dynamic edge whose newest stamp is [`Self::by_ns`] behind the query,
-   * or [`TFT_INVALID_ID`] when `by_ns` is `0`.
-   *
-   * **The sentinel is this side's, and it is deliberately sharper than the
-   * Rust value it mirrors.** `tf_tree::Extrapolated::edge` carries a real
-   * `EdgeId` documented as *meaningless when `by_ns == 0`*; a C caller
-   * handed `0` there would be looking at a plausible edge id for an answer
-   * that was never extrapolated. [`TFT_INVALID_ID`] is what the rest of this
-   * header already means by "this field does not apply" ([`tft_error`]), so
-   * the sentence is checkable rather than only documented.
+   * The dynamic edge whose newest stamp is [`Self::by_ns`] behind the query, or
+   * [`TFT_INVALID_ID`] when `by_ns` is `0` (where the engine's edge id is
+   * meaningless).
    */
   uint32_t edge;
 } tft_extrapolated;
 
 /**
- * Structured detail for the most recent failure **on this thread**.
- *
- * Every field that does not apply to a given error is `TFT_INVALID_ID` (ids) or
- * `0` (stamps and generations), so a caller can print the whole struct without
- * checking which variant produced it.
+ * Structured detail for the most recent failure **on this thread**. Fields that do not apply are
+ * `TFT_INVALID_ID` (ids) or `0`.
  */
 typedef struct {
   /**
@@ -312,29 +191,22 @@ typedef struct {
 } tft_error;
 
 /**
- * Refuse: the lookup returns [`TFT_ERR_EXTRAPOLATION`] and writes nothing.
- *
- * `0`, so a zeroed struct or a forgotten initialiser produces the refusal
- * rather than an invented pose. It is also `tf_tree::ExtrapPolicy`'s own
- * `Default`, and what [`tft_plan_at`] has always done.
+ * Refuse: the lookup returns [`TFT_ERR_EXTRAPOLATION`] and writes nothing. `0`,
+ * so a zeroed struct refuses; it is `tf_tree::ExtrapPolicy`'s `Default` and what
+ * [`tft_plan_at`] does.
  */
 #define TFT_EXTRAP_ERROR 0
 
 /**
- * Hold the newest sample constant — `tf2`'s behaviour under some settings.
- *
- * The honest primitive for a latched or displayed value. It is not the silent
- * staleness `tf2` is criticised for, because [`tft_extrapolated::by_ns`] comes
- * back in the same call and the caller had to pass somewhere to put it.
+ * Hold the newest sample constant; [`tft_extrapolated::by_ns`] comes back in
+ * the same call.
  */
 #define TFT_EXTRAP_HOLD 1
 
 /**
- * Extend the constant screw twist implied by the two newest samples.
- *
- * What a controller running faster than its state estimate wants
- * (`docs/decisions/0039` *Context*). Falls back to [`TFT_EXTRAP_HOLD`] on an
- * edge that retains a single sample: there is no twist to extend.
+ * Extend the constant screw twist implied by the two newest samples
+ * (`docs/decisions/0039` *Context*); falls back to [`TFT_EXTRAP_HOLD`] on an
+ * edge retaining a single sample.
  */
 #define TFT_EXTRAP_CONSTANT_TWIST 2
 
@@ -438,17 +310,11 @@ typedef struct {
 #define TFT_ERR_WRONG_THREAD -30
 
 /**
- * The path between the two frames is too long: more raw edges than a lookup
- * will walk, or more steps than a compiled plan holds once adjacent rigid
- * links fold into one.
+ * The path between the two frames is too long: more raw edges than a lookup will walk, or more
+ * steps than a compiled plan holds once adjacent rigid links fold into one.
  *
- * **Two engine bounds, one status**, because this table is frozen. Neither is
- * named as a macro here: `TFT_MAX_DEPTH` was referenced in this doc and in the
- * header for the whole of Phase 4 and **defined nowhere**, and `0034` split the
- * quantity it was vaguely about into two, so freezing that one name now would
- * make it ambiguous rather than merely absent. Exporting a constant for each is
- * its own change — it needs `xtask headers` and a decision on what a C caller
- * is promised about a value that has already moved once.
+ * Two engine bounds share one status because this table is frozen (`0034`); neither is exported as
+ * a macro.
  */
 #define TFT_ERR_TREE_TOO_DEEP -21
 
@@ -505,23 +371,13 @@ typedef struct {
 #define TFT_ERR_RELEASED -37
 
 /**
- * Both frame names are known, but the child is attached to a **different**
- * parent than the one named.
- *
- * Distinct from [`TFT_ERR_UNKNOWN_FRAME`] on purpose: that one means "check
- * your spelling", and this one means "check your topology". Reported as
- * `UNKNOWN_FRAME` until review pointed out that its documented meaning — "a
- * frame name that this tree never interned" — is false for *every* instance of
- * this case, since `tft_tree_claim` resolves both names before it can arise.
- *
- * The detail carries `frame_a` = the child, `frame_b` = its actual parent.
+ * Both frame names are known, but the child is attached to a **different** parent than the one
+ * named. The detail carries `frame_a` = the child, `frame_b` = its actual parent.
  */
 #define TFT_ERR_PARENT_MISMATCH -38
 
 /**
- * The named child frame has no incoming edge at all — it is a root, or was
- * never attached. Also formerly `TFT_ERR_UNKNOWN_FRAME`, and false for the
- * same reason.
+ * The named child frame has no incoming edge at all — it is a root, or was never attached.
  */
 #define TFT_ERR_NO_EDGE -39
 
@@ -533,47 +389,22 @@ typedef struct {
 #define TFT_ERR_BAD_CONFIG -40
 
 /**
- * A `(sec, nanos)` pair is not a representable stamp: `nanos` is outside
- * `[0, 1e9)`, or the total does not fit `int64_t`.
+ * A `(sec, nanos)` pair is not a representable stamp: `nanos` is outside `[0, 1e9)`, or the total
+ * does not fit `int64_t`.
  *
- * **Returned only by `tft_stamp_from_parts` and `tft_stamp_from_timespec`**,
- * which is what keeps adding it a minor bump under `docs/PHASE4.md` §3.6: a
- * caller compiled against an older header never calls either function and can
- * therefore never receive this code. The detail carries the offending pair —
- * `requested` = seconds, `newest` = nanoseconds.
- *
- * It is deliberately not `TFT_ERR_BAD_ENUM`, which means "an enum argument is
- * outside the range this build defines". This is an *arithmetic* refusal, and
- * reusing a code whose message names enums would send an operator looking at
- * the wrong argument.
+ * Returned only by `tft_stamp_from_parts` and `tft_stamp_from_timespec` (a minor bump under
+ * `docs/PHASE4.md` §3.6). The detail carries `requested` = seconds, `newest` = nanoseconds. Not
+ * `TFT_ERR_BAD_ENUM`: this is an arithmetic refusal.
  */
 #define TFT_ERR_BAD_STAMP -41
 
 /**
- * A **shared** arena was asked for and could not be had: the rendezvous name is
- * already held by a live arena, the runtime directory is unusable, the segment
- * could not be created or mapped — or this library was built without
- * `--features shm` and so has no shared-memory machinery behind the field at
- * all. The message says which.
+ * A **shared** arena was asked for and could not be had: the rendezvous name is held by a live
+ * arena, the runtime directory is unusable, the segment could not be created or mapped, or this
+ * library was built without `--features shm`. The message says which (`docs/decisions/0015`).
  *
- * The code exists because nothing already meant this (`docs/decisions/0015`
- * *Failure*): [`TFT_ERR_BAD_CONFIG`] is the topology *text*,
- * [`TFT_ERR_TIME_DOMAIN`] is §5.5's domain agreement, and the claim family is
- * per-edge with `frame_a`/`frame_b` in its detail — a rendezvous fault has no
- * edge to name. Collapsing them onto [`TFT_ERR_INTERNAL`] would leave an
- * operator unable to tell "another bridge holds this name" from "the runtime
- * directory is unusable" from "a bug", which is the diagnosis the record exists
- * to protect.
- *
- * **Returned only by `tft_bridge_create`, and only when
- * `tft_bridge_options::arena_name` is non-NULL**, which is what keeps adding it
- * a minor bump under `docs/PHASE4.md` §3.6 — and is a tighter argument than
- * [`TFT_ERR_BAD_STAMP`]'s: a caller whose `struct_size` names the 0.4 layout
- * has no such field to set, so it *provably* cannot receive this code.
- *
- * There is deliberately **no fallback to a private heap arena**. A bridge that
- * downgraded silently would present, on every consumer, as a bridge that never
- * started — forever.
+ * Returned only by `tft_bridge_create` with a non-NULL `tft_bridge_options::arena_name` (a minor
+ * bump under `docs/PHASE4.md` §3.6). There is **no fallback to a private heap arena**.
  */
 #define TFT_ERR_ARENA_UNAVAILABLE -42
 
@@ -610,28 +441,14 @@ typedef struct {
 /**
  * `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]` `f64` — pose **and body twist**.
  *
- * [`TFT_LAYOUT_QVEC7_WXYZ`] with six more slots holding the same twist
- * `TFT_TWIST_BYTES` describes, in the same `[ω, v]` order. It is the
- * layout form of `at_with_derivatives` (`docs/API.md` §3.3), and appending it
- * is a **minor** ABI bump under `docs/PHASE4.md` §3.6: an older caller never
- * names the value and every entry point rejects a discriminant it does not
- * know rather than computing a size from it.
+ * [`TFT_LAYOUT_QVEC7_WXYZ`] plus the `[ω, v]` twist `TFT_TWIST_BYTES` describes
+ * (`docs/API.md` §3.3). Appending it is a minor ABI bump (`docs/PHASE4.md`
+ * §3.6). `tft_plan_at`, `tft_plan_at_many` and `tft_plan_at_with_derivatives`
+ * accept it, and asking for it *is* asking for derivatives.
  *
- * **Every evaluate entry point accepts it** — `tft_plan_at`,
- * `tft_plan_at_many` and `tft_plan_at_with_derivatives`. Asking for this
- * layout *is* asking for derivatives: the call evaluates the plan with them
- * and writes thirteen `f64` per element, which is what makes
- * `docs/PHASE5.md` §4.4's "carried to both bindings by the layout dispatch"
- * true of the batch path and not only of the scalar one.
- *
- * It is the one layout whose emission can fail for a reason the pose layouts
- * cannot: an edge interpolating with `LerpSlerp` has no exact body twist, so
- * the call returns `TFT_ERR_NO_DERIVATIVES` naming the edge rather than a
- * finite difference that would look like an answer. Nothing is written for
- * that element or any after it.
- *
- * It is **not** readable — see `read`. A velocity is derived from the arena,
- * never stored in it.
+ * An edge interpolating with `LerpSlerp` has no exact twist: the call returns
+ * `TFT_ERR_NO_DERIVATIVES` naming the edge and writes nothing for that element
+ * or any after it. Not readable: a velocity is derived, never stored.
  */
 #define TFT_LAYOUT_QVEC7_WXYZ_TWIST6 5
 
@@ -646,56 +463,32 @@ uint32_t tft_abi_version_major(void);
 uint32_t tft_abi_version_minor(void);
 
 /**
- * Check the header a caller compiled against against the library they linked.
+ * Check the header a caller compiled against against the library they linked:
+ * major must match exactly; the runtime minor may be ≥ the compiled-against
+ * minor (§3.6).
  *
- * §3.6 states the rule — **major must match exactly; the runtime minor may be
- * ≥ the compiled-against minor** — and until this existed nothing enforced it.
- * Two getters let a caller *implement* the rule; only one of them will, and the
- * one who does not is the one who needs it.
- *
- * Call it as `tft_check_abi(TFT_ABI_VERSION_MAJOR, TFT_ABI_VERSION_MINOR)`
- * using the constants **from the header**, so the arguments are baked in at the
- * caller's compile time and the comparison is genuinely between two builds. The
- * C++ wrapper does this in a static initializer (§3.6); a C caller should do it
- * once at startup.
+ * Call it as `tft_check_abi(TFT_ABI_VERSION_MAJOR, TFT_ABI_VERSION_MINOR)` with
+ * the constants **from the header**, once at startup (the C++ wrapper does).
  *
  * # Errors
  *
- * [`TFT_ERR_ABI_MISMATCH`], with both version pairs in the error detail:
- * `frame_a`/`frame_b` carry the caller's major/minor, `plan_generation` and
- * `current_generation` the library's. The message names all four, because a
- * silently mismatched ABI is a debugging session nobody deserves.
+ * [`TFT_ERR_ABI_MISMATCH`]; `frame_a`/`frame_b` carry the caller's major/minor,
+ * `plan_generation` and `current_generation` the library's.
  */
 tft_status tft_check_abi(uint32_t compiled_major, uint32_t compiled_minor);
 
 /**
  * Assemble a stamp from a `(sec, nanos)` pair, exactly — `docs/API.md` §5.1.
  *
- * The C spelling of `Stamp::from_parts`, and it refuses exactly what that
- * refuses. This is the shape a ROS 2 `builtin_interfaces/Time` already has
- * (`{int32 sec, uint32 nanosec}`), so the conversion users resent writing in
- * every node — `stamp.sec * 1000000000 + stamp.nanosec` — becomes one call
- * that cannot overflow silently.
- *
- * **No float, on any surface** (R3). The ecosystem already agrees with int64
- * nanoseconds; accepting a double here would not recover precision a driver had
- * already destroyed, only move the blame.
- *
- * # Why it returns a status and not the stamp
- *
- * Because two inputs have no correct answer and both plausible alternatives are
- * silently wrong. Normalising an out-of-range `nanos` turns a malformed message
- * into a well-formed stamp; wrapping an out-of-range sum hands back a stamp on
- * the other side of the epoch that compares, interpolates and prints perfectly.
- * There is no sentinel `int64_t` to return instead — every value is a legal
- * stamp — so the refusal has to be the return value and the answer has to be an
- * out-parameter.
+ * The C spelling of `Stamp::from_parts`, for a ROS 2 `builtin_interfaces/Time`.
+ * No float on any surface (R3). It returns a status because two inputs have no
+ * correct answer and no `int64_t` sentinel exists: normalising an out-of-range
+ * `nanos` or wrapping an out-of-range sum would each yield a plausible stamp.
  *
  * # Errors
  *
  * [`TFT_ERR_NULL_ARG`] if `out` is NULL. [`TFT_ERR_BAD_STAMP`] if `nanos` is
- * outside `[0, 1e9)` or the sum does not fit `int64_t`; `*out` is not written
- * in either case.
+ * outside `[0, 1e9)` or the sum does not fit `int64_t`; `*out` is not written.
  *
  * # Safety
  *
@@ -704,21 +497,14 @@ tft_status tft_check_abi(uint32_t compiled_major, uint32_t compiled_minor);
 tft_status tft_stamp_from_parts(int64_t sec, uint32_t nanos, int64_t *out);
 
 /**
- * Assemble a stamp from the two fields of a POSIX `struct timespec`.
- *
- * `tft_stamp_from_timespec(ts.tv_sec, ts.tv_nsec, &out)` — the fields rather
- * than the struct, because `tf_tree_core`'s dependency budget has no `libc` in
- * it and declaring our own `#[repr(C)]` copy would be a type the caller then
- * has to convert *into*, which is the conversion this exists to remove.
- * `time_t` and `long` are both `int64_t` on every 64-bit target, so there is no
- * cast at the call site.
+ * Assemble a stamp from the two fields of a POSIX `struct timespec`
+ * (`tft_stamp_from_timespec(ts.tv_sec, ts.tv_nsec, &out)`).
  *
  * # Errors
  *
- * Everything [`tft_stamp_from_parts`] refuses, plus a **negative `tv_nsec`**.
- * POSIX permits one only in a *relative* `timespec` — an interval handed to
- * `nanosleep` — so a negative field means an interval is being converted as an
- * instant, which is the mistake this refusal catches.
+ * Everything [`tft_stamp_from_parts`] refuses, plus a negative `tv_nsec`
+ * (legal only in a relative `timespec`, so an interval is being converted as an
+ * instant).
  *
  * # Safety
  *
@@ -728,15 +514,10 @@ tft_status tft_stamp_from_timespec(int64_t tv_sec, int64_t tv_nsec, int64_t *out
 
 #if defined(TFT_HAVE_SHM)
 /**
- * Join the running arena named by the environment, read-only.
+ * Join the running arena named by the environment, read-only (D18).
  *
  * Mirrors `tf_tree::open()`: `$TF_TREE_DOMAIN`, `$TF_TREE_NAME` and
- * `$TF_TREE_RUNTIME_DIR` select which arena, and the attach is **read-only**
- * (D18) — a diagnostic or consumer process linked against this ABI cannot
- * corrupt a robot's transform tree, and the MMU is what enforces that rather
- * than our own care.
- *
- * On success `*out` receives a handle the caller must pass to
+ * `$TF_TREE_RUNTIME_DIR` select the arena. On success `*out` must be passed to
  * [`tft_tree_free`] exactly once.
  *
  * # Safety
@@ -747,59 +528,41 @@ tft_status tft_tree_open(tft_tree **out);
 #endif
 
 /**
- * Release a tree handle. Freeing NULL is a no-op.
- *
- * Any plan compiled from this tree stays valid: the underlying tree is
- * refcounted and this drops one reference (see `tft_plan::share`).
+ * Release a tree handle. Freeing NULL is a no-op. Plans compiled from it stay
+ * valid (the tree is refcounted).
  *
  * # Safety
  *
  * `tree` must be NULL or a handle from a `tft_tree_*` constructor that has not
- * already been freed. Double-free is undefined; the magic word catches it in
- * every case that leaves the allocation intact, but not after the allocator has
- * reused the memory.
+ * already been freed. Double-free is undefined; the magic word catches it only
+ * while the allocation is intact.
  */
 void tft_tree_free(tft_tree *tree);
 
 /**
  * Compile a plan for `target <- source`, by frame name.
  *
- * Plan compilation walks the topology once; evaluating the result is the hot
- * path (D3). A C caller should compile once and evaluate many times, exactly as
- * a Rust one would.
+ * Compilation walks the topology once; evaluating is the hot path (D3), so
+ * compile once and evaluate many times.
  *
- * **This is [`tft_plan_create_in_domain`] with `domain = 0`**, which is the tag
- * a real-time tree publishes in and therefore the right call for most arenas.
- * On an arena whose dynamic edges carry any other tag — a simulated tree, which
- * `docs/PHASE4.md` §5.5 tells an operator to configure — it now returns
- * [`TFT_ERR_TIME_DOMAIN`] here instead of on every lookup afterwards. That is
- * the same refusal moved earlier, not a new one: before `docs/decisions/0038`
- * such a plan compiled and then failed every single evaluate call, with no
- * argument a C caller could pass to say otherwise.
+ * This is [`tft_plan_create_in_domain`] with `domain = 0`, the real-time tag. On
+ * an arena whose dynamic edges carry another tag (`docs/PHASE4.md` §5.5) it
+ * returns [`TFT_ERR_TIME_DOMAIN`] here (`docs/decisions/0038`).
  *
  * # Errors
  *
- * `*out` is not written on any failure. Three codes mean something here that
- * their one-line definitions do not say, because compilation reads the
- * topology and can meet a state those definitions were not written for:
+ * `*out` is not written on any failure. Three codes carry extra meaning here:
  *
- * * [`TFT_ERR_UNKNOWN_FRAME`] — before compilation: a name is not UTF-8, or
- *   does not resolve. On a read-only attachment that is usually a name nobody
- *   declared, and rarely a name whose hash slot a different name holds
- *   (permanent) or a name another participant is interning right now
- *   (transient — retry); on a writable tree, which declares a name it does not
- *   find, it is a full frame table or a name that cannot be interned. **From
- *   compilation**, with `frame_a` set, it is not a misspelt name: the topology
- *   read found no consistent snapshot within its retry limit while another
- *   participant re-parented (transient — retry), or the arena records a parent
- *   index outside its frame table (a corrupt or foreign-written arena).
+ * * [`TFT_ERR_UNKNOWN_FRAME`] — a name is not UTF-8 or does not resolve (on a
+ *   read-only attachment: undeclared, or a hash-slot collision (permanent), or
+ *   being interned right now (transient, retry); on a writable tree: a full
+ *   frame table). From compilation, with `frame_a` set: no consistent topology
+ *   snapshot within the retry limit (transient), or a parent index outside the
+ *   frame table (corrupt arena).
  * * [`TFT_ERR_NO_DATA`] — the topology records a parent for `frame_a` but no
- *   edge for the link, which a builder-made arena never contains (a corrupt or
- *   foreign-written arena). An edge with no samples yet compiles, and is
- *   reported by the evaluate call instead.
- * * [`TFT_ERR_TIME_DOMAIN`] — either the route's dynamic edges publish in a
- *   tag other than `domain` (`0` here), or they disagree **among
- *   themselves**, in which case `edge` is the edge that disagreed.
+ *   edge (a corrupt arena). An edge with no samples yet compiles.
+ * * [`TFT_ERR_TIME_DOMAIN`] — the route's dynamic edges publish in a tag other
+ *   than `domain`, or disagree among themselves (`edge` names the one that did).
  *
  * # Safety
  *
@@ -813,53 +576,22 @@ tft_status tft_plan_create(const tft_tree *tree,
 
 /**
  * Compile a plan for `target <- source` that will be queried in time domain
- * `domain`.
+ * `domain` (`docs/decisions/0038`).
  *
- * The domain a binding could not name (`docs/decisions/0038`).
- * [`tf_tree::Domain`] is an **open trait** — `SystemDomain` through
- * `SteadyDomain` hold `0`–`3` and a driver
- * with a PTP-disciplined clock declares its own tag from `4` upwards
- * (`docs/API.md` §2.5) — so a foreign caller can neither enumerate the domains
- * it may be asked about nor name the type it would have to instantiate. It
- * carries the tag as data instead, and the engine's tagged entry points do the
- * comparison they always did.
- *
- * Pass the integer the publisher configured. `0` is [`tft_plan_create`].
- *
- * # The check is here, and it is not removed from the lookup
- *
- * A mismatch is reported once, at plan time, while the frame *names* are still
- * in hand — instead of on every lookup in a hot loop, where the engine can
- * only say which two integers disagreed. Every evaluate entry point still
- * passes this handle's tag to the engine on every call and the engine still
- * compares it: there is no "already checked" fast path, which would be the
- * footgun `0038` exists to remove rather than a smaller version of it.
+ * [`tf_tree::Domain`] is an open trait, so a foreign caller carries the tag
+ * (`0`–`3` are the built-in domains, `4`+ are driver-declared; `docs/API.md`
+ * §2.5) as data. `0` is [`tft_plan_create`]. A mismatch is reported once, at
+ * plan time, with the frame names in hand; every evaluate entry point still
+ * passes the handle's tag to the engine and the engine still compares it.
  *
  * # Errors
  *
  * Everything [`tft_plan_create`] returns, plus [`TFT_ERR_TIME_DOMAIN`] when
- * this route has a dynamic edge and that edge's tag is not `domain`. `*out` is
- * not written and no handle is created.
- *
- * **That condition is the engine's, spelled the same way**, and the equality
- * matters more than it looks. `0038` §4 says the check moves rather than
- * changes: `Plan::check_domain_tag` fires on `has_dynamic() && domain !=
- * self.domain`, so anything refused here is refused by every lookup and
- * anything accepted here is accepted by every lookup. Neither direction is
- * free to drift.
- *
- * * Refuse *more* than the engine and a **static** route becomes unreadable —
- *   `tf_tree::Plan::domain` reports `0` for a route with no dynamic edge on
- *   it, so a bare `domain != plan.domain()` would reject `base -> sensor` for
- *   any caller holding one non-zero tag across a whole arena, a lookup the
- *   engine serves and a route the caller cannot know is static in advance.
- * * Refuse *less* and the diagnostic silently degrades: a route whose dynamic
- *   edges are tag `0`, asked about in domain `1`, would compile and then fail
- *   every evaluate call with only two integers to show for it. `plan.domain()`
- *   cannot tell "all static" from "dynamic, tag 0" on its own — this asks
- *   [`tf_tree::Plan::steps`] whether any [`tf_tree::Step::Dyn`] is present,
- *   which is the same question `has_dynamic` answers, and pays for it once per
- *   plan rather than once per lookup.
+ * this route has a dynamic edge whose tag is not `domain`; `*out` is not
+ * written. The condition is the engine's `has_dynamic() && domain !=
+ * self.domain`: a bare `domain != plan.domain()` would wrongly refuse a static
+ * route (`Plan::domain` reports `0` for one), so this asks
+ * [`tf_tree::Plan::steps`] whether any [`tf_tree::Step::Dyn`] is present.
  *
  * # Safety
  *
@@ -886,25 +618,13 @@ void tft_plan_free(tft_plan *plan);
  *
  * `out` must have room for at least `tft_layout_size(layout)` bytes.
  *
- * **On a hot path, prefer [`tft_plan_at_many`].** The C signature has nowhere
- * to keep a `Guard` between calls, so this one builds a fresh one per lookup
- * and the batch entry point pays it once per call instead: 261 ns/element
- * against 302 on the depth-3 fixture at n = 256 (`docs/decisions/0022`, whose
- * implementation plan asks for this pointer in both headers — batching is the
- * whole of the available win, and a reader who never finds `tft_plan_at_many`
- * is the only way that decision goes wrong).
+ * **On a hot path, prefer [`tft_plan_at_many`]**: this builds a `Guard` per
+ * lookup (`docs/decisions/0022`), the batch pays it once per call. The plan is
+ * evaluated in the domain it was compiled for ([`tft_plan_create_in_domain`]).
  *
- * The plan is evaluated in the domain it was compiled for
- * ([`tft_plan_create_in_domain`]); the tag is on the handle, not on this call.
- *
- * # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
- *
- * Asking for that layout *is* asking for derivatives: the plan is evaluated
- * with them and thirteen `f64` are written, pose then body twist. It is
- * therefore the one layout this function can fail on for a reason the others
- * cannot — `TFT_ERR_NO_DERIVATIVES` when an edge on the path interpolates with
- * `LerpSlerp`, `TFT_ERR_NO_SEGMENT` when it has a pose at this stamp but no
- * segment to differentiate. Nothing is written in either case.
+ * [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] is asking for derivatives: thirteen `f64`
+ * are written, and it fails with `TFT_ERR_NO_DERIVATIVES` (a `LerpSlerp` edge)
+ * or `TFT_ERR_NO_SEGMENT` (a pose but no segment), writing nothing.
  *
  * # Safety
  *
@@ -916,32 +636,23 @@ tft_status tft_plan_at(const tft_plan *plan, int64_t stamp, tft_layout layout, v
 /**
  * Evaluate `plan` at `n` stamps, writing each result `out_stride_bytes` apart.
  *
- * `out_stride_bytes == 0` means tightly packed. A stride larger than the
- * payload writes directly into an array of caller structs — §4.3 is why this
- * parameter exists at all (`Sophus::SE3d` is usually *not* tightly packed).
+ * `out_stride_bytes == 0` means tightly packed; a larger stride writes into an
+ * array of caller structs (§4.3).
  *
  * # Partial writes
  *
- * Evaluation stops at the first stamp that fails, and the elements already
- * written stay written — a batch is not a transaction. `tft_last_error`'s
- * `frame_b` carries the index that failed, so a caller knows exactly how many
- * leading elements are live. Only the argument checks (NULL, stride, overflow,
- * an unknown layout) are all-or-nothing.
+ * Evaluation stops at the first failing stamp and earlier elements stay
+ * written; `tft_last_error`'s `frame_b` carries the failing index. Only the
+ * argument checks (NULL, stride, overflow, unknown layout) are all-or-nothing.
  *
  * # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`
  *
- * Accepted here as it is by [`tft_plan_at`], and with the same meaning, per
- * element. `TFT_ERR_NO_DERIVATIVES` is a property of an *edge*, so it fires on
- * the first element and leaves the buffer untouched; `TFT_ERR_NO_SEGMENT`
- * depends on the stamp and can fire part-way through.
- *
- * **Sort your stamps.** This layout is evaluated by the engine's batch fold,
- * which rides a resumable cursor per plan step when the stamps are
- * non-decreasing — an `O(1)` amortized bracket search instead of `O(log n)` per
- * stamp per step. Unsorted stamps get the same answers and pay the searches.
- * A tightly packed `out` (`out_stride_bytes` of `0` or 104, `f64`-aligned) is
- * written in place with no intermediate copy; any other stride is evaluated in
- * chunks and scattered, which restarts the cursor once per chunk.
+ * Accepted as by [`tft_plan_at`], per element. `TFT_ERR_NO_DERIVATIVES` is a
+ * property of an edge and fires on the first element with the buffer untouched;
+ * `TFT_ERR_NO_SEGMENT` can fire part-way. Sort your stamps: non-decreasing
+ * stamps ride a resumable cursor (`O(1)` amortized bracket search). A packed,
+ * `f64`-aligned `out` is written in place; any other stride is evaluated in
+ * chunks and scattered.
  *
  * # Safety
  *
@@ -959,53 +670,27 @@ tft_status tft_plan_at_many(const tft_plan *plan,
 /**
  * The number of bytes one transform occupies in `layout`, or `0` if the
  * discriminant is not one this build defines.
- *
- * `0` is a safe sentinel here precisely because no real layout has size zero.
  */
 size_t tft_layout_size(tft_layout layout);
 
 /**
  * [`tft_plan_at`], permitting extrapolation past the newest sample under
- * `policy`, and reporting how far the answer was extrapolated.
+ * `policy` and reporting how far (`docs/decisions/0039`).
  *
- * The capability existed in the engine's sampler from the beginning and was
- * reachable from no shipped surface until `docs/decisions/0039`; this is the C
- * half of reaching it. A controller running at 1 kHz against a 100 Hz state
- * estimate is *always* asking for a stamp past the newest sample, and the
- * honest answer is a bounded prediction with its bound attached — not a
- * refusal, and not a silent stale pose.
+ * `info` is required: the distance comes back with the pose. NULL is
+ * [`TFT_ERR_NULL_ARG`] and nothing is written. [`tft_plan_at`] still refuses, and
+ * is what a caller that must not act on invented data should call. The plan is
+ * evaluated in the domain it was compiled for.
  *
- * **`info` is required.** That is the property the whole surface is for: the
- * distance is handed back in the same call as the pose, so a caller cannot get
- * one without the other. Passing NULL is [`TFT_ERR_NULL_ARG`] and nothing is
- * written, in either buffer.
- *
- * [`tft_plan_at`] is untouched, still refuses, and remains what a caller that
- * must not act on invented data should call. This function with
- * [`TFT_EXTRAP_ERROR`] is that same refusal with a distance attached on
- * success.
- *
- * The plan is evaluated in the domain it was compiled for
- * ([`tft_plan_create_in_domain`]); the tag is on the handle, not on this call.
- *
- * # `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` is not accepted here
- *
- * Asking for that layout is asking for derivatives, and the engine has no
- * extrapolating form of `at_with_derivatives` — `docs/decisions/0039` adds one
- * pose-returning method and deliberately no second one. So the layout is
- * refused with [`TFT_ERR_BAD_ENUM`] and nothing is written, exactly as
- * [`tft_publisher_push`] refuses the write-only `TFT_LAYOUT_AFFINE12_ROW_F32`:
- * the discriminant is defined, and this entry point does not take it. The
- * alternative — emitting a twist evaluated under `ExtrapPolicy::Error` beside
- * a pose extrapolated under the caller's — would put two different policies in
- * one thirteen-`f64` row.
+ * [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] is refused with [`TFT_ERR_BAD_ENUM`]: the
+ * engine has no extrapolating `at_with_derivatives`.
  *
  * # Errors
  *
  * Everything [`tft_plan_at`] returns. Under [`TFT_EXTRAP_ERROR`] a stamp past
- * the newest sample is [`TFT_ERR_EXTRAPOLATION`]; under the other two it is
- * not, and `info->by_ns` says how far. [`TFT_ERR_BAD_STRUCT_SIZE`] if
- * `info->struct_size` is not `sizeof(tft_extrapolated)`.
+ * the newest sample is [`TFT_ERR_EXTRAPOLATION`]; otherwise `info->by_ns` says
+ * how far. [`TFT_ERR_BAD_STRUCT_SIZE`] if `info->struct_size` is not
+ * `sizeof(tft_extrapolated)`.
  *
  * # Safety
  *
@@ -1039,24 +724,13 @@ tft_status tft_last_error(tft_error *out);
 /**
  * Claim exclusive write access to the edge attaching `child` to `parent`.
  *
- * Exactly one participant may hold an edge (D7), across the whole machine when
- * the arena is shared. The claim is released by [`tft_publisher_release`] or
- * [`tft_publisher_free`]; a leaked handle is a leaked claim.
+ * One participant per edge (D7), machine-wide when shared. Released by
+ * [`tft_publisher_release`] or [`tft_publisher_free`]; a leaked handle leaks
+ * the claim. The calling thread owns the publisher (§3.2).
  *
- * The thread that calls this **owns** the resulting publisher — see §3.2 and
- * this module's documentation.
- *
- * # A frame name you have not used before is *created*, not rejected
- *
- * `Tree::frame` interns; it does not look up. So mistyping `child` declares a
- * new frame, which then has no incoming edge and the claim fails with
- * `TFT_ERR_NO_EDGE` — not [`TFT_ERR_UNKNOWN_FRAME`], which you only see once
- * the frame table's headroom is exhausted and the name genuinely cannot be
- * interned. Frame ids are never recycled (`docs/PROJECT.md` §5 D10), so a typo
- * costs a headroom slot for the life of the arena.
- *
- * That is Phase 2's interning semantics, shared with the Python binding and the
- * CLI, and it is documented here rather than special-cased at this boundary.
+ * A frame name not seen before is interned, not rejected, so a mistyped
+ * `child` fails with `TFT_ERR_NO_EDGE`, not [`TFT_ERR_UNKNOWN_FRAME`] (which
+ * means the frame table is full). Ids are never recycled (D10).
  *
  * # Safety
  *
@@ -1071,15 +745,9 @@ tft_status tft_tree_claim(const tft_tree *tree,
 /**
  * Publish one transform at `stamp`, read from `src` in `layout`.
  *
- * `src` must hold at least `tft_layout_size(layout)` bytes.
- *
- * `TFT_LAYOUT_AFFINE12_ROW_F32` is **not accepted**: it is an `f32` output
- * encoding for GPU upload, and publishing through it would silently halve the
- * precision of everything downstream. It returns `TFT_ERR_BAD_ENUM`.
- *
- * Matrix layouts are validated — a left-handed or scaled matrix is refused
- * rather than converted into a plausible wrong rotation. See
- * `crate::layout::read`.
+ * `src` must hold at least `tft_layout_size(layout)` bytes. `AFFINE12_ROW_F32`
+ * is not accepted (`TFT_ERR_BAD_ENUM`); matrix layouts are validated (see
+ * `crate::layout::read`).
  *
  * # Safety
  *
@@ -1092,18 +760,12 @@ tft_status tft_publisher_push(tft_publisher *pubh,
                               const void *src);
 
 /**
- * Publish `n` transforms, reading each `src_stride_bytes` apart.
+ * Publish `n` transforms, reading each `src_stride_bytes` apart (0 means
+ * tightly packed; §4.3).
  *
- * `src_stride_bytes == 0` means tightly packed. The stride exists for the same
- * reason it does on `tft_plan_at_many`: an array of `Sophus::SE3d` is usually
- * *not* tightly packed (§4.3).
- *
- * **Stops at the first rejected element**, leaving the earlier ones published.
- * That is the opposite of `tft_plan_at_many`'s all-or-nothing rule and it is
- * deliberate: a publication is not a buffer to be filled, it is a sequence of
- * independent release-stores that readers may already have observed. There is
- * no unpublishing. The failing index is reported in the error detail's
- * `frame_b` so the caller knows exactly where the stream stopped.
+ * Stops at the first rejected element, leaving earlier ones published (unlike
+ * `tft_plan_at_many`'s all-or-nothing: there is no unpublishing). The failing
+ * index is in the error detail's `frame_b`.
  *
  * # Safety
  *
@@ -1119,11 +781,7 @@ tft_status tft_publisher_push_many(tft_publisher *pubh,
 
 /**
  * Release the claim now, leaving the handle valid but unusable for publishing.
- *
- * The claim is *also* released by [`tft_publisher_free`]. This exists because a
- * C caller frequently wants to give the edge back at a known point — the end of
- * a calibration pass, say — while the handle's lifetime is managed elsewhere.
- * Calling it twice is a no-op, not an error.
+ * Also released by [`tft_publisher_free`]; calling it twice is a no-op.
  *
  * # Safety
  *

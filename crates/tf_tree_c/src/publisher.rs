@@ -1,39 +1,13 @@
 //! The publish surface — `docs/PHASE4.md` §3.2's `tft_publisher`.
 //!
-//! # `Send + !Sync`, in a language with no such notion
+//! `Publisher` is `!Sync`; C cannot express that, so §3.2 (NORMATIVE) has the
+//! handle record its creating thread and `abort()` in debug builds on use from
+//! another. Release builds return `TFT_ERR_WRONG_THREAD` instead. No mutex,
+//! unlike `tf_tree_py`: a C caller sharing a publisher has made a mistake, and
+//! serializing it would hide it.
 //!
-//! Phase 1 makes single-writer-per-edge a *type-level* property: `Publisher` is
-//! `!Sync`, so two Rust threads cannot hold references to one and the compiler
-//! says so. C has no way to express that, and §3.2 is NORMATIVE about what to do
-//! instead — **record the creating thread in the handle and `abort()` in debug
-//! builds on use from another thread.**
-//!
-//! That is implemented here, plus one thing §3.2 does not require: in *release*
-//! builds the same check returns `TFT_ERR_WRONG_THREAD` rather than
-//! proceeding. §3.2's argument is "a loud abort in debug beats silent corruption
-//! in release"; it does, but a status code beats both, and the check is one
-//! thread-local load and a compare that the branch predictor gets right every
-//! time. Costed in `examples/abi_cost.rs` rather than assumed.
-//!
-//! **Why not a mutex, as the Python binding does?** `tf_tree_py` wraps the
-//! writer in a `Mutex` because Python threads legitimately share objects and the
-//! GIL-free build makes that concurrent. A C caller who shares a `tft_publisher`
-//! between threads has made a mistake, not a design choice: serializing it would
-//! hide the mistake and hand them a publisher whose stamps interleave between
-//! two threads' clocks. Refusing is the more useful answer.
-//!
-//! # The lifetime
-//!
-//! `EdgeWriter<'a>` borrows the `Tree` and a C handle cannot carry a lifetime,
-//! so this handle holds an [`OwnedWriter`] — the facade's single reviewed
-//! lifetime extension (`docs/decisions/0017`), whose `Arc<Tree>` keeps the arena
-//! mapped for as long as the claim points into it. **This crate no longer
-//! extends a lifetime itself**; it used to, as a local `extend_to_static`, and
-//! deleting it was `0017` step 7.
-//!
-//! The `Arc<TreeShare>` this handle used to carry for that purpose is gone with
-//! it: a second refcount beside the `OwnedWriter`'s own would be one whose
-//! contribution nothing could state.
+//! The handle holds an [`OwnedWriter`], the facade's single reviewed lifetime
+//! extension (`docs/decisions/0017`), whose `Arc<Tree>` keeps the arena mapped.
 
 use core::ffi::{c_char, c_void};
 use std::cell::Cell;
@@ -50,22 +24,14 @@ use crate::{
 
 const MAGIC_PUBLISHER: u64 = 0x7446_5F50_5542_3031;
 
-// ---------------------------------------------------------------------------
 // Thread identity
-// ---------------------------------------------------------------------------
 
-/// Monotonic source of thread tokens. Never recycled, so a token cannot be
-/// reused by a thread created after the publisher's owner exited — which
-/// `gettid` on Linux emphatically can, and which would turn the affinity check
-/// into a coin flip on a long-running process that churns threads.
+/// Monotonic thread tokens, never recycled (unlike Linux `gettid`).
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    /// This thread's token, assigned on first use.
-    ///
-    /// A `Cell<u64>` rather than a `OnceCell` so the fast path is a plain load
-    /// and a compare against zero — no `Option` discriminant, no `Drop` glue,
-    /// and therefore no lazy-destructor registration on the publish path.
+    /// This thread's token, assigned on first use. A `Cell<u64>` so the fast
+    /// path is a plain load with no lazy-destructor registration.
     static TOKEN: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -83,71 +49,45 @@ pub(crate) fn thread_token() -> u64 {
     })
 }
 
-// ---------------------------------------------------------------------------
 // The handle
-// ---------------------------------------------------------------------------
 
 /// An exclusive claim on one edge, and the only way to publish through the C
-/// ABI. `Send`, but **one thread at a time** — see the module docs.
+/// ABI. `Send`, but one thread at a time (see the module docs).
 ///
-/// `#[repr(C)]` for the same reason as `tft_tree`: the magic check reads a named
-/// field, and `repr(Rust)` promises nothing about where that field lands.
-///
-/// **The generated header declares this as an incomplete type.** §3.2 says these
-/// are opaque handles, and a C caller who can see the fields can dereference
-/// them. `cbindgen`'s `cbindgen:opaque` annotation does not take effect on this
-/// shape, so `xtask headers` excludes the type and emits the forward
-/// declaration itself — which also satisfies §3.1's requirement that the stable
-/// header be reviewed by hand rather than merely generated.
+/// `#[repr(C)]` because the magic check reads a named field. The generated
+/// header declares this as an incomplete type (§3.2 opaque handles): `xtask
+/// headers` emits the forward declaration itself.
 #[repr(C)]
 pub struct tft_publisher {
     magic: u64,
     /// The token of the thread that called `tft_tree_claim`.
     owner: u64,
-    /// `None` after [`tft_publisher_release`], so a use-after-release is a clear
-    /// status rather than a claim silently held past its intended scope.
-    ///
-    /// Releasing explicitly matters more here than in Rust: a C caller that
-    /// leaks the handle leaks the *claim*, and no other process can take the
-    /// edge until this one exits.
-    ///
-    /// Setting this to `None` drops both the claim and this handle's share of
-    /// the arena, which is what [`tft_publisher_release`] promises.
+    /// `None` after [`tft_publisher_release`]. A leaked handle leaks the claim.
     writer: Option<OwnedWriter>,
 }
 
 /// # Safety
 ///
-/// `p` must be NULL or point to a live handle — see `crate`'s `magic_check!`,
-/// whose contract this shares.
+/// `p` must be NULL or point to a live handle (see `crate`'s `magic_check!`).
 #[inline]
 unsafe fn check_publisher(p: *const tft_publisher) -> bool {
     if p.is_null() {
         return false;
     }
     // SAFETY: non-null, and the caller contracts eight readable bytes at the
-    // magic field's offset. `read_unaligned` for the same reason as elsewhere.
+    // magic field's offset; `read_unaligned`.
     unsafe { core::ptr::addr_of!((*p).magic).read_unaligned() == MAGIC_PUBLISHER }
 }
 
-/// Check thread affinity, per §3.2.
-///
-/// Returns `TFT_OK` when the calling thread owns `h`. Otherwise debug builds
-/// abort, because a C programmer who has done this wants to find out at the
-/// moment it happens rather than three frames of transform history later, and
-/// release builds return [`TFT_ERR_WRONG_THREAD`] — which is why that code is
-/// not dead.
+/// Check thread affinity, per §3.2: `TFT_OK` on the owning thread; otherwise
+/// debug builds abort and release builds return [`TFT_ERR_WRONG_THREAD`].
 #[inline]
 fn check_thread(h: &tft_publisher) -> tft_status {
     check_thread_token(h.owner, "tft_publisher")
 }
 
-/// [`check_thread`]'s body, over a bare token.
-///
-/// Split out so the bridge handle — which owns one [`OwnedWriter`] per declared
-/// edge and is `!Sync` for exactly the same reason — enforces the rule through
-/// *this* code rather than a second copy of it. `what` names the handle type in
-/// the message.
+/// [`check_thread`]'s body over a bare token, shared with the bridge handle;
+/// `what` names the handle type in the message.
 #[inline]
 pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
     if owner == thread_token() {
@@ -156,11 +96,7 @@ pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
     #[cfg(debug_assertions)]
     {
         // Not `panic!`: the guard would convert it into a status, and §3.2 asks
-        // for an abort specifically so this is impossible to ignore.
-        // `eprintln!` rather than a log facade: this runs microseconds before
-        // `abort()`, in a library with no logging dependency, and the message
-        // has to survive a caller who has redirected nothing. The workspace
-        // lint denies it everywhere else; this is the exception.
+        // for an abort. `eprintln!`: no logging dependency here.
         #[allow(clippy::print_stderr)]
         {
             eprintln!(
@@ -182,22 +118,10 @@ pub(crate) fn check_thread_token(owner: u64, what: &str) -> tft_status {
     }
 }
 
-/// The sentence both profiles print, built in one place.
+/// The sentence both profiles print. It names `what` because only one profile
+/// is compiled at a time, so a name dropped from the other arm goes unobserved.
 ///
-/// **`what` is in it, and that is why this is a function.** Only one profile is
-/// compiled at a time — debug aborts with a message on stderr, release returns
-/// `TFT_ERR_WRONG_THREAD` and a `tft_error` — so a name dropped from the arm you
-/// are not building is a regression nothing observes. It had been: the release
-/// arm discarded `what` and told a `tft_bridge` caller only that *"this handle"*
-/// had moved, and an operator reading `TFT_ERR_WRONG_THREAD` in production has
-/// several handle types in hand and no other clue which one it was.
-///
-/// `format!` on a path that is either about to `abort()` or has already lost the
-/// call is not a hot-path allocation.
-///
-/// **ASCII only.** `tft_error::set_message` substitutes `?` for every non-ASCII
-/// byte rather than risk truncating a code point mid-sequence, so a `§` here
-/// would reach the operator as `??`.
+/// ASCII only: `set_message` substitutes `?` for non-ASCII bytes.
 fn wrong_thread_message(what: &str) -> String {
     format!(
         "{what} is Send but not Sync (docs/PHASE4.md 3.2): it was created on \
@@ -205,10 +129,8 @@ fn wrong_thread_message(what: &str) -> String {
     )
 }
 
-/// Borrow the live writer, or report why not.
-///
-/// Written once so the affinity check cannot be forgotten on a new entry point:
-/// there is no way to reach the writer that does not go through here.
+/// Borrow the live writer, or report why not; every path to the writer goes
+/// through the affinity check here.
 fn writer_of(h: &tft_publisher) -> Result<&OwnedWriter, tft_status> {
     let rc = check_thread(h);
     if rc != TFT_OK {
@@ -224,30 +146,17 @@ fn writer_of(h: &tft_publisher) -> Result<&OwnedWriter, tft_status> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Entry points
-// ---------------------------------------------------------------------------
+// Claim
 
 /// Claim exclusive write access to the edge attaching `child` to `parent`.
 ///
-/// Exactly one participant may hold an edge (D7), across the whole machine when
-/// the arena is shared. The claim is released by [`tft_publisher_release`] or
-/// [`tft_publisher_free`]; a leaked handle is a leaked claim.
+/// One participant per edge (D7), machine-wide when shared. Released by
+/// [`tft_publisher_release`] or [`tft_publisher_free`]; a leaked handle leaks
+/// the claim. The calling thread owns the publisher (§3.2).
 ///
-/// The thread that calls this **owns** the resulting publisher — see §3.2 and
-/// this module's documentation.
-///
-/// # A frame name you have not used before is *created*, not rejected
-///
-/// `Tree::frame` interns; it does not look up. So mistyping `child` declares a
-/// new frame, which then has no incoming edge and the claim fails with
-/// `TFT_ERR_NO_EDGE` — not [`TFT_ERR_UNKNOWN_FRAME`], which you only see once
-/// the frame table's headroom is exhausted and the name genuinely cannot be
-/// interned. Frame ids are never recycled (`docs/PROJECT.md` §5 D10), so a typo
-/// costs a headroom slot for the life of the arena.
-///
-/// That is Phase 2's interning semantics, shared with the Python binding and the
-/// CLI, and it is documented here rather than special-cased at this boundary.
+/// A frame name not seen before is interned, not rejected, so a mistyped
+/// `child` fails with `TFT_ERR_NO_EDGE`, not [`TFT_ERR_UNKNOWN_FRAME`] (which
+/// means the frame table is full). Ids are never recycled (D10).
 ///
 /// # Safety
 ///
@@ -289,9 +198,8 @@ pub unsafe extern "C" fn tft_tree_claim(
             set_error(TFT_ERR_UNKNOWN_FRAME, "no such frame in this tree", |_| {});
             return TFT_ERR_UNKNOWN_FRAME;
         };
-        // `claim_owned`, not `claim`: the returned writer carries its own
-        // `Arc<Tree>`, so this handle needs no `unsafe` and no second refcount
-        // to make the claim outlive this call (`docs/decisions/0017` step 7).
+        // `claim_owned`: the writer carries its own `Arc<Tree>`
+        // (`docs/decisions/0017` step 7).
         let writer = match h.share.tree.claim_owned(cf, pf) {
             Ok(w) => w,
             Err(e) => return map::claim(&e),
@@ -309,15 +217,9 @@ pub unsafe extern "C" fn tft_tree_claim(
 
 /// Publish one transform at `stamp`, read from `src` in `layout`.
 ///
-/// `src` must hold at least `tft_layout_size(layout)` bytes.
-///
-/// `TFT_LAYOUT_AFFINE12_ROW_F32` is **not accepted**: it is an `f32` output
-/// encoding for GPU upload, and publishing through it would silently halve the
-/// precision of everything downstream. It returns `TFT_ERR_BAD_ENUM`.
-///
-/// Matrix layouts are validated — a left-handed or scaled matrix is refused
-/// rather than converted into a plausible wrong rotation. See
-/// `crate::layout::read`.
+/// `src` must hold at least `tft_layout_size(layout)` bytes. `AFFINE12_ROW_F32`
+/// is not accepted (`TFT_ERR_BAD_ENUM`); matrix layouts are validated (see
+/// `crate::layout::read`).
 ///
 /// # Safety
 ///
@@ -361,18 +263,12 @@ pub unsafe extern "C" fn tft_publisher_push(
     })
 }
 
-/// Publish `n` transforms, reading each `src_stride_bytes` apart.
+/// Publish `n` transforms, reading each `src_stride_bytes` apart (0 means
+/// tightly packed; §4.3).
 ///
-/// `src_stride_bytes == 0` means tightly packed. The stride exists for the same
-/// reason it does on `tft_plan_at_many`: an array of `Sophus::SE3d` is usually
-/// *not* tightly packed (§4.3).
-///
-/// **Stops at the first rejected element**, leaving the earlier ones published.
-/// That is the opposite of `tft_plan_at_many`'s all-or-nothing rule and it is
-/// deliberate: a publication is not a buffer to be filled, it is a sequence of
-/// independent release-stores that readers may already have observed. There is
-/// no unpublishing. The failing index is reported in the error detail's
-/// `frame_b` so the caller knows exactly where the stream stopped.
+/// Stops at the first rejected element, leaving earlier ones published (unlike
+/// `tft_plan_at_many`'s all-or-nothing: there is no unpublishing). The failing
+/// index is in the error detail's `frame_b`.
 ///
 /// # Safety
 ///
@@ -395,8 +291,7 @@ pub unsafe extern "C" fn tft_publisher_push_many(
         let Some(payload) = layout::payload_bytes(layout) else {
             return bad_enum("layout");
         };
-        // Zero elements is a no-op, before the NULL checks: a caller looping
-        // over an empty set legitimately passes NULL for both pointers.
+        // Zero elements is a no-op before the NULL checks.
         if n == 0 {
             return TFT_OK;
         }
@@ -416,9 +311,7 @@ pub unsafe extern "C" fn tft_publisher_push_many(
             );
             return TFT_ERR_BUFFER_TOO_SMALL;
         }
-        // The last element occupies `payload` bytes at offset `(n-1)*stride`,
-        // so the required extent is that — not `n*stride`. Checked, because `n`
-        // and `stride` are both caller-controlled.
+        // The extent is `(n-1)*stride + payload`, checked for overflow.
         let Some(span) = (n - 1)
             .checked_mul(stride)
             .and_then(|x| x.checked_add(payload))
@@ -462,9 +355,7 @@ pub unsafe extern "C" fn tft_publisher_push_many(
     })
 }
 
-/// Record which element of a batch failed, without discarding the detail the
-/// error mapper just wrote. `frame_b` is unused by every publish error, so it is
-/// free to carry the index.
+/// Record which element of a batch failed in `frame_b`, unused by publish errors.
 fn blame_index(i: usize, stamp: i64) {
     crate::error::amend_error(|d| {
         d.frame_b = u32::try_from(i).unwrap_or(crate::TFT_INVALID_ID);
@@ -475,11 +366,7 @@ fn blame_index(i: usize, stamp: i64) {
 }
 
 /// Release the claim now, leaving the handle valid but unusable for publishing.
-///
-/// The claim is *also* released by [`tft_publisher_free`]. This exists because a
-/// C caller frequently wants to give the edge back at a known point — the end of
-/// a calibration pass, say — while the handle's lifetime is managed elsewhere.
-/// Calling it twice is a no-op, not an error.
+/// Also released by [`tft_publisher_free`]; calling it twice is a no-op.
 ///
 /// # Safety
 ///
@@ -518,33 +405,23 @@ pub unsafe extern "C" fn tft_publisher_free(pubh: *mut tft_publisher) {
     if !unsafe { check_publisher(pubh) } {
         return;
     }
-    // The affinity check applies to `free` too, and for a sharper reason than
-    // to `push`: `EdgeWriter`'s destructor releases the claim *and* the OFD
-    // lease, and doing that from a thread that does not own the writer is the
-    // corruption §3.2 exists to prevent, not merely a misuse.
+    // The affinity check applies to `free` too: dropping the writer off-thread
+    // is the corruption §3.2 exists to prevent.
     //
     // SAFETY: `check_publisher` confirmed the magic word.
     if check_thread(unsafe { &*pubh }) != TFT_OK {
         return;
     }
-    // Zero the magic before dropping, so a racing or repeated free sees a dead
-    // handle rather than following a freed `Arc`.
+    // Zero the magic so a repeated free sees a dead handle.
     // SAFETY: `check_publisher` confirmed this is a live `tft_publisher`.
     unsafe { core::ptr::write(pubh.cast::<u64>(), 0) };
     // SAFETY: produced by `Box::into_raw` in `tft_tree_claim`.
     drop(unsafe { Box::from_raw(pubh) });
 }
 
-/// `tft_publisher_push` with the panic guard removed, and nothing else changed.
-///
-/// **Measurement scaffolding, not a shipped entry point.** `examples/abi_cost.rs`
-/// subtracts this from the real one to attribute the publish path's boundary
-/// cost, because two rounds of guessing at it were both wrong: the redundant
-/// `sqrt` turned out to be noise, and so did the pose decode.
-///
-/// It is not exported outside `--features test-hooks` and never appears in a
-/// header. Publishing through it would be unsound in exactly the way §3.4
-/// describes — a panic would abort the caller's process.
+/// `tft_publisher_push` without the panic guard: measurement scaffolding for
+/// `examples/abi_cost.rs`, only under `--features test-hooks`, never in a header
+/// (a panic would abort the caller, §3.4).
 ///
 /// # Safety
 ///
@@ -586,11 +463,9 @@ pub unsafe extern "C" fn tft_test_push_unguarded(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Error mapping for the publish direction
-// ---------------------------------------------------------------------------
+// Error mapping
 
-/// The claim and push error families, kept next to the code that raises them.
+/// The claim and push error families.
 pub(crate) mod map {
     use super::{ClaimApiError, ClaimError, PushError};
     use crate::error::set_error;
@@ -613,18 +488,10 @@ pub(crate) mod map {
                     TFT_ERR_ALREADY_CLAIMED,
                     "another participant already holds this edge (one writer per edge)",
                     |d| {
-                        // D11: the refused edge. `ClaimApiError` has carried it
-                        // since the facade stopped dropping it on `?`; the
-                        // field existed all along and read `TFT_INVALID_ID`.
+                        // D11: the refused edge.
                         d.edge = edge.get();
-                        // The owner is a participant *slot*, not a pid — A3 made
-                        // the claim word an indirection into the participant
-                        // table. `tf_tree doctor` resolves it to a process.
-                        //
-                        // `ClaimError` is `#[non_exhaustive]`, so this is a
-                        // `match` and not a `let`: a variant added upstream must
-                        // leave the slot at its sentinel rather than fail to
-                        // compile a boundary crate.
+                        // The owner is a participant slot, not a pid. `ClaimError`
+                        // is `#[non_exhaustive]`, so `match`, not `let`.
                         if let ClaimError::EdgeAlreadyClaimed { owner_slot } = cause {
                             d.frame_a = *owner_slot;
                         }
@@ -632,9 +499,7 @@ pub(crate) mod map {
                 );
                 TFT_ERR_ALREADY_CLAIMED
             }
-            // Both of these mean "somebody else was mid-protocol; go again".
-            // Reporting them as one code is not a loss of information: the
-            // caller's only correct response to either is to retry.
+            // Both mean "somebody else was mid-protocol"; the response is to retry.
             C::LeaseContended { edge } | C::ReapedDuringClaim { edge } => {
                 set_error(
                     TFT_ERR_RETRY,
@@ -782,15 +647,8 @@ pub(crate) mod map {
 mod tests {
     use super::wrong_thread_message;
 
-    /// **The cross-thread diagnostic names the handle type**, in both profiles.
-    ///
-    /// Only one arm of `check_thread_token` is compiled at a time, so a name
-    /// dropped from the arm you are not building is invisible — and one was; see
-    /// `wrong_thread_message`'s own docs.
-    ///
-    /// Mutant: drop `{what}` from the format string (or restore the release
-    /// arm's `let _ = what;` and its fixed sentence) ⇒ neither name appears and
-    /// both assertions fail.
+    /// The cross-thread diagnostic names the handle type in both profiles.
+    /// Mutant: drop `{what}` from the format string ⇒ fails.
     #[test]
     fn the_wrong_thread_message_names_the_handle_that_moved() {
         for what in ["tft_publisher", "tft_bridge"] {
@@ -800,7 +658,6 @@ mod tests {
                 m.contains("Send but not Sync"),
                 "the phrase `publish.rs` asserts on stderr: {m:?}"
             );
-            // `set_message` substitutes `?` for non-ASCII; see the fn's docs.
             assert!(m.is_ascii(), "message was {m:?}");
         }
     }

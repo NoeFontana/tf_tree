@@ -1,93 +1,28 @@
 //! `cargo xtask headers [--check]` — generate `tf_tree.h` and
 //! `tf_tree_unstable.h` from `tf_tree_c`.
 //!
-//! # Why this is an xtask and not a `build.rs`
-//!
-//! `docs/decisions/0007` decides it: `cbindgen` is MPL-2.0 and `deny.toml`'s
-//! licence allowlist has no MPL entry, so it cannot be a dependency of anything
-//! the workspace builds. Invoking the **binary** keeps it out of the dependency
-//! graph entirely, and a developer who does not have it installed simply cannot
-//! regenerate headers — which is fine, because the headers are committed.
-//!
-//! # Why the headers are committed
-//!
-//! §3.1: the stable header is the first ABI freeze in the project and its
-//! surface is permanent. A generated-at-build-time header makes an ABI change
-//! invisible in review; a committed one makes it a diff somebody has to approve.
-//! `--check` is what keeps the two honest, and CI runs it.
+//! An xtask, not a `build.rs`: `cbindgen` is MPL-2.0 and `deny.toml` has no MPL
+//! entry, so only its **binary** is invoked (`docs/decisions/0007`). The headers
+//! are committed so an ABI change is a reviewed diff (§3.1); `--check` runs in CI.
 //!
 //! # The partition is a list, on purpose
 //!
-//! §3.1 splits the surface in two: `tf_tree.h` is semver-frozen, and
-//! `tf_tree_unstable.h` promises nothing and needs `#define TFT_ENABLE_UNSTABLE`.
-//! Every exported symbol must appear in exactly one of [`STABLE`], [`UNSTABLE`]
-//! or [`TEST_ONLY`] below, and [`check_partition`] fails if the source and the
-//! lists disagree in *either* direction.
+//! Every exported symbol must be in exactly one of [`STABLE`], [`UNSTABLE`] or
+//! [`TEST_ONLY`]; [`check_partition`] fails in either direction, so a new
+//! `extern "C"` function fails until somebody chooses a tier. It scans `extern
+//! "C" fn` only: both configs are built by *complement*, so a constant missing
+//! from [`STABLE`] lands in both headers and `--check` reports drift.
 //!
-//! That means **a newly added `extern "C"` function fails this check until
-//! somebody puts it in a tier.** Defaulting new symbols into the stable header
-//! would be the wrong default for a surface that can never be withdrawn, and
-//! defaulting them into the unstable one would let the stable header silently
-//! stop describing the library. Neither is a decision a tool should make.
+//! # Duplicate and missing definitions
 //!
-//! **[`check_partition`] scans `extern "C" fn` declarations only**, so a new
-//! `pub const` is not caught by it. It is still not free-floating: both configs
-//! are built from these lists by *complement*, so a constant missing from
-//! [`STABLE`] lands in **both** headers rather than just the stable one — and
-//! `--check` then reports the unstable header as drifted. That is how the two
-//! codes added after review were caught. The list is therefore an inventory of
-//! the frozen surface, not merely documentation of one.
+//! [`check_overlap`] fails if a symbol is **defined** in both generated headers
+//! (`TFT_ERR_ARENA_UNAVAILABLE` once shipped in both: an identical `#define`
+//! twice is legal C, so `--check` and the compile matrix passed). Definitions
+//! are read, never references: `tf_tree_unstable.h` includes `tf_tree.h`.
 //!
-//! # Why [`check_overlap`] exists as well
-//!
-//! The paragraph above is true only while the *committed* headers are the ones
-//! from before the omission. `TFT_ERR_ARENA_UNAVAILABLE` was added by
-//! `docs/decisions/0015`, left out of [`STABLE`], and regenerated — so both
-//! committed headers grew it in the same commit, `--check` saw no drift at all,
-//! and `just c-header-check`'s two-compiler matrix saw nothing either: an
-//! **identical** `#define` twice is legal C, and `tf_tree_unstable.h` includes
-//! `tf_tree.h`. The symbol shipped in both headers with a 28-line doc block
-//! duplicated behind it, and every gate passed.
-//!
-//! §3.1's two-tier split *is* the stability promise, so a partition that only
-//! holds by accident is not a promise. [`check_overlap`] reads the two generated
-//! headers back and fails if any symbol is **defined** in both — which is the
-//! omission's signature, whatever kind of item it is, and unlike
-//! [`check_partition`] it needs no list of item kinds to know about.
-//!
-//! It reads *definitions*, never references: `tf_tree_unstable.h` legitimately
-//! mentions `tft_status`, `tft_tree` and half the stable header in its own
-//! declarations, and including it in `tf_tree.h` is exactly how that is meant to
-//! work.
-//!
-//! # And [`check_stable_is_complete`] for the opposite sign
-//!
-//! `check_overlap` catches a symbol in *both* headers. The same omission with
-//! the opposite sign — a [`STABLE`] entry in **neither** — makes the frozen
-//! header quietly *smaller*, and until it was added nothing caught that at all.
-//!
-//! Measured, by making `TFT_ERR_ARENA_UNAVAILABLE` `pub(crate)` and
-//! regenerating in the same run, which is exactly how the overlap defect shipped:
-//!
-//! ```text
-//! $ cargo run -p xtask -- headers        # regenerate, as the guilty commit did
-//! $ cargo run -p xtask -- headers --check
-//! xtask headers: both headers are up to date
-//! exit=0
-//! $ grep -c '#define TFT_ERR_ARENA_UNAVAILABLE' include/*.h
-//! 0
-//! ```
-//!
-//! Every gate green with the constant defined nowhere. `--check` compares each
-//! header against a copy regenerated with the same omission; `check_overlap`
-//! sees no intersection because there is nothing in either file to intersect;
-//! and [`check_partition`] filters entries without a lowercase character, so
-//! every screaming-case constant is exempt from its stale half by construction.
-//! The three doc-comment *references* to the code survive in both headers, so
-//! the frozen header is left documenting a status a caller cannot name.
-//!
-//! §3.1 calls the frozen header a promise that can never be withdrawn. This is
-//! the check that stops it being withdrawn by deleting a line.
+//! [`check_stable_is_complete`] is the opposite sign: a [`STABLE`] entry defined
+//! in **neither** header would silently shrink the frozen surface with every
+//! other gate green, because [`check_partition`] exempts screaming-case constants.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -101,18 +36,9 @@ const STABLE: &[&str] = &[
     "tft_abi_version_major",
     "tft_abi_version_minor",
     "tft_check_abi",
-    // The three opaque handle typedefs. They are emitted by `HANDLE_DECLS`
-    // rather than by cbindgen and are in `OPAQUE`, which both configs exclude —
-    // so listing them here changes *generation* not at all (verified: the two
-    // headers are byte-identical before and after). What it changes is
-    // `check_stable_is_complete`'s reach: without them, deleting
-    // `typedef struct tft_tree tft_tree;` from `HANDLE_DECLS` and regenerating
-    // in the same run leaves `--check` at exit 0, and the frozen header has
-    // silently lost the type every entry point in it takes. `just
-    // c-header-check` does catch that one, as `unknown type name 'tft_tree'` —
-    // but a check that depends on a C compiler noticing is not the inventory
-    // this list is supposed to be. `tft_bridge` is deliberately NOT here: it is
-    // declared in the *unstable* header.
+    // The three opaque handle typedefs. Emitted by `HANDLE_DECLS`, not cbindgen;
+    // listing them extends `check_stable_is_complete`'s reach to them.
+    // `tft_bridge` is NOT here: it is declared in the unstable header.
     "tft_tree",
     "tft_plan",
     "tft_publisher",
@@ -153,24 +79,11 @@ const STABLE: &[&str] = &[
     "TFT_ERR_RELEASED",
     "TFT_ERR_PARENT_MISMATCH",
     "TFT_ERR_NO_EDGE",
-    // Returned only by `tft_bridge_create` today, and still stable: §3.3 defines
-    // one status space, the constant is not feature-gated, and the frozen header
-    // is where a C programmer looks up a negative number they were handed. A
-    // code that lived in the unstable header would be un-nameable by a caller
-    // that never opted into `TFT_ENABLE_UNSTABLE` but can still receive it once
-    // any stable entry point starts parsing config.
+    // Returned only by `tft_bridge_create` today; stable because §3.3 defines one status space.
     "TFT_ERR_BAD_CONFIG",
-    // Same argument, one code over, and it is here because it was **missing**:
-    // added by `docs/decisions/0015` and left out of this list, so the
-    // complement below emitted it into the unstable header as well and both
-    // committed headers carried it. That was legal C — an identical `#define`
-    // twice — so the compile matrix passed. [`check_overlap`] is the check that
-    // now fails on it.
+    // Added by `docs/decisions/0015`. Stable; omitting it emits it into both headers ([`check_overlap`]).
     "TFT_ERR_ARENA_UNAVAILABLE",
-    // Returned only by the two stamp converters below, and stable for the same
-    // reason every other status code is: the library hands it *back*, so a
-    // caller who never defines `TFT_ENABLE_UNSTABLE` must still be able to name
-    // the negative number it received.
+    // Returned only by the two stamp converters; stable like every status code the library hands back.
     "TFT_ERR_BAD_STAMP",
     "TFT_ERR_INTERNAL",
     // Layouts — §3.5.
@@ -180,52 +93,27 @@ const STABLE: &[&str] = &[
     "TFT_LAYOUT_MAT4_COL",
     "TFT_LAYOUT_MAT4_ROW",
     "TFT_LAYOUT_AFFINE12_ROW_F32",
-    // Appended by `docs/API.md` §3.3 — a minor bump under §3.6. It is stable
-    // for one reason and it is not `TFT_ERR_BAD_CONFIG`'s: **`tft_plan_at` and
-    // `tft_plan_at_many` accept it**, and both are in this list. A value a
-    // frozen entry point takes has to be spellable by a caller who never
-    // defines `TFT_ENABLE_UNSTABLE`, or that entry point's signature is a lie
-    // about what it accepts.
-    //
-    // The symmetry with `TFT_ERR_BAD_CONFIG` above does *not* hold and an
-    // earlier revision of this comment claimed it did: a status code is stable
-    // because the library hands it *back* to a caller who must be able to name
-    // it, while `tft_layout` is a pure input — it appears in this header only
-    // as a parameter and is never a return value or out-param. A caller who
-    // cannot name it can never receive it.
+    // Appended by `docs/API.md` §3.3 (minor bump, §3.6). Stable because
+    // `tft_plan_at` and `tft_plan_at_many` accept it; a pure input must be
+    // spellable without `TFT_ENABLE_UNSTABLE`.
     "TFT_LAYOUT_QVEC7_WXYZ_TWIST6",
     "tft_layout_size",
-    // Stamps — `docs/API.md` §5.1. Pure functions over integers: no handle, no
-    // arena, nothing to get wrong at a lifetime. They are in the frozen header
-    // because the conversion they replace is the one every ROS 2 node writes by
-    // hand, and a caller who has to opt into an unstable header to avoid
-    // writing it will write it.
+    // Stamps — `docs/API.md` §5.1. Pure functions over integers, stable so no caller has to hand-write the conversion.
     "tft_stamp_from_parts",
     "tft_stamp_from_timespec",
     // Lifecycle and the hot path — §3.2, §3.7.
     "tft_tree_open",
     "tft_tree_free",
     "tft_plan_create",
-    // `docs/decisions/0038`. **Stable, and for the same reason
-    // `tft_stamp_from_parts` is**: it is the only way a C caller can read an
-    // arena whose dynamic edges are not tag `0`, and `docs/PHASE4.md` §5.5
-    // tells operators to configure exactly such an arena. A caller who has to
-    // define `TFT_ENABLE_UNSTABLE` to follow the project's own deployment
-    // advice will instead write the lookup that fails.
+    // `docs/decisions/0038`. Stable: the only way a C caller can read an arena
+    // whose dynamic edges are not tag `0` (`docs/PHASE4.md` §5.5).
     "tft_plan_create_in_domain",
     "tft_plan_free",
     "tft_plan_at",
     "tft_plan_at_many",
-    // Extrapolation — `docs/decisions/0039`. **Stable, and on
-    // `TFT_LAYOUT_QVEC7_WXYZ_TWIST6`'s argument rather than
-    // `TFT_ERR_BAD_CONFIG`'s**: the policy and the struct are pure *inputs and
-    // outputs of a frozen entry point*, so a caller who cannot name them
-    // cannot call it. And the entry point itself belongs here for
-    // `tft_plan_create_in_domain`'s reason — it is the only way a C caller can
-    // ask for the bounded prediction a control loop running faster than its
-    // state estimate needs, and a caller who has to define
-    // `TFT_ENABLE_UNSTABLE` for that will instead hold the last pose by hand,
-    // which is the failure `0039` exists to prevent.
+    // Extrapolation — `docs/decisions/0039`. Stable: the policy and struct are
+    // inputs/outputs of a frozen entry point, and the entry point is the only way
+    // C can ask for bounded prediction.
     "tft_extrap_policy",
     "TFT_EXTRAP_ERROR",
     "TFT_EXTRAP_HOLD",
@@ -248,12 +136,8 @@ const UNSTABLE: &[&str] = &[
     "tft_tree_edge_count",
     "tft_tree_frame_name",
     "tft_tree_instance_uuid",
-    // Recovery — `docs/decisions/0044`. **Unstable on purpose, and the reason is
-    // the age of what they expose rather than the shape of the calls.** §3.5's
-    // ownership migration shipped on 2026-08-28 and has already produced one
-    // outcome its own record did not predict (`0043`'s three-outcome table);
-    // the stable header is a promise about a decade. `tft_tree_plan_in_domain`
-    // went into the frozen tier because it is a query shape, not a protocol.
+    // Recovery — `docs/decisions/0044`. Unstable on purpose: the ownership
+    // migration (§3.5) is too young to freeze (`0043`).
     "TFT_INHERITED",
     "TFT_OWNER_ALIVE",
     "TFT_CONTENDED",
@@ -263,12 +147,8 @@ const UNSTABLE: &[&str] = &[
     "tft_tree_owner_lost",
     "tft_tree_inherit_ownership",
     "tft_tree_reap_dead",
-    // The ROS 2 ingest-bridge seam — `docs/PHASE4.md` §5, compiled only under
-    // `--features bridge` and therefore emitted inside `#if
-    // defined(TFT_HAVE_BRIDGE)`. **Unstable on purpose**: §5 is the half of
-    // Phase 4 that a year of dogfooding is expected to argue with, and freezing
-    // a ROS-shaped surface before the argument has happened is how a
-    // compatibility promise becomes a liability.
+    // The ROS 2 ingest-bridge seam — `docs/PHASE4.md` §5, emitted under
+    // `#if defined(TFT_HAVE_BRIDGE)`. Unstable on purpose: §5 is what dogfooding will argue with.
     "tft_bridge_create",
     "tft_bridge_tree",
     "tft_bridge_free",
@@ -325,25 +205,17 @@ const UNSTABLE: &[&str] = &[
     "TFT_BRIDGE_EVIDENCE_COMMON_MODE",
 ];
 
-/// Tier entries that name a **type**, not an `extern "C" fn`.
-///
-/// They are in the lists to steer `cbindgen`'s exclude-by-complement, so
-/// [`check_partition`]'s reverse direction — "this entry names no exported
-/// function" — must skip them. Constants are skipped by the `is_lowercase`
-/// filter; these are not, because C type names here are lowercase by
-/// convention.
+/// Tier entries that name a **type**, not an `extern "C" fn`; [`check_partition`]'s
+/// reverse direction skips them.
 const TIER_TYPES: &[&str] = &[
-    // The opaque handles: typedefs from `HANDLE_DECLS`, with no `extern "C" fn`
-    // of their own for `check_partition`'s stale half to find.
+    // The opaque handles: typedefs from `HANDLE_DECLS`.
     "tft_tree",
     "tft_plan",
     "tft_publisher",
     "tft_status",
     "tft_error",
     "tft_layout",
-    // `docs/decisions/0039`'s two: a `uint32_t` typedef and a POD struct,
-    // neither of which has an `extern "C" fn` of its own for
-    // `check_partition`'s stale half to find.
+    // `docs/decisions/0039`'s two: a `uint32_t` typedef and a POD struct.
     "tft_extrap_policy",
     "tft_extrapolated",
     "tft_bridge_topic",
@@ -360,9 +232,7 @@ const TIER_TYPES: &[&str] = &[
     "tft_bridge_remap",
 ];
 
-/// Rust types `cbindgen` must never emit: the opaque handles (§3.2) and the
-/// private types it would otherwise forward-declare in order to spell their
-/// fields.
+/// Rust types `cbindgen` must never emit: the opaque handles (§3.2) and private field types.
 const OPAQUE: &[&str] = &[
     "tft_tree",
     "tft_plan",
@@ -376,35 +246,22 @@ const OPAQUE: &[&str] = &[
 /// Compiled only under `--features test-hooks`; never in a shipped header.
 const TEST_ONLY: &[&str] = &[
     "tft_test_tree_create",
-    // The tag-1 fixture `docs/decisions/0038` step 3 is verified against. A
-    // fourth fixture because the other three publish in domain `0`, where the
-    // mismatch it exists to exercise cannot arise.
+    // The tag-1 fixture `docs/decisions/0038` step 3 is verified against (the other three publish in domain `0`).
     "tft_test_domain_tree_create",
     "tft_test_publishable_tree_create",
     "tft_test_lerpslerp_tree_create",
     "tft_test_panic",
-    // The same claim for a boundary with no `tft_status` to carry it:
-    // `guard` cannot wrap an entry point that returns a count, so
-    // `guard_value` does, and this forces the panic that proves it.
+    // A boundary with no `tft_status`: forces the panic `guard_value` catches.
     "tft_test_panic_value",
     "tft_guarded_noop",
     "tft_test_push_unguarded",
-    // `docs/PHASE4.md` §7 gate criterion 1's R2 rung: the same body as
-    // `tft_plan_at` with `catch_unwind` removed, so the guard's cost is a
-    // subtraction rather than an estimate. It is `#[cfg(feature =
-    // "test-hooks")]` and deliberately does *not* catch unwinds, which is
-    // precisely why it must never reach a shipped header.
+    // `docs/PHASE4.md` §7 gate criterion 1's R2 rung: `tft_plan_at` without
+    // `catch_unwind`, so it must never reach a shipped header.
     "tft_test_plan_at_unguarded",
 ];
 
-/// The handle types, declared by hand rather than generated.
-///
-/// §3.2 requires them opaque. `cbindgen`'s `cbindgen:opaque` annotation does not
-/// take effect on `#[repr(C)]` structs whose fields it cannot name, so it emits
-/// the layout — `Arc_TreeShare share;` and all — which a C caller could then
-/// dereference. Excluding them and writing the forward declarations here is both
-/// correct and what §3.1 asks for anyway ("frozen and reviewed by hand, not
-/// merely `cbindgen` output").
+/// The handle types, declared by hand: §3.2 requires them opaque and cbindgen
+/// would emit their layout.
 const HANDLE_DECLS: &str = "\
 /*
  * Opaque handles — docs/PHASE4.md §3.2.
@@ -422,11 +279,8 @@ typedef struct tft_plan tft_plan;
 typedef struct tft_publisher tft_publisher;
 ";
 
-/// The bridge handle, declared by hand for the same reason as [`HANDLE_DECLS`]
-/// and guarded because the symbol only exists under `--features bridge`.
-///
-/// It lives in the *unstable* header: §5's shape is what a year of dogfooding is
-/// meant to argue with, so nothing about it belongs in the frozen one.
+/// The bridge handle, declared by hand and guarded because the symbol only exists
+/// under `--features bridge`. It lives in the unstable header.
 const BRIDGE_DECLS: &str = "\
 #if defined(TFT_HAVE_BRIDGE)
 /*
@@ -505,16 +359,13 @@ pub(crate) fn run(check: bool) -> ExitCode {
         }
     };
 
-    // Before either header is written or compared. A `--check` run that only
-    // diffed would pass on a duplicate that was committed together with the
-    // omission that produced it, which is precisely what happened.
+    // Before writing or comparing: a `--check` that only diffed would pass on a committed duplicate.
     if let Err(e) = check_overlap(&stable, &unstable) {
         eprintln!("xtask headers: {e}");
         return ExitCode::FAILURE;
     }
 
-    // The other direction, and the one [`check_overlap`] cannot see: a symbol
-    // in **neither** header.
+    // The other direction: a symbol in neither header.
     if let Err(e) = check_stable_is_complete(&stable) {
         eprintln!("xtask headers: {e}");
         return ExitCode::FAILURE;
@@ -565,8 +416,7 @@ pub(crate) fn run(check: bool) -> ExitCode {
     }
 }
 
-/// Print the first differing line, so a `--check` failure in CI says *what*
-/// changed rather than only that something did.
+/// Print the first differing line so a `--check` failure says what changed.
 fn report_first_difference(got: &str, want: &str) {
     for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
         if g != w {
@@ -624,16 +474,8 @@ fn generate(crate_dir: &Path, tier: Tier) -> Result<String, String> {
 }
 
 fn config_for(tier: Tier) -> String {
-    // **cbindgen emits declarations only; every wrapper comes from `assemble`.**
-    //
-    // `no_includes` suppresses the `#include`s, no `include_guard` key
-    // suppresses the guard, and `cpp_compat = false` suppresses the
-    // `extern "C"` block. The alternative — letting cbindgen emit them and
-    // filtering afterwards — was tried and shipped a header that would not
-    // compile: the filter dropped `#ifdef __cplusplus` and `extern "C" {` but
-    // left the matching `#endif  // __cplusplus`, so gcc, clang, g++ and
-    // clang++ all reported `#endif without #if`. Generating nothing is easier
-    // to get right than un-generating something.
+    // cbindgen emits declarations only; `assemble` supplies every wrapper. Filtering
+    // cbindgen's own guards afterwards left an unmatched `#endif` and did not compile.
     let _ = tier;
     let mut s = String::from(
         "language = \"C\"\n\
@@ -660,9 +502,7 @@ fn config_for(tier: Tier) -> String {
     match tier {
         Tier::Stable => {
             s.push_str("[export]\nexclude = [");
-            // Everything that is not stable, plus the hand-declared handles and
-            // the private types `cbindgen` would otherwise forward-declare in
-            // order to spell their fields.
+            // Everything not stable, plus the hand-declared handles and private types.
             let excluded: Vec<&str> = UNSTABLE
                 .iter()
                 .chain(TEST_ONLY)
@@ -672,11 +512,7 @@ fn config_for(tier: Tier) -> String {
             push_list(&mut s, &excluded);
         }
         Tier::Unstable => {
-            // `exclude`, not `include`. cbindgen's `[export] include` is
-            // **additive** — "always emit these" — not restrictive, so an
-            // `include`-only config emitted the entire surface into the
-            // unstable header (856 lines for six symbols). The complement is
-            // the only way to say "just these".
+            // `exclude`, not `include`: cbindgen's `include` is additive, so it would emit everything.
             s.push_str("[export]\nexclude = [");
             let excluded: Vec<&str> = STABLE
                 .iter()
@@ -743,10 +579,8 @@ fn assemble(tier: Tier, body: &str) -> String {
 
 /// Every `extern "C"` symbol in `tf_tree_c` must be in exactly one tier.
 ///
-/// Checked in **both** directions: a new function that nobody classified fails,
-/// and so does a stale list entry naming a function that has been removed. The
-/// first is the one that matters — see the module docs for why a tool must not
-/// pick a tier on its own.
+/// Checked in both directions: an unclassified function fails, and so does a
+/// stale entry naming a removed function.
 fn check_partition(crate_dir: &Path) -> Result<(), String> {
     let mut found = BTreeSet::new();
     let src = crate_dir.join("src");
@@ -795,8 +629,7 @@ fn check_partition(crate_dir: &Path) -> Result<(), String> {
         ));
     }
 
-    // The reverse direction. Only function names are scanned, so constants and
-    // types in the lists are skipped here rather than reported as stale.
+    // The reverse direction; constants and types are skipped.
     let stale: Vec<&&str> = STABLE
         .iter()
         .chain(UNSTABLE)
@@ -820,22 +653,10 @@ fn check_partition(crate_dir: &Path) -> Result<(), String> {
 
 /// **No symbol may be defined by both generated headers.**
 ///
-/// §3.1's split is the stability promise: a symbol in `tf_tree.h` can never be
-/// withdrawn, and one in `tf_tree_unstable.h` carries no promise at all. A
-/// symbol in *both* is in neither tier — it is unwithdrawable and unpromised at
-/// the same time — and it means the same thing every time: an entry missing from
+/// A symbol in both is in neither tier: it means an entry is missing from
 /// [`STABLE`], which the complement in [`config_for`] then emits into both.
-///
-/// This is checked on the **generated** text rather than on the committed files
-/// because the generated text is the authority; drift between the two is
-/// [`run`]'s own comparison, and a duplicate reaches the committed files only
-/// through here.
-///
-/// Nothing else can catch it. `--check` diffs each header against its own
-/// committed copy, and a duplicate committed *with* the omission that caused it
-/// makes both copies match. `just c-header-check`'s gcc/clang/g++/clang++ matrix
-/// compiles a translation unit that includes both, and an identical `#define`
-/// twice is legal C — not even under `-Wpedantic -Werror`.
+/// Checked on the generated text. Nothing else catches it: `--check` matches
+/// committed copies, and an identical `#define` twice is legal C.
 fn check_overlap(stable: &str, unstable: &str) -> Result<(), String> {
     let in_stable = defined_symbols(stable);
     let in_unstable = defined_symbols(unstable);
@@ -857,32 +678,11 @@ fn check_overlap(stable: &str, unstable: &str) -> Result<(), String> {
 
 /// Every [`STABLE`] entry is actually **defined** by the frozen header.
 ///
-/// # The direction [`check_overlap`] cannot see
-///
-/// `check_overlap` catches a symbol in *both* headers. This catches one in
-/// **neither**, which is the same defect with the opposite sign and a worse
-/// consequence: the frozen header silently gets **smaller**.
-///
-/// [`check_partition`] does not cover it. That function scans the Rust source
-/// for `extern "C" fn` and its stale-entry half filters on
-/// `n.contains(char::is_lowercase)` — so `TFT_ERR_ARENA_UNAVAILABLE`,
-/// `TFT_ABI_VERSION_MINOR` and every other screaming-case constant is exempt by
-/// construction, and a *type* has no `extern "C" fn` to find at all. Delete a
-/// `pub const` from `tf_tree_c` and leave its name in [`STABLE`] and nothing
-/// notices: `cbindgen` emits it in neither file (the unstable config excludes it
-/// by complement, the stable one has nothing to emit), the two headers stay
-/// disjoint so `check_overlap` is silent, `--check` diffs both against copies
-/// regenerated with the same omission, and the compile matrix compiles a
-/// translation unit that no longer names it.
-///
-/// **That is a withdrawn stability promise, made by deleting a line.** §3.1 says
-/// the frozen header is the promise that can never be withdrawn; this is the
-/// check that makes withdrawing it require saying so.
-///
-/// Grounded in the generated artifact rather than in a second scan of the
-/// source, so it covers constants, types and functions with one rule — the same
-/// reason the `TFT_HAVE_SHM` probe in `crates/tf_tree_c/CMakeLists.txt` asks the
-/// library instead of trusting a list.
+/// Catches a symbol in **neither** header (the opposite sign of [`check_overlap`]):
+/// [`check_partition`] exempts screaming-case constants and types, so deleting a
+/// `pub const` and leaving its [`STABLE`] entry would otherwise shrink the frozen
+/// header with every other gate green. Grounded in the generated text, so one
+/// rule covers constants, types and functions.
 fn check_stable_is_complete(stable_header: &str) -> Result<(), String> {
     let defined = defined_symbols(stable_header);
     let missing: Vec<&&str> = STABLE.iter().filter(|n| !defined.contains(**n)).collect();
@@ -902,15 +702,8 @@ fn check_stable_is_complete(stable_header: &str) -> Result<(), String> {
     ))
 }
 
-/// Every symbol a header **defines** — not the ones it merely mentions.
-///
-/// `tf_tree_unstable.h` includes `tf_tree.h` and names stable types all over its
-/// own declarations, so a scan that counted references would report the entire
-/// stable surface as an overlap. Four definition shapes cover everything the two
-/// headers contain, and all four sit at **column 0**: `cbindgen` indents every
-/// struct field, every enum variant and every continuation line of a wrapped
-/// declaration, so the column is what separates a definition from the inside of
-/// one.
+/// Every symbol a header **defines**, not merely mentions. Definitions sit at
+/// column 0; cbindgen indents fields, variants and continuation lines.
 fn defined_symbols(header: &str) -> BTreeSet<String> {
     let mut defs = BTreeSet::new();
     for line in strip_comments(header).lines() {
@@ -930,8 +723,7 @@ fn defined_symbols(header: &str) -> BTreeSet<String> {
         if t.starts_with('#') {
             continue;
         }
-        // 2. `typedef <...> NAME;` and 3. the `} NAME;` closing a struct or enum
-        //    body opened by `typedef struct {`.
+        // 2. `typedef <...> NAME;` and 3. the `} NAME;` closing a struct or enum.
         if t.starts_with("typedef") || t.starts_with('}') {
             if let Some(name) = last_ident_before_semicolon(t) {
                 defs.insert(name);
@@ -942,9 +734,7 @@ fn defined_symbols(header: &str) -> BTreeSet<String> {
         if t.starts_with("extern") {
             continue;
         }
-        // 4. A function declaration: the identifier immediately before the first
-        //    `(`. Wrapped parameter lists continue on indented lines, which the
-        //    column-0 test above has already dropped.
+        // 4. A function declaration: the identifier before the first `(`.
         if let Some(open) = t.find('(') {
             let name = ident_suffix(&t[..open]);
             if !name.is_empty() {
@@ -955,8 +745,7 @@ fn defined_symbols(header: &str) -> BTreeSet<String> {
     defs
 }
 
-/// Blank out C comments, preserving both line structure and column positions —
-/// [`defined_symbols`] relies on the latter.
+/// Blank out C comments, preserving line structure and column positions.
 fn strip_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut in_block = false;
@@ -1022,13 +811,7 @@ fn workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    //! The overlap check's own gate.
-    //!
-    //! It is here because [`check_overlap`] is a check that exists *because* a
-    //! check silently stopped checking, and a duplicate-detector that quietly
-    //! detected nothing would be the same failure one level up. These pin both
-    //! directions: the shapes it must see, and the references it must not
-    //! mistake for definitions.
+    //! The overlap check's own gate: shapes it must see, references it must not mistake for definitions.
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::{check_overlap, defined_symbols};
@@ -1099,9 +882,7 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         }
     }
 
-    /// The regression this whole check exists for: a status code missing from
-    /// [`super::STABLE`] is emitted into both headers, and the duplicate is an
-    /// identical `#define` that no C compiler objects to.
+    /// A status code missing from [`super::STABLE`] is emitted into both headers as an identical `#define`.
     #[test]
     fn a_symbol_defined_by_both_headers_fails() {
         let stable = "#define TFT_ERR_ARENA_UNAVAILABLE -42\n";
@@ -1113,8 +894,7 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         );
     }
 
-    /// And the unstable header naming stable symbols — which it does on nearly
-    /// every line — is not an overlap.
+    /// The unstable header naming stable symbols is not an overlap.
     #[test]
     fn the_unstable_header_may_reference_the_stable_one() {
         let stable = "typedef int32_t tft_status;\ntft_status tft_tree_open(tft_tree **out);\n";
@@ -1123,8 +903,7 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         assert!(check_overlap(stable, unstable).is_ok());
     }
 
-    /// The committed headers themselves, so the check is exercised against real
-    /// `cbindgen` output and not only against the fixture above.
+    /// The committed headers themselves.
     #[test]
     fn the_committed_headers_do_not_overlap() {
         let inc = super::workspace_root().join("crates/tf_tree_c/include");
@@ -1135,16 +914,10 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         }
     }
 
-    /// The completeness check's own gate, for the same reason the overlap
-    /// tests above exist: it was added *because* three checks each missed the
-    /// same omission, and one that quietly missed it too would be the failure
-    /// repeating a third time.
+    /// The completeness check's own gate.
     #[test]
     fn a_stable_entry_the_header_does_not_define_is_caught() {
-        // One real STABLE entry present, one absent. `TFT_ERR_NULL_ARG` is a
-        // `#define`, which is the shape the whole check exists for — a
-        // screaming-case constant is exempt from `check_partition`'s stale half
-        // by construction.
+        // `TFT_ERR_NULL_ARG` is a `#define`, exempt from `check_partition`'s stale half.
         let header = "#define TFT_ERR_NULL_ARG -1\n";
         match super::check_stable_is_complete(header) {
             Ok(()) => panic!("a header defining one of 60+ STABLE entries must not pass"),
@@ -1166,16 +939,8 @@ tft_status tft_plan_at_many(const tft_plan *plan,
         }
     }
 
-    /// **The one shape [`defined_symbols`] cannot see**, pinned so that the
-    /// first `#[repr(C)] pub enum` added to a tier list meets it here rather
-    /// than as a mystery failure.
-    ///
-    /// cbindgen indents enum variants, and the column-0 rule that separates a
-    /// definition from the inside of one drops them. No entry in `STABLE` or
-    /// `UNSTABLE` is of that shape today — every one is a `#define`, a
-    /// `typedef`, or a function — so the completeness check is vacuous for
-    /// nothing currently listed. Adding a variant name to a tier list would
-    /// give it a false failure, and would give [`check_overlap`] a blind spot.
+    /// The one shape [`defined_symbols`] cannot see: `#[repr(C)] pub enum` variants
+    /// (indented by cbindgen). No tier entry is of that shape today.
     #[test]
     fn enum_variants_are_not_definitions_to_this_scanner() {
         let header = "typedef enum {\n  TFT_KIND_A = 0,\n} tft_kind;\n";

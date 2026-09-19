@@ -8,28 +8,14 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-# **Not published, and the reason is mechanical rather than a status claim.**
-# Three of this crate's `[dependencies]` are themselves `publish = false` —
-# `tf_tree_bench`, `tf_tree_bridge` and `tf_tree_ingest`, each for a reason
-# stated in its own manifest — so they are path-only, with no version to publish
-# against. Flip this line to `true` and `cargo publish --dry-run -p tf_tree_cli`
-# answers "all dependencies must have a version requirement specified when
-# publishing / dependency `tf_tree_bench` does not specify a version". That is a
-# fact cargo checks, not a policy this file has to keep current.
-#
-# It is deliberately not a sentence about which section has landed. A reason of
-# that shape rots the moment `docs/PHASE5.md` §0.0 moves, because §0.0 moves and
-# a string in this file does not — and a stale reason in a manifest is exactly
-# the defect class §9.3 spends a page on. The dependency edge above cannot go
-# stale silently. Publishing becomes possible when those three crates do;
-# `docs/PHASE5.md` §10 owns the distribution question, not this comment.
+# Not published: three `[dependencies]` (`tf_tree_bench`, `tf_tree_bridge`, `tf_tree_ingest`) are `publish = false`, so are path-only.
+# `docs/PHASE5.md` §10 owns the distribution question.
 publish = false
 
 [lints]
 workspace = true
 
-# `doc = false`: the binaries carry no public API to document, and the `tf_tree`
-# bin name otherwise collides with the `tf_tree` library crate's rustdoc output.
+# `doc = false`: the `tf_tree` bin name collides with the library crate's rustdoc output.
 [[bin]]
 name = "tf_tree"
 path = "src/main.rs"
@@ -41,43 +27,14 @@ path = "src/bin/tft.rs"
 doc = false
 
 [dependencies]
-# **`features = ["unstable"]`, unconditionally — `docs/API.md` §2.6.** This crate
-# is the reason that tier exists: `tree`, `doctor` and `top` render the arena's
-# own tables, so they need `Tree::arena_view` and `EdgeKind`, both of which are
-# shaped by a layout `docs/PHASE5.md` §1 changes on purpose. It is a plain
-# dependency feature rather than one of this crate's own `[features]` because
-# there is no build of this binary that does not want it, and a feature nobody
-# can turn off is a worse lie than no feature at all.
+# `unstable` unconditionally (`docs/API.md` §2.6): `tree`, `doctor` and `top` need `Tree::arena_view` and `EdgeKind`.
 tf_tree = { workspace = true, features = ["unstable"] }
 tf_tree_core.workspace = true
 tf_tree_math.workspace = true
-# **Three imports, and only the last is a benchmark.** This is not "the CLI has
-# no other tree to inspect" — `--attach`, `doctor --from-bag` and
-# `doctor --from-file` are the other three sources (`src/lib.rs`'s module docs
-# enumerate them).
-#
-# 1. `fixture` — the tree an invocation that names *none* of those gets, which
-#    is what keeps every subcommand runnable on a machine with nothing
-#    deployed. `fixture::PushSample` is the larger half: it is the per-push
-#    record `checks`, `doctor` and `recording` all speak, so the bag path uses
-#    it too. The fixture is also the only source that fills in a writer and an
-#    arrival delay — it *is* the publisher, so it sees the pushes the engine
-#    refused — which is why `checks::PushStream::Observed` is the one variant
-#    `TFT001` and `TFT011`'s Phase 1 half can run against.
-# 2. `replay::TfStream` — `topology`'s `.tfstream` reader.
-# 3. `differential::run_naive_rust` — the correctness half of `tf_tree bench`
-#    that a plain `cargo install` can run; the perf and zero-alloc gates need
-#    the workspace and stay in `cargo xtask`.
-#
-# Sharing item 1 with the benchmarks is the point rather than an accident: a
-# `doctor` finding and a bench row that disagree about the tree they ran on are
-# two numbers nobody can attribute. The `default-features = false` that keeps
-# this crate's own `counters` feature meaningful lives on the workspace
-# declaration, stated beside the flag it protects.
+# Three imports from `tf_tree_bench`: `fixture` (the tree when no `--attach`/`--from-bag`/`--from-file` is named, and `PushSample`, shared with the
+# benchmarks so a finding and a bench row run on the same tree), `replay::TfStream`, and `differential::run_naive_rust`.
 tf_tree_bench.workspace = true
-# **`docs/PHASE4.md` §5.8's `--discover`.** The collector and the config format
-# live in the bridge because the `rclcpp` half needs them too; the CLI is the
-# host-side front end that feeds them a `.tfstream` instead of a subscription.
+# `docs/PHASE4.md` §5.8's `--discover`: the collector and config format live in the bridge.
 tf_tree_bridge.workspace = true
 anyhow.workspace = true
 clap.workspace = true
@@ -91,23 +48,10 @@ tf_tree_ipc = { workspace = true, optional = true }
 
 [features]
 default = ["counters", "compression"]
-# **Reading zstd/lz4-compressed recordings, and this line is load-bearing for the
-# same reason `counters` is.** The workspace declares `tf_tree_ingest` with
-# `default-features = false`, so without this the CLI would link an ingest that
-# refuses every compressed bag — the ordinary case, since rosbag2 and Foxglove
-# both write zstd chunks by default — and `cargo build --workspace` would hide it,
-# because building `tf_tree_ingest` as a member turns its defaults on and feature
-# unification then covers for the missing edge. `cargo build -p tf_tree_cli` and
-# `cargo install` do not.
-#
-# The codecs are pure Rust (`ruzstd`, `lz4_flex`), so this adds no C build step;
-# see `crates/tf_tree_ingest/Cargo.toml` for why that is the whole point.
+# zstd/lz4 support: the workspace declares `tf_tree_ingest` with `default-features = false`, and workspace builds hide the missing edge by feature
+# unification; `cargo build -p tf_tree_cli` and `cargo install` do not. Codecs are pure Rust.
 compression = ["tf_tree_ingest/compression"]
-# `docs/PHASE5.md` §5's diagnostic counters, which `TFT010`/`TFT011` read.
-# Needed explicitly because the workspace declares `tf_tree` with
-# `default-features = false` (see the comment on that declaration): without
-# this line the CLI would link an engine that counts nothing and `doctor` would
-# report "no extrapolation failures" on an arena that has never counted one.
+# `docs/PHASE5.md` §5's counters, read by `TFT010`/`TFT011`; the workspace declares `tf_tree` with `default-features = false`.
 counters = ["tf_tree/counters"]
 # Attach to a live arena (`--attach`) and `tf_tree participants`. Linux-only,
 # and off by default so the single-process CLI does not grow a syscall
@@ -115,30 +59,9 @@ counters = ["tf_tree/counters"]
 shm = ["tf_tree/shm", "dep:tf_tree_ipc", "tf_tree_ingest/shm"]
 
 [dev-dependencies]
-# **Reading `doctor --json` back, in `tests/catalogue.rs`, and nothing else.**
-# `docs/PHASE5.md` §11 requires that document to be schema-validated, and a
-# hand-rolled reader for our own output would fail *open* on exactly the defects
-# it exists to catch — `render_json` writes the document line by line, and the
-# extractors in `tests/doctor_recording.rs` read it back by line offset with an
-# assertion that the field order has not moved, which is an acknowledgement that
-# they are not parsing.
-#
-# **It costs the workspace nothing**, which is the whole reason this is allowed
-# past `docs/PROJECT.md`'s dependency budget without a decision record: it is
-# already in the lockfile (`criterion` pulls it) and already in *this* crate's
-# build graph, because `tf_tree_bench` — a normal dependency here — declares
-# `serde_json` as a normal dependency of its own for reading the committed
-# benchmark baseline. A dev-dependency, so the shipped `tf_tree` binary does not
-# link it either way; `render_json`'s own doc argues against a serializer for
-# *writing*, and this is reading.
+# Reads `doctor --json` back in `tests/catalogue.rs` only (`docs/PHASE5.md` §11 schema validation). Already in the build graph via `tf_tree_bench`.
 serde_json.workspace = true
-# `sizing.rs`'s four constants are claims about `ArenaLayout`'s regions, and the
-# test that keeps them true differences two real layouts instead of trusting the
-# comment beside them. A dev-dependency rather than a dependency: the CLI itself
-# needs only the arithmetic, and reaching the arena crate from the binary would
-# put a layout type on a surface `tf_tree` deliberately does not export.
+# `sizing.rs`'s four constants are checked against two real layouts; dev-only so no layout type reaches the binary.
 tf_tree_arena.workspace = true
-# The `fixture` feature writes the synthetic recordings `tests/ingest.rs` runs
-# the binary against. Off in the normal build (it fabricates recordings), on
-# here, which is the only place a fabricated recording belongs.
+# `fixture` writes the synthetic recordings `tests/ingest.rs` uses; off in the normal build.
 tf_tree_ingest = { workspace = true, features = ["fixture"] }

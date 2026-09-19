@@ -1,60 +1,29 @@
-//! Serve the §11.1 fixture from a **named, rendezvous-discoverable** arena, and
+//! Serve the §11.1 fixture from a **named, rendezvous-discoverable** arena and
 //! dump the identical sample stream, so a C++ process can measure both engines
 //! with no Rust binding on either side.
 //!
-//! # Why this binary has to exist
+//! # Why this binary exists
 //!
-//! `docs/benchmarks/tf2.md` prices four measurement biases, and the one that
-//! cannot be removed from an in-process Rust harness is the third: the residual
-//! FFI boundary between `tf_tree_tf2_sys` and `tf2::BufferCore` — cross-TU, no
-//! inlining, one extra copy, **45.3 ns / 10% at depth 3** — 498.2 ns through
-//! the binding against 452.9 ns native, a subtraction between two rows of that
-//! document's bracket table. It is charged to tf2, so every ratio measured that
-//! way *flatters* `tf_tree`. (This line read `~21 ns / 8%` until 2026-09-05;
-//! `tf2.md` withdrew that figure for having no derivation recorded anywhere.
-//! `grep -rn '21 ns'` finds the sites that still carry it; a list written into
-//! a comment is one more thing to go stale.)
+//! `docs/benchmarks/tf2.md` prices four measurement biases; the one an in-process
+//! Rust harness cannot remove is the FFI boundary between `tf_tree_tf2_sys` and
+//! `tf2::BufferCore`, charged to tf2 so every such ratio *flatters* `tf_tree`
+//! (figure in that document's bracket table). Putting both engines in one **C++**
+//! process (tf2 natively, `tf_tree` through its C ABI) charges the residual to
+//! *us*, so the ratio is a lower bound. `PHASE4.md` §7 gate 1 and `tf2.md` state
+//! the bracket; `just abi-split` ([`tf_tree_bench::backing`]) splits the C++ cost:
+//! the mapping, read-only attach and linkage are near zero and the remainder is the
+//! C ABI's per-call `Guard` (`tft_plan_at_many` amortises it per batch).
 //!
-//! The fix is to put both engines in one **C++** process: tf2 natively, and
-//! `tf_tree` through its C ABI. That reverses the direction of the residual
-//! cost — it is charged to *us*, so the ratio is a lower bound rather than a
-//! flattering upper one.
+//! **Both arms must be in one process**: interleaving within a round is what makes
+//! the ratio resolvable on a host whose absolute latencies are unusable.
 //!
-//! **How much it costs is larger than `PHASE4.md` §7 gate 1 would suggest.**
-//! That gate records `tft_plan_at` at 1.020× native Rust, measured from Rust
-//! inside one build; a C++ caller against `libtf_tree_c.so` pays **+52%** on the
-//! same host and fixture (306.7 ns against 201.5 ns). Neither ratio is therefore
-//! "the" answer — they bracket it, and `docs/benchmarks/tf2.md` states the
-//! bracket.
+//! # Why a separate process from the C++ one
 //!
-//! **That 52% is now split, and it is neither the mapping nor the linker.**
-//! `just abi-split` ([`tf_tree_bench::backing`]) walks the whole ladder on the
-//! arena this binary serves: the shared mapping costs <= 9.6 ns, attaching to it
-//! read-only from another process costs -0.7 ns, and static-versus-shared
-//! linkage costs ~1 ns (`tests/cpp/bench.cpp` built both ways: 245.4 against
-//! 244.4 ns). What is left is **+99.5 ns, or +49%, in the C ABI itself** —
-//! `tft_plan_at` builds a `Guard` per call where the Rust arm hoists one, and
-//! `tft_plan_at_many` recovers 41 ns of it by paying that once per batch.
-//!
-//! So the arena this binary hands the C++ side is not what makes it slower, and
-//! neither is the link; the per-call shape of the ABI is.
-//!
-//! **Both arms must still be in one process**, because the pairing is what makes
-//! the number resolvable at all: interleaving within a round is why the ratio
-//! reports a ~3% band on a host whose absolute latencies are unusable. Two
-//! separate binaries cannot be interleaved, and comparing their medians puts the
-//! host's ~4% run-to-run spread straight into the answer.
-//!
-//! # Why it is a separate process from the C++ one
-//!
-//! `tft_tree_open` **attaches**; it cannot create. That is D18 — a consumer
-//! linked against the C ABI joins read-only and the MMU is what stops it
-//! corrupting a robot's tree — and it is not something to work around for a
-//! benchmark. `Tree::build_shared` does not help either: its segments are "not
-//! discoverable by name — the fd is the capability", so a process that is not a
-//! child cannot find one. The rendezvous (`Open` with
-//! [`CreatePolicy::IfAbsent`]) is the discoverable path, and this binary is the
-//! owner that serves it.
+//! `tft_tree_open` **attaches**, it cannot create (D18: a C ABI consumer joins
+//! read-only and the MMU protects the tree). `Tree::build_shared` segments are
+//! "not discoverable by name", so a non-child cannot find one. The rendezvous
+//! (`Open` with [`CreatePolicy::IfAbsent`]) is the discoverable path and this
+//! binary is the owner that serves it.
 //!
 //! # Usage
 //!
@@ -62,9 +31,8 @@
 //! native_arena --name tf2_native --stream target/native/fixture.tfstream
 //! ```
 //!
-//! Publishes the history, writes the stream, prints `ready`, and then blocks
-//! until stdin closes — so the C++ side runs while the arena is still served and
-//! the owner goes away when the harness does.
+//! Publishes the history, writes the stream, prints `ready`, then blocks until
+//! stdin closes so the arena is served while the C++ side runs.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -94,17 +62,16 @@ fn layout() -> TreeBuilder {
     b
 }
 
-/// Write the `.tfstream` `docker/tf2/native_scaling.cpp` already parses:
+/// Write the `.tfstream` `docker/tf2/native_scaling.cpp` parses:
 ///
 /// ```text
 /// S <parent> <child> qw qx qy qz tx ty tz
 /// D <parent> <child> <stamp_ns> qw qx qy qz tx ty tz
 /// ```
 ///
-/// **This loop must stay identical to `fixture::spin_up`'s and to
-/// `Tf2Fixture::load`'s**, including the `dyn_seed` increment, or the two
-/// engines are compared on different data and every observed difference is
-/// meaningless. It is the same three lines in all three places for that reason.
+/// **This loop must stay identical to `fixture::spin_up`'s and
+/// `Tf2Fixture::load`'s**, including the `dyn_seed` increment, or the engines are
+/// compared on different data.
 fn dump_stream(path: &PathBuf) -> Result<usize> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -143,11 +110,8 @@ fn dump_stream(path: &PathBuf) -> Result<usize> {
     Ok(wrote)
 }
 
-/// `qw qx qy qz tx ty tz` at full `f64` precision.
-///
-/// `{:.17e}` and not `{}`: the two engines are checked to agree to 1e-9 on the
-/// C++ side, and a stream that round-trips through a shortened decimal would
-/// spend that budget on the serializer rather than on the engines.
+/// `qw qx qy qz tx ty tz` at full `f64` precision (`{:.17e}`): the C++ side
+/// checks agreement to 1e-9, which a shortened decimal would spend.
 fn pose(p: &Iso3) -> String {
     format!(
         "{:.17e} {:.17e} {:.17e} {:.17e} {:.17e} {:.17e} {:.17e}",
@@ -164,14 +128,9 @@ fn main() -> Result<()> {
         match a.as_str() {
             "--name" => name = args.next().context("--name wants a value")?,
             "--stream" => stream = PathBuf::from(args.next().context("--stream wants a value")?),
-            // Write the `.tfstream` and exit, serving no arena.
-            //
-            // `docker/tf2/native_footprint.cpp` needs the *data* and not the
-            // rendezvous: it weighs a `tf2::BufferCore` against a separate Rust
-            // process, and there is no tf_tree arena in that comparison at all.
-            // `dump_stream` regenerates every pose from `fixture::dynamic_pose`
-            // and never reads the tree, so this path is the same bytes by
-            // construction rather than by a second implementation.
+            // Write the `.tfstream` and exit, serving no arena: `native_footprint.cpp`
+            // needs the data only, and `dump_stream` regenerates poses from
+            // `fixture::dynamic_pose` without reading the tree.
             "--dump-only" => dump_only = true,
             other => anyhow::bail!("unknown argument `{other}`"),
         }
@@ -183,8 +142,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `require_create(true)`: if an arena of this name is already served, the
-    // C++ side would measure somebody else's data and never know. Fail instead.
+    // `require_create(true)`: an already-served arena would be somebody else's data.
     let tree = Open::new()
         .name(&name)?
         .mode(AttachMode::ReadWrite)
@@ -200,9 +158,8 @@ fn main() -> Result<()> {
     println!("ready {name} {} {}", stream.display(), wrote);
     std::io::stdout().flush()?;
 
-    // Hold the arena open — and the writers with it, so the claims stay live —
-    // until the harness closes stdin. Dropping `tree` unmaps the segment and the
-    // C++ side's next lookup would fault, so this is the lifetime that matters.
+    // Hold the arena (and the writers' claims) until stdin closes; dropping `tree`
+    // unmaps the segment and the C++ side would fault.
     let mut sink = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut sink);
     drop(writers);

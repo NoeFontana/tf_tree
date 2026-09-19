@@ -1,54 +1,25 @@
-//! The `docs/PHASE5.md` §9 benchmark artifact: one reproducible report.
+//! The `docs/PHASE5.md` §9 benchmark artifact: one reproducible report (`results.json`, `index.html`, environment description).
 //!
-//! §9.1 asks for a *product, not a script* — a single command that emits
-//! `results.json` (stable schema, CI-diffable), `index.html`, and the exact
-//! environment description needed to reproduce it. §9.2 lists the rows it must
-//! carry. §9.3, which is normative, governs everything here:
+//! §9.3 is normative: if a row cannot be measured fairly, omit it and say why. The
+//! measurement code lives in `just` recipes and examples; this module is refusal
+//! machinery, so the report cannot print a number it has no right to:
 //!
-//! > If a row cannot be measured fairly, omit it and say why. An honest gap is
-//! > worth more than a favourable number nobody trusts.
+//! * [`Fitness::probe`] measures the host and decides whether a timing number taken
+//!   here would describe this engine or somebody else's scheduler.
+//! * [`Report::validate`] refuses a report whose rows overclaim: a timing row cannot
+//!   be [`Status::Measured`] on a host that failed the probe, an unavailable row
+//!   needs a reason *and* a reproduce command, the four §9.3 "where we are worse"
+//!   topics must be present, each with a number or
+//!   [`Worse::metrics_absent_because`]. Failure is "no report", never a flattering one.
+//! * [`Status::Indicative`] labels numbers taken under `TF_TREE_BENCH_FORCE=1` as
+//!   *not a claim*.
 //!
-//! # Why this module is mostly *refusal* machinery
-//!
-//! Most of §9.2's rows are comparisons against a running `tf2`, on a host with
-//! at least as many spare cores as consumers. The measurement code for them
-//! already exists — `just mp-bench`, `just mp-bench-tf2`, `just tf2-scaling`,
-//! `just footprint`, `just shm-scaling`, `crates/tf_tree_c/examples/abi_cost.rs`
-//! — and this module deliberately does not reimplement any of it. What did not
-//! exist is the thing §9.3 actually asks for: a report that **cannot** print a
-//! number it has no right to.
-//!
-//! So the honesty is structural rather than editorial:
-//!
-//! * [`Fitness::probe`] measures the host and decides whether a timing number
-//!   taken here would describe this engine or somebody else's scheduler. It is
-//!   the *tool* that decides, from measured facts, not a hardcoded verdict — on
-//!   a machine that qualifies, the same binary emits the number.
-//! * [`Report::validate`] refuses to emit a report whose rows overclaim: a
-//!   timing row cannot be [`Status::Measured`] on a host that failed the
-//!   fitness probe, an unavailable row must carry a reason *and* the command
-//!   that would produce it elsewhere, §9.3's four "where we are worse"
-//!   topics must all be present, and each of those must carry either a number
-//!   or a stated reason it has none ([`Worse::metrics_absent_because`]). A
-//!   validation failure is a hard error, so the failure mode is "no report"
-//!   rather than "a flattering report".
-//! * [`Status::Indicative`] exists because `TF_TREE_BENCH_FORCE=1` already
-//!   exists (`crate::mp::require_quiet_machine`). Someone who overrides the
-//!   refusal gets numbers that are labelled, in the JSON and in the HTML, as
-//!   *not a claim*, together with the reasons the host failed.
-//!
-//! `String` appears freely in these types. That is not a hot path and not an
-//! error type in the sense `CLAUDE.md` forbids: the reasons embed measured host
-//! facts, and a report whose reasons are `&'static str` could not name the core
-//! count it actually found.
+//! `String` is fine here: reasons embed measured host facts.
 //!
 //! # Schema stability
 //!
-//! `results.json` is emitted by hand (`to_json`) rather than by a serialiser,
-//! for one reason worth the code: the schema is a compatibility surface — §12
-//! gate 7 diffs it across machines — and hand-writing it makes a field rename a
-//! deliberate edit in one place instead of a side effect of a `#[derive]`.
-//! `SCHEMA` is the version; bump it when a consumer would break.
+//! `results.json` is emitted by hand (`to_json`), so a field rename is a deliberate
+//! edit; §12 gate 7 diffs the schema across machines. `SCHEMA` is the version.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,28 +29,17 @@ use tf_tree::{InterpPolicy, Stamp};
 
 /// `results.json` schema identifier. Bump on any consumer-visible change.
 ///
-/// `/2` added `drift` and `tolerance` to every metric. `/1` emitted a bare
-/// `{"value", "unit"}`, which meant a consumer — including
-/// [`crate::baseline`], the regression gate §10 asks for — could not tell
-/// whether `compared: 47922` growing was an improvement, a regression, or
-/// nothing at all. A regression gate over untyped numbers is a coin flip with
-/// extra steps, so the direction is now part of the artifact rather than
-/// knowledge held by whoever wrote the checker.
+/// `/2` added `drift` and `tolerance` to every metric, so [`crate::baseline`] knows
+/// which direction is a regression.
 pub const SCHEMA: &str = "tf_tree.bench-report/2";
 
-/// The command that regenerates the whole report directory.
+/// The command that regenerates the report directory.
 ///
-/// Named once, so the HTML's "Reproducing this" line and the test that checks it
-/// against the real `justfile` cannot disagree. It is **not**
-/// `cargo xtask bench-report`: `xtask` dispatches `loom | bench-gate | headers`
-/// and nothing else, so that spelling exits non-zero.
+/// Not `cargo xtask bench-report`: `xtask` dispatches `loom | bench-gate | headers` only.
 pub const REPRODUCE_RECIPE: &str = "just bench-report";
 
-/// The row ids `docs/PHASE5.md` §9.2 requires the report to carry.
-///
-/// A row may be [`Status::Unavailable`], but it may not be *missing*: a report
-/// that silently dropped the rows it could not measure would read as a clean
-/// sweep of the ones it could.
+/// The row ids `docs/PHASE5.md` §9.2 requires. A row may be [`Status::Unavailable`]
+/// but not *missing*.
 pub const REQUIRED_ROWS: &[&str] = &[
     "cpu_per_consumer",
     "total_rss_n_consumers",
@@ -93,95 +53,35 @@ pub const REQUIRED_ROWS: &[&str] = &[
     "lookup_ratio_vs_tf2",
 ];
 
-/// Relative slack the regression gate allows on the tf2 ratio row, as a
-/// fraction of the committed baseline.
-///
-/// Wider than it looks necessary, and deliberately: the measured within-run band
-/// is ~3%, but the *between-build* movement of a ratio also carries whatever the
-/// container's toolchain does to either arm, and the row exists to catch an
-/// engine regression rather than to police a codegen difference. 15% below the
-/// baseline ratio is a real regression at this magnitude — 2.46x would have to
-/// fall past 2.09x, which is nearly to the floor itself.
+/// Relative slack on the tf2 ratio row, as a fraction of the baseline. Wider than
+/// the ~3% within-run band because between-build codegen also moves a ratio.
 #[cfg(feature = "tf2")]
 const RATIO_SLACK: f64 = 0.15;
 
-/// Relative slack the regression gate allows on the differential row's
-/// `max_deviation`, as a fraction of the committed baseline: `9.0` means the
-/// gate fires above `baseline * (1 + 9)`, i.e. **10x** the baseline.
+/// Relative slack on the differential row's `max_deviation`: `9.0` fires above
+/// **10x** the baseline.
 ///
-/// **10x, which reads loose and is not.** The measured deviation on this host is
-/// ~2.5e-16 rad/m — a handful of f64 ULPs — against the row's own pass tolerance
-/// of 1e-12. A tight relative bound on a quantity that close to machine epsilon
-/// gates the *compiler*: a rustc upgrade that reassociates one FMA moves it by a
-/// factor of two while the engine is unchanged, and a gate that cries wolf on
-/// toolchain bumps is a gate that gets its baseline regenerated without anyone
-/// reading the diff.
-///
-/// What this bound is for is the failure that matters: a real disagreement — a
-/// dropped normalization, a wrong interpolation branch, a quaternion sign flip —
-/// lands at 1e-3 or worse, thirteen orders above the ceiling this sets. It also
-/// still leaves ~2.5e-15, three orders *below* the pass tolerance, so the gate
-/// fires long before the differential itself would.
+/// The deviation sits near machine epsilon (~2.5e-16 rad/m), so a tight bound would
+/// gate the compiler. A real disagreement lands at 1e-3 or worse, and the bound
+/// still fires three orders below the row's 1e-12 pass tolerance.
 pub const DEVIATION_SLACK: f64 = 9.0;
 
-/// Relative slack the regression gate allows on a latency percentile.
+/// Relative slack (25%) on a latency percentile.
 ///
-/// 25%. These rows are only ever [`Status::Measured`] on a host that passed
-/// [`Fitness::probe`] — quiet, no SMT, a readable governor — and the gate only
-/// compares a baseline taken on that same host to a run on it. Even there a
-/// p99.9 moves several percent run to run from page placement and interrupt
-/// timing alone, so a 10% bound would flap. 25% is above that noise and well
-/// under the size of any regression worth a bisect: the changes this is written
-/// against — an extra atomic in the read path, a lost inline, a bounds check
-/// back in the bracket search — cost tens of percent or more.
+/// p99.9 moves several percent run to run even on a fit host, so 10% would flap; 25%
+/// is well under any regression worth a bisect.
 pub const LATENCY_SLACK: f64 = 0.25;
 
-/// Relative slack the regression gate allows on the idle arena's resident
-/// footprint.
+/// Relative slack on the idle arena's resident footprint: 300%, the metric may
+/// quadruple before the gate fires.
 ///
-/// 300% — the metric may quadruple before the gate fires. Looser than
-/// [`LATENCY_SLACK`] for three reasons, all properties of the quantity rather
-/// than of the code it gates.
+/// `idle_arena_resident_bytes` is a Pss delta quantised to the page size (24 576 B
+/// here, six 4 KiB pages). A 64 KiB-page host would read one page as a +166%
+/// regression at a 100% band, and this is the one baseline number compared across
+/// two machines (CI's `bench-gate` runs on another host).
 ///
-/// **It is six pages of a whole-process counter.**
-/// `idle_arena_resident_bytes` is a *delta* of `/proc/self/smaps_rollup`'s Pss
-/// across building one tree, which the kernel reports in whole KiB and which
-/// therefore quantises to the host's page size. On this host it is 24 576 B —
-/// six 4 KiB pages, most of them the tree's own non-arena allocation rather than
-/// the arena. One page either way is 17% of that.
-///
-/// **The page size is not 4 KiB everywhere.** At a 100% band the bound would be
-/// 49 152 B, and a host with 64 KiB base pages — aarch64 is configured that way
-/// on several distributions — exceeds it on its *first* page and reads as a
-/// +166% regression with nothing about the code having changed. That is not a
-/// hypothetical about libc versions; it is arithmetic on the unit the kernel
-/// reports in. 300% clears one 64 KiB page with room to spare.
-///
-/// **The baseline is cut on one host and this gate also runs on another.** CI's
-/// `bench-gate` job runs `just bench-check` on `ubuntu-latest` against the
-/// committed baseline, and until this metric there was nothing host-dependent
-/// left for it to compare — the one claim it held,
-/// `differential_agreement.max_deviation`, is host-independent by construction.
-/// So this is the first number in the artifact whose comparison spans two
-/// machines, and the band has to cover that or it becomes a gate that fails for
-/// the machine. The exposure is deliberate and worth having: if a runner ever
-/// exceeds the bound, the failure prints both numbers and the finding is that
-/// this residency figure is not portable, which nobody currently knows either
-/// way.
-///
-/// **Measured before choosing it, not assumed.** Thirty consecutive runs of
-/// `bench_report` on this host returned 24 576 B bit-identically, and six more
-/// with all eight logical CPUs spinning returned the same, so the *observed*
-/// spread here is zero and every bit of this slack is headroom. What it must not
-/// do is stop catching the regression it exists for: `docs/decisions/0021`'s
-/// before column is **2 408 448 B** (and a re-measurement on 2026-09-10 with the
-/// fix reverted read 2 412 544 B — the same page count, a different sitting), so
-/// the failure this gates against sits at 98x the baseline and **24x the bound
-/// this slack sets** (98 304 B). It still fires on anything above 24 pages.
-///
-/// `0021`'s own words on the number: *"The order of magnitude is the finding;
-/// the third digit is not."* A tolerance that pretended to gate the third digit
-/// would contradict the row it gates.
+/// The regression it guards (`docs/decisions/0021`) sits at 2 408 448 B, 24x this
+/// bound: the order of magnitude is the finding, not the third digit.
 pub const RESIDENCY_SLACK: f64 = 3.0;
 
 /// The "where `tf_tree` is worse" topics `docs/PHASE5.md` §9.3 names, verbatim.
@@ -192,28 +92,12 @@ pub const REQUIRED_WORSE: &[&str] = &[
     "bridge_supervision",
 ];
 
-/// The provenance facts `docs/PHASE5.md` §9.3 requires the report to state,
-/// as a closed list [`Report::validate`] checks.
+/// The provenance facts `docs/PHASE5.md` §9.3 requires, as a closed list
+/// [`Report::validate`] checks for *present and non-empty*. An explicit `unknown`
+/// from an unreadable sysfs file counts as a report of that host.
 ///
-/// Bullets 1 and 3 of §9.3 name these: bullet 3 asks for the `tf2` version, the
-/// ROS distro, the RMW implementation, the kernel, the CPU model and the THP
-/// setting; bullet 1 asks for the QoS, the executor configuration and the DDS
-/// vendor and version. Until this list existed, both bullets were held only by
-/// [`Provenance::collect`] happening to `push` each key — a report assembled
-/// with an empty provenance header validated cleanly, and deleting a `push`
-/// line broke no test.
-///
-/// **What this can and cannot decide.** It decides that a key is *present and
-/// non-empty*, which is what catches the deletion and the rename. It cannot
-/// decide that the value is *true*: `Provenance::collect` writes an explicit
-/// `unknown` where a sysfs file is unreadable, and that is a correct reading of
-/// a host rather than a violation of §9.3 — the bullet asks for the setting to
-/// be reported, and "we looked and the kernel does not say" is a report of it.
-///
-/// **Two THP keys, not one.** §9.3 says "THP setting", singular, and there are
-/// two knobs; [`Provenance::collect`] carries which governs what, and what
-/// reading only the first one cost. This report had exactly that hole until
-/// both keys were required here. See §9.3's amendment.
+/// Two THP keys, not one: §9.3 says "THP setting" but there are two knobs (see
+/// [`Provenance::collect`] and §9.3's amendment).
 pub const REQUIRED_FACTS: &[&str] = &[
     // Bullet 3, verbatim.
     "tf2_version",
@@ -228,13 +112,9 @@ pub const REQUIRED_FACTS: &[&str] = &[
     "executor_config",
 ];
 
-/// The build facts an `unavailable` row's reason is allowed to rest on.
-///
-/// Two `cfg!`s, evaluated once in [`Build::current`] and carried on the
-/// [`Report`] rather than read at each use, for one reason: a rule keyed on a
-/// compile-time constant cannot be red-tested. [`Report::validate`] reads this
-/// struct, so a test can hand it a build in which the frozen backend *is*
-/// compiled and watch a row that claims otherwise be refused.
+/// The build facts an `unavailable` row's reason may rest on, evaluated once in
+/// [`Build::current`] and carried on the [`Report`] so a test can hand
+/// [`Report::validate`] a different build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Build {
     /// `cfg!(feature = "tf2")` — whether `tf2::BufferCore` is linked into this
@@ -260,35 +140,16 @@ impl Build {
 
 /// The machine-checkable claim an `unavailable` row's reason rests on.
 ///
-/// # Why a reason needs a ground
+/// §9.3 requires a reason, and a check keyed on wording is defeated by rewording
+/// (`tests::no_unavailable_reason_rests_on_a_claim_that_has_gone_stale`), so
+/// [`Report::validate`] re-derives the ground on every run; the prose only elaborates.
 ///
-/// §9.3 is NORMATIVE that a row which cannot be measured fairly must *say why*.
-/// **A check keyed on how a claim is worded is defeated by rewording it** —
-/// see `tests::no_unavailable_reason_rests_on_a_claim_that_has_gone_stale`.
-///
-/// So the decisive half of a reason is moved out of the prose and into this
-/// enum, and [`Report::validate`] re-derives it on every run. The prose stays,
-/// because a reader needs a sentence rather than a discriminant — but the prose
-/// is now elaboration on a claim the tool checks, instead of being the claim.
-///
-/// # What it still cannot see
-///
-/// `Ground::holds` — private, so named rather than linked — returns [`None`]
-/// for three variants, and that is the class
-/// this guard does not reach: [`Ground::MeasuredElsewhere`],
-/// [`Ground::NoInstrument`] and [`Ground::MeasurementRefused`] are claims about
-/// *the repository* and *this run*, not about the build or the host, and
-/// nothing in `validate` can decide them. Two partial mitigations exist and
-/// neither is a proof: `tests::every_command_the_report_names_is_a_command_that_exists`
-/// resolves the recipe a `MeasuredElsewhere` row names against the real
-/// `justfile`, so a row that points at a recipe nobody wrote fails; and
-/// `MeasurementRefused` is at least paired with a row that carries no numbers.
-/// That test reads both `reproduce` and `reason`, and the comment at its own
-/// `check(&row.reason, ...)` call is why it must. The check still says nothing
-/// about whether the recipe measures what the row claims it measures.
-/// **A row whose ground is `NoInstrument` is exactly as trustworthy as the
-/// person who wrote it**, which is why it is spelled out as its own variant
-/// rather than folded into the others: it is greppable.
+/// `Ground::holds` returns [`None`] for [`Ground::MeasuredElsewhere`],
+/// [`Ground::NoInstrument`] and [`Ground::MeasurementRefused`]: claims about the
+/// repository or this run that nothing here can decide.
+/// `tests::every_command_the_report_names_is_a_command_that_exists` resolves the
+/// named recipe against the `justfile`. `NoInstrument` is as trustworthy as its
+/// author, which is why it is its own greppable variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ground {
     /// This host cannot produce a trustworthy number on the row's own
@@ -359,19 +220,11 @@ impl Ground {
         }
     }
 
-    /// The stable spelling of the ground, for [`Report::validate`]'s refusal
-    /// messages and for the test that seeds a stale ground and greps for it.
+    /// The stable spelling, for [`Report::validate`]'s refusal messages and the test
+    /// that seeds a stale ground.
     ///
-    /// **No row carries it into `results.json` or `index.html`.**
-    /// `to_json` writes the schema `SCHEMA` names, and adding a key to it is a
-    /// consumer-visible change that rides a schema bump. What a reader of the
-    /// artifact gets is the prose reason. The checkable form of that is the
-    /// emitter directly above and below: no row object written by `to_json`
-    /// has a `grounds` key. It is *not* checkable by grepping the artifact for
-    /// one of these spellings, because `host_fitness` is also the name of the
-    /// artifact's top-level fitness block, so a grep for it hits and means
-    /// nothing. If the ground is wanted in the artifact, that is the bump — not
-    /// a quiet extra field.
+    /// No row carries it into `results.json` or `index.html`: a new key rides a `SCHEMA`
+    /// bump.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -386,12 +239,7 @@ impl Ground {
     }
 }
 
-/// Which way a metric is allowed to move before it is a regression.
-///
-/// This exists for [`crate::baseline`]. Without it the regression gate would
-/// have to infer intent from key names — `p99_ns` down, `samples` neither,
-/// `throughput` up — and a checker that guesses is a checker that will one day
-/// pass a doubled latency because somebody named a field `ops_ns`.
+/// Which way a metric may move before it is a regression, for [`crate::baseline`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Drift {
     /// Context, not a claim: sample counts, the tolerance a comparison was run
@@ -435,14 +283,9 @@ pub struct Metric {
 }
 
 impl Metric {
-    /// A metric with the given key, value and unit, **informational**.
-    ///
-    /// Informational is the default because most report numbers are context,
-    /// and because a wrong direction is worse than none: a metric silently
-    /// typed `LowerIsBetter` when it is really a count would fail the gate on
-    /// every run that scored more queries. The omission is not silent —
-    /// [`Report::validate`] refuses a row that claims to be `measured` while
-    /// carrying nothing directional, so a new claim cannot arrive ungated.
+    /// A metric with the given key, value and unit, **informational**: a wrong
+    /// direction is worse than none. [`Report::validate`] refuses a `measured` row with
+    /// nothing directional.
     #[must_use]
     pub fn new(key: &'static str, value: f64, unit: &'static str) -> Metric {
         Metric {
@@ -499,31 +342,19 @@ impl Status {
     }
 }
 
-/// What kind of host fitness a row's numbers actually depend on.
+/// What kind of host fitness a row's numbers depend on. One boolean could not
+/// answer this: different quantities fail for different facts about a machine.
 ///
-/// **One boolean could not answer this, and pretending it could is what left
-/// rows unavailable for reasons that were not about them.** An absolute
-/// duration, a paired ratio and a resident-memory figure fail for different
-/// facts about a machine, so they are asked different questions:
+/// - a **frequency governor** moves an absolute latency and cancels out of an
+///   interleaved ratio;
+/// - **SMT** likewise cancels when both arms interleave on one thread;
+/// - a **busy machine** does *not* cancel out of a cross-engine ratio: the arms are
+///   asymmetric (`tf2::BufferCore` locks per lookup, `tf_tree` does not), so load
+///   inflates the quotient in our favour;
+/// - **PSS** involves no clock, but `smaps_rollup` must be *readable*; a silent zero
+///   would be a false PASS.
 ///
-/// - a **frequency governor** moves an absolute latency and cancels out of a
-///   ratio measured by interleaving both engines inside one round;
-/// - **SMT** makes a per-thread duration depend on the sibling, and again
-///   cancels when the two arms are interleaved on the same thread;
-/// - a **busy machine** does *not* cancel out of a cross-engine ratio, and this
-///   is the exception worth knowing: cancellation needs the disturbance to land
-///   on both arms alike, and these arms are asymmetric by construction —
-///   `tf2::BufferCore` locks on every lookup and `tf_tree` does not, so load adds
-///   lock-holder preemption and convoying to one arm only. It inflates the
-///   quotient in our favour rather than adding noise to it;
-/// - **PSS does not involve a clock at all** — it is proportional set size read
-///   out of `/proc`, and neither the governor nor a noisy neighbour changes how
-///   many pages a process has resident. What it does need is to be *readable*:
-///   `smaps_rollup` is absent on non-Linux and on some hardened containers, and
-///   a silent zero there would be a false PASS.
-///
-/// What every one of them *does* depend on is being a release build, because a
-/// debug build is a different program rather than a slower one.
+/// Every axis needs a release build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sensitivity {
     /// The same inputs give the same answer on any host — a differential
@@ -532,24 +363,14 @@ pub enum Sensitivity {
     /// An absolute duration. Needs a trustworthy clock *and* a quiet machine:
     /// every check in [`Fitness::reasons`] applies.
     AbsoluteTiming,
-    /// A ratio between two engines measured by interleaving them within each
-    /// round and taking the median of per-round quotients. Common-mode drift —
-    /// governor, SMT — lands on both arms and divides out, which is why
-    /// `just cpp-bench`'s gate went from flapping to a stable 1.006× when it
-    /// started interleaving. A debug build and a busy machine still invalidate
-    /// it; see the type's own docs for why load is not common-mode here.
+    /// A ratio between two engines measured by interleaving them within each round
+    /// and taking the median of per-round quotients. Governor and SMT divide out; a
+    /// debug build and a busy machine still invalidate it.
     ///
-    /// **`lookup_ratio_vs_tf2` constructs this, and is the reason the axis
-    /// exists.** *(This paragraph read "No row constructs this yet" and named
-    /// `embedding_cross_crate` as the nearest candidate; the row landed with
-    /// §9.3's amendment and the sentence was not moved.)* It is the mechanism
-    /// the `PHASE5.md` §9.2 tf2-comparison rows are intended to move onto, so
-    /// that a 4-core host can gate a *ratio* against tf2 even where it cannot
-    /// gate either side's absolute latency — measured in the container at
-    /// 2.49x on a host whose absolute latencies are `unavailable`.
-    /// `embedding_cross_crate` is deliberately **not** on this axis: §9.2 gates
-    /// its two absolute durations as well as their quotient, so it needs the
-    /// stricter one.
+    /// `lookup_ratio_vs_tf2` constructs this, so a 4-core host can gate a *ratio*
+    /// against tf2 where it cannot gate either absolute latency.
+    /// `embedding_cross_crate` is **not** on this axis: §9.2 gates its absolute
+    /// durations too.
     Ratio,
     /// Resident or proportional memory. Not a timing measurement, so the timing
     /// checks do not apply to it — but it does require that Pss be readable at
@@ -578,12 +399,9 @@ pub struct Row {
     pub reason: String,
     /// The machine-checkable claims [`Row::reason`] rests on.
     ///
-    /// Required — and required to be *empty* — in opposite directions:
-    /// [`Report::validate`] refuses an `unavailable` row with no ground (a
-    /// reason resting on nothing is the prose this list exists to replace) and
-    /// refuses a row that prints numbers while still carrying one (a row with a
-    /// number has nothing to excuse). Every ground it can decide, it re-derives
-    /// on each run; see [`Ground`] for the three it cannot.
+    /// [`Report::validate`] refuses an `unavailable` row with none, and a row that
+    /// prints numbers while carrying one. See [`Ground`] for the three it cannot
+    /// re-derive.
     pub grounds: Vec<Ground>,
     /// The command that produces this row on a host that can measure it.
     pub reproduce: &'static str,
@@ -619,26 +437,16 @@ impl Row {
         }
     }
 
-    /// State the machine-checkable claims this row's reason rests on.
-    ///
-    /// Separate from [`Row::unavailable`]'s already-long argument list, and a
-    /// builder rather than a defaulted field, because forgetting it is not
-    /// silent: an `unavailable` row with no ground fails
-    /// [`Report::validate`].
+    /// State the machine-checkable claims this row's reason rests on; an
+    /// `unavailable` row with none fails [`Report::validate`].
     #[must_use]
     pub fn on(mut self, grounds: &[Ground]) -> Row {
         self.grounds = grounds.to_vec();
         self
     }
 
-    /// Promote this row out of [`Status::Unavailable`], dropping the grounds
-    /// that explained its absence.
-    ///
-    /// The three promotion sites in this file all went through
-    /// `row.status = ...; row.reason = ...` before grounds existed, and each
-    /// would have left a stale ground behind on a host fit enough to reach it —
-    /// a state neither this host nor its tests can produce, which is exactly the
-    /// kind of gap a helper closes and a convention does not.
+    /// Promote this row out of [`Status::Unavailable`], dropping the grounds that
+    /// explained its absence so none goes stale.
     fn measured_as(&mut self, status: Status, reason: String) {
         self.status = status;
         self.reason = reason;
@@ -652,21 +460,15 @@ impl Row {
         self
     }
 
-    /// Whether this row reports an absolute duration.
-    ///
-    /// Kept as the JSON field of the same name so `tf_tree.bench-report/2` does
-    /// not change shape: it means exactly what it always meant, and the two
-    /// non-timing sensitivities were previously spelled `false` here alongside
-    /// [`Sensitivity::HostIndependent`].
+    /// Whether this row reports an absolute duration; the JSON field of the same
+    /// name, kept so `tf_tree.bench-report/2` does not change shape.
     #[must_use]
     pub fn timing_sensitive(&self) -> bool {
         matches!(self.sensitivity, Sensitivity::AbsoluteTiming)
     }
 
-    /// The status this row should carry on `fitness`, from its sensitivity.
-    ///
-    /// The core budget is applied on top by the caller when [`Row::needs_n_cores`]
-    /// is set; it is a separate question from whether the number is trustworthy.
+    /// The status this row should carry on `fitness`; the caller applies the core
+    /// budget on top when [`Row::needs_n_cores`] is set.
     #[must_use]
     pub fn status_on(&self, fitness: &Fitness) -> Status {
         let (fair, _, _) = fitness.axis(self.sensitivity);
@@ -674,10 +476,8 @@ impl Row {
     }
 }
 
-/// One §9.3 "where `tf_tree` is worse" entry.
-///
-/// §9.3 puts these "in the same table and not in a footnote", so
-/// [`Report::to_html`] renders them inside the results table.
+/// One §9.3 "where `tf_tree` is worse" entry, rendered inside the results table
+/// by [`Report::to_html`].
 #[derive(Debug, Clone)]
 pub struct Worse {
     /// Stable id; must be one of [`REQUIRED_WORSE`].
@@ -688,84 +488,46 @@ pub struct Worse {
     pub statement: String,
     /// Numbers, where the cost is measurable rather than operational.
     pub metrics: Vec<Metric>,
-    /// Why [`Self::metrics`] is empty — required whenever it is.
+    /// Why [`Self::metrics`] is empty — required whenever it is, and forbidden
+    /// beside metrics ([`Report::validate`]).
     ///
-    /// **An honesty section that cannot regress is the problem this field
-    /// exists to close.** Two of the four §9.3 entries carried
-    /// `metrics: Vec::new()` for their whole life, and an empty vector is
-    /// indistinguishable from an oversight: nobody reading the report can tell
-    /// "this cost has no number *because*..." from "somebody forgot".
-    ///
-    /// [`Report::validate`] enforces the pair in both directions — empty
-    /// metrics need a reason, and a reason beside metrics is a contradiction —
-    /// so this is the same structural honesty [`Row::unavailable`] already has,
-    /// applied to the section whose job is to be quotable against us.
-    ///
-    /// Two shapes of reason are legitimate, and the entries here use one each:
-    /// the cost is measured *elsewhere*, by a recipe this binary cannot run
-    /// (`bridge_supervision`); or the cost is genuinely not denominated in
-    /// nanoseconds or bytes at all (`format_bump_cost`). "Nobody has got round
-    /// to it" is not one of them — that is what `attach_latency` used to be,
-    /// and the answer was to go and measure it.
+    /// Legitimate reasons: the cost is measured elsewhere by a recipe this binary
+    /// cannot run (`bridge_supervision`), or it is not denominated in nanoseconds or
+    /// bytes (`format_bump_cost`). "Nobody has got round to it" is not one.
     pub metrics_absent_because: Option<String>,
-    /// Metric keys this entry would carry and deliberately did **not**, with the
-    /// reason stated in [`Worse::statement`] rather than here.
+    /// Metric keys this entry deliberately did **not** carry, with the reason in
+    /// [`Worse::statement`].
     ///
-    /// **Rust-side only: it has no JSON representation, and that is a constraint
-    /// rather than a preference.** `results.json`'s schema is a compatibility
-    /// surface — `docs/PHASE5.md` §12 gate 7 diffs it across machines — so a new
-    /// field is a `SCHEMA` bump, and a bump invalidates
-    /// `baseline/results-tf2.json` as well, which can only be regenerated inside
-    /// `docker/tf2`. So the reason a metric is absent reaches
-    /// [`Report::validate`], which runs in the same process, and cannot reach
-    /// [`crate::baseline`], which reads the committed file.
-    ///
-    /// It exists because the direction rule below would otherwise turn a *missing
-    /// measurement* into **no artifact at all**: `measure_idle_arena_resident`
-    /// withholds the residency figure both where Pss is unreadable and where the
-    /// whole-process delta comes out non-positive, and the second is not a
-    /// fitness failure. Without this the floor entry would then be two
-    /// informational metrics, `validate` would refuse the report, and the message
-    /// would tell the author to add a direction the code already has.
+    /// Rust-side only: a JSON field would be a `SCHEMA` bump that invalidates
+    /// `baseline/results-tf2.json`. It exists because `measure_idle_arena_resident`
+    /// withholds the residency figure when Pss is unreadable or the delta is
+    /// non-positive, and the direction rule would otherwise turn that into no artifact.
     pub metrics_withheld: Vec<&'static str>,
 }
 
 /// Whether this host can produce a timing number that means anything.
 ///
-/// **Two independent verdicts, deliberately not merged.** Whether a clock
-/// reading is trustworthy (`fair_for_timing`) and whether the machine has room
-/// for N consumers plus a publisher (`enough_cores`) are different questions,
-/// and folding them into one boolean makes every stated reason wrong for half
-/// the rows: a single-threaded in-process lookup does not want seventeen cores,
-/// and a memory row does not care about the frequency governor. §9.3's "say
-/// why" is only worth anything if the *why* is the actual one.
+/// Two independent verdicts, deliberately not merged: clock trustworthiness
+/// (`fair_for_timing`) and room for N consumers plus a publisher (`enough_cores`).
+/// Merging them makes every stated reason wrong for half the rows.
 #[derive(Debug, Clone)]
 pub struct Fitness {
-    /// True when nothing about this host makes a clock reading untrustworthy —
-    /// release build, quiet machine, no SMT, `performance` governor. Says
-    /// nothing about whether the host is big enough for the comparison.
+    /// True when no fact makes a clock reading untrustworthy: release build, quiet
+    /// machine, no SMT, `performance` governor.
     pub fair_for_timing: bool,
-    /// True when this host can produce a trustworthy *ratio* between two
-    /// engines measured by interleaving them within a round.
-    ///
-    /// Strictly weaker than [`Fitness::fair_for_timing`]; [`Sensitivity`]
-    /// carries which host facts divide out of an interleaved pair and which —
-    /// load — do not.
+    /// True when this host can produce a trustworthy *ratio* between two engines
+    /// interleaved within a round; strictly weaker than [`Fitness::fair_for_timing`]
+    /// (see [`Sensitivity`]).
     pub fair_for_ratios: bool,
-    /// True when this host can produce a trustworthy *memory* figure.
-    ///
-    /// Also strictly weaker than [`Fitness::fair_for_timing`]; see
-    /// [`Sensitivity::Memory`].
+    /// True when this host can produce a trustworthy *memory* figure; strictly weaker
+    /// than [`Fitness::fair_for_timing`].
     pub fair_for_memory: bool,
-    /// True when the host has at least `consumers + 1` physical cores. Says
-    /// nothing about whether a clock reading here would be trustworthy.
+    /// True when the host has at least `consumers + 1` physical cores.
     pub enough_cores: bool,
     /// Whether `TF_TREE_BENCH_FORCE=1` was set.
     pub forced: bool,
-    /// One string per failed *timing* check, each naming the measured fact.
-    ///
-    /// This is the widest of the three lists; [`Fitness::ratio_reasons`] and
-    /// [`Fitness::memory_reasons`] are subsets of it.
+    /// One string per failed *timing* check; [`Fitness::ratio_reasons`] and
+    /// [`Fitness::memory_reasons`] are subsets.
     pub reasons: Vec<String>,
     /// The subset of [`Fitness::reasons`] that also invalidates a ratio.
     pub ratio_reasons: Vec<String>,
@@ -777,9 +539,8 @@ pub struct Fitness {
     pub consumers: usize,
     /// Measured busy fraction of the machine before the run.
     pub busy_fraction: f64,
-    /// Physical cores, from `/proc/cpuinfo` core ids — or the logical CPU count
-    /// when this host publishes no core ids. Read `physical_cores_known` before
-    /// quoting this at anyone.
+    /// Physical cores from `/proc/cpuinfo` core ids, or the logical count when none
+    /// are published; read `physical_cores_known` before quoting it.
     pub physical_cores: usize,
     /// Whether `physical_cores` is a measurement or the logical-CPU fallback.
     pub physical_cores_known: bool,
@@ -790,42 +551,28 @@ pub struct Fitness {
 impl Fitness {
     /// Probe the host for `consumers` concurrent consumers plus one publisher.
     ///
-    /// Every check is a measurement of *this* machine. The thresholds are
-    /// deliberately strict — §10 says under-promising is fine — and the
-    /// consequence of failing one is that the affected rows come out
-    /// [`Status::Unavailable`], not that anything is estimated.
+    /// Thresholds are deliberately strict: failing one makes the affected rows
+    /// [`Status::Unavailable`], never estimated.
     #[must_use]
     pub fn probe(consumers: usize) -> Fitness {
-        // Every input this verdict rests on is read here and nowhere else, so
-        // that `assess` — which holds all of the judgement — can be handed a
-        // host it would take special hardware to stand in front of.
+        // Every input is read here so `assess` can be handed hosts this one is not.
         Fitness::assess(
             consumers,
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             physical_cores(),
             crate::mp::busy_fraction(Duration::from_millis(300)),
             governors(),
-            // Checking it here means the CLI path (`cargo run` defaults to
-            // debug) cannot quietly publish debug latencies.
+            // Checked here so the CLI path (debug by default) cannot publish debug latencies.
             cfg!(debug_assertions),
-            // Whether a Pss figure can be obtained at all. `self_pss_kib`
-            // returns 0 when `smaps_rollup` is unreadable, and a silent 0 is a
-            // false PASS of exactly the kind the physical-core fallback below
-            // refuses to make: it would leave `fair_for_memory` true and let a
-            // memory row publish zeros as a claim.
+            // `self_pss_kib` returns 0 when `smaps_rollup` is unreadable; a silent 0 would be a false PASS.
             crate::mp::self_pss_kib() > 0,
         )
     }
 
-    /// The judgement half of [`Fitness::probe`], over measurements already taken.
-    ///
-    /// Split out because the interesting failures are hosts this one is not:
-    /// a machine that publishes no physical core count (every aarch64 host, and
-    /// many containers), and an absurd `--consumers`. Neither can be produced by
-    /// running the probe here, so neither would ever be tested through it.
-    ///
-    /// `detected_physical` is [`None`] when the host published no core ids, and
-    /// that is deliberately not the same value as `Some(logical)`.
+    /// The judgement half of [`Fitness::probe`], over measurements already taken, so
+    /// hosts this one is not (no published core ids, an absurd `--consumers`) can be
+    /// tested. `detected_physical` is [`None`] when the host published no core ids,
+    /// which is not `Some(logical)`.
     #[must_use]
     pub fn assess(
         consumers: usize,
@@ -836,16 +583,12 @@ impl Fitness {
         debug_build: bool,
         pss_readable: bool,
     ) -> Fitness {
-        // Each failing check is collected into the bucket naming *which kinds of
-        // claim it invalidates*, and the three verdicts are unions of buckets.
-        // Writing it this way is what stops the axes drifting apart: a new check
-        // has to state its reach to be added at all.
+        // Each failing check goes into the bucket naming the claims it invalidates; the
+        // verdicts are unions of buckets, so a new check must state its reach.
         let mut reasons = Vec::new();
-        // Invalidates everything. A debug build is a different program: its
-        // latencies, its quotients and its resident footprint all describe
-        // something nobody ships.
+        // Invalidates everything: a debug build is a different program.
         let mut universal = Vec::new();
-        // Invalidates a duration *and* a quotient, but not a page count.
+        // Invalidates a duration and a quotient, not a page count.
         let mut timing_and_ratio = Vec::new();
         // Invalidates a page count only.
         let mut memory_only = Vec::new();
@@ -867,12 +610,9 @@ impl Fitness {
         }
         reasons.extend(universal.iter().cloned());
 
-        // Falling back to `logical` *silently* is the one thing this must not
-        // do. It makes `logical > physical` vacuously false, so the SMT reason
-        // never fires, and it checks the core budget against sibling threads —
-        // two PASSes about a host nothing was learned from. A refusal machine
-        // whose failure mode is a false PASS has the defect it cannot afford,
-        // so the fallback is stated and it fails both verdicts.
+        // Falling back to `logical` silently would make the SMT reason vacuously false
+        // and check the core budget against siblings: a false PASS. The fallback is stated
+        // and fails both verdicts.
         let physical = detected_physical.unwrap_or(logical);
         let unknown_cores = detected_physical.is_none();
         if unknown_cores {
@@ -884,12 +624,9 @@ impl Fitness {
             ));
         }
 
-        // `saturating_add`, not `+`: `consumers` comes from `--consumers`, and
-        // `usize::MAX + 1` wraps to 0 in a release build, making `physical < 0`
-        // false and printing the core budget as PASS. `just bench-report` builds
-        // `--release`, so the wrap is the reachable half, not the debug panic.
+        // `saturating_add`: `--consumers` of `usize::MAX` would wrap to 0 in release and print the budget as PASS.
         let needed = consumers.saturating_add(1);
-        // Not folded into `reasons`: this one governs the N-way rows only.
+        // Not in `reasons`: this governs the N-way rows only.
         let core_reason = if unknown_cores {
             Some(format!(
                 "the physical core count is unknown on this host, so a {consumers}-consumer \
@@ -912,12 +649,8 @@ impl Fitness {
             ));
         }
 
-        // Load is the one timing check that does **not** divide out of a
-        // cross-engine quotient, and it fails in the direction that flatters
-        // us: the two arms are asymmetric, so a busy host inflates the ratio
-        // rather than adding noise to it (`Sensitivity`'s docs carry the
-        // mechanism). That is precisely the thumb on the scale §9.3 exists to
-        // catch, so `busy` reaches the ratio axis.
+        // Load does not divide out of a cross-engine quotient (only one arm locks) and
+        // fails in our favour, so `busy` reaches the ratio axis.
         if busy > crate::mp::QUIET_ENOUGH {
             timing_and_ratio.push(format!(
                 "machine is {:.0}% busy before the run starts (threshold {:.0}%); a \
@@ -942,8 +675,7 @@ impl Fitness {
             ),
         }
 
-        // The unions. `reasons` is every check that reaches a duration, which is
-        // all three buckets except the memory-only one.
+        // The unions.
         reasons.extend(timing_and_ratio.iter().cloned());
         let ratio_reasons: Vec<String> = universal
             .iter()
@@ -974,30 +706,21 @@ impl Fitness {
         }
     }
 
-    /// The status a single-threaded, in-process timing row should carry.
-    ///
-    /// The core budget is deliberately not consulted: such a row uses one core
-    /// and one process, so a 4-core host is no obstacle to it.
+    /// The status a single-threaded, in-process timing row should carry; the core
+    /// budget is not consulted.
     #[must_use]
     pub fn timing_status(&self) -> Status {
         Fitness::status_from(self.fair_for_timing, self.forced)
     }
 
-    /// The one place a [`Sensitivity`] is mapped to the verdict it rests on.
+    /// The one place a [`Sensitivity`] is mapped to a verdict.
     ///
-    /// Returns `(is_fair, how the row is described in a refusal, why it failed)`.
-    /// This is the only `match` on [`Sensitivity`] that decides fitness, so
-    /// adding a variant is one non-exhaustive-match error rather than three
-    /// places to remember. Both arms of `Report::validate` and [`Row::status_on`]
-    /// call it.
+    /// Returns `(is_fair, how a refusal describes the row, why it failed)`.
+    /// `Report::validate` and [`Row::status_on`] call it.
     ///
-    /// **`status_on` and [`Fitness::memory_status`] currently have no caller.**
-    /// `ratio_row` reaches for [`Fitness::ratio_status`] directly and the two
-    /// `Memory` rows are unavailable for build reasons before fitness is
-    /// consulted, so neither path runs yet. They are kept rather than deleted
-    /// because they are the shape the memory rows need the moment those
-    /// resolve — but that means the single-match property above is *enforced*
-    /// only for the axes `validate` actually exercises.
+    /// `status_on` and [`Fitness::memory_status`] currently have no caller; kept for
+    /// the memory rows, so the single-match property is enforced only for the axes
+    /// `validate` exercises.
     #[must_use]
     pub fn axis(&self, sensitivity: Sensitivity) -> (bool, &'static str, String) {
         match sensitivity {
@@ -1090,11 +813,8 @@ pub struct Provenance {
 
 impl Provenance {
     /// Collect the environment description, measuring rather than assuming.
-    ///
-    /// §9.3 asks for the DDS vendor, RMW implementation, QoS and executor
-    /// configuration. When no ROS 2 is in the configuration those are recorded
-    /// as `none (…)` rather than omitted: a reader must be able to tell "there
-    /// was no middleware in this measurement" from "we forgot to write it down".
+    /// Collect the environment description, measuring rather than assuming. Missing
+    /// ROS 2 facts are recorded as `none (…)`, not omitted.
     #[must_use]
     pub fn collect() -> Provenance {
         let mut f = Vec::new();
@@ -1117,27 +837,12 @@ impl Provenance {
             "rustc",
             capture("rustc", &["--version"]).unwrap_or_else(unknown),
         );
-        // **The profile directory, measured, not `cfg!(debug_assertions)`.**
-        //
-        // This field used to be a two-valued guess: debug assertions on meant
-        // "debug" and off meant "release". Under `--profile embedder` — the
-        // profile every boundary measurement in this repository is taken at,
-        // because it is the one whose `lto = false` leaves the boundary in the
-        // binary — debug assertions are also off, so the guess printed
-        // `release`. Two runs answering *different questions* therefore carried
-        // *identical* provenance, and `baseline::PORTABLE_FACTS` and
-        // `runstore::BUILD_CRITICAL_FACTS` both compare this key, so both would
-        // have compared them and said nothing.
-        //
-        // `build.rs` reads the directory cargo actually built into out of
-        // `OUT_DIR`; see its comment for why that is a fact rather than a label.
+        // The profile directory as built (see `build.rs`), not `cfg!(debug_assertions)`:
+        // under `--profile embedder` debug assertions are off, so the guess said `release`
+        // and two different questions carried identical provenance
+        // (`baseline::PORTABLE_FACTS`, `runstore::BUILD_CRITICAL_FACTS` compare this key).
         push("build_profile", crate::embed::PROFILE_DIR.to_owned());
-        // The half that says what the profile *means*. `build_profile` is the
-        // join key — it is what a comparison matches on — and `build_lto` is
-        // the reason the join key matters: thin LTO inlines across a crate
-        // boundary, so a boundary priced under it is a boundary that was not
-        // there. Recorded beside the profile so a reader of `results.json` does
-        // not have to know this workspace's `[profile.*]` sections by heart.
+        // `build_lto` says what the profile means: thin LTO inlines across a crate boundary.
         push("build_lto", build_lto());
         push("target", std::env::consts::ARCH.to_owned());
         push("counters_feature", cfg!(feature = "counters").to_string());
@@ -1153,9 +858,7 @@ impl Provenance {
         );
         push("interp_policy", "LerpSlerp (tf2's policy)".to_owned());
         push("cpu_model", cpu_model().unwrap_or_else(unknown));
-        // Spelled `unknown` rather than backfilled from `available_parallelism`:
-        // this is the provenance block, and a number here is read as a measured
-        // fact about the host. See `physical_cores`.
+        // `unknown`, not backfilled from `available_parallelism`: a number here reads as a measured fact.
         push(
             "physical_cores",
             physical_cores().map_or_else(unknown, |n| n.to_string()),
@@ -1174,25 +877,10 @@ impl Provenance {
             "kernel",
             read_trim("/proc/sys/kernel/osrelease").unwrap_or_else(unknown),
         );
-        // **Two THP knobs, and §9.3's singular "THP setting" named the wrong
-        // one for this project's own arena.** `transparent_hugepage/enabled`
-        // governs *anonymous* mappings; a live `tf_tree` arena is a sealed
-        // `memfd` mapped `MAP_SHARED`, which is shmem and is governed by
-        // `transparent_hugepage/shmem_enabled` — a separate file with a
-        // different vocabulary, whose stock default is `never` while `enabled`
-        // reads `[madvise]`. `crates/tf_tree_cli/src/hostfacts.rs` carries the
-        // full argument and the cost of getting it wrong: `TFT016` reported a
-        // host as healthy while `MADV_HUGEPAGE` on the arena's mapping was a
-        // silent no-op. Both are recorded, under keys that name their sysfs
-        // file, because which one governs depends on the row: the frozen `.tft`
-        // path is a *file* mapping and is governed by neither.
-        //
-        // Raw text, not parsed, and deliberately no second copy of
-        // `hostfacts`'s parsers: `tf_tree_bench` does not depend on
-        // `tf_tree_cli` (nothing does; it is the binary crate), and a provenance
-        // header wants the string an operator can write back into the file, not
-        // a verdict. A parser here would be the second spelling `CLAUDE.md`
-        // forbids.
+        // Two THP knobs: `enabled` governs anonymous mappings, but a live arena is a
+        // sealed `memfd` `MAP_SHARED` mapping governed by `shmem_enabled` (see
+        // `crates/tf_tree_cli/src/hostfacts.rs`, `TFT016`). Raw text, not parsed: no second
+        // copy of `hostfacts`'s parsers.
         push(
             "transparent_hugepage",
             read_trim("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_else(unknown),
@@ -1264,13 +952,11 @@ impl Provenance {
 pub struct Report {
     /// Environment description (§9.3).
     pub provenance: Provenance,
-    /// The build facts [`Ground`] is decided against. See [`Build`] for why
-    /// they are carried here rather than read from `cfg!` at the point of use.
+    /// The build facts [`Ground`] is decided against.
     pub build: Build,
     /// Host fitness verdict, and why.
     pub fitness: Fitness,
-    /// Seconds of warm-up discarded before any timing row was recorded (§9.3
-    /// requires this to be stated, not merely done).
+    /// Seconds of warm-up discarded before any timing row (§9.3 requires it stated).
     pub warmup_discarded_s: f64,
     /// The §9.2 rows.
     pub rows: Vec<Row>,
@@ -1281,62 +967,29 @@ pub struct Report {
 impl Report {
     /// Enforce §9.3 against the assembled report.
     ///
-    /// # Which of §9.3's five bullets this reaches, and which it does not
-    ///
-    /// The row-by-row map is kept here, beside the code, because a claim about
-    /// what a check covers belongs where the check is:
-    ///
     /// | §9.3 bullet | Held by |
     /// |---|---|
-    /// | 1 — identical QoS, executor configuration, DDS vendor and version, all recorded | [`REQUIRED_FACTS`]' `dds_qos` / `executor_config` / `rmw_implementation`, **recorded only** — see below |
-    /// | 2 — both stacks warmed, first N seconds discarded, N stated | the warm-up rule below |
-    /// | 3 — `tf2` version, ROS distro, RMW, kernel, CPU model, THP setting | [`REQUIRED_FACTS`] |
-    /// | 4 — report where `tf_tree` is worse, in the same table | [`REQUIRED_WORSE`] and the `worse` loop below |
-    /// | 5 — publish the harness source in the same repository | the reproduce-command rule below, **partially** |
+    /// | 1 — QoS, executor, DDS vendor recorded | [`REQUIRED_FACTS`]' `dds_qos` / `executor_config` / `rmw_implementation`, **recorded only** |
+    /// | 2 — warm-up discarded, N stated | the warm-up rule below |
+    /// | 3 — `tf2` version, distro, RMW, kernel, CPU, THP | [`REQUIRED_FACTS`] |
+    /// | 4 — where `tf_tree` is worse | [`REQUIRED_WORSE`] and the `worse` loop |
+    /// | 5 — harness published in the repository | the reproduce-command rule, **partially** |
     ///
-    /// **Bullet 1's word is *identical*, and nothing here can check it.** It
-    /// governs a two-arm run — the same QoS and the same executor on both
-    /// stacks — and this report is assembled in one process that stands up
-    /// neither, so there is one recorded value per key and no second value to
-    /// compare it against. What `validate` enforces is the second half of the
-    /// bullet, "all recorded in the report": the keys are present and
-    /// non-empty. When the N-way comparison rows acquire a real two-arm
-    /// harness, the comparison is theirs to make and this method should gain
-    /// it; recording that it is missing is worth more than a rule that reads as
-    /// though it were there.
-    ///
-    /// **Bullet 2's N is one number for the whole report, and three rows rest
-    /// on it.** `warmup_discarded_s` is [`Options::warmup`], and `Options::warmup`
-    /// reaches exactly one measurement: `measure_lookup_latency`, in this
-    /// process, for the `lookup_latency` row. The other two rows the rule
-    /// governs are timed elsewhere and never see it —
-    /// `embedding_cross_crate` loads a pair `just embed-cost` produced in a
-    /// separate process, and `lookup_ratio_vs_tf2` is timed by
-    /// `crate::ratio::measure`, which discards its own warm-up on its own
-    /// schedule. So for those two the figure is a **report-level declaration**
-    /// rather than that row's discarded window: the rule catches `--warmup 0s`
-    /// and a non-finite N, and it does not establish that the row's own
-    /// warm-up was stated. A per-row warm-up is what would, and it is not
-    /// built.
-    ///
-    /// **Bullet 5 is a claim about a repository, and a running binary cannot
-    /// see one.** The half that is mechanical is that every row names a command
-    /// that re-derives it, which is enforced here for all three statuses; that
-    /// those commands *exist* is
-    /// `tests::every_command_the_report_names_is_a_command_that_exists`, which
-    /// resolves each one against the real `justfile` and the real target files.
-    /// Neither says the harness is public, and neither can.
+    /// Bullet 1's *identical* cannot be checked: this process stands up neither stack.
+    /// Bullet 2's N is [`Options::warmup`], which reaches only
+    /// `measure_lookup_latency`; for `embedding_cross_crate` and `lookup_ratio_vs_tf2`
+    /// it is a report-level declaration. Bullet 5's mechanical half is that every row
+    /// names a command;
+    /// `tests::every_command_the_report_names_is_a_command_that_exists` checks it
+    /// exists.
     ///
     /// # Errors
     ///
-    /// One string per violation. The caller is expected to fail rather than to
-    /// emit a report that broke a rule.
+    /// One string per violation; the caller fails rather than emit the report.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut bad = Vec::new();
 
-        // §9.3 bullets 1 and 3. A closed list, in the shape `REQUIRED_ROWS`
-        // already uses, and for the same reason: a header that silently lost a
-        // key reads as complete.
+        // §9.3 bullets 1 and 3: a closed list, like `REQUIRED_ROWS`.
         for key in REQUIRED_FACTS {
             match self.provenance.get(key) {
                 None => bad.push(format!(
@@ -1353,12 +1006,8 @@ impl Report {
             }
         }
 
-        // §9.3 bullet 2. "Both stacks warmed; discard the first N seconds;
-        // state N" — so a report whose timed rows print numbers must state a
-        // positive N, and every report must state a number at all. The rule is
-        // scoped to the axes a warm-up is *for*: `Memory` reads Pss out of
-        // /proc and `HostIndependent` compares two engines' arithmetic, and
-        // neither has a cold path to discard.
+        // §9.3 bullet 2: timed rows that print numbers need a positive N. `Memory` and
+        // `HostIndependent` have no cold path to discard.
         if !self.warmup_discarded_s.is_finite() || self.warmup_discarded_s < 0.0 {
             bad.push(format!(
                 "PHASE5 §9.3 requires the discarded warm-up to be stated; this report \
@@ -1399,10 +1048,7 @@ impl Report {
         }
 
         for r in &self.rows {
-            // Applies to `measured` and `indicative` alike: both print numbers,
-            // so both can carry a regression past the gate. `unavailable` rows
-            // carry no numbers at all (checked below), so there is nothing to
-            // type.
+            // Both `measured` and `indicative` rows print numbers and so need a direction.
             if r.status != Status::Unavailable
                 && !r
                     .tf_tree
@@ -1431,10 +1077,7 @@ impl Report {
                     ));
                 }
             }
-            // §9.3 bullet 5's mechanical half, for every status rather than
-            // only for `unavailable`. A `measured` row with no command behind
-            // it is a number nobody outside this process can re-derive, which
-            // is the same failure as an unavailable row with no way forward.
+            // §9.3 bullet 5's mechanical half, for every status.
             if r.reproduce.trim().is_empty() {
                 bad.push(format!(
                     "row `{}` is `{}` and names no command that re-derives it. PHASE5 \
@@ -1444,9 +1087,7 @@ impl Report {
                     r.status.as_str()
                 ));
             }
-            // The grounds under this row's reason, re-derived. See [`Ground`]
-            // for why the decisive half of a reason is an enum and not prose,
-            // and for the three variants nothing here can decide.
+            // The grounds under this row's reason, re-derived (see [`Ground`]).
             if r.status == Status::Unavailable && r.grounds.is_empty() {
                 bad.push(format!(
                     "row `{}` is `unavailable` with a reason resting on no stated ground. \
@@ -1489,11 +1130,7 @@ impl Report {
                     if r.tf_tree.is_empty() && r.tf2.is_empty() {
                         bad.push(format!("row `{}` is `measured` with no numbers", r.id));
                     }
-                    // The rule the whole module exists for. Each sensitivity is
-                    // checked against the axis it actually rests on, so a row
-                    // can no longer be refused for a fact that does not reach
-                    // it — nor claim `measured` on a host that fails the one
-                    // that does.
+                    // Each sensitivity is checked against the axis it rests on.
                     let (fair, axis, why) = self.fitness.axis(r.sensitivity);
                     if !fair {
                         bad.push(format!(
@@ -1502,20 +1139,9 @@ impl Report {
                             r.id,
                         ));
                     }
-                    // The second half of the same rule. An N-way row on a host
-                    // with fewer cores than consumers measures the scheduler,
-                    // and that is true even where the clock is perfect.
-                    //
-                    // **Except for a memory row, and that exception is the
-                    // point.** "Above the core count the rows measure the
-                    // scheduler" is a statement about throughput and latency.
-                    // Sixteen workers mapping one `.tft` on four cores share
-                    // exactly the pages they would share on sixteen: Pss is
-                    // decided by the page tables, not by who is running. §12
-                    // gate 4 — total Pss within 1.2x of one worker — is the
-                    // wedge's central claim and it was unmeasurable here only
-                    // because it was being asked a question about cores that it
-                    // does not depend on.
+                    // An N-way row on a host with fewer cores than consumers measures the
+                    // scheduler, except a memory row: Pss is decided by page tables, not by who runs
+                    // (§12 gate 4).
                     let core_budget_applies =
                         r.needs_n_cores && r.sensitivity != Sensitivity::Memory;
                     if core_budget_applies && !self.fitness.enough_cores {
@@ -1531,10 +1157,7 @@ impl Report {
                     }
                 }
                 Status::Indicative => {
-                    // Per-axis for the same reason `measured` is: a memory row
-                    // labelled `indicative` on a host whose only failing checks
-                    // are about the clock is hiding a number that was never in
-                    // doubt.
+                    // Per-axis, as for `measured`.
                     let (fair, _, _) = self.fitness.axis(r.sensitivity);
                     if fair {
                         bad.push(format!(
@@ -1586,27 +1209,14 @@ impl Report {
                 )),
                 _ => {}
             }
-            // The rule the rows above already carry, applied to the section
-            // whose entire purpose is to be the row that *can* regress.
-            //
-            // **This is the defect `docs/decisions/0021` step 4 walked into.**
-            // `arena_memory_floor` printed five numbers for its whole life and
-            // gave none of them a direction, so `crate::baseline` — which until
-            // then compared only the *set* of entry ids — had nothing to
-            // compare, and the falsifier that record names for itself ("a
-            // deliberate revert of step 2 making it fail") passed. Measured, not
-            // argued: with the alignment fix reverted the arena goes back to
-            // ~100% resident and `just bench-check` printed
+            // The rule the rows carry, applied to `worse` entries: `arena_memory_floor`
+            // printed five numbers with no direction, so `crate::baseline` had nothing to
+            // compare and reverting `docs/decisions/0021` step 2 still printed
             // `PASS - 1 directional metric held`.
             //
-            // Scoped to a host that could have produced the number.
-            // `worse_entries` withholds `arena_memory_floor`'s Pss metrics when
-            // the memory axis fails, and refusing to emit a report at all on
-            // such a host would turn "this machine cannot read
-            // `smaps_rollup`" into "there is no artifact" — a worse answer than
-            // the one this rule prevents. The memory axis is the only fitness
-            // axis that reaches a `Worse` entry today; a second one belongs in
-            // this predicate.
+            // Scoped to a host that could have produced the number: `worse_entries` withholds
+            // the Pss metrics when the memory axis fails, and refusing the whole report there
+            // would turn "cannot read `smaps_rollup`" into "no artifact".
             if self.fitness.fair_for_memory
                 && w.metrics_withheld.is_empty()
                 && !w.metrics.is_empty()
@@ -1666,9 +1276,7 @@ impl Report {
             "    \"fair_for_timing\": {},",
             self.fitness.fair_for_timing
         );
-        // The other two axes are published too, or the split is invisible in the
-        // artifact and a reader cannot tell why a memory row was measured on a
-        // host whose `fair_for_timing` is false.
+        // The other axes are published too, so the split is visible in the artifact.
         let _ = writeln!(
             s,
             "    \"fair_for_ratios\": {},",
@@ -1761,12 +1369,8 @@ impl Report {
         s
     }
 
-    /// `index.html` — self-contained, no external assets, no script.
-    ///
-    /// The §9.3 "where we are worse" entries are rendered **inside the results
-    /// table**, because §9.3 says "in the same table and not in a footnote" and
-    /// a separate section at the bottom of the page is a footnote with better
-    /// typography.
+    /// `index.html` — self-contained, no external assets, no script. The §9.3
+    /// "where we are worse" entries render **inside the results table** ("not in a footnote").
     #[must_use]
     pub fn to_html(&self) -> String {
         let mut s = String::with_capacity(16384);
@@ -1850,9 +1454,7 @@ impl Report {
                 } else {
                     format!("<br>{}", cell_html(&w.metrics))
                 },
-                // The reason is rendered *with* the statement, not below the
-                // table: an explanation of why a cost has no number is only
-                // worth anything next to the place the number would have been.
+                // The reason renders beside the place the number would have been.
                 match &w.metrics_absent_because {
                     None => esc_html(&w.statement),
                     Some(why) => format!(
@@ -1898,13 +1500,8 @@ impl Report {
 pub struct Options {
     /// Consumer count the comparison is scoped to (§9.1's `--consumers`).
     pub consumers: usize,
-    // §9.1 also spells `--duration`, the steady-state window per point. There is
-    // deliberately no field for it: every row it would govern is an N-way
-    // comparison row, all of which are UNAVAILABLE here, and the one row this
-    // tool measures itself is bounded by `lookup_samples`, not by wall clock. A
-    // stored-and-never-read knob is the same quiet dishonesty the module exists
-    // to prevent, so the binary rejects the flag instead. It returns, with
-    // something to govern, when the N-way rows do.
+    // No `--duration` field: every row it would govern is an N-way row, unavailable
+    // here, so the binary rejects the flag rather than store a knob nothing reads.
     /// Warm-up discarded before any timing row is recorded (§9.3).
     pub warmup: Duration,
     /// Lookup samples for the latency row.
@@ -1912,12 +1509,9 @@ pub struct Options {
     /// Random queries for the differential row.
     pub differential_queries: usize,
     /// Directory holding the two `embed_cost` runs (§9.2's last row).
-    ///
-    /// [`None`] is the ordinary case and not an omission: this binary is built
-    /// with one profile, and the row is a comparison *between* two, so it cannot
-    /// be measured from inside a single build of this tool. `just embed-cost`
-    /// produces the pair; without it the row is [`Status::Unavailable`] with
-    /// that as the reason.
+    /// [`None`] is the ordinary case: the row compares two profiles, so one build
+    /// cannot measure it. `just embed-cost` produces the pair; without it the row is
+    /// [`Status::Unavailable`].
     pub embed_cost: Option<std::path::PathBuf>,
 }
 
@@ -1935,22 +1529,12 @@ impl Default for Options {
 
 /// Why the two `.tft` rows are unavailable, for a given `attempt`.
 ///
-/// # The reason is derived from a `cfg`, not written as prose, and that is the
-/// point
-///
-/// The frozen backend is `#[cfg(all(feature = "shm", target_os = "linux"))]`,
-/// and `just bench-report` builds without `--features shm`, so on the shipped
-/// recipe `Tree::open_frozen` is *not compiled into this binary* — that is the
-/// real blocker, it is checkable by the compiler, and it cannot go stale the
-/// way a sentence about a phase can.
-///
-/// The branch carries `Ground::MeasuredElsewhere`, which is one of the three
-/// grounds `Report::validate` cannot decide: this half of the reason rests on
-/// somebody having read the repository. What checks it here is
-/// `every_command_the_report_names_is_a_command_that_exists`, and what that
-/// resolves is the recipe's *name* — not that the recipe measures this row.
-/// Each row names the recipe that takes its own measurement (`just gate4`,
-/// `just gate2`).
+/// The reason is derived from a `cfg`: the frozen backend needs
+/// `all(feature = "shm", target_os = "linux")` and `just bench-report` builds
+/// without it, so `Tree::open_frozen` is not compiled in. The other branch carries
+/// `Ground::MeasuredElsewhere`, which `Report::validate` cannot decide; only the
+/// recipe's *name* is checked
+/// (`every_command_the_report_names_is_a_command_that_exists`).
 fn frozen_row_reason(attempt: &str, recipe: &str) -> String {
     if cfg!(all(feature = "shm", target_os = "linux")) {
         format!(
@@ -1968,16 +1552,13 @@ fn frozen_row_reason(attempt: &str, recipe: &str) -> String {
     }
 }
 
-/// Build the whole §9 artifact for this host.
-///
-/// Every row is either measured here or [`Status::Unavailable`] with the reason
-/// and the command that measures it elsewhere. Nothing is estimated, and the
-/// caller is expected to run [`Report::validate`] before writing anything.
+/// Build the whole §9 artifact for this host. Every row is measured here or
+/// [`Status::Unavailable`] with a reason and the command that measures it elsewhere;
+/// nothing is estimated. The caller runs [`Report::validate`] before writing.
 ///
 /// # Errors
 ///
-/// Only a *measurement* failure propagates — a missing fixture frame, say. An
-/// unmeasurable row is not an error; it is a row.
+/// Only a *measurement* failure propagates; an unmeasurable row is a row.
 pub fn assemble(opts: &Options) -> Result<Report> {
     assemble_on(
         opts,
@@ -1987,20 +1568,11 @@ pub fn assemble(opts: &Options) -> Result<Report> {
     )
 }
 
-/// [`assemble`] with the host verdict, the build and the ROS environment handed
-/// in rather than probed.
+/// [`assemble`] with the host verdict, build and ROS environment handed in.
 ///
-/// **This seam exists because the all-clear host was unreachable from a test,
-/// and a defect lived there.** `assemble` probes, so every committed test ran
-/// on whatever host it ran on, and this repository's development host has four
-/// physical cores. The defect, and the host-independent ground every N-way row
-/// now states because of it, are in the `host_grounds` comment below; the seam
-/// is what lets `tests::a_host_with_no_obstacle_still_grounds_every_n_way_row`
-/// pin it.
-///
-/// Not `pub`: the `build` argument must agree with the `cfg!`s the binary was
-/// compiled under, because the `#[cfg]`-selected arms of [`ratio_row`] and the
-/// differential row are chosen at compile time and cannot be talked out of it.
+/// The seam exists so `tests::a_host_with_no_obstacle_still_grounds_every_n_way_row`
+/// can reach the all-clear host (see the `host_grounds` comment). Not `pub`: `build`
+/// must agree with the `cfg!`s the binary was compiled under.
 ///
 /// # Errors
 ///
@@ -2015,38 +1587,19 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
     } else {
         ""
     };
-    // The reason an *N-way, cross-engine* row is missing here, and the host
-    // obstacles under it. Each `parts.push` below has exactly one
-    // `host_grounds.push` beside it, so the prose and the machine-checkable
-    // half cannot drift apart.
+    // The reason an N-way, cross-engine row is missing, and the host obstacles under
+    // it; each `parts.push` has one `host_grounds.push` beside it.
     //
-    // **`host_grounds` is CONDITIONAL and can legitimately be empty, and every
-    // row below must therefore add a ground of its own.** That is the defect
-    // this block shipped with: these were the whole ground list, so on a host
-    // with no obstacle at all the three N-way rows were `unavailable` resting
-    // on nothing and `Report::validate` rejected the entire report. The
-    // permanent gap is not a host obstacle — `bench_report` is one process and
-    // stands up no consumers, so **it measures no N-way row on any host** — so
-    // it leads the reason unconditionally, and each row states the ground that
-    // goes with it:
-    // `MeasuredElsewhere` where the recipe the row names really does take the
-    // number, `NoInstrument` where nothing takes it at all. Those are different
-    // claims and `publish_to_visible` is the row that makes the second one, so
-    // seeding `MeasuredElsewhere` into this shared vector would have quietly
-    // published an over-claim on exactly the row whose reason says the number
-    // does not exist.
+    // `host_grounds` can legitimately be empty, so every row must add a ground of its
+    // own: `bench_report` is one process and measures no N-way row on any host, so that
+    // leads the reason unconditionally. `MeasuredElsewhere` where the named recipe takes
+    // the number, `NoInstrument` where nothing does (`publish_to_visible`); seeding
+    // `MeasuredElsewhere` here would over-claim on that row.
     let mut host_grounds: Vec<Ground> = Vec::new();
     let host_reason = {
-        // Only the process-count half is unconditional. It is true in every
-        // build: nothing here forks a consumer. The second-engine half is NOT —
-        // under `--features tf2` this binary links one, and `crate::ratio::measure`
-        // and `crate::differential::run_tf2` both call `tf2::BufferCore` in this
-        // process — so it lives in the branch below, which fires only when
-        // `no_ros`, and `no_ros` implies `!build.tf2_linked`. Not
-        // compile-checkable on a host with no ROS 2 install (`cargo check
-        // --features tf2` fails in `tf_tree_tf2_sys`'s build script); the split is
-        // reasoned off `Build::current()`, whose `tf2_linked` is
-        // `cfg!(feature = "tf2")`.
+        // Only the process-count half is unconditional. The second-engine half fires
+        // only when `no_ros`, which implies `!build.tf2_linked`; under `--features tf2` this
+        // binary calls `tf2::BufferCore` in-process.
         let mut parts: Vec<String> = vec![format!(
             "this tool is a single process: it stands up none of the {n} consumers this \
              row compares, so the row is not measured here on any host — the command \
@@ -2067,9 +1620,7 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
         parts.join("; ")
     };
 
-    // The two rows whose recipe really does take the number the row is about.
-    // Non-empty on every host by construction: the seed is the standing gap,
-    // and `host_grounds` is whatever this host adds to it.
+    // The rows whose recipe really takes the number; non-empty by construction.
     let n_way_grounds: Vec<Ground> = std::iter::once(Ground::MeasuredElsewhere)
         .chain(host_grounds.iter().copied())
         .collect();
@@ -2089,8 +1640,7 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
         .on(&n_way_grounds),
     );
 
-    // The residual that is true in *both* builds is process count: this row
-    // sums Pss across N consumer processes and `bench_report` is one process.
+    // True in both builds: `bench_report` is one process and has no consumers to weigh.
     let rss_reason = {
         let mut r = "this row sums Pss across N consumer processes, and `bench_report` is \
              one process — it stands up no consumers and has none to weigh. `just \
@@ -2125,15 +1675,9 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
         .on(&rss_grounds),
     );
 
-    // The one timing row this tool measures itself. It is deliberately the
-    // narrowest one: a single-threaded hot-path lookup needs no second engine
-    // and no second process, so the only thing standing between it and a number
-    // is the host — which is exactly what the fitness probe decides.
-    //
-    // Its refusal reason is therefore `fitness.reason_line()` and **not**
-    // `host_reason`: this row does not want 17 cores and does not want a ROS 2
-    // install, so quoting either at a reader would be a false statement about
-    // why the number is missing. §9.3's "say why" means the actual why.
+    // The one timing row this tool measures itself: single-threaded, so only the
+    // host stands between it and a number. Its reason is `fitness.reason_line()`, not
+    // `host_reason`, which would state a false why (17 cores, ROS 2).
     let mut lookup = Row::unavailable(
         "lookup_latency",
         "Lookup latency, depth 3, hot path (p50, p99, p99.9)",
@@ -2168,9 +1712,7 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
     }
     rows.push(lookup);
 
-    // Built before the row so the prose and the ground list are written side by
-    // side: the `shm` clause and `Ground::FrozenBackendNotCompiled` are one
-    // claim, and `validate` re-derives the second.
+    // Built before the row so the `shm` clause and `Ground::FrozenBackendNotCompiled` are one claim.
     let (ptv_reason, ptv_grounds) = {
         let mut r = format!(
             "{host_reason}. There is a further gap, and it is not the one this reason \
@@ -2179,14 +1721,9 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
              listeners, §5.2's QoS — but `dds_report` reports `svc`, the engine call \
              itself, so its number answers a different question"
         );
-        // **`NoInstrument`, and deliberately not `MeasuredElsewhere`.** This
-        // row's own reason says nothing in this repository times
-        // publish-to-visible end to end; `just mp-bench` measures service
-        // latency, which the reason says answers a different question. Calling
-        // that "measured elsewhere" would be the over-claim the `Ground` type
-        // exists to stop, in the type meant to stop it. It is unconditional, so
-        // this row's ground list is non-empty on every host without the seed
-        // the other two N-way rows take.
+        // `NoInstrument`, not `MeasuredElsewhere`: nothing here times publish-to-visible
+        // end to end (`just mp-bench` measures service latency). Unconditional, so the
+        // ground list is non-empty on every host.
         let mut g = vec![Ground::NoInstrument];
         g.extend(host_grounds.iter().copied());
         if !build.frozen_backend {
@@ -2205,17 +1742,8 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
             "Publish -> visible-to-consumer (p50, p99.9)",
             "Both stacks, publisher process to consumer process.",
             Sensitivity::AbsoluteTiming,
-            // **"a DDS round trip that no configuration here provides" was
-            // this row's reason and it is false**: `ros/tf_tree_bench_ros` plus
-            // `just dds-bench` is one publisher on /tf, a real DDS, §5.2's QoS
-            // and N `tf2_ros::TransformListener` consumers, and §0.0's §9 row
-            // describes it at length. What is genuinely missing is the
-            // *instrument*: `dds_report`'s `svc` column times the engine call,
-            // not the publish timestamp to the moment a consumer can see it.
-            // A numeral in front of a list whose length is decided by a `cfg!`
-            // further down the function is not a fact the writer can hold, so
-            // there is no numeral — the sentences enumerate themselves, and the
-            // ground list beside them is what `validate` re-derives.
+            // What is missing is the *instrument*: `dds_report`'s `svc` column times the
+            // engine call, not publish-to-visible. No numeral in front of a `cfg!`-decided list.
             ptv_reason,
             "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
         )
@@ -2229,20 +1757,10 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
             "Scaling curve, N = 1..16 (throughput, CPU)",
             "Both stacks. The claim under test is that reads scale with threads.",
             Sensitivity::AbsoluteTiming,
-            // The 5.35-5.62x figure is attributed to the host `docs/PHASE5.md` §0.0
-            // recorded it on, not to whatever host is running this binary — quoting
-            // somebody else's number as if it came from here is the exact move §9.3
-            // exists to stop.
-            //
-            // **And it is stated only where it applies.** The sentence is
-            // evidence that a *short* host bends this curve; on a host wide
-            // enough for the comparison it describes somebody else's machine
-            // while the row's actual gap is the process count above, which is
-            // the same "reason that is not this row's reason" the amendment
-            // below `Ground` was written against.
+            // The 5.35-5.62x figure is attributed to the host `docs/PHASE5.md` §0.0 recorded
+            // it on, and stated only where a short host applies.
             {
-                // Moves `host_reason`: this is its last reader, and clippy's
-                // `redundant_clone` is right that a clone here would be one.
+                // Moves `host_reason`: its last reader.
                 let mut r = host_reason;
                 if fitness.core_reason.is_some() {
                     r.push_str(
@@ -2271,11 +1789,8 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
                 "mapping one .tft from sixteen worker processes",
                 "just gate4",
             ),
-            // **Not "on >= 16 physical cores".** This is a `Memory` row, which
-            // `Report::validate`'s core-budget clause exempts; `just gate4`
-            // measures it on this 4-core host and reports 1.024x. Naming a core
-            // count here asked the reader for a machine the row does not need,
-            // and contradicted the clause written to say so.
+            // Not "on >= 16 physical cores": a `Memory` row is exempt from the core budget
+            // and `just gate4` measures it on this host.
             "just gate4 (the Rust worker, which is what §12 criterion 4 is stated over; \
              `just gate4-python` reports the same measurement with a CPython worker and \
              does not gate)",
@@ -2294,17 +1809,9 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
             ".tft open time vs bag parse time (ms)",
             "§12 gate 2 wants open under 10 ms for a 233 MB index.",
             Sensitivity::AbsoluteTiming,
-            // **Both halves have an instrument now, and the row still has
-            // none, because the row is a comparison.** `just gate2` times the
-            // open of a 338 MiB `.tft`; `just gate5` times a full
-            // `tf_tree_ingest::run` over an MCAP. What no artifact holds is the
-            // two over **one recording**: gate 2's index is frozen from a
-            // generated `Fleet` and was never a bag, and gate 5's corpus is a
-            // fabricated MCAP that nothing freezes. A ratio of two numbers
-            // taken on two different corpora is not this row's quantity, and
-            // publishing it would be the same thumb on the scale a one-sided
-            // memory row is — so the ground stays `NoInstrument`, which is a
-            // claim about the *ratio*.
+            // Both halves have an instrument (`just gate2`, `just gate5`) but no artifact
+            // holds them over one recording, so the ground stays `NoInstrument`: a ratio across
+            // two corpora is not this row's quantity.
             format!(
                 "{}. The comparison itself is what is missing: the open time and an ingest \
              time both have recipes, but no artifact holds them over one recording — the \
@@ -2328,14 +1835,10 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
         ]),
     );
 
-    // Correctness, and the one row that is hardware-independent by construction:
-    // a disagreement between two engines on the same inputs is the same number
-    // on a busy laptop and on pinned hardware.
+    // Correctness: host-independent by construction.
     let diff =
         crate::differential::run_naive_rust(opts.differential_queries, 0x5EED_1234_ABCD_0001)?;
-    // A differential that scored nothing has a `max_error` of 0.0 and looks
-    // perfect; `passed()` is what distinguishes the two, and a report whose
-    // correctness row is a failure dressed as a number is worse than no report.
+    // A differential that scored nothing has `max_error` 0.0 and looks perfect; `passed()` tells them apart.
     if !diff.passed() {
         bail!(
             "the naive-Rust differential did not pass ({} queries scored, max error {})",
@@ -2374,13 +1877,11 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
         needs_n_cores: false,
         status: Status::Measured,
         reason: String::new(),
-        // Measured, so there is nothing to excuse. `validate` refuses a row
-        // that prints numbers while still carrying a ground.
+        // Measured: nothing to excuse.
         grounds: Vec::new(),
         reproduce: "cargo test -p tf_tree_bench --release --test differential",
         tf_tree: vec![
-            // The one number in this report that is a claim on any host, so it
-            // is also the one the regression gate can actually hold.
+            // The one number in this report that is a claim on any host.
             Metric::new("max_deviation", diff.max_error, "rad or m")
                 .lower_is_better(DEVIATION_SLACK),
             Metric::new("compared", diff.compared as f64, "queries"),
@@ -2393,8 +1894,7 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
     rows.push(embedding_row(opts, &fitness)?);
     rows.push(ratio_row(&fitness));
 
-    // Built before the struct takes ownership of `fitness`: the resident-memory
-    // entry is gated on the memory axis, so it has to see the verdict.
+    // Built before the struct takes `fitness`: the memory entry is gated on the verdict.
     let worse = worse_entries(opts, &fitness);
     Ok(Report {
         provenance: Provenance::collect(),
@@ -2406,22 +1906,7 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
     })
 }
 
-/// §9.2's cross-crate row: the facade called from a separate crate against the
-/// identical body called from inside `tf_tree_core`.
-///
-/// The measurement itself is [`crate::embed`]; this is only the row. The split
-/// is forced rather than stylistic, and for two reasons. The row's in-crate
-/// column is `tf_tree_core::bench_probe`, compiled only under a default-off
-/// feature this tool does not enable; and §9.2 requires the row be reported at
-/// an **embedder's** profile, while this tool is built with `[profile.release]`
-/// — `lto = "thin"`, which erases the very boundary being measured. `just
-/// embed-cost` builds and runs it under both profiles and writes the pair.
-///
-/// **The exploratory profile comparison is deliberately not a row here.** It is
-/// two processes seconds apart, carries the full between-run noise of the host,
-/// and `docs/PHASE1.md` §11.2's exploratory measurements are the shape for that:
-/// `just embed-cost` prints it and writes it to `target/embed-cost/`, and
-/// nothing gates it.
+/// §9.2's cross-crate row is built by [`embedding_row`]; the measurement is [`crate::embed`].
 /// What the two columns of the tf2 ratio row mean, and what they do not.
 const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides (tf2's \
     policy), depth 3 after constant folding, 256 off-grid stamps. `speedup_vs_tf2` is the \
@@ -2458,19 +1943,12 @@ const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides
     Single-threaded and uncontended, which is both engines' best case; the contended \
     comparison, where tf2 anti-scales, is `just tf2-scaling`.";
 
-/// The depth-3 tf2 ratio, and the first row on the `Ratio` axis.
+/// The depth-3 tf2 ratio, the first row on the `Ratio` axis.
 ///
-/// **This is the row a 4-core host can actually gate.** Every other tf2
-/// comparison in §9.2 reports an absolute duration, and this host cannot produce
-/// one: the fitness probe fails on SMT, an unreadable governor and four physical
-/// cores, so all of them come out `unavailable` and the project's central
-/// performance claim is gated by nothing. A quotient of two arms measured inside
-/// one round is a different statistic — measured here, the within-run band is
-/// ~3% wide on the same host whose absolute latencies are unusable.
-///
-/// It is `unavailable` without the `tf2` feature, which needs a ROS 2 install,
-/// so `just bench-report` on a bare host still reports the gap rather than the
-/// number. `just tf2-check`'s container is where it resolves.
+/// The row a 4-core host can gate: every other tf2 comparison is an absolute
+/// duration and unavailable here, while a paired quotient has a ~3% within-run band.
+/// `unavailable` without the `tf2` feature (needs ROS 2; `just tf2-check`'s
+/// container is where it resolves).
 fn ratio_row(fitness: &Fitness) -> Row {
     const ID: &str = "lookup_ratio_vs_tf2";
     const TITLE: &str = "Depth-3 hot lookup, tf_tree vs tf2 (paired ratio)";
@@ -2513,18 +1991,9 @@ fn ratio_row(fitness: &Fitness) -> Row {
                 return row;
             }
         };
-        // A band that straddles the floor has not answered, and saying so beats
-        // resolving it by taking the median — `embed.rs`'s rule, and the reason
-        // a gate whose noise exceeds its threshold reports rather than passes.
-        // **Both non-`Above` verdicts stop here, and the `Below` arm is the one
-        // that matters.** An earlier revision special-cased only `Unresolved`,
-        // so a band lying entirely *under* the floor — `tf_tree` slower than the
-        // multiple this row exists to gate — fell through and was published as a
-        // clean `measured` row, with `floor` sitting next to a failing
-        // `speedup_vs_tf2` and nothing saying so. The less severe outcome was
-        // loud and the severe one was silent. Only the baseline's 15% slack
-        // would have caught it, and `just tf2-bench-baseline-update` bypasses
-        // that by construction.
+        // A band that straddles the floor has not answered (`embed.rs`'s rule). Both
+        // non-`Above` verdicts stop here: a `Below` band must not publish as a clean
+        // `measured` row.
         match run.verdict() {
             crate::ratio::Verdict::Above => {}
             crate::ratio::Verdict::Unresolved => {
@@ -2557,8 +2026,7 @@ fn ratio_row(fitness: &Fitness) -> Row {
             ),
         };
         if status == Status::Unavailable {
-            // The refusal moved from "the run declined" to "the host is unfit
-            // on the ratio axis", so the ground moves with it.
+            // The refusal is now "host unfit on the ratio axis", so the ground moves.
             row.reason = reason;
             row.grounds = vec![Ground::HostFitness];
         } else {
@@ -2579,12 +2047,8 @@ fn ratio_row(fitness: &Fitness) -> Row {
     }
 }
 
-/// Module-level rather than local to [`embedding_row`] so that
-/// `the_row_note_states_the_settings_the_manifest_declares` can read the two
-/// settings back out of the workspace manifest with
-/// [`crate::embed::profile_settings_from_manifest`] and assert this prose still
-/// matches them. `just embed-cost`'s own output deliberately does not repeat
-/// them; a second copy is a second thing that can go stale.
+/// Module-level so `the_row_note_states_the_settings_the_manifest_declares` can
+/// check this prose against the workspace manifest.
 const EMBEDDING_NOTE: &str = "One build, one profile, two identical bodies. `out_of_crate_ns` \
     times an `#[inline(never)]` depth-3 lookup compiled in `tf_tree_bench` — an embedder's \
     position; `in_crate_ns` times the same three lines compiled in `tf_tree_core`, the \
@@ -2598,10 +2062,7 @@ const EMBEDDING_NOTE: &str = "One build, one profile, two identical bodies. `out
     `crates/tf_tree_bench/src/embed.rs` carries that table. There is no tf2 column: this \
     row is `tf_tree` against itself.";
 
-/// `pub(crate)` for one reason: `crate::baseline`'s
-/// `a_baseline_that_measured_the_embedding_row_fails_a_check_that_did_not`
-/// builds the *real* `None`-arm row rather than a fixture that resembles it,
-/// which is the point of that test.
+/// `pub(crate)` so `crate::baseline`'s test builds the real `None`-arm row.
 pub(crate) fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
     const ID: &str = "embedding_cross_crate";
     const TITLE: &str = "Facade Plan::at from a separate crate vs in-crate, depth 3 (ratio)";
@@ -2629,20 +2090,14 @@ pub(crate) fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
         .on(&[Ground::MeasuredElsewhere]));
     };
 
-    // A pair that will not load is a measurement failure, not a row: the caller
-    // asked for this row by naming a directory. Loading the *pair* rather than
-    // the one half this row needs is what runs `Pair::load`'s two provenance
-    // checks — same source, two different profiles.
+    // A pair that will not load is a measurement failure, not a row; loading the
+    // *pair* runs `Pair::load`'s provenance checks.
     let pair = crate::embed::Pair::load(dir)
         .with_context(|| format!("loading the embed_cost pair from {}", dir.display()))?;
     let run = &pair.embedder;
 
-    // **The spread gates the verdict.** A band that straddles §9.2's threshold
-    // cannot answer it, and on this host that is the ordinary case rather than
-    // an exception — so it is reported as unavailable with the band, never
-    // rounded into a pass or a fail. This check is deliberately independent of
-    // the fitness probe: a quiet host can still produce a run too noisy to
-    // resolve 5%.
+    // The spread gates the verdict, independently of the fitness probe: a band
+    // straddling §9.2's threshold is reported unavailable with the band.
     if run.verdict() == crate::embed::Verdict::Unresolved {
         return Ok(Row::unavailable(
             ID,
@@ -2693,31 +2148,18 @@ pub(crate) fn embedding_row(opts: &Options, fitness: &Fitness) -> Result<Row> {
     Ok(row)
 }
 
-/// Pss actually held by an idle arena of §9.3's stated geometry, and the arena's
-/// own view of what it reserved.
+/// Pss actually held by an idle arena of §9.3's stated geometry.
 ///
-/// Returns `(resident_bytes, reserved_bytes)`, or [`None`] where the figure
-/// cannot be trusted — no `smaps_rollup` (not Linux, or a kernel built without
-/// it), or a delta that came out non-positive because whole-process Pss moved
-/// under the measurement.
+/// Returns `(resident_bytes, reserved_bytes)`, or [`None`] where the figure cannot
+/// be trusted (no `smaps_rollup`, or a non-positive delta).
 ///
-/// **This is a delta of a whole-process counter, and that is its limitation.**
-/// Pss is reported in whole KiB and the reads themselves allocate, so the result
-/// is quantised to pages and carries a page or two of slack. That is far below
-/// the difference it exists to settle — megabytes of reservation against
-/// whatever an untouched arena really holds — but it is not a byte-exact
-/// instrument, and a future reader should not treat it as one. The exact tool
-/// would be `mincore(2)` over the arena's own range; it needs a raw pointer and
-/// an `unsafe` block at a boundary `CLAUDE.md`'s budget does not currently name,
-/// so it is a decision record rather than a patch.
-///
-/// The tree is built and then held across the second read: dropping it first
-/// would measure the allocator returning memory, which is a different question.
+/// A delta of a whole-process counter, quantised to pages with a page or two of
+/// slack; not byte-exact (`mincore(2)` would need an `unsafe` boundary and a
+/// decision record). The tree is held across the second read.
 fn measure_idle_arena_resident() -> Option<(f64, f64)> {
     use tf_tree::{Capacity, EdgeCfg, TreeBuilder};
 
-    // 64 frames and 32 dynamic edges at 1024 slots each — the geometry
-    // `from_totals` is asked about above, built for real rather than computed.
+    // The geometry `from_totals` is asked about below, built for real.
     const DYNAMIC_EDGES: u32 = 32;
     const SLOTS_PER_EDGE: u32 = 1024;
     const FRAMES: u32 = 64;
@@ -2731,21 +2173,19 @@ fn measure_idle_arena_resident() -> Option<(f64, f64)> {
     for name in &names {
         b = b.dynamic_edge("root", name, EdgeCfg::new(Capacity::slots(SLOTS_PER_EDGE)));
     }
-    // Headroom to the stated totals: the declared frames and edges above are
-    // fewer than the geometry names, and the reservation is what is under test.
+    // Headroom to the stated totals: the reservation is what is under test.
     let b = b
         .frame_headroom(FRAMES - DYNAMIC_EDGES - 1)
         .edge_headroom(EDGE_SLOTS - DYNAMIC_EDGES);
 
-    // Warm the reader once so its own buffer is already allocated and does not
-    // land inside the delta.
+    // Warm the reader so its buffer is not in the delta.
     let _ = crate::mp::self_pss_kib();
     let before = crate::mp::self_pss_kib();
     let tree = b.build().ok()?;
     let after = crate::mp::self_pss_kib();
 
     let reserved = tree.arena_size_bytes() as f64;
-    // Hold it across the read above — see the doc comment.
+    // Held across the read above.
     std::hint::black_box(&tree);
     drop(tree);
 
@@ -2755,39 +2195,21 @@ fn measure_idle_arena_resident() -> Option<(f64, f64)> {
     Some(((after - before) as f64 * 1024.0, reserved))
 }
 
-/// §9.3's "report where `tf_tree` is worse, in the same table and not in a
-/// footnote" — the four costs it names, with a number wherever the cost has one.
+/// §9.3's "where `tf_tree` is worse": the four costs, with a number wherever one exists.
 fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
-    // A deployment-shaped arena: 64 frames, 64 edge slots, 32 dynamic edges at
-    // 1024 samples each. `from_totals` reproduces the same region geometry from
-    // the totals, which is all a size statement needs.
+    // A deployment-shaped arena; `from_totals` reproduces its region geometry.
     const FRAMES: u32 = 64;
     const EDGES: u32 = 64;
     const SLOTS: u32 = 32 * 1024;
     let floor_bytes = tf_tree_arena::ArenaLayout::from_totals(FRAMES, EDGES, SLOTS)
         .map(|l| l.total_size() as f64);
 
-    // The *resident* half of the same claim. `total_size()` is the mapping — the
-    // last region's `offset + size` — and a mapping need not be a footprint,
-    // because pages become resident when they are touched. Saying "an idle tree
-    // costs its full size from the first second" without ever weighing one is
-    // the kind of unfalsifiable statement §9.3 exists to stop, and this is the
-    // row where `tf_tree` looks worst, so it is the last one that should rest on
-    // arithmetic.
-    //
-    // **The measurement confirms the claim rather than softening it**, which was
-    // not the expected result: an idle arena comes out ~100% resident, because
-    // `alloc_zeroed` at 64-byte alignment zero-fills by hand instead of reaching
-    // `calloc`. The number is kept — and the cause named in the statement —
-    // precisely because a row that turned out worse than hoped is the one a
-    // reader has most reason to want measured.
+    // The *resident* half of the claim: a mapping is not a footprint. The measurement
+    // confirms it: an idle arena is ~100% resident because `alloc_zeroed` at 64-byte
+    // alignment zero-fills by hand (`docs/decisions/0021`).
     let resident = measure_idle_arena_resident();
 
-    // The measured half is stated only when it exists. A statement that asserts
-    // a measurement's *result* while the measurement returned `None` — no
-    // `smaps_rollup`, or a delta that came out non-positive — would be a claim
-    // with nothing behind it, in the one section whose whole job is not to make
-    // those.
+    // The measured half is stated only when it exists.
     let measured_half = match resident {
         Some((resident_bytes, arena_bytes)) => format!(
             "`idle_arena_resident_bytes` is the measured Pss an idle arena of that \
@@ -2835,9 +2257,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
         metrics_absent_because: None,
         metrics_withheld: Vec::new(),
     };
-    // The arithmetic and the measurement are independent facts, so they are
-    // emitted independently: a `from_totals` failure must not discard a Pss
-    // figure that was obtained, and vice versa.
+    // Arithmetic and measurement are independent, so emitted independently.
     if let Ok(bytes) = floor_bytes {
         floor
             .metrics
@@ -2848,20 +2268,15 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
             "MiB",
         ));
     }
-    // The memory axis reaches here too. `Worse` entries carry no `Sensitivity`
-    // and `Report::validate` does not inspect them, so without this guard a
-    // debug build would publish a resident-page figure that the same report's
-    // `fair_for_memory: false` declares untrustworthy.
+    // The memory axis reaches here too: `Worse` entries carry no `Sensitivity`, so a
+    // debug build would otherwise publish a figure `fair_for_memory: false` disowns.
     let resident = if fitness.fair_for_memory {
         resident
     } else {
         None
     };
-    // Recorded, not silent. Both reasons a residency figure can be absent land
-    // here — an unreadable `smaps_rollup`, and a whole-process delta that came
-    // out non-positive — and `Report::validate`'s direction rule stands down on
-    // it rather than refusing to write any artifact at all. See
-    // `Worse::metrics_withheld` for why this cannot also reach the gate.
+    // Recorded, not silent: `Report::validate`'s direction rule stands down on it
+    // (see `Worse::metrics_withheld`).
     if resident.is_none() {
         floor.metrics_withheld.push("idle_arena_resident_bytes");
         floor
@@ -2870,26 +2285,14 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
         floor.metrics_withheld.push("idle_arena_resident_fraction");
     }
     if let Some((resident_bytes, arena_bytes)) = resident {
-        // The one gated number in this entry, and the reason
-        // `crate::baseline::compare_worse` exists: a direction here did nothing
-        // at all until the gate learned to look inside a `where_we_are_worse`
-        // entry. `0021` step 4 asks for this metric specifically, and its
-        // falsifier is a revert of the alignment fix — which lands at 98x this
-        // value.
-        //
-        // The *fraction* below is deliberately left informational. It is this
-        // divided by the reserved bytes on the same line, so gating both would
-        // be two spellings of one claim, and the second would fail for a change
-        // to the geometry rather than to the residency.
+        // The one gated number here (`0021` step 4; its falsifier, a revert of the
+        // alignment fix, lands at 98x). The *fraction* stays informational: it is this
+        // divided by the reserved bytes, so gating both would be one claim twice.
         floor.metrics.push(
             Metric::new("idle_arena_resident_bytes", resident_bytes, "B")
                 .lower_is_better(RESIDENCY_SLACK),
         );
-        // Both sides of this quotient describe the arena the measurement
-        // actually built. Dividing the measured residency by `from_totals`'s
-        // arithmetic would mix two different arenas — they differ by a few KiB
-        // of region rounding — and print a ratio whose numerator and
-        // denominator never met.
+        // Both sides describe the arena the measurement built, not `from_totals`'s.
         floor.metrics.push(Metric::new(
             "idle_arena_measured_reserved_bytes",
             arena_bytes,
@@ -2902,11 +2305,7 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
         ));
     }
 
-    // Both sources of this row's numbers can fail — `from_totals` on an
-    // arithmetic overflow, Pss on a host without `smaps_rollup` or on a build
-    // the memory axis calls unfair — and if both do, the entry has to say so
-    // rather than present an empty list. Set here rather than up with the
-    // statement because only this point knows whether anything was pushed.
+    // If both sources fail, say so rather than present an empty list.
     if floor.metrics.is_empty() {
         floor.metrics_absent_because = Some(
             "neither half landed on this run: `ArenaLayout::from_totals` did not return a layout for the stated geometry, and the Pss measurement was unavailable or was withheld because this host failed the memory axis of the fitness probe. The reservation arithmetic is host-independent, so this state is a bug or a hostile /proc, not a property of the machine — `just bench-report` on any Linux host that passes `Fitness::probe` fills both in."
@@ -3067,30 +2466,12 @@ fn worse_entries(opts: &Options, fitness: &Fitness) -> Vec<Worse> {
     ]
 }
 
-/// The `lookup_latency` row's note — the sentence a reader of `results.json`
-/// actually sees, which is the only place this row explains what it measured.
+/// The `lookup_latency` row's note, the only place the row explains what it measured.
 ///
-/// **Two of its clauses are required rather than chosen, and both were missing.**
-///
-/// 1. `docs/PHASE1.md` §11.3 is NORMATIVE that "every reported latency row must
-///    state its dynamic-step count, not just its nominal depth", because the two
-///    readings of "depth 3" differ by ~2.8× and a static-heavy path can pass a
-///    gate without exercising the sampler at all. The note said "depth 3" in its
-///    title and nothing about steps.
-/// 2. The **stamp regime** decides whether the interpolator runs at all. This
-///    row queried `fixture::NOW_NS` — a knot on all four dynamic grids — until
-///    `docs/decisions/0013`, so every edge took `SampleRing::sample`'s exact-hit
-///    branch and what shipped as a lookup latency was `bracket` plus a seqlock
-///    read. A reader comparing a figure from before that change with one from
-///    after is comparing two different measurements, and only this string can
-///    tell them so.
-///
-/// Both are checked against the code that produces the number, not merely
-/// written here, by `tests::the_lookup_row_note_states_what_phase1_requires`
-/// below (a `#[cfg(test)]` item, so this is a name and not a link).
-/// The stamp half of that check needs the measured stamp to be reachable from a
-/// test without running the measurement, which is what [`LOOKUP_STAMP_NS`] is
-/// for.
+/// `docs/PHASE1.md` §11.3 (NORMATIVE) requires the dynamic-step count, and the stamp
+/// regime decides whether the interpolator runs (`docs/decisions/0013`).
+/// `tests::the_lookup_row_note_states_what_phase1_requires` checks both against the
+/// code, using [`LOOKUP_STAMP_NS`].
 const LOOKUP_NOTE: &str = "tf_tree column: `map <- imu_link`, LerpSlerp, in-process, one \
      thread. **3 dynamic steps** after constant folding (1 kHz, 200 Hz, 50 Hz), which is what \
      docs/PHASE1.md §11.3's NORMATIVE reading of \"depth 3\" means. The query stamp is \
@@ -3101,28 +2482,16 @@ const LOOKUP_NOTE: &str = "tf_tree column: `map <- imu_link`, LerpSlerp, in-proc
      alongside as clock_overhead_p50_ns. The tf2 column is a separate, cross-engine comparison \
      and is not attempted here.";
 
-/// The stamp [`measure_lookup_latency`] queries, named so a test can reach it.
-///
-/// It is one `const` rather than an expression inlined at the call site for the
-/// same reason [`crate::embed`] reads `[profile.embedder]` back out of the
-/// manifest: [`LOOKUP_NOTE`] makes two claims about this stamp — that it is
-/// `fixture::QUERY_NS`, and that it is off every dynamic grid — and a claim
-/// nothing evaluates is how `docs/decisions/0013` stayed true for as long as it
-/// did.
+/// The stamp [`measure_lookup_latency`] queries, named so a test can check
+/// [`LOOKUP_NOTE`]'s claims about it (`fixture::QUERY_NS`, off every dynamic grid).
 const LOOKUP_STAMP_NS: i64 = crate::fixture::QUERY_NS;
 
 /// Measure depth-3 hot-path lookup latency on this process.
 ///
-/// The percentiles include two `Instant::now()` calls per lookup, so the clock's
-/// own cost is measured in the same loop shape and reported as
-/// `clock_overhead_p50_ns` rather than quoted from memory. Subtracting it is
-/// left to the reader: the overhead distribution is not the same shape as the
-/// measurement's, so a subtracted percentile would be a fabrication.
-///
-/// **The query stamp is [`crate::fixture::QUERY_NS`], which interpolates** —
-/// `LOOKUP_NOTE` (private, so named rather than linked) carries what it was
-/// before `docs/decisions/0013`, and why a figure published before that change
-/// is not comparable with one after.
+/// Percentiles include two `Instant::now()` calls; the clock's own cost is reported
+/// as `clock_overhead_p50_ns` and left for the reader to subtract. The query stamp
+/// is [`crate::fixture::QUERY_NS`], which interpolates (`LOOKUP_NOTE`,
+/// `docs/decisions/0013`).
 ///
 /// # Errors
 ///
@@ -3136,17 +2505,14 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
     let source = tree
         .frame("map")
         .map_err(|e| anyhow!("fixture frame `map` is missing: {e:?}"))?;
-    // `LookupError` is `Copy` and deliberately not `std::error::Error`
-    // (`CLAUDE.md`: errors are `Copy` and carry no `String`), so `?` cannot
-    // convert it into `anyhow::Error` on its own.
+    // `LookupError` is `Copy` and not `std::error::Error`, so `?` cannot convert it.
     let plan = tree
         .plan(target, source)
         .map_err(|e| anyhow!("compiling the map <- imu_link plan: {e:?}"))?;
     let guard = tree.guard();
     let stamp: Stamp = Stamp::from_nanos(LOOKUP_STAMP_NS);
 
-    // §9.3: warm, then discard, and state how long. Time-based rather than
-    // iteration-based so the stated number is the one the report prints.
+    // §9.3: warm, then discard; time-based so the stated number is the printed one.
     let mut sink = 0.0f64;
     let warm_start = Instant::now();
     while warm_start.elapsed() < warmup {
@@ -3163,23 +2529,19 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
         sink += iso.t.x;
     }
 
-    // The clock's own cost, in the same loop shape, on this host.
+    // The clock's own cost, in the same loop shape.
     let mut clock = crate::mp::Histogram::new();
     for _ in 0..samples.min(50_000) {
         let t0 = Instant::now();
         clock.record(elapsed_ns(t0));
     }
 
-    // Keep the loop from being optimised into nothing without pulling in
-    // criterion's `black_box`: a NaN sink would mean the samples were discarded.
+    // Keeps the loop from being optimised away; NaN means samples were discarded.
     if sink.is_nan() {
         bail!("lookup sink went NaN — the measured loop did not run as written");
     }
 
-    // `samples` and `clock_overhead_p50_ns` stay informational:
-    // the first is a run parameter, and the second describes the host's clock
-    // rather than the engine — gating it would fail this repository's own
-    // artifact on a kernel that made `clock_gettime` slower.
+    // `samples` and `clock_overhead_p50_ns` stay informational: a run parameter and the host's clock.
     Ok(vec![
         Metric::new("p50_ns", hist.quantile(0.50) as f64, "ns").lower_is_better(LATENCY_SLACK),
         Metric::new("p99_ns", hist.quantile(0.99) as f64, "ns").lower_is_better(LATENCY_SLACK),
@@ -3189,12 +2551,7 @@ pub fn measure_lookup_latency(samples: usize, warmup: Duration) -> Result<Vec<Me
     ])
 }
 
-/// Nanoseconds since `t0`, in 64-bit arithmetic.
-///
-/// `Duration::as_nanos` is `u128`, so the obvious spelling costs a 128-bit
-/// multiply-add and a 128-bit compare *per sample*. That sits after the clock
-/// read, so it never biased the recorded latency — it only widened the gap
-/// between samples. `u64` nanoseconds saturate after 584 years of uptime.
+/// Nanoseconds since `t0` in 64-bit arithmetic (`Duration::as_nanos` is `u128`).
 #[inline]
 fn elapsed_ns(t0: Instant) -> u64 {
     let d = t0.elapsed();
@@ -3203,32 +2560,22 @@ fn elapsed_ns(t0: Instant) -> u64 {
         .saturating_add(u64::from(d.subsec_nanos()))
 }
 
-/// Lift a `Copy`, non-`std::error::Error` [`tf_tree::LookupError`] into `anyhow`.
-///
-/// Out of line so the hot loops keep a single non-inlined error path rather than
-/// a format call per iteration.
+/// Lift a `Copy` [`tf_tree::LookupError`] into `anyhow`, out of line for the hot loops.
 #[cold]
 fn eval_failed(e: tf_tree::LookupError) -> anyhow::Error {
     anyhow!("plan evaluation failed: {e:?}")
 }
 
-/// Physical core count from `/proc/cpuinfo` `physical id` / `core id` pairs,
-/// or [`None`] when this host publishes none.
-///
-/// `available_parallelism` counts SMT siblings, which is the wrong denominator
-/// for "can this host run N consumers without oversubscribing" — so this returns
-/// [`None`] rather than quietly substituting it. **aarch64 `/proc/cpuinfo`
-/// carries no `physical id` or `core id` lines at all**, and neither do many
-/// container configurations, which makes [`None`] the ordinary answer on a
-/// target this project supports rather than a corner case.
-/// [`Fitness::assess`] is what decides what to do about it.
+/// Physical core count from `/proc/cpuinfo` `physical id` / `core id` pairs, or
+/// [`None`] when none are published (aarch64 and many containers, so the ordinary
+/// answer). `available_parallelism` counts SMT siblings and is not substituted;
+/// [`Fitness::assess`] decides what to do.
 #[must_use]
 pub fn physical_cores() -> Option<usize> {
     physical_cores_from_cpuinfo(&std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default())
 }
 
-/// The parse, over text rather than over `/proc`, so it can be tested against a
-/// host this one is not.
+/// The parse over text, so a host this one is not can be tested.
 fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
     let mut ids = std::collections::HashSet::new();
     let (mut phys, mut core) = (None, None);
@@ -3298,19 +2645,10 @@ fn unknown() -> String {
     "unknown".to_owned()
 }
 
-/// The `lto` setting of the profile this binary was built into.
-///
-/// Read out of the workspace manifest at run time rather than baked at build
-/// time, because the parser lives in [`crate::embed`] and a build script cannot
-/// call it — and a second copy of a TOML reader is a second thing that can
-/// disagree with the first. `CARGO_MANIFEST_DIR` is a *compile-time* constant,
-/// so this resolves against the source tree this binary was built from, not
-/// against wherever it happens to be run.
-///
-/// The failure arm names the path it could not read. A benchmark binary copied
-/// out of its checkout is the case that reaches it, and it must be
-/// distinguishable from "the profile declares no LTO", which
-/// [`crate::embed::lto_for_profile_dir`] spells differently again.
+/// The `lto` setting of the profile this binary was built into, read from the
+/// workspace manifest at run time (the parser lives in [`crate::embed`]).
+/// `CARGO_MANIFEST_DIR` is compile-time, so it names the build's source tree. The
+/// failure arm names the unreadable path, distinct from "no LTO".
 fn build_lto() -> String {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -3336,13 +2674,7 @@ fn capture(bin: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// UTC timestamp as `YYYY-MM-DDTHH:MM:SSZ`.
-///
-/// Hand-rolled because the workspace has no date crate and the benchmark report
-/// is not a reason to add one. Civil-from-days is Howard Hinnant's algorithm,
-/// with the era shifted so it is correct before 1970 as well — not that it will
-/// be asked, but a timestamp routine that is only right on the happy path is
-/// exactly the kind of thing that makes a provenance header untrustworthy.
+/// UTC timestamp as `YYYY-MM-DDTHH:MM:SSZ`; hand-rolled (no date crate), Hinnant's civil-from-days, correct before 1970.
 fn iso8601_utc(t: SystemTime) -> String {
     let secs = match t.duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs() as i64,
@@ -3389,11 +2721,7 @@ pub(crate) fn jstr(s: &str) -> String {
     out
 }
 
-/// JSON number, or `null` for a non-finite value.
-///
-/// `NaN` and `Infinity` are not JSON. Emitting them would produce a file that
-/// every consumer rejects, which is a worse failure than a `null` a reader can
-/// see.
+/// JSON number, or `null` for a non-finite value (`NaN` is not JSON).
 pub(crate) fn jnum(v: f64) -> String {
     if v.is_finite() {
         format!("{v}")
@@ -3436,8 +2764,7 @@ fn esc_html(s: &str) -> String {
     out
 }
 
-/// Format a value for a human column: scientific where a fixed-point rendering
-/// would print `0.000`, plain otherwise.
+/// Format a value for a human column: scientific where fixed-point would print `0.000`.
 fn fmt_value(v: f64) -> String {
     if !v.is_finite() {
         return "n/a".to_owned();
@@ -3471,18 +2798,12 @@ fn cell_html(m: &[Metric]) -> String {
 
 #[cfg(test)]
 mod tests {
-    // A failed assertion in a unit test is the intended failure mode, and these
-    // helpers make the failure name the field it came from. `panic!` is in the
-    // list because `expect` takes a `&str`: naming *which* metric went missing
-    // needs a formatted message, and "a metric is missing" without the key is a
-    // failure a reader has to reproduce before they can act on it.
+    // Failed assertions are the intended failure mode; `panic!` is allowed so a message can name the missing metric.
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
 
-    /// A report skeleton with every required row and worse-entry present, all
-    /// unavailable. Tests mutate one thing from here, so a failure names one
-    /// cause.
+    /// A report skeleton with every required row and worse-entry, all unavailable; tests mutate one thing from it.
     fn skeleton(fair: bool, forced: bool) -> Report {
         let rows = REQUIRED_ROWS
             .iter()
@@ -3495,11 +2816,7 @@ mod tests {
                     "a stated reason".to_owned(),
                     "just something",
                 )
-                // `MeasuredElsewhere` on purpose: it is one of the three
-                // grounds `validate` cannot decide, so the skeleton's rows are
-                // never refused for their ground and each test below isolates
-                // the one rule it is about. The ground rules have their own
-                // fixtures, which set a *decidable* ground.
+                // `MeasuredElsewhere` is undecidable by `validate`, so rows are never refused for their ground.
                 .on(&[Ground::MeasuredElsewhere])
             })
             .collect();
@@ -3515,12 +2832,8 @@ mod tests {
             })
             .collect();
         Report {
-            // Every §9.3 fact, spelled from the constant the rule reads. That
-            // is safe here in a way `baseline::FIXTURE_FACTS` is not — this
-            // fixture exists to be *valid*, and a rule that grew a key it does
-            // not satisfy should make every test below fail loudly rather than
-            // silently keep passing. The negative tests blank one key at a
-            // time.
+            // Every §9.3 fact from the constant the rule reads, so a new key the fixture
+            // does not satisfy fails every test; negative tests blank one at a time.
             provenance: Provenance {
                 facts: REQUIRED_FACTS
                     .iter()
@@ -3530,22 +2843,17 @@ mod tests {
                     })
                     .collect(),
             },
-            // The skeleton is the shipped default build: no tf2, no frozen
-            // backend. Tests that exercise a ground override it.
+            // The shipped default build: no tf2, no frozen backend.
             build: Build {
                 tf2_linked: false,
                 frozen_backend: false,
             },
             fitness: Fitness {
                 fair_for_timing: fair,
-                // The skeleton's failing check is a *timing* one, so the ratio
-                // and memory axes stay fair even when `fair` is false. That is
-                // the split under test: a host can be unfit to time and still
-                // fit to weigh.
+                // Timing fails but ratio and memory stay fair: a host can be unfit to time and fit to weigh.
                 fair_for_ratios: true,
                 fair_for_memory: true,
-                // The skeleton's rows are not marked `n_way`, so the core budget
-                // is out of the picture and each test isolates one rule.
+                // Rows are not `n_way`, so the core budget is out of the picture.
                 enough_cores: true,
                 core_reason: None,
                 forced,
@@ -3568,38 +2876,18 @@ mod tests {
         }
     }
 
-    /// The skeleton itself must validate, or every negative test below passes
-    /// for the wrong reason.
-    ///
-    /// Mutant: drop `"a stated reason"` to `""` in `skeleton` — this test fails.
+    /// The skeleton itself must validate, or every negative test passes for the wrong reason.
     #[test]
     fn a_fully_unavailable_report_is_valid() {
         assert_eq!(skeleton(false, false).validate(), Ok(()));
     }
 
-    /// **A row that prints numbers must print at least one the regression gate
-    /// can hold.**
+    /// A row that prints numbers must print at least one the regression gate can hold.
     ///
-    /// [`crate::baseline`] compares only metrics with a direction, so a row
-    /// whose numbers are all [`Drift::Informational`] passes `just bench-check`
-    /// no matter what it says. That is the way a regression gate rots: not by
-    /// being deleted, but by a new claim arriving next to it, ungated, and
-    /// nobody noticing that the green tick covers less than it used to. The rule
-    /// lives in `validate` rather than in the gate because the gate would have
-    /// to *guess* that a row it skipped was meant to be checked.
+    /// It binds `indicative` as well as `measured`: a row's status is a property of
+    /// the host, and a direction never acquired while cheap is one nothing gates later.
     ///
-    /// It binds `indicative` as well as `measured`. `bench-check` skips every
-    /// row whose **baseline** status is not `measured` (`baseline::compare`
-    /// short-circuits on it), so an indicative row is compared neither with a
-    /// direction nor without one, and "the gate would compare nothing in it" is
-    /// false for that half. The rule binds it anyway because a row's status is a
-    /// property of the *host*: the same row is indicative here and measured on
-    /// the machine the baseline is cut from, and a direction it never acquired
-    /// while it was cheap to add is one nothing gates once it matters.
-    ///
-    /// Mutant (applied, confirmed fatal): restrict the new arm to
-    /// `r.status == Status::Measured` — the `indicative` half of this test then
-    /// returns `Ok(())` and the `expect_err` panics.
+    /// Mutant: restrict the arm to `Status::Measured`; the `indicative` half fails.
     #[test]
     fn a_row_that_prints_numbers_must_print_one_the_gate_can_hold() {
         for (fair, forced, status) in [
@@ -3626,8 +2914,7 @@ mod tests {
                 "{status:?}: {errs:?}"
             );
 
-            // The same row with one directional metric is fine: the rule is
-            // about being gateable, not about the metric count.
+            // One directional metric is enough.
             r.rows[0]
                 .tf_tree
                 .push(Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK));
@@ -3635,16 +2922,10 @@ mod tests {
         }
     }
 
-    /// A directional metric with a negative or non-finite tolerance is refused.
+    /// A directional metric with a negative or non-finite tolerance is refused: both
+    /// look like a working gate (always or never firing).
     ///
-    /// `slack = |baseline| * tolerance` in the gate, so a negative tolerance
-    /// makes the bound tighter than exact equality and fires on every run, and a
-    /// NaN one makes every comparison `false` and fires on none. Both are worse
-    /// than an ungated metric, because both look like a working gate.
-    ///
-    /// Mutant (applied, confirmed fatal): drop the `m.tolerance >= 0.0`
-    /// conjunct — the `-0.5` case then validates and the loop's `expect_err`
-    /// panics.
+    /// Mutant: drop the `m.tolerance >= 0.0` conjunct.
     #[test]
     fn a_directional_metric_needs_a_usable_tolerance() {
         for bad in [-0.5, f64::NAN, f64::INFINITY] {
@@ -3664,11 +2945,9 @@ mod tests {
         }
     }
 
-    /// §9.3's central rule: a timing row may not claim `measured` on a host that
-    /// failed the fitness probe. This is the check the whole module exists for.
+    /// §9.3's central rule: a timing row may not claim `measured` on a host that failed the probe.
     ///
-    /// Mutant: delete the `r.timing_sensitive && !self.fitness.fair_for_timing`
-    /// arm in `validate` — this test fails (validation returns `Ok`).
+    /// Mutant: delete the fitness arm in `validate`.
     #[test]
     fn a_timing_row_cannot_claim_measured_on_an_unfit_host() {
         let mut r = skeleton(false, false);
@@ -3681,8 +2960,7 @@ mod tests {
             "{errs:?}"
         );
 
-        // The same row on a host that passed is fine — the rule is about the
-        // host, not about the row being timing sensitive.
+        // Same row on a fit host is fine.
         let mut ok = skeleton(true, false);
         let row = &mut ok.rows[0];
         row.measured_as(Status::Measured, String::new());
@@ -3690,15 +2968,11 @@ mod tests {
         assert_eq!(ok.validate(), Ok(()));
     }
 
-    /// The other half of the same rule, and the reason `Fitness` carries two
-    /// verdicts: an N-way row on a host with fewer cores than consumers measures
-    /// the scheduler even when the clock is beyond reproach. The fixture sets
-    /// `fair_for_timing: true` and [`Sensitivity::HostIndependent`] precisely so
-    /// that only the core budget can produce the failure — otherwise the test
-    /// would pass off the back of the timing rule and prove nothing.
+    /// An N-way row on a host with fewer cores than consumers measures the scheduler
+    /// even with a perfect clock. The fixture is `HostIndependent` so only the core
+    /// budget can fail.
     ///
-    /// Mutant: delete the `r.needs_n_cores && !self.fitness.enough_cores` arm in
-    /// `validate` — this test fails.
+    /// Mutant: delete the `needs_n_cores && !enough_cores` arm.
     #[test]
     fn an_n_way_row_cannot_claim_measured_without_the_cores() {
         let mut r = skeleton(true, false);
@@ -3719,20 +2993,15 @@ mod tests {
         );
         assert!(errs.iter().any(|e| e.contains("17 needed")), "{errs:?}");
 
-        // The converse: the identical row on a host that has the cores is fine.
+        // Converse: enough cores is fine.
         r.fitness.enough_cores = true;
         r.fitness.core_reason = None;
         assert_eq!(r.validate(), Ok(()));
     }
 
-    /// A memory row is not a timing row, and refusing it for a timing reason is
-    /// how §12 gate 4 came to be unmeasurable on a host that could always have
-    /// weighed it. The skeleton fails every *timing* check; a `Memory` row on it
-    /// must still be allowed to claim `measured`.
+    /// A memory row must be allowed to claim `measured` on a host failing every *timing* check.
     ///
-    /// Mutant: in `validate`'s `Status::Measured` arm, change the
-    /// `Sensitivity::Memory` branch to read `self.fitness.fair_for_timing`
-    /// instead of `self.fitness.fair_for_memory` — this test fails.
+    /// Mutant: the `Memory` branch reads `fair_for_timing`.
     #[test]
     fn a_memory_row_is_measurable_on_a_host_that_only_fails_the_timing_checks() {
         let mut r = skeleton(false, false);
@@ -3745,8 +3014,7 @@ mod tests {
         row.tf_tree = vec![Metric::new("pss_kib", 4096.0, "KiB").lower_is_better(0.20)];
         assert_eq!(r.validate(), Ok(()));
 
-        // And the converse, so this is not vacuous: the same row on a host whose
-        // *memory* axis failed — a debug build — is refused.
+        // Converse: a memory-axis failure (debug build) is refused.
         r.fitness.fair_for_memory = false;
         r.fitness.memory_reasons = vec!["built with debug assertions on".to_owned()];
         let errs = r
@@ -3759,15 +3027,9 @@ mod tests {
         );
     }
 
-    /// The core budget is a statement about the scheduler, and Pss is not
-    /// scheduled, so `needs_n_cores` must not reach a memory row.
+    /// The core budget must not reach a memory row (Pss is not scheduled).
     ///
-    /// The fixture sets `fair_for_timing: true` so that only the core-budget
-    /// rule could produce a failure here, exactly as
-    /// `an_n_way_row_cannot_claim_measured_without_the_cores` does.
-    ///
-    /// Mutant: drop the `&& r.sensitivity != Sensitivity::Memory` conjunct from
-    /// `core_budget_applies` in `validate` — this test fails.
+    /// Mutant: drop `&& r.sensitivity != Sensitivity::Memory` from `core_budget_applies`.
     #[test]
     fn a_memory_row_does_not_need_the_core_budget() {
         let mut r = skeleton(true, false);
@@ -3782,8 +3044,7 @@ mod tests {
         row.tf_tree = vec![Metric::new("total_pss_kib", 65536.0, "KiB").lower_is_better(0.20)];
         assert_eq!(r.validate(), Ok(()));
 
-        // Not vacuous: the identical row that reports a *duration* instead is
-        // still refused by the same short core budget.
+        // Not vacuous: the same row reporting a duration is refused.
         r.rows[0].sensitivity = Sensitivity::AbsoluteTiming;
         let errs = r
             .validate()
@@ -3794,20 +3055,14 @@ mod tests {
         );
     }
 
-    /// The classification itself: which measured facts about a host invalidate
-    /// which kind of claim.
+    /// Which measured facts invalidate which kind of claim: SMT and governor are
+    /// common-mode, a busy machine is not, a debug build reaches everything, an
+    /// unreadable `smaps_rollup` reaches memory alone.
     ///
-    /// SMT and an unreadable governor are common-mode, and neither moves a page
-    /// count. A **busy machine is not**, and that is the interesting row. A
-    /// debug build reaches everything, and an unreadable `smaps_rollup` reaches
-    /// memory alone.
-    ///
-    /// Mutant: set `fair_for_ratios: reasons.is_empty()` in `assess` (i.e. fold
-    /// the axes back into one boolean) — this test fails on the first block.
+    /// Mutant: `fair_for_ratios: reasons.is_empty()` in `assess`.
     #[test]
     fn each_host_check_reaches_only_the_axes_it_bears_on() {
-        // SMT on (8 logical over 4 physical) and an unreadable governor, on a
-        // quiet machine: both are common-mode between two interleaved arms.
+        // SMT and an unreadable governor on a quiet machine: common-mode between interleaved arms.
         let clock_only = Fitness::assess(2, 8, Some(4), 0.0, None, false, true);
         assert!(
             !clock_only.fair_for_timing,
@@ -3830,8 +3085,7 @@ mod tests {
             clock_only.reasons
         );
 
-        // Load is the timing check that *does* reach a cross-engine ratio, and
-        // it fails in the flattering direction, so it must not be waved through.
+        // Load reaches a cross-engine ratio and flatters, so it must not be waved through.
         let busy = Fitness::assess(
             2,
             4,
@@ -3853,7 +3107,7 @@ mod tests {
             busy.memory_reasons
         );
 
-        // An unreadable smaps_rollup reaches the memory axis and nothing else.
+        // Unreadable smaps_rollup reaches memory only.
         let no_pss = Fitness::assess(
             2,
             4,
@@ -3878,7 +3132,7 @@ mod tests {
             no_pss.memory_reasons
         );
 
-        // A debug build is a different program, so it reaches all three.
+        // A debug build reaches all three.
         let debug = Fitness::assess(
             2,
             4,
@@ -3897,7 +3151,7 @@ mod tests {
             debug.ratio_reasons
         );
 
-        // And a host that passes everything passes all three.
+        // A passing host passes all three.
         let good = Fitness::assess(
             2,
             4,
@@ -3912,13 +3166,10 @@ mod tests {
         assert!(good.fair_for_memory);
     }
 
-    /// A required row may be unavailable, but it may not be dropped, and an
-    /// unavailable row must say why *and* name the command that would produce
-    /// it elsewhere.
+    /// A required row may be unavailable but not dropped, and a gap must say why
+    /// *and* name a command.
     ///
-    /// Mutants, each of which makes this test fail: remove the `REQUIRED_ROWS`
-    /// loop from `validate`; remove the empty-`reason` check; remove the empty-
-    /// `reproduce` check.
+    /// Mutants: remove the `REQUIRED_ROWS` loop, the empty-`reason` check, or the empty-`reproduce` check.
     #[test]
     fn required_rows_cannot_be_dropped_and_gaps_must_be_actionable() {
         let mut r = skeleton(false, false);
@@ -3943,25 +3194,15 @@ mod tests {
         );
     }
 
-    /// **§9.3 bullet 1**, the recorded half: QoS, executor configuration and
-    /// DDS vendor and version are in the report or the report is refused.
+    /// §9.3 bullet 1, the recorded half: QoS, executor and DDS facts are in the report
+    /// or it is refused. One seeded violation per key. ("Identical" is not checkable;
+    /// see `validate`.)
     ///
-    /// The bullet's other word is *identical*, and `validate` cannot check it —
-    /// there is one arm here, so there is one value per key and nothing to
-    /// compare it against. That limit is stated on `validate` itself; this test
-    /// pins what is enforceable.
-    ///
-    /// One seeded violation per key, because a loop over a constant is exactly
-    /// where a single seeded violation caught by one arm proves nothing about
-    /// the others.
-    ///
-    /// Mutant (applied, confirmed fatal): delete the `REQUIRED_FACTS` loop from
-    /// `validate` — every arm of this test then validates `Ok` and the first
-    /// `expect_err` panics.
+    /// Mutant: delete the `REQUIRED_FACTS` loop.
     #[test]
     fn bullet_1_the_middleware_facts_are_recorded_or_the_report_is_refused() {
         for key in ["dds_qos", "executor_config", "rmw_implementation"] {
-            // Absent entirely: the `push` line was deleted.
+            // Absent: the `push` line was deleted.
             let mut r = skeleton(false, false);
             r.provenance.facts.retain(|f| f.key != key);
             let errs = r
@@ -3973,9 +3214,7 @@ mod tests {
                 "{key}: {errs:?}"
             );
 
-            // Present and blank: the `push` line survived and its value did
-            // not. `Provenance::collect` never writes an empty string — it
-            // writes `unknown` — so a blank is a defect rather than a reading.
+            // Blank: `collect` writes `unknown`, never an empty string.
             let mut r = skeleton(false, false);
             for f in &mut r.provenance.facts {
                 if f.key == key {
@@ -3993,21 +3232,12 @@ mod tests {
         }
     }
 
-    /// **§9.3 bullet 3**: the six facts it names, one seeded deletion each.
+    /// §9.3 bullet 3: the facts it names, one seeded deletion each.
     ///
-    /// This is the test `docs/PHASE5.md` §0.0's claim that the honesty rules are
-    /// "structural" was making on behalf of code that did not exist: before
-    /// `REQUIRED_FACTS`, deleting any `push` line from `Provenance::collect`
-    /// broke nothing, and a `Report` with a completely empty provenance header
-    /// validated cleanly.
-    ///
-    /// Mutant (applied, confirmed fatal): drop `"kernel"` from
-    /// `REQUIRED_FACTS` — the `kernel` arm then validates `Ok`.
+    /// Mutant: drop `"kernel"` from `REQUIRED_FACTS`.
     #[test]
     fn bullet_3_every_host_fact_the_spec_names_must_be_present() {
-        // Spelled out rather than iterated from `REQUIRED_FACTS`, so that
-        // shrinking the constant cannot also shrink the test that pins it —
-        // `baseline::FIXTURE_FACTS` carries the same argument.
+        // Spelled out, so shrinking the constant cannot shrink its test.
         for key in [
             "tf2_version",
             "ros_distro",
@@ -4025,22 +3255,14 @@ mod tests {
             assert!(errs.iter().any(|e| e.contains(key)), "{key}: {errs:?}");
         }
 
-        // Non-degenerate: the same report with every fact present validates, so
-        // the arms above fail for the fact they removed and not for the shape
-        // of the fixture.
+        // Non-degenerate: the full report validates.
         assert_eq!(skeleton(false, false).validate(), Ok(()));
     }
 
-    /// **§9.3 bullet 2**: "Both stacks warmed; discard the first N seconds;
-    /// state N." A report that timed something and discarded nothing is
-    /// refused, and so is one whose N is not a number.
+    /// §9.3 bullet 2: a report that timed something and discarded nothing is refused,
+    /// as is a non-numeric N. Scoped to the axes a warm-up is *for*.
     ///
-    /// The rule is scoped to the two axes a warm-up is *for*; refusing a
-    /// `Memory` or `HostIndependent` row for a warm-up it does not use would be
-    /// the same category error §9.3's `Sensitivity` amendment exists to undo.
-    ///
-    /// Mutant (applied, confirmed fatal): delete the `warmup_discarded_s`
-    /// clause from `validate` — the first two arms validate `Ok`.
+    /// Mutant: delete the `warmup_discarded_s` clause.
     #[test]
     fn bullet_2_a_timed_claim_needs_a_stated_warm_up() {
         for sensitivity in [Sensitivity::AbsoluteTiming, Sensitivity::Ratio] {
@@ -4058,14 +3280,12 @@ mod tests {
                 "{sensitivity:?}: {errs:?}"
             );
 
-            // The same row with a warm-up is fine: the rule is about the
-            // discarded window, not about the row.
+            // With a warm-up it is fine.
             r.warmup_discarded_s = 2.0;
             assert_eq!(r.validate(), Ok(()), "{sensitivity:?}");
         }
 
-        // A memory claim is exempt, and that exemption is load-bearing: §12
-        // gate 4 is a Pss ratio and there is no cold path in a page table.
+        // A memory claim is exempt: no cold path in a page table.
         let mut r = skeleton(true, false);
         r.warmup_discarded_s = 0.0;
         let row = &mut r.rows[0];
@@ -4074,10 +3294,7 @@ mod tests {
         row.tf_tree = vec![Metric::new("pss_kib", 4096.0, "KiB").lower_is_better(0.20)];
         assert_eq!(r.validate(), Ok(()));
 
-        // And N must be a number at all, whatever the rows say. `jnum` writes a
-        // non-finite value as JSON `null`, so a NaN here would reach the
-        // artifact as "warmup_discarded_s": null and read as *no warm-up
-        // stated* rather than as a defect.
+        // N must be a number: `jnum` writes non-finite as `null`, reading as "none stated".
         for bad in [f64::NAN, -1.0, f64::INFINITY] {
             let mut r = skeleton(false, false);
             r.warmup_discarded_s = bad;
@@ -4092,15 +3309,9 @@ mod tests {
         }
     }
 
-    /// **§9.3 bullet 5**, the mechanical half: every row names a command that
-    /// re-derives it, whatever its status.
+    /// §9.3 bullet 5, mechanical half: every row names a command, whatever its status.
     ///
-    /// The `unavailable` half was already enforced; this pins the `measured`
-    /// half, which was not — a number nobody outside this process can re-derive
-    /// is the same dead end as a gap with no way forward.
-    ///
-    /// Mutant (applied, confirmed fatal): scope `validate`'s reproduce check
-    /// back to `Status::Unavailable` — the `measured` arm here validates `Ok`.
+    /// Mutant: scope the reproduce check back to `Status::Unavailable`.
     #[test]
     fn bullet_5_a_measured_row_also_names_the_command_that_re_derives_it() {
         let mut r = skeleton(true, false);
@@ -4118,24 +3329,13 @@ mod tests {
         );
     }
 
-    /// **A stale ground is refused, and the prose reads perfectly throughout.**
+    /// A stale ground is refused while the prose reads perfectly. One seeded
+    /// violation per decidable [`Ground`]; the reason string is untouched in each arm.
     ///
-    /// One seeded violation per decidable [`Ground`], because the four are four
-    /// separate rules and a union check would let one dead arm hide behind a
-    /// live one. In each arm the row's *reason string* is untouched and
-    /// plausible — which is the whole point: the guard this replaces was a scan
-    /// for three phrases, and every one of the four reasons that had actually
-    /// gone stale in this file used none of them.
-    ///
-    /// Mutant (applied, confirmed fatal): make `Ground::holds` return `None` for
-    /// every variant — all four arms validate `Ok`.
+    /// Mutant: `Ground::holds` returns `None` for every variant.
     #[test]
     fn a_ground_that_no_longer_holds_is_refused_one_arm_at_a_time() {
         // `Tf2NotLinked`: true in the default build, false in the container's.
-        // This is `total_rss_n_consumers`' historical defect exactly — the
-        // sentence "running both halves from one tool would mean linking tf2
-        // into it" shipped in `results-tf2.json`, a file produced by a build
-        // that had linked tf2 into it.
         let mut r = skeleton(false, false);
         r.build.tf2_linked = true;
         r.rows[0].grounds = vec![Ground::Tf2NotLinked];
@@ -4147,8 +3347,7 @@ mod tests {
             "{errs:?}"
         );
 
-        // `FrozenBackendNotCompiled`: true under `just bench-report`, false
-        // under `just bench-report-shm`.
+        // `FrozenBackendNotCompiled`: true under `just bench-report`, false under `bench-report-shm`.
         let mut r = skeleton(false, false);
         r.build.frozen_backend = true;
         r.rows[0].grounds = vec![Ground::FrozenBackendNotCompiled];
@@ -4161,7 +3360,7 @@ mod tests {
             "{errs:?}"
         );
 
-        // `HostFitness`: a row blaming the host on an axis the host passes.
+        // `HostFitness`: blaming the host on an axis it passes.
         let mut r = skeleton(true, false);
         r.rows[0].grounds = vec![Ground::HostFitness];
         let errs = r
@@ -4169,15 +3368,8 @@ mod tests {
             .expect_err("a fitness claim on a fit host must be refused");
         assert!(errs.iter().any(|e| e.contains("host_fitness")), "{errs:?}");
 
-        // `HostFitness` a second time, on a NON-timing axis, because the arm
-        // above cannot see which axis was asked: `skeleton`'s rows are
-        // `AbsoluteTiming`, so `axis(row.sensitivity).0` and `fair_for_timing`
-        // are the same value there and a mutant reading the fixed field passes.
-        // Here the host fails to time and passes the ratio axis, so a `Ratio`
-        // row blaming the host is stale — which is exactly `ratio_row`'s
-        // shipped shape: it sets `Ground::HostFitness` on a `Sensitivity::Ratio`
-        // row, and the whole argument for that row existing is that the ratio
-        // axis survives a host the timing axis does not.
+        // `HostFitness` again on a non-timing axis: the fixture splits timing from ratio,
+        // so a mutant reading `fair_for_timing` is caught.
         let mut r = skeleton(false, false);
         assert!(
             !r.fitness.fair_for_timing && r.fitness.fair_for_ratios,
@@ -4190,9 +3382,7 @@ mod tests {
             .expect_err("a fitness claim on an axis the host passes must be refused");
         assert!(errs.iter().any(|e| e.contains("host_fitness")), "{errs:?}");
 
-        // `HostCores`, three times, because it is a conjunction of three
-        // conditions and only one of them is about the host. First: the host
-        // has the cores.
+        // `HostCores` is a conjunction of three; first, the host has the cores.
         let mut r = skeleton(false, false);
         r.rows[0].needs_n_cores = true;
         r.rows[0].grounds = vec![Ground::HostCores];
@@ -4202,10 +3392,7 @@ mod tests {
             .expect_err("a core-count claim on a wide host must be refused");
         assert!(errs.iter().any(|e| e.contains("host_cores")), "{errs:?}");
 
-        // Second, and this is `tft_16_workers_rss`' defect: the host is short,
-        // but the row is a `Memory` row, and §9.3's amendment says the core
-        // budget does not reach one. The row was telling a reader to find
-        // sixteen physical cores for a measurement `just gate4` takes on four.
+        // Second: a `Memory` row is exempt from the budget (`tft_16_workers_rss`).
         let mut r = skeleton(false, false);
         r.fitness.enough_cores = false;
         r.rows[0].needs_n_cores = true;
@@ -4216,15 +3403,8 @@ mod tests {
             .expect_err("a memory row may not blame the core budget");
         assert!(errs.iter().any(|e| e.contains("host_cores")), "{errs:?}");
 
-        // Third, and this conjunct was dead until 2026-09-04: the host is
-        // short, the row is on an axis the budget reaches, and the row does not
-        // run N consumers. `Fitness::core_reason` governs the N-way rows only —
-        // `validate`'s own `measured` arm says so with the identical
-        // `needs_n_cores && sensitivity != Memory` test — so a single-threaded,
-        // single-process row blaming the core count is blaming a check that
-        // never applied to it. Every other arm here seeds `needs_n_cores =
-        // true`, so deleting `&& row.needs_n_cores` from `Ground::holds` left
-        // the whole suite green.
+        // Third: a row that runs no consumers may not blame the core budget; deleting
+        // `&& row.needs_n_cores` from `Ground::holds` was otherwise green.
         let mut r = skeleton(false, false);
         r.fitness.enough_cores = false;
         r.rows[0].needs_n_cores = false;
@@ -4235,9 +3415,7 @@ mod tests {
             .expect_err("a row that runs no consumers may not blame the core budget");
         assert!(errs.iter().any(|e| e.contains("host_cores")), "{errs:?}");
 
-        // Non-degenerate: the identical row with the budget actually reaching it
-        // validates, so every arm above failed for its ground and not for the
-        // fixture.
+        // Non-degenerate: the budget actually reaching the row validates.
         let mut ok = skeleton(false, false);
         ok.fitness.enough_cores = false;
         ok.rows[0].needs_n_cores = true;
@@ -4245,17 +3423,10 @@ mod tests {
         assert_eq!(ok.validate(), Ok(()));
     }
 
-    /// The two structural halves of the same rule: an `unavailable` row rests on
-    /// a stated ground, and a row with numbers keeps none.
+    /// An `unavailable` row rests on a stated ground, and a row with numbers keeps
+    /// none (a leftover ground is an excuse nothing re-checks).
     ///
-    /// The second half is not decoration. A ground left on a promoted row is a
-    /// claim nothing re-checks — `validate` only re-derives the grounds it finds,
-    /// so a row that acquired numbers while keeping "the host is unfit" would
-    /// carry a permanently-true-looking excuse beside a published figure.
-    ///
-    /// Mutants (each applied, confirmed fatal): delete the empty-grounds check
-    /// (first half validates `Ok`); delete the non-empty-on-a-claim check
-    /// (second half does).
+    /// Mutants: delete either check.
     #[test]
     fn a_gap_rests_on_a_ground_and_a_claim_carries_none() {
         let mut r = skeleton(false, false);
@@ -4272,8 +3443,7 @@ mod tests {
         r.rows[0].status = Status::Measured;
         r.rows[0].reason = String::new();
         r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
-        // Deliberately *not* `measured_as`, which is the helper that clears
-        // them: this is the hand-written promotion the helper exists to replace.
+        // Deliberately not `measured_as`, which clears the grounds.
         let errs = r
             .validate()
             .expect_err("a promoted row must drop its ground");
@@ -4283,18 +3453,11 @@ mod tests {
         );
     }
 
-    /// **§9.3 bullet 3's "THP setting" is two knobs, and this report recorded
-    /// the one that does not govern its own arena.** On the development host
-    /// the two disagree today: `enabled` reads `[madvise]` and `shmem_enabled`
-    /// reads `[never]`.
+    /// §9.3 bullet 3's "THP setting" is two knobs, and the one that governs the arena
+    /// is `shmem_enabled`. Values are compared against the sysfs files, so this passes
+    /// on any configuration and fails if the two keys share a file.
     ///
-    /// The values are compared against the sysfs files rather than against a
-    /// hardcoded string, so this passes on a host configured either way and
-    /// fails if the two keys are ever wired to the same file.
-    ///
-    /// Mutant (applied, confirmed fatal): point the `transparent_hugepage_shmem`
-    /// push at `.../enabled` — the two facts then agree with one file and the
-    /// second assertion fails.
+    /// Mutant: point the `transparent_hugepage_shmem` push at `.../enabled`.
     #[test]
     fn both_transparent_hugepage_knobs_are_recorded() {
         let p = Provenance::collect();
@@ -4315,20 +3478,11 @@ mod tests {
         }
     }
 
-    /// **§9.2's required row set is one list, and it is `REQUIRED_ROWS`.**
+    /// §9.2's required row set is one list, `REQUIRED_ROWS`. This counts rather than
+    /// matches names (the table cells are prose titles), catching a row added to one
+    /// list and not the other.
     ///
-    /// It was three, disagreeing: nine rows in §9.2's table, ten ids here, and
-    /// "all eight §9.2 rows" in `docs/PHASE5.md` §0.0. The tenth —
-    /// `lookup_ratio_vs_tf2` — arrived with §9.3's `Ratio` amendment and never
-    /// reached the table it is required by.
-    ///
-    /// This counts rather than matches names, and says so: §9.2's table cells
-    /// are the spec's prose titles, not this file's ids, so a row renamed on
-    /// both sides passes. What it catches is the drift that actually happened —
-    /// a row added to one list and not the other.
-    ///
-    /// Mutant (applied, confirmed fatal): delete any row line from §9.2's table
-    /// — the counts differ by one and this fails naming both.
+    /// Mutant: delete a row line from §9.2's table.
     #[test]
     fn the_required_row_set_is_the_size_of_phase5_section_9_2s_table() {
         let doc = std::fs::read_to_string(
@@ -4346,10 +3500,7 @@ mod tests {
         let rows = table
             .lines()
             .map(str::trim)
-            // The header line itself is consumed by `split_once`, so what is
-            // left starts with the remainder of that line (empty) and then the
-            // `|---|---|` separator; both are skipped, and the count stops at
-            // the first line that is not a table row.
+            // Skip the emptied header remainder and the `|---|` separator; stop at the first non-row.
             .skip_while(|l| l.is_empty() || l.starts_with("|---"))
             .take_while(|l| l.starts_with('|'))
             .count();
@@ -4362,11 +3513,10 @@ mod tests {
         );
     }
 
-    /// `indicative` is the `TF_TREE_BENCH_FORCE=1` escape hatch and nothing
-    /// else: it is invalid without the override, and invalid on a fit host
-    /// (where it would hide a number that *is* a claim).
+    /// `indicative` is the `TF_TREE_BENCH_FORCE=1` escape hatch only: invalid without
+    /// the override, and invalid on a fit host.
     ///
-    /// Mutant: delete the `!self.fitness.forced` check — the first half fails.
+    /// Mutant: delete the `!self.fitness.forced` check.
     #[test]
     fn indicative_requires_the_force_override_and_an_unfit_host() {
         let mut r = skeleton(false, false);
@@ -4386,22 +3536,16 @@ mod tests {
             "{errs:?}"
         );
 
-        // Unfit + forced is the one combination that is allowed.
+        // Unfit + forced is the one allowed combination.
         let mut r = skeleton(false, true);
         r.rows[0].measured_as(Status::Indicative, "forced on an unfit host".to_owned());
         r.rows[0].tf_tree = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
         assert_eq!(r.validate(), Ok(()));
     }
 
-    /// The four §9.3 "where we are worse" topics are as required as the rows,
-    /// and each must actually state the cost. A report that quietly shed them
-    /// reads as a clean sweep, which is the flattering-report failure mode
-    /// `validate` exists to make impossible.
+    /// The four §9.3 "where we are worse" topics are required, and each must state the cost.
     ///
-    /// Mutants, each applied and confirmed to make this test fail: delete the
-    /// `REQUIRED_WORSE` presence loop from `validate` (the first half then
-    /// validates `Ok`); delete the empty-`statement` check (the second half
-    /// does).
+    /// Mutants: delete the `REQUIRED_WORSE` loop, or the empty-`statement` check.
     #[test]
     fn the_where_we_are_worse_entries_are_required_and_must_state_the_cost() {
         let dropped = REQUIRED_WORSE[0];
@@ -4410,8 +3554,7 @@ mod tests {
         let errs = r.validate().expect_err("a dropped `worse` topic must fail");
         assert!(errs.iter().any(|e| e.contains(dropped)), "{errs:?}");
 
-        // A *present but empty* entry is the more likely regression: the id is
-        // still there, so a presence-only check would pass it.
+        // Present but empty is the likelier regression.
         let mut r = skeleton(false, false);
         r.worse[1].statement = "   ".to_owned();
         let errs = r
@@ -4427,22 +3570,11 @@ mod tests {
         );
     }
 
-    /// **A `where_we_are_worse` entry whose numbers are all informational is
-    /// refused.** The section whose whole purpose is to be the cost a reader may
-    /// quote against us must be a cost that can *move*.
+    /// A `where_we_are_worse` entry whose numbers are all informational is refused
+    /// (the row rule, applied to entries; `arena_memory_floor` is why). Scoped to a host
+    /// whose memory axis passed, since [`worse_entries`] withholds Pss metrics otherwise.
     ///
-    /// This is the rule the rows have carried all along, arriving three months
-    /// late for the entries — `arena_memory_floor` is why, and `validate`
-    /// carries what it cost.
-    ///
-    /// The rule is scoped to a host whose memory axis passed, because
-    /// [`worse_entries`] withholds that entry's Pss metrics when it does not —
-    /// and refusing to emit any artifact at all on a host that cannot read
-    /// `smaps_rollup` would be a worse answer than the one being prevented.
-    ///
-    /// Mutant (applied, confirmed fatal): delete the `fair_for_memory` conjunct
-    /// and the whole `!w.metrics.iter().any(...)` arm — the first half below
-    /// then validates cleanly and the test fails.
+    /// Mutant: delete the `fair_for_memory` conjunct and the direction arm.
     #[test]
     fn a_worse_entry_whose_numbers_are_all_informational_cannot_be_gated_and_fails() {
         let mut r = skeleton(true, false);
@@ -4461,7 +3593,7 @@ mod tests {
             "the violation must name the entry: {errs:?}"
         );
 
-        // One direction is enough, and it is what the shipped entry now carries.
+        // One direction is enough.
         let mut ok = skeleton(true, false);
         ok.worse[0].metrics = vec![
             Metric::new("idle_arena_bytes", 2_405_696.0, "B"),
@@ -4475,8 +3607,7 @@ mod tests {
             ok.validate()
         );
 
-        // A direction with a tolerance that makes the gate always or never fire
-        // is not a gate. Same rule the rows carry.
+        // A tolerance that makes the gate always or never fire is not a gate.
         let mut bad_tol = skeleton(true, false);
         bad_tol.worse[0].metrics =
             vec![Metric::new("idle_arena_resident_bytes", 24_576.0, "B").lower_is_better(-1.0)];
@@ -4486,9 +3617,7 @@ mod tests {
             .expect_err("a negative tolerance must fail");
         assert!(errs.iter().any(|e| e.contains("either always")), "{errs:?}");
 
-        // On a host that cannot weigh anything, the rule stands down rather than
-        // suppressing the artifact — `worse_entries` has withheld the number
-        // this rule would ask for a direction on.
+        // On a host that cannot weigh anything the rule stands down.
         let mut unfit = skeleton(true, false);
         unfit.fitness.fair_for_memory = false;
         unfit.fitness.memory_reasons = vec!["/proc/self/smaps_rollup is unreadable".to_owned()];
@@ -4501,34 +3630,18 @@ mod tests {
         );
     }
 
-    /// **The shipped `arena_memory_floor` entry carries a direction.** The rule
-    /// above is satisfiable in the abstract; this is the one assertion that says
-    /// the *real* entry satisfies it, which is what `docs/decisions/0021` step 4
-    /// actually asks for.
+    /// The shipped `arena_memory_floor` entry carries a direction
+    /// (`docs/decisions/0021` step 4).
     ///
-    /// **`Fitness::assess`, not `Fitness::probe`, and that is the whole reason
-    /// this test works.** The first version of it called `probe` and skipped
-    /// early when the memory axis failed — and a test binary is built with
-    /// `debug_assertions`, so `probe`'s `debug_build` input is *always* true
-    /// here and the memory axis is *always* false. The test therefore returned
-    /// before its first assertion on every run, and dropping
-    /// `.lower_is_better(RESIDENCY_SLACK)` from `worse_entries` left it green:
-    /// an anti-vacuity test that was itself vacuous, which is the failure mode
-    /// this repository has recorded three times. `assess` takes the host facts
-    /// as arguments, so the axis can be made to pass here.
+    /// Uses `Fitness::assess`, not `probe`: a test binary always has
+    /// `debug_assertions`, so `probe` would fail the memory axis and skip every
+    /// assertion.
     ///
-    /// Mutant (applied, re-run 2026-09-10): drop
-    /// `.lower_is_better(RESIDENCY_SLACK)` from `worse_entries` — this test
-    /// fails on `the residency figure must be gated`. Before the `probe` ->
-    /// `assess` fix the same mutant was caught only by
-    /// `a_host_with_no_obstacle_still_grounds_every_n_way_row`, by accident: it
-    /// is the one test that hands `validate` a fitness with the memory axis
-    /// passing.
+    /// Mutant: drop `.lower_is_better(RESIDENCY_SLACK)` from `worse_entries`.
     #[test]
     fn the_arena_memory_floor_entry_gates_its_residency_figure() {
         let opts = Options::default();
-        // `debug_build: false, pss_readable: true` — the host facts a release
-        // run on this machine has, handed in rather than probed.
+        // Release-run host facts, handed in rather than probed.
         let fitness = Fitness::assess(
             opts.consumers,
             32,
@@ -4538,8 +3651,7 @@ mod tests {
             false,
             true,
         );
-        // Non-degenerate: without this the test could go back to passing for the
-        // reason it used to pass for.
+        // Non-degenerate: the axis this test needs must pass.
         assert!(
             fitness.fair_for_memory,
             "the axis this test needs must pass: {:?}",
@@ -4577,18 +3689,10 @@ mod tests {
         );
     }
 
-    /// A §9.3 entry with no numbers must say why it has none, and one with
-    /// numbers must not claim it has none.
+    /// A §9.3 entry with no numbers must say why, and one with numbers must not claim
+    /// it has none.
     ///
-    /// **This is the rule that closes the hole two of the four entries sat in**
-    /// — `bridge_supervision` and `format_bump_cost` carried
-    /// `metrics: Vec::new()` from the day they were written. An entry that
-    /// cannot regress is not an honest entry; an entry that explains why it
-    /// cannot is.
-    ///
-    /// Mutants, each applied and confirmed to make this test fail: delete the
-    /// `(true, None | Some(""))` arm from `validate` (the first half validates
-    /// `Ok`); delete the `(false, Some(_))` arm (the second half does).
+    /// Mutants: delete the `(true, None | Some(""))` arm, or the `(false, Some(_))` arm.
     #[test]
     fn a_worse_entry_with_no_numbers_must_say_why() {
         let mut r = skeleton(false, false);
@@ -4602,14 +3706,12 @@ mod tests {
             "the violation must name the entry and the missing field: {errs:?}"
         );
 
-        // Whitespace is not an explanation, for the same reason `"   "` is not
-        // a statement two tests above.
+        // Whitespace is not an explanation.
         let mut r = skeleton(false, false);
         r.worse[0].metrics_absent_because = Some("  ".to_owned());
         assert!(r.validate().is_err(), "a blank reason must not satisfy it");
 
-        // And the contradiction: numbers *and* a reason they are absent. One of
-        // the two is stale, and the report cannot say which.
+        // Numbers *and* a reason they are absent: one is stale.
         let mut r = skeleton(false, false);
         r.worse[0].metrics = vec![Metric::new("bytes", 1.0, "B")];
         let errs = r
@@ -4620,9 +3722,7 @@ mod tests {
             "{errs:?}"
         );
 
-        // The real report satisfies the rule on this host — which is the point
-        // of the field, not an incidental check: `worse_entries` is where the
-        // four entries are actually written.
+        // The real report satisfies the rule.
         let opts = Options::default();
         for w in worse_entries(&opts, &Fitness::probe(opts.consumers)) {
             assert_eq!(
@@ -4635,24 +3735,14 @@ mod tests {
         }
     }
 
-    /// The remaining §9.3 row rules, each isolated so a failure names one cause:
-    /// a `measured` row must carry numbers, an `indicative` row must say why, an
-    /// `unavailable` row must carry none, and a required row may not be counted
-    /// twice (which would let a second, flattering copy sit beside the first).
+    /// The remaining row rules, each isolated: a `measured` row carries numbers, an
+    /// `indicative` row says why, an `unavailable` row carries none, and a required row
+    /// is not counted twice. Each block picks the fitness that silences the other rules.
     ///
-    /// Each block picks the `skeleton` fitness that makes the *other* rules
-    /// inapplicable — otherwise the assertion would pass off the back of a rule
-    /// it is not testing.
-    ///
-    /// Mutants, each applied and confirmed to make this test fail: delete the
-    /// `r.tf_tree.is_empty() && r.tf2.is_empty()` check; delete the
-    /// `indicative`/`r.reason.trim().is_empty()` check; delete the
-    /// `!r.tf_tree.is_empty() || !r.tf2.is_empty()` check under `Unavailable`;
-    /// replace `validate`'s duplicate-count `n =>` arm with `_ => {}`.
+    /// Mutants: delete the corresponding check in `validate`.
     #[test]
     fn a_row_must_carry_exactly_the_evidence_its_status_claims() {
-        // `measured` with nothing to show. Fit host, so the timing rule is
-        // silent and only the missing-numbers rule can fire.
+        // `measured` with nothing to show; a fit host silences the timing rule.
         let mut r = skeleton(true, false);
         r.rows[0].status = Status::Measured;
         r.rows[0].reason = String::new();
@@ -4663,8 +3753,7 @@ mod tests {
             "{errs:?}"
         );
 
-        // `indicative` with no reason. Unfit + forced is the one combination the
-        // other two indicative rules allow, so the reason rule is alone.
+        // `indicative` with no reason; unfit + forced silences the other two.
         let mut r = skeleton(false, true);
         r.rows[0].status = Status::Indicative;
         r.rows[0].reason = "  ".to_owned();
@@ -4676,10 +3765,7 @@ mod tests {
             "{errs:?}"
         );
 
-        // `unavailable` and yet carrying a number. The number would render in
-        // the table beside the refusal, which is a claim wearing a disclaimer.
-        // Asserted on the `tf2` column specifically: the `tf_tree` column alone
-        // would leave the `||`'s right operand untested.
+        // `unavailable` carrying a number, in the `tf2` column so the `||`'s right operand is tested.
         let mut r = skeleton(false, false);
         r.rows[0].tf2 = vec![Metric::new("p50_ns", 42.0, "ns").lower_is_better(LATENCY_SLACK)];
         let errs = r.validate().expect_err("unavailable carrying numbers");
@@ -4688,8 +3774,7 @@ mod tests {
             "{errs:?}"
         );
 
-        // A duplicated required row: present twice, so the presence check is
-        // satisfied and only the count arm can catch it.
+        // Duplicated required row: only the count arm catches it.
         let mut r = skeleton(false, false);
         let dup = r.rows[3].clone();
         r.rows.push(dup);
@@ -4700,14 +3785,10 @@ mod tests {
         );
     }
 
-    /// §9.3 puts the "where we are worse" entries in the same table as the
-    /// results, not in a footnote. Asserted structurally: the section header and
-    /// every topic must fall between the results table's `<table>` and its
-    /// `</table>`.
+    /// §9.3 puts "where we are worse" in the same table as the results. Asserted
+    /// structurally: the header and every topic fall inside the results `<table>`.
     ///
-    /// Mutant (verified): close the results table early by inserting
-    /// `s.push_str("</table>\n")` immediately before the worse-entry block in
-    /// `to_html` — the topics then land outside the table and this test fails.
+    /// Mutant: insert `s.push_str("</table>\n")` before the worse-entry block in `to_html`.
     #[test]
     fn worse_entries_render_inside_the_results_table() {
         let mut r = skeleton(false, false);
@@ -4729,13 +3810,9 @@ mod tests {
         );
     }
 
-    /// The JSON must survive a reason containing the characters that break
-    /// hand-written serialisers, and must never emit `NaN`.
+    /// The JSON survives hostile reason characters and never emits `NaN`.
     ///
-    /// Mutants, each verified to fail this test: drop the `'"'` arm from `jstr`
-    /// (the quote is then emitted raw and closes the string early); make `jnum`
-    /// print `{v}` unconditionally (`NaN` then reaches the file, and `NaN` is
-    /// not JSON — no parser accepts it).
+    /// Mutants: drop the `'"'` arm from `jstr`; make `jnum` print `{v}` unconditionally.
     #[test]
     fn json_escapes_hostile_reasons_and_never_emits_nan() {
         let mut r = skeleton(false, false);
@@ -4748,41 +3825,21 @@ mod tests {
         assert!(json.contains("\\\\"), "{json}");
         assert!(!json.contains("NaN"), "{json}");
         assert!(json.contains("\"value\": null"), "{json}");
-        // Cheap structural check: braces balance and the schema key is first.
-        // The version is spelled out rather than read from `SCHEMA` on purpose —
-        // it is a compatibility surface, so bumping it should cost an edit here
-        // that somebody reads, not pass silently because both sides moved.
+        // Braces balance and the schema key is first; the version is spelled out so a bump costs a deliberate edit.
         assert!(json.starts_with("{\n  \"schema\": \"tf_tree.bench-report/2\""));
         let opens = json.matches('{').count();
         let closes = json.matches('}').count();
         assert_eq!(opens, closes, "unbalanced JSON braces");
     }
 
-    /// **The shipped rows' reasons, checked against the property rather than
-    /// against the wording.**
+    /// The shipped rows' reasons, checked against the property rather than the wording.
     ///
-    /// # What this checks
+    /// Every unavailable row rests on at least one [`Ground`] and every ground it names
+    /// still holds. The test also asserts the shipped set has a **decidable** ground,
+    /// else moving every row to `MeasuredElsewhere` would leave the rule green and
+    /// checking nothing. The three-phrase scan is a subordinate check.
     ///
-    /// Every unavailable row in the *shipped* report rests on at least one
-    /// [`Ground`], and every ground it names still holds. `validate` is what
-    /// enforces that; this test is what makes it non-vacuous, because a rule
-    /// over a set can pass by the set being empty or by every member being
-    /// exempt. So it also asserts that the shipped set contains rows with a
-    /// **decidable** ground — without that assertion, a future edit that moved
-    /// every row onto `MeasuredElsewhere` would leave this file's honesty rule
-    /// green and checking nothing.
-    ///
-    /// The three-phrase scan is kept as a subordinate check rather than deleted.
-    /// It is cheap, it pins the two sentences that actually shipped, and its
-    /// weakness is now recorded beside it instead of being mistaken for
-    /// coverage: **it can see three spellings of one claim, and there is no
-    /// claim it can see that a `Ground` does not already decide.**
-    ///
-    /// Mutant (applied, confirmed fatal): give `tft_16_workers_rss` the ground
-    /// `Ground::HostCores` — the row is `Memory`, the budget does not reach it,
-    /// and `assemble`'s own validation fails naming `host_cores`. Second mutant
-    /// (applied, confirmed fatal): drop `.on(...)` from the `lookup_latency`
-    /// row — this test fails on the empty-grounds assertion.
+    /// Mutants: give `tft_16_workers_rss` `Ground::HostCores`; drop `.on(...)` from `lookup_latency`.
     #[test]
     fn no_unavailable_reason_rests_on_a_claim_that_has_gone_stale() {
         let opts = Options {
@@ -4793,8 +3850,7 @@ mod tests {
         };
         let report = assemble(&opts).expect("assemble");
 
-        // Non-degenerate: if nothing were unavailable this would pass vacuously,
-        // and on a host that can measure everything it still must not.
+        // Non-degenerate: some rows must be unavailable.
         let unavailable: Vec<&Row> = report
             .rows
             .iter()
@@ -4831,15 +3887,12 @@ mod tests {
                         g.decided_by(),
                         r.reason
                     ),
-                    // The three the guard cannot see. Counted nowhere on
-                    // purpose: they must not be able to satisfy the
-                    // `decidable > 0` assertion below.
+                    // The undecidable three must not satisfy `decidable > 0`.
                     None => {}
                 }
             }
 
-            // The old spelling scan, kept and demoted. It sees three phrasings
-            // of one claim; the loop above sees the claim.
+            // The old spelling scan, demoted.
             for phrase in ["is not implemented", "are not implemented", "unimplemented"] {
                 assert!(
                     !r.reason.contains(phrase),
@@ -4859,48 +3912,33 @@ mod tests {
         );
     }
 
-    /// The timestamp routine is the one piece of the provenance header with no
-    /// external oracle, so it is pinned against known instants.
+    /// The timestamp routine has no external oracle, so it is pinned against known instants.
     ///
-    /// Mutant: change `719_468` to `719_469` in `iso8601_utc` — every date
-    /// shifts by a day and this test fails.
+    /// Mutant: change `719_468` to `719_469`.
     #[test]
     fn iso8601_matches_known_instants() {
         let at = |s: u64| iso8601_utc(UNIX_EPOCH + Duration::from_secs(s));
         assert_eq!(at(0), "1970-01-01T00:00:00Z");
         assert_eq!(at(1_000_000_000), "2001-09-09T01:46:40Z");
-        // 2024-02-29: a leap day in a century-divisible-by-400 era.
+        // 2024-02-29: a leap day.
         assert_eq!(at(1_709_164_800), "2024-02-29T00:00:00Z");
         assert_eq!(at(1_735_689_599), "2024-12-31T23:59:59Z");
     }
 
-    /// Every command the artifact tells a stranger to run must be a command that
-    /// exists — the "Reproducing this" line at the top, and the `reproduce:`
-    /// field of every unavailable row. §9.3's "no private benchmark" is worth
-    /// nothing if the published incantation exits non-zero, and it is worse than
-    /// nothing: it teaches the reader that the rest of the page is decorative.
+    /// Every command the artifact tells a stranger to run must exist: the "Reproducing
+    /// this" line, and the `reproduce:` field and reason of every row. Checked against
+    /// the real `justfile`, `xtask` dispatch and target files, on the shipped rows
+    /// from `assemble`.
     ///
-    /// Checked against the real `justfile`, the real `xtask` dispatch and the
-    /// real target files, so this fails on a renamed recipe as well as on an
-    /// invented one. `assemble` is called rather than `skeleton` because the
-    /// commands under test are the ones in the shipped rows.
-    ///
-    /// Mutant (applied, confirmed fatal): put `cargo xtask bench-report` back in
-    /// `to_html`'s "Reproducing this" block — `xtask` dispatches no such task and
-    /// this fails naming it.
-    ///
-    /// Mutant (applied, confirmed fatal): rename the `scaling_curve` row's
-    /// reproduce recipe to `just tf2-scaling-curve` — no such recipe, and this
-    /// fails.
+    /// Mutants: put `cargo xtask bench-report` back in `to_html`; rename the
+    /// `scaling_curve` recipe to `just tf2-scaling-curve`.
     #[test]
     fn every_command_the_report_names_is_a_command_that_exists() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let justfile = std::fs::read_to_string(root.join("justfile")).expect("justfile");
         let xtask = std::fs::read_to_string(root.join("xtask/src/main.rs")).expect("xtask main");
 
-        // `just <name>` where `<name>` is a recipe: a `justfile` recipe is a
-        // line at column 0 whose first token, up to a space or a colon, is the
-        // name. Comments start with `#`, so they cannot match a bare name.
+        // A `justfile` recipe is a column-0 line whose first token up to a space or colon is the name.
         let recipe_exists = |name: &str| {
             justfile.lines().any(|l| {
                 !l.starts_with(char::is_whitespace)
@@ -4931,13 +3969,8 @@ mod tests {
                 t.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
                     .to_owned()
             };
-            // The *leading* token needs its own trim, and this is why the
-            // reason scan below was vacuous when it was first added: a
-            // `reproduce:` field spells a command bare (`just mp-bench-tf2`),
-            // while a reason spells it in backticks (`` `just dds-bench` ``), so
-            // the token is `` `just `` and an equality test against "just"
-            // matches nothing. `word` cannot do this job — it strips leading
-            // dashes too, and `--bench` is one of the things being matched.
+            // The leading token needs its own trim: a reason spells a command in backticks
+            // and `word` would also strip `--bench`'s dashes.
             let cmd = |t: &str| {
                 t.trim_matches(|c: char| {
                     matches!(
@@ -4949,11 +3982,7 @@ mod tests {
             };
             let tok: Vec<String> = plain.split_whitespace().map(String::from).collect();
             for (i, t) in tok.iter().enumerate() {
-                // Bind the trimmed token ONCE. Matching on `cmd(t)` and then
-                // branching on the raw `t` is how a backticked `` `--bench` ``
-                // in a reason selected this arm and then resolved against
-                // `tests/`; the reason scan was added precisely because reasons
-                // spell commands in backticks.
+                // Bind the trimmed token once; branching on the raw one mis-resolved backticked `--bench`.
                 let key = cmd(t);
                 match key.as_str() {
                     "just" => {
@@ -4972,8 +4001,7 @@ mod tests {
                         );
                         checked += 1;
                     }
-                    // `--bench X` / `--test X` name files cargo must be able to
-                    // find; a renamed harness is the same class of rot.
+                    // `--bench X` / `--test X` name files cargo must find.
                     "--bench" | "--test" => {
                         let dir = if key == "--bench" { "benches" } else { "tests" };
                         let name = word(tok.get(i + 1).map_or("", String::as_str));
@@ -4999,15 +4027,8 @@ mod tests {
         let r = assemble(&opts).expect("assemble");
         for row in &r.rows {
             check(row.reproduce, row.id);
-            // **The reason, not only `reproduce:`.** The `Ground` type's docs
-            // offer this test as the one partial mitigation for
-            // `Ground::MeasuredElsewhere`, "resolves the recipe a
-            // `MeasuredElsewhere` row names" — and recipes are named in reasons
-            // that appear in no `reproduce` field: `just bench-report`, for one,
-            // which `frozen_row_reason` puts in both `.tft` rows' reason while
-            // neither row's `reproduce` names it. A recipe in a reason rots
-            // exactly as a recipe in a command does; it is the same prose
-            // wearing a different field name.
+            // The reason too, not only `reproduce:`: recipes named in a reason (e.g.
+            // `just bench-report` in `frozen_row_reason`) rot the same way.
             check(&row.reason, row.id);
         }
         let html = r.to_html();
@@ -5017,33 +4038,19 @@ mod tests {
             .1;
         check(block, "the `Reproducing this` block");
 
-        // Guards the parser itself: if `check` silently matched nothing, every
-        // assertion above would be vacuous and this test would pass on a report
-        // naming only fictional commands. **That is not hypothetical here**:
-        // the reason scan added above matched zero tokens on its first version,
-        // because a reason spells a recipe in backticks, and this floor was low
-        // enough to hide it.
-        //
-        // The floor is the one number here on purpose, and it sits *between*
-        // two counts rather than restating them: above what the scan yields
-        // from `reproduce` and the HTML block alone, so deleting
-        // `check(&row.reason, ...)` or reverting the leading-token trim fails
-        // this test; and below what it yields with both, so deleting one
-        // sentence of prose does not. Re-derive both, in whichever tree state
-        // you are asking about, by replacing this floor with an unreachable
-        // one and reading the panic message.
+        // Guards the parser: if `check` matched nothing every assertion is vacuous. The
+        // floor sits above the yield from `reproduce` and the HTML block alone and below
+        // the yield with the reason scan, so deleting either fails; re-derive it by
+        // substituting an unreachable floor and reading the panic.
         assert!(
             checked >= 20,
             "only {checked} commands were checked — the scanner matched nothing"
         );
     }
 
-    /// A real x86-64 `/proc/cpuinfo` fragment (two SMT siblings per core, four
-    /// cores across two sockets) and a real aarch64 one, which carries no
-    /// `physical id` or `core id` lines at all.
-    ///
-    /// Non-degenerate on purpose: the x86 text repeats `core id: 0` on socket 0
-    /// and again on socket 1, so a parse that keyed on `core id` alone would
+    /// Real `/proc/cpuinfo` fragments: x86-64 (two SMT siblings per core, four cores
+    /// over two sockets; `core id` repeats per socket, so keying on it alone answers 2,
+    /// not 4) and aarch64, which has no `physical id` or `core id`.
     /// answer 2 instead of 4.
     const X86_CPUINFO: &str = "\
 processor\t: 0
@@ -5077,14 +4084,10 @@ CPU implementer\t: 0x41
 CPU part\t: 0xd0c
 ";
 
-    /// `/proc/cpuinfo` publishes no core ids on aarch64 — the target
-    /// `CLAUDE.md` requires CI to cover — nor in many containers. The parse must
-    /// say so rather than answer with the logical CPU count, which is the wrong
-    /// denominator by this function's own documentation.
+    /// aarch64 and many containers publish no core ids: the parse must say so rather
+    /// than answer with the logical CPU count.
     ///
-    /// Mutant (applied, confirmed fatal): make the parse fall back to
-    /// `available_parallelism()` instead of returning `None` — the aarch64 half
-    /// then yields `Some(n)` and this fails.
+    /// Mutant: fall back to `available_parallelism()` instead of `None`.
     #[test]
     fn a_host_that_publishes_no_core_ids_is_unknown_not_guessed() {
         assert_eq!(physical_cores_from_cpuinfo(X86_CPUINFO), Some(4));
@@ -5092,22 +4095,13 @@ CPU part\t: 0xd0c
         assert_eq!(physical_cores_from_cpuinfo(""), None);
     }
 
-    /// The verdicts must degrade honestly when the physical core count is
-    /// unknown; `assess`'s fallback comment carries why a silent fallback to
-    /// logical CPUs is a false PASS about a host nothing was learned from.
+    /// Verdicts degrade honestly when the physical core count is unknown.
+    /// `debug_build: false` so the host facts decide `fair_for_timing`.
     ///
-    /// `debug_build: false` throughout, so `fair_for_timing` is decided by the
-    /// host facts rather than by the fact that tests run in a debug build.
-    ///
-    /// Mutant (applied, confirmed fatal): in `assess`, drop both `unknown_cores`
-    /// branches and keep only `let physical = detected_physical
-    /// .unwrap_or(logical);` — the unknown host then reports
-    /// `fair_for_timing == true` and `core_reason == None`, and this fails.
+    /// Mutant: drop both `unknown_cores` branches in `assess`.
     #[test]
     fn an_unknown_physical_core_count_fails_both_verdicts_and_says_why() {
-        // A known-good host: quiet, `performance`, no SMT, cores to spare.
-        // This is the control — without it the assertions below could be passing
-        // because `assess` refuses everything.
+        // Control: a known-good host, so the assertions below are not passing because `assess` refuses everything.
         let ok = Fitness::assess(
             4,
             8,
@@ -5121,7 +4115,7 @@ CPU part\t: 0xd0c
         assert!(ok.enough_cores, "{:?}", ok.core_reason);
         assert!(ok.physical_cores_known);
 
-        // The same host, except that it published no core ids.
+        // Same host, no core ids.
         let blind = Fitness::assess(
             4,
             8,
@@ -5149,8 +4143,7 @@ CPU part\t: 0xd0c
             "a core budget checked against SMT siblings is not a budget check"
         );
 
-        // The SMT reason is the one that goes quiet under a silent fallback, so
-        // it is pinned separately: a genuine SMT host must still name it.
+        // The SMT reason goes quiet under a silent fallback, so pin it separately.
         let smt = Fitness::assess(
             2,
             8,
@@ -5167,16 +4160,10 @@ CPU part\t: 0xd0c
         );
     }
 
-    /// `--consumers` is operator input. `consumers + 1` wraps to 0 at
-    /// `usize::MAX` in a release build, making `physical < needed` false, so the
-    /// core budget prints PASS and the N-way rows become claimable — the refusal
-    /// inverted by an argument. `just bench-report` builds `--release`, so the
-    /// wrap is the reachable half; a debug build panics instead, and neither is
-    /// acceptable.
+    /// `--consumers` is operator input: `consumers + 1` wraps to 0 at `usize::MAX` in
+    /// release and would print the core budget as PASS.
     ///
-    /// Mutant (applied, confirmed fatal): restore `let needed = consumers + 1;`
-    /// — this test panics with `attempt to add with overflow` under `cargo
-    /// nextest` (debug), and reports `enough_cores == true` under `--release`.
+    /// Mutant: restore `let needed = consumers + 1;`.
     #[test]
     fn an_absurd_consumer_count_still_refuses_the_core_budget() {
         let f = Fitness::assess(
@@ -5201,19 +4188,11 @@ CPU part\t: 0xd0c
         );
     }
 
-    /// `measure_lookup_latency` is the only real measurement in this module, and
-    /// `assemble` reaches it only when the clock-fitness probe passes — which
-    /// running the test suite actively prevents, since the suite is what makes
-    /// the machine busy. Left to `assemble`, the one code path whose numbers ever
-    /// get published as a claim would be the one path no test executes. So it is
-    /// called here directly, at a sample count that costs milliseconds.
+    /// `measure_lookup_latency` is the only real measurement here and `assemble`
+    /// reaches it only on a fit host, which running the suite prevents; so it is called
+    /// directly at a cheap sample count.
     ///
-    /// Mutant (applied, confirmed fatal): change the measured loop's bound to
-    /// `for _ in 0..samples.min(100)` — the `samples` metric then reports 100 and
-    /// the first assertion fails.
-    ///
-    /// Mutant (applied, confirmed fatal): swap the `p50_ns` and `p999_ns` rows of
-    /// the returned vector — the ordering assertion fails.
+    /// Mutants: bound the loop at `samples.min(100)`; swap the `p50_ns` and `p999_ns` rows.
     #[test]
     fn the_lookup_measurement_reports_every_sample_and_ordered_percentiles() {
         const SAMPLES: usize = 4_096;
@@ -5226,53 +4205,29 @@ CPU part\t: 0xd0c
                 .value
         };
 
-        // Every sample must reach the histogram: a loop that silently recorded
-        // fewer would still produce plausible percentiles.
+        // Every sample must reach the histogram.
         assert_eq!(get("samples"), SAMPLES as f64);
 
         let (p50, p99, p999) = (get("p50_ns"), get("p99_ns"), get("p999_ns"));
         assert!(p50 <= p99 && p99 <= p999, "p50={p50} p99={p99} p999={p999}");
-        // A p50 of 0 ns would mean the histogram recorded a constant, not a
-        // measurement — the degenerate fixture this repo has shipped before.
+        // A p50 of 0 ns would be a constant, not a measurement.
         assert!(p50 > 0.0, "p50 of {p50} ns is not a measurement");
-        // A depth-3 in-process lookup taking a millisecond at the *median* means
-        // the unit is wrong or the fixture is not the fixture. Loose enough to
-        // survive a contended test runner, tight enough to catch a unit error.
+        // A millisecond median means a wrong unit or fixture; loose enough for a contended runner.
         assert!(p50 < 1_000_000.0, "p50 of {p50} ns is not a depth-3 lookup");
         assert!(get("clock_overhead_p50_ns") >= 0.0);
         assert!(m.iter().all(|x| x.value.is_finite()), "{m:?}");
     }
 
-    /// [`LOOKUP_NOTE`] states the two things `docs/PHASE1.md` §11.3 requires,
-    /// and states them about the plan `measure_lookup_latency` actually compiles.
+    /// [`LOOKUP_NOTE`] states what `docs/PHASE1.md` §11.3 requires, about the plan
+    /// `measure_lookup_latency` compiles. The step count is read from the compiled plan,
+    /// so changing the fixture or the note's number fails it.
     ///
-    /// This is a gate on a *string*, so it is written to fail for the reasons
-    /// that matter rather than on any edit: the step count is read out of the
-    /// compiled plan and formatted, so changing the fixture's `base_link ->
-    /// imu_link` chain fails this test without anyone touching the note, and
-    /// changing the note's number fails it without anyone touching the fixture.
-    ///
-    /// Three mutants were applied and each was observed fatal; all three
-    /// outputs are pasted in this branch's report.
-    ///
-    /// 1. In [`LOOKUP_NOTE`], write "**2 dynamic steps**" — assertion 1:
-    ///    *"the plan `map <- imu_link` compiles to 3 dynamic steps, so the note
-    ///    must contain `"**3 dynamic steps**"`"*.
-    /// 2. Set [`LOOKUP_STAMP_NS`] back to `crate::fixture::NOW_NS`, which is
-    ///    what `measure_lookup_latency` queried before `docs/decisions/0013` —
-    ///    assertion 2, *"the note names fixture::QUERY_NS and
-    ///    `measure_lookup_latency` queries something else, left: 9900000000,
-    ///    right: 9899500000"*. Note that it is assertion 2 and **not** the
-    ///    off-grid loop that catches this one: the loop runs on the stamp this
-    ///    row reads, and the name check runs first.
-    /// 3. Move `fixture::QUERY_NS` to `NOW_NS - 1_000_000`, which is off three
-    ///    of the four grids and *on* the 1 kHz one — assertion 3, naming the
-    ///    edge: *"base_link->imu_link: this row's stamp lands on the 1000 Hz
-    ///    grid"*. This is the mutant that shows the loop is live rather than
-    ///    shadowed by the equality above it.
+    /// Mutants: write "**2 dynamic steps**" in the note (assertion 1); set
+    /// [`LOOKUP_STAMP_NS`] back to `crate::fixture::NOW_NS` (assertion 2, not the loop);
+    /// move `fixture::QUERY_NS` to `NOW_NS - 1_000_000`, on the 1 kHz grid (assertion 3).
     #[test]
     fn the_lookup_row_note_states_what_phase1_requires() {
-        // 1. The dynamic-step count, taken from the plan rather than from prose.
+        // 1. The dynamic-step count, from the plan.
         let tree = crate::fixture::build_tree_with(InterpPolicy::LerpSlerp).expect("fixture");
         let target = tree.frame("imu_link").expect("target frame");
         let source = tree.frame("map").expect("source frame");
@@ -5286,8 +4241,7 @@ CPU part\t: 0xd0c
              note must contain {stated:?}. It reads: {LOOKUP_NOTE}"
         );
 
-        // 2. The note names a stamp, and it must be the one the measured loop
-        //    queries. Two claims, so two assertions.
+        // 2. The note names a stamp, and it must be the one the loop queries.
         assert!(
             LOOKUP_NOTE.contains("fixture::QUERY_NS"),
             "the note must name the stamp it was taken at: {LOOKUP_NOTE}"
@@ -5299,11 +4253,7 @@ CPU part\t: 0xd0c
              queries something else"
         );
 
-        // 3. …and "off-grid" must be true of the stamp this row reads. That
-        //    duplicates `fixture`'s own test on purpose: `fixture` guards the
-        //    constant, this guards the *claim the note publishes about it*, and
-        //    the loop runs over every dynamic edge in the fixture — a superset
-        //    of the three on this path, so it cannot pass by missing one.
+        // 3. "off-grid" must be true of the stamp; this guards the note's claim, `fixture` the constant.
         assert!(
             LOOKUP_NOTE.contains("off-grid"),
             "the note must state the stamp regime: {LOOKUP_NOTE}"
@@ -5321,28 +4271,12 @@ CPU part\t: 0xd0c
         }
     }
 
-    /// The all-clear host: **no obstacle at all**, which no committed test
-    /// could reach before this one and where the branch that introduced
-    /// `Ground` was broken.
+    /// The all-clear host: no obstacle at all. `assemble` probes and this host has four
+    /// cores, so `core_reason` was always `Some`; on a host with none, `host_grounds`
+    /// came out empty and `validate` rejected the whole report. The fix is the seeded
+    /// `Ground::MeasuredElsewhere` in `assemble_on`.
     ///
-    /// `assemble` probes, and this repository's development host has four
-    /// physical cores, so `Fitness::core_reason` was always `Some` and the
-    /// three N-way rows always had an obstacle to name. On a host with none —
-    /// ROS installed, `consumers + 1` physical cores, quiet, no SMT,
-    /// `performance` governor, release build — `host_grounds` was assembled
-    /// from the obstacles that *fired*, came out empty, and
-    /// `Report::validate`'s own new "an unavailable row rests on a stated
-    /// ground" rule then rejected the entire report: `bench_report` would have
-    /// written nothing on the best host it could run on. The fix is the seeded
-    /// `Ground::MeasuredElsewhere` in `assemble_on`, which is the honest label
-    /// — this tool is one process and these three rows are measured by the
-    /// recipes they name.
-    ///
-    /// Mutant (verified, re-run 2026-09-05): replace `n_way_grounds` in
-    /// `assemble_on` with `host_grounds.clone()`, i.e. drop the seeded
-    /// `Ground::MeasuredElsewhere` — this test fails with "row
-    /// `cpu_per_consumer` is unavailable on an all-clear host carrying grounds
-    /// []", which is the shipped defect reproduced.
+    /// Mutant: replace `n_way_grounds` with `host_grounds.clone()`.
     #[test]
     fn a_host_with_no_obstacle_still_grounds_every_n_way_row() {
         const N: usize = 4;
@@ -5355,8 +4289,7 @@ CPU part\t: 0xd0c
             false,
             true,
         );
-        // Non-degenerate: if any of these went false the test below would be
-        // passing for the ordinary reason rather than for the all-clear one.
+        // Non-degenerate: the all-clear host really is one.
         assert!(fitness.fair_for_timing, "{:?}", fitness.reasons);
         assert!(fitness.fair_for_ratios && fitness.fair_for_memory);
         assert!(fitness.enough_cores && fitness.core_reason.is_none());
@@ -5368,18 +4301,11 @@ CPU part\t: 0xd0c
             consumers: N,
             ..Options::default()
         };
-        // `Build::current()` rather than a fabricated `Build`: `ratio_row`'s and
-        // the differential row's arms are `#[cfg]`-selected at compile time and
-        // cannot be talked out of the build they were compiled for, so a
-        // fabricated `tf2_linked = true` would make a *correct* ground read
-        // stale. The ROS flag is the one that has to be handed in, because it is
-        // read from the environment.
+        // `Build::current()`, not a fabricated `Build`: the `#[cfg]`-selected arms cannot
+        // be talked out of their build. The ROS flag is read from the environment, so it is handed in.
         let r = assemble_on(&opts, fitness, Build::current(), true).expect("assemble");
 
-        // The ground each row must carry whatever the host is — and they are
-        // not the same ground. `publish_to_visible` may not say
-        // `MeasuredElsewhere`, because its own reason says nothing in this
-        // repository times publish-to-visible end to end.
+        // The ground each row must carry on any host; `publish_to_visible` may not say `MeasuredElsewhere`.
         for (id, standing) in [
             ("cpu_per_consumer", Ground::MeasuredElsewhere),
             ("scaling_curve", Ground::MeasuredElsewhere),
@@ -5392,10 +4318,7 @@ CPU part\t: 0xd0c
                 "row `{id}` is unavailable on an all-clear host carrying grounds {:?}",
                 row.grounds
             );
-            // The prose half of the same defect: the reason for these rows used
-            // to be the literal sentence "no obstacle was found for a
-            // 4-consumer comparison on this host", printed as the explanation of
-            // why the row is missing.
+            // The prose half: the reason used to read "no obstacle was found".
             assert!(
                 !row.reason.contains("no obstacle"),
                 "row `{id}` explains its absence with: {}",
@@ -5408,8 +4331,7 @@ CPU part\t: 0xd0c
             );
         }
 
-        // The over-claim half of the same rule: the row that has no instrument
-        // may not borrow the other two rows' standing ground.
+        // The row with no instrument may not borrow the others' ground.
         let ptv = r
             .rows
             .iter()
@@ -5421,27 +4343,18 @@ CPU part\t: 0xd0c
             ptv.grounds
         );
 
-        // The whole point: the report a fit host produces is one this tool will
-        // write.
+        // A fit host produces a report this tool will write.
         assert_eq!(r.validate(), Ok(()));
     }
 
-    /// End-to-end: the report this tool actually assembles on *this* host must
-    /// pass its own §9.3 validation, and the emitted JSON must survive a
-    /// round trip through a parser strict about escapes and non-finite numbers.
+    /// End-to-end: the report assembled on *this* host passes its own §9.3 validation
+    /// (the skeleton tests use hand-built reports; only this notices `assemble` disagreeing).
     ///
-    /// The skeleton tests above check `validate` against hand-built reports; if
-    /// `assemble` disagrees with them, only this test notices.
-    ///
-    /// Mutant (verified): in `assemble`, give the `lookup_latency` row
-    /// `Status::Measured` and a `p50_ns` metric before the `timing_status`
-    /// match — this test fails on any host that does not pass the clock-fitness
-    /// probe, which includes the one this was developed on.
+    /// Mutant: give `lookup_latency` `Status::Measured` before the `timing_status` match.
     #[test]
     fn the_assembled_report_passes_its_own_validation() {
         let opts = Options {
-            // Small enough to run inside a unit test; `assemble`'s structure is
-            // what is under test, not the size of the sample.
+            // Small: `assemble`'s structure is under test, not the sample size.
             lookup_samples: 2_000,
             differential_queries: 512,
             warmup: Duration::from_millis(10),
@@ -5450,8 +4363,7 @@ CPU part\t: 0xd0c
         let r = assemble(&opts).expect("assemble");
         assert_eq!(r.validate(), Ok(()));
 
-        // The differential row is the one row that is a claim everywhere: it is
-        // a disagreement between engines on fixed inputs, not a timing number.
+        // The differential row is a claim everywhere.
         let diff = r
             .rows
             .iter()
@@ -5464,17 +4376,14 @@ CPU part\t: 0xd0c
             .iter()
             .find(|m| m.key == "compared")
             .expect("compared metric");
-        // A differential that scored nothing would report max_deviation 0.0 and
-        // look perfect; pinning `compared` is what makes the row non-degenerate.
+        // Pinning `compared` makes the row non-degenerate.
         assert!(
             compared.value > 100.0,
             "only {} queries scored",
             compared.value
         );
 
-        // §9.3's "say why" means the *actual* why. This row is single-threaded
-        // and in-process, so a reason quoting the 16-consumer core budget or a
-        // missing ROS 2 install would be a false statement.
+        // §9.3's "say why" means the actual why: this row is single-threaded, in-process.
         let lookup = r
             .rows
             .iter()
@@ -5491,17 +4400,10 @@ CPU part\t: 0xd0c
         }
     }
 
-    /// A pair that cannot resolve §9.2's 5% is reported `unavailable`, on a
-    /// host that passes the fitness probe.
+    /// A pair that cannot resolve §9.2's 5% is `unavailable` even on a fit host: a band
+    /// straddling 1.05 gets no verdict and no numbers.
     ///
-    /// **The spread is not advisory here.** A gate whose noise floor exceeds
-    /// its threshold is not a gate, so a run whose per-round band straddles
-    /// 1.05 gets no verdict at all — not a pass, not a fail, and no numbers a
-    /// baseline could later gate against.
-    ///
-    /// Mutant: delete the `Verdict::Unresolved` early return in
-    /// `embedding_row`. The straddling pair is then reported `measured` with
-    /// numbers, and the first two assertions fail.
+    /// Mutant: delete the `Verdict::Unresolved` early return in `embedding_row`.
     #[test]
     fn a_pair_that_cannot_resolve_five_percent_gets_no_verdict() {
         let fit = skeleton(true, false).fitness;
@@ -5557,18 +4459,10 @@ CPU part\t: 0xd0c
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The row's note names the two profiles' settings, and this is what keeps
-    /// that statement true rather than merely written down.
+    /// The row's note states the two profiles' settings, read back here from the
+    /// workspace manifest.
     ///
-    /// The settings are stated in exactly one place in this repository —
-    /// [`EMBEDDING_NOTE`] — and read back here out of the workspace manifest by
-    /// the same function the `embed` module's own profile test uses. `just
-    /// embed-cost`'s printed output deliberately no longer repeats them.
-    ///
-    /// Mutant (applied, observed): set `[profile.embedder]`'s `codegen-units`
-    /// to `8` in the workspace manifest. Output pasted in the branch's fix
-    /// report; the assertion below fires with
-    /// `the row note does not state "lto = false, codegen-units = 8"`.
+    /// Mutant: set `[profile.embedder]`'s `codegen-units` to `8`.
     #[test]
     fn the_row_note_states_the_settings_the_manifest_declares() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -5584,8 +4478,7 @@ CPU part\t: 0xd0c
              [profile.embedder] now declares"
         );
 
-        // The note's other half: the control profile whose `lto` is the reason
-        // the row cannot be measured by this binary's own build.
+        // The control profile whose `lto` is why this binary cannot measure the row.
         let (rel_lto, _) = crate::embed::profile_settings_from_manifest(
             &manifest,
             crate::embed::REFERENCE_PROFILE,
@@ -5599,27 +4492,11 @@ CPU part\t: 0xd0c
         );
     }
 
-    /// `build_profile` names the directory cargo built into, not a two-valued
-    /// guess from `cfg!(debug_assertions)`.
+    /// `build_profile` names the directory cargo built into, not a guess from `cfg!(debug_assertions)`.
     ///
-    /// The guess is what let a `--profile embedder` run — the profile every
-    /// boundary measurement here is taken at, because `lto = false` is the only
-    /// setting that leaves the boundary in the binary — call itself `release`
-    /// and compare cleanly against a thin-LTO baseline.
-    ///
-    /// Mutant (applied, observed): replace the `push("build_profile", …)` value
-    /// with the literal `"release".to_owned()`. This test fails under `cargo
-    /// nextest` with `left: "release", right: "debug"`.
-    ///
-    /// **What this test does not catch**, stated because a note nobody checked
-    /// is how this repository got six wrong attributions: reinstating the old
-    /// `cfg!(debug_assertions)` spelling passes here, because under `cargo
-    /// nextest` both spellings say `debug`. It fails only when the tests
-    /// themselves are built at a third profile
-    /// (`cargo nextest run -p tf_tree_bench --cargo-profile embedder -E
-    /// 'test(build_profile)'` — run, and observed to fail with
-    /// `left: "release", right: "embedder"`). The mutation that fires here is
-    /// the hardcode; the mutation that fires there is the guess.
+    /// Mutant: hardcode `"release"`. Reinstating the old `cfg!` guess passes under
+    /// `nextest` (both say `debug`); only building the tests at a third profile
+    /// (`--cargo-profile embedder -E 'test(build_profile)'`) catches it.
     #[test]
     fn the_build_profile_fact_is_the_directory_cargo_built_into() {
         let p = Provenance::collect();
@@ -5630,17 +4507,10 @@ CPU part\t: 0xd0c
         );
     }
 
-    /// And the profile's *meaning* travels beside its name.
+    /// The profile's meaning travels beside its name: `build_lto` is emitted from the
+    /// manifest for the profile `build_profile` names.
     ///
-    /// A reader of `results.json` should not have to know this workspace's
-    /// `[profile.*]` sections by heart to know whether the crate boundary was
-    /// inlined away, so `build_lto` is emitted from the manifest for whichever
-    /// profile `build_profile` names.
-    ///
-    /// Mutant (applied, observed): make `build_lto()` ask
-    /// `lto_for_profile_dir` about `crate::embed::REFERENCE_PROFILE` instead of
-    /// `PROFILE_DIR`. This test fails under `cargo nextest` with
-    /// `left: Some("\"thin\"")`, right the `dev` profile's default `false (…)`.
+    /// Mutant: make `build_lto()` query `REFERENCE_PROFILE` instead of `PROFILE_DIR`.
     #[test]
     fn the_build_lto_fact_is_the_one_the_manifest_declares_for_that_profile() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

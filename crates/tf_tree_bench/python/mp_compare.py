@@ -1,34 +1,17 @@
 """Multi-process Python: N consumer nodes on one arena, against N `tf2_ros` buffers.
 
-`docs/PHASE2.md` §12.4 and `docs/PHASE3.md` §12.1. The Rust `mp_bench` answers
-this for Rust nodes; **Python is where the claim is largest and was unmeasured**,
-because a Python `tf2_ros` node carries a full private `Buffer` and a Python
-`tf_tree` node carries a `PROT_READ` mapping of one shared arena.
+`docs/PHASE2.md` §12.4 and `docs/PHASE3.md` §12.1. A Python `tf2_ros` node carries a
+full private `Buffer`; a Python `tf_tree` node carries a `PROT_READ` mapping of one
+shared arena. Methodology is `crates/tf_tree_bench/src/mp.rs`'s:
 
-The methodology is `crates/tf_tree_bench/src/mp.rs`'s, and the reasons are the
-same — restated here only where Python changes them:
+* **Open loop.** Tick `i` is due at `t0 + i/rate`; latency is `finish - intended`
+  (a closed loop hides stalls: coordinated omission).
+* **A publisher runs throughout**, so the seqlock retry path is exercised.
+* **Per-consumer tails**, not one mean (`PHASE1.md` §11.2: p99.9).
+* **PSS, not summed RSS**, which double-counts shared pages.
+* **CPU from `schedstat`** in ns (`stat`'s 10 ms ticks read as 0.0%).
 
-* **Open loop.** Tick `i` is due at `t0 + i/rate` whether or not the consumer
-  was ready, and its latency is `finish - intended`. A closed loop cannot
-  measure latency: a stall *reduces* the offered load, so every recorded sample
-  looks fast. That is coordinated omission.
-* **A publisher runs throughout**, so the seqlock retry path is exercised and
-  the readers' cache lines are actually invalidated. Measuring a transform
-  engine with no publisher is measuring an empty road.
-* **Per-consumer tails, not one mean.** `PHASE1.md` §11.2: p99.9 is the number
-  that matters.
-* **PSS, not summed RSS.** Summing RSS double-counts every shared page, which
-  is precisely the quantity under test. PSS is the kernel's own answer — each
-  shared page divided by the number of mappers — and needs no knowledge of the
-  arena size, so it is equally fair to tf2's private buffers.
-* **CPU from `schedstat`**, in nanoseconds. `/proc/<pid>/stat`'s utime/stime are
-  in 10 ms ticks, which against a few milliseconds of work over six seconds
-  reads as a flat 0.0%.
-
-**`subprocess`, never `os.fork`.** The arena is mapped `MADV_DONTFORK`, so a
-forked child inherits a handle to memory it does not have. That is not a
-limitation being worked around here — it is the documented contract, and a
-benchmark that forked would be measuring something no correct program does.
+**`subprocess`, never `os.fork`**: the arena is mapped `MADV_DONTFORK`.
 
 Usage: `just py-mp-bench` (both engines, in the ROS container).
 """
@@ -41,8 +24,7 @@ import sys
 import tempfile
 import time
 
-# Consumer counts to sweep. Above the physical core count the rows are
-# scheduler noise, and the report says so rather than pretending otherwise.
+# Consumer counts to sweep; above the physical core count rows are scheduler noise.
 CONSUMERS = [1, 2, 4, 8]
 #: Per-consumer tick rate. 100 Hz is a plausible perception/planning node.
 HZ = 100.0
@@ -52,35 +34,23 @@ SECONDS = 4.0
 PUB_HZ = 100.0
 #: How far behind the wall clock every query is aimed.
 #:
-#: Both engines are stamped with `time.time_ns()`, so both consumers can aim at
-#: the same instant without knowing anything about the publisher. 100 ms is far
-#: enough back that a consumer is never asking for a sample that has not been
-#: published yet — an `ExtrapolationError` is an error path, and timing an error
-#: path measures the error path.
+#: Both engines are stamped with `time.time_ns()`; 100 ms back avoids timing an
+#: `ExtrapolationError` path.
 LAG_NS = 100_000_000
 #: History each tf2 consumer must materialise to answer the same queries.
-#:
-#: Both engines are asked for `now - LAG_NS`, and `now` advances for the whole
-#: measurement window. tf_tree's answer comes from a live publisher; tf2's
-#: buffer is static once filled, so it has to be filled *past* the end of the
-#: window or the last ticks extrapolate into the future. That is not a handicap
-#: invented here — it is what having no shared arena costs, and the fill itself
-#: is reported as `fill` below.
+#: tf2's buffer is static once filled, so it is filled past the end of the window;
+#: that is what having no shared arena costs (reported as `fill`).
 TF2_HISTORY_S = 30.0
 EDGES = [("map", "odom"), ("odom", "base"), ("base", "cam")]
 
 
-# ---------------------------------------------------------------------------
 # Process accounting
-# ---------------------------------------------------------------------------
 
 
 def pss_kib(pid: int) -> int:
     """Proportional set size, from `smaps_rollup`.
-
-    Each shared page counted as `1/n` for `n` mappers. Summing RSS instead
-    would count the one shared arena once per consumer, which would flatter
-    tf_tree by exactly the amount being claimed — so it is not used.
+    Each shared page is counted as `1/n` for `n` mappers; summed RSS would flatter
+    tf_tree by exactly the amount claimed.
     """
     try:
         with open(f"/proc/{pid}/smaps_rollup") as f:
@@ -94,10 +64,7 @@ def pss_kib(pid: int) -> int:
 
 def cpu_ns(pid: int) -> int:
     """CPU time in nanoseconds, from `schedstat` field 1.
-
-    Not `stat`'s utime+stime: those are in 10 ms clock ticks, and a consumer
-    doing a few milliseconds of work across a six-second window reads as
-    exactly 0.0% on every row.
+    Not `stat`'s utime+stime (10 ms ticks, which read as 0.0%).
     """
     try:
         with open(f"/proc/{pid}/schedstat") as f:
@@ -114,9 +81,7 @@ def pct(xs: list[float], q: float) -> float:
     return xs[i]
 
 
-# ---------------------------------------------------------------------------
-# The consumer, which is also this file run as `-m` with a role argument
-# ---------------------------------------------------------------------------
+# The consumer, also this file run as `-m` with a role argument
 
 
 def run_consumer(engine: str) -> None:
@@ -127,17 +92,14 @@ def run_consumer(engine: str) -> None:
         import numpy as np
         import tf_tree
 
-        # **Time to first usable lookup.** tf_tree joins an arena somebody else
-        # is already publishing into, so this is a handshake and a mapping.
+        # Time to first usable lookup (a handshake and a mapping for tf_tree).
         fill_t0 = time.perf_counter()
         tree = tf_tree.open(mode="ro")
         plan = tree.plan("map", "cam")
 
-        # `at_into` into a buffer allocated once, not `at`. A node does one
-        # lookup per tick and cannot batch, so `at`'s per-call `(4, 4)`
-        # allocation is paid every tick forever — measured at 224 ns against
-        # 173 ns for `at_into` on this chain. Allocating here rather than in
-        # the loop is what a real node does, and is why the API has the method.
+        # `at_into` a buffer allocated once: a node cannot batch, and `at` allocates
+        # per call
+        # (224 ns against 173 ns).
         out = np.empty((4, 4))
 
         def lookup(stamp_ns: int) -> None:
@@ -152,15 +114,11 @@ def run_consumer(engine: str) -> None:
         def rclpy_duration(seconds: float) -> Duration:
             return Duration(seconds=seconds)
 
-        # **The structural difference, and the point of the whole benchmark.**
-        # There is no shared arena, so this consumer must hold its own copy of
-        # the entire history. Every node pays for it again, in memory and in
-        # the CPU that filled it.
+        # The structural difference: no shared arena, so this consumer holds its own
+        # copy
+        # of the whole history.
         buf = Buffer(cache_time=rclpy_duration(TF2_HISTORY_S + 5.0))
-        # Anchored on this consumer's own start, because the queries below are
-        # aimed at the wall clock and there is no shared arena to read a stamp
-        # from. Every consumer materialises all of it, separately — that is the
-        # cost being measured.
+        # Anchored on this consumer's own start; every consumer materialises all of it.
         fill_t0 = time.perf_counter()
         t_start = time.time_ns()
         n_ticks = int(PUB_HZ * TF2_HISTORY_S)
@@ -181,12 +139,7 @@ def run_consumer(engine: str) -> None:
 
     fill_ms = (time.perf_counter() - fill_t0) * 1e3
 
-    # **Wait for history before measuring.** A consumer that starts before the
-    # publisher has filled its window gets `ExtrapolationError` — an error path,
-    # and timing an error path measures the error path. Polling until the first
-    # query succeeds is startup, not measurement, and it keeps the harness
-    # honest about start ordering rather than depending on a sleep being long
-    # enough on whatever machine runs it.
+    # Wait for history before measuring: an early consumer gets `ExtrapolationError`.
     deadline = time.perf_counter() + 20.0
     while True:
         try:
@@ -198,12 +151,8 @@ def run_consumer(engine: str) -> None:
             time.sleep(0.02)
 
     period = 1.0 / HZ
-    # **CPU is measured by the consumer, over its own loop.** The coordinator
-    # used to sample `schedstat` between two sleeps, which for tf2 overlapped
-    # the consumer's exit — roughly half that window was a process that had
-    # already finished, understating exactly the column the O(1)-in-consumers
-    # claim rests on. A consumer knows when its loop starts and ends; nothing
-    # else does.
+    # CPU is measured by the consumer over its own loop; sampling from the coordinator
+    # overlapped the consumer's exit and understated tf2.
     cpu_t0 = cpu_ns(os.getpid())
     t0 = time.perf_counter()
     service: list[float] = []
@@ -217,9 +166,7 @@ def run_consumer(engine: str) -> None:
         start = time.perf_counter()
         lookup(time.time_ns() - LAG_NS)
         done = time.perf_counter()
-        # `service` is what the engine cost; `cycle` is what the node
-        # experienced, measured from the tick's *intended* time, so falling
-        # behind shows up as latency rather than as fewer samples.
+        # `service` is engine cost; `cycle` is measured from the intended time.
         service.append((done - start) * 1e9)
         cycle.append((done - due) * 1e9)
 
@@ -239,42 +186,28 @@ def run_publisher() -> None:
     """Publish into the shared arena until killed."""
     import tf_tree
 
-    # `interp="lerpslerp"` explicitly: the consumers below are timed against
-    # `tf2_ros` buffers, so both sides must run tf2's own interpolator for the
-    # latency ratio to be like-for-like. It was the Python binding's default
-    # when this was written and is no longer (`API.md` §3).
+    # `interp="lerpslerp"` explicitly, to match tf2's interpolator (`API.md` §3).
     tree = tf_tree.open(mode="rw", create=EDGES, capacity=4096, interp="lerpslerp")
     writers = [tree.publisher(child, parent) for parent, child in EDGES]
     print("READY", flush=True)
     period = 1.0 / PUB_HZ
     t0 = time.perf_counter()
     while True:
-        # **The tick index is derived from elapsed time, not incremented.**
-        # A publisher that increments and then sleeps `due - now` does not
-        # sleep at all once it is behind, so it bursts at full speed until it
-        # catches up — and a burst laps the ring, leaving a retained window of
-        # milliseconds instead of the 40 s the capacity implies. That is how
-        # this first failed: every consumer got `ExtrapolationError` because the
-        # publisher had run away from its own history.
-        # Derived from elapsed time and **not also incremented**. It was both,
-        # which advanced the index twice per iteration: the publisher ran at
-        # ~156 Hz where `PUB_HZ` says 100, the index stopped meaning "tick", and
-        # the header's claim that both engines see the same stream was false.
+        # The tick index is derived from elapsed time and not also incremented: a
+        # catching-up burst laps the ring, and incrementing twice ran ~156 Hz, not
+        # `PUB_HZ`.
         now = time.perf_counter()
         i = int((now - t0) / period) + 1
         due = t0 + i * period
         if now < due:
             time.sleep(due - now)
-        # Wall-clock stamps, as a real publisher uses, so a consumer can aim at
-        # an instant without knowing when this process started.
+        # Wall-clock stamps, so a consumer can aim at an instant.
         stamp = time.time_ns()
         for w in writers:
             w.push(stamp, [1.0, 0.0, 0.0, 0.0, 0.001 * i, 0.0, 0.0])
 
 
-# ---------------------------------------------------------------------------
 # Coordinator
-# ---------------------------------------------------------------------------
 
 
 def measure(engine: str, n: int, env: dict[str, str]) -> dict[str, float]:
@@ -288,9 +221,7 @@ def measure(engine: str, n: int, env: dict[str, str]) -> dict[str, float]:
         )
         for _ in range(n)
     ]
-    # Let every consumer reach its loop before sampling: a process still
-    # filling a tf2 buffer has neither its steady-state memory nor its
-    # steady-state CPU, and sampling then would understate tf2's cost.
+    # Let every consumer reach its loop before sampling steady-state memory and CPU.
     time.sleep(1.5 if engine == "tf_tree" else 3.0)
     pss = sum(pss_kib(k.pid) for k in kids)
 
@@ -369,8 +300,8 @@ def main() -> None:
                     env=env,
                 )
                 assert pub.stdout is not None
-                # Reading READY is the synchronisation: the arena exists and is
-                # being published into by the time it returns. No sleeps.
+                # Reading READY synchronises: the arena exists and is being published
+                # into.
                 assert pub.stdout.readline().strip() == "READY", (
                     "publisher did not start"
                 )
@@ -391,15 +322,13 @@ def main() -> None:
                     pub.kill()
                     pub.wait()
 
-        # **Marginal cost is the claim.** The totals are dominated by the Python
-        # interpreter and numpy, which both engines pay identically; what the
-        # shared arena changes is the *slope* — what each additional node costs.
+        # Marginal cost is the claim: totals are dominated by the interpreter and numpy.
         if len(sweep) >= 2:
             lo, hi = sweep[0], sweep[-1]
             dn = CONSUMERS[-1] - CONSUMERS[0]
             d_pss = (hi["pss_mib"] - lo["pss_mib"]) / dn
-            # `cpu_pct` is the mean over that row's consumers, so it is scaled
-            # back to a fleet total before differencing.
+            # `cpu_pct` is a per-row mean, scaled back to a fleet total before
+            # differencing.
             d_cpu = (hi["cpu_pct"] * CONSUMERS[-1] - lo["cpu_pct"] * CONSUMERS[0]) / dn
             print(f"  marginal: {d_pss:.1f} MiB/node, {d_cpu:.2f}% cpu/node")
         print()

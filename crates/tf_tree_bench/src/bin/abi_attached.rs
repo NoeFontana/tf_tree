@@ -1,112 +1,38 @@
-//! Is the C ABI's +101 ns on a shared arena the **ABI**, or the **C++ caller**?
+//! Is the C ABI's +101 ns on a shared arena the ABI or the C++ caller?
+//! (`docs/benchmarks/tf2.md`: C++ 302 ns against native Rust 200.6.)
 //!
-//! # Why this binary exists
-//!
-//! `docs/benchmarks/tf2.md` records a C++ caller at **302 ns** on the §11.1
-//! fixture over a shared arena where native Rust measures **200.6**. Four things
-//! have been eliminated by measurement:
-//!
-//! | candidate | measured |
-//! |---|---|
-//! | the `memfd` mapping | <= 9.6 ns |
-//! | the cross-process read-only attach | -0.2 ns |
-//! | static against shared linkage | ~1 ns |
-//! | the per-call `Guard` **on this arena** | **+19.3 ns** |
-//!
-//! That leaves **~81 ns unattributed**, and `abi_cost` does not reproduce it:
-//! its full ABI costs **+2.3 ns** over a native arm that also builds a guard per
-//! call. The two differ by 35x, so one of them is answering a different
-//! question.
-//!
-//! **The remaining variable was the caller — and the answer is that it is not the
-//! caller at all.** This binary calls `tft_plan_at` from Rust, on the same arena,
-//! in the same process, against the same stamps, under two build profiles:
+//! This binary calls `tft_plan_at` from Rust on the same arena and stamps under two
+//! profiles:
 //!
 //! | profile | native Rust | Rust -> ABI | C++ -> ABI |
 //! |---|---|---|---|
 //! | `release` (`lto = "thin"`) | 200.5 | 225.8 (+25) | 302.0 |
 //! | **`embedder` (`lto = false`)** | 241.3 | **298.4 (+57)** | **302.0 (+61)** |
 //!
-//! At a real boundary a Rust caller and a C++ caller **agree to within 4 ns**. So
-//! the cost is the boundary itself, not the language — and the reason
-//! `abi_cost` sees only +2.3 ns is that the workspace `release` profile is
-//! `lto = "thin"`, which **inlines `tft_plan_at` into its Rust caller**. No C or
-//! C++ embedder can get that, and `report.rs`'s §9.2 embedding row already says
-//! so in those words: thin LTO "is exactly what erases the boundary".
+//! A Rust and a C++ caller agree to within 4 ns at a real boundary: the cost is the
+//! boundary, not the language. `abi_cost` sees only +2.3 ns because thin LTO inlines
+//! `tft_plan_at` into its Rust caller, which makes `PHASE4` §7 gate criterion 1
+//! unmeasurable in its own build (`report.rs`'s §9.2 embedding row says the same).
 //!
-//! **That makes `PHASE4` §7 gate criterion 1 unmeasurable in its own build**, and
-//! it also explains the baseline instability recorded there: with the call
-//! inlined, both arms collapse into the same optimisable blob and the ratio
-//! becomes a coin toss on how well LLVM specialises it.
-//!
-//! # What is inside the per-call `Guard` — the second question this answers
-//!
-//! Amendment 3 of `docs/decisions/0022` closed "is the ABI's cost the boundary
-//! or the caller" and immediately opened "then what is the **guard**". At
-//! `[profile.embedder]` the per-call guard is ~45 of the ~55 ns an embedder pays
-//! over native Rust, so it is the whole prize, and "it is the guard" is not an
-//! actionable answer. The arms below take it apart. Medians of six runs, one
-//! `just abi-attached` each, `taskset -c 2`, all at `[profile.embedder]`:
-//!
-//! | part | ns | how it was isolated |
-//! |---|---|---|
-//! | `tf_tree_ipc::fork::generation()` | **+0.2** | a loop with the call against the identical loop without it |
-//! | `Tree::view()` | +3.7 | the same loop, building a view per iteration |
-//! | `Guard::new(view)` | +4.8 | over the view arm |
-//! | the rest of `Tree::guard` — `detached`, `is_shared`, `with_fork_check` | +6.7 | over `Guard::new` |
-//! | **= build + drop a guard, in isolation** | **15.1** | |
-//! | the same, on `Plan::at`'s critical path | ~22 | arm `E`: guard built per call, *evaluated* through the hoisted one |
-//! | the cold bracket-search cursor | ~4.8 | arm `B` − `A`: hoisted guard, stamps visited in a fixed permutation |
-//! | **still unattributed** | **~16** | |
-//!
-//! **The leading hypothesis was wrong, and this is the third one in this area to
-//! be.** `fork::generation` was expected to be the cost — a cross-crate call
-//! that thin LTO inlines and `[profile.embedder]` does not. It costs **0.2 ns**.
-//! It is `#[inline]`, so its MIR crosses the crate boundary and it is inlined at
-//! `lto = false` too; the LTO difference in the guard's cost is not this.
-//!
-//! Two more candidates were killed the same way, by changing them and finding
-//! the number did not move:
-//!
-//! * **`#[inline]` on `Tree::guard`.** Applied, measured, reverted: rung 1 was
-//!   43.2 ns against a 43.0–46.9 spread without it, and the ABI arm 298 against
-//!   294–297. So the guard is not paying for the *call*.
-//! * **The size of the `Guard`.** It is **208 bytes**, 128 of which are the
-//!   `[Cell<u64>; MAX_DEPTH]` cursor on a fixture whose plan is three steps
-//!   deep. `MAX_DEPTH` was cut 16 → 8, making the guard 144 bytes: rung 1 44.3,
-//!   the isolated build+drop 15.0, arm `E` 21.1, the cursor 5.0 — every one of
-//!   them inside the run-to-run spread. Reverted. **Zeroing that array is not
-//!   what a guard costs.**
-//!
-//! What is left is ~16 ns for *evaluating through a fresh guard* beyond the
-//! cursor, and it is left **unattributed on purpose**. The plausible reading is
-//! that a guard materialised per iteration cannot have its fields held in
-//! registers across `Plan::at` the way a hoisted one can — but that is a
-//! hypothesis, it is what the three refuted candidates above also sounded like,
-//! and `0022` does not need it decided. One known asymmetry to fold in before
-//! anyone tries: the isolated build+drop arm never performs a lookup, so its
-//! `Guard::drop` takes the `n == 0` early return, while a real guard's drop
-//! reaches the `is_writable` one.
-//!
-//! # Usage
+//! The arms also decompose the per-call `Guard` (`0022` amendment 3) at
+//! `[profile.embedder]`: `fork::generation()` +0.2 ns, `Tree::view()` +3.7,
+//! `Guard::new` +4.8, the rest of `Tree::guard` +6.7 (15.1 isolated build+drop, ~22 on
+//! `Plan::at`'s critical path, arm `E`), the cold cursor ~4.8 (arm `B` - `A`), and
+//! ~16 ns left unattributed on purpose. `#[inline]` on `Tree::guard` and halving
+//! `MAX_DEPTH` moved nothing.
 //!
 //! Needs an arena served by `native_arena --name <n>`; run it through
-//! `just abi-attached`, which wires the two together.
+//! `just abi-attached`.
 
 #![allow(clippy::print_stdout)]
-// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
-// measure it** (`docs/decisions/0048`). The posture is declared here rather than
-// inherited: `crates/tf_tree_bench/src/lib.rs` is `#![forbid(unsafe_code)]` and a
-// bin is a **separate crate root**, so that attribute governs none of this file.
+// `docs/decisions/0007` rule 1, kind 5 (our own C ABI, called from Rust to measure it),
+// per `0048`; a bin is a separate crate root.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// SAFETY (module invariant): every `unsafe` block below is a call to a
-// `tft_*` entry point of `tf_tree_c`, on a handle this process created and has
-// not freed, from the thread that created it — which is the affinity every one
-// of those entry points documents. The two arms attach independently and
-// neither handle is converted into the other; there is no API to do that, and
-// doing it would defeat what this binary measures.
+// SAFETY (module invariant): every `unsafe` block calls a `tft_*` entry point of
+// `tf_tree_c` on a handle this process created and has not freed, from its creating
+// thread (the documented affinity). The two arms attach independently.
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -123,28 +49,14 @@ const SWEEPS: usize = 40;
 const ROUNDS: usize = 9;
 const WARMUP: usize = 60_000;
 
-/// Byte-identical to `backing::stamp_ns` and `ratio::stamp_ns` — off every
-/// dynamic grid, so `I::eval` runs. `docs/decisions/0013`.
+/// Byte-identical to `backing::stamp_ns` and `ratio::stamp_ns`: off every dynamic grid (`0013`).
 fn stamp_ns(i: i64) -> i64 {
     tf_tree_bench::fixture::NOW_NS - 3_700_000 - i * 9_631
 }
 
 fn main() -> Result<()> {
-    // **The profile is measured here, not asserted by the caller.**
-    //
-    // `--boundary-real` used to *be* the answer: `just abi-attached` passed it
-    // to the `[profile.embedder]` build and withheld it from the `release` one,
-    // and this binary believed whichever it got. That put the most load-bearing
-    // fact about a boundary measurement — whether the boundary was in the binary
-    // at all — in a shell script, where swapping two lines would silently label
-    // the LTO-erased run as the real one. `build.rs` reads the profile directory
-    // out of `OUT_DIR` and `embed::lto_for_profile_dir` maps it to the `lto` the
-    // workspace manifest declares, so both halves are now facts about this
-    // executable.
-    //
-    // The flag is still accepted, and is now a *claim that is checked*: a
-    // mismatch against the measured profile is an error rather than a wrong
-    // label on a right-looking table.
+    // The profile is measured (`build.rs` + `embed::lto_for_profile_dir`), not asserted
+    // by the caller; `--boundary-real` is a claim that is checked against it.
     let mut name = "abi_attached".to_owned();
     let mut claimed_real = false;
     for a in std::env::args().skip(1) {
@@ -160,11 +72,7 @@ fn main() -> Result<()> {
     .context("reading the workspace manifest to find out what profile this binary is")?;
     let lto =
         tf_tree_bench::embed::lto_for_profile_dir(&manifest, tf_tree_bench::embed::PROFILE_DIR);
-    // Anything but a declared `false` leaves LTO able to inline across the crate
-    // boundary. `starts_with` rather than `==` because the "cargo's default"
-    // spelling is `false (…)`; see `lto_for_profile_dir`. An `unknown (…)` value
-    // is correctly *not* a real boundary: a run that cannot name its own LTO
-    // setting has not earned the claim.
+    // Anything but a declared `false` leaves LTO able to inline across the boundary.
     let boundary_real = lto.starts_with("false");
     if claimed_real != boundary_real {
         bail!(
@@ -200,10 +108,7 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("compiling {SOURCE} <- {TARGET}: {e:?}"))?;
 
     // --- the ABI arm: attach again, through the C entry points --------------
-    //
-    // A second, independent attach of the same segment: `tft_tree_open` reads
-    // the same `TF_TREE_NAME`/`TF_TREE_RUNTIME_DIR` the facade used, so both
-    // arms are on the same arena.
+    // A second attach of the same segment via `TF_TREE_NAME`/`TF_TREE_RUNTIME_DIR`.
     let mut ctree = core::ptr::null_mut();
     // SAFETY: `out` is a writable pointer to a null-initialised handle slot.
     let rc = unsafe { tft_tree_open(&mut ctree) };
@@ -282,11 +187,7 @@ fn main() -> Result<()> {
     };
 
     // --- the rungs between them ------------------------------------------
-    //
-    // `abi_cost` prices these too, but with `lto = "thin"` erasing the boundary
-    // and on a 3-edge tree that fits in L1 — where they total ~3 ns. At a real
-    // boundary on this fixture they are the ~35 ns `0022` question 5 leaves
-    // open, so they are measured here rather than carried across.
+    // The rungs `abi_cost` prices at ~3 ns under thin LTO; `0022` question 5 leaves ~35 ns open.
 
     // 1. The guard, per call — what the C signature cannot hoist.
     let sweep_guard = || {
@@ -302,9 +203,7 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // 2. The same, plus the 56-byte `QVEC7_WXYZ` store the ABI must make and a
-    //    native caller never does: Rust returns an `Iso3` the caller consumes
-    //    from registers.
+    // 2. The same, plus the 56-byte `QVEC7_WXYZ` store a native caller never makes.
     let mut wbuf = [0.0f64; 7];
     let mut sweep_write = || {
         let mut acc = 0.0f64;
@@ -344,44 +243,10 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // --- decomposing rung 1: what inside `Tree::guard()` costs the ~45 ns? ---
-    //
-    // Rung 1 above prices "a guard per call" as a *difference between two
-    // sweeps that both evaluate the plan*. That difference contains two things
-    // and the ladder cannot tell them apart:
-    //
-    //   (a) building and dropping the `Guard` value itself, and
-    //   (b) what a fresh guard does to `Plan::at` — a guard carries the
-    //       per-step bracket-search cursor (`plan.rs`'s `cursor` field), and
-    //       `Guard::new` starts it at the `EdgeId(0)` sentinel, so **every step
-    //       of every call takes the cold search path**. A hoisted guard warms
-    //       that cursor once and resumes beside the previous answer.
-    //
-    // Attributing the whole 47 ns to (a) would be the residue mistake this
-    // file's own header is about. So (a) is measured directly — the same loop,
-    // constructing and dropping a guard and *not* evaluating anything — and (b)
-    // is what is left over, named as such.
-    //
-    // Within (a), three arms in increasing order of what they include, so each
-    // step is one named thing:
-    //
-    //   `empty`    the loop itself, so nothing below is loop overhead;
-    //   `forkgen`  `tf_tree_ipc::fork::generation` — the leading hypothesis;
-    //   `view`     `Tree::view` (through the `unstable` public spelling) — the
-    //              `ArenaView` a guard is built from: an `as_dyn` vtable hop,
-    //              the header deref, and three builder fields;
-    //   `gnew`     `Guard::new(view)` — adds the seqlock generation read and
-    //              zeroing the 16-entry cursor array;
-    //   `gfull`    `Tree::guard()` — adds the whole fork-safety half.
-    //
-    // `gfull - gnew` is therefore the fork check *as the facade pays for it*,
-    // and `forkgen - empty` is the counter load alone. If those two disagree by
-    // a lot, the cost is the branching and the extra `Option<(u64, fn)>` field,
-    // not the load.
-    //
-    // Every arm carries the same `black_box(n)` fold so the loop shape, the
-    // `raw` walk and the accumulator are identical across all five and the
-    // subtractions remove them.
+    // Decomposing rung 1: (a) building and dropping a `Guard`, and (b) what a fresh
+    // guard does to `Plan::at` (its cursor starts cold at every step). Arms: `empty`
+    // (loop), `forkgen` (`fork::generation`), `view` (`Tree::view`), `gnew`
+    // (`Guard::new`), `gfull` (`Tree::guard()`); each carries the same `black_box(n)` fold.
     let sweep_empty = || {
         let mut acc = 0u64;
         for _ in 0..SWEEPS {
@@ -434,35 +299,10 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // --- and the residue is a hypothesis until it is varied against ---------
-    //
-    // "Rung 1 minus the guard's construction cost is the cold cursor" is
-    // exactly the shape of reasoning this repository has been wrong about six
-    // times. So it is tested rather than asserted, with the one variable the
-    // cursor is sensitive to and nothing else is: **the order the stamps are
-    // visited in**.
-    //
-    // The `stamp_ns` sequence walks monotonically backwards, 9631 ns per step,
-    // so a hoisted guard's cursor is always one probe from the answer. Visiting
-    // the same 256 stamps in a fixed permutation instead leaves the cursor
-    // pointing somewhere useless on nearly every call — which is precisely the
-    // state `Guard::new` puts a fresh guard in. That gives a 2x2:
-    //
-    //   |            | in order | shuffled |
-    //   | hoisted    |    A     |    B     |
-    //   | per call   |    C     |    D     |
-    //
-    // If the cursor is the mechanism, then B rises to meet C-minus-the-guard,
-    // and D stays level with C — a per-call guard is already cold, so the order
-    // cannot make it colder. If instead B stays level with A, the cursor is not
-    // what rung 1 is paying for and the residue is something else, which is a
-    // result worth having and would stop the amendment being written.
-    //
-    // The permutation is a fixed multiplicative step over a prime-free stride
-    // (`STAMPS` is a power of two, so an odd stride is a full cycle) — no RNG,
-    // no dependency, byte-identical run to run. All four arms walk an index
-    // slice, including the two "in order" ones, so the extra indirection is in
-    // every arm and cancels in the comparison.
+    // The cursor residue is tested by varying visit order (stamps walk monotonically
+    // backwards; a fixed odd-stride permutation leaves the cursor cold). 2x2:
+    // hoisted/per-call x in-order/shuffled = A B / C D. All arms walk an index slice
+    // so the indirection cancels.
     let idx_seq: Vec<usize> = (0..STAMPS).collect();
     let idx_shuf: Vec<usize> = (0..STAMPS).map(|i| (i * 97 + 13) % STAMPS).collect();
     debug_assert_eq!(
@@ -497,26 +337,8 @@ fn main() -> Result<()> {
         std::hint::black_box(acc)
     };
 
-    // --- and one more, because the parts do not add up ----------------------
-    //
-    // The 2x2 above prices the cold cursor at ~7 ns and the standalone loop
-    // prices building+dropping a guard at ~15 ns, against a rung 1 of ~43. So
-    // ~21 ns is still unaccounted for, and there are two candidate readings:
-    //
-    //   (i)  the standalone 15 ns *underestimates* the guard, because in that
-    //        loop nothing depends on the guard and the CPU overlaps successive
-    //        iterations freely, while in rung 1 the construction sits on
-    //        `Plan::at`'s critical path;
-    //   (ii) or evaluating through a *fresh* guard costs something beyond the
-    //        cursor — the guard's `ArenaView` and generation are re-read from a
-    //        stack slot the compiler cannot hold in registers across the call.
-    //
-    // This arm separates them: build a guard per call, `black_box` it so it is
-    // really built and really dropped — then evaluate the plan through the
-    // **hoisted** guard. It pays construction on the same critical path as rung
-    // 1 and pays nothing for using it. `E - A` is therefore the guard object as
-    // rung 1 actually pays for it, and `C - E` is everything about *using* a
-    // fresh one.
+    // Arm `E`: build a guard per call, `black_box` it, evaluate through the hoisted one.
+    // `E - A` is the guard object on the critical path; `C - E` is using a fresh one.
     let sweep_build_only = || {
         let mut acc = 0.0f64;
         for _ in 0..SWEEPS {
@@ -582,9 +404,7 @@ fn main() -> Result<()> {
         };
         r_ns.push(a);
         a_ns.push(b);
-        // The intermediate rungs are not part of the alternating pair above —
-        // they only ever appear as differences against their neighbours, so a
-        // fixed order costs them nothing the subtraction does not remove.
+        // Intermediate rungs only appear as differences, so fixed order is harmless.
         let t = std::time::Instant::now();
         let _ = sweep_guard();
         g_ns.push(t.elapsed().as_nanos() as f64 / per_round);
@@ -750,9 +570,7 @@ fn main() -> Result<()> {
         cell[2] - build_only
     );
     println!();
-    // The profile travels with the numbers, on the same page as the numbers:
-    // every table above is a boundary measurement, and one read without its
-    // profile is the error `docs/PHASE4.md` §0.0 records twice.
+    // The profile travels with the numbers (`docs/PHASE4.md` §0.0).
     println!(
         "  build: target/{}/  (the workspace manifest declares lto = {lto} for it)",
         tf_tree_bench::embed::PROFILE_DIR

@@ -22,724 +22,79 @@
 | 11 | CLI adoption | #58 |
 | 12 | docs close-out | this one |
 
-Milestone B (layout kernels, #34) and Phase 3's Python work (#35, #37, #44–#51)
-ran alongside and are not part of this decision.
-
-## Context
-
-`docs/PHASE2.md` §3 specifies zero-config rendezvous: a process calls `tf_tree::open()`
-with no arguments and either joins the running arena or creates it. That is also
-Phase 3's headline deliverable (`docs/PHASE3.md` §4.1, DoD item 1).
-
-**It cannot happen today, and the reason is a missing edge in the dependency graph
-rather than a missing algorithm.**
-
-- `crates/tf_tree_ipc/` implements the entire rendezvous — `RuntimeDir::resolve`
-  (`runtime_dir.rs:111`), `Rendezvous` (`rendezvous.rs:106`), `LockFile` with OFD
-  locks (`lockfile.rs`), `Identity` records (`identity.rs`), and the §3.4 decision
-  machine `Open::from_env().mode(..).create(..).open(..)` (`open.rs:240`), with
-  multi-process tests.
-- `crates/tf_tree_arena/` implements the mapping — `MappedArena::create`
-  (`mapped.rs:160`) and `MappedArena::attach(OwnedFd, AttachMode)` (`mapped.rs:235`).
-- **Nothing depends on `tf_tree_ipc`.** `grep -rn tf_tree_ipc --include=Cargo.toml`
-  returns only the workspace-member line. The two halves have never touched.
-- §3.7 — `SOCK_SEQPACKET` + `SCM_RIGHTS` fd passing — is unimplemented.
-  `crates/tf_tree_ipc/src/lib.rs:54` says so; `Rendezvous::sock_path()`
-  (`rendezvous.rs:172`) is computed and never bound; the only `ServerProbe` impl is
-  `NoServer` (`open.rs:140`), which always answers `Reach::Absent`.
-
-Consequently **no second process can obtain the arena fd**. `Tree::attach_shared`
-takes an `OwnedFd` and the only transport in the workspace is fd inheritance by a
-child (`crates/tf_tree_bench/src/shm_util.rs`). `CreatePolicy::Never` can never reach
-`Joined`.
-
-Amendments A1–A8 are all applied (`FORMAT_VERSION = 2`). This decision does not
-revisit them; it is about the seam and the four protocols that cross it.
-
-A **new crate boundary** is exactly what `CLAUDE.md` and this folder's README say must
-start as a decision rather than a PR, which is why this document exists.
-
-### Two facts established by measurement, not assumption
-
-1. **`SCM_RIGHTS` requires no `unsafe`.** rustix 1.1.4 — already the pinned version —
-   exposes a safe ancillary-data API: `sendmsg` (`net/send_recv/msg.rs:712`),
-   `SendAncillaryBuffer::push(SendAncillaryMessage::ScmRights(&[BorrowedFd]))`
-   (`:299`), `RecvAncillaryMessage::ScmRights(AncillaryIter<OwnedFd>)` (`:181`). Only
-   `RecvAncillaryBuffer::parse` (`:529`) is `unsafe`, and it is not on the required
-   path. Enabling rustix's `net`, `event` and `rand` features pulls **no new crates** —
-   they only turn on features of `linux-raw-sys`, already in the graph.
-
-   This matters because the obvious argument against putting the seam in `tf_tree` was
-   that `tf_tree` is `#![forbid(unsafe_code)]`. That argument is void.
-
-2. **`ArenaHeader` has 56 bytes of implicit padding.** `boot_id` at offset 112 (+16 =
-   128), `_reserved: [u8; 8]` at 128..136, `topo_lock` at 192, `size_of == 256`
-   (`header.rs:205-209`). An `instance_uuid: [u8; 16]` at 136 leaves **every pinned
-   offset and `layout_hash()` unchanged** — the hash covers region sizes, alignments
-   and strides, not header fields.
+Milestone B (layout kernels, #34) and Phase 3 Python work ran alongside and are not part of this decision.
 
 ## Decision
 
-### 1. `tf_tree` gains an optional dependency on `tf_tree_ipc`, gated by the existing `shm` feature
+### 1. `tf_tree` gains an optional dependency on `tf_tree_ipc`, gated by `shm`
 
-```toml
-# crates/tf_tree/Cargo.toml
-[features]
-shm = ["tf_tree_arena/shm", "dep:tf_tree_ipc"]
-```
-
-Responsibility split:
-
-- **`tf_tree_ipc`** owns the wire and the lock file, and **never learns what the fd
-  is**. §3.7 lands here as `wire.rs` / `server.rs` / `client.rs`, parameterised by a
-  plain `Copy` descriptor plus a `BorrowedFd`:
-
-  ```rust
-  pub struct SegmentDescriptor {
-      pub format_version: u32,
-      pub layout_hash: u32,
-      pub arena_size: u64,
-      pub instance_uuid: [u8; 16],
-      pub boot_id: [u8; 16],
-  }
-  ```
-
-  This keeps §2's "no arena dependency" rule literally true, and lets the wire be
-  tested end to end inside `tf_tree_ipc` with a three-line `memfd_create` payload.
-
-- **`tf_tree_arena`** keeps `MappedArena`; gains `instance_uuid`, `descriptor()`, and
-  §7.1 per-region population.
-
-- **`tf_tree`** owns composition: `open()`, the owner thread, the takeover watcher,
-  claims-as-leases, reaping, and fork poisoning. It is the only crate that sees both
-  `tf_tree_ipc::MAX_PARTICIPANTS` (`lockfile.rs:48`) and
-  `tf_tree_arena::DEFAULT_MAX_PARTICIPANTS` (`layout.rs:92`), so it is the only place
-  their required equality can become `const _: () = assert!(..)`.
-
-`tf_tree` stays `#![forbid(unsafe_code)]`.
-
-> **Amendment note (not a revision).** This document is `implemented` and
-> therefore frozen — the sentence above stands as written, and the decision it
-> records was carried out exactly as stated. It is no longer true of the code:
-> [`0017`](./0017-owned-handles-and-the-lifetime-rule.md) moved `tf_tree` to
-> `#![deny(unsafe_code)]` with **exactly one** `#[allow]`, for the lifetime
-> extension inside `OwnedWriter`. Nothing this record decided changed with it —
-> the seam is still composed in `tf_tree`, and the two `unsafe` sites *this*
-> work needed (`pthread_atfork`, and the `fork()` in the test helper) are still
-> outside the crate. The same correction applies to the three other places this
-> document leans on the attribute — *Context*'s "that argument is void", §7's
-> poison-arena paragraph, and the "What we commit to" bullet. Their reasoning
-> survives unchanged: `SCM_RIGHTS` still needs no `unsafe`, and safe code still
-> must not be able to reach an unmapped page, because the one exception
-> `OwnedWriter` was granted puts no `unsafe` on any path they name.
+`shm = ["tf_tree_arena/shm", "dep:tf_tree_ipc"]`. Nothing depended on `tf_tree_ipc` and §3.7 was unimplemented (`crates/tf_tree_ipc/src/lib.rs:54`). `tf_tree_ipc` owns the wire and lock file and never learns what the fd is: it is parameterised by a `Copy` `SegmentDescriptor { format_version, layout_hash, arena_size, instance_uuid, boot_id }` plus a `BorrowedFd`. `tf_tree_arena` gains `instance_uuid` (header offset 136, existing padding), `descriptor()` and §7.1 population. `tf_tree` owns composition (`open()`, owner thread, leases, reaping, fork poisoning) and, seeing both `MAX_PARTICIPANTS` and `DEFAULT_MAX_PARTICIPANTS`, asserts their equality in a `const _`. `SCM_RIGHTS` needs no `unsafe`. The two `unsafe` sites (`pthread_atfork`, the test helper's `fork()`) live outside `tf_tree`; `0017` later moved `tf_tree` to `deny` with one `#[allow]`.
 
 ### 2. `tf_tree::open()`
 
-```rust
-pub fn open() -> Result<Tree, OpenError>;
-pub fn open_named(name: &str) -> Result<Tree, OpenError>;
+`open()`, `open_named(name)` and `Open` (`mode` DEFAULT `ReadOnly` (D18); `create` DEFAULT `IfAbsent`; `timeout` DEFAULT `tf_tree_ipc::DEFAULT_OPEN_TIMEOUT`, re-exported not restated; `layout_if_creating(TreeBuilder)`, per `0004`).
 
-pub struct Open { /* .. */ }
-impl Open {
-    pub fn new() -> Open;                       // domain and name from the environment
-    pub fn domain(self, domain: u32) -> Open;
-    pub fn name(self, name: &str) -> Open;
-    pub fn mode(self, mode: AttachMode) -> Open;         // DEFAULT: ReadOnly  (D18)
-    pub fn create(self, policy: CreatePolicy) -> Open;   // DEFAULT: IfAbsent
-    pub fn timeout(self, d: Duration) -> Open;           // DEFAULT: tf_tree_ipc::DEFAULT_OPEN_TIMEOUT
-    pub fn layout_if_creating(self, builder: TreeBuilder) -> Open;
-    pub fn open(self) -> Result<Tree, OpenError>;
-}
-```
-
-`layout_if_creating` takes a **`TreeBuilder`**, not an `ArenaLayout`: decision `0004`
-is still authoritative, the arena is sized from declared edges, and the creator must
-also *write* the topology. `Created`/`TookOver` ⇒ `builder.build_shared(name)`
-(`tree.rs:315`); `Joined` ⇒ `Tree::attach_shared(fd, mode)` (`tree.rs:791`). Both are
-reused as they stand.
-
-`OpenError` is `Copy`, `String`-free, `#[non_exhaustive]`, with `From<IpcError>`,
-`From<ShmError>`, `From<BuildError>` and `Rejected(HelloStatus)`. This closes the
-current state of three unrelated error families reaching the surface with no bridges.
-
-The default timeout **re-exports `tf_tree_ipc::DEFAULT_OPEN_TIMEOUT`** (`open.rs:159`,
-currently 5 s) rather than restating the number. Two constants that must agree and are
-written down twice will eventually disagree, and this one governs how long a failing
-`open()` blocks — the drift would present as a hang, not as a mismatch.
-
-The `AttachMode` ↔ `AccessMode` conversion cannot be a `From` impl anywhere — both
-types are foreign to `tf_tree` and neither dependency may depend on the other. It is a
-private exhaustive `match` plus a round-trip test, which is what breaks if either enum
-gains a third variant.
+`OpenError` is `Copy`, `String`-free, `#[non_exhaustive]`, with `From<IpcError>`, `From<ShmError>`, `From<BuildError>` and `Rejected(HelloStatus)`.
 
 ### 3. §3.7 — the owner serves from a thread in the owning process
 
-Not a daemon. §3.5 makes ownership a *role* that a surviving participant inherits,
-which is only possible if any participant can bind. `tf_treed` (§9) then becomes "a
-process that does only this", not a prerequisite for anything.
-
-`OwnerServer` owns the listener fd, a `dup` of the segment fd, the `SegmentDescriptor`,
-an `eventfd` for shutdown, and a slot-assignment callback. It `epoll`s over
-{listener, eventfd, accepted client fds}. **`EPOLLHUP` on a client fd is the reap
-trigger** (D17: "the attach socket is the liveness signal").
-
-Message structs are exactly PHASE2 §3.7's `HelloRequest`/`HelloResponse`, `#[repr(C)]`
-little-endian, with explicit `to_bytes`/`from_bytes` reusing the pattern
-`identity.rs` already established — which keeps `bytemuck` out of `tf_tree_ipc` and
-makes endianness explicit rather than incidental.
-
-Additions §3.7 does not specify but which are required (see *Consequences*):
-
-- Bind as `<name>.sock.<pid>`, `chmod 0600`, then `rename` into place. §3.4 step 5's
-  bare `sock.tmp` collides between two takers, or with a stale file from a dead binder.
-- `SO_RCVTIMEO` / `SO_SNDTIMEO` on both sides.
-- Reject any datagram whose length ≠ `size_of::<Hello*>()` **before** parsing; check
-  `magic`, then `format_version`, before any other field.
-- `RecvFlags::CMSG_CLOEXEC`, so a received fd is never leaked into a concurrent `exec`.
-- Rejection statuses get explicit `u32` values, pinned by a table test.
-
-Client-side reachability collapses to three cases, deliberately:
+Not a daemon: ownership is a role a survivor inherits (§3.5). `OwnerServer` `epoll`s over its listener, a shutdown `eventfd` and client fds; **`EPOLLHUP` on a client fd is the reap trigger** (D17). Required: bind as `<name>.sock.<pid>`, `chmod 0600`, `rename` into place; `SO_RCVTIMEO`/`SO_SNDTIMEO` both sides; reject any datagram whose length is not `size_of::<Hello*>()` before parsing, checking `magic` then `format_version` first; `RecvFlags::CMSG_CLOEXEC`; rejection statuses pinned by `wire_status_codes_are_pinned`. Client reachability:
 
 | Observation | Verdict |
 |---|---|
-| `connect` → `ENOENT` / `ECONNREFUSED` | `Absent`. §3.9 makes a stale path expected; the ownership byte is the real discriminator. |
-| `connect` succeeds, peer HUPs or times out mid-handshake | `Absent`. The ownership byte will be free and the §3.4 loop proceeds. |
-| `connect` → `EAGAIN` (backlog full) | `Absent`. The existing back-off (`open.rs:300-304`) and the contention branch already cover it; "server busy" is not a distinct state. |
+| `connect` → `ENOENT` / `ECONNREFUSED` | `Absent`; the ownership byte is the real discriminator. |
+| `connect` succeeds, peer HUPs or times out mid-handshake | `Absent`; the §3.4 loop proceeds. |
+| `connect` → `EAGAIN` (backlog full) | `Absent`; the existing back-off covers it. |
 | A **rejection** (`VersionMismatch`, `LayoutMismatch`, …) | **Terminal, not retried.** |
 
 ### 4. `ServerProbe` widens; it is not removed
 
-The existing trait (`open.rs:116`) is the right injection point and the module doc
-(`open.rs:57-61`) is right that keeping it is what makes the split-brain race
-reproducible in a test. But `probe() -> Reach` is too narrow: the real client must
-receive the fd on the *same* connection, or it connects twice and re-races.
-
-```rust
-pub trait ServerProbe {
-    type Attached;
-    fn probe(&mut self, sock: &Path) -> Result<Reach<Self::Attached>, IpcError>;
-}
-pub enum Reach<T> { Serving(T), Absent, Rejected(HelloStatus) }
-```
-
-`NoServer` keeps `type Attached = ()`. `Session` gains `take_attached()`.
-**All eight existing tests in `open.rs:456-604` must pass unchanged; that is the
-regression gate for the change.**
-
-`Open` also gains `register_at(slot)` (a joiner takes the byte the owner named)
-alongside `register_any()` (Created/TookOver, where there is no owner to ask). This
-retires the deviation documented at `open.rs:308-323`.
+`trait ServerProbe { type Attached; fn probe(&mut self, sock: &Path) -> Result<Reach<Self::Attached>, IpcError>; }` with `enum Reach<T> { Serving(T), Absent, Rejected(HelloStatus) }`, so the fd arrives on the same connection. `NoServer` keeps `Attached = ()`; the eight pre-existing `open.rs` tests pass unchanged. `Open` gains `register_at(slot)` (joiner) beside `register_any()` (creator).
 
 ### 5. The claim protocol: the arena CAS is the decision, the OFD lock is the lease
 
-PHASE2 §6.1's literal wording — "the lock file is authoritative … any code that makes
-a decision from `ClaimRecord` alone is a bug" — **is not implementable.** The lock file
-and the arena are two files with no atomic cross-update, so exactly one of them has to
-be the linearization point; and A4's epoch check reads the record on every `push` by
-design.
+PHASE2 §6.1's "the lock file is authoritative" is not implementable: two files have no atomic cross-update.
 
-> **Acquire, in this order:** `edge::claim(rec, slot)` CAS → on success
-> `F_OFD_SETLK(CLAIM_BASE + edge_id)` → **re-read `rec.epoch`**; if it changed, a
-> reaper ran inside the window, so `edge::release`, unlock, retry. If the SETLK is
-> contended, back the CAS out and return `ClaimLeaseContended`.
->
-> **Release, in this order:** clear the record (`edge::release`, already a CAS and not
-> a store, `edge.rs:302`) → **then** unlock.
->
-> **Invariant bought:** `record held ∧ lock free` ⟺ the holder is dead, or is inside
-> the one-syscall acquire window. That is exactly the predicate §6.3's reaper wants,
-> and it is the only inconsistent state the protocol can produce. The inverse
-> (`record free ∧ lock held`) occurs during release and is ignored by every reader.
-
-This is a **second layer, not a replacement**. A3's slot indirection and A4's epoch
-were just implemented on the CAS, are loom-covered, and are the only mechanism that
-works for a `HeapArena`.
+> **Acquire:** `edge::claim(rec, slot)` CAS → `F_OFD_SETLK(CLAIM_BASE + edge_id)` → **re-read `rec.epoch`**; if it changed, a reaper ran inside the window: `edge::release`, unlock, retry. A contended SETLK backs the CAS out and returns `ClaimLeaseContended`.
+> **Release:** clear the record (`edge::release`, a CAS) → **then** unlock.
+> **Invariant:** `record held ∧ lock free` ⟺ the holder is dead or inside the acquire window.
 
 ### 6. Reaping, with a self-skip
 
-Any read-write participant reaps (D15/D17: reaping is cooperative, not owner-only, so
-an owner's death does not leak every claim). Triggers: the owner on `EPOLLHUP`; lazily
-by any claimer that gets `EdgeAlreadyClaimed`; and `Tree::reap_dead()` for
-`tf_tree doctor --repair` and for tests.
+Any read-write participant reaps (D15/D17): the owner on `EPOLLHUP`, lazily a claimer that gets `EdgeAlreadyClaimed`, and `Tree::reap_dead()`. Precondition: `self.participant != u32::MAX`, asserted. For each edge: skip if `owner == 0`; **skip if `slot_of(owner)` is the reaper's own slot** (compare `slot_of`, never the packed word against `slot + 1`); skip if `probe_claim(edge)` is held; else `edge::reap` (epoch++ then owner = 0) and A5 parity repair. Then `force_free` each recorded participant slot other than its own whose byte is not held.
 
-```text
-# PRECONDITION: self.participant != u32::MAX. A read-only tree never registers
-# (tree.rs:801) and cannot reap; assert it rather than assume it, because
-# `u32::MAX + 1` overflows — see Consequences.
-own_slot = self.participant           # NOT `+ 1` — see below
-
-for edge in 0..edge_count:
-    owner = claim[edge].owner.load(Acquire)
-    if owner == 0                        { continue }   # cheap filter, no syscall
-    if slot_of(owner) == own_slot        { continue }   # ADDED — see Consequences
-    if let Some(dead) = only_slot        {              # see "one syscall per
-        if slot_of(owner) != dead { continue }          #  *dead* edge", below
-    }
-    if lock.probe_claim(edge)?.held      { continue }   # alive: never reapable
-    edge::reap(&claim[edge])                            # epoch++ then owner = 0
-    normalize_slot_parity(edge, head & mask)            # A5 repair, §6.3
-for slot in 0..MAX_PARTICIPANTS:
-    if slot == self.participant          { continue }   # ADDED
-    if participants.identity(slot).is_some() && !lock.probe_participant(slot)?.held:
-        participants.force_free(slot)                   # incarnation-guarded
-```
-
-**One syscall per *dead* edge, not per edge — NORMATIVE.** `probe_claim` is an
-`fcntl`, so a naive sweep costs one syscall per claimed edge and an arena with
-thousands of edges would make reaping the most expensive operation in the system.
-Two things keep it cheap, and both must be implemented:
-
-- The `owner == 0` test is a relaxed load of a word already in the claim table.
-  Unclaimed edges cost no syscall, which is the common case.
-- **The owner-`EPOLLHUP` trigger knows *which* participant slot died**, so it
-  passes `only_slot = Some(slot)` and the loop degenerates to `O(edges)` atomic
-  loads plus one syscall per edge that slot actually held. The lazy trigger
-  probes exactly one edge. Only `Tree::reap_dead()` — `doctor --repair` and
-  tests — passes `None` and pays the full sweep, which is the one caller where
-  a whole-arena scan is the point.
-
-With OFD locks the kernel answers liveness authoritatively, so the `/proc`
-"unknown ⇒ alive" fail-safe is no longer the defence. The defence is that a
-`SIGSTOP`ped or GC-stalled process **still holds its byte**. The only remaining
-false-positive source is the acquire window, and it is closed from the claimer's side
-by the epoch re-check — strictly better than a grace period, because there is no
-timing constant to tune.
-
-`/proc` parsing does not go away: it remains the identity source for `doctor` and the
-liveness predicate for `HeapArena` trees and for a `Tree` attached over an inherited fd
-with no `Session`, exactly as §5.1 says.
+**One syscall per *dead* edge, not per edge — NORMATIVE.** The owner-`EPOLLHUP` trigger passes `only_slot = Some(slot)`; the lazy trigger probes one edge; only `reap_dead()` passes `None`. A `SIGSTOP`ped process still holds its byte; the epoch re-check closes the acquire window.
 
 ### 7. Fork poisoning
 
-```rust
-static FORK_GEN: AtomicU64;                  // bumped by pthread_atfork(after_in_child)
-struct Tree { fork_gen_at_open: u64, /* .. */ }
-fn alive(&self) -> Result<(), OpenError>     // one Relaxed load
-```
-
-Checked at `Tree::guard()`, every mutating entry point (`claim`, `reparent`, `intern`),
-the writer facade's `push`, and — decisively — **the destructors**.
-
-The single `unsafe { pthread_atfork(..) }` lives in `tf_tree_ipc`, which already
-budgets `unsafe` in `ofd.rs`, exposed as a safe `tf_tree_ipc::fork::generation()`.
-`libc` 0.2 does not declare `pthread_atfork` for `linux_like`, so the crate declares
-it. `ofd.rs`'s case against hand-maintaining an ABI does not carry over: what made
-`fcntl(F_OFD_*)` the wrong thing to hand-roll was `struct flock`, and `pthread_atfork`
-has no struct in its signature — three nullable function pointers and an `int`, fixed
-by POSIX.1-2001.
-
-**"Checked at `Tree::guard()`" is not implementable as written, and the fix is more
-useful than the check.** `guard()` returns a `Guard`, not a `Result`, and it is the
-`let g = tree.guard();` idiom at 53 call sites; `Guard::new` reads the topology
-generation *immediately*, so a detached tree cannot build one even to discard. The
-resolution is two-sided:
-
-* `Tree::view()` — which every accessor funnels through — returns a view over a
-  process-wide **poison arena** (one frame, no edges, `ArenaLayout::minimal()`) when
-  detached. Nothing can reach the vanished mapping through a safe method, which
-  matters because `tf_tree` is `forbid(unsafe_code)` and a `&`-reference into an
-  unmapped page is a soundness hole, not merely a crash.
-* `tf_tree_core::Guard::poisoned(view, err)` builds a guard that reads nothing and
-  answers `err` to every evaluation, so the error is `ChildDetached` rather than a
-  misleading `TopologyChanged { current: 0 }`.
-
-The poison arena is allocated when the *first shared tree is opened*, not lazily on
-the detached path: a `fork` child may have inherited a locked allocator from a thread
-that no longer exists, so the recovery path must not be the thing that first
-allocates.
-
-**Guarding `Tree::drop` is necessary but nowhere near sufficient, and in the end it
-was not even necessary.** A `Drop` impl's early return does not stop the struct's
-*fields* from being dropped afterwards, so every owned resource has to stand itself
-down independently. Five destructors reach across the fork, four of them at a
-distance, into a parent that is still running:
-
-| destructor | what it does in the child | guard |
-|---|---|---|
-| `Publisher::drop` (core) | `compare_exchange` into the unmapped arena ⇒ `SIGSEGV` | new `Publisher::abandon`, called by `EdgeWriter::drop` |
-| `ClaimLease::drop` | `F_OFD_SETLK` unlock on an **inherited description** ⇒ releases the *parent's* claim lease | `fork_gen` compare |
-| `OwnerThread::stop` | writes an inherited `eventfd` ⇒ stops the *parent's* owner server; then joins a thread this process never had | `fork_gen` compare, and clears the `JoinHandle` |
-| `OwnerServer::drop` | `unlink_if_still_ours` matches, because the listener fd is inherited ⇒ removes the *parent's* live socket path | `fork_gen` compare |
-| `MappedArena::drop` | `munmap` of a hole — a no-op until the child maps something into it | `getpid()` compare (a destructor can afford a syscall) |
-
-`Tree::drop`'s own check was written, tested against a mutant, found **unreachable**
-— the `view()` poison already sends the release into the throwaway arena — and
-deleted. Two mechanisms for one invariant, only one load-bearing, is how the
-load-bearing one eventually gets removed as redundant.
-
-**Measured cost.** `EdgeWriter::push` on a shared arena: **9.041 ns against
-8.846 ns** with the branch forced not-taken — `+0.195 ns`, one relaxed load of a
-process-local static plus a predictable branch (`benches/push.rs`,
-`--features shm`). A heap tree carries `None` and pays only the discriminant test,
-so the single-process path is unchanged at 8.71 ns. `Tree::view()`'s check is once
-per `guard()`, i.e. once per batch, and `benches/lookup.rs` is unchanged within
-noise (depth-3 64.60 ns vs 64.11 ns on `main`).
-
-Two of the five guards have **no failing mutant**, and the code says so at each
-site rather than implying coverage it does not have. `MappedArena`'s needs the child
-to have mapped something into the hole, which the harness cannot arrange without a
-public accessor for the arena base that would exist for no other reason;
-`OwnerServer`'s is unreachable in this workspace because the value only ever lives on
-the serving thread's stack, and `fork` does not copy threads — it is reachable only
-through the public API, which is exactly the case a library owes a guard for.
+`FORK_GEN` is bumped by `pthread_atfork(after_in_child)`; `Tree` stores `fork_gen_at_open`; the check is one Relaxed load. The single `unsafe { pthread_atfork(..) }` lives in `tf_tree_ipc` behind `fork::generation()`. `Tree::view()` returns a process-wide **poison arena** (allocated at first shared open) when detached, and `Guard::poisoned(view, err)` answers `ChildDetached`. Each destructor stands itself down independently: `Publisher::abandon` (called by `EdgeWriter::drop`); `ClaimLease`, `OwnerThread::stop` and `OwnerServer::drop` by `fork_gen` compare; `MappedArena::drop` by `getpid()` compare (a destructor can afford the syscall).
 
 ### 8. D16 is amended, not silently contradicted
 
-`docs/PROJECT.md:117` D16 reads "Ownership is configured, not negotiated. … No leader
-election, no consensus, **no takeover**." PHASE2 §3.5 says ownership "is *inherited*,
-and the kernel picks the heir"; `OpenOutcome::TookOver` (`open.rs:96`) already ships;
-and D17 already presupposes that an owner can die without leaking claims.
-
-D16's *reasoning* survives and its *last clause* does not. What D16 correctly rejects
-is **negotiated** ownership — election, consensus, a quorum protocol. What §3.5 does is
-not negotiation: the heir is whichever process wins an uncontended `F_OFD_SETLK` on a
-single byte, decided by the kernel, with no message exchanged between candidates.
-
-D16 gains an amendment note saying exactly that. D1–D20 are hard constraints per
-`CLAUDE.md`, so leaving the contradiction in place would eventually get takeover
-"restored" to spec by a reader doing the right thing with the wrong document.
-
-## Rationale
-
-**Why the seam is in `tf_tree` and not a new crate.** `tf_tree::open()` must return a
-`Tree`, and `Tree`'s constructor surface is private — the fields at `tree.rs:521-560`
-and the `ArenaBacking` enum are both private. Any crate that is not `tf_tree` pays for
-the seam by forcing `Tree` to grow a public
-`from_parts(ArenaBacking, u32, u64, Box<dyn Fn..>)`, which widens the public API to a
-shape whose only consumer is the seam. Secondary: the CLI already depends on `tf_tree`,
-and Phase 3's PyO3 crate then binds exactly one crate rather than two.
-
-Rejected: **a `tf_tree_session` crate** — loses on the private-constructor argument
-above, and adds a fourth node to a graph whose problem is a missing edge.
-Rejected: **the server inside `tf_tree_ipc`** — it would need `tf_tree_arena`, which
-§2 forbids.
-
-**Why the wire is parameterised by a descriptor rather than given the arena.** It keeps
-`tf_tree_ipc` free of `tf_tree_arena` (§2), and it makes the §3.7 protocol testable
-without an arena at all — a `memfd_create` of any size exercises every path.
-
-**Why a thread and not a daemon.** §3.5's inheritance requires that any participant can
-become the server. A daemon-only design makes `tf_treed` a hard prerequisite and makes
-owner death fatal rather than recoverable.
-
-**Why the CAS stays the decision.** Inverting it — making the lock file authoritative —
-would require rewriting A3 and A4 within weeks of landing them, would leave `HeapArena`
-with no claim mechanism at all, and cannot be made atomic across the two files anyway.
-
-**Why `getpid()` was rejected for fork detection.** It is a real syscall on Linux, not
-vDSO: roughly 50–100 ns against a 150 ns p50 lookup budget (`PHASE1.md` §11). It also
-cannot detect a fork that happened while no call was in flight. The atfork counter is a
-relaxed load of a few nanoseconds and is correct in both respects.
+D16's "no takeover" does not survive §3.5 inheritance; D16 rejects *negotiated* ownership, and the heir is whoever wins an uncontended `F_OFD_SETLK`, decided by the kernel. D16 carries an amendment note.
 
 ## Consequences
 
-### Failure modes this protocol is chosen to exclude
+Each rule below has a named test:
 
-Each is a real state reachable if the corresponding rule is dropped, and each becomes a
-named test:
-
-1. **Inverted acquire order** ⇒ the record says P2 while the lock says P1. P1 holds the
-   lease and cannot write; P2 holds the record and can. Two writers by the back door —
-   precisely what D7 and A4 exist to prevent.
-2. **No epoch re-check** ⇒ a concurrent reaper clears the record inside the acquire
-   window; the claimer then holds a lease on an edge the arena reports free, and a
-   third process claims it. `edge::reap` already bumps the epoch *before* clearing the
-   owner (`edge.rs:334-337`), which is what makes recovery possible at all.
-3. **No self-skip in the reaper** ⇒ `F_OFD_GETLK` reports only *conflicting* locks, so
-   a process's own byte always reads free (proven by `lockfile.rs:379`). A literal §6.3
-   loop therefore revokes the reaper's own live `Publisher`s, and A4 then correctly
-   reports `ClaimRevoked` on the next push: a self-inflicted outage that presents as a
-   spurious reap.
-4. **No self-skip in the liveness predicate** ⇒ the same blindness makes a `Tree`
-   declare *itself* dead and steal the topology lock from itself.
-4a. **Comparing the whole owner word against `slot + 1`** ⇒ the self-skip never
-   fires. `pack_owner` is `(epoch << 16) | (slot + 1)` (A3, and #20's "one
-   acquisition, not just one slot"), so that comparison matches only at epoch 0
-   — which `claim` never produces, since it starts at 1. **The pseudocode above
-   originally had this bug**, written before the packed encoding was fully in
-   mind, and `a_reaper_does_not_reap_its_own_live_claim` failed on its first run
-   with `reaped 1 still_ours false`. Compare `slot_of(owner)`, not the word.
-4b. **`self.participant + 1` on a read-only tree** ⇒ arithmetic overflow.
-   `u32::MAX` is the read-only sentinel (`tree.rs:801`), so the expression panics
-   in a debug build and wraps to `0` in release. The release behaviour is
-   *accidentally* harmless — `owner == 0` is filtered one line earlier — and
-   accidental correctness is exactly what this project does not accept. The
-   precondition is that only a read-write participant reaps; encode it as an
-   assertion at the top of the loop, not as a comment.
-5. **`CreatePolicy::Always`** creates a second arena against the *same* lock file, so
-   arena A's edge 5 and arena B's edge 5 alias on byte `CLAIM_BASE + 5`, as do their
-   participant bytes. Requires an instance-scoped lock path.
-6. **Fork** ⇒ `MADV_DONTFORK` means the child's mapping is absent, so `Tree::drop`
-   (`tree.rs:918-933`) faults at child exit even if every API entry point is guarded.
-   `MappedArena::drop`'s `munmap` of an unmapped range is harmless; the fault is the
-   participant release.
+1. No epoch re-check ⇒ `the_acquire_window_backs_out`; inverted acquire order ⇒ two writers.
+2. No reaper self-skip ⇒ `F_OFD_GETLK` reports only conflicting locks, so a process revokes its own claims (`a_reaper_does_not_reap_itself`, `a_reaper_does_not_reap_its_own_live_claim`).
+3. No self-skip in liveness ⇒ `a_tree_never_reports_itself_dead`.
+4. **`CreatePolicy::Always`** creates a second arena against the same lock file, so claim and participant bytes alias; it needs an instance-scoped lock path.
+5. **Fork** ⇒ `MADV_DONTFORK` leaves the child unmapped, so the participant release faults unless guarded.
 
 ### What we commit to
 
-- One new dependency edge, `tf_tree → tf_tree_ipc`, and the discipline that it stays
-  one-directional and `shm`-gated.
-- rustix `net` + `event` + `rand` features. No new crates, so `cargo deny` is
-  unaffected.
-- `tf_tree` remains `#![forbid(unsafe_code)]`. The two `unsafe` sites this work needs
-  (`pthread_atfork`, and the `fork()` in the test helper) live outside it and are named
-  here. **(Amended: `0017` later moved the crate to `deny` with one `#[allow]` for
-  `OwnedWriter`'s lifetime extension — see the amendment note in §1. Both sites named
-  here are still outside the crate, so what this bullet commits to is intact.)**
-- The **fork test helper bends the documented unsafe budget**: it needs a real `fork()`
-  without `exec`, which `std::process::Command` cannot do, so
-  `crates/tf_tree_bench/src/bin/fork_child.rs` carries one `unsafe { libc::fork() }`
-  with a `// SAFETY:` block. `tf_tree_bench` is `publish = false` and its crate root is
-  `#![forbid(unsafe_code)]`, so this is a separate bin target, and it is called out
-  here rather than discovered later.
-  **(Amended by [`0048`](./0048-a-kind-is-not-a-crate-name.md), 2026-09-05: the
-  COUNT is stale and the scope clause is not.** That file carries more than one
-  `unsafe` site now — two of them `libc::fork()` and the rest split between the
-  OS and this workspace's own C ABI, driven across the fork for `0015`'s
-  *Invariants to maintain*. Recount with `scripts/unsafe-budget.sh`, which
-  censuses with the compiler rather than with a grep, rather than trusting a
-  number in a frozen record. What this bullet got right is the clause *"so this
-  is a separate bin target"*: the `forbid` is on `src/lib.rs` and governs no bin,
-  test, bench or example. Several other sites in this repository had that
-  backwards and cited the attribute as the reason for a design choice; `0048`
-  corrects them and lists them. And since `0048` makes 0007's kinds **properties
-  rather than crate names**, this is no longer a bent budget at all — it is kinds
-  2 and 5, registered in `scripts/unsafe-budget.txt`.)
-- Miri coverage does **not** extend to any of this: miri cannot execute
-  `memfd_create`, `F_ADD_SEALS`, or `fcntl(F_OFD_*)`. The `just miri` recipe gains a
-  comment saying so, so that nobody "fixes" it by adding `--features shm`.
-- aarch64 coverage of the new orderings depends on CI, and **GitHub Actions has
-  produced no run for this repository since 2026-07-23**. Until that is resolved, the
-  aarch64 half of every ordering claim in this milestone is unverified. This is a known
-  gap, recorded rather than papered over.
+- One dependency edge, `tf_tree → tf_tree_ipc`, one-directional and `shm`-gated; rustix `net`+`event`+`rand`, no new crates.
+- The fork test helper needs a real `fork()` without `exec`, so `crates/tf_tree_bench/src/bin/fork_child.rs` carries `unsafe { libc::fork() }` with a `// SAFETY:` block. **"So this is a separate bin target"** stands: `forbid` on `src/lib.rs` governs no bin, test, bench or example. Per `0048` the site count is stale (`scripts/unsafe-budget.sh`) and these are kinds 2 and 5 in `scripts/unsafe-budget.txt`.
+- Miri covers none of this (`memfd_create`, `F_ADD_SEALS`, `fcntl(F_OFD_*)`); `just miri` says so.
 
 ## Implementation plan
 
-Each step lands as one PR, in order.
-
-1. **`instance_uuid` + `SegmentDescriptor`** — field at header offset 136, which is
-   implicit padding created by `TopoLock`'s `align(64)` (`header.rs:77`): `boot_id`
-   ends at 128, `_reserved` at 136, and the next 64-byte boundary is 192, so 136..192
-   is free and `topo_lock` stays at 192 with `size_of == 256`. `FORMAT_VERSION` stays
-   2. Bytes from `rustix::rand::getrandom` — **which must be retried on `EINTR` and
-   on a short read**; the kernel does not return partial reads for buffers this small
-   except when interrupted, and "except when interrupted" is the whole hazard, since a
-   partially-filled uuid would still look random. Verified by
-   `instance_uuid_lands_at_136` alongside the existing `key_field_offsets_are_stable`
-   (`header.rs:179`), plus `two_creates_have_distinct_uuids` and
-   `attach_preserves_the_creator_uuid`.
-2. **`ParticipantTable::register_at(slot, ..)`** — §3.7's `participant_slot` requires
-   the arena slot and the lock byte to be the same integer; today they are independently
-   allocated (`lockfile.rs:175` vs `participant.rs:155`). Verified by a loom test in
-   which two threads `register_at(3)` and exactly one wins; mutant: replace the CAS with
-   load+store ⇒ loom finds both winning.
-3. **§3.7 wire in `tf_tree_ipc`** (`wire.rs`, `server.rs`, `client.rs`, `ipc_child`
-   gains `serve`/`attach`). Verified by a child-serves/parent-receives round trip that
-   `fstat`s the received fd; mutant: omit the `ScmRights` push ⇒ the client must fail
-   with `NoFdReceived`, not hang and not succeed. Plus `layout_mismatch_names_both_hashes`
-   (asserting the ancillary iterator is *empty* on rejection) and
-   `wire_status_codes_are_pinned`.
-4. **Wire §3.7 into `Open`** — widen `ServerProbe`, add `register_at`, make rejections
-   terminal, and add `IpcError::SocketPathTooLong` checked at `Rendezvous` construction
-   rather than at `bind`. Verified by all eight existing `open.rs` tests passing
-   unchanged, plus `a_rejection_does_not_burn_the_timeout`.
-5. **`tf_tree::open()`** — the seam. Verified by `crates/tf_tree/tests/rendezvous.rs`
-   covering PHASE2 §11.2 scenarios 7 (thundering herd, 32 processes, one `Created` and
-   one shared `instance_uuid`), 9 (split-brain), 10 (stuck participant), 11 (domain
-   isolation), 4 (layout mismatch) and 6 (65th participant). Mutant for 7 and 9: remove
-   §3.4 step 4 (`any_participant_held`, `open.rs:279`) ⇒ distinct uuids appear.
-6. **§5.1 liveness from `F_OFD_GETLK`** — verified by `a_sigstopped_holder_is_still_alive`
-   (mutant: the current `/proc` predicate ⇒ a stopped process reads as dead),
-   `a_sigkilled_holder_is_immediately_dead`, and `a_tree_never_reports_itself_dead`.
-7. **§6.1 claims as leases** — verified by two processes racing edge 5;
-   `SIGKILL`-then-`probe_claim` with no sleep; `the_acquire_window_backs_out` (mutant:
-   delete the epoch re-check ⇒ the claimer publishes onto a reaped record); and a loom
-   model of the CAS↔lock ordering with the kernel byte as a loom atomic.
-8. **§6.3 reaping** — verified by `a_reaper_does_not_reap_itself` (mutant: delete the
-   self-skip ⇒ the process revokes its own live claims — the single most valuable test
-   in this milestone), `killed_writer_is_reaped_and_reclaimed` including A5 parity
-   repair, and `a_stopped_writer_is_never_reaped` (which is D17/§6.4 as an executable
-   assertion).
-9. **Fork poisoning** — verified by `fork_child`: the child calls `tree.lookup(..)`,
-   must get `ChildDetached`, and must exit 0. Assert `WIFEXITED`, not merely the status
-   code; mutant: remove the poison ⇒ the child dies with `SIGSEGV` even though the API
-   check is present, which an exit-status-only assertion would miss. The parent then
-   re-validates **itself** — lookup, push, its own liveness, a fresh `open()` through
-   the socket, and `probe_claim` from an *independent* open file description — because
-   the cross-fork damage is invisible in the child's exit status. The independent
-   description is not optional: OFD locks are self-blind, so the tree's own lock file
-   reports its byte free whether or not it still holds it, and without that vantage
-   point the `ClaimLease` guard has no test that can fail.
-10. **§7.1 per-region population** — drop `MapFlags::POPULATE`; populate per region
-    with `MADV_POPULATE_WRITE`/`_READ`, falling back on `EINVAL` (kernels < 5.14) to
-    touching one byte per page. **The fallback reads, it does not write** — the
-    "zeroing write" this step originally called for would store into a segment other
-    processes are already using, racing every reader of a live claim record or sample
-    slot. A read fault populates the page-table entry, which is the whole objective.
-
-    **Declaration granularity comes from the arena, not from the builder.**
-    `frame_count` and `edge_count` are live header counters, so an *attaching*
-    process derives the used extents itself: nothing crosses the handshake and there
-    is no agreement with the creator to keep in sync. Population therefore runs
-    **after** `build_with`, not inside `create` — at `create` time nothing is declared
-    and both counters are zero. The frame hash is deliberately left cold (probed by
-    hash, so scattered; interning is not the hot path), and the four topology blocks
-    are populated per block, since they are strided and one range would pull in three
-    blocks of headroom.
-
-    Measured, on an arena declaring one 1024-slot edge with 200k slots of frame and
-    edge headroom: **66.3 MiB of RSS against 66.1 MiB declared → 3.8 MiB. 17x.** The
-    3.8 MiB residue is `MADV_HUGEPAGE` (§7.2) rounding a handful of small live regions
-    up to 2 MiB pages, not slack in the accounting.
-
-    Verified by RSS and minor-fault deltas rather than `mincore`, which would need the
-    mapping's base pointer — something `tf_tree` does not expose and should not start
-    exposing for a test. **The test is two-sided**, because "headroom is not charged"
-    is satisfied perfectly by populating nothing, which reintroduces the exact fault
-    storm §7.1 exists to prevent:
-
-    | test | mutant that fails it |
-    |---|---|
-    | `declared_headroom_is_not_charged` | restore `MAP_POPULATE` ⇒ 100% charged |
-    | `declared_content_is_charged` | `populate_hot` a no-op ⇒ 0.7% charged |
-    | `the_first_lookup_after_attach_does_not_fault` | drop the `populate_hot` in `attach_shared_inner` ⇒ 1 minor fault |
-    | `touch_offsets_covers_every_page_and_never_passes_the_end` | drop the final partial page; align the start down |
-
-    The last of those exists because the fallback's *effect* is not observable from
-    inside `tf_tree_arena` — a test of it cannot tell "touched every page" from
-    "stopped one page short" — so the bound is a pure function and is tested as one.
-11. **CLI adoption** — `--attach`/`--domain`/`--name`/`--rw`/`--create`/`--timeout` as
-    global flags on `tree`, `echo` and `doctor`; new `tf_tree participants` reading
-    `LockFile::read_identity`, which **must work without the arena** (§3.3).
-
-    `--rw` is opt-in and `--create` defaults to *never*. A diagnostic tool attached
-    read-write to a robot's tree can corrupt it with any bug it happens to have, and
-    the MMU is the only thing that stops it (D18); defaulting to *create* would be
-    worse still, because a `doctor` run against a mistyped domain would conjure an
-    empty arena and then pronounce it healthy.
-
-    **`doctor` on a live arena loses two of its seven checks, and says so.** A live
-    arena has no recorded push stream, so `Observations::from_arena` reconstructs
-    what the rings retain — every stamp, in order — and *cannot* reconstruct two
-    things: a ring remembers the current claim owner rather than the sequence of
-    processes that wrote into it (so **multi-writer** can never fire), and
-    `arrival_delay_ns` is a fact about the publisher's clock at push time that
-    nothing in the arena records (so **short-buffer** can never fire). Printing "all
-    seven pass" would be a clean bill of health that was never earned, and those two
-    are exactly the checks an operator wants after a mystery outage.
-
-    Verified by `crates/tf_tree_cli/tests/attach.rs`, which drives the **shipped
-    binary** against a live publisher — through `clap`, through `open()`, over the
-    socket. Mutants: `--attach` falls back to the fixture ⇒ two tests fail on the
-    fixture's frame names; `doctor` drops the disclosure line ⇒ fails; either
-    `--domain` path ignored ⇒ `a_different_domain_is_a_different_arena` fails, which
-    is the mistake an operator actually makes and whose dangerous form is silent.
-12. **Docs close-out** — PHASE2 §0.0 status table, the D16 amendment note, RUNBOOK rows,
-    `README.md` gaining §3.10's "shared memory IPC is not a sandbox", and this document
-    to `implemented` with PR numbers.
-
-New recipes: `shm-rendezvous` (§11.2 scenarios), `shm-split-brain` (scenario 9 × 1000,
-nightly). `shm-check` extends to `-p tf_tree --features shm`, `-p tf_tree_ipc` and
-`-p tf_tree_cli --features shm`, because that combination only compiles under `shm` and
-`--workspace` never sees it. CI extends the existing `shm` job on **both** x86-64 and
-`ubuntu-24.04-arm` rather than adding a job.
-
-## Found while implementing
-
-**The acquire window cannot be tested by racing, so it is tested by injection.**
-`the_acquire_window_backs_out` finally exists — it was owed from step 7 and did not
-arrive with the step 8 reaper that made it reachable. The window between the claim
-CAS and the lease `SETLK` is *one syscall* wide, which is not a thing a test can
-land inside by repetition. `tf_tree` therefore gains a `test-hooks` feature — off by
-default, absent from the API entirely unless enabled — carrying a single
-`CLAIM_WINDOW_HOOK` fired at exactly that point.
-
-The reaper in the hook must be a **second participant**, not the claimer: §6.3's
-self-skip means a process never reaps its own slots, so a self-reap would prove
-nothing. Two `open()` calls in one process give two slots, two lock-file
-descriptions, and therefore a genuine cross-participant reap.
-
-The test also asserts the **retry succeeds and publishes**. A guard that detects the
-reap and then leaks the record or the lease converts a recoverable race into a
-permanently unclaimable edge, which is worse than the race it fixed.
-
-Mutant: `if claim_rec.epoch.load(..) != epoch` ⇒ `if false`. `claim` returns `Ok`,
-and the writer publishes onto a record that was reaped out from under it.
-
-
-**The epoch re-check could not be tested until step 8 existed.** Step 7's
-CAS-to-`SETLK` window is guarded by re-reading `ClaimRecord::epoch`, and
-removing that guard leaves every test green — because nothing reaps yet, so no
-reaper can run inside the window. The guard is written anyway: the window is
-created by step 7, and a reader arriving with step 8 would otherwise have to
-re-derive why it is needed. **Its test belongs with the reaper**, and step 8 is
-not complete without one that fails when the check is removed. *(Landed after
-step 9; see the injection note above.)*
-
-The same is true of `ClaimApiError::LeaseContended` and `ReapedDuringClaim`:
-both are reachable only once a reaper or `CreatePolicy::Always` aliasing exists.
-
-
-
-**A read-only participant holds a lock byte but has no arena record.**
-`Tree::attach_shared` skips registration when the mapping is not writable — it
-*cannot* write the table — so a `mode="ro"` joiner, which is the consumer
-default (D18) and the Python default (`PHASE3.md` §4.1), occupies
-`participant` byte *n* in the lock file while arena slot *n* stays `FREE`.
-
-That is the byte/record split step 2's `register_at` exists to close, reappearing
-from the other side. Two consequences:
-
-1. `Tree::participant_alive(n)` reports such a peer **dead**, because it checks
-   the arena record before consulting the lock. For a reaper that is the safe
-   direction — there is nothing to reap — but it means the predicate answers
-   "dead" for a live process, and any future code that reads it as "this slot is
-   free" would be wrong.
-2. The owner's slot assigner scans the *arena* table, so it can hand out a slot
-   whose lock byte is already held by a read-only peer. Today the granted-slot
-   bitmask (step 5) prevents an immediate re-grant, so the joiner retries and
-   gets a different slot — but the bitmask does not survive an owner restart,
-   and after a takeover the new owner would name that slot again and the joiner
-   would loop.
-
-**Half of it is now fixed** (consequence 2): the owner's assigner consults
-`probe_participant` as well as the arena table, so it will not name a slot whose
-byte is held. The guard is forward-looking rather than currently load-bearing —
-the granted-slot bitmask already prevents a re-grant for the life of one owner,
-so removing the check leaves every test passing. It becomes load-bearing the
-moment §3.5 takeover lands and a *new* owner inherits an arena whose read-only
-peers it never granted: the bitmask is empty, the arena table reports those
-slots free, and the owner names one forever while the joiner loops.
-
-Consequence 1 — `participant_alive` reporting a read-only peer dead — is left
-as it is, and is arguably correct: there is no participant *record*, so there is
-nothing for a reaper to act on. Revisit it with step 8, where "what is a slot's
-true occupancy" has to be answered anyway.
-
-Neither is reachable as a *correctness* failure today, which is why the rest is
-recorded rather than hot-fixed. The fix belongs with step 8 (reaping), which is
-the first code that must decide what a slot's true occupancy is: either the
-owner consults `held_participants()` as well as the arena table, or a read-only
-attach stops taking an arena-indexed byte at all. **Resolve it there; do not
-paper over it by making `participant_alive` consult the lock first**, which
-would report a phantom participant as alive and give the reaper nothing to act
-on.
-
-## Open questions
-
-None. Items that PHASE2 §3 leaves under-specified are resolved above rather than left
-open — §3.4 step 5's socket temp name (§3 of the Decision), the missing handshake
-timeout and datagram-length rule (§3), the absent terminal exit for a rejection (§3),
-who watches the socket (§3: one watcher thread per attached `Tree`), the reaper's
-self-blindness and the missing epoch re-check (§5, §6), `sun_path`'s 108-byte limit
-(plan step 4), and the `--force-new` byte aliasing (§5 of *Consequences*).
-
-Two items are deliberately **out of scope** and left for a later decision rather than
-called open questions here:
-
-- **§3.8 versus decision `0004`.** §3.8 presumes a generous default layout (~600 MiB)
-  for a creator that declares no capacity; `0004` sizes the arena from declared edges
-  and is still authoritative. `open()`'s `layout_if_creating` inherits `0004`'s model,
-  so §3.8's premise does not arise in this milestone. One of the two must give, and
-  that is its own decision.
-- **§11.4 `shm_torture`.** The harness skeleton lands with step 12; the 30-minute
-  nightly run is a separate piece of work.
+Steps 1-4: `instance_uuid` at header offset 136 (`FORMAT_VERSION` stays 2; `getrandom` retried on `EINTR`/short reads); `ParticipantTable::register_at` (arena slot and lock byte are one integer); §3.7 wire in `tf_tree_ipc` (an omitted `ScmRights` push must fail with `NoFdReceived`); wire into `Open` with `IpcError::SocketPathTooLong` at `Rendezvous` construction.
+5. `tf_tree::open()`, tested by `crates/tf_tree/tests/rendezvous.rs` (PHASE2 §11.2 scenarios 4, 6, 7, 9, 10, 11).
+6-8. §5.1 liveness from `F_OFD_GETLK`; §6.1 claims as leases, the acquire window tested by injection (`test-hooks`, `CLAIM_WINDOW_HOOK`, a second participant as reaper); §6.3 reaping, where the owner's slot assigner also consults `probe_participant` because a read-only joiner holds a byte with no arena record.
+9. Fork poisoning: `fork_child` asserts `WIFEXITED`, `ChildDetached` and exit 0; the parent re-validates itself, including `probe_claim` from an independent description (OFD locks are self-blind).
+10. §7.1 per-region population: no `MAP_POPULATE`; `MADV_POPULATE_WRITE`/`_READ`, falling back on `EINVAL` to a read touch (never a write into a live segment); runs after `build_with`. Tests: `declared_headroom_is_not_charged`, `declared_content_is_charged`, `the_first_lookup_after_attach_does_not_fault`.
+11. CLI adoption: `--attach`/`--domain`/`--name`/`--rw`/`--create`/`--timeout`; `--rw` opt-in, `--create` defaults to never (D18); `doctor` on a live arena drops multi-writer and short-buffer and says so (`crates/tf_tree_cli/tests/attach.rs`).
+12. Docs close-out.

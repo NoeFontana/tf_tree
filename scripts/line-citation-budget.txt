@@ -22,30 +22,18 @@
 # marker count inverts the pairing for the rest of a file — prose blanked, code
 # blocks scanned. The stripper is line-anchored now (`strip_fenced_blocks`).
 2	docs/changelog/0.0.5.md
-17	docs/PHASE2.md
 3	docs/PHASE3.md
 5	docs/PHASE4.md
 2	docs/PHASE5.md
-2	docs/PROJECT.md
 1	docs/RUNBOOK.md
 2	docs/benchmarks/tf2.md
 1	docs/decisions/0005-the-shared-memory-seam.md
-4	docs/decisions/0013-the-benchmark-gate-never-interpolated.md
 3	docs/decisions/0015-the-bridge-fills-a-shared-arena.md
-5	docs/decisions/0016-portable-simd-and-the-dependency-budget.md
 6	docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md
 3	docs/decisions/0020-the-consumer-side-of-the-arena-refusal.md
-1	docs/decisions/0022-the-per-call-guard-and-the-unwatched-gate.md
 1	docs/decisions/0026-the-corpus-shape-of-a-frozen-index.md
-2	docs/decisions/0027-the-48-byte-frame-name-store.md
-27	docs/decisions/0028-the-slot-a-killed-participant-keeps.md
 1	docs/decisions/0030-the-atfork-handler-and-inherited-descriptors.md
-1	docs/decisions/0031-the-participant-record-with-no-byte.md
-14	docs/decisions/0033-the-identity-record-cannot-name-a-namespace.md
-24	docs/decisions/0034-the-depth-bound-priced-two-slots-the-same.md
 1	docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md
 12	docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md
 6	docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md
-5	docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
-1	docs/decisions/README.md
 1	testdata/frozen/README.md

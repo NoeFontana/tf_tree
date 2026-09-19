@@ -1,28 +1,17 @@
 //! Output layouts — `docs/PHASE4.md` §3.5.
 //!
-//! # Two traps, both of which produce plausible wrong answers rather than crashes
+//! Two traps produce plausible wrong answers rather than crashes:
 //!
-//! **Quaternion component order.** `tf_tree`'s canonical form is `w`-first
-//! (`tf_tree_math` convention 2). `Eigen::Quaterniond`'s *internal storage* is
-//! `(x, y, z, w)` even though its constructor takes `(w, x, y, z)` — so a
-//! `memcpy` from [`TFT_LAYOUT_QVEC7_WXYZ`] into an `Eigen::Quaterniond` or a
-//! `Sophus::SE3d` is silently wrong. It still yields a *unit* quaternion, so
-//! nothing complains and no norm check fires; the rotation is simply a different
-//! one. [`TFT_LAYOUT_QVEC7_XYZW`] exists solely to make the correct thing the
-//! easy thing.
+//! **Quaternion order.** The canonical form is `w`-first, but `Eigen::Quaterniond`
+//! stores `(x, y, z, w)`; a `memcpy` from [`TFT_LAYOUT_QVEC7_WXYZ`] into one is a
+//! silently different rotation. [`TFT_LAYOUT_QVEC7_XYZW`] exists for that case.
 //!
-//! **Matrix major order.** Row-major and column-major differ by a transpose,
-//! which for a rotation is its *inverse* — again a valid transform, pointing the
-//! wrong way. There is deliberately no default: the enum is always explicit.
+//! **Matrix major order.** Row- vs column-major is a transpose, which for a
+//! rotation is its inverse. There is no default; the enum is always explicit.
 //!
-//! # Why these are written here and not delegated
-//!
-//! `tf_tree_core::layout` already writes `Mat4`, `Quat` and `Affine32`, and the
-//! three that overlap delegate to it so the C ABI and the Python binding cannot
-//! disagree. The two that do not exist there — `QVEC7_XYZW` and the row/column
-//! distinction — are written out longhand, and §3.5's NORMATIVE test asserts
-//! them against **hand-computed byte patterns** rather than against another
-//! `tf_tree` call, because a self-consistent pair of bugs would otherwise pass.
+//! `Mat4`, `Quat` and `Affine32` delegate to `tf_tree_core::layout`; `QVEC7_XYZW`
+//! and the row/column distinction are written here, and §3.5's NORMATIVE test
+//! asserts them against hand-computed byte patterns, not another `tf_tree` call.
 
 use tf_tree::{Iso3, Twist};
 
@@ -41,35 +30,18 @@ pub const TFT_LAYOUT_MAT4_ROW: tft_layout = 3;
 pub const TFT_LAYOUT_AFFINE12_ROW_F32: tft_layout = 4;
 /// `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]` `f64` — pose **and body twist**.
 ///
-/// [`TFT_LAYOUT_QVEC7_WXYZ`] with six more slots holding the same twist
-/// `TFT_TWIST_BYTES` describes, in the same `[ω, v]` order. It is the
-/// layout form of `at_with_derivatives` (`docs/API.md` §3.3), and appending it
-/// is a **minor** ABI bump under `docs/PHASE4.md` §3.6: an older caller never
-/// names the value and every entry point rejects a discriminant it does not
-/// know rather than computing a size from it.
+/// [`TFT_LAYOUT_QVEC7_WXYZ`] plus the `[ω, v]` twist `TFT_TWIST_BYTES` describes
+/// (`docs/API.md` §3.3). Appending it is a minor ABI bump (`docs/PHASE4.md`
+/// §3.6). `tft_plan_at`, `tft_plan_at_many` and `tft_plan_at_with_derivatives`
+/// accept it, and asking for it *is* asking for derivatives.
 ///
-/// **Every evaluate entry point accepts it** — `tft_plan_at`,
-/// `tft_plan_at_many` and `tft_plan_at_with_derivatives`. Asking for this
-/// layout *is* asking for derivatives: the call evaluates the plan with them
-/// and writes thirteen `f64` per element, which is what makes
-/// `docs/PHASE5.md` §4.4's "carried to both bindings by the layout dispatch"
-/// true of the batch path and not only of the scalar one.
-///
-/// It is the one layout whose emission can fail for a reason the pose layouts
-/// cannot: an edge interpolating with `LerpSlerp` has no exact body twist, so
-/// the call returns `TFT_ERR_NO_DERIVATIVES` naming the edge rather than a
-/// finite difference that would look like an answer. Nothing is written for
-/// that element or any after it.
-///
-/// It is **not** readable — see `read`. A velocity is derived from the arena,
-/// never stored in it.
+/// An edge interpolating with `LerpSlerp` has no exact twist: the call returns
+/// `TFT_ERR_NO_DERIVATIVES` naming the edge and writes nothing for that element
+/// or any after it. Not readable: a velocity is derived, never stored.
 pub const TFT_LAYOUT_QVEC7_WXYZ_TWIST6: tft_layout = 5;
 
-/// The number of **bytes** one transform occupies in `layout`, or `None` if the
-/// discriminant is not one this build defines.
-///
-/// Returning `None` rather than a default is deliberate: an unknown layout from
-/// a newer header must be an error, never a silent fallback to `QVEC7_WXYZ`.
+/// The number of **bytes** one transform occupies in `layout`, or `None` for a
+/// discriminant this build does not define (never a silent default).
 #[must_use]
 pub fn payload_bytes(layout: tft_layout) -> Option<usize> {
     Some(match layout {
@@ -81,22 +53,14 @@ pub fn payload_bytes(layout: tft_layout) -> Option<usize> {
     })
 }
 
-/// Whether `layout` includes a twist, and therefore has to be evaluated with
-/// derivatives and written by [`write_twist6`] rather than [`write`].
-///
-/// Every entry point tests this **once**, outside its loop, and then runs the
-/// matching one of two bodies — the alternative, a test inside the writer, put
-/// a loop-invariant compare on the per-element path of a batch whose whole
-/// purpose is per-element cost.
+/// Whether `layout` includes a twist and so goes through [`write_twist6`].
+/// Entry points test this once, outside their loop.
 #[must_use]
 pub(crate) fn carries_twist(layout: tft_layout) -> bool {
     layout == TFT_LAYOUT_QVEC7_WXYZ_TWIST6
 }
 
-/// The rotation matrix of `t`, row-major, as nine `f64`.
-///
-/// One place, used by both matrix layouts, so the two cannot disagree about the
-/// rotation and differ only in how it is laid out.
+/// The rotation matrix of `t`, row-major, as nine `f64`; shared by both matrix layouts.
 #[inline]
 fn rot3(t: &Iso3) -> [f64; 9] {
     let (w, x, y, z) = (t.q.w, t.q.x, t.q.y, t.q.z);
@@ -118,24 +82,11 @@ fn rot3(t: &Iso3) -> [f64; 9] {
 
 /// Write the pose `t` into `dst` in `layout`.
 ///
-/// `dst` must be at least [`payload_bytes`] long; the caller checks that, and
-/// this function's slicing would panic rather than overrun if it did not — which
-/// the panic guard turns into `TFT_ERR_INTERNAL` rather than an abort.
-///
-/// # A twist-carrying layout does not come here
-///
-/// [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] has six slots a pose cannot fill, and this
-/// function has no twist to fill them with. Its `_` arm would therefore write
-/// *nothing* for that discriminant, leaving the caller's own bytes where a
-/// velocity is supposed to be — which is undetectable, since they are finite,
-/// plausible and different every run.
-///
-/// So the split is by function rather than by argument: every caller decides
-/// once, from [`carries_twist`], whether it is evaluating a pose or a pose and
-/// a twist, and the twist-carrying case goes to [`write_twist6`]. The
-/// `debug_assert` below is what keeps "decides once" from becoming "forgot
-/// once" — release builds pay nothing for it, and every path through here is
-/// covered by a test.
+/// `dst` must be at least [`payload_bytes`] long (the caller checks; a short
+/// slice panics, which the panic guard maps to `TFT_ERR_INTERNAL`). A
+/// twist-carrying layout must go to [`write_twist6`]: its `_` arm would write
+/// nothing and leave the caller's bytes where a velocity belongs, so the
+/// `debug_assert` below guards that split.
 pub(crate) fn write(t: &Iso3, layout: tft_layout, dst: &mut [u8]) {
     debug_assert!(
         !carries_twist(layout),
@@ -144,7 +95,7 @@ pub(crate) fn write(t: &Iso3, layout: tft_layout, dst: &mut [u8]) {
     match layout {
         TFT_LAYOUT_QVEC7_WXYZ => put_qvec7_wxyz(t, dst),
         TFT_LAYOUT_QVEC7_XYZW => {
-            // The whole reason this variant exists. See the module docs.
+            // See the module docs.
             put_f64(dst, &[t.q.x, t.q.y, t.q.z, t.q.w, t.t.x, t.t.y, t.t.z]);
         }
         TFT_LAYOUT_MAT4_ROW => {
@@ -161,8 +112,7 @@ pub(crate) fn write(t: &Iso3, layout: tft_layout, dst: &mut [u8]) {
         }
         TFT_LAYOUT_MAT4_COL => {
             let r = rot3(t);
-            // Column-major: the translation lands in the last *column*, which in
-            // this ordering is elements 12..15 — not the last row.
+            // Column-major: translation is elements 12..15.
             put_f64(
                 dst,
                 &[
@@ -185,23 +135,15 @@ pub(crate) fn write(t: &Iso3, layout: tft_layout, dst: &mut [u8]) {
                 dst[i * 4..i * 4 + 4].copy_from_slice(&b);
             }
         }
-        // Unreachable: the caller validated the discriminant with
-        // `payload_bytes` before allocating a slice for it, and the one
-        // discriminant that would land here is the one the `debug_assert`
-        // above names.
+        // Unreachable: the discriminant was validated by `payload_bytes`.
         _ => {}
     }
 }
 
 /// Write `t` and `twist` into `dst` as [`TFT_LAYOUT_QVEC7_WXYZ_TWIST6`].
 ///
-/// `dst` must be at least 104 bytes — [`payload_bytes`] for that layout.
-///
-/// The pose half **is** [`TFT_LAYOUT_QVEC7_WXYZ`], byte for byte, written by
-/// the same helper that arm uses: the `w`-first order this module's first trap
-/// is about gets exactly one home in this file. The tail is `[ω, v]`, the same
-/// six slots in the same order as `TFT_TWIST_BYTES`'s `out_twist`, so a caller
-/// reading either spelling reads the same numbers.
+/// `dst` must be at least 104 bytes. The pose half is [`TFT_LAYOUT_QVEC7_WXYZ`],
+/// written by the same helper; the tail is `[ω, v]`, as `TFT_TWIST_BYTES`.
 #[inline]
 pub(crate) fn write_twist6(t: &Iso3, twist: &Twist, dst: &mut [u8]) {
     let (pose, tail) = dst.split_at_mut(7 * 8);
@@ -234,69 +176,37 @@ pub(crate) fn put_f64(dst: &mut [u8], vals: &[f64]) {
 
 // The publish direction — §3.2's `tft_publisher`.
 
-/// Why a caller's transform was refused.
-///
-/// `Copy` and carries no `String`, per `docs/PROJECT.md` §5. The C ABI maps
-/// each to its own status code, because "your matrix is left-handed" and "your
-/// quaternion is zero" want different fixes.
-// The `Not*` prefix is the point: every variant is a way the input fails to be
-// a transform, and the shared prefix is what makes that readable at the call
-// site. `enum_variant_names` would have them renamed to `Finite`/`UnitQuaternion`
-// /`RotationMatrix`, which read as the *successful* properties.
+/// Why a caller's transform was refused. `Copy`, no `String`
+/// (`docs/PROJECT.md` §5); each maps to its own status code.
+// The `Not*` prefix reads as the failing property; `enum_variant_names` would not.
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadError {
     /// Some component was NaN or infinite.
     NotFinite,
-    /// A quaternion whose norm is too far from 1 to be a rotation — including
-    /// the all-zeros buffer, which is what an uninitialized one looks like.
+    /// A quaternion too far from unit norm, including the all-zeros buffer.
     NotAUnitQuaternion,
-    /// `|det R − 1| > DET_TOL`. One check that catches both realistic mistakes;
-    /// see [`read`].
+    /// `|det R − 1| > DET_TOL`; see [`read`].
     NotARotationMatrix,
 }
 
-/// How far `det R` may stray from `+1`.
-///
-/// Loose enough that an honest matrix which has been composed a few hundred
-/// times and never re-orthonormalized still passes — `f64` drift after 1000
-/// compositions is ~1e-13 — and tight enough that a 0.001 % scale is refused.
+/// How far `det R` may stray from `+1`: loose enough for honest drift
+/// (~1e-13 after 1000 compositions), tight enough to refuse a 0.001 % scale.
 const DET_TOL: f64 = 1e-6;
 
-/// How far `|q|` may stray from 1, in the same spirit.
-///
-/// Compared against `norm_squared`, not `norm`: `|q| ∈ [1−t, 1+t]` iff
-/// `|q|² ∈ [(1−t)², (1+t)²]`, and to first order that is `|‖q‖² − 1| ≤ 2t`. The
-/// bound below is deliberately the loose side of that — `2t + t²` — so the
-/// squared test accepts exactly what the unsquared one would and not a hair
-/// less. Saves a `sqrt` on every published transform.
+/// How far `|q|` may stray from 1. Applied to `‖q‖²` as [`NORM2_TOL`] (`2t + t²`),
+/// which saves a `sqrt` and accepts exactly what the unsquared test would.
 const NORM_TOL: f64 = 1e-6;
 
 /// `|‖q‖² − 1|` above which a quaternion is refused. See [`NORM_TOL`].
 const NORM2_TOL: f64 = 2.0 * NORM_TOL + NORM_TOL * NORM_TOL;
 
-/// `|‖q‖² − 1|` below which renormalizing is not worth a `sqrt` and four
-/// divides.
-///
-/// `Quat`'s invariant is `|q| == 1` within `1e-12`, so anything inside that band
-/// is already what the arena requires and normalizing would only move the last
-/// bit. A caller who hands us a correctly normalized quaternion — which is
-/// almost all of them, since that is what every quaternion library produces —
-/// therefore pays nothing for the renormalization path.
-///
-/// The squared band is `2 × 1e-13`, comfortably inside the `1e-12` the invariant
-/// allows, so the fast path cannot admit a quaternion the engine would reject.
+/// `|‖q‖² − 1|` below which renormalizing is skipped: `2 × 1e-13`, inside the
+/// `1e-12` band `Quat`'s invariant allows.
 const RENORM_SKIP_TOL: f64 = 2e-13;
 
-/// Normalize `q` only if it needs it.
-///
-/// The quaternion path used to do **two** `sqrt`s — one for the norm check, one
-/// for the normalization — on a push that costs tens of nanoseconds.
-///
-/// **Measured effect: none.** `examples/abi_cost.rs` reports 22.1 ns/push with
-/// and without this, inside the run-to-run spread. It is kept because it is
-/// strictly less work for provably the same result, not because it bought
-/// anything.
+/// Normalize `q` only if it needs it (one `sqrt` instead of two; no measured
+/// effect on `examples/abi_cost.rs`, kept as strictly less work).
 #[inline]
 fn normalize_if_needed(q: tf_tree::Quat) -> tf_tree::Quat {
     if (q.norm_squared() - 1.0).abs() <= RENORM_SKIP_TOL {
@@ -308,69 +218,39 @@ fn normalize_if_needed(q: tf_tree::Quat) -> tf_tree::Quat {
 
 /// Read a transform **out of caller memory** in `layout`.
 ///
-/// `src` must be at least [`payload_bytes`] long; the caller checks that.
+/// `src` must be at least [`payload_bytes`] long; the caller checks.
 ///
-/// # What is validated, and why it is only these things
+/// Two silent mistakes are refused with one check, `|det R − 1| ≤ 1e-6`: a
+/// left-handed matrix (`det = −1`, which Shepperd's method converts to a
+/// different valid rotation) and a matrix carrying scale (`det = s³`). Honest
+/// drift is not an error; the quaternion is normalized after conversion.
 ///
-/// A C caller's transform arrives from their own math, and the two mistakes
-/// that actually happen are both silent:
-///
-/// * **A left-handed matrix** — someone negated a column, or transposed a
-///   coordinate convention. `det R = −1`, and Shepperd's method converts it
-///   without complaint into a *different, perfectly valid* rotation.
-/// * **A matrix carrying scale** — an `Eigen::Affine3d` used where an
-///   `Isometry3d` was meant. `det R = s³`, and normalizing the quaternion
-///   silently discards the scale.
-///
-/// **One determinant catches both**, which is why the check is a determinant
-/// and not an orthonormality sweep: `|det R − 1| ≤ 1e-6`. It costs 9
-/// multiplies and 5 adds against a `push` that is already tens of nanoseconds,
-/// and it is the difference between a robot that reports an error and one that
-/// drives into a wall confidently.
-///
-/// Float drift from honest composition is *not* an error: the quaternion is
-/// normalized after conversion, which is exactly what an arena sample requires
-/// and what `Iso3::normalized` already does everywhere else.
-///
-/// `AFFINE12_ROW_F32` is **not readable**. It is an output encoding for GPU
-/// upload (`tf_tree_core::layout`'s reasoning, and `docs/PROJECT.md` §5's "f64
-/// only"): accepting a publication in `f32` would quietly halve the precision
-/// of everything downstream of it. Returns `None` for that discriminant, which
-/// the caller turns into `TFT_ERR_BAD_ENUM`.
+/// `AFFINE12_ROW_F32` is **not readable** (`docs/PROJECT.md` §5, "f64 only"):
+/// returns `None`, which the caller turns into `TFT_ERR_BAD_ENUM`.
 pub(crate) fn read(layout: tft_layout, src: &[u8]) -> Option<Result<Iso3, ReadError>> {
     Some(match layout {
         TFT_LAYOUT_QVEC7_WXYZ => read_quat7(src, [0, 1, 2, 3]),
         TFT_LAYOUT_QVEC7_XYZW => read_quat7(src, [3, 0, 1, 2]),
         TFT_LAYOUT_MAT4_ROW => read_mat4(src, false),
         TFT_LAYOUT_MAT4_COL => read_mat4(src, true),
-        // Deliberately unreadable — see the doc comment.
         TFT_LAYOUT_AFFINE12_ROW_F32 => return None,
         _ => return None,
     })
 }
 
-/// `[w, x, y, z]` slot indices, so the two quaternion orders share one body and
-/// cannot drift apart.
+/// `[w, x, y, z]` slot indices, so both quaternion orders share one body.
 fn read_quat7(src: &[u8], wxyz: [usize; 4]) -> Result<Iso3, ReadError> {
     quat7(get_f64s::<7>(src), wxyz)
 }
 
-/// Validate and convert `[qw qx qy qz tx ty tz]` that is **already** seven
-/// `f64`s rather than caller bytes.
-///
-/// The bridge's samples arrive as an array in the ABI's own struct, not as an
-/// opaque buffer in a caller-chosen layout, so there is nothing to decode — but
-/// there is everything to check. Routing them through the same body as
-/// [`read`] is what makes "a NaN from `/tf` is refused exactly as a NaN from
-/// `tft_publisher_push` is" true by construction instead of by a second copy of
-/// the tolerances.
+/// Validate and convert seven `f64`s already in `[qw qx qy qz tx ty tz]`, with
+/// the same tolerances as [`read`] (the bridge's samples arrive this way).
 #[cfg(feature = "bridge")]
 pub(crate) fn from_wxyz_pose(v: [f64; 7]) -> Result<Iso3, ReadError> {
     quat7(v, [0, 1, 2, 3])
 }
 
-/// A one-line description of a rejected transform, for a diagnostic that is not
-/// a `tft_error`.
+/// A one-line description of a rejected transform.
 #[cfg(feature = "bridge")]
 pub(crate) fn read_error_text(e: ReadError) -> &'static str {
     match e {
@@ -399,8 +279,7 @@ fn read_mat4(src: &[u8], column_major: bool) -> Result<Iso3, ReadError> {
     if !m.iter().all(|x| x.is_finite()) {
         return Err(ReadError::NotFinite);
     }
-    // Index the source as `at(row, col)` whichever way it is stored, so the
-    // rest of this function is written once in row-major terms.
+    // `at(row, col)` undoes the storage order.
     let at = |r: usize, c: usize| {
         if column_major {
             m[c * 4 + r]
@@ -425,8 +304,7 @@ fn read_mat4(src: &[u8], column_major: bool) -> Result<Iso3, ReadError> {
     if (det - 1.0).abs() > DET_TOL {
         return Err(ReadError::NotARotationMatrix);
     }
-    // The translation is the last *column* in both storage orders — `at` has
-    // already undone the transposition, which is the whole trap §3.5 names.
+    // The translation is the last column in both storage orders.
     let t = tf_tree::Vec3::new(at(0, 3), at(1, 3), at(2, 3));
     Ok(Iso3::new(
         normalize_if_needed(tf_tree::quat_from_rot3(&r)),
@@ -434,13 +312,8 @@ fn read_mat4(src: &[u8], column_major: bool) -> Result<Iso3, ReadError> {
     ))
 }
 
-/// The first `N` `f64` of `src`, native-endian.
-///
-/// One bounds check for the whole read rather than `N` of them: the slice is
-/// narrowed once, and the per-element `try_into` then sees a fixed-size chunk
-/// the optimizer can prove is in range. A short `src` yields zeros, which cannot
-/// happen — every caller sizes the slice from `payload_bytes` first — and is
-/// still the safe answer if one ever forgets.
+/// The first `N` `f64` of `src`, native-endian. A short `src` yields zeros;
+/// every caller sizes it from `payload_bytes` first.
 #[inline]
 fn get_f64s<const N: usize>(src: &[u8]) -> [f64; N] {
     let mut out = [0.0f64; N];
@@ -459,9 +332,7 @@ mod tests {
     use super::*;
     use tf_tree::{Quat, Vec3};
 
-    /// A 90° rotation about +z with a distinctive translation. Chosen so every
-    /// matrix entry is exactly 0, ±1 — a hand-computable byte pattern with no
-    /// rounding, which is what §3.5 requires the assertion to be against.
+    /// A 90° rotation about +z; every matrix entry is exactly 0 or ±1.
     fn rz90() -> Iso3 {
         let h = core::f64::consts::FRAC_PI_4; // half of 90°
         Iso3::new(
@@ -482,8 +353,7 @@ mod tests {
         (a - b).abs() < 1e-15
     }
 
-    /// **`QVEC7_WXYZ` is `w` first.** The canonical order; everything else is
-    /// defined relative to it.
+    /// `QVEC7_WXYZ` is `w` first.
     #[test]
     fn qvec7_wxyz_is_w_first() {
         let t = rz90();
@@ -499,12 +369,7 @@ mod tests {
         assert!(close(read_f64(&d, 6), 3.0));
     }
 
-    /// **`QVEC7_XYZW` is `w` last** — the Eigen/Sophus storage order, and the
-    /// entire reason the variant exists.
-    ///
-    /// Mutant: make `QVEC7_XYZW` write the same order as `WXYZ` ⇒ fails. That
-    /// mutation is exactly the bug the variant exists to prevent, and it would
-    /// still produce a unit quaternion in the caller's `Eigen::Quaterniond`.
+    /// `QVEC7_XYZW` is `w` last.
     #[test]
     fn qvec7_xyzw_is_w_last_and_differs_from_wxyz() {
         let t = rz90();
@@ -516,16 +381,11 @@ mod tests {
         assert!(close(read_f64(&b, 1), 0.0));
         assert!(close(read_f64(&b, 2), c), "slot 2 must be qz");
         assert!(close(read_f64(&b, 3), c), "slot 3 must be qw");
-        // Translation is in the same place in both.
         assert_eq!(&a[32..], &b[32..]);
-        // Non-vacuity: the two layouts must actually differ.
         assert_ne!(&a[..32], &b[..32], "XYZW is not distinct from WXYZ");
     }
 
-    /// **Row-major puts the translation in the last column of each row.**
-    ///
-    /// Asserted against the hand-computed pattern for `Rz(90°)`:
-    /// `[0 −1 0 | 1; 1 0 0 | 2; 0 0 1 | 3; 0 0 0 1]`.
+    /// Row-major puts the translation in the last column: `Rz(90°)` against a hand-computed pattern.
     #[test]
     fn mat4_row_matches_a_hand_computed_pattern() {
         let mut d = [0u8; 128];
@@ -545,11 +405,7 @@ mod tests {
         }
     }
 
-    /// **Column-major is the transpose, and the translation moves to 12..14.**
-    ///
-    /// This is the trap: a caller that reads column-major bytes as row-major gets
-    /// `Rz(−90°)` — a perfectly valid rotation pointing the wrong way — and a
-    /// translation of `(0, 0, 0)` from what it thinks is the last column.
+    /// Column-major is the transpose, with the translation at 12..14.
     #[test]
     fn mat4_col_is_the_transpose_and_moves_the_translation() {
         let (mut r, mut c) = ([0u8; 128], [0u8; 128]);
@@ -568,7 +424,6 @@ mod tests {
                 read_f64(&c, i)
             );
         }
-        // And it is genuinely the transpose of the row-major form.
         for row in 0..4 {
             for col in 0..4 {
                 assert!(close(
@@ -612,22 +467,9 @@ mod tests {
         assert_eq!(payload_bytes(u32::MAX), None);
     }
 
-    /// **The twist layout is `QVEC7_WXYZ` plus `[ω, v]`, and nothing else.**
+    /// The twist layout is `QVEC7_WXYZ` (byte for byte) plus `[ω, v]`.
     ///
-    /// The first 56 bytes are asserted *byte-for-byte* against the layout it
-    /// extends rather than value-by-value: a consumer that already reads a
-    /// 56-byte row is meant to be able to read the first 56 bytes of a 104-byte
-    /// one with the same code, and that is a claim about bytes.
-    ///
-    /// The tail order is `[ω, v]` — the same six slots, in the same order, that
-    /// `TFT_TWIST_BYTES` documents for `tft_plan_at_with_derivatives`'s
-    /// `out_twist`. The fixture uses ω and v of comparable magnitude so that a
-    /// reader cannot rescue a transposed pair by noticing which numbers look
-    /// like radians.
-    ///
-    /// Mutant: write `v` before `ω` ⇒ the tail assertions fail and nothing else
-    /// does. Mutant B: write the pose half as `XYZW` ⇒ the memcmp against the
-    /// `QVEC7_WXYZ` buffer fails.
+    /// Mutant: `v` before `ω`, or the pose half as `XYZW` ⇒ fails.
     #[test]
     fn the_twist_layout_extends_qvec7_wxyz_and_appends_omega_then_v() {
         let t = rz90();
@@ -655,15 +497,7 @@ mod tests {
         }
     }
 
-    /// **A pose write stays inside its own payload.** `write` in a 56-byte
-    /// layout must move 56 bytes and not one more, whatever the buffer it was
-    /// handed is long enough to hold.
-    ///
-    /// Mutant: `put_qvec7_wxyz` writing an eighth `f64` ⇒ the tail assertion
-    /// fails. It is a narrow claim and it is the one this shape can make — the
-    /// separate claim, that `write` is never *reached* with a twist layout, is
-    /// `the_pose_writer_refuses_a_twist_layout` below, because a `debug_assert`
-    /// is not observable from a call that does not trip it.
+    /// A pose write stays inside its own payload.
     #[test]
     fn a_pose_write_stays_inside_its_own_payload() {
         const SENTINEL: u8 = 0xAA;
@@ -680,23 +514,8 @@ mod tests {
         );
     }
 
-    /// **`write` refuses a twist-carrying layout rather than half-filling it.**
-    ///
-    /// The `debug_assert` catches a caller that forgot which of the two
-    /// [`carries_twist`] selects — and *a `debug_assert` nothing trips is a
-    /// `debug_assert` nobody has checked exists*, which is why this calls the
-    /// wrong function on purpose rather than trusting the attribute.
-    ///
-    /// Without the guard this call would fall through `write`'s `_` arm and
-    /// return having written **nothing**, leaving 104 bytes of the caller's own
-    /// memory for a C consumer to read as a pose and a velocity.
-    ///
-    /// `cfg(debug_assertions)` because that is exactly when the assert exists;
-    /// in a release build the guard is compiled out by design and there is
-    /// nothing here to observe.
-    ///
-    /// Mutant, run: delete the `debug_assert!` from `write` ⇒ this fails with
-    /// "test did not panic as expected".
+    /// `write` refuses a twist-carrying layout (debug builds only, where the
+    /// `debug_assert` exists). Mutant: delete it ⇒ "did not panic as expected".
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "must go through `write_twist6`")]
@@ -705,8 +524,7 @@ mod tests {
         write(&rz90(), TFT_LAYOUT_QVEC7_WXYZ_TWIST6, &mut d);
     }
 
-    /// **Round-tripping through `QVEC7_WXYZ` must reproduce the arena's bits
-    /// exactly**, since that layout *is* the arena's representation.
+    /// Round-tripping through `QVEC7_WXYZ` reproduces the arena's bits exactly.
     #[test]
     fn qvec7_wxyz_round_trips_bit_for_bit() {
         let t = tf_tree::exp_se3([0.3, -0.7, 0.2, 1.1, -0.5, 3.7]);
@@ -717,29 +535,17 @@ mod tests {
         assert_eq!(read_f64(&d, 6).to_bits(), t.t.z.to_bits());
     }
 
-    /// **A general rotation, because `Rz(90°)` is degenerate for this purpose.**
+    /// A general rotation (all three components non-zero), because `Rz(90°)`
+    /// zeroes seven of `rot3`'s nine products. The oracle is three axis-angle
+    /// rotations composed as matrices.
     ///
-    /// Found by review: in `rot3`, `Rz(90°)` makes seven of the nine quaternion
-    /// products identically zero (`x = y = 0`, so `xx`, `yy`, `xy`, `xz`, `yz`,
-    /// `wx`, `wy` all vanish). The hand-computed byte-pattern tests above are
-    /// therefore checking two live terms out of nine — they pin the *layout*,
-    /// which is what §3.5 asks for, but they cannot catch a swapped or
-    /// sign-flipped product in `rot3` itself.
-    ///
-    /// This uses a rotation with all three components non-zero and checks the
-    /// matrix against an **independent** construction: three successive
-    /// axis-angle rotations composed as matrices, sharing no code with `rot3`.
-    ///
-    /// Mutant: swap `wx` and `wy` in `rot3`, or flip the sign of any
-    /// `2.0 * (.. - ..)` term ⇒ fails here while every test above still passes.
+    /// Mutant: swap `wx` and `wy` in `rot3` ⇒ fails.
     #[test]
     fn rot3_matches_an_independent_construction_for_a_general_rotation() {
         let w = Vec3::new(0.62, -0.51, 0.74);
         let t = Iso3::new(tf_tree::exp_so3(w), Vec3::new(1.0, 2.0, 3.0));
 
-        // The oracle: Rodrigues, straight from the axis-angle vector. Shares no
-        // code with `rot3`'s quaternion algebra, so a matched pair of errors
-        // cannot satisfy both.
+        // Oracle: Rodrigues, sharing no code with `rot3`.
         let th = (w.x * w.x + w.y * w.y + w.z * w.z).sqrt();
         let (a, b) = (th.sin() / th, (1.0 - th.cos()) / (th * th));
         let k = [[0.0, -w.z, w.y], [w.z, 0.0, -w.x], [-w.y, w.x, 0.0]];
@@ -756,8 +562,7 @@ mod tests {
             }
         }
 
-        // Non-vacuity: every product in `rot3` must be live, or this is no
-        // better than the `Rz(90°)` fixture it exists to complement.
+        // Non-vacuity: every product in `rot3` must be live.
         assert!(
             t.q.x.abs() > 0.15 && t.q.y.abs() > 0.15 && t.q.z.abs() > 0.15 && t.q.w.abs() > 0.15,
             "the fixture is not a general rotation: {:?}",
@@ -785,9 +590,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // The publish direction — `read`
-    // -----------------------------------------------------------------------
 
     fn iso_err(a: &Iso3, b: &Iso3) -> f64 {
         let mut dq = a.q * b.q.conjugate();
@@ -798,16 +601,9 @@ mod tests {
         (2.0 * nv.atan2(dq.w.abs())) + a.t.sub(b.t).norm()
     }
 
-    /// **Every readable layout round-trips through `write` then `read`.**
+    /// Every readable layout round-trips through `write` then `read`.
     ///
-    /// A general rotation, so all four Shepperd branches and all nine
-    /// quaternion products are live — the `Rz(90°)` fixture above would not
-    /// distinguish a transposed matrix read from a correct one.
-    ///
-    /// Mutant: drop the `column_major` transposition in `read_mat4` (index
-    /// `m[r * 4 + c]` unconditionally) ⇒ `MAT4_COL` round-trips to the inverse
-    /// rotation and this fails. That is exactly the §3.5 trap, in the direction
-    /// nothing else tests.
+    /// Mutant: drop the `column_major` transposition in `read_mat4` ⇒ fails.
     #[test]
     fn every_readable_layout_round_trips() {
         let t = Iso3::new(
@@ -834,12 +630,7 @@ mod tests {
         }
     }
 
-    /// **The two quaternion orders are not interchangeable on read either.**
-    ///
-    /// Reading `WXYZ` bytes as `XYZW` yields a *different unit quaternion* — no
-    /// norm check fires, nothing complains, and the robot points somewhere else.
-    /// This is the trap in the publish direction, and it is why the two orders
-    /// have to be distinguishable by test rather than by inspection.
+    /// Reading `WXYZ` bytes as `XYZW` yields a different unit quaternion.
     #[test]
     fn reading_wxyz_bytes_as_xyzw_is_a_different_rotation() {
         let t = Iso3::new(
@@ -849,7 +640,6 @@ mod tests {
         let mut buf = [0u8; 56];
         write(&t, TFT_LAYOUT_QVEC7_WXYZ, &mut buf);
         let wrong = read(TFT_LAYOUT_QVEC7_XYZW, &buf).unwrap().unwrap();
-        // Still a unit quaternion — that is the whole problem.
         assert!((wrong.q.norm() - 1.0).abs() < 1e-12);
         assert!(
             iso_err(&t, &wrong) > 0.1,
@@ -857,14 +647,7 @@ mod tests {
         );
     }
 
-    /// **A left-handed matrix is refused, not silently converted.**
-    ///
-    /// Negating one column gives `det R = −1`. Shepperd's method happily
-    /// produces a valid quaternion from it, which would be a rotation the
-    /// caller never asked for.
-    ///
-    /// Mutant: delete the determinant check ⇒ this returns `Ok` and the
-    /// reflection is published as a rotation.
+    /// A left-handed matrix is refused. Mutant: delete the determinant check ⇒ `Ok`.
     #[test]
     fn a_reflection_is_refused() {
         let t = Iso3::new(
@@ -873,7 +656,6 @@ mod tests {
         );
         let mut buf = [0u8; 128];
         write(&t, TFT_LAYOUT_MAT4_ROW, &mut buf);
-        // Negate the first column: rows 0, 1, 2 at element 0, 4, 8.
         for i in [0usize, 4, 8] {
             let v = -read_f64(&buf, i);
             buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_ne_bytes());
@@ -884,10 +666,7 @@ mod tests {
         );
     }
 
-    /// **A scaled matrix is refused by the same check.**
-    ///
-    /// `Eigen::Affine3d` where an `Isometry3d` was meant. `det = s³`, and
-    /// normalizing the quaternion would discard the scale without a word.
+    /// A scaled matrix is refused by the same check.
     #[test]
     fn a_scaled_matrix_is_refused() {
         let t = Iso3::new(
@@ -909,9 +688,7 @@ mod tests {
         );
     }
 
-    /// **Honest drift is accepted.** A matrix composed many times and never
-    /// re-orthonormalized must still publish, or the check is a nuisance rather
-    /// than a guard. `DET_TOL` is calibrated for exactly this.
+    /// Honest drift is accepted; `DET_TOL` is calibrated for it.
     #[test]
     fn accumulated_float_drift_is_still_accepted() {
         let step = tf_tree::exp_so3(Vec3::new(0.013, -0.021, 0.007));
@@ -928,26 +705,20 @@ mod tests {
         );
     }
 
-    /// **An all-zero buffer is refused rather than divided by.**
-    ///
-    /// This is what an uninitialized C struct looks like, and without the norm
-    /// check `normalize` divides by zero and publishes NaN into the arena.
+    /// An all-zero buffer is refused rather than divided by.
     #[test]
     fn an_uninitialized_quaternion_buffer_is_refused() {
         assert_eq!(
             read(TFT_LAYOUT_QVEC7_WXYZ, &[0u8; 56]).unwrap(),
             Err(ReadError::NotAUnitQuaternion)
         );
-        // ...and so is the all-zero matrix, by the determinant.
         assert_eq!(
             read(TFT_LAYOUT_MAT4_ROW, &[0u8; 128]).unwrap(),
             Err(ReadError::NotARotationMatrix)
         );
     }
 
-    /// **NaN never reaches the arena.** A single NaN in a pose poisons every
-    /// interpolation that ever brackets it, and there is no way to detect it
-    /// after the fact except by the results being wrong.
+    /// NaN never reaches the arena.
     #[test]
     fn non_finite_input_is_refused() {
         let mut buf = [0u8; 56];
@@ -966,28 +737,16 @@ mod tests {
         );
     }
 
-    /// **`AFFINE12_ROW_F32` is write-only, on purpose.**
-    ///
-    /// It is a GPU upload encoding; accepting a publication in `f32` would
-    /// halve the precision of everything downstream (`docs/PROJECT.md` §5,
-    /// "f64 only"). `None` here becomes `TFT_ERR_BAD_ENUM` at the boundary.
+    /// `AFFINE12_ROW_F32` is write-only.
     #[test]
     fn the_f32_layout_cannot_be_published_from() {
         assert!(read(TFT_LAYOUT_AFFINE12_ROW_F32, &[0u8; 48]).is_none());
         assert!(read(9999, &[0u8; 48]).is_none());
     }
 
-    /// **The twist layout cannot be published from either.**
+    /// The twist layout cannot be published.
     ///
-    /// A velocity is not a thing the arena stores: an edge holds poses and the
-    /// twist is derived from the segment between two of them. Accepting a
-    /// publication in this layout would mean silently discarding the six
-    /// elements the caller thought were the point of choosing it — which is
-    /// worse than refusing, because the call would report success.
-    ///
-    /// Mutant: give `read` a `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` arm that reads the
-    /// first seven and drops the rest ⇒ `tft_publisher_push` starts accepting
-    /// it and this fails.
+    /// Mutant: give `read` a `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` arm ⇒ fails.
     #[test]
     fn the_twist_layout_cannot_be_published_from() {
         assert!(read(TFT_LAYOUT_QVEC7_WXYZ_TWIST6, &[0u8; 104]).is_none());

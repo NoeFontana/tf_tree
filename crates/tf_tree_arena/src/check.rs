@@ -1,28 +1,15 @@
 //! Validating an arena header that came from somewhere else.
 //!
-//! Two backends map bytes this process did not write: [`crate::mapped`] takes
-//! them from a peer's `memfd`, and [`crate::frozen`] takes them from a file on
-//! disk. Both must decide whether the header in front of them describes an arena
-//! *this build* can read, and the answer has to be the same in both — a check
-//! that exists on one path and not the other is a hole with a filename on it.
-//!
-//! So the checks live here, once, and both backends call
-//! [`validate_arena_header`]. The alternative (each backend validating what its
-//! author remembered) is exactly how [`ShmError::HeaderInconsistent`] came to be
-//! missing the participant-table region for a release: `ArenaView::participants`
-//! builds a slice straight off `participant_table_off`, and nothing checked it.
-//!
-//! [`ShmError`] lives here rather than in [`crate::mapped`] for the same reason:
-//! it is the vocabulary of *validating foreign arena bytes*, which is now two
-//! backends' shared concern and not the `memfd` one's private business.
+//! [`crate::mapped`] (a peer's `memfd`) and [`crate::frozen`] (a file) both
+//! decide through [`validate_arena_header`], so the answer is the same on both
+//! paths. [`ShmError`] lives here as the vocabulary of validating foreign bytes.
 
 use crate::header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC};
 use crate::layout::{layout_hash, ArenaLayout};
 
 /// Everything that can go wrong obtaining or validating a shared segment.
 ///
-/// `Copy` and `String`-free, like every other error in this workspace
-/// (`docs/PROJECT.md` §5): an errno and what was being attempted.
+/// `Copy` and `String`-free (`docs/PROJECT.md` §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShmError {
     /// `memfd_create` failed.
@@ -35,17 +22,12 @@ pub enum ShmError {
     Seal(rustix::io::Errno),
     /// `F_GET_SEALS` failed, so the seals could not be verified.
     SealQuery(rustix::io::Errno),
-    /// The segment is missing `F_SEAL_SHRINK`/`F_SEAL_GROW`, so it could be
-    /// truncated under a reader and fault it with `SIGBUS`.
+    /// The segment is missing `F_SEAL_SHRINK`/`F_SEAL_GROW` (`SIGBUS` risk).
     Unsealed,
     /// `fstat` on the segment failed.
     Stat(rustix::io::Errno),
-    /// `getrandom` could not fill the arena's `instance_uuid`.
-    ///
-    /// Deliberately fatal rather than falling back to a counter or a timestamp:
-    /// a *guessable* instance id still compares equal to itself, so the
-    /// split-brain check it exists for would keep passing while no longer
-    /// meaning anything.
+    /// `getrandom` could not fill the arena's `instance_uuid`. Fatal rather than
+    /// falling back to a guessable id, which would defeat the split-brain check.
     Random(rustix::io::Errno),
     /// The fd's size disagrees with the header's `arena_size`.
     SizeMismatch {
@@ -76,55 +58,27 @@ pub enum ShmError {
     TooSmall,
     /// This process could not register in the arena's participant table.
     ///
-    /// **Despite the name, not evidence that the table is full.** `tf_tree`'s
-    /// attach raises it for any refusal to register, and the attach that
-    /// registers does so into the slot an owner's handshake granted, so the
-    /// cause it erases is usually that slot being taken or beyond the table.
-    /// This variant does not carry which. A table that really is full is
-    /// refused earlier, by the rendezvous, before the segment is attached.
+    /// **Not evidence that the table is full**: the attach raises it for any
+    /// refusal to register, usually the granted slot being taken or out of range.
+    /// A full table is refused earlier, by the rendezvous.
     ParticipantTableFull,
     /// [`crate::AttachMode::ReadWrite`] was asked for over a bare file
     /// descriptor, which takes no participant lock byte.
     ///
-    /// **The fd-passing attach is for readers**
-    /// (`docs/decisions/0028-the-slot-a-killed-participant-keeps.md`, open
-    /// question 1). A process that publishes joins through the rendezvous —
-    /// `tf_tree::Open` — which takes an OFD lock byte for its slot *before* the
-    /// arena record is written, and that byte is what decides whether the slot
-    /// may be reclaimed. A writer registered over a raw descriptor holds a live
-    /// record with a permanently free byte, which is indistinguishable, by the
-    /// byte alone, from a slot leaked by a killed process.
-    ///
-    /// Attach [`crate::AttachMode::ReadOnly`] over the descriptor, or build the
-    /// writer on `tf_tree::Open`.
+    /// The fd-passing attach is for readers (`docs/decisions/0028`, open
+    /// question 1); writers join through `tf_tree::Open`.
     ReadWriteNeedsRendezvous,
     /// The header's region offsets do not match the geometry its own capacities
-    /// imply, so the regions cannot be trusted to lie within the segment.
-    ///
-    /// Distinct from [`ShmError::LayoutMismatch`], which compares against a
-    /// *build* constant: this catches a header that is internally inconsistent,
-    /// whether from a peer bug, a scribbled byte, or a build that shares this
-    /// one's record sizes but not its capacities.
+    /// imply. Distinct from [`ShmError::LayoutMismatch`], which compares against
+    /// a *build* constant.
     HeaderInconsistent,
 }
 
-// **`Display` and `core::error::Error`** (`docs/decisions/0059`), for the same
-// reason `tf_tree_core`'s enums have them (`0040`): `MappedArena::attach` and
-// `tf_tree::Tree::attach_shared` return this type bare, so without the traits
-// nothing `?`-chains it into `Box<dyn Error>` or `anyhow::Error`.
-//
-// The rules the text follows are
-// `docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md`
-// decision 2 (a)-(g); an errno is `errno N` from `raw_os_error()`, never `Errno`'s
-// own rendering (locale/feature dependent).
-//
-// The match is exhaustive and there is no catch-all, so a variant added later
-// fails to compile here rather than rendering as something generic.
+// `Display` and `core::error::Error` follow `docs/decisions/0059` decision 2;
+// the match is exhaustive, so a new variant fails to compile here.
 
-/// **The text is a diagnostic and not a compatibility promise**
-/// (`docs/API.md` R5): it may change in any release, and the discriminant is
-/// what a caller matches on. [`core::error::Error::source`] returns `None`,
-/// and that is not promised either.
+/// **The text is a diagnostic, not a compatibility promise** (`docs/API.md`
+/// R5); callers match on the discriminant. `source` returns `None`.
 impl core::fmt::Display for ShmError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
@@ -203,22 +157,16 @@ impl core::fmt::Display for ShmError {
     }
 }
 
-/// Lets a `ShmError` leave a function through `?` into `Box<dyn Error>` or
-/// `anyhow::Error`.
-///
-/// [`source`](core::error::Error::source) is the default `None`: what a variant
-/// carries is written into its `Display`, and a chain-walker would otherwise
-/// print it twice. That choice is not a compatibility promise.
+/// Lets a `ShmError` leave a function through `?` into `Box<dyn Error>`.
+/// `source` is `None`: what a variant carries is already in its `Display`.
 impl core::error::Error for ShmError {}
 
 /// Decide whether `h` describes an arena of `size` bytes that this build can
 /// read, without touching anything outside the header.
 ///
-/// Called by every backend that maps foreign bytes, **after** the header is
-/// mapped and **before** any region offset in it is used to form a slice. The
-/// order of the checks is deliberate: identity (magic), then vocabulary
-/// (version), then geometry (hash), then self-consistency — each one narrowing
-/// what the next is allowed to assume.
+/// Call **after** the header is mapped and **before** any region offset is used
+/// to form a slice. Order: identity (magic), vocabulary (version), geometry
+/// (hash), then self-consistency.
 ///
 /// # Errors
 ///
@@ -235,8 +183,7 @@ pub(crate) fn validate_arena_header(h: &ArenaHeader, size: u64) -> Result<(), Sh
             expected: FORMAT_VERSION,
         });
     }
-    // The layout hash is what makes a mismatched build fail loudly instead of
-    // reading every region at the wrong offset.
+    // A mismatched build must fail loudly, not read regions at wrong offsets.
     if h.layout_hash != layout_hash() {
         return Err(ShmError::LayoutMismatch {
             found: h.layout_hash,
@@ -250,15 +197,8 @@ pub(crate) fn validate_arena_header(h: &ArenaHeader, size: u64) -> Result<(), Sh
         });
     }
 
-    // `layout_hash()` is a *build* constant — it pins the record sizes this
-    // binary was compiled against, not this segment's capacities. Two builds
-    // can agree on it and disagree about `max_frames`. Since `ArenaView` forms
-    // slices straight off these offsets, an inconsistent header would produce
-    // out-of-bounds reads rather than an error, so recompute the geometry the
-    // header's own counts imply and require it to match.
-    //
-    // `from_totals` is exact here: the region layout depends only on the *sum*
-    // of the per-edge capacities, which is `stamp_slots`.
+    // `layout_hash()` pins record sizes, not capacities, and `ArenaView` forms
+    // slices off these offsets: recompute the geometry the counts imply.
     let implied = ArenaLayout::from_totals(h.max_frames, h.max_edges, h.stamp_slots)
         .map_err(|_| ShmError::HeaderInconsistent)?;
     let matches = implied.total_size() as u64 == h.arena_size
@@ -267,21 +207,14 @@ pub(crate) fn validate_arena_header(h: &ArenaHeader, size: u64) -> Result<(), Sh
         && implied.topo_blocks().offset as u32 == h.topo_block_off
         && implied.topo_block_stride() as u32 == h.topo_block_stride
         && implied.claim_table().offset as u32 == h.claim_table_off
-        // A6's region. Omitting these was a real hole: `ArenaView::participants`
-        // builds a slice from `participant_table_off` and `max_participants`
-        // and its SAFETY comment cites *this* check as what bounds them, so a
-        // header carrying garbage there produced an out-of-bounds slice —
-        // exactly the failure this validation exists to prevent.
+        // `ArenaView::participants` builds a slice from these and its SAFETY
+        // comment cites this check.
         && implied.participant_table().offset as u32 == h.participant_table_off
         && implied.max_participants() == h.max_participants
         && implied.edge_table().offset as u32 == h.edge_table_off
         && implied.stamp_arena().offset as u32 == h.stamp_arena_off
         && implied.pose_arena().offset as u32 == h.pose_arena_off
-        // v3: the counter regions are part of the geometry a foreign header
-        // must agree about. Without these two, a header claiming a v3 layout
-        // hash could still point them anywhere, and §5.2's readers would build
-        // slices from the numbers — the same failure the participant-table
-        // check above exists to prevent.
+        // v3: the counter regions are part of the geometry.
         && implied.edge_counters().offset as u32 == h.edge_counters_off
         && implied.participant_counters().offset as u32 == h.participant_counters_off
         && h.stamp_slots == h.pose_slots;
@@ -291,16 +224,11 @@ pub(crate) fn validate_arena_header(h: &ArenaHeader, size: u64) -> Result<(), Sh
     Ok(())
 }
 
-/// One value of every `ShmError` variant, each carried integer at its type's
-/// maximum and each `Errno` at 4095 (the largest `from_raw_os_error` accepts),
-/// paired with those integers in `docs/decisions/0059` decision 2(a)'s
-/// spelling.
-///
-/// Shared with `frozen.rs`'s rendering test, which wraps every one of these in
-/// `FrozenError::Arena`. **The list is guarded**: `shm_error_index` is an
-/// exhaustive match, and `every_shm_error_variant_renders_by_0059s_rules`
-/// requires the list to hit every index it returns, so a variant added later
-/// does not compile until it has an index and does not pass until it is here.
+/// One value of every `ShmError` variant, integers at their maximum and each
+/// `Errno` at 4095, paired with the numbers `docs/decisions/0059` decision 2(a)
+/// requires in the text. Shared with `frozen.rs`'s rendering test. Guarded by
+/// the exhaustive `shm_error_index` and
+/// `every_shm_error_variant_renders_by_0059s_rules`.
 #[cfg(test)]
 pub(crate) fn every_shm_error(
 ) -> alloc::vec::Vec<(ShmError, alloc::vec::Vec<alloc::string::String>)> {
@@ -387,32 +315,14 @@ mod tests {
         HeapArena::new(&layout, 0, 0, [0; 16])
     }
 
-    /// Every field the geometry block compares, scrambled one at a time —
-    /// **including `arena_size`, which is the conjunct that ties the derived
-    /// geometry to the length of the memory actually mapped.**
+    /// Every field the geometry block compares, scrambled one at a time,
+    /// including `arena_size`, which ties the derived geometry to the mapped
+    /// length. `size` is read *after* the poke so `SizeMismatch` cannot
+    /// pre-empt the geometry block (it is covered by
+    /// `the_checks_run_in_the_documented_order`).
     ///
-    /// The block is the only thing bounding `participant_table_off` /
-    /// `max_participants` before `ArenaView::participants` builds a slice from
-    /// them, and this module's own header records that omitting it shipped an
-    /// out-of-bounds slice for a release. Poking each field individually is what
-    /// makes a *partial* deletion attributable: a single scrambled-header case
-    /// would pass as long as any one comparison survived.
-    ///
-    /// `size` is read *after* the poke, from the header itself, so `size` and
-    /// `h.arena_size` move together and the earlier `SizeMismatch` check cannot
-    /// pre-empt the geometry block. That is what makes the `arena_size` row
-    /// reachable at all: with `a.len()` as `size` the two can never disagree,
-    /// which is why `implied.total_size() as u64 == h.arena_size` was the one
-    /// conjunct in this function with no test anywhere in the workspace —
-    /// deleting it left the whole suite green while a header declaring a
-    /// 4096-byte arena kept a `pose_arena_off` of 11264. It costs one thing,
-    /// stated rather than hidden: `SizeMismatch` is structurally unreachable in
-    /// this driver, and is covered by `the_checks_run_in_the_documented_order`'s
-    /// `size - 64` case.
-    ///
-    /// Mutant: drop any one conjunct of the `let matches = …` chain — the
-    /// leading `implied.total_size() as u64 == h.arena_size` included — ⇒ the
-    /// case naming that field reports `Ok(())` and fails.
+    /// Mutant: drop any one conjunct of the `let matches = …` chain ⇒ the case
+    /// naming that field reports `Ok(())` and fails.
     #[test]
     fn a_header_that_disagrees_with_its_own_counts_is_refused() {
         let good = arena();
@@ -445,14 +355,9 @@ mod tests {
         for (field, poke) in pokes {
             let a = arena();
             // SAFETY: this test uniquely owns `a`, whose base is a live,
-            // 64-byte-aligned, initialized `ArenaHeader` written by
-            // `HeapArena::new`. No other reference to it is live across this
-            // call, so the `&mut` is unaliased for its whole (statement-long)
-            // lifetime.
+            // 64-byte-aligned, initialized `ArenaHeader`; the `&mut` is unaliased.
             unsafe { poke(&mut *a.base().cast::<ArenaHeader>()) };
-            // Read after the poke, so the `arena_size` row reaches the geometry
-            // block instead of stopping at `SizeMismatch`. Every other row
-            // leaves the field alone, so this is still `a.len()` for them.
+            // Read after the poke so the `arena_size` row reaches the geometry.
             let size = a.header().arena_size;
             assert_eq!(
                 validate_arena_header(a.header(), size),
@@ -462,14 +367,8 @@ mod tests {
         }
     }
 
-    /// Identity, then vocabulary, then geometry, then self-consistency.
-    ///
-    /// The order is documented on [`validate_arena_header`] as "each one
-    /// narrowing what the next is allowed to assume", and it is observable only
-    /// by breaking several fields at once and watching which error comes out
-    /// first. Each step below repairs exactly the field the previous step's
-    /// error named, so the sequence of errors *is* the order.
-    ///
+    /// Identity, then vocabulary, then geometry, then self-consistency: each step
+    /// repairs the field the previous error named, so the errors *are* the order.
     /// Mutant: hoist the version check above the magic check ⇒ the first
     /// assertion sees `VersionMismatch` and fails.
     #[test]
@@ -522,14 +421,11 @@ mod tests {
         );
     }
 
-    /// `docs/decisions/0059` step 1(b): every variant renders by decision 2's
-    /// rules, structurally and never as a pinned sentence (`docs/API.md` R5).
+    /// `docs/decisions/0059` step 1(b): every variant renders structurally, never
+    /// as a pinned sentence (`docs/API.md` R5).
     ///
-    /// **Mutant (M1):** `ShmError::SizeMismatch`'s arm → `write!(f, "{self:?}")`.
-    /// Applied: this test fails — `SizeMismatch { actual: 18446744073709551615,
-    /// expected: 18446744073709551615 } renders as its Debug` — and so does
-    /// `frozen.rs`'s, whose nested `Arena(SizeMismatch { .. })` `renders with a
-    /// brace, which is a struct dump`.
+    /// **Mutant (M1):** `SizeMismatch`'s arm → `write!(f, "{self:?}")` ⇒ this
+    /// and `frozen.rs`'s test fail.
     #[test]
     fn every_shm_error_variant_renders_by_0059s_rules() {
         use crate::render_test::{assert_structure, variant_name};
@@ -552,9 +448,8 @@ mod tests {
         }
     }
 
-    /// Decision 2(f): on `tf_tree`'s joiner path this variant is the erasure of
-    /// a taken or out-of-range slot, so its text may not say the table is full.
-    /// Its own name ends in `Full`, which is why the search key is cut off first.
+    /// Decision 2(f): on `tf_tree`'s joiner path this variant erases a taken or
+    /// out-of-range slot, so its text may not say the table is full.
     #[test]
     fn participant_table_full_does_not_claim_a_full_table() {
         use alloc::string::ToString;
@@ -569,13 +464,9 @@ mod tests {
         );
     }
 
-    /// The compile-time pin `0040` used: a `ShmError` leaves a function through
-    /// `?` into `Box<dyn core::error::Error>`.
-    ///
-    /// **Mutant (M4):** delete `impl core::error::Error for ShmError`. Applied:
-    /// the crate's tests do not compile — `error[E0277]: `?` couldn't convert
-    /// the error: `check::ShmError: core::error::Error` is not satisfied`, at
-    /// the `?` below.
+    /// A `ShmError` leaves a function through `?` into `Box<dyn Error>`.
+    /// **Mutant (M4):** delete `impl core::error::Error for ShmError` ⇒ the tests
+    /// do not compile.
     #[test]
     fn a_shm_error_can_leave_a_function_as_box_dyn_error() {
         use alloc::boxed::Box;

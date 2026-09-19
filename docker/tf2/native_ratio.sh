@@ -1,37 +1,19 @@
 #!/usr/bin/env bash
 # Build and run the fair depth-3 ratio: tf2 native C++, tf_tree through its C ABI.
 #
-# The Rust harness (`crates/tf_tree_bench/src/ratio.rs`) measures the same
-# quotient with tf2 behind `tf_tree_tf2_sys`, which charges tf2 the residual FFI
-# boundary and therefore flatters `tf_tree`. This one reverses it: tf2 pays
-# nothing and `tf_tree` pays its C ABI, so the result is a conservative lower
-# bound.
+# Unlike the Rust harness (`crates/tf_tree_bench/src/ratio.rs`), tf2 pays no FFI
+# boundary and `tf_tree` pays its C ABI, so the result is a conservative lower
+# bound; the costs are priced in `native_ratio.cpp`'s header.
 #
-# **Both of those costs are priced in `native_ratio.cpp`'s header — the file
-# this script builds and runs — and are deliberately not restated here.** This
-# header carried its own copy of each until 2026-09-05, and both copies were of
-# withdrawn figures: `~21 ns / 8%` for the FFI boundary, cited to the very
-# `docs/benchmarks/tf2.md` section that withdraws it, and "the C ABI's measured
-# 1.020x", which `docs/PHASE4.md` §0.0 and §7 gate 1 retract on
-# `docs/decisions/0023-the-gate-that-could-not-gate.md`. The
-# direction of the argument survived both — a larger charged boundary makes this
-# arm a stricter lower bound — and neither magnitude did. The fix is deletion
-# rather than a third spelling: `grep -rn '21 ns'` and `grep -rn '1\.020'` are
-# the instruments, because an enumeration of sites written here is a list that
-# goes stale silently.
-#
-# Three processes' worth of setup, for one reason: `tft_tree_open` **attaches**
-# and cannot create (D18, and not something to work around for a benchmark). So
-# a Rust owner serves the arena and dumps the identical `.tfstream`, and this
-# program attaches to the first and feeds tf2 the second.
+# `tft_tree_open` attaches and cannot create (D18), so a Rust owner serves the
+# arena and dumps the `.tfstream` that feeds tf2.
 set -euo pipefail
 
 ROS_PREFIX="/opt/ros/${ROS_DISTRO:?source a ROS 2 install first}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 OUT="$TARGET_DIR/native_ratio"
 STREAM="$TARGET_DIR/native/fixture.tfstream"
-# Short by necessity: the attach socket path must fit `sun_path`'s 108 bytes,
-# and a `target/` under a deep checkout does not.
+# Short: the socket path must fit `sun_path`'s 108 bytes.
 RT="${TF_TREE_RUNTIME_DIR:-/tmp/tft-native-ratio}"
 ARENA="${TF_TREE_NAME:-tf2_native}"
 
@@ -44,7 +26,7 @@ cargo build --release -p tf_tree_bench --features shm --bin native_arena
 INCLUDES=(-I"$ROS_PREFIX/include" -Icrates/tf_tree_c/include)
 for d in "$ROS_PREFIX"/include/*/; do INCLUDES+=(-I"$d"); done
 
-# 2. The C++ side, linked against the same `libtf_tree_c` the ABI check pins.
+# 2. The C++ side.
 g++ -std=c++20 -O2 -DNDEBUG -pthread \
     docker/tf2/native_ratio.cpp -o "$OUT" \
     "${INCLUDES[@]}" -DTFT_HAVE_SHM \
@@ -52,9 +34,8 @@ g++ -std=c++20 -O2 -DNDEBUG -pthread \
     -L"$TARGET_DIR/release" -ltf_tree_c -Wl,-rpath,"$TARGET_DIR/release" \
     -Wno-deprecated-declarations
 
-# 3. Serve the arena, run the harness against it, then stop serving. The owner
-#    holds the arena open until its stdin closes, so the consumer can never
-#    outlive the mapping it is reading.
+# 3. Serve the arena, run the harness, stop serving (the owner holds the arena
+#    until its stdin closes).
 export TF_TREE_RUNTIME_DIR="$RT" TF_TREE_NAME="$ARENA"
 coproc OWNER { "$TARGET_DIR/release/native_arena" --name "$ARENA" --stream "$STREAM"; }
 # shellcheck disable=SC2154
@@ -67,14 +48,8 @@ esac
 status=0
 "$OUT" "$STREAM" "$@" || status=$?
 
-# Closing the coproc's stdin is what tells the owner to release the arena.
-#
-# Guarded, and `|| true` on every step: bash unsets the fd array when a coproc
-# has already exited, so a bare `exec {OWNER[1]}>&-` fails with "ambiguous
-# redirect" and — under `set -e` — takes the script down *before* `exit
-# "$status"` runs. An owner that died mid-run would then be reported as a
-# generic 1 instead of the harness's real result, which is the one number this
-# script exists to return.
+# Closing stdin releases the arena. Guarded: bash unsets the fd array once the
+# coproc has exited, and `set -e` would then skip `exit "$status"`.
 if [ -n "${OWNER[1]:-}" ]; then
     exec {OWNER[1]}>&- || true
 fi

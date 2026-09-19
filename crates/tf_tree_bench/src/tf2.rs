@@ -1,25 +1,11 @@
-//! The `tf2::BufferCore` differential seam — the migration-credibility test.
+//! The `tf2::BufferCore` differential seam, behind `--features tf2` (needs ROS 2;
+//! `just tf2-differential` runs it in a container).
 //!
-//! Compile-gated behind `--features tf2`, which pulls in `tf_tree_tf2_sys` (the
-//! FFI bridge; see that crate for why the `unsafe` lives there and not here).
-//! Building this module needs a ROS 2 install; `just tf2-differential` runs it
-//! in a container so no host setup is required.
-//!
-//! # What this module owns
-//!
-//! Turning the shared [`crate::fixture`] into a stream tf2 can consume, and
-//! nothing else. The comparison logic lives in [`crate::differential`], so the
-//! tf2 and naive-Rust references go through the identical query loop and any
-//! disagreement is attributable to the engine, not the harness.
-//!
-//! # Two conventions this has to reconcile
-//!
-//! * **Time.** tf_tree stamps are `i64` nanoseconds and may be negative; ROS
-//!   time is unsigned. The fixture starts at 0, so no rebasing is needed, but
-//!   [`tf_tree_tf2_sys::Tf2Error::NegativeStamp`] catches it if that ever changes.
-//! * **Cache horizon.** tf2 drops transforms older than its cache and then
-//!   reports extrapolation. The buffer is sized to the fixture's full history
-//!   plus slack so the horizon never silently truncates the comparison.
+//! Only turns the shared [`crate::fixture`] into a stream tf2 can consume; the
+//! comparison lives in [`crate::differential`]. Stamps start at 0, so ROS's
+//! unsigned time needs no rebasing ([`tf_tree_tf2_sys::Tf2Error::NegativeStamp`]
+//! catches a change), and the buffer is sized past the fixture history so tf2's
+//! cache horizon never truncates the comparison.
 
 use anyhow::{anyhow, Result};
 
@@ -28,8 +14,7 @@ use tf_tree_tf2_sys::Tf2Buffer;
 
 use crate::fixture::{self, EdgeDefKind, EDGES};
 
-/// Cache span for the comparison buffer: the fixture's history plus generous
-/// slack, so tf2's horizon never truncates a query the engine can answer.
+/// Cache span: the fixture's history plus slack.
 const CACHE_SECS: f64 = fixture::HISTORY_SECS * 3.0;
 
 /// A `tf2::BufferCore` loaded with the fixture's topology and history.
@@ -38,14 +23,9 @@ pub struct Tf2Fixture {
 }
 
 impl Tf2Fixture {
-    /// Build a `BufferCore` and replay the *identical* declarations and sample
-    /// stream the engine tree receives.
-    ///
-    /// Static edges are inserted once with tf2's static flag (`/tf_static`
-    /// semantics). Dynamic edges are replayed sample by sample, reproducing the
-    /// same `dynamic_pose(seed, stamp)` values `fixture::spin_up` publishes — so
-    /// the two engines hold bit-identical inputs and every observed difference is
-    /// a difference in lookup, not in data.
+    /// Replay the identical declarations and samples `fixture::spin_up`
+    /// publishes: static edges once with tf2's static flag, dynamic edges per
+    /// sample.
     ///
     /// # Errors
     ///
@@ -85,9 +65,7 @@ impl Tf2Fixture {
     /// `T_target_source` at `stamp_ns` per tf2, or `None` if tf2 cannot answer
     /// (extrapolation past its horizon, or an unknown pair).
     ///
-    /// Returning `None` rather than an error is deliberate: the differential
-    /// scores only the queries *both* engines can resolve, so a tf2-side horizon
-    /// miss is skipped rather than counted as a disagreement.
+    /// `None`, not an error: the differential scores only queries both engines resolve.
     #[must_use]
     pub fn lookup(&self, target: &str, source: &str, stamp_ns: i64) -> Option<Iso3> {
         self.buffer.lookup(target, source, stamp_ns).ok()
@@ -100,9 +78,6 @@ impl Tf2Fixture {
     }
 
     /// Consume the fixture, yielding just the loaded buffer.
-    ///
-    /// Lets a benchmark hold a plain [`Tf2Buffer`] for every workload, so the
-    /// timed body is identical regardless of where the data came from.
     #[must_use]
     pub fn into_buffer(self) -> Tf2Buffer {
         self.buffer

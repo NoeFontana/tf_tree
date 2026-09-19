@@ -1,11 +1,8 @@
 //! The lock file — `docs/PHASE2.md` §3.3.
 //!
-//! A small regular file that holds no state, only locks. **The design principle
-//! is to not implement leader election but to borrow the kernel's.** A
-//! rendezvous needs exactly three properties: mutual exclusion, automatic
-//! release when the holder dies, and a way to ask whether anyone holds it. Linux
-//! byte-range OFD locks provide all three, maintained by the kernel, with no
-//! timeouts, no heartbeats, and no state that can survive a `SIGKILL`.
+//! A regular file that holds no state, only kernel-maintained OFD byte-range
+//! locks: mutual exclusion, release on holder death, and a way to ask whether
+//! anyone holds it.
 //!
 //! | Offset | Meaning |
 //! |---|---|
@@ -15,20 +12,10 @@
 //! | bytes 16 + *i* | **Participant liveness** for slot *i*, held for the lifetime of the attachment. |
 //! | 4096 + 64·*i* | **Identity record** for slot *i*, written with `pwrite`. Advisory. |
 //!
-//! Two properties of this arrangement are easy to get wrong and are asserted by
-//! tests rather than assumed:
-//!
-//! * **`F_OFD_GETLK` cannot name a holder.** An OFD lock belongs to an open file
-//!   description, not a process, so the kernel reports `l_pid = -1`. The lock
-//!   file answers *"is anyone alive?"* — all the rendezvous needs — and *"who?"*
-//!   comes from the identity records. That is exactly why those records exist as
-//!   plain `pwrite` data instead of living only in the arena: a process that
-//!   cannot reach the arena can still run `doctor` and get names and pids.
-//! * **A description's own locks are invisible to its own `GETLK`.** The kernel
-//!   reports *conflicts*, and nothing conflicts with itself. Every query here is
-//!   therefore "does anyone **else** hold this", which is what the §3.4
-//!   split-brain check wants, and a trap for any future code that tries to read
-//!   back its own state.
+//! * **`F_OFD_GETLK` cannot name a holder** (`l_pid = -1`): the lock answers
+//!   "is anyone alive?", the identity records answer "who?".
+//! * **A description's own locks are invisible to its own `GETLK`.** Every query
+//!   is "does anyone **else** hold this".
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsFd;
@@ -43,9 +30,8 @@ pub use crate::ofd::LockProbe;
 
 /// Participant slots, and therefore participant lock bytes.
 ///
-/// Matches `tf_tree_arena::DEFAULT_MAX_PARTICIPANTS`, which is the arena-side
-/// table this indexes. The two must agree; they are separate constants only
-/// because `docs/PHASE2.md` §2 forbids this crate from depending on the arena.
+/// Must equal `tf_tree_arena::DEFAULT_MAX_PARTICIPANTS`; separate only because
+/// this crate may not depend on the arena (`docs/PHASE2.md` §2).
 pub const MAX_PARTICIPANTS: u32 = 64;
 
 /// Byte 0: ownership.
@@ -53,55 +39,35 @@ const OWNERSHIP_OFFSET: u64 = 0;
 /// Byte 1: A2's topology mutation lock
 /// ([`docs/decisions/0029`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0029-the-topology-lock-is-a-kernel-lock.md)).
 ///
-/// **One byte, not one per participant.** It is not asked *whether a participant
-/// is alive* — the question a per-slot byte would answer — but *whether anyone
-/// is inside the critical section*, which is the only question a mutator has to
-/// settle before it may steal the arena's topology word. A per-slot byte would
-/// re-create the slot indirection that put `/proc` on this path in the first
-/// place, and buy nothing: `F_OFD_GETLK` cannot name a holder anyway (see the
-/// module documentation), so the identity records are still what names one.
+/// One byte, not one per participant: it answers "is anyone inside the critical
+/// section", not "is a participant alive".
 const TOPOLOGY_OFFSET: u64 = 1;
 /// Participant liveness starts at byte 16, leaving 2–15 reserved.
 const PARTICIPANT_BASE: u64 = 16;
 /// Identity records start on the second page.
 const IDENTITY_BASE: u64 = 4096;
 
-/// Base offset reserved for §6.1 claim locks (`CLAIM_BASE + edge_id`).
-///
-/// Nothing takes these yet — claims land with the arena in a later pass — but
-/// the region is reserved here so the offset arithmetic lives in one file. It
-/// starts at 1 MiB, far past the identity records, because a collision between
-/// a claim byte and a participant byte would hand one edge to two writers and
-/// present as impossible numerical results rather than as an error.
+/// Base offset reserved for §6.1 claim locks (`CLAIM_BASE + edge_id`), 1 MiB
+/// past the identity records so a claim byte cannot collide with a participant
+/// byte.
 pub const CLAIM_BASE: u64 = 1 << 20;
 
-/// How many claim bytes the reserved region can address.
-///
-/// A whole mebibyte of byte-range locks, which is far more edges than
-/// `ArenaLayout` will accept — the bound exists so a corrupt `max_edges` cannot
-/// walk a lock request out of the region rather than because the space is
-/// tight.
+/// How many claim bytes the reserved region can address; bounds a corrupt
+/// `max_edges`.
 pub const MAX_CLAIM_BYTES: u64 = 1 << 20;
 
 /// Handle on the lock file for one open file description.
 ///
-/// **Ownership of the `File` is the lock's lifetime.** OFD locks are released
-/// when the last descriptor referring to this description closes, which happens
-/// on `Drop` and, identically, on process death by any means including
-/// `SIGKILL`. There is no unlock path that can be missed, which is the entire
-/// reason this is not a heartbeat protocol.
+/// **Ownership of the `File` is the lock's lifetime.** OFD locks release when the
+/// last descriptor closes, on `Drop` or process death including `SIGKILL`.
 #[derive(Debug)]
 pub struct LockFile {
     file: File,
 }
 
 impl LockFile {
-    /// Open (creating if absent) the lock file at `path`.
-    ///
-    /// Mode `0600`: the rendezvous is same-user by construction (§3.10) and the
-    /// containing directory is `0700`, so a wider mode would only be misleading.
-    /// Opened read-write because `F_WRLCK` requires a descriptor open for
-    /// writing.
+    /// Open (creating if absent) the lock file at `path`, mode `0600` (§3.10),
+    /// read-write because `F_WRLCK` needs a writable descriptor.
     ///
     /// # Errors
     ///
@@ -122,12 +88,10 @@ impl LockFile {
 
     /// Try to take byte 0 — become the owner.
     ///
-    /// Returns [`LockAttempt::Contended`] when someone else holds it. That is
-    /// not an error: in the §3.4 loop it means another process holds byte 0 —
-    /// an owner mid-bind, which will be serving shortly, or another `open()`
-    /// passing through steps 2–4, which will hand it back
-    /// ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
-    /// Either way the loop backs off and asks again.
+    /// [`LockAttempt::Contended`] is not an error: another process holds byte 0
+    /// (an owner mid-bind, or another `open()` in steps 2–4,
+    /// [`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md))
+    /// and the §3.4 loop backs off.
     ///
     /// # Errors
     ///
@@ -158,22 +122,10 @@ impl LockFile {
     /// Try to take byte 1 — the right to mutate topology (`docs/PHASE2.md` §1,
     /// A2).
     ///
-    /// **This is an acquire, not a probe.** [`Self::probe_participant`] answers
-    /// a question about somebody else's byte and races every subsequent take,
-    /// which is why §5.1 constrains the order in which a probe may be composed
-    /// with an arena word. Holding this byte *excludes* every subsequent take
-    /// for as long as it is held, so what the holder reads afterwards cannot be
-    /// invalidated by a taker: there cannot be one.
-    ///
-    /// What that buys the caller is stated as an invariant in `0029`: if a
-    /// process holds this byte and then observes a non-zero topology word, the
-    /// word's holder is either **dead** or **a writer with no lock file**. A
-    /// live holder that `/proc` misreports — another PID namespace, a
-    /// non-dumpable process under `hidepid` — is excluded by the kernel before
-    /// any inference runs.
-    ///
-    /// Returns [`LockAttempt::Contended`] when another open file description
-    /// holds it, which means a live peer is mid-mutation. Retry.
+    /// **An acquire, not a probe**: while held it excludes every other taker, so
+    /// a non-zero topology word observed afterwards names a holder that is dead
+    /// or has no lock file (`0029`). [`LockAttempt::Contended`] means a live peer
+    /// is mid-mutation; retry.
     ///
     /// # Errors
     ///
@@ -188,12 +140,8 @@ impl LockFile {
 
     /// Release byte 1.
     ///
-    /// **Order matters, and it is the mirror of the acquire**: release the arena
-    /// topology word *first*, then this byte. The reverse leaves a window in
-    /// which the byte is free and the word still names this process, which is
-    /// the exact signature `0029`'s T2 reads as "the holder is dead or has no
-    /// lock file" — so a peer would spin out its budget and then consult
-    /// `/proc` about a process that is merely finishing.
+    /// Release the arena topology word *first*, then this byte; the reverse
+    /// reads as "holder dead" to `0029`'s T2.
     ///
     /// # Errors
     ///
@@ -237,18 +185,9 @@ impl LockFile {
 
     /// Take the lowest free participant slot.
     ///
-    /// **No production caller since issue #201, and that is a property of the
-    /// question rather than of this function.** Its one caller was
-    /// `Open::register_any`, now deleted: taking *any* free byte is the wrong
-    /// way to assign a **participant** slot, because a participant's byte and
-    /// its arena record are indexed by one integer (`docs/PHASE2.md` §5.1), so
-    /// the byte is never free to choose. A creator's is `0`, a joiner's is the
-    /// one the owner named in its `HelloResponse` (§3.7, and `Open::register_at`
-    /// takes exactly that byte), and a taker-over already has one.
-    ///
-    /// Kept because the primitive is correct and tested, and a lock-file byte is
-    /// not always a participant record. **Do not reach for it to assign a
-    /// participant slot** — that is the shape #201 was filed about.
+    /// No production caller since #201: a participant's byte and arena record
+    /// share one index (`docs/PHASE2.md` §5.1), so it is never free to choose.
+    /// **Do not use it to assign a participant slot.**
     ///
     /// # Errors
     ///
@@ -285,18 +224,8 @@ impl LockFile {
 
     /// Take the lease on `edge`'s claim byte (`docs/PHASE2.md` §6.1).
     ///
-    /// **The lease is not the claim.** `docs/decisions/0005` §5 makes the
-    /// arena's `ClaimRecord` CAS the decision and this the thing that makes
-    /// death *observable*: a process that dies for any reason has its byte
-    /// released by the kernel, with no cooperation and no timeout, which is
-    /// the predicate §6.3's reaper needs.
-    ///
-    /// §6.1's literal wording — "the lock file is authoritative … any code
-    /// that makes a decision from `ClaimRecord` alone is a bug" — is not
-    /// implementable: the lock file and the arena are two files with no atomic
-    /// cross-update, so exactly one has to be the linearization point, and the
-    /// record also has to keep working for a `HeapArena` that has no lock file
-    /// at all.
+    /// The lease is not the claim: the arena's `ClaimRecord` CAS decides
+    /// (`docs/decisions/0005` §5); this makes death observable to §6.3's reaper.
     ///
     /// # Errors
     ///
@@ -312,10 +241,8 @@ impl LockFile {
 
     /// Drop the lease on `edge`'s claim byte.
     ///
-    /// **Order matters**: clear the arena record *first*, then unlock. The
-    /// reverse leaves a window in which the record says held and the byte says
-    /// free — which is exactly the signature a reaper treats as "the holder is
-    /// dead" (`0005` §5).
+    /// Clear the arena record *first*, then unlock; the reverse reads as "holder
+    /// dead" to a reaper (`0005` §5).
     ///
     /// # Errors
     ///
@@ -325,11 +252,8 @@ impl LockFile {
             .map(|_| ())
     }
 
-    /// Whether `edge`'s claim byte is held, and by whom.
-    ///
-    /// Subject to the module doc's self-blindness: a process asking about an
-    /// edge *it* holds is told the byte is free, so callers must skip their own
-    /// edges — see `a_holder_does_not_see_its_own_lock`.
+    /// Whether `edge`'s claim byte is held by someone else. A holder does not see
+    /// its own lock (`a_holder_does_not_see_its_own_lock`).
     ///
     /// # Errors
     ///
@@ -338,12 +262,8 @@ impl LockFile {
         self.probe(claim_range(edge)?, LockRole::Claim(edge))
     }
 
-    /// Bitmask of participant slots held by *other* open file descriptions.
-    ///
-    /// This is the §3.4 step 4 question. It is deliberately a full scan rather
-    /// than an early exit: the caller that fails the check needs the whole set
-    /// to name the stuck slots in [`IpcError::ArenaHeldButUnreachable`], and 64
-    /// `fcntl` calls on a cold path are free.
+    /// Bitmask of participant slots held by *other* open file descriptions
+    /// (§3.4 step 4); a full scan so callers can name every stuck slot.
     ///
     /// # Errors
     ///
@@ -358,10 +278,8 @@ impl LockFile {
         Ok(mask)
     }
 
-    /// Whether any participant byte is held — the split-brain predicate.
-    ///
-    /// Early-exits, because the §3.4 loop asks this on every iteration and only
-    /// needs a yes/no.
+    /// Whether any participant byte is held — the split-brain predicate;
+    /// early-exits.
     ///
     /// # Errors
     ///
@@ -375,12 +293,8 @@ impl LockFile {
         Ok(false)
     }
 
-    /// Write the identity record for `slot`.
-    ///
-    /// Written *before* the slot's lock is taken (§3.3), so that any process
-    /// which observes the lock can also read a fully-formed record for it. The
-    /// record is advisory (§5.1) — the lock is the liveness — but "advisory"
-    /// must not mean "sometimes absent when a lock is held".
+    /// Write the identity record for `slot`, before the slot's lock is taken
+    /// (§3.3), so an observer of the lock can read a formed record.
     ///
     /// # Errors
     ///
@@ -421,20 +335,11 @@ impl LockFile {
                 raw_os_error: IpcError::os(&e),
             })?;
         if n != buf.len() {
-            // Short read means the file has never been grown to this record, so
-            // nobody has ever taken the slot.
+            // Short read: the slot was never taken.
             return Ok(None);
         }
         Ok(Identity::from_bytes(&buf))
     }
-
-    // `as_file` removed: it had no caller anywhere in the workspace, and the
-    // consumer its doc named — "code that needs to prove two `LockFile`s are
-    // distinct open file descriptions" — does not exist; the test for that
-    // property opens two `LockFile`s and contends the lock bytes instead.
-    // Handing out `&File` also widened this type's contract, because it let a
-    // caller `set_len` or `try_clone` the rendezvous file from outside the
-    // module that owns the lock lifetime.
 
     fn set(&self, range: Range, kind: LockKind, role: LockRole) -> Result<LockAttempt, IpcError> {
         ofd::try_lock(self.file.as_fd(), range, kind)
@@ -456,12 +361,8 @@ fn participant_range(slot: u32) -> Result<Range, IpcError> {
     Ok(Range::byte(PARTICIPANT_BASE + u64::from(slot)))
 }
 
-/// The claim-lease byte for `edge`.
-///
-/// Bounded so an edge id from a corrupt header cannot address a byte outside
-/// the reserved region and collide with an identity record — which would hand
-/// one edge to two writers and present as impossible numbers rather than as an
-/// error.
+/// The claim-lease byte for `edge`, bounded so a corrupt id cannot address a
+/// byte outside the reserved region.
 fn claim_range(edge: u32) -> Result<Range, IpcError> {
     if u64::from(edge) >= MAX_CLAIM_BYTES {
         return Err(IpcError::ClaimOutOfRange {
@@ -506,18 +407,12 @@ mod tests {
         assert_eq!(identity_offset(0).unwrap(), 4096);
         assert_eq!(identity_offset(1).unwrap(), 4096 + 64);
         assert_eq!(identity_offset(63).unwrap(), 4096 + 64 * 63);
-        // Participant bytes must not reach into the identity page, and claims
-        // must start past every identity record.
+        // Participant bytes stay out of the identity page; claims start past it.
         assert!(PARTICIPANT_BASE + u64::from(MAX_PARTICIPANTS) <= IDENTITY_BASE);
         assert!(CLAIM_BASE > identity_offset(MAX_PARTICIPANTS - 1).unwrap());
         assert!(participant_range(MAX_PARTICIPANTS).is_err());
         assert!(identity_offset(MAX_PARTICIPANTS).is_err());
-        // **The topology byte is disjoint from every other role.** It is one
-        // byte in a region the spec calls reserved, so the only thing standing
-        // between it and a participant byte is arithmetic — and a collision here
-        // would let one process hold the topology lock and another believe it
-        // holds a participant slot, which is the "same integer, two meanings"
-        // failure `0035` is about, one region over.
+        // The topology byte is disjoint from every other role.
         assert_ne!(TOPOLOGY_OFFSET, OWNERSHIP_OFFSET);
         const { assert!(TOPOLOGY_OFFSET < PARTICIPANT_BASE) };
         for slot in [0, 1, MAX_PARTICIPANTS - 1] {
@@ -531,10 +426,7 @@ mod tests {
 
     #[test]
     fn two_descriptions_contend_for_the_topology_byte_and_a_release_hands_it_over() {
-        // A2's exclusion, as a kernel fact rather than an inference
-        // (`docs/decisions/0029`). Two descriptions stand in for two mutators;
-        // `two_descriptions_in_one_process_still_conflict` is why that is a
-        // faithful stand-in rather than a convenience.
+        // A2's exclusion (`0029`); see `two_descriptions_in_one_process_still_conflict`.
         let path = scratch("topo-byte");
         let a = LockFile::open(&path).unwrap();
         let b = LockFile::open(&path).unwrap();
@@ -542,10 +434,7 @@ mod tests {
         assert_eq!(a.try_take_topology().unwrap(), LockAttempt::Acquired);
         assert_eq!(b.try_take_topology().unwrap(), LockAttempt::Contended);
 
-        // Holding topology must not imply holding anything else. If the offsets
-        // ever collided this is the assertion that catches it, because the
-        // *symptom* would be a peer refused a slot it is entitled to rather than
-        // anything that looks like a lock bug.
+        // Holding topology implies holding nothing else.
         assert_eq!(b.try_take_ownership().unwrap(), LockAttempt::Acquired);
         assert_eq!(b.try_take_participant(0).unwrap(), LockAttempt::Acquired);
         assert_eq!(b.try_take_claim(0).unwrap(), LockAttempt::Acquired);
@@ -557,11 +446,7 @@ mod tests {
 
     #[test]
     fn closing_a_description_releases_the_topology_byte() {
-        // The property the whole design rests on, asserted for this byte
-        // specifically rather than inherited from
-        // `dropping_the_file_releases_every_lock`: a mutator killed inside A2's
-        // critical section must not wedge the tree, and nothing in `tf_tree`
-        // runs on its behalf to unlock.
+        // A mutator killed inside A2's critical section must not wedge the tree.
         let path = scratch("topo-death");
         let survivor = LockFile::open(&path).unwrap();
         {
@@ -578,9 +463,7 @@ mod tests {
 
     #[test]
     fn two_descriptions_in_one_process_still_conflict() {
-        // The property that makes OFD locks usable in a library: unlike classic
-        // POSIX locks, which are per-process and would let this succeed twice,
-        // two separate `open`s conflict even inside one process.
+        // Unlike POSIX locks, two `open`s conflict even inside one process.
         let path = scratch("two-fds");
         let a = LockFile::open(&path).unwrap();
         let b = LockFile::open(&path).unwrap();
@@ -593,7 +476,7 @@ mod tests {
 
     #[test]
     fn a_holder_does_not_see_its_own_lock() {
-        // The module doc's self-blindness trap, asserted rather than assumed.
+        // The module doc's self-blindness.
         let path = scratch("self-blind");
         let a = LockFile::open(&path).unwrap();
         assert_eq!(a.try_take_participant(3).unwrap(), LockAttempt::Acquired);
@@ -629,19 +512,12 @@ mod tests {
         assert_eq!(a.take_any_participant().unwrap(), 0);
         assert_eq!(b.take_any_participant().unwrap(), 1);
         drop(a);
-        // Slot 0 is free again the instant its description closed.
         assert_eq!(c.take_any_participant().unwrap(), 0);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// **`docs/PHASE2.md` §11.2 scenario 6**: the 65th participant is refused,
-    /// and the message says how to raise the limit.
-    ///
-    /// The exhaustion arm of [`LockFile::take_any_participant`] is otherwise
-    /// unreachable from any test in the workspace — every other one takes at
-    /// most three slots — so `Err(NoParticipantSlots)` could be replaced by
-    /// `Ok(0)` and every suite would stay green while two participants shared
-    /// slot 0, one arena record and one lock byte, with nothing reporting it.
+    /// `docs/PHASE2.md` §11.2 scenario 6: the 65th participant is refused, with a
+    /// message saying how to raise the limit.
     #[test]
     fn the_sixty_fifth_participant_is_refused_and_told_why() {
         let path = scratch("full");
@@ -660,14 +536,12 @@ mod tests {
                 limit: MAX_PARTICIPANTS
             }
         );
-        // §11.2 asks for the *message* too: "all slots are live" on its own
-        // sends an operator hunting a leak that does not exist.
+        // §11.2 asks for the message too.
         let msg = err.to_string();
         assert!(msg.contains("64"), "{msg}");
         assert!(msg.contains("MAX_PARTICIPANTS"), "{msg}");
 
-        // The limit is a concurrency bound, not a one-way quota: one departure
-        // frees exactly one slot, and it is the slot that departed.
+        // One departure frees exactly the slot that departed.
         holders.pop();
         assert_eq!(
             extra.take_any_participant().unwrap(),
@@ -696,8 +570,7 @@ mod tests {
         };
         lf.write_identity(5, &id).unwrap();
         assert_eq!(lf.read_identity(5).unwrap(), Some(id));
-        // Neighbouring records are untouched: the stride is 64, not "whatever
-        // the struct happens to be".
+        // Neighbouring records are untouched: the stride is 64.
         assert_eq!(lf.read_identity(4).unwrap(), None);
         assert_eq!(lf.read_identity(6).unwrap(), None);
         let len = std::fs::metadata(&path).unwrap().len();

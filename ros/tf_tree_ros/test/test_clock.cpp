@@ -1,30 +1,15 @@
-// `docs/PHASE4.md` §5.5 and `docs/decisions/0012` — the clock, from the ROS
-// side of the seam.
+// `docs/PHASE4.md` §5.5 and `docs/decisions/0012` — the clock, from the ROS side
+// of the seam. Two properties need a real `rclcpp::TimeSource` and `/clock`:
 //
-// Two properties live here and nowhere else, because both of them need a real
-// `rclcpp::TimeSource` and a real `/clock`:
+//   1. The authoritative path: rcl reports clock jumps (a looping bag, a sim
+//      reset) to jump callbacks, so the bridge asks rather than infers
+//      (`docs/decisions/0012`; inference survives only as L2 common-mode).
+//   2. Which clock throttled diagnostics use: `node_->get_clock()` reads zero
+//      until the first `/clock` and rewinds with a bag, silencing every
+//      `RCLCPP_*_THROTTLE` in `bridge_handle.cpp` when they are needed.
 //
-//   1. **The authoritative path.** ROS 2 *publishes* clock jumps. A bag that
-//      loops and a simulator that resets both call `rcl_set_ros_time_override`
-//      with a time behind the one before it, and rcl reports that to every
-//      registered jump callback. Why the bridge asks rather than infers:
-//      `docs/decisions/0012-the-authoritative-clock-jump-signal-and-the-degradation-ladder.md`
-//      §Context *The three rules, and what killed each*; inference survives only
-//      as L2 common-mode rejection.
-//
-//   2. **Which clock the diagnostics are rate-limited on.** Every
-//      `RCLCPP_*_THROTTLE` in `bridge_handle.cpp` compares `clock.now()` against
-//      a remembered timestamp. Given `node_->get_clock()` under `use_sim_time`
-//      that clock reads **zero** until the first `/clock` message and *rewinds*
-//      when a bag loops — so the throttle is silent over exactly the boot window
-//      a misconfigured bridge is diagnosed in, and silent again for the duration
-//      of a rewind about which it is the only thing that would speak. Nothing in
-//      the Rust half can see this: it is a property of a C++ macro and a ROS
-//      parameter.
-//
-// The engine's own rules — when a jump halts, what evidence promotes a step,
-// how a per-edge guard drops — are unit-tested in `crates/tf_tree_bridge` and
-// `crates/tf_tree_c/tests/bridge.rs` and are not retested here.
+// The engine's own rules are unit-tested in `crates/tf_tree_bridge` and
+// `crates/tf_tree_c/tests/bridge.rs`.
 
 #include <atomic>
 #include <chrono>
@@ -56,8 +41,7 @@ kind = "dynamic"
 capacity = 256
 )";
 
-/// Ten seconds of simulated time, and the five it rewinds to. Fifty times
-/// §5.5's 100 ms threshold, so nothing here is decided by a boundary.
+/// Ten seconds of simulated time, and the five it rewinds to (50x §5.5's threshold).
 constexpr int64_t kSimStart = 10'000'000'000LL;
 constexpr int64_t kSimRewound = 5'000'000'000LL;
 
@@ -94,18 +78,11 @@ bool wait_for(F predicate, std::chrono::milliseconds timeout)
   return predicate();
 }
 
-/// Counts log records whose **format string** contains a needle, at or above a
-/// severity, and forwards every record to the handler that was installed
-/// before.
-///
-/// Matching on the format rather than on the rendered text is what makes this
-/// specific: the format is the literal in `bridge_handle.cpp`, so a match is
-/// that exact line and not a coincidence in a frame name. Matching on the
-/// logger name would not distinguish the seven throttled lines from each other.
-///
-/// `rcutils_logging_set_output_handler` is process-global and documented not
-/// thread-safe, so it is installed and removed from the test thread while no
-/// bridge is running; only the counter is written from the ingest thread.
+/// Counts log records whose **format string** contains a needle at or above a
+/// severity, forwarding every record to the prior handler. The format is the
+/// literal in `bridge_handle.cpp`, so a match is that exact line. The handler is
+/// process-global and not thread-safe: swap it from the test thread while no
+/// bridge runs.
 std::atomic<int> g_matches{0};
 std::atomic<int> g_min_severity{RCUTILS_LOG_SEVERITY_WARN};
 const char * g_needle = "";
@@ -141,14 +118,8 @@ int stop_counting()
   return g_matches.load();
 }
 
-/// A node with `use_sim_time` already true at construction.
-///
-/// Set through `parameter_overrides` rather than with `set_parameter` after the
-/// fact, and that ordering is load-bearing: rclcpp's `TimeSource` calls
-/// `rcl_enable_ros_time_override` while the node is being built, which is itself
-/// a `RCL_ROS_TIME_ACTIVATED` jump. Turning sim time on *later* would fire that
-/// at a `BridgeHandle` that already exists, halting it for a reason this test is
-/// not about — correctly, but not usefully.
+/// A node with `use_sim_time` true at construction via `parameter_overrides`;
+/// enabling it later fires `RCL_ROS_TIME_ACTIVATED` at an existing bridge.
 rclcpp::Node::SharedPtr sim_time_node(const std::string & name)
 {
   rclcpp::NodeOptions o;
@@ -165,46 +136,17 @@ tf_tree_ros::BridgeOptions options_on(const std::string & topic)
   return o;
 }
 
-/// **A `/clock` that goes backwards stops the bridge, with no publisher stamp
-/// consulted at all.**
+/// A `/clock` that goes backwards stops the bridge with no publisher stamp
+/// consulted (§5.5's case, reported by the time source). `/tf` is silent, so the
+/// halt can only come from rcl's jump callback, latched and drained on the
+/// ingest thread from `run`'s loop (not only `ingest`).
 ///
-/// This is §5.5's case — a bag loop, a sim reset — reported by the time source
-/// instead of guessed at. Nothing publishes `/tf` before the rewind, so there
-/// are no stamps to infer from and no quorum that could be reached: the halt
-/// here can only have come from `rcl`'s jump callback. That is the whole point
-/// of the tier, and it is why the assertion is made with the `/tf` topic silent.
-///
-/// It also pins the two things about the hand-off that cannot be seen from
-/// Rust. The callback fires on the `TimeSource`'s own `/clock` thread — with
-/// `NodeOptions::use_clock_thread` defaulting to true it is never the bridge
-/// thread — and `tft_bridge_*` is affinity-checked, so the jump has to be
-/// latched and drained on the ingest thread. And it must be drained from
-/// `run`'s loop rather than only from `ingest`, because at this moment `/tf`
-/// carries nothing: a drain that waited for the next transform would wait
-/// forever on a bag between takes.
-///
-/// **Mutant — APPLIED, in `docker/tf2`, and observed:** in `BridgeHandle::run`,
-/// delete the `drain_time_jump()` call at the bottom of the loop, leaving only
-/// the one at the top of `ingest`. Nothing publishes `/tf` here, so nothing ever
-/// drains, `clock_resets` stays 0 and the first wait times out. `just ros-test`
-/// reported `[  FAILED  ]
-/// ClockTest.a_backward_clock_jump_reported_by_the_time_source_stops_the_bridge
-/// (20554 ms)`, `83% tests passed, 1 tests failed out of 6`. That is the whole
-/// point of this suite: a bridge whose `/tf` has gone silent is exactly when the
-/// time source's own report is the only signal there is, and draining only from
-/// `ingest` means it is never applied. Source restored byte-identical afterwards.
-/// **Mutant:** in `register_jump_callback`, drop the
-/// returned handler on the floor instead of storing it in `jump_handler_`.
-/// rclcpp holds only a `weak_ptr`, so the callback is unregistered immediately
-/// and silently — the same failure, with nothing anywhere reporting it.
-/// (Stated, not applied.)
-/// **Mutant:** call `tft_bridge_note_time_jump` directly from the post-callback.
-/// Under `ros/build.sh`'s release build of `tf_tree_c` that returns
-/// `TFT_ERR_WRONG_THREAD`, the jump is dropped, and this test times out; a debug
-/// build of the same code aborts the process instead. (Stated, and deliberately
-/// left that way: the debug half of that sentence takes the whole test process
-/// down rather than failing one case, so applying it would prove the affinity
-/// rule by destroying the run that was meant to observe it.)
+/// Mutant (applied, observed to fail): delete the `drain_time_jump()` at the
+/// bottom of `BridgeHandle::run`'s loop; `clock_resets` stays 0.
+/// Mutant (stated): drop the handler returned by `register_jump_callback`
+/// instead of storing it (rclcpp holds a `weak_ptr`).
+/// Mutant (stated, not applied): call `tft_bridge_note_time_jump` from the
+/// post-callback; release returns `TFT_ERR_WRONG_THREAD`, debug aborts.
 TEST(ClockTest, a_backward_clock_jump_reported_by_the_time_source_stops_the_bridge)
 {
   const std::string topic = "/tf_clock_jump";
@@ -214,14 +156,9 @@ TEST(ClockTest, a_backward_clock_jump_reported_by_the_time_source_stops_the_brid
   auto clock_pub =
     clock_node->create_publisher<rosgraph_msgs::msg::Clock>("/clock", rclcpp::ClockQoS());
 
-  // **The needle is the EDGELESS form of the sentence**, `"ingest bridge
-  // HALTED: "` and not `"ingest bridge HALTED on "`. A jump reported by the time
-  // source is a decision taken with no sample in hand, so the ABI leaves
-  // `parent` and `child` at its documented "does not apply to this outcome"
-  // empty string — and the edge-shaped sentence renders that as
-  // `HALTED on  -> : …`, two empty conversions in the middle of the one line an
-  // operator gets. Counting the format string rather than the rendered text is
-  // what lets this distinguish the two call sites at all.
+  // The edgeless sentence: a jump reported by the time source has no sample, so
+  // `parent`/`child` are empty. Counting the format string tells the two call
+  // sites apart.
   start_counting("ingest bridge HALTED: ", RCUTILS_LOG_SEVERITY_FATAL);
 
   uint64_t resets = 0;
@@ -229,9 +166,8 @@ TEST(ClockTest, a_backward_clock_jump_reported_by_the_time_source_stops_the_brid
   {
     tf_tree_ros::BridgeHandle bridge(node.get(), options_on(topic));
 
-    // Simulated time runs forward first, so the rewind below is a rewind rather
-    // than the clock starting. Republished because `/clock` is `KeepLast(1)`
-    // volatile and DDS discovery is not instant.
+    // Simulated time runs forward first so the rewind is a rewind; republished
+    // because `/clock` is `KeepLast(1)` volatile and discovery is not instant.
     ASSERT_TRUE(
       wait_for(
         [&] {
@@ -241,30 +177,19 @@ TEST(ClockTest, a_backward_clock_jump_reported_by_the_time_source_stops_the_brid
         20s)) << "the node's ROS clock never followed /clock; use_sim_time did not take effect, "
                  "so there was no clock to rewind";
 
-    // **Starting simulated time is not a jump**, and this is the assertion that
-    // says so. The first `/clock` message moves ROS time from 0 to the
-    // simulation's epoch — here ten seconds, on a real robot's bag the better
-    // part of a decade — and rcl reports that to any callback registered with a
-    // finite `min_forward`, because it calls them from `set_ros_time_override`
-    // for *every* `/clock` message rather than only for discontinuities. A
-    // bridge that treated it as authoritative would stop before ingesting its
-    // first transform, on every simulated deployment.
+    // Starting simulated time is not a jump: the first `/clock` moves time from 0
+    // to the epoch, and rcl calls jump callbacks for every `/clock` message, so
+    // a finite `min_forward` would stop the bridge at startup. The sleep lets the
+    // 50 ms drain run.
     //
-    // The sleep is not a settling hack for the assertion below it: the drain
-    // runs once per 50 ms poll of `run`'s loop, so without it this reads a
-    // counter that has not had the chance to move and would pass either way.
-    //
-    // **Mutant:** set `threshold.min_forward.nanoseconds` to 1 in
-    // `register_jump_callback`. The 0 -> 10 s start is reported as a forward
-    // jump, the bridge halts here, and `clock_resets` is 1 — note that every
-    // other expectation in this test would still pass, which is precisely why
-    // the check has to be here and not inferred from the ones below.
+    // Mutant: `threshold.min_forward.nanoseconds = 1` in `register_jump_callback`;
+    // `clock_resets` is 1 (the other expectations still pass).
     std::this_thread::sleep_for(500ms);
     ASSERT_EQ(bridge.stats().clock_resets, 0u)
       << "simulated time merely starting was reported as a clock jump; min_forward must stay "
          "disabled (docs/decisions/0012)";
 
-    // The loop point. Five seconds backwards, fifty times §5.5's threshold.
+    // The loop point: five seconds backwards.
     ASSERT_TRUE(
       wait_for(
         [&] {
@@ -276,10 +201,8 @@ TEST(ClockTest, a_backward_clock_jump_reported_by_the_time_source_stops_the_brid
                  "jump callback was registered, or the jump was never drained onto the ingest "
                  "thread. clock_resets=" << bridge.stats().clock_resets;
 
-    // And the stop is a *stop*: a transform offered afterwards is refused,
-    // whatever its stamp. This is the half that proves the authoritative path
-    // reaches the same latch the per-sample path does, rather than merely
-    // moving a counter.
+    // The stop is a stop: a later transform is refused, proving the reported jump
+    // reaches the same latch as the per-sample path.
     auto tf_node = std::make_shared<rclcpp::Node>("clock_jump_broadcaster");
     auto tf_pub = tf_node->create_publisher<tf2_msgs::msg::TFMessage>(
       topic, rclcpp::QoS(rclcpp::KeepLast(100)).reliable());
@@ -304,41 +227,19 @@ TEST(ClockTest, a_backward_clock_jump_reported_by_the_time_source_stops_the_brid
     << "and `out.first_time` is 1 exactly once";
 }
 
-/// **A throttled diagnostic still prints when simulated time has not started.**
+/// A throttled diagnostic still prints when sim time has not started. With no
+/// `/clock` publisher `node_->get_clock()->now()` is 0, so `now >= last_logged +
+/// period` is false forever and every throttled line was silent for the whole
+/// sim boot. The steady clock has no such state. A frame name `"/"` (an
+/// unsubstituted launch variable) reaches the `BAD_NAME` line cheaply.
 ///
-/// `RCLCPP_WARN_THROTTLE` expands to `now >= last_logged + period` over a
-/// `last_logged` that starts at zero. Under `use_sim_time` with no `/clock`
-/// publisher, `node_->get_clock()->now()` is **0**, the comparison is
-/// `0 >= 0 + 5000000000`, and it is false forever — so every throttled line in
-/// `report()` was suppressed for the entire boot of every simulated deployment.
-/// Not rate-limited: *silent*. The steady clock has no such state: it is
-/// monotonic since boot and independent of every ROS parameter.
-///
-/// A frame name that does not normalize is the cheapest way to reach one of
-/// those lines. `"/"` is a bare leading slash with nothing after it — §5.6's
-/// rule strips one slash and refuses what is left — and it is not hypothetical:
-/// it is what a launch file with an unsubstituted variable publishes.
-///
-/// **Mutant — APPLIED, in `docker/tf2`, and observed:** put
-/// `*node_->get_clock()` back as the clock of the `BAD_NAME` throttle in
-/// `BridgeHandle::report`. `dropped_bad_name` still climbs, so the counter half
-/// of this test passes and the ledger still balances — and the warning count
-/// falls to zero, which is the whole finding: the fault was counted and never
-/// spoken about. `just ros-test` reported `[  FAILED  ]
-/// ClockTest.a_throttled_diagnostic_is_not_silenced_by_sim_time_that_never_started
-/// (27 ms)`, `83% tests passed, 1 tests failed out of 6`.
-///
-/// Note the 27 ms against the other two mutants' 20 s: this one fails
-/// *immediately*, on the first message, because under `use_sim_time` with no
-/// `/clock` publisher `now()` is 0 and rcutils' `now >= last_logged + duration`
-/// is false forever. Nothing is slow about it — the line simply never exists.
-/// Source restored byte-identical afterwards.
+/// Mutant (applied, observed to fail in 27 ms): restore `*node_->get_clock()` as
+/// the `BAD_NAME` throttle clock in `BridgeHandle::report`; `dropped_bad_name`
+/// still climbs but the warning count is 0.
 TEST(ClockTest, a_throttled_diagnostic_is_not_silenced_by_sim_time_that_never_started)
 {
   const std::string topic = "/tf_clock_throttle";
-  // Sim time on, and **nothing publishes `/clock`** — which is not a contrived
-  // state but the first seconds of every simulated launch, and the seconds in
-  // which a misconfigured bridge is diagnosed.
+  // Sim time on and nothing publishes `/clock`: the first seconds of every sim launch.
   auto node = sim_time_node("clock_throttle_bridge");
   ASSERT_EQ(node->get_clock()->now().nanoseconds(), 0)
     << "something else in this process is publishing /clock, so this test cannot mean what it says";

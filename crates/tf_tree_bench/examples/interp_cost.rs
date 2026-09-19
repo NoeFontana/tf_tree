@@ -1,25 +1,16 @@
 //! Cost of one interpolation, isolated from the tree.
 //!
-//! `cost_model` measures `Plan::at`, where `sample::<LerpSlerp>` and
-//! `sample::<ScLerp>` are monomorphized into the *same* hot function behind a
-//! `match` on the policy byte. Changing the size of either one therefore
-//! relocates the other's code, and a ±15% swing in the untouched policy is a
-//! routine artifact of that. It makes `cost_model` unable to attribute a change
-//! in the interpolation math to the math.
-//!
-//! This benchmark calls `Interp::eval` directly on pre-built pose pairs, so a
-//! number here moves only when the interpolation itself moves.
+//! `cost_model` measures `Plan::at`, where both policies share one hot function, so changing one
+//! relocates the other's code (a ±15% artifact). This calls `Interp::eval` directly on pre-built pose
+//! pairs, so a number here moves only when the interpolation itself moves.
 //!
 //! Three regimes, because the two policies branch on arc size:
 //!
-//! * **adjacent** — the case that dominates: two samples one 1 kHz tick apart on
-//!   a body rotating at a brisk 180 °/s, so ~3 mrad. Both policies take their
-//!   transcendental-free series path.
-//! * **slow-rate** — a 10 Hz edge on the same body, ~314 mrad. Past the 0.15
-//!   half-angle threshold, so both fall to the exact `acos`/`atan2` path.
-//! * **near-identity** — a stationary robot. Formerly `screw_pow`'s
-//!   `SCREW_SMALL` fallback, which routed every such lookup through the full
-//!   `log_se3`/`exp_se3` reference form.
+//! * **adjacent** — two samples one 1 kHz tick apart at 180 °/s (~3 mrad): the transcendental-free
+//!   series path, which dominates.
+//! * **slow-rate** — a 10 Hz edge, ~314 mrad: past the 0.15 half-angle threshold, the exact
+//!   `acos`/`atan2` path.
+//! * **near-identity** — a stationary robot (once `screw_pow`'s `SCREW_SMALL` fallback).
 //!
 //! Run pinned — unpinned runs migrate cores and swing by >30%:
 //! `taskset -c 2 cargo run --release -p tf_tree_bench --example interp_cost`
@@ -35,10 +26,8 @@ const N: usize = 4096;
 /// Timed rounds; the median is reported.
 const ROUNDS: usize = 41;
 
-/// A pair of poses whose *relative* rotation is `theta` about a tumbling axis,
-/// with a metre-scale relative translation. Both endpoints are themselves
-/// arbitrary rigid transforms, so nothing degenerates into an identity-times-x
-/// special case the optimizer could exploit.
+/// A pair of poses whose *relative* rotation is `theta` about a tumbling axis, with a metre-scale
+/// relative translation; both are arbitrary rigid transforms, so no identity special case arises.
 fn pairs(theta: f64) -> Vec<(Iso3, Iso3)> {
     (0..N)
         .map(|i| {
@@ -48,8 +37,7 @@ fn pairs(theta: f64) -> Vec<(Iso3, Iso3)> {
                 axis_angle(0.3 + u, 0.267_261, 0.534_522, 0.801_784),
                 Vec3::new(1.5 + u, -0.7 + 2.0 * u, 3.1 - u),
             );
-            // Relative rotation of exactly `theta`, about an axis that walks so
-            // successive pairs do not share a branch history.
+            // Relative rotation of exactly `theta`, about a walking axis so pairs share no branch history.
             let (sx, sy, sz) = ((u * 7.0).cos(), (u * 5.0).sin(), (u * 3.0 + 1.0).cos());
             let n = (sx * sx + sy * sy + sz * sz).sqrt();
             let rel = Iso3::new(
@@ -72,8 +60,7 @@ fn time<I: Interp>(data: &[(Iso3, Iso3)]) -> f64 {
     let run = || {
         let mut acc = 0.0f64;
         for (i, (a, b)) in data.iter().enumerate() {
-            // s walks over (0,1) exclusive: the endpoint short-circuits in
-            // `eval` would otherwise skip the work being measured.
+            // s walks over (0,1) exclusive: the endpoint short-circuits would skip the work.
             let s = (i as f64).mul_add(1.0 / N as f64, 0.5).fract() * 0.98 + 0.01;
             let r = I::eval(a, b, black_box(s));
             acc += r.t.x + r.q.w;

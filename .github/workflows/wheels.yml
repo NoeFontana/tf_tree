@@ -1,48 +1,7 @@
-# Wheel matrix — `docs/PHASE3.md` §10.
-#
-# Two maturin invocations per platform row, and that is not an accident of the
-# scripting: maturin emits **at most one stable-ABI family per invocation**
-# (PyO3/maturin#3226). Selection happens after interpreter resolution — `abi3t`
-# when a CPython >= 3.15 interpreter is present, otherwise `abi3` — so `abi3`
-# and `abi3.abi3t` cannot come out of the same build. A single job with an extra
-# flag would silently produce only one of them.
-#
-# `cp313t` is deliberately absent (§1.1): PyO3 0.29 refuses to build for 3.13t,
-# manylinux dropped it from its images, and `--find-interpreters` skips it. That
-# is the right outcome rather than a loss — 3.13t was PEP 703's experimental
-# phase; free-threading became *supported* in 3.14 under PEP 779.
-#
-# NOTE: **the whole file has now executed, `publish` included.** It produced
-# nothing at all through the 2026-07-23 to 2026-08-16 Actions outage (`ci.yml`'s
-# header has what that was), and until 2026-08-19 the last job had never run. It
-# has since run twice and this note is the evidence, read off the API rather than
-# remembered:
-#
-#     $ gh api repos/:owner/:repo/actions/workflows/wheels.yml/runs \
-#         -q '.workflow_runs[] | "\(.head_branch) \(.conclusion)"'
-#     v0.0.4  success        v0.0.3  success
-#     main    failure        v0.0.2  cancelled       v0.0.1  failure
-#
-# with `sdist` and `publish` both `success` on each of the two tag runs.
-#
-# **The sdist gap is closed too** (#179). `transform_tree` 0.0.2 landed as
-# eleven wheels and no sdist — the upload died on the twelfth file, and it did
-# not get there from this workflow, whose `publish` had never started. 0.0.3 and
-# 0.0.4 each carry twelve files including the sdist:
-#
-#     $ curl -sS https://pypi.org/pypi/transform_tree/json | python3 -c "..."
-#     0.0.2: ['bdist_wheel'] 11
-#     0.0.3: ['bdist_wheel', 'sdist'] 12
-#     0.0.4: ['bdist_wheel', 'sdist'] 12
-#
-# So the upload path is exercised rather than assumed. What that does *not* say
-# is that it is exercised on every platform: see the `macos-15-intel` row below,
-# which is on borrowed time and fails by queueing rather than by erroring.
-#
-# **Nothing here tests a wheel.** These jobs build and (on a tag) publish; the
-# suite that would run against the artifact is `ci.yml`'s `python` job, which
-# builds its own extension with maturin. A wheel that imports but computes the
-# wrong transform would leave this workflow green.
+# Wheel matrix (`docs/PHASE3.md` §10). Two maturin invocations per platform row:
+# maturin emits at most one stable-ABI family per invocation (PyO3/maturin#3226).
+# `cp313t` is absent by design (§1.1).
+# Nothing here tests a wheel; `ci.yml`'s `python` job runs the suite.
 name: wheels
 
 on:
@@ -55,43 +14,8 @@ permissions:
 
 jobs:
   # Row 1 of §10's matrix: the stable-ABI wheel, one per platform.
-  # **Timeouts on every job, because the default is six hours and these two
-  # workflows are the ones that publish.** A build that wedges should cost
-  # minutes of runner time and report, not burn a quarter of a day and then
-  # report the same thing.
-  #
-  # **What this does NOT reliably catch is the failure that actually bit us**,
-  # and that is worth being exact about rather than implying a guarantee. The
-  # `v0.0.2` matrix had one row requesting `macos-13`, a label retired on
-  # 2025-12-04; the job did not fail, it sat *queued* against a label no runner
-  # carries while every other row went green, and the publish job waited behind
-  # it.
-  #
-  # **`timeout-minutes` does not cover queue time, and the stall is bounded at
-  # 24 hours.** Both halves were checked rather than left open (#180). The
-  # workflow-syntax reference defines the setting as time to "let a job *run*"
-  # and ties it to the "job execution time limit"; the GitHub-hosted limits are
-  # likewise stated in *execution* time, and community discussion #50926 is a
-  # feature request premised on exactly this gap. So it is a bound on a hung
-  # *build* and nothing else.
-  #
-  # The bound on the queue came from this repository's own history, not the
-  # docs — which list a 24-hour "job queue time" row under **self-hosted** only
-  # and have no queue row for GitHub-hosted runners:
-  #
-  #     $ gh api repos/:owner/:repo/actions/runs/31982307326/jobs \
-  #         -q '.jobs[] | select(.labels[0]=="macos-13")'
-  #     created_at   2026-08-17T00:32:13Z
-  #     completed_at 2026-08-18T00:32:14Z
-  #     conclusion   "cancelled"      runner_name ""
-  #
-  # 24 hours and one second, never assigned a runner. `timeout-minutes` did not
-  # exist in this file then, so it was not the cause. A tag push against a
-  # retired label therefore stalls for a day, then the run fails and `publish`
-  # skips — bad, but not the "forever" this file used to say.
-  #
-  # The guard remains knowing the signature: a row with `status: queued` and an
-  # empty `runner_name` long after its siblings finished. See issue #180.
+  # `timeout-minutes` bounds a hung build, not queue time: a row on a retired runner
+  # label queues for 24 h, then is cancelled, and `publish` skips (#180).
   abi3:
     name: abi3 ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -105,26 +29,9 @@ jobs:
           - { os: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
           - { os: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
           - { os: macos-latest, target: aarch64, manylinux: auto }
-          # **`macos-15-intel`, not `macos-13`.** The macOS 13 image was retired
-          # on 2025-12-04; a job requesting it does not fail, it **queues for
-          # 24 hours** against a label no runner carries and is then cancelled.
-          # That is how it presented here — the `v0.0.2` wheel matrix sat with
-          # one row `queued` and no runner assigned while every other row had
-          # long since passed, holding the PyPI publish (which `needs` the whole
-          # matrix) behind it. This comment said "forever" and "indefinitely"
-          # until the run was read back: 24 h + 1 s, quoted in the job comment
-          # above.
-          #
-          # `macos-15-intel` is the successor and **the last x86_64 macOS image
-          # Actions will offer**. The date is announced rather than inferred:
-          # `actions/runner-images#13045` says the label "will be available from
-          # now until August 2027", after which "the x86_64 architecture will not
-          # be supported on GitHub Actions". This comment said *autumn* 2027
-          # until that was checked (#180); August is both more specific and
-          # earlier than autumn, which matters for a row that fails by queueing
-          # silently rather than by erroring. When it lands, this row goes away
-          # and macOS is arm64-only; `macos-latest` above already covers Apple
-          # Silicon.
+          # `macos-15-intel` is the last x86_64 macOS image (available until August
+          # 2027, actions/runner-images#13045); remove this row then. A retired label
+          # queues silently rather than failing.
           - { os: macos-15-intel, target: x86_64, manylinux: auto }
           - { os: windows-latest, target: x64, manylinux: auto }
     steps:
@@ -171,12 +78,7 @@ jobs:
           name: wheel-cp314t-${{ matrix.os }}-${{ matrix.target }}
           path: dist
 
-  # Row 3: PEP 803's combined stable ABI. Written now, skipped until CPython
-  # 3.15 ships — PyO3 0.29 and maturin 1.14.1 already do their halves, so the
-  # only unmet precondition is the interpreter (§1.1, corrected in #25).
-  #
-  # Having the job written is the difference between a same-week and a
-  # same-quarter response when 3.15 lands.
+  # Row 3: PEP 803's combined stable ABI; skipped until CPython 3.15 ships.
   abi3t:
     name: abi3.abi3t (awaiting CPython 3.15)
     if: false
@@ -204,15 +106,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # **The tag-versus-version check, which this workflow did not have.**
-      # `release.yml` refuses a tag whose number disagrees with the tree it
-      # points at; this file publishes to PyPI off the same `v*` tag and made no
-      # such check, and it depends on none of `release.yml`'s jobs — the two run
-      # independently. In practice `just artifact-versions` keeps
-      # `pyproject.toml` in step with the workspace, but nothing here *asserted*
-      # it, so a tag could put a wheel on PyPI whose version no gate had compared
-      # to the tag. PyPI does not permit re-uploading a version, so the check is
-      # worth its two seconds. `version` is the field maturin builds from.
+      # PyPI forbids re-uploading a version, so assert the tag matches `pyproject.toml`
+      # (`release.yml` does the same for the workspace).
       - name: assert the tag matches the version being published
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -230,22 +125,8 @@ jobs:
           command: sdist
           args: --out dist
 
-      # **This is the assertion PyPI makes, made here instead.** `0.0.2`'s upload
-      # put all eleven wheels on the index and then died on the twelfth file:
-      #
-      #   400 License-File LICENSE-APACHE does not exist in distribution
-      #
-      # PyPI validates that every `License-File:` in the metadata is present in
-      # the archive, and maturin writes those headers from `[project] license`
-      # while selecting sdist *files* from the cargo package — two different
-      # mechanisms, so the metadata could name a file the archive did not carry.
-      # `pyproject.toml`'s `include` closed that, and this is what keeps it
-      # closed: nothing else compares the two, and the failure is unrecoverable
-      # per version, because neither registry lets a number be reused.
-      #
-      # Deliberately in the `sdist` job and not in `publish`: a build that cannot
-      # be uploaded should fail where it was built, before eleven wheels have
-      # gone to the index and left the release half-done.
+      # PyPI rejects an sdist whose `License-File:` metadata names a file the archive
+      # lacks (0.0.2); check it here, before any wheel is uploaded.
       - name: every License-File named in the metadata is in the archive
         run: |
           set -euo pipefail
@@ -253,19 +134,7 @@ jobs:
           root=$(basename "$tarball" .tar.gz)
           echo "checking $tarball"
           declared=$(tar -xOzf "$tarball" "$root/PKG-INFO" | sed -n 's/^License-File: //p')
-          # **An empty subject set is not a pass.** This branch used to print
-          # "no License-File headers to check" and `exit 0`, which made the step
-          # green in exactly the state it exists to prevent: an sdist that
-          # declares no licence file and therefore is not required to carry one.
-          # Every way of arriving there is a defect — maturin stopping emitting
-          # the headers, `[project] license` changing shape, the `sed` pattern
-          # drifting past a renamed field, `PKG-INFO` moving inside the archive
-          # — and none of them is distinguishable here from a licence that
-          # travelled. `pyproject.toml` declares the licence files, so at least
-          # one header is the floor, and the same discipline
-          # `scripts/artifact-versions.py` writes down for `VERSION_FILES`
-          # applies: a scan that silently finds nothing is how a gate keeps
-          # passing after its subject moved.
+          # An empty `declared` is a failure, not a pass: the check would have nothing to compare.
           if [ -z "$declared" ]; then
             echo "::error file=pyproject.toml::PKG-INFO in $tarball declares no 'License-File:' header at all, so this check has nothing to compare and the sdist carries no required licence file. Apache-2.0 4(a) is what makes that a defect rather than a formality." >&2
             exit 1
@@ -287,23 +156,10 @@ jobs:
           name: sdist
           path: dist
 
-  # Publishing is deliberately a separate, tag-only job.
-  #
-  # PEP 740 attestations are produced by the *upload* step under Trusted
-  # Publishing, not by `maturin build` — maturin adopting them for its own
-  # releases is precedent for the workflow shape, not a feature inherited by
-  # building with it (§10, corrected in #25).
-  # **A tag *or* a manual dispatch, and the second is a recovery path rather
-  # than a convenience.** crates.io and PyPI publish from the same tag but not
-  # atomically: `release.yml` succeeded for `v0.0.2` while this matrix was still
-  # blocked on a retired runner label, so crates.io had 0.0.2 and PyPI had
-  # nothing, with no way to finish the release short of burning a version
-  # number or moving a tag that a published crate records the sha of.
-  #
-  # `workflow_dispatch` is already privileged — it needs write access — and the
-  # `pypi` environment gates it on top, so allowing it to publish adds no path
-  # an untrusted actor can take. What it adds is the ability to complete a
-  # half-published release from the same commit.
+  # Tag-only publish, or a manual dispatch to finish a half-published release
+  # (crates.io and PyPI publish from one tag, not atomically). Dispatch needs write
+  # access and the `pypi` environment gates it. PEP 740 attestations come from the
+  # upload step (§10).
   publish:
     needs: [abi3, freethreaded, sdist]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -321,18 +177,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           attestations: true
-          # **Because a partial upload is a state this workflow can reach.**
-          # twine uploads file by file; if PyPI refuses one, the files before it
-          # are already published and the version cannot be re-cut. 0.0.2 landed
-          # exactly there — eleven wheels accepted, then the sdist refused with
-          # `400 License-File LICENSE-APACHE does not exist in distribution`.
-          #
-          # Without this, the dispatch that completes such a release fails on
-          # the first already-published wheel and never reaches the missing
-          # file. Rebuilt wheels are not byte-identical to the uploaded ones, so
-          # "upload only what is new" is not something the matrix can decide.
-          #
-          # It is narrow: PyPI still refuses a *different* file under an
-          # existing name, so this cannot overwrite a published artifact — it
-          # only declines to treat "already there" as an error.
+          # A partial upload is reachable (0.0.2); skip-existing lets a re-dispatch
+          # reach the missing file. PyPI still refuses a different file under an
+          # existing name.
           skip-existing: true

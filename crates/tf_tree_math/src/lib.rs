@@ -1,17 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
-// `PHASE1.md` §13 asks for this at the root. The workspace sets
-// `missing_docs = "warn"` and `just lint`'s `-D warnings` promotes it, so the
-// gate was already effective — but only inside that recipe. This makes a plain
-// `cargo build` of this repository say so too.
-//
-// **It does not bind a downstream consumer, and an earlier version of this
-// comment claimed it did.** Cargo builds registry dependencies with
-// `--cap-lints allow`, which caps an attribute-level `deny` as well, so for
-// somebody building `tf_tree` from crates.io this attribute has no effect at
-// all. What it binds is builds of this repository and its path dependents —
-// which is where a missing doc would be introduced, so the box is still worth
-// closing this way.
+// Binds this repository's builds only: cargo's `--cap-lints allow` caps it for registry consumers.
 #![deny(missing_docs)]
 //! `no_std` SE(3)/SO(3) and dual-quaternion math for the `tf_tree` engine.
 //!
@@ -29,35 +18,18 @@
 //!    [`log_se3`] returns the twist `ξ = [ω, v]` of the right-multiplied
 //!    increment and [`exp_se3`] consumes the same ordering.
 //!
-//! This crate is `#![forbid(unsafe_code)]`, which is why its *library* code is
-//! cheap for Miri to interpret: no `unsafe`, no arena, no provenance to track.
-//! It is reached under Miri as a callee of `tf_tree_core`'s tests.
-//!
-//! **Its own test suite is not run under Miri, and this comment said otherwise
-//! until 2026-08-29** — it read "its property tests run under Miri in seconds",
-//! which was true of no command in this repository. `just miri` selects
-//! `-p tf_tree_arena -p tf_tree_core`, and building those two produces no
-//! `tf_tree_math` test target, so neither `tests/proptests.rs` nor
-//! `tests/slerp_public.rs` has ever been interpreted. The claim is corrected
-//! rather than deleted because this crate publishes, so the sentence was on its
-//! docs.rs front page.
+//! `just miri` does not run this crate's own tests; it reaches Miri only as a callee of `tf_tree_core`'s.
 //!
 //! # Numerics
 //!
-//! The two findings that drive the implementation (verified against a 50-digit
-//! reference in `docs/PHASE1.md` §3.3):
+//! Verified against a 50-digit reference in `docs/PHASE1.md` §3.3:
 //!
 //! * [`log_so3`] goes through the quaternion (`2·atan2(‖q_v‖, q_w)`), never
 //!   through `acos((tr − 1)/2)`, which loses nine digits near `θ = π`.
 //! * The small-angle series threshold for the `V`/`V⁻¹` coefficients is
 //!   `θ < 0.1` with four series terms, not the `1e-8` most libraries use.
 
-// **The crates.io front page, compiled.** `README.md`'s `rust` fence — the
-// three conventions written as assertions — is a doctest *here and nowhere
-// else*: no recipe parses a README, so without this the published front page
-// could go on demonstrating an API that no longer exists with every gate green.
-// `cfg(doctest)` is what keeps it from also duplicating the module docs above:
-// the module exists for `cargo test --doc` and does not exist for `cargo doc`.
+// README's `rust` fence is a doctest here only; `cfg(doctest)` keeps it out of `cargo doc`.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme {}

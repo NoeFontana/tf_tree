@@ -1,57 +1,17 @@
-//! Shared machinery for the multi-process evaluation (`mp_bench`).
+//! Shared machinery for the multi-process evaluation (`mp_bench`): what each of
+//! N consumers at its own rate experiences, and what it costs, rather than
+//! `shm_scaling`'s saturated roofline.
 //!
-//! # Why this exists, when `shm_scaling` already measured "multi-process"
-//!
-//! `shm_scaling` answers *"how many lookups per second can N processes extract
-//! from one arena?"*. That is a roofline measurement: it saturates the machine
-//! and reports a property of the machine. The question a robotics integrator
-//! actually has is different — **"if I run sixteen nodes that each need
-//! transforms at their own rate, what does each one experience, and what does it
-//! cost me?"** — and the two answers can diverge arbitrarily.
-//!
-//! Five things had to change to ask the second question.
-//!
-//! ## 1. Open loop, not closed loop — and coordinated omission
-//!
-//! `shm_scaling`'s consumer is a tight `for` loop. That is a **closed-loop**
-//! load generator: the next request starts when the previous one finishes, so
-//! the offered load is whatever the system can absorb. Such a harness cannot
-//! measure latency, because a slow response *reduces the load*. If a lookup
-//! stalls for 10 ms, a closed loop simply performs fewer lookups and every one
-//! it does record looks fast.
-//!
-//! That is **coordinated omission**, and it is why a tight loop reports a
-//! beautiful p99.9 for a system that is visibly stuttering. The fix is to fix
-//! the schedule in advance and measure against *intended* start times, so a
-//! consumer that falls behind sees its latency grow. See [`RateLoop`].
-//!
-//! ## 2. A writer must be running
-//!
-//! `shm_scaling` reads a quiescent tree. Nothing exercises the seqlock retry
-//! path, nothing invalidates the cache lines the readers hold, and — decisively
-//! for the comparison — nothing holds `tf2::BufferCore`'s mutex.
-//!
-//! ## 3. Latency distribution per consumer, not one aggregate number
-//!
-//! `docs/PHASE1.md` §11.2 says "p99.9 is the number that matters, not the mean.
-//! A control loop cares about the tail." `shm_scaling` reports the *worst mean*
-//! across consumers. [`Histogram`] records the distribution, and the coordinator
-//! reports per-consumer tails and the worst across the fleet.
-//!
-//! ## 4. CPU per consumer is the actual claim
-//!
-//! The industrial argument (`docs/PHASE2.md` §12.4) is that tf_tree's cost is
-//! *O(1) in the number of consumers* where `/tf` is O(consumers × edges × rate).
-//! Nothing measured it. [`ProcStats`] reads the per-process CPU time so the
-//! claim can be checked rather than asserted.
-//!
-//! ## 5. PSS, not summed RSS
-//!
-//! Summing each process's RSS double-counts every shared page. `shm_scaling`
-//! corrected for that by subtracting a known arena size, which only works
-//! because we know it. **PSS** (proportional set size) is the kernel's own
-//! answer — each shared page divided by the number of mappers — and needs no
-//! such knowledge, so it works for tf2's private buffers too.
+//! * **Open loop.** [`RateLoop`] fixes the schedule in advance and measures
+//!   against intended start times, so a stall shows as latency instead of
+//!   fewer samples (coordinated omission).
+//! * **A writer is running**, so the seqlock retry path and `tf2::BufferCore`'s
+//!   mutex are exercised.
+//! * **Per-consumer distributions** ([`Histogram`]): `docs/PHASE1.md` §11.2
+//!   wants p99.9, not the mean.
+//! * **CPU per consumer** ([`ProcStats`]): `docs/PHASE2.md` §12.4's claim that
+//!   cost is O(1) in the number of consumers.
+//! * **PSS, not summed RSS**: RSS counts a shared page once per mapper.
 
 use std::time::{Duration, Instant};
 
@@ -62,15 +22,9 @@ const SUB: u64 = 1 << SUB_BITS;
 /// Values below `SUB` get their own bucket, so sub-128 ns resolution is exact.
 const BUCKETS: usize = (64 - SUB_BITS as usize) * SUB as usize + SUB as usize;
 
-/// A log-linear latency histogram, in nanoseconds.
-///
-/// Hand-rolled rather than pulling in `hdrhistogram`: the whole thing is one
-/// array and three methods, and a benchmark harness that drags a dependency into
-/// the workspace to count numbers is a poor trade. Same bucketing scheme —
-/// constant *relative* error, so the tail is resolved as precisely as the head.
-///
-/// Recording is a shift, a mask and an increment: ~2 ns, which matters because
-/// it happens inside the measured loop.
+/// A log-linear latency histogram, in nanoseconds: one array, constant relative
+/// error, ~2 ns to record (it runs inside the measured loop). Hand-rolled to
+/// avoid a dependency.
 #[derive(Clone)]
 pub struct Histogram {
     counts: Vec<u32>,
@@ -147,10 +101,8 @@ impl Histogram {
         self.max
     }
 
-    /// The value at quantile `q` (0.0..=1.0), in nanoseconds.
-    ///
-    /// Returns the bucket floor, so a reported quantile is always a value that
-    /// *could* have occurred and is never rounded upward into optimism.
+    /// The value at quantile `q` (0.0..=1.0), in nanoseconds; the bucket floor,
+    /// so never rounded upward.
     #[must_use]
     pub fn quantile(&self, q: f64) -> u64 {
         if self.total == 0 {
@@ -168,20 +120,10 @@ impl Histogram {
         self.max
     }
 
-    /// Fraction of observations strictly below `ns`, in `0.0..=1.0`.
-    ///
-    /// The inverse question to [`Histogram::quantile`], and it exists because a
-    /// *bimodal* distribution is not describable by quantiles alone: a p50 says
-    /// where the middle sample landed, not that half the samples landed a
-    /// decade away from it. `dds_report` uses it to state, from a run's own
-    /// data, how much of a `.processes` arm's `svc` column is at composed
-    /// speed — see `docs/benchmarks/tf2.md` for the worked example.
-    ///
-    /// **Bucket resolution, and it rounds against the caller.** A bucket is
-    /// counted whole when its floor is below `ns`, so the answer can overstate
-    /// by at most one bucket's share — the buckets are 128-per-octave, so under
-    /// 0.8% of a value. `0.0` for an empty histogram, which is the honest
-    /// answer to "how many of no samples were fast".
+    /// Fraction of observations strictly below `ns`, in `0.0..=1.0`; the inverse
+    /// of [`Histogram::quantile`], for bimodal distributions quantiles cannot
+    /// describe. A bucket counts whole when its floor is below `ns`, so it can
+    /// overstate by under 0.8%. `0.0` for an empty histogram.
     #[must_use]
     pub fn fraction_below(&self, ns: u64) -> f64 {
         if self.total == 0 {
@@ -232,17 +174,10 @@ impl Histogram {
     }
 }
 
-/// A fixed-rate loop that measures against the **intended** schedule.
-///
-/// This is the coordinated-omission fix. `next_due()` returns the instant tick
-/// `i` was *due*, computed from the start time and the period, never from when
-/// the previous tick happened to finish. A consumer that overruns does not get to
-/// quietly redefine its own deadline: the next tick is already late, and the
-/// latency it records says so.
-///
-/// When the loop has fallen behind it does not sleep — it returns immediately
-/// with an already-past deadline, so backlog shows up as latency rather than as
-/// a reduced sample count.
+/// A fixed-rate loop that measures against the **intended** schedule
+/// (coordinated-omission fix): `next_due()` is computed from the start time and
+/// the period, and a loop that has fallen behind returns an already-past
+/// deadline without sleeping, so backlog shows up as latency.
 pub struct RateLoop {
     start: Instant,
     period: Duration,
@@ -260,11 +195,8 @@ impl RateLoop {
         }
     }
 
-    /// Sleep until the next tick is due and return the instant it was *due*.
-    ///
-    /// The returned instant is the measurement baseline: latency is
-    /// `Instant::now() - due` after the work completes, which includes any time
-    /// spent waiting because the consumer was still busy with the previous tick.
+    /// Sleep until the next tick is due and return the instant it was *due*;
+    /// latency is `Instant::now() - due` after the work completes.
     pub fn next_due(&mut self) -> Instant {
         let due = self.start + self.period * u32::try_from(self.tick).unwrap_or(u32::MAX);
         self.tick += 1;
@@ -283,11 +215,6 @@ pub struct ProcStats {
     pub cpu_ns: u64,
     /// Proportional set size, in KiB: private pages plus each shared page
     /// divided by the number of processes mapping it.
-    ///
-    /// The right memory metric for this comparison, and the reason summed RSS is
-    /// not: RSS counts a shared arena page once per mapper, so sixteen consumers
-    /// sharing 1.3 MiB appear to use 21 MiB. PSS reports what the machine
-    /// actually holds.
     pub pss_kib: u64,
 }
 
@@ -314,48 +241,16 @@ impl ProcStats {
 
 /// CPU time of this process, in nanoseconds.
 ///
-/// **Read from `schedstat`, not `stat`, and the difference is the whole
-/// measurement.** `/proc/self/stat`'s `utime`/`stime` are USER_HZ clock ticks —
-/// 10 ms each. A consumer here runs 600 ticks of 8 lookups, which is about 4 ms
-/// of CPU per 6-second window: *less than one clock tick*. Read that way the
-/// column reports `0.0` for every row, which reads like the O(1)-in-consumers
-/// claim holding when it is really the instrument having no resolution — and it
-/// would flatten the tf2 comparison, where CPU per node is the whole point.
+/// Read from `schedstat` (nanoseconds), not `stat` (10 ms USER_HZ ticks): a
+/// consumer uses ~4 ms of CPU per window, under one tick, so `stat` would read
+/// `0.0`. Summed over `task/*` so threads are counted whole.
 ///
-/// `/proc/<pid>/schedstat` field 1 is time-on-cpu in nanoseconds. Summed over
-/// `task/*` so a threaded consumer is counted whole; the process-level file
-/// covers only the main thread.
-///
-/// # The task sum loses a thread's CPU when that thread exits
-///
-/// `task/*` lists **live** threads, so a thread's `sum_exec_runtime` leaves the
-/// total the moment it is joined. `docs/benchmarks/tf2.md` records this being
-/// found in `measure.hpp`, where an unsaturated `uint64_t` difference printed
-/// `cpu_ns 18446744073701835266`, and left open "whether it is reachable
-/// [in `mp.rs`]". **It is not, today** — nothing that reads [`ProcStats::cpu_ns`]
-/// spawns a thread (`load_child` and `mp_consumer` are single-threaded, and
-/// `soak` reads only `pss_kib`, inside a live `thread::scope`) — and
-/// [`ProcStats::since`] saturates, so the failure here would be a plausible
-/// **zero** rather than an absurd number. That is the worse of the two to read.
-///
-/// Measured on this host, two threads burning 1 s each:
-///
-/// | instrument | threads alive | after `join()` |
-/// | --- | --- | --- |
-/// | `/proc/self/schedstat` (process-level) | 0.001 s | 0.001 s |
-/// | sum over `task/*` | 0.999 s | **0.001 s** |
-/// | `/proc/self/stat` `utime + stime` | 0.990 s | **2.000 s** |
-///
-/// `stat` is the only always-correct reading available without `unsafe` — this
-/// crate is `#![forbid(unsafe_code)]`, which rules out
-/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, the fix `measure.hpp` could take.
-///
-/// **So the two are cross-checked rather than one being chosen.** When `stat`
-/// exceeds the task sum by more than two clock ticks, the task sum has provably
-/// lost a thread and the coarse-but-correct number is returned instead. A coarse
-/// number beats a precise wrong one, and the 10 ms floor — which this workload
-/// cannot afford, at ~4 ms of CPU per 6-second window — is paid only when the
-/// alternative is a number that is simply false.
+/// `task/*` lists live threads only, so a joined thread's CPU leaves the sum
+/// (`docs/benchmarks/tf2.md`). The two instruments are therefore cross-checked:
+/// when `stat` exceeds the task sum by more than two ticks, the coarse `stat`
+/// reading is returned. `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` needs
+/// `unsafe`, which this crate forbids. Tested by
+/// `a_joined_threads_cpu_is_not_lost` and the sub-tick test below.
 fn self_cpu_ns() -> u64 {
     // Always read: it is the completeness reference for the cross-check below.
     let stat_ns = stat_cpu_ns();
@@ -371,10 +266,7 @@ fn self_cpu_ns() -> u64 {
                 any = true;
             }
         }
-        // Two ticks of slack, not zero: `stat` rounds *up* to whole USER_HZ
-        // ticks, so on a quiet single-threaded process it routinely reads a few
-        // milliseconds above the exact sum. One tick of slack would flip to the
-        // coarse instrument on quantisation alone.
+        // Two ticks of slack: `stat` rounds up to whole ticks.
         if any && stat_ns <= ns.saturating_add(2 * TICK_NS) {
             return ns;
         }
@@ -388,10 +280,7 @@ fn self_cpu_ns() -> u64 {
     stat_ns
 }
 
-/// One USER_HZ clock tick in nanoseconds. `USER_HZ` is 100 on every Linux
-/// target this harness runs on; reading it properly is `sysconf(_SC_CLK_TCK)`,
-/// which needs `unsafe` — forbidden here — and libc, which this crate does not
-/// otherwise want.
+/// One USER_HZ clock tick in nanoseconds (100 Hz; `sysconf` needs `unsafe`).
 const TICK_NS: u64 = 10_000_000;
 
 /// Field 1 of a `schedstat` file: time on cpu, in nanoseconds.
@@ -401,10 +290,8 @@ fn schedstat_ns(path: &std::path::Path) -> Option<u64> {
 }
 
 /// User + system CPU time in nanoseconds, quantized to 10 ms. Fallback only.
-///
-/// Fields 14 and 15 of `/proc/self/stat`, in clock ticks. Parsed after the
-/// **last** `)` because `comm` may contain spaces and parentheses — the same
-/// trap `docs/PHASE2.md` §5.1 documents for field 22.
+/// Parsed after the last `)` because `comm` may contain parentheses
+/// (`docs/PHASE2.md` §5.1).
 fn stat_cpu_ns() -> u64 {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
         return 0;
@@ -419,13 +306,8 @@ fn stat_cpu_ns() -> u64 {
     (utime + stime) * 10_000_000
 }
 
-/// Proportional set size of this process, in KiB.
-///
-/// `pub` rather than `pub(crate)` since `bin/frozen_workers.rs` — a separate
-/// crate target — is what reports PHASE5 §12 gate 4, and Pss summed over live
-/// workers *is* that gate. Pss and not RSS: summed across N processes it gives
-/// total unique bytes, the only accounting under which "16 workers share one
-/// arena" means anything.
+/// Proportional set size of this process, in KiB. `pub` because
+/// `bin/frozen_workers.rs` reports PHASE5 §12 gate 4 as Pss summed over workers.
 pub fn self_pss_kib() -> u64 {
     let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") else {
         return 0;
@@ -443,17 +325,10 @@ pub fn self_pss_kib() -> u64 {
 }
 
 // ---- machine-quiet accounting ------------------------------------------
-//
-// Every latency number in this harness is a measurement of the *scheduler* as
-// much as of the engine, so a row taken while something else was running is not
-// a slightly-worse number — it is a different experiment. The check below
-// exists because the first run of `mp_bench` was taken against a machine
-// carrying an unrelated 600%-CPU job, and nothing in the output said so.
+// A row taken while something else was running is a different experiment.
 
-/// System-wide busy fraction, sampled from `/proc/stat`.
-///
-/// Returns the proportion of CPU time across all cores that was **not** idle
-/// over `window`. 0.0 is a perfectly quiet machine; 1.0 is every core saturated.
+/// System-wide busy fraction from `/proc/stat` over `window`: 0.0 is quiet,
+/// 1.0 is every core saturated.
 #[must_use]
 pub fn busy_fraction(window: Duration) -> f64 {
     let Some((idle0, total0)) = cpu_jiffies() else {
@@ -485,17 +360,12 @@ fn cpu_jiffies() -> Option<(u64, u64)> {
     Some((idle, v.iter().sum()))
 }
 
-/// Busy fraction above which a measurement is not worth taking.
-///
-/// The harness's own load — n consumers at 100 Hz doing microseconds of work —
-/// is a fraction of one core, so anything above this is somebody else.
+/// Busy fraction above which a measurement is not worth taking; the harness's
+/// own load is a fraction of one core.
 pub const QUIET_ENOUGH: f64 = 0.10;
 
-/// Refuse to measure on a busy machine, naming what is running.
-///
-/// Overridable with `TF_TREE_BENCH_FORCE=1`, which is deliberately awkward: the
-/// override exists for someone who knows the load is irrelevant, not as a way
-/// past an inconvenient check.
+/// Refuse to measure on a busy machine, naming what is running. Overridable
+/// with `TF_TREE_BENCH_FORCE=1`.
 ///
 /// # Errors
 ///
@@ -574,14 +444,11 @@ mod tests {
         assert_eq!(h.max(), 1_000_000);
     }
 
-    /// `fraction_below` sees the shape a quantile cannot: bimodality.
+    /// `fraction_below` sees bimodality (30% of samples at composed speed, 70% a
+    /// decade slower).
     ///
-    /// The fixture is the distribution `dds_report` exists to describe — 30% of
-    /// samples at composed speed, 70% a decade slower.
-    ///
-    /// Mutant: `if Self::bucket_floor(i) > ns` (`>=` → `>`) in
-    /// `fraction_below`. The exact-boundary case below then counts the bucket
-    /// holding 1000 itself and reports 0.4 where 0.3 is true.
+    /// Mutant: `>=` → `>` in `fraction_below`; the exact-boundary case then
+    /// reports 0.4 where 0.3 is true.
     #[test]
     fn fraction_below_reports_the_fast_mode_a_quantile_hides() {
         let mut h = Histogram::new();
@@ -686,13 +553,8 @@ mod tests {
         );
     }
 
-    /// The counter must resolve less than one 10 ms clock tick.
-    ///
-    /// Monotonicity above is satisfied by a counter that is always zero, which
-    /// is exactly what `utime + stime` gives for this workload: the whole
-    /// `CPU %/node` column then prints `0.0`, indistinguishable from the O(1)
-    /// claim holding (see `self_cpu_ns`). Spin for a few milliseconds and
-    /// require the reading to see it.
+    /// The counter must resolve less than one 10 ms clock tick (a counter that
+    /// is always zero satisfies monotonicity; see `self_cpu_ns`).
     #[test]
     fn cpu_time_resolves_below_one_clock_tick() {
         if !std::path::Path::new("/proc/self/schedstat").exists() {
@@ -723,24 +585,17 @@ mod tests {
     }
 
     /// A thread's CPU must not vanish from the reading when the thread is
-    /// joined.
+    /// joined (`self_cpu_ns` cross-check).
     ///
-    /// `task/*` lists live threads only, so the exact instrument collapses here
-    /// and the cross-check in `self_cpu_ns` is what catches it.
-    ///
-    /// Mutant: delete the `if any { return stat_ns; }` arm in `self_cpu_ns`
-    /// (so the task sum is returned unconditionally) — verified to fail this
-    /// test, reporting ~0 s of CPU for ~0.4 s burned.
+    /// Mutant: delete the `if any { return stat_ns; }` arm; the test then
+    /// reports ~0 s for ~0.4 s burned.
     #[test]
     fn cpu_time_survives_a_thread_exiting() {
         if !std::path::Path::new("/proc/self/schedstat").exists() {
             return;
         }
-        // 200 ms of wall clock per thread, asserted at 100 ms of CPU total —
-        // a 4x margin, because on a CPU-quota'd container or a single-vCPU host
-        // two spinning threads do not collectively receive 400 ms of CPU in
-        // 200 ms of wall clock, and the post-join reading floors to 10 ms ticks.
-        // The mutant this test targets reports ~0.34 ms, so 4x still kills it.
+        // 200 ms wall per thread, asserted at 100 ms CPU total: a quota'd host
+        // does not give two threads 400 ms, and the mutant reports ~0.34 ms.
         let burn = Duration::from_millis(200);
         let before = ProcStats::read();
         let hs: Vec<_> = (0..2)

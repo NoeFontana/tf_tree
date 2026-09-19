@@ -1,33 +1,16 @@
-//! One consumer node in the multi-process evaluation.
+//! One consumer node in the multi-process evaluation: wake at a fixed rate, do a
+//! small burst of lookups, sleep (see `mp.rs` for why a tight loop is wrong).
 //!
-//! Models what a robotics node actually does: wake at a fixed rate, do a small
-//! burst of lookups, go back to sleep. Not a tight loop — see `mp.rs` for why
-//! that measures the wrong thing and hides the tail.
+//! Two engines, selected by argv, same schedule and measurement code:
 //!
-//! Two engines, selected by argv so the same schedule, the same query mix and
-//! the same measurement code drive both:
+//! * `tf_tree` attaches to the shared arena on stdin (`shm_util`).
+//! * `tf2` has its own private `tf2::BufferCore` loaded with the identical stream:
+//!   tf2's **best case** (no DDS, no deserialization), a **floor** that must be
+//!   labelled as one. Across processes the transport **is** tf2's mechanism, so
+//!   excluding it understates tf2's cost by a `TransformListener` and its fan-out.
 //!
-//! * `tf_tree` — attaches to the shared arena on stdin (`shm_util`).
-//! * `tf2` — its own private `tf2::BufferCore`, loaded with the identical
-//!   stream. This is tf2's **best case**: no DDS, no deserialization, just the
-//!   per-process memory and CPU duplication that having no shared arena forces.
-//!   A real `tf2_ros` consumer additionally pays the transport (§ below).
-//!
-//! Emits one histogram line plus CPU and PSS on stdout for the coordinator.
-//!
-//! # What the `tf2` mode does and does not represent
-//!
-//! It is a **floor**, and it must be labelled as one wherever it is reported.
-//! Every other benchmark in this repo deliberately excludes middleware, because
-//! for a single-process library-vs-library comparison DDS would measure the
-//! transport rather than the engine. That reasoning does not survive the
-//! multi-process question: across processes, the transport **is** tf2's
-//! mechanism — there is no other way for a second process to obtain the tree.
-//! So excluding it here understates tf2's real cost, and the honest presentation
-//! is to measure this floor *and* say plainly that the deployed number is worse
-//! by the cost of a `TransformListener` and its DDS fan-out.
-// stdout is this binary's protocol with the coordinator; stderr carries its
-// usage errors, which must not land in that stream.
+//! Emits one histogram line plus CPU and PSS on stdout.
+// stdout is the coordinator protocol; usage errors go to stderr.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -66,21 +49,12 @@ fn main() {
     }
 }
 
-/// Report the measurement in the coordinator's line protocol.
+/// Report the measurement in the coordinator's line protocol, with two clocks:
 ///
-/// **Two clocks, because they answer different questions and only one of them
-/// is about the engine.**
-///
-/// * `cycle` — intended tick time to completion. What the node experiences, and
-///   the number a control loop lives with. At 100 Hz it is dominated by
-///   `sleep` granularity and scheduler wakeup: ~75 us of it is the OS deciding
-///   to run you, against ~2 us of actual work.
-/// * `service` — first instruction of the burst to its last. What the engine
-///   costs. This is the column a comparison between two engines belongs in.
-///
-/// Reporting only the first would have made both engines look identical and
-/// excellent; reporting only the second would hide the fact that a node's real
-/// latency is mostly not up to the engine at all.
+/// * `cycle`: intended tick time to completion, what the node experiences;
+///   dominated by scheduler wakeup at 100 Hz.
+/// * `service`: first instruction of the burst to its last, what the engine costs;
+///   the column a two-engine comparison belongs in.
 fn report(cycle: &Histogram, service: &Histogram, before: ProcStats, after: ProcStats) {
     let d = after.since(before);
     println!("cycle {}", cycle.encode());
@@ -89,11 +63,8 @@ fn report(cycle: &Histogram, service: &Histogram, before: ProcStats, after: Proc
     println!("pss_kib {}", d.pss_kib);
 }
 
-/// Stamps for tick `t`: a 100 ms trailing window, the §11.2 query mix's shape.
-///
-/// Recomputed per tick from a moving "now" so the consumer keeps chasing fresh
-/// data rather than re-reading one warm slot — which would measure the branch
-/// predictor rather than the engine.
+/// Stamps for tick `t`: a 100 ms trailing window (the §11.2 mix), recomputed from
+/// a moving "now" so the consumer does not re-read one warm slot.
 fn stamps_for(tick: u64, out: &mut [i64]) {
     let now = fixture::NOW_NS - (tick as i64 % 1000) * 1_000_000;
     for (i, s) in out.iter_mut().enumerate() {
@@ -120,8 +91,7 @@ fn run_tf_tree(hz: f64, seconds: f64) {
     let mut stamps = [0i64; LOOKUPS_PER_TICK];
     let ticks = (hz * seconds) as u64;
 
-    // Warm the plan and the pages before the clock starts; the first-touch cost
-    // is a separate measurement (`docs/PHASE2.md` §7.1), not part of steady state.
+    // Warm plan and pages first; first-touch is `docs/PHASE2.md` §7.1's.
     {
         let guard = tree.guard();
         stamps_for(0, &mut stamps);
@@ -137,8 +107,7 @@ fn run_tf_tree(hz: f64, seconds: f64) {
         let due = rate.next_due();
         let started = Instant::now();
         stamps_for(tick, &mut stamps);
-        // A fresh guard per tick: that is what a node does, and it is where the
-        // topology generation is pinned.
+        // A fresh guard per tick, as a node does; this pins the topology generation.
         let guard = tree.guard();
         let mut acc = 0.0f64;
         for &ns in &stamps {
@@ -149,8 +118,7 @@ fn run_tf_tree(hz: f64, seconds: f64) {
         }
         black_box(acc);
         let done = Instant::now();
-        // Measured from when the tick was *due*, so a consumer that was still
-        // busy records the backlog instead of hiding it.
+        // Measured from when the tick was *due*, so backlog is recorded.
         cycle.record(done.duration_since(due).as_nanos() as u64);
         service.record(done.duration_since(started).as_nanos() as u64);
     }
@@ -167,9 +135,8 @@ mod tf2_mode {
     use tf_tree_tf2_sys::FrameName;
 
     pub fn run(hz: f64, seconds: f64) {
-        // Each consumer builds its **own** buffer from the identical stream.
-        // That duplication is the point of the measurement: it is what having no
-        // shared arena costs, in memory and in the CPU spent filling it.
+        // Each consumer builds its **own** buffer: that duplication is what having no
+        // shared arena costs.
         let fixture = Tf2Fixture::load().expect("load tf2 fixture");
         let target = FrameName::new("imu_link").expect("imu_link");
         let source = FrameName::new("map").expect("map");

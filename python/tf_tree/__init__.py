@@ -1,46 +1,24 @@
-"""tf_tree — a transform tree engine.
+"""tf_tree — a faster, more scalable transform tree engine than ROS ``tf2``.
 
-A faster, more scalable alternative to ROS ``tf2``.
-
-Two things surprise people, and both are deliberate:
-
-**Stamps are integer nanoseconds.** There is no float-seconds overload. At a
-2026 epoch the ULP of ``float64`` seconds is 238 ns, so *every* interval in a
-1 kHz stream is wrong after a round trip. :func:`from_sec` exists for callers
-who genuinely have float seconds and accept the loss.
+**Stamps are integer nanoseconds.** There is no float-seconds overload (``float64``
+seconds cannot represent 1 kHz intervals at a 2026 epoch). :func:`from_sec` is
+the lossy escape hatch.
 
 **Nothing returns a view into shared memory.** An edge's samples are a ring
-being overwritten by another process, and correct reads go through a seqlock;
-an array pointing into it would be a data race by construction. "Zero-copy"
-here means no *intermediate* allocation — results are written once, into their
-final home. Use :meth:`Plan.at_into` to supply that home yourself.
+overwritten by another process; results are copied once into their final home.
+Use :meth:`Plan.at_into` to supply that home yourself.
 
-**A query carries a time domain, and it defaults to zero.** Edges are stamped
-with the clock that produced them (``SYSTEM_DOMAIN``, ``SENSOR_DOMAIN``,
-``SIM_DOMAIN``, ``STEADY_DOMAIN``, or an integer a driver declared for itself),
-and a stamp from one clock cannot address an edge sampled on another. So a tree
-under ``use_sim_time`` is read with ``tree.plan(target, source,
-domain=tf_tree.SIM_DOMAIN)``; the default is ``SYSTEM_DOMAIN``, which is right
-for a wall-clock arena and refused — loudly, at ``plan()`` — for any other. It
-is *not* ``tf_tree.open(domain=...)``, which selects which arena to attach to.
+**A query carries a time domain, default ``SYSTEM_DOMAIN``.** A stamp from one
+clock cannot address an edge sampled on another, and a mismatch is refused at
+``plan()``. Read a ``use_sim_time`` tree with
+``tree.plan(target, source, domain=tf_tree.SIM_DOMAIN)``. This is not
+``tf_tree.open(domain=...)``, which selects the arena.
 
-**Identifying a build.** A benchmark number or a bug report has to say which
-build produced it, and three values do that::
-
-    tf_tree.__version__                     # the extension build, as a str
-    tf_tree.arena_format_version()          # the header's set of fields
-    f"0x{tf_tree.arena_layout_hash():08X}"  # the geometry, as tft prints it
-
-They are three because they fail independently: the right version can still
-refuse to attach, because the arena it was pointed at was written by a
-different geometry. The last two are what every participant compares on attach.
-
-``__version__`` is compiled in from ``crates/tf_tree_py/Cargo.toml``, and it is
-*not* the canonical answer for the wheel: ``importlib.metadata.version`` is,
-and it reads ``pyproject.toml``. ``tests/python/test_version.py`` asserts the
-two agree, so a disagreement is a stale wheel or a half-applied bump rather
-than two right answers — which is the attribution this whole trio exists to
-get right.
+**Identifying a build.** ``tf_tree.__version__`` (extension build),
+``tf_tree.arena_format_version()`` (header fields) and
+``tf_tree.arena_layout_hash()`` (geometry) fail independently.
+``importlib.metadata.version`` is the canonical wheel version;
+``tests/python/test_version.py`` asserts the two agree.
 """
 
 from ._core import (
@@ -78,24 +56,14 @@ from ._core import (
     push,
 )
 
-# `BufferError` is public — `tf_tree.BufferError` — and kept out of `__all__`
-# below, so `from tf_tree import *` does not shadow the builtin of the same
-# name. They are unrelated classes: `tf_tree.BufferError` subclasses
-# `TfTreeError` only, and a resized exported `bytearray` raises the builtin one,
-# which a star-importer's bare `except BufferError` stopped catching for as long
-# as the name was in `__all__`. The redundant alias is `__version__`'s reason
-# below: without it, a name absent from `__all__` is F401 to ruff and private to
-# a downstream strict type checker (`reportPrivateImportUsage`).
+# `BufferError` is public but kept out of `__all__` so a star-import does not
+# shadow the builtin. The redundant alias marks a re-export (F401,
+# `reportPrivateImportUsage`).
 from ._core import (
     BufferError as BufferError,
 )
 
-# Its own statement, and the redundant alias is not a typo. `__version__` is
-# deliberately absent from `__all__` (the note below it says why), so the alias
-# is what marks it as re-exported — without it ruff reports F401 and a type
-# checker treats the name as private to this module. ruff's isort keeps aliased
-# imports in a separate statement from plain ones, which is why it is down here
-# rather than inside the first block.
+# Separate statement: ruff isort keeps aliased imports apart.
 from ._core import (
     __version__ as __version__,
 )
@@ -135,19 +103,10 @@ __all__ = [
     "push",
 ]
 
-# `__version__` is deliberately absent from `__all__` above. It is not an
-# oversight and not a style call: `tests/python/test_stubs.py` asserts `__all__`
-# equals the package's public namespace, and it computes that namespace by
-# skipping underscore-prefixed names — so listing the dunder here would make
-# those two sets differ by exactly this name. `from tf_tree import *` binding a
-# `__version__` is not something anyone wants either.
+# `__version__` is absent from `__all__`: `tests/python/test_stubs.py` compares
+# `__all__` to the public namespace, which skips underscore names.
 
-# `open` is `open_arena` under the spelling §4.1 promises, `tf_tree.open()`, and
-# like `BufferError` it is deliberately absent from `__all__`. This comment said
-# the shadowing was "inside this module only" while `"open"` sat in `__all__`,
-# so `from tf_tree import *` rebound every star-importer's `open` and
-# `open("notes.txt")` raised `TypeError: open_arena() takes 0 positional
-# arguments`. It still shadows the builtin inside this module, which calls
-# neither. No alias is needed: it is assigned here rather than imported, so
-# neither ruff nor a type checker reads it as an unused import.
+# `open` is `open_arena` under the spelling §4.1 promises. It is absent from
+# `__all__` so a star-import does not rebind the builtin; it shadows it only in
+# this module.
 open = open_arena  # noqa: A001

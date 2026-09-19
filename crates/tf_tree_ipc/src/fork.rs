@@ -1,73 +1,28 @@
-//! Fork detection — one relaxed load, and a counter the kernel bumps for us.
+//! Fork detection — one relaxed load of a counter `pthread_atfork` bumps in the child.
 //!
-//! # The problem this exists for
+//! A shared arena is mapped `MADV_DONTFORK` (`docs/PHASE2.md` §7.3), so a fork
+//! child has no mapping where the arena was, yet inherits the parent's `Tree`
+//! and its destructors. Two of those release OFD locks on inherited
+//! descriptions, which frees the *parent's* claim lease and ownership byte.
+//! The child must therefore be able to tell it is the child with no syscall
+//! (`getpid` is a real syscall, and a cached pid is only checked when called).
 //!
-//! A `tf_tree` shared arena is mapped `MADV_DONTFORK` (`docs/PHASE2.md` §7.3),
-//! so a `fork()` child gets **no mapping at all** where the arena used to be.
-//! Every `&`-reference the parent's `Tree` holds into that region is dangling in
-//! the child the instant `fork` returns. Nothing in the child *observes* that:
-//! the `Tree` value is byte-for-byte identical, the pointers still look like
-//! pointers, and the first read is a `SIGSEGV` with no diagnostic attached.
-//!
-//! Worse, the child does not have to *do* anything. `Tree`, `ClaimLease` and
-//! `Attachment` all have destructors, and the child runs them at scope exit —
-//! including on the `os._exit`-less path that `multiprocessing` takes. Two of
-//! those destructors release **OFD locks on inherited descriptions**, and an OFD
-//! lock is owned by the open file description, not the process: unlocking from
-//! the child releases the *parent's* claim lease and the *parent's* ownership
-//! byte. That is a silent, remote failure — the parent keeps publishing onto an
-//! edge a reaper is now free to hand to somebody else.
-//!
-//! So the child must be able to tell that it is the child, cheaply, at any
-//! point, with no syscall.
-//!
-//! # Why a counter and not `getpid()`
-//!
-//! `getpid` on Linux is a real syscall, not a vDSO call — roughly 50–100 ns
-//! against `PHASE1.md` §11's 150 ns p50 lookup budget, which would be a
-//! measurable tax on every lookup forever. It is also *insufficient*: a cached
-//! pid can only be compared when something calls, so a fork that happens while
-//! no call is in flight leaves a `Tree` that has never been re-validated.
-//!
-//! `pthread_atfork`'s child handler runs **in the child, inside `fork`**, before
-//! the child can execute any user code. So by the time anything can observe the
-//! `Tree`, the counter has already moved. Reading it is a relaxed load of a
-//! process-local static: a few nanoseconds, no fence, no syscall.
-//!
-//! # Ordering
-//!
-//! `Relaxed` is correct and is not a shortcut. The child of a `fork` is a fresh
-//! single-threaded process whose memory is a snapshot taken at the fork point,
-//! and the handler runs in that child before it returns from `fork` — so the
-//! bump *happens-before* every subsequent operation in the child by program
-//! order alone. There is no inter-thread edge to establish and nothing for an
-//! `Acquire` to synchronize with.
+//! `Relaxed` is correct: the handler runs in the fresh single-threaded child
+//! before `fork` returns, so the bump happens-before everything the child does
+//! by program order.
 //!
 //! # SAFETY (module invariant)
 //!
-//! The single `unsafe` block calls `pthread_atfork` with a `child` handler
-//! that is an `extern "C" fn` with no arguments and no return value, and no
-//! `prepare` or `parent` handler. The handler is a `'static` item, so the
-//! pointer the C library retains for the lifetime of the process is always
-//! valid. Its body is a single `fetch_add` on a `static AtomicU64`, which is
-//! async-signal-safe and lock-free on every architecture this crate supports —
-//! the standing requirement for an atfork handler, which may run with arbitrary
-//! locks held by other threads. It allocates nothing and can neither panic nor
-//! unwind across the FFI boundary.
+//! The single `unsafe` block registers a `'static` `extern "C" fn()` child
+//! handler (no `prepare`/`parent`), so the pointer the C library retains stays
+//! valid. Its body is one `fetch_add` on a `static AtomicU64`: async-signal-safe,
+//! lock-free, allocation-free, cannot panic or unwind across the FFI boundary.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 
-// `libc` 0.2.189 declares `pthread_atfork` for the BSDs, Haiku, AIX, Cygwin and
-// newlib — but **not** for `linux_like`. So it is declared here.
-//
-// `ofd.rs` argues at length against hand-maintaining an ABI, and that argument
-// does not apply to this one. What made `fcntl(F_OFD_*)` the wrong thing to
-// hand-roll was `struct flock`: a layout that differs between 32- and 64-bit,
-// with command numbers that are renumbered on sparc and hppa. `pthread_atfork`
-// has no struct in its signature at all. It is three nullable function pointers
-// and an `int`, fixed by POSIX.1-2001, identical on every platform that has it.
-// There is nothing here that can drift.
+// `libc` declares `pthread_atfork` for the BSDs but not `linux_like`. Its
+// signature has no struct (unlike `fcntl(F_OFD_*)`), so it cannot drift.
 unsafe extern "C" {
     fn pthread_atfork(
         prepare: Option<extern "C" fn()>,
@@ -84,26 +39,17 @@ static ARMED: Once = Once::new();
 
 /// The `pthread_atfork` child handler.
 ///
-/// Deliberately the smallest thing that can be written: an atfork handler runs
-/// in a child that may have forked while another thread held the allocator lock,
-/// so anything that could allocate or take a lock can deadlock here. A
-/// `fetch_add` on a `static` does neither.
+/// Must not allocate or take a lock: the child may have forked while another
+/// thread held the allocator lock.
 extern "C" fn after_fork_in_child() {
     FORK_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Install the fork handler. Idempotent, and cheap enough to call from any
-/// constructor.
+/// Install the fork handler. Idempotent.
 ///
-/// Call this **before** any `fork` can happen — from wherever a shared mapping
-/// is established. Arming lazily on first *use* would be too late: the fork that
-/// matters may already have happened, and the counter would read 0 in both
-/// processes.
-///
-/// A failure to register is swallowed. `pthread_atfork` fails only with
-/// `ENOMEM`, at which point the process has larger problems than fork detection,
-/// and the alternative — refusing to open the arena — would turn a
-/// nearly-impossible allocation failure into a hard outage.
+/// Call this **before** any `fork` can happen, from wherever a shared mapping
+/// is established; arming on first use is too late. A registration failure
+/// (`ENOMEM` only) is swallowed.
 pub fn arm() {
     ARMED.call_once(|| {
         // SAFETY: see the module invariant above. `after_fork_in_child` is a
@@ -115,9 +61,9 @@ pub fn arm() {
 
 /// The current fork generation of this process.
 ///
-/// Capture it alongside anything that holds a shared mapping or an OFD lock, and
-/// compare before using that thing. A difference means "this value belongs to a
-/// process that no longer exists" — see [`arm`].
+/// Capture it alongside anything holding a shared mapping or an OFD lock and
+/// compare before use; a difference means the value belongs to another process
+/// — see [`arm`].
 #[inline]
 #[must_use]
 pub fn generation() -> u64 {
@@ -128,9 +74,7 @@ pub fn generation() -> u64 {
 mod tests {
     use super::*;
 
-    /// In the parent — the process running this test — the generation never
-    /// moves on its own. If this ever fails, something is calling the handler
-    /// outside a fork.
+    /// The generation never moves in the parent.
     #[test]
     fn the_generation_is_stable_without_a_fork() {
         arm();
@@ -141,17 +85,9 @@ mod tests {
         assert_eq!(generation(), before);
     }
 
-    /// The real behaviour is only observable across a `fork`, which needs
-    /// `unsafe` and a child process; `docs/decisions/0005` records that
-    /// exception exactly once, for `crates/tf_tree_bench/src/bin/fork_child.rs`,
-    /// and this workspace has no second `fork()` — which is why there is no
-    /// arming test here at all. That child captures [`generation`] before the
-    /// fork and asserts it moved by **exactly one** afterwards, and that is what
-    /// pins the `Once` in [`arm`]: a handler registered twice bumps by two,
-    /// which is still merely "different" and would satisfy any weaker check,
-    /// while an `arm` that registered nothing would bump by zero. Both fail that
-    /// child loudly, with their own exit status. This test records the link so
-    /// the coverage is findable from here.
+    /// The cross-fork behaviour (the counter moves by exactly one, pinning the
+    /// `Once` in [`arm`]) is asserted by `crates/tf_tree_bench/src/bin/fork_child.rs`
+    /// (`docs/decisions/0005`); this records the link.
     #[test]
     fn the_cross_fork_behaviour_is_tested_elsewhere() {
         assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

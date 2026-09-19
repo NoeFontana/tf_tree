@@ -1,22 +1,16 @@
 //! Child process for the multi-process integration test and benchmark.
 //!
-//! Attaches to a shared arena over an **inherited file descriptor** and reads
-//! from it. The parent runs the writer; this process runs the Phase 1 reader,
-//! completely unmodified — which is the whole claim of `docs/PHASE2.md` §4.
+//! Attaches to a shared arena over an **inherited file descriptor** (standard
+//! input; see `shm_util::spawn_attached`) and runs the Phase 1 reader unmodified,
+//! which is `docs/PHASE2.md` §4's claim. Argument 1 selects the mode:
 //!
-//! The segment arrives as this process's **standard input** (see
-//! `shm_util::spawn_attached` for why that transport and not `SCM_RIGHTS`).
-//! Argument 1 selects the mode:
-//!
-//! * `verify <target> <source> <ns> <count>` — print one line per lookup,
-//!   `ok <bits...>` or `err`, so the parent can compare bit-for-bit against its
-//!   own answers.
-//! * `bench <target> <source> <count>` — time `count` lookups and print
+//! * `verify <target> <source> <ns> <count>`: one line per lookup, `ok <bits...>`
+//!   or `err`, for bit-for-bit comparison by the parent.
+//! * `bench <target> <source> <count>`: time `count` lookups and print
 //!   `ns_per_lookup <f64>` plus the process's own RSS.
 //!
-//! Output is line-oriented on stdout because the parent parses it; anything
-//! diagnostic goes to stderr.
-// This binary's stdout IS its protocol — the parent parses it line by line.
+//! Output is line-oriented on stdout (parsed by the parent); diagnostics go to stderr.
+// stdout IS the protocol; the parent parses it line by line.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -34,16 +28,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args[1].as_str();
 
-    // The parent installed the segment as our stdin. Duplicating it to an
-    // `OwnedFd` needs no `unsafe` and leaves fd 0 itself untouched.
+    // The parent installed the segment as stdin; duplicate it to an `OwnedFd`.
     let fd = std::io::stdin()
         .as_fd()
         .try_clone_to_owned()
         .expect("duplicate the segment from stdin");
 
-    // ReadOnly on purpose: this process only reads, so it maps PROT_READ and
-    // the MMU makes it structurally incapable of corrupting the arena. That is
-    // the boundary `docs/PHASE2.md` §0 says consumers should default to.
+    // ReadOnly on purpose: PROT_READ makes corrupting the arena structurally
+    // impossible (`docs/PHASE2.md` §0).
     let tree = Tree::attach_shared(fd, AttachMode::ReadOnly).expect("attach shared arena");
     assert!(tree.is_shared(), "attached tree reports itself heap-backed");
 
@@ -93,11 +85,8 @@ fn bench(tree: &Tree, target: &str, source: &str, count: usize) {
     let plan = tree.plan(t, s).expect("plan");
     let guard = tree.guard();
 
-    // A 100 ms window, matching `footprint::window_stamp` and every other
-    // latency row. The obvious `(k % 100_000) * 1_000` over `k < 4096` leaves
-    // the modulo inert and spans only 4 ms — about four samples of the 1 kHz
-    // edge — which measures a cache- and branch-predictor best case rather than
-    // the intended window. `cost_model`'s own header warns about exactly this.
+    // A 100 ms window, as `footprint::window_stamp`; `(k % 100_000) * 1_000` over
+    // `k < 4096` spans only 4 ms (`cost_model`'s header warns of it).
     const WINDOW_NS: i64 = 100_000_000;
     let stamps: Vec<i64> = (0..4096)
         .map(|k: i64| tf_tree_bench::fixture::NOW_NS - k * (WINDOW_NS / 4096))
@@ -123,12 +112,8 @@ fn bench(tree: &Tree, target: &str, source: &str, count: usize) {
     println!("rss_kib {}", rss_kib());
 }
 
-/// Resident set size of this process, in KiB, from `/proc/self/statm`.
-///
-/// This is the number that matters for the multi-process comparison: it counts
-/// what this process actually has resident, and a `MAP_SHARED` arena is resident
-/// *once* no matter how many processes map it — which `/proc/self/statm` alone
-/// cannot show, so the parent reports the system-wide figure too.
+/// Resident set size in KiB from `/proc/self/statm`; a `MAP_SHARED` arena is
+/// resident once however many map it, so the parent reports the system-wide figure too.
 fn rss_kib() -> u64 {
     let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
     let pages: u64 = s

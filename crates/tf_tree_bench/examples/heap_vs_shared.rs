@@ -1,10 +1,7 @@
 //! Same topology, same stamps, same process: heap arena against shared arena.
 //!
-//! The Python multi-process benchmark reported ~2.7 us per lookup where the
-//! in-process figure is ~0.17 us, and the Rust `mp_bench` reports ~2 us for its
-//! own fixture. Two languages seeing the same thing says it is not the binding.
-//! This isolates the one remaining variable — which arena the bytes live in —
-//! with everything else held fixed.
+//! Python's multi-process benchmark reported ~2.7 us per lookup against ~0.17 us in-process, and
+//! Rust's `mp_bench` ~2 us; this isolates the one remaining variable, which arena the bytes live in.
 //! # What it found
 //!
 //! ```text
@@ -19,29 +16,15 @@
 //! which `relocation.rs` proves for *correctness*, holds for latency too — and a
 //! concurrent cross-core publisher at 100 Hz costs 0.7 ns.
 //!
-//! # This example cannot carry the mapping claim, and should not be cited for it
+//! # This example cannot carry the mapping claim
 //!
-//! The conclusion above is right, but the measurement under it has
-//! `docs/decisions/0013`'s defect. It queries the single stamp `1_500_000_000`
-//! against samples laid down at `1_000_000 + i * 1_000_000` — an **exact grid
-//! hit** at `i = 1499` — so `SampleRing::sample` takes its exact-hit branch,
-//! `I::eval` never runs, and all four rows are `bracket` plus a seqlock read.
-//! A mapping, if it costs anything, costs it on the loads the interpolation
-//! issues; this never issues them. The 51 ns figures are also far below the
-//! ~200 ns the §11.1 fixture measures off-grid, which is the tell.
+//! It queries one stamp that is an **exact grid hit**, so `I::eval` never runs and all four rows are
+//! `bracket` plus a seqlock read (`docs/decisions/0013`'s defect). `src/backing.rs` (`just abi-split`)
+//! is the off-grid, paired measurement that carries it; this is kept for the read-only attached and
+//! concurrent-writer rows.
 //!
-//! **`crates/tf_tree_bench/src/backing.rs` is the measurement that carries it**
-//! (`just abi-split`): the §11.1 fixture, off-grid, paired and interleaved,
-//! reporting the shared mapping at <= 9.6 ns worst-case over nine runs, ~1.8 ns
-//! typically. This example is retained for the two rows that one does not
-//! cover: the read-only *attached* mapping, and the concurrent-writer row.
-//!
-//! So the ~2.7 us a Python consumer sees in the multi-process benchmark is the
-//! **deployment environment**: separate processes, descheduled between ticks,
-//! reading through caches that another process has been evicting. It is not the
-//! arena, not concurrency, and not the binding (which adds ~120 ns). There is no
-//! engine headroom left to spend on that number, which is also why tf2 pays the
-//! same environmental cost and the ratio survives it.
+//! The ~2.7 us a Python consumer sees is the deployment environment (separate processes, descheduled,
+//! evicted caches), not the arena, concurrency, or the binding (~120 ns).
 #![allow(missing_docs, clippy::unwrap_used, clippy::print_stdout)]
 use std::time::Instant;
 use tf_tree::{
@@ -107,13 +90,10 @@ fn main() {
     let ro = Tree::attach_shared(fd, AttachMode::ReadOnly).unwrap();
     time(&ro, "shared arena (ro, attached)");
 
-    // The one variable left. A concurrent writer's stores invalidate the lines a
-    // reader holds; a thread on another core is enough to produce that, and it
-    // isolates coherence traffic from anything cross-process.
+    // A thread on another core suffices for coherence traffic.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // 100 Hz only. At 10 kHz into a 4096-slot ring the writer laps the reader
-    // mid-read and `at` correctly returns `SlotRecycled` — which is the ring
-    // protocol working, not a latency number, so it is not reported as one.
+    // 100 Hz only: at 10 kHz the writer
+    // laps the reader and `at` correctly returns `SlotRecycled`.
     {
         let (label, hz) = ("100 Hz", 100u64);
         let flag = std::sync::Arc::clone(&stop);

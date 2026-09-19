@@ -4,13 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "transform_tree"
-# The wheel's version, and a hand-kept copy of `[workspace.package] version` in
-# the root `Cargo.toml`, which carries the argument for the number. maturin
-# reads it from here rather than from `crates/tf_tree_py/Cargo.toml`, so this is
-# the one users see — but the two must agree, because a wheel and a crate that
-# disagree about their version are two artifacts nobody can pair up.
-#
-# `CHANGELOG.md`'s versioning preamble says what `0.0.x` means to Python.
+# Hand-kept copy of `[workspace.package] version` in the root `Cargo.toml`;
+# maturin reads it from here, and the two must agree.
 version = "0.0.5"
 description = "A transform tree engine — faster and more scalable than ROS tf2"
 readme = "README.md"
@@ -28,8 +23,7 @@ classifiers = [
 dependencies = ["numpy>=2.2.6"]
 
 [dependency-groups]
-# Floors from `docs/PHASE3.md` §10.1. Each is there for a reason recorded in
-# that section, not merely because it is current.
+# Floors and their reasons: `docs/PHASE3.md` §10.1.
 dev = ["maturin>=1.14.1,<2.0", "pytest>=9.1.1", "ruff>=0.16.2", "pyright>=1.1.411"]
 
 [tool.maturin]
@@ -38,18 +32,8 @@ module-name = "tf_tree._core"
 python-source = "python"
 features = ["pyo3/extension-module"]
 strip = true
-# **The sdist declares these and would not ship them.** maturin auto-detects
-# root `LICENSE*` / `NOTICE` for PEP 639 and writes them into PKG-INFO as
-# `License-File:`, but its sdist file selection is driven by the cargo package
-# rules and never picks up files at the *workspace* root — so the tarball's root
-# held only Cargo.toml, PKG-INFO, pyproject.toml and README.md. PyPI validates
-# the pair and refuses the upload:
-#
-#   400 License-File LICENSE-APACHE does not exist in distribution
-#
-# It rejected the 0.0.2 sdist after the eleven wheels had already gone up, which
-# is why that release has wheels and no source distribution. The wheels were
-# never affected — only the sdist selection is.
+# The sdist must ship the license files it declares (PyPI rejects it otherwise);
+# maturin's sdist selection does not pick up workspace-root files.
 include = ["LICENSE-APACHE", "LICENSE-MIT", "NOTICE"]
 
 [tool.ruff]
@@ -58,14 +42,11 @@ target-version = "py310"
 extend-exclude = [".venv", "target", "dist"]
 
 [tool.ruff.format]
-# ruff 0.16 formats Python code blocks inside Markdown *by default*, and
-# `docs/` is this project's contract — its fenced blocks are line-broken to
-# make an argument and sometimes elided with `...`. See PHASE3 §10.1.
+# Keep ruff out of `docs/`' fenced blocks (PHASE3 §10.1).
 exclude = ["**/*.md"]
 
 [tool.ruff.lint]
-# Explicit, because ruff 0.16 raised the default set from 59 rules to 413 and
-# an implicit set would change under us on every upgrade (PHASE3 §10.1).
+# Explicit so an upgrade cannot change the set (PHASE3 §10.1).
 select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
 
 [tool.pytest.ini_options]
@@ -77,10 +58,8 @@ testpaths = ["tests/python"]
 include = ["python"]
 pythonVersion = "3.10"
 typeCheckingMode = "strict"
-# Without these pyright resolves nothing from the venv and reports every numpy
-# type as unknown — 12 errors that look like stub bugs and are not.
+# Without these pyright reports every numpy type as unknown.
 venvPath = "."
 venv = ".venv"
-# The extension is `.so` + `.pyi`; pyright must read the stub, not try to
-# introspect the binary.
+# Read the `.pyi`, not the `.so`.
 stubPath = "python"

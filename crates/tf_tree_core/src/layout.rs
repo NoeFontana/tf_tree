@@ -1,45 +1,16 @@
 //! Output layouts — folding a plan straight into the caller's buffer.
 //!
-//! # Why this exists
+//! [`crate::Plan::at_many`] writes `Iso3`, which matches no caller layout except
+//! [`Layout::Quat`](crate::layout::Layout) (56 bytes, `[qw qx qy qz tx ty tz]`
+//! since [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)).
+//! These kernels fold **directly into the destination** (`docs/PHASE3.md` §5.2,
+//! "zero copies"): no intermediate buffer, and no allocation for `at_many_into`.
 //!
-//! [`crate::Plan::at_many`] writes `Iso3`. A 4x4 `f64` matrix is 128 bytes and a
-//! 3x4 `f32` affine is 48, so `&mut [Iso3]` aliases neither, and a caller
-//! wanting one would have to allocate an `Iso3` buffer, evaluate into it, and
-//! then convert — two passes over the data and one allocation that exists only
-//! because the shapes disagree.
+//! The layout is matched **once**, outside the loop, so no branch sits between
+//! elements; emitters are `#[inline]` and branch-free.
 //!
-//! **One of the three now coincides, and this paragraph used to say none did.**
-//! Before [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)
-//! `Iso3` was a padded 64-byte cacheline and the argument held for every layout.
-//! It is now 56 bytes in exactly `[qw qx qy qz tx ty tz]` order — the same bytes
-//! [`Layout::Quat`](crate::layout::Layout) writes — so a `[Iso3]` and a
-//! `Quat`-layout buffer are the same memory. Nothing here changes because of
-//! that: the kernels still fold into the destination, which is what the `_into`
-//! forms are for. It is recorded because the *reason* has a hole in it now, and
-//! because it makes the `Quat` kernel a candidate for a straight copy — an
-//! optimisation with its own measurement, not smuggled into a layout change.
-//!
-//! These kernels fold **directly into the destination**. `docs/PHASE3.md` §5.2's
-//! "zero copies" is not a figure of speech: there is no intermediate buffer,
-//! and for `at_many_into` no allocation at all.
-//!
-//! # Shape of the hot loop
-//!
-//! The layout is matched **once**, outside the loop, and each arm runs its own
-//! monotone-cursor loop. That is deliberate and not duplication for its own
-//! sake: a `match` on the layout *inside* the loop would put an unpredictable
-//! branch between every element and the next, and the whole point of a batch
-//! API is that the per-element cost is a handful of nanoseconds. Emitters are
-//! `#[inline]` and branch-free — straight-line stores from an `Iso3` already in
-//! registers.
-//!
-//! # Why `f32` is only the affine layout
-//!
-//! `docs/PROJECT.md` §5 says `f64` only, and that holds for everything the
-//! engine *computes*. `Affine32` is an output *encoding* for consumers that are
-//! going to upload the result to a GPU, where `f32` is the native format and
-//! the conversion would otherwise happen anyway — one pass later, over a buffer
-//! that had to exist. Nothing reads it back.
+//! `Affine32` is an output *encoding* for GPU upload, not engine arithmetic
+//! (`docs/PROJECT.md` §5 D6, `f64` only, still holds); nothing reads it back.
 
 use tf_tree_math::{Iso3, Twist};
 
@@ -48,38 +19,25 @@ use tf_tree_math::{Iso3, Twist};
 #[non_exhaustive]
 pub enum Layout {
     /// Row-major 4x4 homogeneous matrix, `f64`. 16 elements.
-    ///
-    /// What NumPy users mean by "a transform": `(N, 4, 4)`.
     Mat4,
     /// `[qw, qx, qy, qz, tx, ty, tz]`, `f64`. 7 elements.
     ///
-    /// **Byte-for-byte the engine's own `Iso3`** since `0042` removed its
-    /// padding — same size, same order, same alignment — so this is the cheapest
-    /// layout to emit and the one to prefer when the consumer does not
-    /// specifically need a matrix. It read "minus the padding" until then.
+    /// Byte-for-byte the engine's own `Iso3` (`0042`); the cheapest to emit.
     Quat,
     /// Row-major 3x4 affine, `f32`. 12 elements.
     ///
-    /// The bottom row of a rigid transform is always `[0 0 0 1]`, so storing it
-    /// wastes a quarter of the buffer and all of the bandwidth that goes with
-    /// it. GPU-facing.
+    /// Omits the constant `[0 0 0 1]` bottom row. GPU-facing.
     Affine32,
     /// `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`, `f64`. 13 elements.
     ///
-    /// [`Layout::Quat`] with the body twist appended — angular first, matching
-    /// [`tf_tree_math::twist`]'s `[ω, v]` order and `log_se3`'s. This is how
-    /// `at_with_derivatives` reaches a batch caller (`docs/API.md` §3.3,
-    /// `docs/PHASE5.md` §4.4): **a fourth layout rather than a fourth method**,
-    /// because one variant rides the dispatch that already exists into every
-    /// binding, where a second entry point would need its own buffer validation
-    /// and its own GIL threshold for the same bytes.
+    /// [`Layout::Quat`] with the body twist appended, angular first (`[ω, v]`, as
+    /// [`tf_tree_math::twist`]). It is how `at_with_derivatives` reaches a batch
+    /// caller (`docs/API.md` §3.3, `docs/PHASE5.md` §4.4): one variant rides the
+    /// existing dispatch into every binding.
     ///
-    /// It is the one layout whose emission can *fail*: `LerpSlerp` has no exact
-    /// body twist, so an edge using it yields
-    /// [`LookupError::DerivativesUnavailable`] here exactly as it does from
-    /// `at_with_derivatives`, rather than a finite difference that would look
-    /// like an answer. A layout that quietly changed meaning per interpolator
-    /// would be the quaternion-order trap moved into the time axis.
+    /// The one layout whose emission can *fail*: `LerpSlerp` has no exact body
+    /// twist, so its edges yield [`LookupError::DerivativesUnavailable`] here as
+    /// from `at_with_derivatives`.
     ///
     /// [`LookupError::DerivativesUnavailable`]: crate::LookupError::DerivativesUnavailable
     QuatTwist,
@@ -108,13 +66,8 @@ impl Layout {
 
 /// Write `iso` as a row-major 4x4 `f64` matrix.
 ///
-/// Public because a binding needs to emit a *single* transform without paying
-/// for a batch — the scalar path in `docs/PHASE3.md` §4.2, whose budget is
-/// ~200 ns end to end.
-///
-/// The rotation is expanded from the quaternion directly rather than through a
-/// `Mat3` type: the products below are shared between entries, so doing it in
-/// one place lets the compiler keep every one of them in a register.
+/// Public so a binding can emit a *single* transform without a batch
+/// (`docs/PHASE3.md` §4.2).
 #[inline]
 pub fn write_mat4(iso: &Iso3, out: &mut [f64]) {
     let q = iso.q;
@@ -138,10 +91,7 @@ pub fn write_mat4(iso: &Iso3, out: &mut [f64]) {
     out[10] = 1.0 - 2.0 * (xx + yy);
     out[11] = iso.t.z;
 
-    // The bottom row is constant for a rigid transform. Written rather than
-    // assumed: the caller's buffer may be reused across calls, and leaving it
-    // to whatever was there before would make a stale row look like a valid
-    // projective transform.
+    // Written, not assumed: the caller's buffer may be reused.
     out[12] = 0.0;
     out[13] = 0.0;
     out[14] = 0.0;
@@ -162,20 +112,10 @@ pub fn write_quat(iso: &Iso3, out: &mut [f64]) {
 
 /// Write `iso` and `twist` as `[qw qx qy qz tx ty tz | ωx ωy ωz vx vy vz]`.
 ///
-/// The first seven elements are [`write_quat`]'s, unchanged and delegated to
-/// rather than repeated — a second copy of the quaternion order is a second
-/// place for it to be wrong, and this crate's whole argument about `w`-first is
-/// that the order must have one home.
-///
-/// The tail is `[ω, v]`, **angular first**: `tf_tree_math::twist`'s convention,
-/// which is also `log_se3`'s and `exp_se3`'s. `TFT_TWIST_BYTES` in the C ABI's
-/// unstable header already documents the same six slots in the same order, so a
-/// caller reading a `QuatTwist` row's tail and a caller reading
-/// `tft_plan_at_with_derivatives`'s `out_twist` are reading the same thing.
-///
-/// The twist is body-frame and expressed in the plan's **source** frame; see
-/// `Plan::at_with_derivatives` for why, and for the example that shows a
-/// magnitude check cannot tell the two conventions apart.
+/// The first seven elements are [`write_quat`]'s. The tail is `[ω, v]`, **angular
+/// first**, as `tf_tree_math::twist` and the C ABI's `TFT_TWIST_BYTES`. The twist
+/// is body-frame, in the plan's **source** frame (see
+/// `Plan::at_with_derivatives`).
 #[inline]
 pub fn write_quat_twist(iso: &Iso3, twist: &Twist, out: &mut [f64]) {
     write_quat(iso, out);
@@ -197,9 +137,7 @@ pub fn write_affine32(iso: &Iso3, out: &mut [f32]) {
     let (xy, xz, yz) = (x * y, x * z, y * z);
     let (wx, wy, wz) = (w * x, w * y, w * z);
 
-    // Computed in f64 and narrowed once at the store. Doing the algebra in f32
-    // would lose bits the engine went to trouble to keep, for no bandwidth
-    // saving — the buffer is the same size either way.
+    // Computed in f64, narrowed once at the store.
     out[0] = (1.0 - 2.0 * (yy + zz)) as f32;
     out[1] = (2.0 * (xy - wz)) as f32;
     out[2] = (2.0 * (xz + wy)) as f32;
@@ -225,11 +163,7 @@ mod tests {
         exp_se3([0.3, -0.2, 0.15, 1.5, -2.5, 0.75])
     }
 
-    /// A 4x4 emitted from a rotation must be orthonormal with det = +1.
-    ///
-    /// Transposing the rotation block — the classic row/column-major slip — is
-    /// still orthonormal, so this is checked against the *action* on a vector
-    /// below, not by itself.
+    /// The rotation block is orthonormal (a transpose passes; see the next test).
     #[test]
     fn mat4_rotation_block_is_orthonormal() {
         let mut m = [0.0f64; 16];
@@ -245,9 +179,7 @@ mod tests {
         assert_eq!(&m[12..16], &[0.0, 0.0, 0.0, 1.0]);
     }
 
-    /// **The orientation check.** `M * v` must equal what the engine's own
-    /// `Iso3` application gives — which is what catches a transposed rotation
-    /// block, the one error orthonormality cannot see.
+    /// `M * v` equals the engine's own `Iso3` application; catches a transpose.
     #[test]
     fn mat4_acts_on_a_point_exactly_as_the_iso_does() {
         let iso = sample();
@@ -260,8 +192,6 @@ mod tests {
             m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7],
             m[8] * v[0] + m[9] * v[1] + m[10] * v[2] + m[11],
         ];
-        // The independent reference: the engine's own quaternion rotation
-        // plus the translation. Nothing here shares code with `write_mat4`.
         let p = tf_tree_math::Vec3 {
             x: v[0],
             y: v[1],
@@ -314,17 +244,7 @@ mod tests {
         }
     }
 
-    /// **`QuatTwist`'s first seven elements are exactly `Quat`'s.**
-    ///
-    /// The pose half is the same bytes in the same order, so a consumer that
-    /// already parses a `(N, 7)` row can read a `(N, 13)` one by ignoring the
-    /// tail. Asserted bit-for-bit rather than within a tolerance: the two go
-    /// through the same emitter, and anything less than equality would mean one
-    /// of them recomputed the quaternion.
-    ///
-    /// Mutant: inline `write_quat`'s seven stores into `write_quat_twist` and
-    /// transpose any two of them ⇒ fails here while every twist assertion still
-    /// passes, because the tail is untouched.
+    /// `QuatTwist`'s first seven elements are bit-for-bit `Quat`'s.
     #[test]
     fn quat_twist_opens_with_exactly_the_quat_layout() {
         let iso = sample();
@@ -346,16 +266,8 @@ mod tests {
         }
     }
 
-    /// **The tail is `[ω, v]`, angular first** — `tf_tree_math::twist`'s order,
-    /// `log_se3`'s order, and `TFT_TWIST_BYTES`'s order.
-    ///
-    /// Swapping ω and v produces six live `f64` in six live slots and no norm
-    /// check anywhere can see it: an angular velocity in rad/s and a linear one
-    /// in m/s are both just numbers. The fixture uses values whose magnitudes
-    /// are of the same order so that "these are obviously the angular ones"
-    /// cannot rescue a consumer that got it wrong.
-    ///
-    /// Mutant: write `v` into slots 7..10 and `ω` into 10..13 ⇒ fails.
+    /// The tail is `[ω, v]`, angular first; no norm check can see a swap, so the
+    /// fixture uses same-magnitude components.
     #[test]
     fn quat_twist_tail_is_omega_then_v() {
         let twist = Twist::new(
@@ -381,10 +293,7 @@ mod tests {
         assert!(Layout::Affine32.is_f32());
         assert!(!Layout::Mat4.is_f32());
         assert!(!Layout::Quat.is_f32());
-        // `QuatTwist` is `f64` like the pose layouts, so it goes through
-        // `at_many_into` and not `at_many_into_f32`. Pinned because `is_f32` is
-        // what routes it, and a stray `true` here would send a 13-element `f64`
-        // write down the `f32` path.
+        // `is_f32` routes `QuatTwist` to `at_many_into`, not `_f32`.
         assert!(!Layout::QuatTwist.is_f32());
     }
 }

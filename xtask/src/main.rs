@@ -5,9 +5,7 @@
 //! implementation order; §10.2 and §11.3). `headers` generates and drift-checks
 //! the C ABI's committed headers (`docs/PHASE4.md` §3.1, `docs/decisions/0007`).
 //!
-//! No `miri` task: the one that used to be here returned `ExitCode::SUCCESS`
-//! having run nothing, so the only documented way to reach it was also the only
-//! way to get a false green. Miri is `just miri` and `just c-abi-check`.
+//! No `miri` task: it is `just miri` and `just c-abi-check`.
 
 mod headers;
 
@@ -28,14 +26,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Run the `tf_tree_core` concurrency model-checking suite under `--cfg loom`.
+/// Run the `tf_tree_core` model-checking suite under `--cfg loom`.
 ///
-/// Builds and runs the crate's tests with `RUSTFLAGS="--cfg loom"`, which selects
-/// the loom atomics in `crate::sync` and enables the `#[cfg(all(test, loom))]`
-/// test module. A bounded preemption count keeps the state space tractable while
-/// still exercising every ordering; override via `LOOM_MAX_PREEMPTIONS`.
+/// `LOOM_MAX_PREEMPTIONS` overrides the preemption bound.
 fn run_loom() -> ExitCode {
-    // Fold `--cfg loom` into any existing RUSTFLAGS rather than clobbering them.
+    // Fold `--cfg loom` into any existing RUSTFLAGS.
     let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
     if !rustflags.is_empty() {
         rustflags.push(' ');
@@ -64,17 +59,11 @@ fn run_loom() -> ExitCode {
     }
 }
 
-/// Evaluate the `docs/PHASE1.md` §11.3 go/no-go gate — honestly.
+/// Evaluate the `docs/PHASE1.md` §11.3 go/no-go gate.
 ///
-/// Two of the three gate criteria (depth-3 p50 latency; read throughput scaling
-/// 1→8 threads) and the `tf2::BufferCore` comparison ratio are *measurements*
-/// that only mean something on dedicated, core-pinned hardware, and the tf2 path
-/// additionally needs a ROS 2 install this host does not have. This runner does
-/// **not** fabricate those numbers. It runs what is decisive and portable here —
-/// the zero-allocation gate and the differential correctness check — and reports
-/// the hardware-dependent criteria as UNAVAILABLE with the reason.
-///
-/// Exit status: non-zero iff a *decisive, runnable* gate fails.
+/// Runs the zero-allocation gate and the differential check; reports the
+/// hardware-dependent criteria as UNAVAILABLE. Exit status is non-zero iff a
+/// runnable gate fails.
 fn run_bench_gate() -> ExitCode {
     let cargo = env!("CARGO");
     println!("xtask bench-gate: docs/PHASE1.md §11.3 go/no-go gate\n");
@@ -109,14 +98,7 @@ fn run_bench_gate() -> ExitCode {
     ]));
     println!("{}", if differential { "PASS" } else { "FAIL" });
 
-    // 3. The hardware-dependent criteria — reported honestly, never faked.
-    //
-    // The thresholds are `docs/PHASE1.md` §11.3's, as re-cut by decision 0013:
-    // 300/220 ns rather than 150/100 (the old pair was set before anything had
-    // measured interpolation, against a fixture whose query stamp was on-grid
-    // for all four dynamic rates), and 1->4 threads rather than 1->8 (8 threads
-    // on 4 physical cores can pass 6x only through SMT, so the old row was not
-    // a gate on any host this project has).
+    // 3. Hardware-dependent criteria: reported UNAVAILABLE, never faked (thresholds per PHASE1 §11.3 as re-cut by 0013).
     println!(
         "[gate]        depth-3 hot p50 < 300 ns (ScLerp) / < 220 ns (LerpSlerp), inlined ... UNAVAILABLE"
     );
@@ -128,9 +110,7 @@ fn run_bench_gate() -> ExitCode {
     println!("[gate]        tf_tree's 1->4 scaling factor >= 5x tf2's ... UNAVAILABLE");
     println!("                  reason: needs ROS 2 and pinned cores in one run;");
     println!("                  run `just tf2-scaling` in the container for indicative numbers.");
-    // 4. The tf2 differential — decisive wherever ROS 2 is reachable. Unlike the
-    //    latency rows this is a *correctness* comparison, so it does not need
-    //    pinned hardware: run it whenever we can, report honestly when we can't.
+    // 4. The tf2 differential: a correctness comparison, so it needs no pinned hardware.
     print!("[correctness] tf2::BufferCore differential within 1e-12 ... ");
     let tf2 = if ros_available() {
         let ok = run_ok(Command::new(cargo).args([
@@ -169,10 +149,7 @@ fn run_bench_gate() -> ExitCode {
     }
 }
 
-/// Whether a ROS 2 install with `tf2` is reachable from this environment.
-///
-/// Mirrors `tf_tree_tf2_sys`'s `build.rs` discovery so the gate never *attempts*
-/// a build it knows will fail with a wall of missing-header errors.
+/// Whether a ROS 2 install with `tf2` is reachable (mirrors `tf_tree_tf2_sys`'s `build.rs` discovery).
 fn ros_available() -> bool {
     let has_tf2 = |prefix: &std::path::Path| {
         prefix.join("include/tf2").is_dir() && prefix.join("lib/libtf2.so").exists()
@@ -194,8 +171,7 @@ fn ros_available() -> bool {
 
 /// Run a command inheriting stdio, returning whether it exited successfully.
 fn run_ok(cmd: &mut Command) -> bool {
-    // Quiet the child's own output so the gate table stays readable; failures
-    // still surface via the PASS/FAIL column and the non-zero exit.
+    // Child output is quieted so the gate table stays readable.
     match cmd.arg("--quiet").output() {
         Ok(out) => out.status.success(),
         Err(e) => {

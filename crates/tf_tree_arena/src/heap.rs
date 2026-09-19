@@ -2,23 +2,16 @@
 //!
 //! # SAFETY (module invariant)
 //!
-//! A [`HeapArena`] owns exactly one allocation obtained from [`alloc_zeroed`]
-//! with a **16-byte**-aligned [`Layout`] of `len + 63` bytes, where
-//! `len == ArenaLayout::total_size()`, out of which a 64-byte-aligned arena base
-//! is carved by hand. The following hold for the whole lifetime of the value:
+//! A [`HeapArena`] owns one 16-byte-aligned [`alloc_zeroed`] allocation of
+//! `len + 63` bytes (`len == ArenaLayout::total_size()`), from which a
+//! 64-byte-aligned base is carved by hand. For its lifetime:
 //!
-//! * `ptr` is non-null, 64-byte aligned, and points to `len` valid, owned bytes.
+//! * `ptr` is non-null, 64-byte aligned, and points to `len` owned bytes.
 //! * `alloc_ptr` is the allocation's own base, at most 63 bytes below `ptr`.
-//! * The allocation is freed exactly once, in [`Drop`], **with `alloc_ptr` and
-//!   the identical [`Layout`] recorded in `alloc_layout`** — never with `ptr`,
-//!   which is generally not the pointer the allocator handed out. This is the
-//!   one way to get [`0021`] wrong and it is undefined behaviour, so
-//!   `tests/heap_alignment.rs` exercises the whole lifecycle under Miri.
-//! * `HeapArena` exposes only the raw base pointer and length; all typed access
-//!   to the bytes happens through the atomic protocols in `tf_tree_core`, which
-//!   is why sharing the handle across threads (`Send + Sync`) is sound.
-//!
-//! Every `unsafe` block below cites which of these invariants it relies on.
+//! * It is freed once, in [`Drop`], with `alloc_ptr` and `alloc_layout`, never
+//!   `ptr` (UB; [`0021`]; `tests/heap_alignment.rs` runs this under Miri).
+//! * Only the raw base and length are exposed; typed access goes through the
+//!   atomic protocols in `tf_tree_core`, so `Send + Sync` is sound.
 //!
 //! [`0021`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md
 
@@ -28,28 +21,15 @@ use core::ptr::NonNull;
 use crate::header::{ArenaHeader, FORMAT_VERSION, TF_TREE_MAGIC};
 use crate::layout::{layout_hash, ArenaLayout};
 
-/// Byte alignment of the arena base and of [`ArenaHeader`].
-///
-/// Load-bearing: `PoseSlot` is `#[repr(C, align(64))]` and exactly one cache
-/// line, and every concurrency number in this repository rests on two slots
-/// never sharing one. It is **obtained** by hand rather than requested from the
-/// allocator — see [`CALLOC_ALIGN`] — but it is not negotiable.
+/// Byte alignment of the arena base and of [`ArenaHeader`] (one cache line per
+/// `PoseSlot`); obtained by hand, see [`CALLOC_ALIGN`].
 const ARENA_ALIGN: usize = 64;
 
 /// The alignment actually requested from the allocator.
 ///
-/// Must stay **at or below `MIN_ALIGN`** for the target (16 on every 64-bit
-/// platform this builds for), because that is the condition under which Rust's
-/// `System` allocator routes [`alloc_zeroed`] to `calloc` rather than to
-/// `posix_memalign` plus an explicit zero-fill. The fill is what touches every
-/// page; `calloc` at this size returns fresh `mmap` pages that stay
-/// demand-faulted. `docs/decisions/0021` carries the measurement — 4 KiB
-/// resident against 2356 KiB for the same bytes, differing only in this
-/// constant.
-///
-/// **Raising this to 64 would silently undo the whole fix** and nothing in the
-/// type system would notice, which is why `tests/heap_alignment.rs` asserts the
-/// residency property and not merely the alignment.
+/// Must stay **at or below `MIN_ALIGN`** (16) so `alloc_zeroed` uses `calloc`
+/// and pages stay demand-faulted (`docs/decisions/0021`). **Raising it to 64
+/// silently undoes that**; `tests/heap_alignment.rs` asserts residency.
 const CALLOC_ALIGN: usize = 16;
 
 const _: () = assert!(CALLOC_ALIGN <= ARENA_ALIGN);
@@ -62,9 +42,7 @@ const _: () = assert!(CALLOC_ALIGN <= ARENA_ALIGN);
 /// reads and writes of [`Arena::len`] bytes for as long as `self` is alive, that
 /// the pointer is 64-byte aligned, and that the region may be shared across
 /// threads (all interior mutation goes through atomics).
-// An arena is never empty (it always holds at least the header region, 320 B
-// since FORMAT_VERSION 3 and never smaller than 256), so an
-// `is_empty` companion would be dead weight.
+// An arena is never empty (the header region is at least 256 B).
 #[allow(clippy::len_without_is_empty)]
 pub unsafe trait Arena: Send + Sync {
     /// Base pointer of the arena's byte region.
@@ -74,23 +52,13 @@ pub unsafe trait Arena: Send + Sync {
 }
 
 /// An [`Arena`] backed by a single zeroed, 64-byte-aligned heap allocation.
-///
-/// Phase 2 adds `MappedArena` (`memfd` + `mmap`) as the only new backend; the
-/// rest of the stack is written against [`Arena`] and never learns which it has.
 pub struct HeapArena {
-    /// The **arena base**: 64-byte aligned, `len` bytes, what [`Arena::base`]
-    /// returns. Up to `ARENA_ALIGN - 1` bytes *above* [`Self::alloc_ptr`].
+    /// The **arena base** [`Arena::base`] returns, up to 63 bytes above
+    /// [`Self::alloc_ptr`].
     ptr: NonNull<u8>,
     len: usize,
-    /// The **allocation's own base**, and the only pointer [`dealloc`] may be
-    /// given.
-    ///
-    /// Distinct from `ptr` since [`0021`]: the arena is over-allocated at an
-    /// alignment `alloc_zeroed` will route to `calloc` and then aligned by hand,
-    /// so these two differ whenever the allocator did not already return a
-    /// 64-byte-aligned block. **Freeing `ptr` would be undefined behaviour**;
-    /// `tests/heap_alignment.rs` runs the whole lifecycle under Miri because a
-    /// passing suite alone cannot see that mistake.
+    /// The **allocation's own base**, the only pointer [`dealloc`] may be given;
+    /// **freeing `ptr` is undefined behaviour** ([`0021`]).
     ///
     /// [`0021`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md
     alloc_ptr: NonNull<u8>,
@@ -101,13 +69,7 @@ impl HeapArena {
     /// Allocate a zeroed, 64-byte-aligned arena sized for `layout`, then write
     /// the [`ArenaHeader`] into its first bytes.
     ///
-    /// `creator_pid`, `owner_start_time` and `boot_id` are constructor
-    /// parameters, not self-discovered: this is a `no_std` crate and cannot read
-    /// `/proc` or call `getpid`. The `std` facade supplies real values —
-    /// `boot_id` detects a segment that outlived a reboot, and
-    /// `owner_start_time` is what makes the PID reuse-proof — and tests may pass
-    /// zeros.
-    ///
+    /// The creator identity is passed in: this `no_std` crate cannot read `/proc`.
     /// # Panics
     ///
     /// Aborts (via [`handle_alloc_error`]) if the allocation fails. Asserts the
@@ -118,8 +80,6 @@ impl HeapArena {
         owner_start_time: u64,
         boot_id: [u8; 16],
     ) -> HeapArena {
-        // Invariant 7: the arena is host-native little-endian. Refuse to even
-        // compile for a big-endian host rather than silently producing garbage.
         const {
             assert!(
                 cfg!(target_endian = "little"),
@@ -129,50 +89,29 @@ impl HeapArena {
 
         let size = layout.total_size();
 
-        // **Over-allocate at `CALLOC_ALIGN` and align to 64 by hand.** Asking
-        // the allocator for 64-byte alignment directly costs ~293x the resident
-        // memory, and `docs/decisions/0021` is the measurement: Rust's
-        // `alloc_zeroed` reaches `calloc` only when the requested alignment is
-        // at most `MIN_ALIGN`, and above that falls back to `posix_memalign`
-        // followed by an explicit zero-fill — which *touches every page*.
-        // `calloc` for an allocation this size hands back fresh `mmap` pages the
-        // kernel already guarantees to be zero and never materialises until
-        // touched. Measured at the §9.3 geometry: **4 KiB resident at align 16,
-        // 2356 KiB at align 64.**
-        //
-        // SAFETY: `CALLOC_ALIGN` (16) is a non-zero power of two; `size` is a
-        // multiple of 64 and at least 256, and `size + ARENA_ALIGN - 1` cannot
-        // overflow `isize::MAX` because `ArenaLayout::new` already refuses any
-        // `total_size` above `u32::MAX`.
+        // **Over-allocate at `CALLOC_ALIGN` and align to 64 by hand**: requesting
+        // 64 directly costs ~293x the resident memory (`docs/decisions/0021`;
+        // 4 KiB at align 16, 2356 KiB at 64).
+        // SAFETY: `CALLOC_ALIGN` is a non-zero power of two and `size + 63`
+        // cannot overflow `isize::MAX` (`ArenaLayout::new` caps `total_size`).
         let alloc_layout =
             unsafe { Layout::from_size_align_unchecked(size + ARENA_ALIGN - 1, CALLOC_ALIGN) };
 
-        // SAFETY: `alloc_layout` has non-zero size (>= 256), satisfying
-        // `alloc_zeroed`'s precondition. Nullness is checked immediately below.
+        // SAFETY: `alloc_layout` has non-zero size; nullness is checked below.
         let raw = unsafe { alloc_zeroed(alloc_layout) };
         let alloc_ptr = match NonNull::new(raw) {
             Some(p) => p,
             None => handle_alloc_error(alloc_layout),
         };
 
-        // The offset to the next 64-byte boundary, which is at most
-        // `ARENA_ALIGN - 1` and is exactly the slack requested above.
-        //
-        // `addr()` arithmetic rather than `<*mut u8>::align_offset`: Miri is
-        // permitted to return `usize::MAX` from `align_offset` on any call, on
-        // purpose, so that code cannot come to depend on it succeeding — and
-        // this crate is one `just miri` runs. Deriving the pointer with `add`
-        // keeps provenance from `raw`, which the strict-provenance model
-        // requires and which casting through an integer would lose.
+        // `addr()`, not `align_offset` (Miri may return `usize::MAX`).
         let offset = alloc_ptr.as_ptr().addr().wrapping_neg() % ARENA_ALIGN;
 
-        // SAFETY: `offset < ARENA_ALIGN` and the allocation is
-        // `size + ARENA_ALIGN - 1` bytes, so `base` and the `size` bytes after
-        // it lie inside the same allocation; provenance is inherited from `raw`.
+        // SAFETY: `offset < 64` and the allocation is `size + 63` bytes, so
+        // `base..base+size` lies inside it; provenance is inherited from `raw`.
         let base = unsafe { alloc_ptr.as_ptr().add(offset) };
 
-        // SAFETY: `base` is `alloc_ptr` (non-null) advanced within its own
-        // allocation, so it is non-null.
+        // SAFETY: `alloc_ptr` advanced within its allocation is non-null.
         let ptr = unsafe { NonNull::new_unchecked(base) };
 
         let arena = HeapArena {
@@ -192,9 +131,8 @@ impl HeapArena {
         owner_start_time: u64,
         boot_id: [u8; 16],
     ) {
-        // SAFETY: `self.ptr` is the base of a freshly zeroed, 64-byte-aligned
-        // allocation of `self.len >= 256` bytes that `self` uniquely owns, which
-        // is exactly `write_header_at`'s contract.
+        // SAFETY: `self.ptr` is a freshly zeroed, 64-byte-aligned, uniquely
+        // owned allocation of `self.len >= 256` bytes: `write_header_at`'s contract.
         unsafe {
             write_header_at(
                 self.ptr.as_ptr(),
@@ -203,19 +141,12 @@ impl HeapArena {
                 creator_pid,
                 owner_start_time,
                 boot_id,
-                // All-zero: a heap arena is single-process by construction, so
-                // there is no second attacher for an instance id to disambiguate
-                // against. Drawing randomness here would also put an RNG in the
-                // no-`shm` dependency budget for no reader.
                 [0; 16],
             )
         }
     }
 
     /// Borrow the arena header living at the base of the allocation.
-    ///
-    /// Useful for readers that need the region offsets or the live atomic
-    /// counters without recomputing the layout.
     pub fn header(&self) -> &ArenaHeader {
         // SAFETY: the base is a validly-initialized ArenaHeader (written in
         // `new`), 64-byte aligned, and borrowed for no longer than `self`.
@@ -225,19 +156,14 @@ impl HeapArena {
 
 impl Drop for HeapArena {
     fn drop(&mut self) {
-        // SAFETY: **`alloc_ptr`, not `ptr`.** `alloc_ptr` and `alloc_layout` are
-        // exactly the pointer and layout returned/used by `alloc_zeroed` in
-        // `new`; `ptr` is that pointer advanced by up to 63 bytes to reach a
-        // 64-byte boundary, and freeing it would be undefined behaviour. The
-        // allocation is still owned by `self` and is freed here exactly once.
+        // SAFETY: **`alloc_ptr`, not `ptr`**: `alloc_ptr` and `alloc_layout` are
+        // what `alloc_zeroed` used in `new`; freeing `ptr` would be UB. Freed once.
         unsafe { dealloc(self.alloc_ptr.as_ptr(), self.alloc_layout) }
     }
 }
 
-// SAFETY: `HeapArena` owns a unique heap allocation and exposes only its base
-// pointer and length. It hands out no interior references that would alias the
-// bytes, and all concurrent access to those bytes is mediated by atomics in the
-// layers above, so the handle may be sent and shared across threads.
+// SAFETY: `HeapArena` owns a unique allocation and exposes only its base pointer
+// and length; concurrent access is mediated by atomics in the layers above.
 unsafe impl Send for HeapArena {}
 // SAFETY: see the `Send` impl above.
 unsafe impl Sync for HeapArena {}
@@ -255,12 +181,8 @@ unsafe impl Arena for HeapArena {
 }
 
 /// Write an [`ArenaHeader`] into the first bytes of a freshly zeroed arena
-/// region.
-///
-/// Shared by [`HeapArena`] and (behind the `shm` feature) `MappedArena`, because
-/// a mapped arena that disagreed with a heap arena about its own header would
-/// break the one property Phase 2 rests on: that the two are the same bytes,
-/// read by the same code.
+/// region. Shared by [`HeapArena`] and `MappedArena`, so the two are the same
+/// bytes read by the same code.
 ///
 /// # Safety
 ///
@@ -276,21 +198,13 @@ pub(crate) unsafe fn write_header_at(
     boot_id: [u8; 16],
     instance_uuid: [u8; 16],
 ) {
-    // Offsets and slot counts are stored as u32 in the header. This is enforced
-    // (not merely assumed) by `ArenaLayout::new`, which rejects any layout whose
-    // `total_size` exceeds `u32::MAX` with `ArenaTooLarge`. So every `as u32`
-    // below is a truncation that provably cannot lose bits; this assert restates
-    // that invariant at the point it is relied on.
+    // `ArenaLayout::new` caps `total_size` at `u32::MAX`: every `as u32` is lossless.
     debug_assert!(len <= u32::MAX as usize);
 
-    // SAFETY: by contract `base` is 64-byte aligned (matching ArenaHeader's
-    // align(64)) and backed by at least size_of::<ArenaHeader>() owned, zeroed
-    // bytes. An all-zero bit pattern is a valid ArenaHeader (integers and
-    // atomics accept any pattern), so forming `&mut *base.cast::<ArenaHeader>()`
-    // and assigning scalar fields is sound. The atomic fields are deliberately
-    // left at their zeroed value: `topo` (one packed word since A1), plus
-    // frame_count, edge_count and participant_count, all starting at 0.
-    // The caller uniquely owns the region, so nothing aliases it.
+    // SAFETY: by contract `base` is 64-byte aligned and backed by at least
+    // `size_of::<ArenaHeader>()` owned, zeroed bytes, and all-zero is a valid
+    // `ArenaHeader`; the caller uniquely owns the region, so nothing aliases the
+    // `&mut`. The atomic fields (`topo`, the counts) are left at zero.
     let h = unsafe { &mut *base.cast::<ArenaHeader>() };
     h.magic = u64::from_le_bytes(TF_TREE_MAGIC);
     h.format_version = FORMAT_VERSION;
@@ -310,11 +224,7 @@ pub(crate) unsafe fn write_header_at(
     h.edge_table_off = layout.edge_table().offset as u32;
     h.stamp_arena_off = layout.stamp_arena().offset as u32;
     h.pose_arena_off = layout.pose_arena().offset as u32;
-    // v3 (`docs/PHASE5.md` §1.2). The counter regions always exist; the spline
-    // region is declared absent with offset 0, which is what lets Phase 6 fill
-    // it without another format break. Covariance had two fields here until
-    // `docs/decisions/0009` descoped it; the header keeps their eight bytes
-    // reserved in place so the spline offsets do not move.
+    // v3 (`docs/PHASE5.md` §1.2): the spline region is absent (offset 0).
     h.edge_counters_off = layout.edge_counters().offset as u32;
     h.participant_counters_off = layout.participant_counters().offset as u32;
     h.spline_region_off = 0;
@@ -369,8 +279,6 @@ mod tests {
         assert_eq!(h.edge_table_off as usize, layout.edge_table().offset);
         assert_eq!(h.stamp_arena_off as usize, layout.stamp_arena().offset);
         assert_eq!(h.pose_arena_off as usize, layout.pose_arena().offset);
-        // v3: the counter regions are recorded, and the Phase 6 ones are
-        // explicitly absent rather than uninitialised.
         assert_eq!(h.edge_counters_off as usize, layout.edge_counters().offset);
         assert_eq!(
             h.participant_counters_off as usize,
@@ -391,7 +299,6 @@ mod tests {
         );
         assert_eq!(h.max_participants, layout.max_participants());
 
-        // Atomics start zeroed.
         assert_eq!(h.topo.load(Ordering::Relaxed), 0);
         assert_eq!(h.participant_count.load(Ordering::Relaxed), 0);
         assert_eq!(h.topo_lock.owner.load(Ordering::Relaxed), 0);
@@ -403,7 +310,6 @@ mod tests {
     fn body_is_zeroed_past_the_header() {
         let layout = fixture();
         let arena = HeapArena::new(&layout, 0, 0, [0u8; 16]);
-        // Sample a byte well past the header region.
         let off = layout.pose_arena().offset;
         // SAFETY: `off` is within the arena (`< len`); reading one owned byte.
         let byte = unsafe { *arena.base().add(off) };

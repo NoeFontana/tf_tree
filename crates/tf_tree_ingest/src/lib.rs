@@ -3,114 +3,38 @@
 //!
 //! Reads an MCAP recording's `tf2_msgs/msg/TFMessage` traffic and produces a
 //! [`tf_tree::Tree`], or (with `--features shm`) a frozen `.tft` index, plus an
-//! **ingest report** that §3.2 calls a first-class output.
+//! ingest report (§3.2). A separate crate because `mcap` would break the core's
+//! dependency budget and `tf_tree_py` cannot depend on the CLI binary.
 //!
-//! # Why this is its own crate
+//! # Compression
 //!
-//! It cannot live where the rest of the engine lives. `tf_tree_core` and
-//! `tf_tree_arena` have fixed dependency budgets that `mcap` would break, and
-//! `docs/PHASE5.md` §3's opening note says so. That leaves `tf_tree_cli` or a
-//! new crate, and this is a new crate for two reasons:
+//! `mcap` is taken with `default-features = false` (`docs/PHASE5.md` §0.0;
+//! `docs/PHASE2.md` §2 forbids its C build steps). `crate::decompress` decodes
+//! zstd and lz4 chunks with pure-Rust codecs (`ruzstd`, `lz4_flex`) behind the
+//! default-on `compression` feature. Two cases remain unreadable: a codec no one
+//! names ([`IngestError::CompressedChunk`] with [`ChunkCodec::Other`]) and a
+//! `--no-default-features` build; the remedy is `mcap compress --compression none`.
 //!
-//! - §4's offline Python API and §3.3's `freeze_from_arrays` both need this
-//!   logic, and `tf_tree_py` cannot depend on a binary crate. Putting it in the
-//!   CLI would mean moving it later, across a release.
-//! - `tf_tree_cli` is `#![forbid(unsafe_code)]`, small, and about *printing*.
-//!   A ~1 500-line ingest engine with a CDR decoder inside it is not a
-//!   subcommand; it is a library the subcommand calls, and it wants its own
-//!   tests, its own feature flags and its own dependency surface.
-//!
-//! The cost is one more workspace member. The benefit is that `cargo nextest
-//! run --workspace` gates the two-pass logic on every host, with no feature
-//! flag and no container — the frozen-file half is what needs `shm`.
-//!
-//! # What this build can and cannot read
-//!
-//! `mcap` is taken with `default-features = false`, which `docs/PHASE5.md` §0.0
-//! requires: its defaults are `[zstd, lz4]` and both vendor a C build step that
-//! `docs/PHASE2.md` §2 forbids. **That rule still holds and the cost it used to
-//! carry is gone.** `crate::decompress` takes each chunk over whole and decodes
-//! it with pure-Rust codecs of our own — `ruzstd` and `lz4_flex`, behind the
-//! default-on `compression` feature — so a zstd- or lz4-compressed recording
-//! (Foxglove's default, and `rosbag2`'s when `compression_mode` is set) ingests
-//! transparently, with no `*-sys` crate in the graph and no C toolchain.
-//!
-//! An earlier revision of this section told the user to run
-//! `mcap compress --compression none` instead. That is no longer the ordinary
-//! path; it is the remedy for the two cases that remain:
-//!
-//! * a codec neither we nor the MCAP specification names, which is
-//!   [`IngestError::CompressedChunk`] with [`ChunkCodec::Other`], and
-//! * a build with `--no-default-features`, where zstd and lz4 are compiled out
-//!   and report themselves as exactly that rather than as corruption.
-//!
-//! Decompression is bounded: `uncompressed_size` is a number off a disk, so
-//! [`IngestOptions::max_chunk_uncompressed_bytes`] and
-//! [`IngestOptions::max_chunk_expansion_ratio`] are checked before anything is
-//! allocated for it, and the zstd decoder's *window* — a separate number in the
-//! codec's own header that neither of those can see — is bounded too. Neither codec
-//! crate bounds its total output for us; `crate::decompress` says exactly what each
-//! of them does bound, and what the three guards here cost.
-//!
-//! **What the C-free codecs cost, measured.** On this host, `survey` over a
-//! 160 000-transform recording takes 0.027 s uncompressed, 0.035 s for lz4 and
-//! 0.048 s for zstd — so roughly **1.8× the per-pass wall time** of an uncompressed
-//! recording. Multiplied by the pass count, which is `1 + groups + spilled edges`.
-//! **Those three figures are a `survey` measurement taken by hand and
-//! re-derived by nothing**; `docs/PHASE5.md` §12 criterion 5's gate (`just gate5`,
-//! `docs/decisions/0050-what-ten-times-real-time-divides.md`) times a whole `run`
-//! on one codec arm and does not reproduce them.
-//!
-//! **CORRECTION (2026-09-05): "`ruzstd` decodes libzstd frames at about a quarter
-//! of libzstd's own rate" is deleted rather than kept.** It stood here and in
-//! `crate::decompress`, in two spellings, with no producer for either — the shape
-//! `docs/benchmarks/EVIDENCE.md` exists to prevent. `decompress`'s module doc
-//! carries the qualitative claim, which is what the trade rests on.
+//! Decompression is bounded by [`IngestOptions::max_chunk_uncompressed_bytes`],
+//! [`IngestOptions::max_chunk_expansion_ratio`] and a zstd window limit, all
+//! checked before allocation; `crate::decompress` lists what each guard covers.
 //!
 //! # Status against §3
 //!
-//! Implemented: §3.1's **pass structure** — two passes, the group re-read and the
-//! spill-to-run-file — §3.3's MCAP source, and every row of §3.2 except
-//! `--on-clock-reset=split`, which is refused with a reason
-//! ([`IngestError::ClockResetSplitUnsupported`]) rather than silently doing
-//! something else. `docs/PHASE5.md` §3.2 carries the argument for leaving it
-//! refused; it is a decision, not a backlog entry. `rosbag2` sqlite3 (§3.3,
-//! "lower priority") and `freeze_from_arrays` are not here.
+//! Implemented: §3.1's passes (group re-read, spill-to-run-file), §3.3's MCAP
+//! source, and every row of §3.2 except `--on-clock-reset=split`, which is refused
+//! ([`IngestError::ClockResetSplitUnsupported`]; `docs/PHASE5.md` §3.2 holds the
+//! argument). Not here: `rosbag2` sqlite3 and `freeze_from_arrays`.
 //!
-//! **Two corrections to what this block used to claim, kept rather than
-//! rewritten**, because a claim silently repaired stops recording that it was
-//! ever stronger:
+//! **No time-domain detection.** §3.1's pass one is NORMATIVE that it detects the
+//! domain; nothing here does, so every ingested edge takes `TreeBuilder`'s default
+//! (`SystemDomain`, tag 0). A `TFMessage` carries no domain and every other domain
+//! in the project is declared, not inferred; this is a specification gap,
+//! deliberately not closed by code (`docs/PHASE5.md` §3.1's amendment).
 //!
-//! * It said "every row of §3.2" while the **static-conflict** row —
-//!   *"report both values"* — was implemented as a bare count. Both values are
-//!   now on [`StaticConflict`], in the report's JSON and in its summary.
-//!   `docs/PHASE4.md` §5.7 states what the count could not answer: which of two
-//!   URDFs is installed.
-//! * It said "§3.1's two passes" without qualification, and **§3.1's pass one is
-//!   NORMATIVE that it detects the time domain, which nothing here does.**
-//!   `rg -n 'TreeBuilder::new|static_edge|dynamic_edge'
-//!   crates/tf_tree_ingest/src/ingest.rs` prints where this crate constructs a
-//!   tree and its edges (`ingest::fill` is its only `TreeBuilder` call site) and
-//!   none of them names a domain, so every ingested edge takes `TreeBuilder`'s
-//!   default — `SystemDomain`, tag 0 — whatever clock the recording was made
-//!   against.
-//!   **This is a specification gap and is
-//!   deliberately not closed by code**: a `TFMessage` carries no domain, and every
-//!   other domain in this project is *declared* (`tf_tree_bridge::config`'s
-//!   `domain`/`default_domain`, [`tf_tree::EdgeCfg::domain`]) rather than
-//!   inferred — `ros/tf_tree_ros/src/bridge_node.cpp` warns the *operator* to
-//!   configure one when `use_sim_time` is set, which is the online half admitting
-//!   the same thing. Inventing an inference rule here is what `CLAUDE.md` forbids.
-//!   `docs/PHASE5.md` §3.1's amendment carries the consequence: a bag recorded
-//!   under simulated time is indistinguishable, to every consumer, from one
-//!   recorded against a wall clock.
-//!
-//! **Every test in this crate reads a recording this crate wrote.** The MCAP
-//! framing under test is produced by `crate::fixture` (or, for the compressed
-//! conformance file, by `crate::fixture` with libzstd supplying only the chunk
-//! payloads), so the suite gates this reader's *bookkeeping* and never its
-//! agreement with a real `rosbag2` or DDS writer. `testdata/ATTRIBUTION.md` says
-//! the same in its first paragraph.
+//! **Every test here reads a recording this crate wrote** (`crate::fixture`), so
+//! the suite gates this reader's bookkeeping, not its agreement with a real
+//! `rosbag2` writer (`testdata/ATTRIBUTION.md`).
 
 use std::path::Path;
 
@@ -119,32 +43,21 @@ pub mod ingest;
 pub mod report;
 pub mod source;
 
-/// §3.1's spill-to-run-file. Private: it is a strategy `ingest::fill` chooses,
-/// not a surface a caller picks — the only knob is
+/// §3.1's spill-to-run-file; the only knob is
 /// [`IngestOptions::spill_dir`](ingest::IngestOptions::spill_dir).
 mod spill;
 
 /// Chunk handling: taking MCAP chunks whole and reading inside them.
-///
-/// Private for the same reason as [`spill`] — it is how `source` reads a file,
-/// not a choice a caller makes. What a caller sees is that a compressed
-/// recording either works or reports why.
 mod decompress;
 
 pub use decompress::{BadChunkKind, ChunkCodec, ChunkLimits};
 
 /// Whether this build compiled the zstd and lz4 chunk decoders in.
 ///
-/// **It has to be evaluated here, inside the crate that owns the feature.** Cargo
-/// unifies features across a workspace, so a `cfg!(feature = "compression")` in a
-/// consumer reports what *that* crate asked for rather than what this one was built
-/// with — and the two can differ silently, which is exactly how a `cargo install`
-/// ships a binary that refuses every zstd bag while `cargo build --workspace` stays
-/// green. `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader`
-/// compares the two answers; it is the only thing that can see them disagree.
-///
-/// Mirrors [`tf_tree::counters_compiled_in`], for the same reason and after the same
-/// defect.
+/// Evaluated here because a consumer's `cfg!(feature = "compression")` reports
+/// what *it* asked for, not how this crate was built (Cargo unifies features).
+/// `tf_tree_cli::tests::the_cli_compression_feature_switches_the_reader` compares
+/// the two. Mirrors [`tf_tree::counters_compiled_in`].
 #[must_use]
 pub fn compression_compiled_in() -> bool {
     cfg!(feature = "compression")
@@ -153,20 +66,10 @@ pub fn compression_compiled_in() -> bool {
 #[cfg(feature = "fixture")]
 pub mod fixture;
 
-/// Writing a `.tft` from a recording (`docs/PHASE5.md` §2 + §3).
-/// BLAKE3 of a recording's bytes, read in 1 MiB chunks.
+/// BLAKE3 of a recording's bytes, streamed in 1 MiB chunks (§2.3).
 ///
-/// **At the crate root rather than in [`tft`], and not behind its `cfg`.** The
-/// digest is what makes a `.tft` traceable to the recording it came from (§2.3),
-/// so it was written where the freeze is — but it is plain `std::fs` and
-/// `blake3` with nothing platform-specific in it, and `tf_tree_py`'s
-/// `ingest_bag` reports it on every platform the wheel builds for, including
-/// the ones with no frozen backend at all (`docs/decisions/0046`). Gating it
-/// behind `shm` would have left the binding either without a digest or with a
-/// second copy of this loop, which is the spelling `CLAUDE.md` forbids.
-///
-/// Streaming rather than reading the file in, for the same reason the reader
-/// streams: a recording is allowed to be larger than memory.
+/// Not behind the `shm` cfg: `tf_tree_py`'s `ingest_bag` reports it on every
+/// platform (`docs/decisions/0046`).
 ///
 /// # Errors
 ///
@@ -206,12 +109,9 @@ pub struct FrameId(pub u32);
 
 /// Why an ingest failed.
 ///
-/// `Copy` and `String`-free (`docs/PROJECT.md` §5, D11), and the two variants
-/// that are about a specific edge name it — by [`FrameId`], which indexes the
-/// [`Frames`] table the caller passed in. That is why [`survey`] takes the
-/// table as an `&mut` parameter instead of returning it: a failed pass still has
-/// to be able to say *which* edge, and an index without its table cannot.
-/// [`describe`] does the join.
+/// `Copy` and `String`-free (D11); edge variants name frames by [`FrameId`],
+/// an index into the [`Frames`] table that [`survey`] takes as `&mut` so a failed
+/// pass can still say which edge. [`describe`] does the join.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum IngestError {
@@ -221,12 +121,8 @@ pub enum IngestError {
         /// `errno`, or `0` if the platform did not supply one.
         raw_os_error: i32,
     },
-    /// §3.1's temporary run file could not be created, written or read back.
-    ///
-    /// Distinct from [`IngestError::Io`] because the remedy is different and the
-    /// user cannot guess which file failed: this one is about the *spill*
-    /// directory — a full or read-only `/tmp` — not about the recording, which
-    /// was read fine.
+    /// §3.1's temporary run file could not be created, written or read back —
+    /// the *spill* directory, not the recording.
     #[error("could not use the spill file (errno {raw_os_error}); check --spill-dir")]
     Spill {
         /// `errno`, or `0` if the platform did not supply one.
@@ -238,13 +134,9 @@ pub enum IngestError {
     /// A top-level record declared a body larger than the reader will allocate
     /// for — [`IngestOptions::max_record_bytes`], `--max-record-size` at the CLI.
     ///
-    /// **A variant of its own rather than [`IngestError::Mcap`], because the two
-    /// conditions want opposite things from the reader.** "Not a well-formed
-    /// MCAP" sends somebody hunting for corruption; this file may be perfectly
-    /// well formed and merely carry a record — an attachment, most likely —
-    /// bigger than a *policy* number the caller chose. Carrying `declared` is
-    /// what makes the remedy computable rather than guessable: the number to
-    /// pass to `--max-record-size` is in the error.
+    /// Not [`IngestError::Mcap`]: the file may be well formed, with a record
+    /// (an attachment, likely) over a policy number. `declared` is the value to
+    /// pass to `--max-record-size`.
     #[error(
         "a record declared {declared} bytes, over the {ceiling}-byte ceiling; \
          raise --max-record-size"
@@ -252,50 +144,29 @@ pub enum IngestError {
     RecordTooLarge {
         /// The length the record header declared.
         declared: u64,
-        /// The ceiling it was measured against, so the message is self-contained
-        /// and a caller does not have to know which knob was in force.
+        /// The ceiling it was measured against.
         ceiling: u64,
     },
     /// The file is a SQLite database — almost certainly a rosbag2 `.db3` bag,
-    /// which §3.3 lists as a source and which this crate does not read.
-    ///
-    /// A variant of its own rather than [`IngestError::Mcap`]: it is the most
-    /// likely wrong file to be handed, "not a well-formed MCAP recording" is a
-    /// true statement that sends the user hunting for corruption, and the remedy
-    /// (`ros2 bag convert`) is one command. See the amendment at
-    /// `docs/PHASE5.md` §3.3 for why the reader is absent.
+    /// which this crate does not read; the remedy is `ros2 bag convert`
+    /// (`docs/PHASE5.md` §3.3).
     #[error("the file is a SQLite database, not an MCAP recording")]
     Rosbag2Sqlite,
     /// A chunk names a codec this build has no decoder for.
     ///
-    /// **Not the ordinary compressed recording.** zstd and lz4 are decoded
-    /// transparently by the default-on `compression` feature; the crate docs list
-    /// the two cases that reach here. A chunk which *claims* zstd and carries
-    /// something else is [`IngestError::BadChunk`] instead — that is damage, not a
-    /// missing decoder.
-    ///
-    /// **Never skippable, unlike [`IngestError::BadChunk`].** Every chunk in a
-    /// recording uses the same codec, so skipping them all would yield
-    /// [`IngestError::NoTransforms`] — an answer that explains nothing about a
-    /// file which is perfectly intact.
+    /// The crate docs list the two cases that reach here; a chunk that claims
+    /// zstd but is not is [`IngestError::BadChunk`]. Never skippable: every chunk
+    /// shares the codec, so skipping would yield a misleading
+    /// [`IngestError::NoTransforms`].
     #[error("the recording uses {codec}-compressed chunks, which this build cannot read")]
     CompressedChunk {
         /// Which codec, as far as it could be identified.
         codec: decompress::ChunkCodec,
     },
-    /// A chunk was unreadable and the policy was
-    /// [`OnBadChunk::Halt`].
-    ///
-    /// It names the chunk, and that is not decoration — the same reason
-    /// [`cdr::CdrError`] carries a byte offset. "Chunk 3 of 812 failed its CRC" is
-    /// a damaged recording; "chunk 0 failed", and then 811 more, is a file that is
-    /// not what it claims to be, and the two want different responses.
+    /// A chunk was unreadable and the policy was [`OnBadChunk::Halt`].
     #[error("chunk {chunk} is unreadable: {kind}")]
     BadChunk {
-        /// Zero-based index of the chunk in read order.
-        ///
-        /// An ordinal rather than a byte offset because it is what `mcap info`
-        /// numbers chunks by, and so is directly comparable against it.
+        /// Zero-based index in read order, as `mcap info` numbers chunks.
         chunk: u64,
         /// What was wrong with it.
         kind: decompress::BadChunkKind,
@@ -306,36 +177,15 @@ pub enum IngestError {
     /// No TF channel in the recording carried a decodable transform.
     #[error("the recording contains no tf2_msgs/msg/TFMessage transforms")]
     NoTransforms,
-    /// The recording is truncated and its surviving prefix held no transform —
-    /// distinct from [`IngestError::NoTransforms`], which means the recording is
-    /// whole and simply has no TF in it.
-    ///
-    /// **Why this needs its own variant.** The two are indistinguishable from the
-    /// outside and have opposite remedies. Reporting an incomplete file as "this
-    /// recording contains no transforms" sends the user looking for a publisher
-    /// that was never running, when what they have is a recorder that was killed.
+    /// The recording is truncated and its surviving prefix held no transform;
+    /// [`IngestError::NoTransforms`] means a whole recording with no TF.
     #[error("the recording is truncated, and the part that survived holds no transforms")]
     TruncatedBeforeAnyChunk,
-    /// Every chunk that could have held a transform was refused by one of **this
-    /// reader's own limits**, so nothing was read from a file that is not damaged.
-    ///
-    /// # Why this needs its own variant, for the same reason as the one above
-    ///
-    /// A chunk over `--max-chunk-size`, over the expansion ratio, or whose zstd
-    /// frame declares more window than [`BadChunkKind::ImplausibleWindow`] allows,
-    /// is skipped like any other bad chunk — and those refusals are **uniform
-    /// across a recording**, because a writer's chunk size and compression level
-    /// are settings, not accidents. So the skips take every chunk, and
-    /// [`IngestError::NoTransforms`] then reports "this recording contains no
-    /// transforms" about a recording full of them, sending the operator to look for
-    /// a publisher that was running the whole time.
-    ///
-    /// The remedy is a flag, so this variant exists to name one. That is also why
-    /// the refusals stay skippable rather than being promoted to hard errors: a
-    /// corrupt `uncompressed_size` off a bad sector produces the identical fault,
-    /// and one bad sector must not cost a recording `--on-bad-chunk=skip` would
-    /// recover. Fixing the diagnosis costs that case nothing; changing the policy
-    /// would lose it.
+    /// Every chunk that could have held a transform was refused by one of this
+    /// reader's own limits (`--max-chunk-size`, the expansion ratio,
+    /// [`BadChunkKind::ImplausibleWindow`]); the remedy is a flag. The refusals
+    /// stay skippable so one corrupt `uncompressed_size` does not cost a recording
+    /// `--on-bad-chunk=skip` would recover.
     #[error(
         "every chunk was refused by this reader's limits ({skipped} of them), so nothing was read"
     )]
@@ -357,18 +207,9 @@ pub enum IngestError {
     /// One edge's stamps jumped backwards past the reset threshold, under
     /// [`ClockResetPolicy::Halt`].
     ///
-    /// **It names the edge**, and that is not decoration. The guard is per edge
-    /// (`ingest`'s module docs say why), so the only honest thing this error can
-    /// report is *which* edge regressed — an earlier revision watched the merged
-    /// stream and said "clock reset" when the truth was two publishers with
-    /// different latencies, which is a diagnosis a user cannot act on.
-    ///
-    /// **And it names two clocks**, because after a rewind only one of them
-    /// still locates anything. `at_ns` is the stamp that regressed, which in a
-    /// looped recording occurs twice; `at_log_time_ns` is the recorder's own
-    /// monotone clock at that record, which occurs once and is the coordinate
-    /// `mcap` and `ros2 bag` cut on — so it is the one the message's own advice
-    /// to split the recording is actionable in.
+    /// The guard is per edge (`ingest`'s module docs). `at_ns` is the regressed
+    /// stamp, which a looped recording repeats; `at_log_time_ns` is the recorder's
+    /// monotone clock, the coordinate `mcap` and `ros2 bag` cut on.
     #[error(
         "clock reset on edge {parent:?} -> {child:?} at stamp {at_ns} \
          (log time {at_log_time_ns}, backwards by {by_ns} ns)"
@@ -380,8 +221,7 @@ pub enum IngestError {
         child: FrameId,
         /// The stamp that regressed.
         at_ns: i64,
-        /// The recorder's log time for the record carrying that stamp — the
-        /// reference clock that is not the one under test.
+        /// The recorder's log time for the record carrying that stamp.
         at_log_time_ns: i64,
         /// How far back it went.
         by_ns: i64,
@@ -396,14 +236,10 @@ pub enum IngestError {
     #[error("could not claim an edge: {0}")]
     Claim(tf_tree::ClaimApiError),
     /// A sample was rejected by the engine.
-    ///
-    /// `{0}`: `PushError` has had its own `Display` since `docs/decisions/0040`,
-    /// and it names the edge.
     #[error("push rejected: {0}")]
     Push(tf_tree::PushError),
     /// A surveyed frame was not present in the built tree. Structurally
-    /// impossible — every surveyed name is declared on the builder — and kept
-    /// as an error rather than an `unwrap` because this crate denies both.
+    /// impossible; an error rather than an `unwrap` because this crate denies both.
     #[error("frame {frame:?} was surveyed but is not in the built tree")]
     FrameLost {
         /// The missing frame.
@@ -417,16 +253,7 @@ pub enum IngestError {
 
 /// An [`IngestError`] with the frame table needed to print its names.
 ///
-/// The same shape as [`tf_tree::Described`], and for the same reason: the error
-/// stays `Copy` and the names stay out of it (`docs/API.md` §R5).
-///
-/// **Its fields are private, as that type's now are.** They promised that this
-/// wrapper is *exactly* the pair `(error, frames)` forever, for no caller: the
-/// only construction site in the workspace is [`describe`] and the only use is
-/// `Display`. A caller who wants the [`IngestError`] back holds the one it
-/// passed in — it is `Copy`. Keeping them `pub` here after privatising them on
-/// `tf_tree::Described` would have left this doc comment's first line false,
-/// which is the second reason to change it rather than the first.
+/// Same shape as [`tf_tree::Described`] (`docs/API.md` §R5); fields are private.
 #[derive(Clone, Copy, Debug)]
 pub struct Described<'a>(IngestError, &'a Frames);
 
@@ -487,9 +314,6 @@ pub struct Ingested {
 }
 
 /// Run both passes over `path`.
-///
-/// The `frames` table is an `&mut` parameter for the reason [`IngestError`]
-/// documents.
 ///
 /// # Errors
 ///

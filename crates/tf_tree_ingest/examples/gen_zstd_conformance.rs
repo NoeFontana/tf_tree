@@ -1,37 +1,20 @@
 //! Regenerate `testdata/zstd_conformance.mcap`: an MCAP whose chunk payloads are
-//! compressed by the **real** `zstd` CLI, i.e. by libzstd.
+//! compressed by the real `zstd` CLI (libzstd), so `tests/ingest.rs`'s
+//! `a_real_libzstd_recording_ingests` checks conformance and not just an
+//! `ruzstd` round-trip.
 //!
-//! # Why this exists at all
-//!
-//! Every other compressed fixture in this crate is encoded by `ruzstd` and decoded
-//! by `ruzstd`. That proves round-trip and **not** conformance: an encoder and a
-//! decoder from the same crate can agree with each other and both disagree with the
-//! zstd that `rosbag2` links. So one fixture is compressed by libzstd and committed,
-//! and `tests/ingest.rs`'s `a_real_libzstd_recording_ingests` reads it.
-//!
-//! # Why it is an example and not a test
-//!
-//! It shells out to `zstd`, which is a build-host assumption no gate may depend on
-//! — the committed output is what the gate reads. Run it only when the corpus in
-//! `fixture::conformance_recording` changes:
+//! An example, not a test: it shells out to `zstd`, which no gate may depend on.
+//! Run it only when `fixture::conformance_recording` changes:
 //!
 //! ```text
 //! cargo run -p tf_tree_ingest --features fixture --example gen_zstd_conformance
 //! ```
 //!
-//! # What is ours and what is libzstd's
-//!
-//! The MCAP framing is entirely ours: `fixture::chunked_mcap_bytes` writes an
-//! uncompressed hand-rolled file, and this program then walks its nine-byte record
-//! framing, replaces each chunk's records field with `zstd`'s output, and rewrites
-//! that chunk's `compression` and `compressed_size`. `uncompressed_size` and
-//! `uncompressed_crc` are carried across **untouched**, which is what the MCAP
-//! specification says they cover — so the committed file's CRC is a check on
+//! The MCAP framing is ours: this walks `fixture::chunked_mcap_bytes`' records,
+//! replaces each chunk's records field with `zstd`'s output and rewrites
+//! `compression` and `compressed_size`. `uncompressed_size` and
+//! `uncompressed_crc` are carried across untouched, so the chunk CRC checks
 //! libzstd's output against our hash of its input.
-//!
-//! The rewrite is done here rather than by teaching `fixture` to invoke a
-//! subprocess, because a fixture writer that can shell out is a fixture writer a
-//! test will eventually shell out from.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -78,9 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     out.extend_from_slice(&plain[plain.len() - magic..]);
 
-    // A file with no chunk to compress would be a conformance fixture that
-    // conforms to nothing, and the failure would be invisible in the committed
-    // bytes.
+    // No chunk means a fixture that conforms to nothing, invisibly.
     if chunks == 0 {
         return Err("the corpus produced no chunk records; nothing was compressed".into());
     }
@@ -88,8 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/zstd_conformance.mcap");
     std::fs::write(&path, &out)?;
-    // `print_stdout` is a workspace lint at `warn`, and a generator whose whole
-    // purpose is to be run by hand has to say what it wrote and with what.
+    // A hand-run generator must say what it wrote.
     #[allow(clippy::print_stdout)]
     {
         println!(
@@ -104,10 +84,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Replace one chunk body's records field with libzstd's compression of it.
-///
-/// The header's first four fields are copied as one slice rather than re-emitted
-/// field by field, so the two that must **not** change — `uncompressed_size` and
-/// `uncompressed_crc` — are carried across by construction rather than by care.
+/// The first four header fields are copied as one slice, so `uncompressed_size`
+/// and `uncompressed_crc` carry across by construction.
 fn recompress_chunk(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let name_len = usize::try_from(u32::from_le_bytes(
         body[CHUNK_FIXED..CHUNK_FIXED + 4].try_into()?,
@@ -130,36 +108,11 @@ fn recompress_chunk(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
     Ok(out)
 }
 
-/// Pipe `bytes` through the host's `zstd` CLI.
+/// Pipe `bytes` through the host's `zstd -19` (more of the format than the default).
 ///
-/// Level 19 rather than the default 3: the corpus is a couple of kilobytes, so the
-/// cost is nothing and a higher level exercises more of the format — longer matches
-/// and larger Huffman tables — which is the point of testing against libzstd rather
-/// than against an encoder whose decoder we already read.
-///
-/// `--no-check` omits zstd's own content checksum. Deliberate, and it makes the
-/// fixture *stronger*: nothing in `decompress` verifies that checksum (ruzstd
-/// computes one and compares nothing), so leaving it in would invite a reader to
-/// believe it is what validates the frame. The chunk CRC32 is the check that runs.
-///
-/// # The write runs on its own thread, and that is a deadlock fix
-///
-/// Writing the whole input from this thread and only then calling
-/// `wait_with_output` pins both ends of a pipe pair: once the child has filled the
-/// pipe this process is not draining, it blocks on its own write, and this process
-/// is still blocked on `write_all`. Neither side moves again.
-///
-/// It happened to be safe while every chunk here was ~660 bytes, but this file's
-/// whole instruction is "run it when the corpus changes", and a large enough one
-/// hangs the generator with no diagnostic at all. Measured on this host against the
-/// two shapes side by side, with an incompressible corpus so the *output* is as
-/// large as the input: 4 MiB completes either way, and **64 MiB hangs the
-/// single-threaded shape indefinitely** — killed at a 60-second budget — while the
-/// threaded one finishes. Handing the write to a thread means something is always
-/// draining stdout.
-///
-/// The regenerated `zstd_conformance.mcap` is byte-identical across the change,
-/// which is the check that this bought safety and not different bytes.
+/// `--no-check` omits zstd's content checksum: `decompress` verifies none, and the
+/// chunk CRC32 is the check that runs. The write runs on its own thread so
+/// something always drains stdout; a single-threaded write deadlocks on large input.
 fn zstd_compress(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut child = Command::new("zstd")
         .args(["-19", "--no-check", "-c", "-q"])
@@ -168,16 +121,11 @@ fn zstd_compress(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .spawn()
         .map_err(|e| format!("could not run the `zstd` CLI, which this generator needs: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("the zstd child has no stdin")?;
-    // Owned by the thread, so the handle is dropped — and the child sees EOF — even
-    // if the write fails partway. Leaking it would replace this deadlock with
-    // another: the child would wait forever for an input that never ends.
+    // Owned by the thread so the child sees EOF even if the write fails.
     let input = bytes.to_vec();
     let writer = std::thread::spawn(move || stdin.write_all(&input));
     let done = child.wait_with_output()?;
-    // Joined after the child has exited, so a `zstd` that rejected its arguments
-    // and closed stdin early surfaces as its own exit status below rather than as
-    // this thread's `BrokenPipe` — the second is a true error about the wrong
-    // thing.
+    // Joined after exit so an early-closing `zstd` reports its exit status, not `BrokenPipe`.
     let wrote = writer
         .join()
         .map_err(|_| "the stdin writer thread panicked")?;
@@ -188,8 +136,7 @@ fn zstd_compress(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     Ok(done.stdout)
 }
 
-/// The `zstd` version string, so a regeneration records which libzstd produced the
-/// bytes rather than leaving `ATTRIBUTION.md` to be trusted.
+/// The `zstd` version string, recording which libzstd produced the bytes.
 fn zstd_version() -> Result<String, Box<dyn std::error::Error>> {
     let out = Command::new("zstd").arg("--version").output()?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())

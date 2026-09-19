@@ -1,21 +1,9 @@
-// The one publisher every arm of the §9.1 comparison listens to.
+// The one publisher every arm of the §9.1 comparison listens to (`docs/PHASE5.md`
+// §9.3: same data, same QoS for both stacks).
 //
-// **One publisher, not one per arm**, and that is the point: `docs/PHASE5.md`
-// §9.3 is normative that both stacks run "on the same data" with "identical
-// QoS, identical executor configuration, identical DDS vendor and version". The
-// cheapest way to guarantee that is to have exactly one process producing the
-// traffic and to run the arms against it, so there is no second publisher whose
-// configuration could quietly differ.
-//
-// QoS is `docs/PHASE4.md` §5.2's, which is also `tf2_ros`'s: `/tf` is reliable,
-// volatile, `KeepLast(depth)`; `/tf_static` is reliable, **transient_local**, so
-// a consumer that joins late still receives it. A volatile `/tf_static` is the
-// classic silent failure — the late joiner simply never learns the static half
-// of the tree and every lookup through it fails forever.
-//
-// The plan file is written by `dds_report emit-config`, from the same
-// `tf_tree_bench::workload` catalogue the Rust harnesses use, so a DDS row and a
-// `contended_scaling` row on the same workload name describe the same tree.
+// QoS is `docs/PHASE4.md` §5.2's: `/tf` reliable, volatile, `KeepLast(depth)`;
+// `/tf_static` reliable, **transient_local** (a volatile one is never seen by a
+// late joiner). The plan file comes from `dds_report emit-config`.
 
 #include <chrono>
 #include <cmath>
@@ -82,13 +70,8 @@ Plan read_plan(const std::string & path)
   return p;
 }
 
-/// A smooth, bounded pose for edge `seed` at time `t`.
-///
-/// It does not have to match the Rust fixture's trajectory — no arm compares
-/// values against a reference here, only against each other, and both arms
-/// receive the identical bytes from this one publisher. What it does have to be
-/// is *varying*, so neither engine's interpolation is handed two identical
-/// samples to bracket between.
+/// A smooth, bounded pose for edge `seed` at time `t`. It must vary, so neither
+/// engine brackets two identical samples; values are not compared to a reference.
 void pose_at(double seed, double t, double q[4], double xyz[3])
 {
   const double a = 0.2 * std::sin(0.7 * t + seed);
@@ -107,19 +90,15 @@ public:
   Publisher(const Plan & plan, double seconds)
   : rclcpp::Node("tf_bench_publisher"), plan_(plan)
   {
-    // §5.2 / tf2_ros defaults. `KeepLast(100)` on /tf matches the bridge's
-    // `queue_depth` default, so neither side is given a deeper queue than the
-    // other.
+    // §5.2 / tf2_ros defaults; `KeepLast(100)` matches the bridge's `queue_depth`.
     tf_ = create_publisher<tf2_msgs::msg::TFMessage>("/tf", rclcpp::QoS(rclcpp::KeepLast(100)));
     tf_static_ = create_publisher<tf2_msgs::msg::TFMessage>(
       "/tf_static", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local());
 
     publish_statics();
 
-    // One timer per distinct rate, each publishing every dynamic edge at that
-    // rate in ONE `TFMessage`. That is what a real broadcaster does — a
-    // `robot_state_publisher` sends its whole joint set per tick — and it also
-    // keeps the message count identical for both arms.
+    // One timer per distinct rate, publishing every edge at that rate in one
+    // `TFMessage`, as a `robot_state_publisher` does.
     std::map<int64_t, std::vector<size_t>> by_period_us;
     for (size_t i = 0; i < plan_.dynamic.size(); ++i) {
       const auto us = static_cast<int64_t>(1e6 / plan_.dynamic[i].rate_hz);

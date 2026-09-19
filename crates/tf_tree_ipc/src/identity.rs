@@ -1,20 +1,11 @@
 //! Identity records — 64 bytes per slot at `4096 + 64·i` of the lock file.
 //!
-//! These exist because of a property of OFD locks that cannot be worked around:
-//! `F_OFD_GETLK` reports `l_pid = -1`, since a lock belongs to an open file
-//! description rather than a process. The lock file therefore answers *"is
-//! anyone alive?"* exactly, and cannot answer *"who?"* at all.
+//! `F_OFD_GETLK` reports `l_pid = -1`, so the lock answers "is anyone alive?"
+//! but not "who?". Who is written here as plain `pwrite` data, so a process that
+//! cannot map the arena (`tf_tree doctor`) can still list the holders.
 //!
-//! So *who* is written down separately, as plain `pwrite` data at a fixed
-//! offset. Keeping it in the lock file rather than only in the arena is the
-//! point: a process that cannot map the arena — wrong layout hash, no socket, an
-//! operator on a wedged robot running `tf_tree doctor` — can still open a
-//! 4 KiB file and print the pids holding it.
-//!
-//! `docs/PHASE2.md` §5.1: **this is advisory.** Liveness is the lock. Any code
-//! that decides whether a participant is alive by reading these bytes is a bug;
-//! the record may lag, and after a crash it is stale by definition (nothing runs
-//! to clear it — that is the whole reason the lock is authoritative).
+//! `docs/PHASE2.md` §5.1: **advisory.** Liveness is the lock; deciding liveness
+//! from these bytes is a bug (the record may lag and is stale after a crash).
 
 use crate::error::{IpcError, ProcError};
 use crate::procstat::{boot_id, self_comm, self_pid_ns_inode, self_start_time};
@@ -27,8 +18,7 @@ pub const IDENTITY_RECORD_LEN: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AccessMode {
-    /// `PROT_READ`. The consumer default (§8): the MMU makes corruption
-    /// impossible rather than merely impolite.
+    /// `PROT_READ`. The consumer default (§8).
     ReadOnly = 0,
     /// `PROT_READ | PROT_WRITE`. Required to publish or claim.
     ReadWrite = 1,
@@ -36,9 +26,7 @@ pub enum AccessMode {
 
 impl AccessMode {
     fn from_byte(b: u8) -> AccessMode {
-        // Anything unrecognised reads as the *less* privileged mode: this field
-        // is diagnostics, and over-reporting privilege in a `doctor` listing is
-        // the more misleading direction.
+        // Unrecognised reads as the less privileged mode (diagnostics only).
         if b == 1 {
             AccessMode::ReadWrite
         } else {
@@ -46,13 +34,8 @@ impl AccessMode {
         }
     }
 
-    /// Strict decode, for a byte a *decision* will be made from.
-    ///
-    /// [`AccessMode::from_byte`]'s leniency is right for a `doctor` listing and
-    /// wrong for the §3.7 handshake: silently downgrading a mode the peer named
-    /// and we did not understand hands back a read-only mapping the client
-    /// never asked for, and the failure then surfaces at its first write with
-    /// nothing to connect it to the handshake. The wire wants `Malformed`.
+    /// Strict decode for the §3.7 handshake, where [`AccessMode::from_byte`]'s
+    /// leniency would silently downgrade a mode; the wire wants `Malformed`.
     pub(crate) fn try_from_byte(b: u8) -> Option<AccessMode> {
         match b {
             0 => Some(AccessMode::ReadOnly),
@@ -64,11 +47,8 @@ impl AccessMode {
 
 /// Who holds a participant slot.
 ///
-/// `(pid, start_time, boot_id)` is the identity triple. A bare pid is not an
-/// identity: pids are recycled, and on an embedded system with a low `pid_max`
-/// they recycle fast, so `pid 1841` on its own can name two different processes
-/// within a minute. `start_time` (ticks since boot) separates them within one
-/// boot; `boot_id` separates the boots.
+/// `(pid, start_time, boot_id)`: pids recycle, `start_time` (ticks since boot)
+/// separates them within a boot, `boot_id` separates boots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     /// Process id.
@@ -82,30 +62,14 @@ pub struct Identity {
     pub mode: AccessMode,
     /// `comm`, NUL-padded. Diagnostics only.
     ///
-    /// **Sixteen bytes at `32..48` since `docs/decisions/0033`, where it was
-    /// thirty-two.** The kernel caps `comm` at 15 bytes plus its NUL
-    /// (`TASK_COMM_LEN`), so nothing that ever reached this field filled half of
-    /// the old one — the narrowing is what makes room for `pid_ns_inode` without
-    /// touching the 64-byte stride, and therefore without touching
-    /// `FORMAT_VERSION` or `layout_hash`, neither of which this file is.
+    /// Sixteen bytes at `32..48` (`docs/decisions/0033`); the kernel caps `comm`
+    /// at 15 bytes plus NUL.
     pub name: [u8; 16],
-    /// The `nsfs` inode of the writer's PID namespace, or **`0` for "unknown
-    /// namespace"**.
+    /// The `nsfs` inode of the writer's PID namespace, or **`0` for "unknown"**.
     ///
-    /// The discriminator `pid` cannot be: a pid is namespace-local, so a record
-    /// written inside `unshare --fork --pid` or a container names a *different*
-    /// process when it is resolved against an observer's `/proc`, and the
-    /// identity triple has nothing that differs — `boot_id` is identical across
-    /// every namespace on one host, and the kernel has no per-namespace boot id.
-    /// `docs/decisions/0033` is the argument; `TFT014` calling a healthy
-    /// containerised participant a fork inheritor, and telling the operator to
-    /// stop it, is what it cost.
-    ///
-    /// **Zero must mean *keep the pre-`0033` behaviour*, never "namespace 0".**
-    /// A record written before this field existed reads back as zero, because
-    /// `comm` never reached byte 48; so does one whose writer could not read
-    /// `/proc`. Lock files outlive the process that wrote them, so an observer
-    /// meets both.
+    /// A pid is namespace-local, so `pid` alone cannot tell namespaces apart
+    /// (`docs/decisions/0033`). **Zero means keep the pre-`0033` behaviour, never
+    /// "namespace 0"**: old records and unreadable-`/proc` writers read back zero.
     pub pid_ns_inode: u64,
 }
 
@@ -115,9 +79,7 @@ impl Identity {
     /// # Errors
     ///
     /// [`IpcError::Proc`] if `/proc/self/stat` or the boot id cannot be read.
-    /// The caller may reasonably choose to proceed without one — the record is
-    /// advisory — but that has to be an explicit decision, so this does not
-    /// paper over the failure itself.
+    /// The record is advisory, so the caller may proceed without one.
     pub fn of_self(mode: AccessMode) -> Result<Identity, IpcError> {
         Ok(Identity {
             pid: std::process::id(),
@@ -125,20 +87,16 @@ impl Identity {
             boot_id: boot_id().map_err(IpcError::from)?,
             mode,
             name: self_comm(),
-            // Not an error even here, where every other field is one: an
-            // unreadable namespace is `0`, which every reader already has a
-            // rule for. Failing `of_self` on it would make a `/proc` without
-            // `ns/` — a kernel built with `CONFIG_PID_NS=n`, or a sandbox that
-            // hides the directory — refuse an arena it can otherwise serve.
+            // An unreadable namespace is `0`, not an error: a `/proc` without `ns/`
+            // must not refuse an arena it can serve.
             pid_ns_inode: self_pid_ns_inode().unwrap_or(0),
         })
     }
 
     /// This process's identity, with unreadable fields left zero.
     ///
-    /// For the rendezvous path, where failing to `open()` because `/proc` is not
-    /// mounted would be absurd: the record is advisory and the lock carries the
-    /// liveness regardless.
+    /// For the rendezvous path: the record is advisory, so a missing `/proc`
+    /// must not fail `open()`.
     #[must_use]
     pub fn of_self_best_effort(mode: AccessMode) -> Identity {
         Identity {
@@ -154,12 +112,8 @@ impl Identity {
     /// The name field as a string, trimmed at the first NUL.
     #[must_use]
     pub fn name_str(&self) -> &str {
-        // `self.name.len()`, never a literal: with the field at `[u8; 16]` a
-        // hard-coded 32 is an out-of-bounds slice on a `pub` method, and the
-        // type checker does not see it. Not reachable from data this workspace
-        // writes — `self_comm` NUL-terminates every name the kernel can produce
-        // — but `from_bytes` is `pub`, validates `pid != 0` and nothing else,
-        // and decodes a file any same-uid process can `pwrite` into.
+        // `self.name.len()`, never a literal: `from_bytes` decodes a file any
+        // same-uid process can write, and a hard-coded 32 would panic here.
         let end = self
             .name
             .iter()
@@ -170,9 +124,8 @@ impl Identity {
 
     /// Encode to the on-disk layout: little-endian, fixed offsets, 64 bytes.
     ///
-    /// Hand-rolled rather than `bytemuck`-cast because the dependency budget for
-    /// this crate is `rustix` alone (§2), and because a record written by one
-    /// build and read by another must not depend on either one's struct padding.
+    /// Hand-rolled: no `bytemuck` in this crate's budget (§2), and no dependence
+    /// on struct padding.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; IDENTITY_RECORD_LEN] {
         let mut out = [0u8; IDENTITY_RECORD_LEN];
@@ -181,11 +134,8 @@ impl Identity {
         out[12..28].copy_from_slice(&self.boot_id);
         out[28] = self.mode as u8;
         // 29..32 padding
-        // `32 + self.name.len()`, and for the same reason `name_str` spells its
-        // bound that way: both sides of `copy_from_slice` are slices, so a
-        // literal 32 here type-checks against a `[u8; 16]` and then panics at
-        // run time on *every* `to_bytes` — which is every `write_identity`,
-        // which is every registering `open()`.
+        // `32 + self.name.len()`, not a literal: a literal 32 compiles and then
+        // panics on every `to_bytes`.
         out[32..32 + self.name.len()].copy_from_slice(&self.name);
         out[48..56].copy_from_slice(&self.pid_ns_inode.to_le_bytes());
         // 56..64 spare
@@ -194,9 +144,8 @@ impl Identity {
 
     /// Decode a record, or `None` if it was never written.
     ///
-    /// A zero `pid` is the "never written" marker: the lock file is created by
-    /// `open(O_CREAT)` and read sparsely, so an untouched record reads back as
-    /// zeroes, and pid 0 is not a process any participant can be.
+    /// A zero `pid` is the "never written" marker (an untouched record reads as
+    /// zeroes).
     #[must_use]
     pub fn from_bytes(raw: &[u8; IDENTITY_RECORD_LEN]) -> Option<Identity> {
         let pid = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
@@ -217,20 +166,14 @@ impl Identity {
             boot_id: boot,
             mode: AccessMode::from_byte(raw[28]),
             name,
-            // A pre-`0033` record reaches here too, and reads `0`: its writer's
-            // `comm` stopped at byte 47 or earlier, so these eight bytes are
-            // the NUL padding of a name that was never this long.
+            // A pre-`0033` record reads `0` here: these bytes were name padding.
             pid_ns_inode: u64::from_le_bytes(ns),
         })
     }
 
     /// Whether this record still describes a live process, for `doctor`-style
-    /// reporting only.
-    ///
-    /// **Never use this to decide liveness for the protocol** (§5.1): the lock
-    /// byte is authoritative, this is a `/proc` inference with a race in it. It
-    /// exists to say "slot 3's record names pid 1841, which is gone" in a
-    /// diagnostic, which is genuinely useful and not a decision.
+    /// reporting only. **Never use it to decide liveness** (§5.1): the lock byte
+    /// is authoritative and this is a racy `/proc` inference.
     #[must_use]
     pub fn matches_running_process(&self) -> bool {
         match crate::procstat::start_time_of(self.pid) {
@@ -268,17 +211,8 @@ mod tests {
         assert_eq!(id.name_str(), "hello");
     }
 
-    /// **The compatibility direction that has to hold in the wild: a record
-    /// written before `pid_ns_inode` existed decodes as `0`, "unknown
-    /// namespace".** Lock files outlive the process that wrote them, and this
-    /// crate carries no version field to make the change detectable, so this is
-    /// the whole compatibility argument rather than one clause of it.
-    ///
-    /// The bytes below are the *pre-`0033`* encoding, built here rather than
-    /// produced by the current encoder — which could not produce them, and that
-    /// is the point. What makes it decode correctly is that `self_comm` could
-    /// never write past byte 47: the kernel caps `comm` at 15 bytes plus its
-    /// NUL, so `48..64` of every record the old code wrote is padding.
+    /// A record written before `pid_ns_inode` existed decodes as `0`, "unknown
+    /// namespace" (`docs/decisions/0033`); `self_comm` never wrote past byte 47.
     #[test]
     fn a_pre_0033_record_reads_as_unknown_namespace() {
         let mut old = [0u8; IDENTITY_RECORD_LEN];
@@ -286,7 +220,6 @@ mod tests {
         old[4..12].copy_from_slice(&987_654u64.to_le_bytes());
         old[12..28].copy_from_slice(&[7u8; 16]);
         old[28] = AccessMode::ReadWrite as u8;
-        // The old field was `32..64`; a real writer filled at most `32..47`.
         old[32..36].copy_from_slice(b"node");
 
         let id = Identity::from_bytes(&old).expect("a nonzero pid is a written record");
@@ -296,9 +229,7 @@ mod tests {
             "an old record must read as unknown, never as namespace 0"
         );
 
-        // And the other direction, which is what lets an unmodified decoder
-        // read a new record: every reader NUL-trims, so the name is intact and
-        // the inode is simply never looked at.
+        // An unmodified decoder reads a new record: it NUL-trims the name.
         let new = Identity {
             pid: 4242,
             start_time: 987_654,
@@ -311,16 +242,8 @@ mod tests {
         assert_eq!(&new[32..36], b"node");
         assert_eq!(new[36], 0, "an old reader trims here and stops");
 
-        // **A pre-`0033` name longer than the new field, which is the only
-        // input that reaches `name_str`'s fallback.** The `"node"` record
-        // above has a NUL at 36 and never gets there, so it does not pin
-        // `unwrap_or(self.name.len())` at all: reverting that to the old
-        // `unwrap_or(32)` left `-p tf_tree_ipc` 91/91, `--lib` 124/124 and
-        // `--test attach` 16/16 green. Sixteen bytes with no NUL is what an
-        // 18-to-20-byte name from before the narrowing leaves in `32..48`, and
-        // on `unwrap_or(32)` it panics — *range end index 32 out of range for
-        // slice of length 16* — on a `pub` method, from lock-file bytes any
-        // process with the right uid can write.
+        // A 16-byte name with no NUL is the only input reaching `name_str`'s
+        // fallback; `unwrap_or(32)` would panic on it.
         let mut long = [0u8; IDENTITY_RECORD_LEN];
         long[0..4].copy_from_slice(&4242u32.to_le_bytes());
         long[32..48].copy_from_slice(b"a-parent-that-fo");
@@ -340,8 +263,6 @@ mod tests {
 
     #[test]
     fn the_field_offsets_are_pinned() {
-        // Two builds must agree byte for byte; this is the only place that is
-        // checkable without a second binary.
         let id = Identity {
             pid: 1,
             start_time: 2,
@@ -358,10 +279,6 @@ mod tests {
         assert_eq!(&b[29..32], &[0u8; 3], "padding must be zero");
         assert_eq!(&b[32..48], &[4u8; 16]);
         assert_eq!(&b[48..56], &5u64.to_le_bytes());
-        // The tail `0033` left spare. Nothing else in the workspace pins this
-        // layout, so without this line the eight bytes a future field would
-        // take are pinned by nothing — and the pre-`0033` compatibility
-        // argument is exactly that a record's unused tail reads zero.
         assert_eq!(&b[56..64], &[0u8; 8], "the spare tail must be zero");
     }
 
@@ -391,17 +308,8 @@ mod tests {
         let id = Identity::of_self_best_effort(AccessMode::ReadWrite);
         assert_eq!(id.pid, std::process::id());
         assert_eq!(id.mode, AccessMode::ReadWrite);
-        // **This is the only test of the production writer's namespace field,
-        // and without it `0033` ships inert.** `of_self_best_effort` is the
-        // sole constructor on the registration path (`open.rs`'s step 5 and
-        // `ipc_child`); `of_self` has one caller in the workspace and it is a
-        // test. Every `TFT014` namespace arm hand-writes `pid_ns_inode` into a
-        // synthetic record, so replacing the read here with a literal `0` —
-        // the fix recording nothing, in the field it exists to fill — left
-        // `-p tf_tree_ipc` 91/91, `-p tf_tree_cli --features shm --lib`
-        // 124/124, `--test attach` 16/16 and `--test rendezvous` 31/31 all
-        // green. Measured, not supposed. Mutant: with this line, that same
-        // change fails here.
+        // The only test of the production writer's namespace field:
+        // `of_self_best_effort` is the sole constructor on the registration path.
         assert_eq!(
             Some(id.pid_ns_inode),
             crate::procstat::self_pid_ns_inode(),

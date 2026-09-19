@@ -1,23 +1,10 @@
-//! Status codes, the thread-local error detail, and the panic guard —
-//! `docs/PHASE4.md` §3.3 and §3.4.
+//! Status codes, the thread-local error detail, and the panic guard — `docs/PHASE4.md` §3.3 and
+//! §3.4.
 //!
-//! # Two things a C caller cannot do for itself
-//!
-//! **Carry a typed error.** Phase 1's errors are `Copy` structs that name the
-//! offending edge, the requested stamp and the window that failed (D11), and
-//! Python already exposes all of it. Collapsing that to an `int` would make the
-//! C++ wrapper strictly worse than the Python binding at reporting what went
-//! wrong. So the status code is accompanied by a thread-local [`tft_error`]
-//! carrying the same fields, formatted **only on the error path**.
-//!
-//! **Survive a Rust panic.** Since Rust 1.81 a panic escaping an `extern "C"`
-//! function aborts the process. For a library linked into somebody's robot,
-//! killing the host process because of a bug in *us* is not acceptable, so every
-//! entry point wraps its body in [`catch_unwind`](std::panic::catch_unwind).
-//!
-//! Both are handled by one helper, `guard`, because they happen at the same
-//! place: wrapping the body *is* the boundary. Two separate requirements
-//! remembered at thirty call sites would be two requirements to forget.
+//! A status code alone would make the C++ wrapper worse than Python at reporting what went wrong
+//! (D11), so it is accompanied by a thread-local [`tft_error`], formatted only on the error path. A
+//! Rust panic escaping an `extern "C"` function aborts the host process, so every entry point wraps
+//! its body in `guard`.
 
 use core::cell::RefCell;
 use core::ffi::c_char;
@@ -30,8 +17,7 @@ pub type tft_status = i32;
 /// Success.
 pub const TFT_OK: tft_status = 0;
 
-// Status codes. Stable, and **append-only** — a C consumer may compare against
-// a literal it compiled against years ago.
+// Status codes: stable and **append-only**.
 /// A required pointer argument was NULL.
 pub const TFT_ERR_NULL_ARG: tft_status = -1;
 /// A handle's magic word did not match: freed, corrupted, or not ours.
@@ -75,17 +61,11 @@ pub const TFT_ERR_NO_DERIVATIVES: tft_status = -19;
 pub const TFT_ERR_NO_SEGMENT: tft_status = -20;
 /// A `tft_publisher` was used from a thread other than its creator's.
 pub const TFT_ERR_WRONG_THREAD: tft_status = -30;
-/// The path between the two frames is too long: more raw edges than a lookup
-/// will walk, or more steps than a compiled plan holds once adjacent rigid
-/// links fold into one.
+/// The path between the two frames is too long: more raw edges than a lookup will walk, or more
+/// steps than a compiled plan holds once adjacent rigid links fold into one.
 ///
-/// **Two engine bounds, one status**, because this table is frozen. Neither is
-/// named as a macro here: `TFT_MAX_DEPTH` was referenced in this doc and in the
-/// header for the whole of Phase 4 and **defined nowhere**, and `0034` split the
-/// quantity it was vaguely about into two, so freezing that one name now would
-/// make it ambiguous rather than merely absent. Exporting a constant for each is
-/// its own change — it needs `xtask headers` and a decision on what a C caller
-/// is promised about a value that has already moved once.
+/// Two engine bounds share one status because this table is frozen (`0034`); neither is exported as
+/// a macro.
 pub const TFT_ERR_TREE_TOO_DEEP: tft_status = -21;
 /// The compiled-against ABI version is incompatible with this library (§3.6).
 pub const TFT_ERR_ABI_MISMATCH: tft_status = -6;
@@ -109,63 +89,28 @@ pub const TFT_ERR_READ_ONLY: tft_status = -35;
 pub const TFT_ERR_RETRY: tft_status = -36;
 /// The publisher's claim was released; claim the edge again to publish.
 pub const TFT_ERR_RELEASED: tft_status = -37;
-/// Both frame names are known, but the child is attached to a **different**
-/// parent than the one named.
-///
-/// Distinct from [`TFT_ERR_UNKNOWN_FRAME`] on purpose: that one means "check
-/// your spelling", and this one means "check your topology". Reported as
-/// `UNKNOWN_FRAME` until review pointed out that its documented meaning — "a
-/// frame name that this tree never interned" — is false for *every* instance of
-/// this case, since `tft_tree_claim` resolves both names before it can arise.
-///
-/// The detail carries `frame_a` = the child, `frame_b` = its actual parent.
+/// Both frame names are known, but the child is attached to a **different** parent than the one
+/// named. The detail carries `frame_a` = the child, `frame_b` = its actual parent.
 pub const TFT_ERR_PARENT_MISMATCH: tft_status = -38;
-/// The named child frame has no incoming edge at all — it is a root, or was
-/// never attached. Also formerly `TFT_ERR_UNKNOWN_FRAME`, and false for the
-/// same reason.
+/// The named child frame has no incoming edge at all — it is a root, or was never attached.
 pub const TFT_ERR_NO_EDGE: tft_status = -39;
 /// A configuration text could not be turned into a topology: it does not parse,
 /// declares a cycle, or describes a tree the engine will not build. The
 /// message names the line or the frame.
 pub const TFT_ERR_BAD_CONFIG: tft_status = -40;
-/// A `(sec, nanos)` pair is not a representable stamp: `nanos` is outside
-/// `[0, 1e9)`, or the total does not fit `int64_t`.
+/// A `(sec, nanos)` pair is not a representable stamp: `nanos` is outside `[0, 1e9)`, or the total
+/// does not fit `int64_t`.
 ///
-/// **Returned only by `tft_stamp_from_parts` and `tft_stamp_from_timespec`**,
-/// which is what keeps adding it a minor bump under `docs/PHASE4.md` §3.6: a
-/// caller compiled against an older header never calls either function and can
-/// therefore never receive this code. The detail carries the offending pair —
-/// `requested` = seconds, `newest` = nanoseconds.
-///
-/// It is deliberately not `TFT_ERR_BAD_ENUM`, which means "an enum argument is
-/// outside the range this build defines". This is an *arithmetic* refusal, and
-/// reusing a code whose message names enums would send an operator looking at
-/// the wrong argument.
+/// Returned only by `tft_stamp_from_parts` and `tft_stamp_from_timespec` (a minor bump under
+/// `docs/PHASE4.md` §3.6). The detail carries `requested` = seconds, `newest` = nanoseconds. Not
+/// `TFT_ERR_BAD_ENUM`: this is an arithmetic refusal.
 pub const TFT_ERR_BAD_STAMP: tft_status = -41;
-/// A **shared** arena was asked for and could not be had: the rendezvous name is
-/// already held by a live arena, the runtime directory is unusable, the segment
-/// could not be created or mapped — or this library was built without
-/// `--features shm` and so has no shared-memory machinery behind the field at
-/// all. The message says which.
+/// A **shared** arena was asked for and could not be had: the rendezvous name is held by a live
+/// arena, the runtime directory is unusable, the segment could not be created or mapped, or this
+/// library was built without `--features shm`. The message says which (`docs/decisions/0015`).
 ///
-/// The code exists because nothing already meant this (`docs/decisions/0015`
-/// *Failure*): [`TFT_ERR_BAD_CONFIG`] is the topology *text*,
-/// [`TFT_ERR_TIME_DOMAIN`] is §5.5's domain agreement, and the claim family is
-/// per-edge with `frame_a`/`frame_b` in its detail — a rendezvous fault has no
-/// edge to name. Collapsing them onto [`TFT_ERR_INTERNAL`] would leave an
-/// operator unable to tell "another bridge holds this name" from "the runtime
-/// directory is unusable" from "a bug", which is the diagnosis the record exists
-/// to protect.
-///
-/// **Returned only by `tft_bridge_create`, and only when
-/// `tft_bridge_options::arena_name` is non-NULL**, which is what keeps adding it
-/// a minor bump under `docs/PHASE4.md` §3.6 — and is a tighter argument than
-/// [`TFT_ERR_BAD_STAMP`]'s: a caller whose `struct_size` names the 0.4 layout
-/// has no such field to set, so it *provably* cannot receive this code.
-///
-/// There is deliberately **no fallback to a private heap arena**. A bridge that
-/// downgraded silently would present, on every consumer, as a bridge that never
-/// started — forever.
+/// Returned only by `tft_bridge_create` with a non-NULL `tft_bridge_options::arena_name` (a minor
+/// bump under `docs/PHASE4.md` §3.6). There is **no fallback to a private heap arena**.
 pub const TFT_ERR_ARENA_UNAVAILABLE: tft_status = -42;
 /// Something the library did not anticipate — including a caught Rust panic.
 pub const TFT_ERR_INTERNAL: tft_status = -99;
@@ -176,11 +121,8 @@ pub const TFT_INVALID_ID: u32 = u32::MAX;
 /// Length of [`tft_error::message`], including the NUL.
 pub const TFT_MESSAGE_LEN: usize = 256;
 
-/// Structured detail for the most recent failure **on this thread**.
-///
-/// Every field that does not apply to a given error is `TFT_INVALID_ID` (ids) or
-/// `0` (stamps and generations), so a caller can print the whole struct without
-/// checking which variant produced it.
+/// Structured detail for the most recent failure **on this thread**. Fields that do not apply are
+/// `TFT_INVALID_ID` (ids) or `0`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(non_camel_case_types)]
@@ -212,14 +154,8 @@ pub struct tft_error {
 }
 
 impl tft_error {
-    /// A well-formed all-clear `tft_error`, with `struct_size` already set.
-    ///
-    /// **Public because the alternative is `unsafe { core::mem::zeroed() }` at
-    /// every caller.** `docs/decisions/0048` found that spelling across this
-    /// crate's own tests and examples and `tf_tree_bench`'s bins: every one is
-    /// an `unsafe` block with a safe replacement, and this is the replacement.
-    /// `#[derive(Default)]` is not available — `message` is `[c_char; 256]` and
-    /// arrays longer than 32 have no `Default`.
+    /// A well-formed all-clear `tft_error`, with `struct_size` already set. Public so callers need
+    /// not `mem::zeroed()` (`docs/decisions/0048`).
     pub const fn blank() -> tft_error {
         tft_error {
             struct_size: core::mem::size_of::<tft_error>() as u32,
@@ -238,17 +174,8 @@ impl tft_error {
 
     /// Copy `text` into `message`, truncating at the buffer and always leaving a
     /// NUL. ASCII only, so truncation cannot split a multi-byte sequence.
-    // **`c_char` is `i8` on x86_64 and `u8` on aarch64, so exactly one of the
-    // two casts below is a no-op on any given target** — and `-D warnings`
-    // turns `clippy::unnecessary_cast` into a build error on whichever target
-    // that is. Removing the cast fixes the lint on one architecture and breaks
-    // compilation on the other, so the allow is the fix rather than a
-    // suppression of one.
-    //
-    // Found by the first `ubuntu-24.04-arm` job this repository has ever run
-    // (2026-08-16). It had been latent since the C ABI landed: GitHub Actions
-    // produced no run here between 2026-07-23 and the repository being made
-    // public, and the aarch64 rows had never executed even before that.
+    // `c_char` is `i8` on x86_64 and `u8` on aarch64, so exactly one cast below is a
+    // no-op per target; the allow is the fix, not a suppression.
     #[allow(clippy::unnecessary_cast)]
     fn set_message(&mut self, text: &str) {
         let bytes = text.as_bytes();
@@ -266,9 +193,8 @@ impl tft_error {
 }
 
 thread_local! {
-    /// Thread-local by design (§3.3). A process-global would need a lock on the
-    /// error path and would report another thread's failure to this one, which
-    /// is worse than reporting nothing.
+    /// Thread-local by design (§3.3): a process-global would need a lock and report another
+    /// thread's failure.
     static LAST_ERROR: RefCell<tft_error> = const { RefCell::new(tft_error::blank()) };
 }
 
@@ -284,13 +210,8 @@ pub(crate) fn set_error(code: tft_status, message: &str, fill: impl FnOnce(&mut 
     });
 }
 
-/// Add detail to this thread's error **without** discarding what is already
-/// there.
-///
-/// [`set_error`] deliberately blanks first, so a fresh error cannot inherit a
-/// stale field. That makes it the wrong tool for layering: `tft_plan_at_many`
-/// used it after `record_lookup` and wiped the edge id and the retained window
-/// the caller needs — reported by review, and the reason this exists.
+/// Add detail to this thread's error **without** discarding what is there; [`set_error`] blanks
+/// first, which is wrong for layering.
 pub(crate) fn amend_error(fill: impl FnOnce(&mut tft_error)) {
     LAST_ERROR.with(|slot| {
         if let Ok(mut e) = slot.try_borrow_mut() {
@@ -299,15 +220,10 @@ pub(crate) fn amend_error(fill: impl FnOnce(&mut tft_error)) {
     });
 }
 
-/// This thread's most recent error message, as a Rust `String`.
-///
-/// Exists so a caller *inside* this crate can quote what the engine just said
-/// rather than inventing a second wording for the same failure — the bridge's
-/// `TFT_BRIDGE_REJECTED` outcome does exactly that. Allocates, and is therefore
-/// only ever called on a failure path.
+/// This thread's most recent error message, so a caller inside this crate can quote the engine
+/// rather than invent a second wording. Allocates; failure paths only.
 #[cfg(feature = "bridge")]
-// See `set_message` for why this cast carries an allow rather than being
-// removed: `c_char` signedness is target-dependent.
+// `c_char` signedness: see `set_message`.
 #[allow(clippy::unnecessary_cast)]
 pub(crate) fn last_message() -> String {
     LAST_ERROR.with(|slot| {
@@ -320,9 +236,6 @@ pub(crate) fn last_message() -> String {
                     .take_while(|&&c| c != 0)
                     .map(|&c| c as u8)
                     .collect();
-                // `set_message` substitutes non-ASCII, so this cannot fail; the
-                // fallback is here because a panic in an error path is the worst
-                // possible place for one.
                 String::from_utf8(bytes).unwrap_or_default()
             },
         )
@@ -353,9 +266,7 @@ pub(crate) fn clear_error() {
 /// whose `struct_size` field has been initialised.
 #[no_mangle]
 pub unsafe extern "C" fn tft_last_error(out: *mut tft_error) -> tft_status {
-    // Deliberately NOT wrapped in `guard`: it must stay callable from an error
-    // path, and re-entering the error machinery to report a failure to report an
-    // error is how a diagnostic surface becomes the bug.
+    // Deliberately not wrapped in `guard`: it must stay callable from an error path.
     if out.is_null() {
         return TFT_ERR_NULL_ARG;
     }
@@ -430,12 +341,8 @@ pub(crate) fn record_lookup(err: LookupError) -> tft_status {
             );
             TFT_ERR_TOPOLOGY_CHANGED
         }
-        // Split, because only one of the two knows an edge. A query against a
-        // plan compiled for another domain names two integers and nothing
-        // else; a *path* whose dynamic edges disagree names the edge that
-        // disagreed (D11), and dropping it left a C caller with a refusal and
-        // no way to find the edge to reconfigure. The message stays static:
-        // this runs on the `tft_plan_at` path, which does not allocate.
+        // Split: only `MixedTimeDomains` knows an edge (D11). Static messages: this is the
+        // `tft_plan_at` path, which does not allocate.
         L::TimeDomainMismatch { .. } => {
             set_error(TFT_ERR_TIME_DOMAIN, "time domain mismatch", |_| {});
             TFT_ERR_TIME_DOMAIN
@@ -490,12 +397,7 @@ pub(crate) fn record_lookup(err: LookupError) -> tft_status {
             TFT_ERR_NO_SEGMENT
         }
         L::TreeTooDeep { depth } => {
-            // `requested` carries `depth`, and since `0034` that number is the
-            // count that overran *one of two* bounds — the raw walk's or the
-            // folded plan's. The sentence says "one of the engine's two length
-            // bounds" rather than picking one, because this layer cannot name
-            // either without naming a macro, and the one this header used to
-            // name (`TFT_MAX_DEPTH`) was never defined; see
+            // `requested` carries `depth`, the count that overran one of two bounds (`0034`); see
             // `TFT_ERR_TREE_TOO_DEEP`.
             set_error(
                 TFT_ERR_TREE_TOO_DEEP,
@@ -542,43 +444,24 @@ pub(crate) fn record_lookup(err: LookupError) -> tft_status {
 
 /// Run `body` with a panic guard, returning `fallback` if it panics.
 ///
-/// **The shape `guard` cannot cover.** [`guard`] returns [`tft_status`], so it
-/// fits only the entry points that report through one. §6's checklist asks for
-/// `catch_unwind` on *every* `extern "C"` boundary, and the ones returning a
-/// count, a size or nothing had no guard at all — not because they were judged
-/// safe, but because the helper did not fit them. Modern Rust aborts rather than
-/// unwinding across an `extern "C"` frame, so the hazard is a process abort in a
-/// C or C++ host rather than undefined behaviour; a diagnostic that reads a
-/// count is still the wrong place to take a robot down.
-///
-/// No error is recorded here: these entry points have no status to carry one,
-/// and setting the thread slot would leave a caller that never reads it with a
-/// stale error the *next* status-returning call would have to clear. `fallback`
-/// is chosen per site to be the value that reads as "nothing to report".
+/// For the `extern "C"` entry points that return a count, a size or nothing, which [`guard`] does
+/// not fit (§6's checklist). No error is recorded: there is no status to carry it. `fallback` reads
+/// as "nothing to report".
 #[inline]
 pub(crate) fn guard_value<T>(fallback: T, body: impl FnOnce() -> T) -> T {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(fallback)
 }
 
-/// Run `body` with a panic guard, translating a panic into
-/// [`TFT_ERR_INTERNAL`] instead of aborting the process (§3.4).
+/// Run `body` with a panic guard, translating a panic into [`TFT_ERR_INTERNAL`] instead of aborting
+/// the process (§3.4). Clears the thread's error slot first.
 ///
-/// Clears the thread's error slot first, so a success leaves no stale detail
-/// behind and a failure's detail is unambiguously the one just recorded.
-///
-/// `catch_unwind` is zero-cost on the non-panicking path — it emits landing pads,
-/// not a runtime check — which is why §3.7's hot path can be wrapped without a
-/// measurable cost. `bench/abi_cost` is the row that proves it rather than
-/// asserting it.
+/// `catch_unwind` is zero-cost on the non-panicking path; `bench/abi_cost` measures it.
 #[inline]
 pub(crate) fn guard(body: impl FnOnce() -> tft_status) -> tft_status {
     clear_error();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(status) => status,
         Err(payload) => {
-            // The payload is whatever `panic!` was given. `&str` and `String`
-            // cover every panic the standard library and this crate produce;
-            // anything else still yields a status rather than an abort.
             let text = payload
                 .downcast_ref::<&str>()
                 .copied()
@@ -601,22 +484,14 @@ mod tests {
         LAST_ERROR.with(|slot| *slot.borrow())
     }
 
-    /// **A path whose dynamic edges disagree names the edge that disagreed**,
-    /// and a query in the wrong domain — which has no edge to name — still
-    /// reports `TFT_INVALID_ID` rather than inheriting one.
+    /// A path whose dynamic edges disagree names the edge that disagreed; a query in the wrong
+    /// domain has no edge to name and reports `TFT_INVALID_ID`.
     ///
-    /// Called on the mapper directly: no `test-hooks` fixture builds a
-    /// mixed-domain tree, and the facade's own `behavior.rs` already proves
-    /// `Tree::plan` returns `MixedTimeDomains` with that edge.
+    /// **Mutant:** delete `|e| e.edge = edge.get()` from the `MixedTimeDomains` arm; the test
+    /// fails.
     ///
-    /// **Mutant:** delete `|e| e.edge = edge.get()` from the `MixedTimeDomains`
-    /// arm (replace it with `|_| {}`). Applied: this test fails —
-    /// `left: 4294967295`, `right: 7`.
-    ///
-    /// **Mutant:** in the `TimeDomainMismatch` arm, `set_error(..)` →
-    /// `amend_error(|e| e.code = TFT_ERR_TIME_DOMAIN)`, i.e. a refusal that
-    /// layers onto the previous error instead of replacing it. Applied: the last
-    /// assertion fails — `left: 7`, `right: 4294967295`.
+    /// **Mutant:** in the `TimeDomainMismatch` arm, `set_error(..)` → `amend_error(|e| e.code =
+    /// TFT_ERR_TIME_DOMAIN)`; the last assertion fails.
     #[test]
     fn mixed_time_domains_names_its_edge() {
         let rc = record_lookup(LookupError::MixedTimeDomains {
@@ -636,32 +511,13 @@ mod tests {
         assert_eq!(last().edge, TFT_INVALID_ID);
     }
 
-    /// **The buffer `tf_tree_ipc`'s message budget is derived from** (`0055`
-    /// step 6).
+    /// The buffer `tf_tree_ipc`'s message budget is derived from (`0055` step 6).
     ///
-    /// `tf_tree_ipc::error`'s `MESSAGE_BUDGET` is 255 usable bytes minus the
-    /// **longest** fixed text a C path puts before one of its renderings, which
-    /// is `bridge::generic_failure_message`'s `shared arena could not be
-    /// created: ` — not the shorter `could not open the arena: ` an earlier
-    /// revision of this comment named. That crate cannot see these constants
-    /// (`tf_tree_c` depends on it, not the reverse), so the derivation is
-    /// repeated there and the three facts it rests on are pinned here: the
-    /// buffer's size, the truncation bound, and the `?` substitution. If any of
-    /// them moves, that budget is wrong in the unsafe direction and its own gate
-    /// would keep passing.
-    ///
-    /// **The number itself is deliberately not repeated here.** It was, and it
-    /// went stale in this file the moment it was corrected in the other one.
-    ///
-    /// It also pins the substitution, because a message that is merely *short*
-    /// is not enough: `set_message` replaces each non-ASCII **byte** with `?`,
-    /// so one em-dash becomes `???` and the budget has to be spent on ASCII.
-    // Same reason as `set_message`'s own allow above: `c_char` is `i8` on
-    // x86_64 and `u8` on aarch64, so `c as u8` is a no-op on exactly one of
-    // them and `-D warnings` makes that a build error there. **This test was
-    // written and gated on x86_64 and failed the `ubuntu-24.04-arm` row**,
-    // which is the same defect class the comment above records, one target
-    // over — and the reason that row exists.
+    /// That crate's `MESSAGE_BUDGET` is 255 usable bytes minus the longest fixed text a C path
+    /// puts before a rendering (`bridge::generic_failure_message`'s prefix), and cannot see these
+    /// constants. Pinned here: the buffer size, the truncation bound and the `?` substitution
+    /// (one em-dash costs three bytes).
+    // `c_char` signedness again: `c as u8` is a no-op on exactly one target.
     #[allow(clippy::unnecessary_cast)]
     #[test]
     fn the_message_buffer_is_the_size_this_crates_budget_assumes() {
@@ -670,11 +526,6 @@ mod tests {
             "tf_tree_ipc's MESSAGE_BUDGET is derived from this; move both together"
         );
 
-        // **The truncation bound itself, which is the "255 usable" term in that
-        // budget and was not pinned.** Mutating `min(TFT_MESSAGE_LEN - 1)` to
-        // `min(TFT_MESSAGE_LEN / 4)` left all 34 tests in this crate green — so
-        // the budget could have gone wrong in the unsafe direction with the gate
-        // passing, which is the exact hazard this test's doc says it prevents.
         let mut long = last();
         long.set_message(&"x".repeat(300));
         let kept = long.message.iter().take_while(|&&c| c != 0).count();

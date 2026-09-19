@@ -1,16 +1,9 @@
-//! The shared mobile-robot fixture tree (`docs/PHASE1.md` §11.1 *Fixture*).
-//!
-//! A single 24-frame tree, max depth 6, shaped like a real mobile robot: four
-//! dynamic edges (`map→odom` @ 50 Hz, `odom→base_link` @ 200 Hz,
-//! `base_link→imu_link` @ 1 kHz, `lidar_mount→lidar` @ 10 Hz) and 19 static edges.
-//! Every dynamic ring is sized (via [`Capacity::history`]) to retain
-//! [`HISTORY_SECS`] seconds at its own rate.
-//!
-//! The same [`EDGES`] table drives the criterion benches, the CLI demo, the tf2
-//! differential harness, and the doctor's healthy-tree tests, so they never drift
-//! apart. All builders return `Result`; the crate proper holds no `unwrap`/`panic`
-//! (the workspace lints forbid them), and callers that genuinely cannot fail
-//! (benches, tests) surface the error at their own boundary.
+//! The shared mobile-robot fixture tree (`docs/PHASE1.md` §11.1): 24 frames,
+//! max depth 6, four dynamic edges (`map→odom` 50 Hz, `odom→base_link` 200 Hz,
+//! `base_link→imu_link` 1 kHz, `lidar_mount→lidar` 10 Hz) and 19 static. Every
+//! dynamic ring retains [`HISTORY_SECS`] at its own rate. The [`EDGES`] table
+//! drives the benches, the CLI demo, the differential harness and the doctor's
+//! healthy-tree tests. Builders return `Result`; the crate holds no `unwrap`.
 
 use anyhow::{anyhow, Result};
 
@@ -20,34 +13,18 @@ use tf_tree_math::exp_se3;
 /// Seconds of history every dynamic ring is sized to retain.
 pub const HISTORY_SECS: f64 = 10.0;
 
-/// A query stamp that lies inside *every* dynamic edge's retained window.
+/// A query stamp inside every dynamic edge's retained window.
 ///
-/// The lidar edge (10 Hz, 100 samples over 10 s) has the shortest reach; its
-/// newest stamp is `9.9 s`. Picking `9.9 s` as "now" keeps `At(now)` and
-/// `At(now − 100 ms)` valid on all four edges without extrapolation.
-///
-/// **It is a knot on all four grids, deliberately and permanently.** `9.9 s` is
-/// an exact multiple of every dynamic period here (20 ms, 5 ms, 1 ms, 100 ms),
-/// and [`spin_up`] publishes each edge from stamp `0`, so a query *at* `NOW_NS`
-/// takes `SampleRing::sample`'s exact-hit branch on every edge and the
-/// interpolator never runs. That is what made it the right anchor for a
-/// *history window* and the wrong stamp for a *latency* measurement
-/// (`docs/decisions/0013`). A latency benchmark queries [`QUERY_NS`]; do not
-/// "tidy" that offset away.
+/// It is a knot on all four sample grids (multiple of 20, 5, 1 and 100 ms), so
+/// a query at `NOW_NS` takes the exact-hit branch and the interpolator never
+/// runs: right for a history window, wrong for latency (`docs/decisions/0013`).
+/// Latency benchmarks query [`QUERY_NS`]; do not tidy that offset away.
 pub const NOW_NS: i64 = 9_900_000_000;
 
-/// The stamp every **latency** benchmark queries: [`NOW_NS`] moved off all four
-/// sample grids, so `I::eval` actually runs.
-///
-/// 500 µs is off-grid for the 20 ms, 5 ms, 1 ms and 100 ms periods alike, and
-/// still inside every retained window (the newest 1 kHz sample is at 9.999 s,
-/// the newest 10 Hz sample at 9.9 s). The resulting interpolation fractions are
-/// 0.975 (50 Hz), 0.9 (200 Hz), 0.5 (1 kHz) and 0.995 (10 Hz) — non-zero on
-/// every edge, which is the whole property being bought.
-///
-/// The on-grid case is the *best* case, not the normal one: a consumer queries
-/// at a sensor stamp or a control tick, and landing exactly on a publisher's
-/// grid is the coincidence.
+/// The stamp every latency benchmark queries: [`NOW_NS`] moved 500 µs off all
+/// four sample grids so the interpolator runs, still inside every retained
+/// window. Interpolation fractions: 0.975 (50 Hz), 0.9 (200 Hz), 0.5 (1 kHz),
+/// 0.995 (10 Hz).
 pub const QUERY_NS: i64 = NOW_NS - 500_000;
 
 /// What an [`EdgeDef`] describes.
@@ -90,11 +67,8 @@ const fn mount(rz: f64, x: f64, y: f64, z: f64) -> EdgeDefKind {
     }
 }
 
-/// The 23 edges of the fixture (4 dynamic + 19 static), over 24 frames.
-///
-/// The longest chain — `map → odom → base_link → sensor_arch → camera_mount →
-/// camera_link → camera_optical` — is six edges deep, matching the spec's "max
-/// depth 6".
+/// The 23 edges of the fixture (4 dynamic + 19 static), over 24 frames; the
+/// longest chain (`map → … → camera_optical`) is six edges deep.
 pub const EDGES: &[EdgeDef] = &[
     // --- kinematic spine (dynamic) --------------------------------------
     EdgeDef {
@@ -243,16 +217,13 @@ pub fn frame_names() -> Vec<&'static str> {
 ///
 /// # Errors
 ///
-/// Propagates any [`tf_tree::BuildError`] (unreachable for this fixed topology,
-/// but surfaced rather than unwrapped).
+/// Propagates any [`tf_tree::BuildError`].
 pub fn build_tree() -> Result<Tree> {
     build_tree_with(InterpPolicy::ScLerp)
 }
 
-/// Build the fixture tree with a chosen default interpolation policy.
-///
-/// The tf2 differential harness uses [`InterpPolicy::LerpSlerp`] (tf2's policy);
-/// the benches use the `ScLerp` default.
+/// Build the fixture tree with a chosen default interpolation policy
+/// (`LerpSlerp` for the tf2 differential, `ScLerp` for the benches).
 ///
 /// # Errors
 ///
@@ -272,11 +243,8 @@ pub fn build_tree_with(interp: InterpPolicy) -> Result<Tree> {
     b.build().map_err(|e| anyhow!("build fixture tree: {e}"))
 }
 
-/// A deterministic synthetic pose for dynamic edge `seed` at nanosecond `stamp`.
-///
-/// A smooth, bounded screw motion (`exp_se3` of a slowly time-varying twist), so
-/// interpolation between adjacent samples is well conditioned and the reference /
-/// engine agreement in the differential harness is meaningful.
+/// A deterministic synthetic pose for dynamic edge `seed` at nanosecond `stamp`:
+/// a smooth, bounded screw motion, well conditioned for interpolation.
 #[must_use]
 pub fn dynamic_pose(seed: f64, stamp_ns: i64) -> Iso3 {
     let t = stamp_ns as f64 * 1e-9;
@@ -291,9 +259,8 @@ pub fn dynamic_pose(seed: f64, stamp_ns: i64) -> Iso3 {
     exp_se3(xi)
 }
 
-/// One recorded publish, in arrival order — the observed-history input the
-/// `doctor` diagnostics consume (multi-writer, inconsistent-rate, out-of-order,
-/// short-buffer checks all read this stream).
+/// One recorded publish, in arrival order: the input the `doctor` diagnostics
+/// consume.
 #[derive(Clone, Copy, Debug)]
 pub struct PushSample {
     /// The edge id the sample was published to.
@@ -308,17 +275,12 @@ pub struct PushSample {
 }
 
 /// Claim every dynamic edge and publish [`HISTORY_SECS`] of synthetic history,
-/// returning the live [`EdgeWriter`]s (claims stay held while they live) and the
+/// returning the live [`EdgeWriter`]s (claims held while they live) and the
 /// recorded push stream.
-///
-/// Keeping the publishers alive is what lets the CLI `tree`/`doctor` demo show
-/// *claimed* edges with a live writer PID; drop them to release the claims.
 ///
 /// # Errors
 ///
-/// If a frame is unknown, an edge cannot be claimed, or a push is rejected — none
-/// of which can happen for the fixed fixture, but all surfaced rather than
-/// unwrapped.
+/// If a frame is unknown, an edge cannot be claimed, or a push is rejected.
 pub fn spin_up(tree: &Tree) -> Result<(Vec<EdgeWriter<'_>>, Vec<PushSample>)> {
     let pid = std::process::id();
     let mut writers = Vec::new();
@@ -354,8 +316,7 @@ pub fn spin_up(tree: &Tree) -> Result<(Vec<EdgeWriter<'_>>, Vec<PushSample>)> {
     Ok((writers, samples))
 }
 
-/// Build the fixture and pre-populate its history, dropping the publishers (the
-/// benches read against the populated rings and do not need the claims held).
+/// Build the fixture and pre-populate its history, dropping the publishers.
 ///
 /// # Errors
 ///
@@ -377,16 +338,12 @@ mod tests {
     use super::{build_tree, DYNAMIC_EDGES, NOW_NS, QUERY_NS};
     use crate::workload::dyn_steps;
 
-    /// The two stamps' relationship to the sample grids, asserted rather than
-    /// commented — `docs/decisions/0013` exists because the on-grid property was
-    /// a coincidence nobody had written down, and the fix is one subtraction that
-    /// a tidying pass would delete without noticing.
+    /// The two stamps' relationship to the sample grids (`docs/decisions/0013`):
+    /// edge `k` is published at `0, period, 2·period, …`, so "on the grid" is
+    /// "divisible by the period".
     ///
-    /// [`super::spin_up`] publishes edge `k` at `0, period, 2·period, …`, so
-    /// "on the grid" is exactly "divisible by the period".
-    ///
-    /// Mutant (applied, confirmed fatal): `QUERY_NS = NOW_NS` — the second
-    /// assertion fires on the first edge, naming the 50 Hz period.
+    /// Mutant (confirmed fatal): `QUERY_NS = NOW_NS` fires the second assertion
+    /// on the first edge.
     #[test]
     fn the_latency_query_stamp_is_off_every_dynamic_grid() {
         assert!(!DYNAMIC_EDGES.is_empty());
@@ -406,10 +363,8 @@ mod tests {
                 "{parent}->{child}: QUERY_NS lands on the {rate_hz} Hz grid, so \
                  that edge takes the exact-hit branch and never interpolates"
             );
-            // …and it interpolates rather than extrapolates: NOW_NS is a knot on
-            // every grid and no later than each edge's newest sample, so a stamp
-            // inside `(NOW_NS − period, NOW_NS)` is bracketed by two stored
-            // samples on every edge.
+            // …and it interpolates: NOW_NS is a knot on every grid, so a stamp
+            // in `(NOW_NS − period, NOW_NS)` is bracketed by two stored samples.
             assert!(
                 QUERY_NS < NOW_NS && QUERY_NS > NOW_NS - period_ns,
                 "{parent}->{child}: QUERY_NS must fall inside the segment ending \
@@ -418,21 +373,14 @@ mod tests {
         }
     }
 
-    /// What each row of `benches/lookup.rs` actually compiles to.
+    /// What each row of `benches/lookup.rs` compiles to. `docs/PHASE1.md` §11.3
+    /// is NORMATIVE that every latency row states its dynamic-step count;
+    /// `depth6` folds four static edges to one constant step, so it is cheaper
+    /// than `depth3`, and `docs/decisions/0013`'s per-step arithmetic relies on
+    /// these shapes.
     ///
-    /// `docs/PHASE1.md` §11.3 is NORMATIVE that "every reported latency row must
-    /// state its dynamic-step count, not just its nominal depth" — the two
-    /// readings differ by ~2.8× — and the gate's row is the *three dynamic steps*
-    /// one. The `depth6` row is the interesting case: six edges, four of them
-    /// static, which fold to a single constant step, so it is **cheaper** than
-    /// `depth3` rather than twice as expensive. `docs/decisions/0013`'s
-    /// re-baseline reads a per-step cost out of the three rows together, and that
-    /// arithmetic is only valid if these shapes are what it assumes.
-    ///
-    /// Mutant (applied, confirmed fatal): declare `base_link -> sensor_arch`
-    /// dynamic instead of static in [`super::EDGES`] — *assertion `left == right`
-    /// failed: depth6: compiled step count, left: 4, right: 3*. The dynamic-count
-    /// assertion is not reached, because the step count is checked first.
+    /// Mutant (confirmed fatal): declaring `base_link -> sensor_arch` dynamic
+    /// fails `depth6: compiled step count` (left 4, right 3).
     #[test]
     fn the_benched_paths_have_the_step_counts_the_baseline_assumes() {
         let tree = build_tree().expect("fixture");

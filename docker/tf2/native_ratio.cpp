@@ -1,75 +1,20 @@
 // Both engines in one C++ process, with no Rust binding on either arm.
 //
-// # What this measures, and why it is the fair version
+// `crates/tf_tree_bench/src/ratio.rs` measures the same quotient with tf2 behind
+// `tf_tree_tf2_sys`, which charges tf2 the FFI boundary and flatters `tf_tree`.
+// Here tf2 is native (`BufferCore::lookupTransform` called directly) and tf_tree
+// goes through its C ABI, linked as a shared library, so the ratio is a lower
+// bound. Neither this ratio nor the Rust one is "the" answer; they bracket it
+// (`docs/benchmarks/tf2.md`). The residual C ABI cost is measured by
+// `just abi-split` (`crates/tf_tree_bench/src/backing.rs`).
 //
-// `crates/tf_tree_bench/src/ratio.rs` measures the same quotient from Rust, and
-// its tf2 arm goes through `tf_tree_tf2_sys`. `docs/benchmarks/tf2.md` prices
-// that boundary at **45.3 ns / 10% at depth 3** (bias 3: cross-TU, no inlining,
-// one extra copy) — 498.2 ns through the binding against 452.9 ns native, a
-// subtraction between two rows of that document's bracket table, one of which
-// **this file produces**. It is charged to tf2 — so every ratio measured that
-// way flatters `tf_tree`. (This line read `~21 ns / 8%` until 2026-09-05;
-// `tf2.md` withdrew that figure for having no derivation recorded anywhere and
-// for disagreeing with its own bracket table by a factor of two. To find every
-// site that still carries it, grep — an enumeration written here is a list that
-// goes stale silently, which is how this file came to cite the document that
-// withdrew the number it was quoting.)
+// Both arms share one process: they are interleaved within every round and the
+// leading arm alternates, so drift common to both divides out of each quotient.
 //
-// Here the arms are the other way round:
-//
-//   * **tf2 is native.** `tf2::BufferCore::lookupTransform` called directly from
-//     C++, the call a real node makes. It pays nothing.
-//   * **tf_tree goes through its C ABI**, linked as a shared library from C++.
-//
-// So the residual cost works against the claim rather than for it, and this
-// number is a lower bound rather than a flattering upper one. That is the
-// direction a published ratio should err.
-//
-// **How much it is charged was a surprise, and this comment used to state it
-// wrongly.** It said ~2%, on the strength of `docs/PHASE4.md` §7 gate 1's
-// `tft_plan_at` = 1.020x native Rust. Measured here, on the same host and
-// fixture as the Rust harness: **306.7 ns against 201.5 ns, or +52%.** §7 gate 1
-// is `examples/abi_cost.rs`, which calls the ABI from *Rust inside the same
-// build*, where the linker can still see across the call. A C++ caller against
-// `libtf_tree_c.so` cannot, and this is what that costs.
-//
-// Two differences separate the two figures and **this run does not tell them
-// apart**: the cross-`.so` call itself, and the fact that the arena here is a
-// shared `memfd` mapping rather than a heap one.
-//
-// **They have since been told apart, elsewhere, and the answer is neither.**
-// `just abi-split` (`crates/tf_tree_bench/src/backing.rs`) walks the ladder on
-// the arena `native_arena` serves: the shared mapping costs <= 9.6 ns, attaching
-// read-only from another process costs -0.7 ns, and the link mode costs ~1 ns
-// (`tests/cpp/bench.cpp` compiled against the `.a` and the `.so` measures 245.4
-// against 244.4). What remains is **+99.5 ns / +49% in the C ABI itself**:
-// `tft_plan_at` constructs a `Guard` on every call where the Rust arm hoists
-// one, and `tft_plan_at_many` recovers 41 ns by paying it once per batch.
-//
-// **A first version of this comment blamed the shared-library boundary.** It
-// had reached that by subtracting a measured mapping cost from the total and
-// attributing the residue; nothing had measured the boundary. It is 0.4%.
-//
-// The consequence for the reader: **neither this ratio nor the Rust one is
-// "the" answer.** They bracket it. See `docs/benchmarks/tf2.md`.
-//
-// # Why both arms are still in one process
-//
-// Because the pairing is what makes the number resolvable at all. The arms are
-// interleaved within every round and the leading arm alternates, so drift common
-// to both divides out of each round's quotient; the Rust harness reports a ~3%
-// band that way on a host whose absolute latencies are `unavailable`. Two
-// separate binaries cannot be interleaved, and comparing their medians puts this
-// host's ~4% run-to-run spread straight into the answer — which is the failure
-// `cpp-bench`'s §7 gate 2 had before it started interleaving.
-//
-// # Why an arena is attached rather than built
-//
-// `tft_tree_open` attaches; it cannot create. That is D18 — a consumer linked
-// against the C ABI joins read-only and the MMU enforces it — and it is not
-// something to work around for a benchmark. `native_arena` is the Rust owner
-// that serves the arena and dumps the identical `.tfstream` this program feeds
-// to tf2, so both engines hold the same data by construction.
+// `tft_tree_open` attaches and cannot create (D18). `native_arena` is the Rust
+// owner that serves the arena and dumps the `.tfstream` this program feeds to
+// tf2, so both engines hold the same data.
+
 
 #include <tf2/buffer_core.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -142,13 +87,10 @@ geometry_msgs::msg::TransformStamped to_msg(const Sample &x) {
   return m;
 }
 
-// A real broadcaster stores its authority once. Constructing it per call was
-// bias 4 in `tf2.md` — 20 characters is past libstdc++'s 15-byte SSO buffer, so
-// a literal costs one heap allocation on every `setTransform`, charged to tf2.
+// Stored once: a literal past the 15-byte SSO limit would allocate per call.
 const std::string kAuthority = "tf_tree_native_ratio";
 
-// `tft_last_error` fills a caller-owned struct rather than returning a pointer —
-// the ABI holds no global string for a caller to outlive.
+// `tft_last_error` fills a caller-owned struct; the ABI holds no global string.
 const char *last_error() {
   static tft_error e;
   if (tft_last_error(&e) != TFT_OK) return "(no error recorded)";
@@ -164,17 +106,8 @@ double median(std::vector<double> v) {
 // max(rotation-angle error in rad, translation error in m) — the same metric the
 // Rust differential scores with, so "agree" means the same thing on both sides.
 //
-// **The angle comes from the chord, not from `acos` of the dot product**, and
-// the first version of this function got it wrong in a way worth recording. Near
-// identity — which is where two engines agreeing spend all their time — `acos`
-// is catastrophically ill-conditioned: at `w = 1 - 1e-15` it returns ~4.5e-8,
-// so the *metric* manufactures a disagreement of about 2^-24 out of two poses
-// that are equal to the last bit. That is exactly the cancellation
-// `tf_tree_math`'s `interp.rs` refuses to write, for the same reason, and the
-// check below duly refused to time anything until it was fixed.
-//
-// For unit quaternions the rotation angle between them satisfies
-// `sin(theta/2) = |qa - qb| / 2`, and `asin` near zero is well conditioned.
+// The angle comes from the chord, `sin(theta/2) = |qa - qb| / 2`, not `acos` of
+// the dot product, which is ill-conditioned near identity.
 // `q` and `-q` are the same rotation, so the shorter of the two chords wins.
 double pose_error(const double *qa, const double *ta,
                   const tf2::Quaternion &qb, const tf2::Vector3 &tb) {
@@ -201,12 +134,8 @@ int main(int argc, char **argv) {
   const int rounds = argc > 4 ? std::atoi(argv[4]) : 9;
   const int sweeps = argc > 5 ? std::atoi(argv[5]) : 40;
 
-  // `atoi` maps anything unparseable to 0, and the script forwards "$@"
-  // straight here. `rounds <= 0` leaves `ratios` empty and `min_element` then
-  // dereferences `end()`; `sweeps <= 0` makes `per_round` zero and every timing
-  // divide by it. Both are refusals, not clamps: a run that silently measured
-  // something other than what was asked for is the failure this whole file is
-  // written to avoid.
+  // `atoi` maps garbage to 0; `rounds <= 0` or `sweeps <= 0` would dereference
+  // `end()` or divide by zero. Refuse rather than clamp.
   if (rounds <= 0 || sweeps <= 0) {
     std::fprintf(stderr,
                  "rounds and sweeps must both be positive (got %d and %d); "
@@ -244,10 +173,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // The stamp sweep, off every dynamic grid so the interpolator actually runs.
-  // Same construction as the Rust harness and for the same reason: `NOW_NS` is a
-  // knot on all four rates, and a sweep anchored there measures `bracket` plus a
-  // seqlock read rather than interpolation. That is `docs/decisions/0013`.
+  // The stamp sweep, off every dynamic grid so the interpolator runs
+  // (`docs/decisions/0013`).
   const std::int64_t kNowNs = 9900000000LL;
   std::vector<std::int64_t> stamps;
   stamps.reserve(256);
@@ -256,9 +183,6 @@ int main(int argc, char **argv) {
   }
 
   // ---- agreement, before anything is timed -------------------------------
-  //
-  // An arm that is fast because it is answering a different question would move
-  // the ratio and nothing in the timing would say so.
   std::size_t agreed = 0;
   double worst = 0.0;
   for (std::int64_t ns : stamps) {
@@ -314,8 +238,7 @@ int main(int argc, char **argv) {
     return acc;
   };
 
-  // Warm both arms: tf2 walks the topology per call and fills its own caches,
-  // and ours faults in the rings through a fresh mapping.
+  // Warm both arms.
   volatile double sink = 0.0;
   for (int i = 0; i < 20; ++i) { sink += sweep_ours(); sink += sweep_theirs(); }
 
@@ -323,8 +246,7 @@ int main(int argc, char **argv) {
   std::vector<double> ratios, ours_ns, theirs_ns;
   for (int r = 0; r < rounds; ++r) {
     double a = 0.0, b = 0.0;
-    // Alternate the leading arm: a fixed order gives one arm the colder cache in
-    // every round, which the pairing would preserve rather than cancel.
+    // Alternate the leading arm so neither always gets the colder cache.
     if (r % 2 == 0) {
       auto t0 = std::chrono::steady_clock::now();
       sink += sweep_ours();

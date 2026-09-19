@@ -1,43 +1,16 @@
 //! Long-duration steady state: does anything **drift**?
 //!
-//! Every timing measurement in this repository is taken over a window of four to
-//! six seconds. That is enough to characterise a distribution and not enough to
-//! answer a different question, which is the one an integrator asks before
-//! shipping: *after an hour, is it still doing that?*
+//! Watches a healthy system over minutes to hours for latency drift (last
+//! interval's p99.9 vs the first's), memory growth (the arena is fixed-capacity,
+//! so any growth is outside it), ring wraparound (only exercised by a run that
+//! laps the rings), and publish-to-visible latency (`docs/PHASE5.md` §9.2).
 //!
-//! Four things could go wrong over hours and are invisible over seconds:
+//! Not `shm_torture` (`docs/PHASE2.md` §11.4): nothing is killed and nothing
+//! is asserted about consistency.
 //!
-//! * **Latency drift.** A tail that grows — fragmentation, a bracket search that
-//!   degrades as a ring's stamp distribution changes, a counter that starts
-//!   contending once it is warm.
-//! * **Memory growth.** The arena is fixed-capacity by construction, so *any*
-//!   growth is outside it. That makes this a sharp test rather than a vague one:
-//!   the expected answer is a flat line, and a rising one localises the leak to
-//!   the parts of the system that are allowed to allocate.
-//! * **Ring wraparound.** The fixture's rings hold 10 s. A six-second benchmark
-//!   never laps them; thirty minutes laps them about 180 times. Everything about
-//!   the read path near a wrap — the seqlock retry, the oldest-stamp bound — is
-//!   only exercised here.
-//! * **Publish-to-visible.** `docs/PHASE5.md` §9.2 asks for it as a required
-//!   report row, and nothing measures it. It is not lookup latency: it is how
-//!   long after a writer's `push` returns that a *different* thread can read the
-//!   sample, which is the number a control loop's end-to-end budget contains.
-//!
-//! # This is not `shm_torture`
-//!
-//! `docs/PHASE2.md` §11.4's `shm_torture` kills processes at 6 Hz and checks
-//! that survivors read consistent data. That is a **correctness** harness under
-//! crash conditions. This one never kills anything and asserts nothing about
-//! consistency; it watches a healthy system for signs of decay. Neither
-//! subsumes the other, and running the torture harness for longer would not
-//! produce these numbers.
-//!
-//! # It can fail
-//!
-//! A soak that only prints a table is a soak nobody reads to the end. The last
-//! interval's p99.9 may not exceed the first's by more than [`DRIFT_FACTOR`],
-//! and RSS may not grow by more than [`RSS_GROWTH_KIB`]; either one exits
-//! non-zero and says which.
+//! It can fail: the last interval's p99.9 may not exceed the first's by more
+//! than [`DRIFT_FACTOR`], and RSS may not grow by more than [`RSS_GROWTH_KIB`];
+//! either exits non-zero and says which.
 //!
 //! Usage: `just soak`, `just soak-long`, or
 //! `soak --workload fleet_16 --duration 30m --interval 60s --json out.json`.
@@ -64,30 +37,14 @@ use tf_tree_bench::runstore::{Run, RunRow};
 use tf_tree_bench::workload::{self, Backing, Built};
 
 /// How much the last interval's p99.9 may exceed the first's before the soak
-/// fails.
-///
-/// 3x, which is loose, and loose on purpose. The failure this is written
-/// against is *unbounded* drift — a tail that doubles every ten minutes, which
-/// reaches 3x well inside any useful run — not a 20% step. A tight bound on a
-/// tail measured over a single interval on a shared machine would fire on
-/// scheduling, and a soak that cries wolf overnight is a soak that gets its
-/// threshold raised without anyone reading the table.
+/// fails. Loose on purpose: the target is unbounded drift, not a 20% step on a
+/// shared machine.
 const DRIFT_FACTOR: f64 = 3.0;
 
 /// How much resident memory may grow between the first and last interval, in
-/// KiB.
-///
-/// **Measured as Pss, not RSS**, here and in `rss_kib` below. The names are kept
-/// because they are serialised into `tf_tree.bench-run/1` and are the join keys
-/// `bench_ab` compares on, so renaming them would un-compare every run file
-/// written before the rename. Pss is the correct instrument: it divides each
-/// shared page by the number of processes mapping it, which is what makes a
-/// growth figure meaningful for an arena several processes hold.
-///
-/// 8 MiB. The arena is fixed-capacity, so the true expectation is zero growth;
-/// the allowance covers the histogram and the per-interval bookkeeping this
-/// harness itself accumulates, plus allocator retention. Anything that leaks per
-/// *lookup* passes this in the first minute.
+/// KiB. Measured as Pss; the `rss` names are kept because they are serialised
+/// join keys in `tf_tree.bench-run/1`. 8 MiB covers this harness's own
+/// bookkeeping and allocator retention.
 const RSS_GROWTH_KIB: u64 = 8 * 1024;
 
 /// Reader threads. Kept below the core count so the soak does not spend hours
@@ -189,11 +146,8 @@ struct Snapshot {
     visible_p999_ns: u64,
     wraps: f64,
     rss_kib: u64,
-    /// Arena error counters accrued **during this interval**, not since start.
-    ///
-    /// A cumulative column rises by construction and reads as decay. What
-    /// matters over a soak is whether the *rate* is stable, so the coordinator
-    /// differences it.
+    /// Arena error counters accrued during this interval (differenced; a
+    /// cumulative column rises by construction).
     err_delta: u64,
 }
 
@@ -280,9 +234,7 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
     let pushes = AtomicU64::new(0);
     let latency = Mutex::new(Histogram::new());
     let visible = Mutex::new(Histogram::new());
-    // The probe writer's most recent (stamp, publish instant), as a pair of
-    // atomics. `AtomicI64` for the stamp and nanoseconds-since-start for the
-    // instant, because `Instant` is not `Copy` into an atomic.
+    // Probe writer's latest (stamp, publish instant) as atomics.
     let probe_stamp = AtomicI64::new(i64::MIN);
     let probe_at_ns = AtomicU64::new(0);
     let origin = Instant::now();
@@ -313,12 +265,8 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
                     if w.push(stamp, &fixture::dynamic_pose(p.seed, stamp)).is_ok() {
                         pushes.fetch_add(1, Ordering::Relaxed);
                         if is_probe {
-                            // Order matters: the instant must be stored *before*
-                            // the stamp the reader keys on, or the reader can
-                            // observe a new stamp against the previous
-                            // publication time and report a latency from the
-                            // wrong sample. `Release` on the stamp publishes
-                            // both.
+                            // Store the instant before the stamp the reader keys
+                            // on; `Release` on the stamp publishes both.
                             probe_at_ns
                                 .store(origin.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             probe_stamp.store(stamp, Ordering::Release);
@@ -385,11 +333,8 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
 
                 while !stop.load(Ordering::Relaxed) {
                     let guard = tree.guard();
-                    // Re-probe the retained window periodically rather than per
-                    // lookup. The writers slide it continuously, so a window
-                    // fixed at startup would put every query below the oldest
-                    // retained stamp within one ring period — the whole soak
-                    // would then be timing the error path.
+                    // Re-probe the retained window periodically: writers slide
+                    // it, and a fixed one would time only the error path.
                     if refresh == 0 {
                         let mut w: Option<(i64, i64)> = None;
                         for p in &plans {
@@ -433,13 +378,8 @@ fn run_soak(built: &Built, args: &Args, n_writers: usize, intervals: usize) -> V
         }
 
         // --- coordinator -------------------------------------------------
-        //
-        // Ring laps per interval are `interval / retained`, both in seconds, and
-        // the retained span is read from the arena rather than assumed. An
-        // earlier revision derived it from `fixture::HISTORY_SECS`, which is a
-        // constant about *one* workload — it would have reported `extreme_wide`
-        // (1 s of history) as lapping ten times less often than it does, and the
-        // coverage assertion below rests on this number.
+        // Ring laps per interval come from the retained span read off the
+        // arena, not from a per-workload constant.
         let probe_plan = built
             .tree
             .frame(&built.publishers[0].parent)
@@ -596,10 +536,8 @@ fn verdict(s: &[Snapshot]) -> bool {
 
     let total_wraps: f64 = s.iter().map(|x| x.wraps).sum();
     if total_wraps < 1.0 {
-        // Not a failure of the engine — a failure of the *experiment*. A soak
-        // that never lapped a ring did not exercise the path it exists for, and
-        // reporting it as a pass would be the vacuous-green case
-        // `docs/PHASE2.md` §11.4's torture harness was rewritten to avoid.
+        // A failure of the experiment, not the engine: a soak that never
+        // lapped a ring is not a pass (`docs/PHASE2.md` §11.4).
         println!(
             "FAIL coverage: the rings lapped {total_wraps:.2} times, so wraparound was \
              never exercised — run longer, or pick a workload with shorter history"
@@ -612,9 +550,8 @@ fn verdict(s: &[Snapshot]) -> bool {
     ok
 }
 
-/// Slack on a per-interval soak metric in the A/B differ. Wide: a single
-/// interval's tail on a shared machine is a noisy quantity, and the value of
-/// these rows is the *trend*, which the verdict above judges directly.
+/// Slack on a per-interval metric in the A/B differ; a single interval's tail
+/// is noisy and the verdict judges the trend.
 const SOAK_SLACK: f64 = 0.50;
 
 fn json_row(workload: &str, built: &Built, s: &Snapshot) -> RunRow {

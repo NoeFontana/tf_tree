@@ -15,11 +15,9 @@ use crate::sync::{AtomicI64, AtomicU64, Ordering};
 
 /// Discriminant stored in [`EdgeRecord::kind`].
 ///
-/// Not `#[non_exhaustive]`: see [`crate::plan::InterpPolicy`] for the argument.
-/// Every consumer renders all three kinds (`tf_tree top`, `doctor`, the web
-/// view), and [`EdgeKind::from_u8`] already absorbs an unknown discriminant.
-/// Reachable from the `tf_tree` facade only as `tf_tree::unstable::EdgeKind`
-/// (`docs/API.md` §2.6), because its three values *are* an arena field.
+/// Not `#[non_exhaustive]` (see [`crate::plan::InterpPolicy`]); [`EdgeKind::from_u8`]
+/// absorbs unknown discriminants. Facade path: `tf_tree::unstable::EdgeKind`
+/// (`docs/API.md` §2.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EdgeKind {
@@ -32,10 +30,7 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
-    /// Decode the [`EdgeRecord::kind`] discriminant. Any value other than the
-    /// three defined discriminants maps to [`EdgeKind::Tombstone`] (a zeroed edge
-    /// slot has `kind == 0` = [`EdgeKind::Dynamic`], which is only ever read for a
-    /// slot that was actually declared).
+    /// Decode [`EdgeRecord::kind`]; any undefined value maps to [`EdgeKind::Tombstone`].
     #[inline]
     #[must_use]
     pub const fn from_u8(v: u8) -> EdgeKind {
@@ -51,11 +46,8 @@ impl EdgeKind {
 ///
 /// # Layout
 ///
-/// `#[repr(C, align(64))]`, **exactly 128 bytes** to match the frozen arena edge
-/// stride (`max_edges * 128`). The nominal field list in `docs/PHASE1.md` §5.3
-/// sums to more than 128 bytes once the `head` atomic is 8-aligned; this record
-/// keeps the same field order and semantics and trims the trailing pad (`_pad2`)
-/// so the whole thing lands on the 128-byte stride.
+/// `#[repr(C, align(64))]`, **exactly 128 bytes** (the arena edge stride);
+/// `docs/PHASE1.md` §5.3's field list trimmed at `_pad2` to fit.
 #[cfg(not(loom))]
 #[repr(C, align(64))]
 pub struct EdgeRecord {
@@ -78,22 +70,11 @@ pub struct EdgeRecord {
     pub pose_off: u32,
     /// Declared publication rate, in **milli-hertz** (`docs/PHASE5.md` §1.2).
     ///
-    /// `0` means "not declared" — **not** "declared as 0 Hz": `docs/PHASE5.md`
-    /// §6's `TFT007` compares an observed rate against this one, and reading the
-    /// sentinel as a rate makes every undeclared edge deviate from it by infinity.
-    ///
-    /// Written at declaration time from `tf_tree::EdgeCfg::nominal_rate_hz`,
-    /// which a topology file's `rate_hz` reaches through
-    /// `tf_tree_bridge::TopologyConfig::builder`. An edge whose ring was sized
-    /// by an explicit slot count declares no rate and leaves this 0.
-    ///
-    /// Milli-hertz rather than hertz because the rates that matter span
-    /// 0.1 Hz (a map update) to 1 kHz (an IMU), and an integer hertz cannot
-    /// express the low end.
+    /// `0` means "not declared", **not** 0 Hz (`docs/PHASE5.md` §6 `TFT007`).
+    /// Set from `tf_tree::EdgeCfg::nominal_rate_hz`; an edge sized by an explicit
+    /// slot count leaves it 0. Milli-hertz so 0.1 Hz is expressible.
     pub nominal_rate_mhz: u32,
-    /// The 4 bytes the compiler inserts before `head`'s 8-byte alignment.
-    /// Named so a struct literal initialises them: unnamed padding is left
-    /// uninitialised, and `write_frozen` memcpys this record to disk.
+    /// Named so it is initialised: `write_frozen` memcpys this record.
     _pad1: [u8; 4],
     /// Monotone total samples published (invariant 5).
     pub head: AtomicU64,
@@ -101,33 +82,16 @@ pub struct EdgeRecord {
     pub static_pose: [u64; 7],
     /// The participant slot that **declared** this edge (§1.2).
     ///
-    /// Distinct from the *claim*, which lives in the claim table and moves as
-    /// writers come and go. This one does not move, so a diagnostic can say
-    /// "this edge was declared by the node that is now gone" — which is a
-    /// different fault from "this edge is unclaimed".
-    ///
-    /// `u32::MAX` means unknown, which is what a v3 arena built by this version
-    /// writes; the builder has no participant identity at declaration time.
+    /// Distinct from the *claim*, which moves with writers. `u32::MAX` means
+    /// unknown (what the builder writes).
     pub declared_by_slot: u32,
     _pad2: [u8; 28],
 }
 
-// **`size_of` is not a layout.** Every structural check this crate had before
-// these pins — `size_of`, `align_of`, `layout_hash`'s region strides — is
-// invariant under a *field reorder*, and a reorder changes what every byte on
-// disk and in a shared segment **means** while all of them still pass. Two
-// builds then attach to each other, agree on `FORMAT_VERSION` and
-// `layout_hash`, and read each other's records wrong.
-//
-// These are wire records: they go into a shared `memfd` another process maps,
-// and `write_frozen` memcpys them into a `.tft` a later build opens. Their
-// field offsets are part of the format, and nothing asserted them.
-//
-// Appending a field is still fine — the pins below do not move. *Moving* one is
-// a format break and now says so at compile time. See
-// `docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md` for
-// the neighbouring gap: the region table and `layout_hash`'s stride array are
-// also two hand-kept facts with nothing between them.
+// `size_of` is not a layout: a field reorder passes every size check and
+// `layout_hash` yet changes what shared-segment and `.tft` bytes mean. These
+// pins fix the offsets; appending a field is fine, moving one is a format break.
+// Neighbouring gap: `docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md`.
 #[cfg(not(loom))]
 const _: () = {
     assert!(core::mem::size_of::<EdgeRecord>() == 128);
@@ -206,34 +170,21 @@ impl EdgeRecord {
 ///
 /// # Layout
 ///
-/// `#[repr(C, align(64))]`, exactly 64 bytes. `owner_pid`/`owner_boot_id` are
-/// documented in `docs/PHASE1.md` §5.4 as plain integers; they are modeled here
-/// as atomics of identical layout so the failing claimer's diagnostic read is
-/// UB-free (the spec does not pin the memory ordering of their publication).
+/// `#[repr(C, align(64))]`, exactly 64 bytes. `docs/PHASE1.md` §5.4's plain
+/// integers are atomics of identical layout so a failing claimer's diagnostic
+/// read is UB-free.
 #[cfg(not(loom))]
 #[repr(C, align(64))]
 pub struct ClaimRecord {
     /// `0` = free, else `(epoch << 16) | (participant_slot + 1)` as built by
-    /// `pack_owner` — the `participant_slot + 1` shorthand `docs/PHASE2.md` §1
-    /// A3 uses names only the low half of the word.
-    ///
-    /// **One word carries both the state and the full identity** (`docs/PHASE2.md`
-    /// §1, A3), because the identity is an *indirection* into a participant
-    /// record that was completely written at attach time, long before any claim.
-    ///
-    /// Phase 1 stored `state` and `owner_pid` separately and wrote the PID
-    /// *after* winning the CAS. A writer killed in between left `state = HELD,
-    /// owner_pid = 0` — held by nobody, reclaimable by nobody, and
-    /// indistinguishable from a valid claim, so the edge leaked for the life of
-    /// the arena. In one process that was unobservable; across processes it is a
-    /// permanent resource leak.
+    /// `pack_owner`. One word carries both state and identity (`docs/PHASE2.md`
+    /// §1, A3): the identity indexes a participant record written at attach time,
+    /// so no crash window leaves a held claim with no resolvable owner.
     pub owner: AtomicU64,
     /// Bumped on every successful claim **and every reap**.
     ///
-    /// This is what fences a zombie writer (A4): a `Publisher` records the epoch
-    /// it claimed at and re-checks it on every push, so a process that was
-    /// stopped, judged dead, reaped, and then resumed cannot write to an edge
-    /// somebody else now owns.
+    /// Fences a zombie writer (A4): a `Publisher` re-checks its claim epoch on
+    /// every push.
     pub epoch: AtomicU64,
     /// Advisory liveness hint, bumped by the writer on every push. **Never a
     /// reaping trigger on its own** (`docs/PHASE2.md` §6.4).
@@ -242,64 +193,22 @@ pub struct ClaimRecord {
     /// the header stamp, both read at the same push. Diagnostics only, and
     /// **never a reaping trigger** (`docs/PHASE2.md` §6.4).
     ///
-    /// This is what `docs/PHASE5.md` §6's `TFT004` compares across publishers to
-    /// find the machine whose clock has drifted.
-    ///
-    /// # Why the difference and not the receipt time
-    ///
-    /// Because a receipt time cannot be paired with a stamp by anyone else. The
-    /// write is **sampled** — a wall-clock read costs about eight times a push,
-    /// so `tf_tree`'s `EdgeWriter` takes one per second of published data — and
-    /// by the time a reader looks, the ring's newest stamp belongs to a *later*
-    /// push than the receipt does. `receipt - newest_stamp` is then the offset
-    /// minus however much data has been published since the sample: on a 10 Hz
-    /// publisher with an **exact** clock, measured, it reads anywhere from
-    /// +3 µs to -900 ms depending only on when the reader arrives. That is a
-    /// ±1 s noise floor under a signal `TFT004` must resolve at tens of
-    /// milliseconds, and the sampling interval is ~1 s for every publisher by
-    /// construction, so it does not cancel in a fleet comparison either.
-    ///
-    /// The writer is the only party holding both sides at one instant, so the
-    /// writer is where the subtraction belongs. An earlier revision of this
-    /// field stored the receipt time and was called `last_push_nanos`;
-    /// `docs/decisions/0036` records the measurement that changed it.
+    /// `docs/PHASE5.md` §6's `TFT004` compares it across publishers. The writer
+    /// stores the difference, not a receipt time, because only the writer holds
+    /// both sides at one instant (sampled writes make a reader-side receipt
+    /// unpairable with the newest stamp; `docs/decisions/0036`).
     ///
     /// # Reading it
     ///
-    /// `0` means **no sample yet** — a fresh claim clears it, because a claim
-    /// inherits the edge and not the writer. A genuine offset of exactly zero
-    /// nanoseconds is therefore indistinguishable from unset; that is one sample
-    /// in ~10^9 and the next one overwrites it, which is a cheaper price than a
-    /// sentinel a zeroed arena cannot express.
-    ///
-    /// **Both sides must share an epoch, and this field cannot check that.**
-    /// `TFT005` exists because an arena's stamps need not be Unix time; where
-    /// they are not, this number is the epoch difference and not an offset, and
-    /// the check that reads it has to skip for the reason `TFT005` skips.
-    ///
-    /// This crate is `no_std` and writes it nowhere: it cannot read a clock at
-    /// all (D14).
+    /// `0` means **no sample yet**; a fresh claim clears it. **Both sides must
+    /// share an epoch**, which this field cannot check (`TFT005`). This `no_std`
+    /// crate never writes it (D14).
     pub clock_offset_nanos: AtomicI64,
     _pad: [u8; 32],
 }
 
-// The argument is the one above `EdgeRecord`'s pins: `size_of` is not a layout,
-// and this record travels the same two routes.
-//
-// **This block used to cover two of the four fields.** `heartbeat` and
-// `clock_offset_nanos` are the same width class, so swapping them changes
-// neither size, nor alignment, nor `layout_hash` — measured, the swap builds
-// with zero warnings and leaves the whole workspace suite green, including the
-// committed `.tft` fixture test. Two builds would then agree on
-// `FORMAT_VERSION` and `layout_hash`, attach to the same segment, and read a
-// monotone push count as a nanosecond clock offset.
-//
-// The blast radius is narrower than the sibling records' and it is written down
-// rather than left to be re-derived: `owner` and `epoch` — the words the claim
-// protocol and the zombie fence actually depend on — were already pinned, and
-// both of the fields this block was missing are diagnostics-only and "never a
-// reaping trigger" (`docs/PHASE2.md` §6.4). A pin is still what belongs here:
-// the cost is four lines that can only fail once the layout has already moved.
+// As above. `heartbeat`/`clock_offset_nanos` are the same width, so a swap
+// changes no size and no `layout_hash`; both are diagnostics-only (`docs/PHASE2.md` §6.4).
 #[cfg(not(loom))]
 const _: () = {
     assert!(core::mem::size_of::<ClaimRecord>() == 64);
@@ -310,25 +219,22 @@ const _: () = {
     assert!(core::mem::offset_of!(ClaimRecord, clock_offset_nanos) == 24);
 };
 
-/// Under `loom`, `ClaimRecord` is a plain heap struct of loom atomics (loom
-/// atomics are not `repr(C)`), holding only the fields the claim protocol
-/// touches. The `claim`/`release` algorithm is identical to the production one.
+/// Under `loom`, a heap struct of loom atomics with only the fields the claim
+/// protocol touches.
 #[cfg(loom)]
 pub struct ClaimRecord {
-    /// Exactly as in the production record; `pack_owner` is shared between the two.
+    /// As in the production record.
     pub owner: AtomicU64,
     /// Claim epoch; bumped on claim and on reap.
     pub epoch: AtomicU64,
     /// Writer heartbeat.
     pub heartbeat: AtomicU64,
-    /// The publisher's clock offset at the last sampled push. See the production
-    /// record's field for the whole contract.
+    /// Clock offset at the last sampled push.
     pub clock_offset_nanos: AtomicI64,
 }
 
 impl ClaimRecord {
-    /// A fresh, unclaimed record. Used to build heap claim slots for the loom
-    /// tests; the production arena views zeroed bytes instead of constructing.
+    /// A fresh, unclaimed record, for heap claim slots in tests.
     #[must_use]
     pub fn new() -> ClaimRecord {
         #[cfg(not(loom))]
@@ -362,27 +268,17 @@ impl Default for ClaimRecord {
 /// Attempt to claim exclusive write access to an edge, on behalf of
 /// `participant_slot`.
 ///
-/// **One `compare_exchange` publishes both the held state and the owner's
-/// identity** (`docs/PHASE2.md` §1, A3). There is no window in which the edge is
-/// held by an unidentified owner, so a claimer killed at any instruction leaves
-/// the edge either free or owned by a participant record that a reaper can
-/// resolve and check for liveness.
-///
-/// On success the epoch is incremented and returned; the caller stores it and
-/// re-checks it on every push (A4).
-///
-/// Exactly one of any set of racing claimers succeeds (loom-tested).
+/// On success returns `(epoch, owner_word)`; the caller re-checks the epoch on
+/// every push (A4). Exactly one of any set of racing claimers succeeds
+/// (loom-tested); a claimer killed at any instruction leaves the edge free or
+/// owned by a resolvable participant (`docs/PHASE2.md` §1, A3).
 ///
 /// # Errors
 ///
-/// [`ClaimError::EdgeAlreadyClaimed`] if the edge is already held. The reported
-/// `owner_slot` is a participant slot, which the facade resolves to a PID
-/// through the participant table.
+/// [`ClaimError::EdgeAlreadyClaimed`] if held; `owner_slot` is a participant slot.
 pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<(u64, u64), ClaimError> {
-    // Win the record exclusively first. `CLAIMING` is distinguishable garbage,
-    // not a plausible owner: a claimer killed before step 3 leaves a word no
-    // participant could legitimately hold, so a reaper clears it on sight —
-    // the same shape as A6's `RESERVED` participant slot.
+    // `CLAIMING` is a word no participant can hold, so a reaper clears a claimer
+    // killed before the store below (cf. A6's `RESERVED`).
     rec.owner
         .compare_exchange(0, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|held| ClaimError::EdgeAlreadyClaimed {
@@ -392,17 +288,8 @@ pub fn claim(rec: &ClaimRecord, participant_slot: u32) -> Result<(u64, u64), Cla
     let word = pack_owner(epoch, participant_slot);
     rec.owner.store(word, Ordering::Release);
 
-    // §11.3 `claim.after_cas`: "claim held by a dead participant -> reapable via
-    // slot indirection (A3)". The site is after the owner *word* is installed,
-    // not after the `compare_exchange` two lines above, because the row names
-    // the state and the state it names is a claim whose owner resolves to a
-    // participant slot, which is what the store above finishes publishing. The
-    // earlier window leaves `CLAIMING`: a different row's state, and there is no
-    // §11.3 row for it.
-    //
-    // The caller has not built its `Publisher` yet, so nothing here will ever
-    // run `Drop` — the leak A3 exists to make repairable, and why §11.3 forbids
-    // `panic!`.
+    // §11.3 `claim.after_cas`: after the owner word is installed, so the state is
+    // a claim reapable via slot indirection (A3); no `Publisher` exists to `Drop`.
     crash_point!("claim.after_cas");
 
     Ok((epoch, word))
@@ -413,18 +300,9 @@ const CLAIMING: u64 = u64::MAX;
 
 /// `(epoch, slot + 1)` packed into the owner word.
 ///
-/// **The epoch is in the word.** A bare `slot + 1` is constant per participant,
-/// not per acquisition, so this sequence frees a live claim:
-///
-/// 1. P (slot 7) claims E; it is `SIGSTOP`ped and reaped.
-/// 2. P resumes, `push` returns `ClaimRevoked` — and P does exactly what that
-///    error documents: it re-claims. Same slot, so the *same* owner word.
-/// 3. P drops the old `Publisher`. A release comparing only `slot + 1` matches
-///    the new claim and frees it, while the new one is still publishing.
-///
-/// A third process then claims E and two writers share a single-writer ring:
-/// the failure A4 exists to prevent, reached through `Drop`. Folding the epoch
-/// in makes every acquisition's word distinct, so a stale release cannot match.
+/// The epoch is in the word so every acquisition's word is distinct: a stale
+/// `Publisher` dropped after a same-slot re-claim (`ClaimRevoked`, then re-claim)
+/// must not match, and free, the new claim.
 #[inline]
 #[must_use]
 fn pack_owner(epoch: u64, participant_slot: u32) -> u64 {
@@ -434,13 +312,9 @@ fn pack_owner(epoch: u64, participant_slot: u32) -> u64 {
 /// The participant slot named by an owner word, or `u32::MAX` if it names none
 /// (free, or a claim still in flight).
 ///
-/// **Public because a reaper cannot do without it.** The word is
-/// `(epoch << 16) | (slot + 1)` (A3, and #20's "one acquisition, not just one
-/// slot"), so comparing a whole owner word against `slot + 1` matches only at
-/// epoch 0 — which `claim` never produces, since it starts at 1. A reaper that
-/// made that comparison would fail to recognise its *own* claims and revoke
-/// them; `docs/decisions/0005` §6's pseudocode had exactly that bug, and
-/// `a_reaper_does_not_reap_its_own_live_claim` is what found it.
+/// Public for reapers: comparing a whole word against `slot + 1` matches only
+/// at epoch 0, which `claim` never produces
+/// (`a_reaper_does_not_reap_its_own_live_claim`).
 #[inline]
 #[must_use]
 pub fn slot_of(word: u64) -> u32 {
@@ -452,19 +326,9 @@ pub fn slot_of(word: u64) -> u32 {
 
 /// Whether an owner word is a claim still in flight rather than a held one.
 ///
-/// **Public because [`slot_of`] deliberately erases the difference and some
-/// callers need it back.** `slot_of` maps both "free" and "mid-claim" to
-/// `u32::MAX`, which is right for anything that only wants to resolve an owner.
-/// It is wrong for anything that draws a *conclusion* from failing to resolve
-/// one: a record holding `CLAIMING` for a few instructions during a normal
-/// handoff is indistinguishable, through `slot_of` alone, from one whose owner
-/// slot has genuinely gone dead.
-///
-/// [`reap`] gets away without this because it consults an independent liveness
-/// source — a claimer caught in that window is protected by `probe_claim`
-/// reporting the lock still held. A caller with no such second source (a
-/// snapshot-based diagnostic, say) must not treat `CLAIMING` as evidence of
-/// anything, and needs this predicate to tell the two cases apart.
+/// [`slot_of`] maps both "free" and "mid-claim" to `u32::MAX`; a caller with no
+/// independent liveness source (unlike [`reap`], protected by `probe_claim`)
+/// needs this to avoid reading `CLAIMING` as a dead owner.
 #[inline]
 #[must_use]
 pub fn is_claiming(word: u64) -> bool {
@@ -474,20 +338,9 @@ pub fn is_claiming(word: u64) -> bool {
 /// Release a held claim. Idempotent at the memory level but should be called
 /// exactly once, by the owner, via `Publisher::drop`.
 pub fn release(rec: &ClaimRecord, owner: u64) {
-    // **A CAS, not a store.** An unconditional store frees whatever claim is
-    // there, including one that belongs to somebody else.
-    //
-    // The sequence that breaks: P1 claims E, is `SIGSTOP`ped, is reaped, and P2
-    // claims E. P1 resumes — `push` correctly refuses with `ClaimRevoked` (A4),
-    // but dropping its now-stale `Publisher` would store `owner = 0` and free
-    // *P2's* live claim. A third process could then claim E while P2 still holds
-    // a `Publisher`: two writers on a single-writer ring, which is the exact
-    // failure A4 exists to prevent, arriving through the back door.
-    //
-    // Comparing against our own owner word makes a stale release a no-op — and
-    // the word carries the *epoch*, so it is unique per acquisition. Comparing
-    // only `slot + 1` would still match a re-claim by the same participant,
-    // which is exactly what `ClaimRevoked` tells a revoked writer to do.
+    // A CAS, not a store: a stale `Publisher` (reaped, slot re-claimed) must not
+    // free the new owner's claim (A4). The word carries the epoch, so it is
+    // unique per acquisition.
     let _ = rec
         .owner
         .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
@@ -495,13 +348,9 @@ pub fn release(rec: &ClaimRecord, owner: u64) {
 
 /// Forcibly reclaim an edge whose owner is dead.
 ///
-/// **The epoch is bumped *before* the owner word is cleared** (`docs/PHASE2.md`
-/// §6.3), which closes the zombie window from both ends: a stopped writer that
-/// resumes after this sees a changed epoch and refuses to push (A4), and it
-/// cannot re-acquire the same epoch because the next claimer bumps it again.
-///
-/// Cooperative and idempotent: reaping an already-free edge is a no-op beyond
-/// the epoch bump, so two reapers racing is harmless.
+/// The epoch is bumped *before* the owner word is cleared (`docs/PHASE2.md`
+/// §6.3), so a resumed zombie sees the change (A4). Idempotent beyond the bump;
+/// racing reapers are harmless.
 pub fn reap(rec: &ClaimRecord) {
     rec.epoch.fetch_add(1, Ordering::AcqRel);
     rec.owner.store(0, Ordering::Release);
@@ -509,10 +358,8 @@ pub fn reap(rec: &ClaimRecord) {
 
 /// Exclusive writer handle for one edge.
 ///
-/// `Send + !Sync`: a writer may be moved between threads but never shared, so
-/// "single writer per edge" is a type-level property, not a convention (D7). The
-/// `!Sync` is enforced by the `PhantomData<Cell<()>>` marker (a `Cell` is `Send`
-/// but not `Sync`). `Drop` releases the claim.
+/// `Send + !Sync` (via a `PhantomData<Cell<()>>` marker), so single-writer is a
+/// type-level property (D7). `Drop` releases the claim.
 ///
 /// `Publisher` is `Send`:
 /// ```
@@ -526,25 +373,14 @@ pub fn reap(rec: &ClaimRecord) {
 /// assert_sync::<tf_tree_core::edge::Publisher<'static>>();
 /// ```
 ///
-/// The error code is pinned so the negative test cannot pass for the wrong
-/// reason: a bare `compile_fail` also succeeds when the type is renamed or
-/// un-exported, which is the failure mode this repository's `Mutant:` notes
-/// exist to prevent. **rustdoc enforces the code on nightly only** — measured:
-/// mutating it to `E0599` fails `cargo +nightly test --doc -p tf_tree_core`
-/// with *"Some expected error codes were not found: \["E0599"\]"*, and still
-/// reports `ok` on stable. `just test-doc` is stable, so it does not check this
-/// line; `just test-doc-error-codes` does, and CI's `miri` job runs it.
+/// The error code is pinned so the test cannot pass for the wrong reason; rustdoc
+/// enforces it on nightly only (`just test-doc-error-codes`).
 pub struct Publisher<'a> {
     ring: SampleRing<'a>,
     claim: &'a ClaimRecord,
     epoch: u64,
-    /// The owner word this writer wrote when it claimed —
-    /// `(epoch << 16) | (participant_slot + 1)`, as built by [`pack_owner`].
-    ///
-    /// Retained so `Drop` can release with a compare-exchange instead of a
-    /// store, and therefore cannot free a claim that has since passed to
-    /// somebody else. The epoch is part of the word on purpose: see
-    /// [`pack_owner`] and [`release`].
+    /// The owner word from the claim ([`pack_owner`]); `Drop` releases with a
+    /// compare-exchange on it ([`release`]).
     owner: u64,
     /// Set by [`Publisher::abandon`]; makes `Drop` touch no arena memory.
     abandoned: bool,
@@ -556,8 +392,7 @@ pub struct Publisher<'a> {
 impl<'a> Publisher<'a> {
     /// Wrap a freshly-won claim and its sample ring into a writer handle.
     ///
-    /// `epoch` is the value returned by [`claim`]; it is retained so a Phase 2
-    /// reaper/reclaim can be detected.
+    /// `epoch` and `owner` are the values [`claim`] returned.
     #[must_use]
     pub fn new(
         ring: SampleRing<'a>,
@@ -575,27 +410,13 @@ impl<'a> Publisher<'a> {
         }
     }
 
-    /// Give up this claim **without releasing it**, so that dropping this
-    /// writer performs no arena access whatsoever.
+    /// Give up this claim **without releasing it**: dropping this writer then
+    /// touches no arena memory.
     ///
-    /// # Why a `no_std` engine crate has this
-    ///
-    /// Releasing is a `compare_exchange` on the claim record — a *write* into
-    /// the arena — and there is one situation where that write is not merely
-    /// unnecessary but wrong: the memory is no longer there, or is no longer
-    /// ours. The `std` facade hits it after a `fork()`, where the shared mapping
-    /// is `MADV_DONTFORK` and the child holds a `Publisher` whose `claim`
-    /// reference points into a hole in its address space. Dropping it faults,
-    /// and the child dies in a destructor it never asked to run.
-    ///
-    /// This crate cannot detect that condition — it is `no_std` and has no
-    /// notion of a process. It only has to be *tellable*, which is what this is.
-    ///
-    /// The claim stays held in the arena. That is the correct outcome in the
-    /// case this exists for: the claim belongs to the process that forked, which
-    /// is still alive and still writing to it. In any other use it leaks the
-    /// claim until a reaper collects it, so **do not reach for this as a way to
-    /// avoid a release** — [`release`] is that.
+    /// For the `std` facade after `fork()`, where the mapping is `MADV_DONTFORK`
+    /// and a release would fault. The claim stays held (correctly: the forking
+    /// process still owns it); otherwise it leaks until reaped, so use
+    /// [`release`] to release.
     #[inline]
     pub fn abandon(&mut self) {
         self.abandoned = true;
@@ -621,17 +442,8 @@ impl<'a> Publisher<'a> {
     ///
     /// [`PushError::NonMonotonicStamp`] if the stamp regresses (invariant 6).
     pub fn push(&self, stamp: i64, iso: &Iso3) -> Result<(), PushError> {
-        // A4: the zombie-writer check. One Relaxed load, on a cacheline this
-        // writer already owns and touches, so it costs about a nanosecond — and
-        // it is not optional.
-        //
-        // A process stopped by SIGSTOP, a GC pause, or a page fault against a
-        // slow device can be judged dead, have its claim reaped, and then
-        // *resume*. Without this it would carry on publishing into an edge
-        // another process now owns: two writers on a single-writer ring, tearing
-        // each other's samples silently. That is precisely the failure the claim
-        // model exists to prevent, so the model has to survive its own owner
-        // being wrong about who is alive.
+        // A4: zombie-writer check. A writer stopped, reaped and resumed must not
+        // publish into an edge another process now owns.
         if self.claim.epoch.load(Ordering::Relaxed) != self.epoch {
             return Err(PushError::ClaimRevoked {
                 edge: self.ring.edge,

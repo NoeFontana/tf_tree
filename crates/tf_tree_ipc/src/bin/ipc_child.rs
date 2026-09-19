@@ -1,24 +1,12 @@
 //! Child process for the multi-process rendezvous tests.
 //!
-//! Half of what this crate relies on is what the **kernel** does when a lock
-//! holder dies, and there is no way to `SIGKILL` a thread out from under its
-//! locks. So the tests spawn this binary, which takes a lock and then parks
-//! until the parent kills it.
+//! Spawned so tests can `SIGKILL` a lock holder and watch the kernel release
+//! its locks. It opens the lock file **by path**, never from an inherited fd:
+//! OFD locks belong to the open file description, so an inherited fd would share
+//! the parent's locks and make every contention test vacuous.
 //!
-//! It opens the lock file **by path**, not from an inherited descriptor. That is
-//! the point: OFD locks belong to an open file description, so a child that
-//! inherited the parent's fd would share the parent's locks and conflict with
-//! nobody. Inheriting the fd — the transport
-//! `crates/tf_tree_bench/src/shm_util.rs` uses for a shared *segment* — would
-//! silently make every contention test vacuous.
-//!
-//! Output is line-oriented on stdout because the parent parses it, and every
-//! line is flushed before the child blocks, so the parent never has to guess
-//! whether a lock has been taken yet.
-//!
-//! The bin target is `tf_tree_ipc_child`, not this file's name: the crate is
-//! published, and a helper called `ipc_child` has no business claiming that name
-//! in anybody's `~/.cargo/bin` (the manifest argues it). Its argv:
+//! Output is line-oriented on stdout, flushed before the child blocks. The bin
+//! is `tf_tree_ipc_child` (see the manifest). Its argv:
 //!
 //! ```text
 //! hold-ownership   <lock> [ms]     -> "won" | "lost", then parks
@@ -51,11 +39,7 @@ fn main() {
         SegmentDescriptor,
     };
 
-    /// Print and flush, then block until killed.
-    ///
-    /// Parking rather than sleeping a fixed time: the tests decide when the
-    /// child dies, and a child that exited on its own would turn a "the kernel
-    /// released it" assertion into "the child happened to finish".
+    /// Block until killed; the tests decide when the child dies.
     fn park() -> ! {
         loop {
             std::thread::sleep(Duration::from_secs(3600));
@@ -76,9 +60,7 @@ fn main() {
     let path = PathBuf::from(&args[2]);
 
     match mode {
-        // Retry until the deadline so the outcome is deterministic: whoever
-        // holds it wins, everyone else reports "lost" rather than "lost the
-        // race by starting first".
+        // Retry until the deadline so "lost" means the lock was held throughout.
         "hold-ownership" => {
             let lock = LockFile::open(&path).expect("open lock file");
             let ms: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5_000);
@@ -112,8 +94,6 @@ fn main() {
                 }
             }
         }
-        // Take an edge's claim lease and park holding it, so the parent can
-        // kill the process and watch the kernel release the byte.
         "hold-claim" => {
             let lock = LockFile::open(&path).expect("open lock file");
             let edge: u32 = args.get(3).and_then(|s| s.parse().ok()).expect("edge");
@@ -134,9 +114,7 @@ fn main() {
                 own.held, own.holder_pid
             ));
         }
-        // Serve a §3.7 handshake over `path`, backed by a bare memfd of
-        // `size` bytes. No arena: the wire is parameterised by a descriptor
-        // (`docs/decisions/0005`), so the transport is testable without one.
+        // Serve a §3.7 handshake over `path`, backed by a bare memfd (no arena).
         "serve" => {
             use rustix::fs::{ftruncate, memfd_create, MemfdFlags};
 
@@ -153,8 +131,6 @@ fn main() {
             };
             let server = OwnerServer::bind_at(&path, desc, std::process::id()).expect("bind");
             say("serving");
-            // Hand every client the next slot in sequence, which is all the
-            // policy a transport test needs.
             let mut next = 0u32;
             let outcome = server.serve(
                 fd.as_fd(),
@@ -167,14 +143,11 @@ fn main() {
                     say(&format!("hangup {slot}"));
                 },
             );
-            // Never silently: a server that returns is a bug the parent must
-            // see, not a child that quietly exits and leaves the parent
-            // reporting "nothing is listening".
+            // A returning server is a bug the parent must see.
             say(&format!("server-stopped {outcome:?}"));
         }
-        // Attach to a server at `path` and report what came back, including the
-        // *size the kernel reports for the received fd* — which is the only
-        // evidence that a real descriptor crossed the process boundary.
+        // Attach and report, including the received fd's `fstat` size (proof a
+        // real descriptor crossed).
         "attach" => {
             let req = HelloRequest {
                 format_version: 2,
@@ -203,8 +176,7 @@ fn main() {
                 Err(e) => say(&format!("error {e}")),
             }
         }
-        // `path` is the runtime directory here, so the child resolves the same
-        // rendezvous the parent did and runs the real §3.4 algorithm.
+        // `path` is the runtime directory; runs the real §3.4 algorithm.
         "open" => {
             let rd = RuntimeDir::resolve_with(&Fixed(path), current_uid()).expect("runtime dir");
             let rv = Rendezvous::new(rd, 0, ArenaName::new("default", EnvVar::Name).unwrap());
@@ -230,8 +202,7 @@ fn main() {
         }
     }
 
-    /// An environment with `TF_TREE_RUNTIME_DIR` forced to one path, so the
-    /// child cannot pick up whatever the test runner's environment says.
+    /// Environment with `TF_TREE_RUNTIME_DIR` forced to one path.
     struct Fixed(PathBuf);
 
     impl tf_tree_ipc::EnvLookup for Fixed {

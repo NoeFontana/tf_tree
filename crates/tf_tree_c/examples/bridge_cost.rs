@@ -1,38 +1,14 @@
-//! What one `tft_bridge_offer` costs — `docs/PHASE4.md` §7, the bridge row.
+//! What one `tft_bridge_offer` costs (`docs/PHASE4.md` §7, bridge row). Not a gate.
 //!
-//! §5.9 says the bridge *"is the one component that still pays `tf2`'s
-//! deserialization cost, so it should be measured and isolated, not spread
-//! across a shared executor where it will be blamed for someone else's
-//! latency"*. This is the measuring half. It is not a gate — §7's gate criterion
-//! 3 compares the bridge against a `tf2` consumer and needs a fair comparison
-//! machine, which this host is not (§0.0) — but the per-offer cost is a number
-//! the C seam owns entirely, and a regression in it is this repository's fault
-//! rather than the scheduler's.
+//! Measures a steady-state accepted `/tf` offer through §5.4-§5.8 and the arena
+//! write, over `EDGES` edges (every §5 table is keyed on `(parent, child)`).
+//! Allocation count is gated by `crates/tf_tree_bridge/tests/steady_state_alloc.rs`.
 //!
-//! # What is measured
-//!
-//! A steady-state accepted `/tf` offer: a monotonic stamp on a declared dynamic
-//! edge, with an attributed publisher, going all the way through §5.6 names →
-//! §5.8 declared? → §5.7 kind → §5.4 authority → §5.5 clock **and the arena
-//! write**. That is the path a 1 kHz `/tf` spends essentially all of its time
-//! on, so it is the one worth a number.
-//!
-//! `EDGES` matters: every §5 table is keyed on `(parent, child)`, so a
-//! single-edge measurement reports `BTreeMap` lookups that never compare
-//! anything. Twenty is §7's row and roughly a small robot.
-//!
-//! The allocation count on the same path is
-//! `crates/tf_tree_bridge/tests/steady_state_alloc.rs`, which is a *gate*.
-//!
-//! Run pinned; unpinned runs migrate cores and swing by more than anything here
-//! is trying to resolve:
+//! Run pinned:
 //! `taskset -c 2 cargo run --release -p tf_tree_c --features bridge --example bridge_cost`
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::expect_used)]
-// **`docs/decisions/0007` rule 1, kind 5 — our own C ABI, called from Rust to
-// exercise or measure it** (`docs/decisions/0048`: a kind is a property, not a
-// crate name). The posture is declared here rather than inherited:
-// `crates/tf_tree_c/src/lib.rs` does not govern this file, because an example
-// is a **separate crate root**. `0048` step 4 is what this closes.
+// 0007 rule 1, kind 5 (our own C ABI, called from Rust); 0048: an example is a
+// separate crate root, so the posture is declared here.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -46,16 +22,11 @@ use tf_tree_c::*;
 
 /// §7's row is "1 kHz x 20 edges".
 const EDGES: usize = 20;
-/// Offers per round. A multiple of `EDGES` so every round is a whole number of
-/// sweeps and no edge is over-represented.
+/// Offers per round; a multiple of `EDGES`.
 const N: usize = 20_000;
 const ROUNDS: usize = 7;
 
-/// A chain `link0 -> link1 -> … -> link20`, all dynamic.
-///
-/// A chain rather than a star because a star gives every edge the same parent
-/// name, and the `BTreeMap` comparisons on the hot path would then all resolve
-/// on the child alone — which is not the shape a real `/tf` has.
+/// A dynamic chain `link0 -> … -> link20` (a star would share one parent name).
 fn topology() -> String {
     let mut s = String::new();
     for i in 0..EDGES {
@@ -67,12 +38,7 @@ fn topology() -> String {
     s
 }
 
-/// The minimum of `ROUNDS` rounds, in ns per offer.
-///
-/// **Minimum, not median**, unlike `abi_cost.rs`: that file compares two paths
-/// and wants a central tendency for a ratio. This one reports an absolute cost,
-/// where every source of noise on this host adds time and none removes it, so
-/// the fastest round is the closest thing to the work itself.
+/// The minimum of `ROUNDS` rounds, in ns per offer (noise only adds time).
 fn bench(mut run: impl FnMut() -> u64) -> f64 {
     for _ in 0..2 {
         black_box(run());
@@ -95,8 +61,7 @@ fn main() {
         on_clock_reset: TFT_BRIDGE_ON_CLOCK_RESET_HALT,
         domain: 0,
         tf_prefix: ptr::null(),
-        // A private heap arena: this measures the offer path, and a rendezvous
-        // would put a memfd and a socket in the middle of the number.
+        // Private heap arena: no rendezvous in the number.
         arena_name: ptr::null(),
     };
     let mut b: *mut tft_bridge = ptr::null_mut();
@@ -112,9 +77,7 @@ fn main() {
         TFT_OK
     );
 
-    // The names are built once, as an `rclcpp` node's `TransformStamped`s hand
-    // them over: a `const char *` into a message it already owns. Building them
-    // per offer would measure `CString::new`.
+    // Built once, as `rclcpp` hands them over; per-offer would measure `CString::new`.
     let names: Vec<(CString, CString)> = (0..EDGES)
         .map(|i| {
             (
@@ -124,8 +87,7 @@ fn main() {
         })
         .collect();
 
-    // A 30-degree yaw, so the pose validation has real components to check
-    // rather than an identity's zeros.
+    // A 30-degree yaw, so pose validation has real components.
     let pose = [
         0.965_925_826_289_068_3,
         0.0,
@@ -137,10 +99,7 @@ fn main() {
     ];
 
     let mut stamp: i64 = 1_000_000_000;
-    // The steady receipt clock the ROS caller reads once per `TFMessage`. Read
-    // here on the same schedule — once per sweep, not once per transform —
-    // because the offset layer's cost is part of what this measures, and a
-    // benchmark that left `received_steady_nanos` at `0` would silently skip it.
+    // Receipt clock, read once per sweep like the ROS caller; `0` would skip the offset layer.
     let mut received = Instant::now();
     let epoch = received;
     let mut out = tft_bridge_outcome {
@@ -166,9 +125,7 @@ fn main() {
         let mut accepted = 0u64;
         for k in 0..N {
             let (p, c) = &names[k % EDGES];
-            // One sweep of all `EDGES` shares a stamp, then time advances —
-            // which is what a `/tf` publisher batching into one `TFMessage`
-            // does, and it keeps the clock guard's compare on its real branch.
+            // One sweep shares a stamp, as a batched `TFMessage` does.
             if k % EDGES == 0 {
                 stamp += 1_000_000;
                 received = Instant::now();

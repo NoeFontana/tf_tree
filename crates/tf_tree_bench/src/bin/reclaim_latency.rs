@@ -1,35 +1,17 @@
-//! `docs/PHASE2.md` §12.3 gate 4 — **kill → re-claimable p99 under 10 ms**.
+//! `docs/PHASE2.md` §12.3 gate 4: **kill -> re-claimable p99 under 10 ms**.
 //!
-//! # What this measures, and what it deliberately does not
+//! The interval between a claim-holding process being `SIGKILL`ed and *another*
+//! process being able to take that edge: what a supervisor experiences restarting
+//! a dead publisher. **The clock starts at the `kill(2)` return**, since kernel
+//! teardown is part of what a supervisor waits through.
 //!
-//! The quantity is the interval between a claim-holding process being
-//! `SIGKILL`ed and *another* process being able to take that edge. It is a
-//! recovery latency, not a throughput: what a supervisor experiences when it
-//! restarts a publisher that died.
-//!
-//! **The clock starts at the `kill(2)` return, not at the child's death.** The
-//! two differ by however long the kernel takes to tear the process down, and
-//! that interval is part of what a restarting supervisor waits through — so
-//! excluding it would measure the library's half of a number the operator
-//! experiences whole.
-//!
-//! **Reaping is caller-driven and the harness does it in a loop**
-//! ([`0019`](../../../docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md)):
-//! there is no daemon, so the survivor calls `reap_dead()` itself. The loop is
-//! therefore measuring *"how soon does the arena permit the reclaim"*, not *"how
-//! soon does something notice"* — a poll interval would put the poller's period
-//! into the number. It spins, and the spin is why this is a harness rather than
-//! a test.
-//!
-//! Two mechanisms can free the claim and this does not distinguish them: the
-//! owner's socket-hangup callback, and the survivor's own `reap_dead()`. Both
-//! are legitimate answers to the gate's question, which is about the arena
-//! becoming usable again.
+//! **Reaping is caller-driven** (`docs/decisions/0019`): the harness spins on
+//! `reap_dead()` itself, so a poll period is not in the number. It does not
+//! distinguish the owner's hangup callback from the survivor's `reap_dead()`; both
+//! answer the gate's question.
 
-// A harness: its output *is* its result, like every other bin in this crate.
-// `expect` is the right shape here for the same reason — a harness that cannot
-// set up its own fixture has no measurement to report, and a panic naming the
-// step is more useful to whoever runs it than a `Result` nothing reads.
+// A harness: its output is its result, and `expect` is right because a
+// harness that cannot set up its fixture has nothing to report.
 #![allow(
     clippy::print_stdout,
     clippy::print_stderr,
@@ -114,9 +96,7 @@ mod real {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .expect("spawn child");
-            // Block until the child says it holds the claim: without this the
-            // kill could land before the claim exists and the trial would
-            // measure nothing.
+            // Block until the child holds the claim, or the kill could precede it.
             let mut line = String::new();
             {
                 use std::io::BufRead;
@@ -128,19 +108,14 @@ mod real {
 
             let t0 = Instant::now();
             let _ = kid.kill();
-            // **`wait()` is deliberately NOT here**, and the first revision of
-            // this harness had it. `wait` blocks until the kernel has finished
-            // tearing the child down, which is precisely the interval being
-            // measured — so timing after it made the first `claim` succeed on
-            // attempt one in 50 of 50 trials and reported a 0.25 ms p99 that
-            // was really the cost of `kill` plus `wait`. A supervisor does not
-            // `wait` on the process whose slot it is trying to take, either.
-            // The zombie holds no descriptors, so the lock byte is already
-            // released; the child is reaped after the measurement.
+            // **`wait()` is deliberately NOT here**: it blocks until kernel teardown, the
+            // very interval measured (with it, 50/50 trials succeeded on attempt one). A
+            // supervisor does not `wait` on the process whose slot it takes; the zombie holds
+            // no descriptors, so the lock byte is already released.
 
             let mut spins = 0u64;
-            // Spin until the edge is takeable. `reap_dead` is the caller-driven
-            // collector; the owner's hangup callback may get there first.
+            // Spin until takeable; `reap_dead` is the caller-driven collector, though the
+            // owner's hangup callback may get there first.
             loop {
                 let _ = owner.reap_dead();
                 spins += 1;
@@ -166,13 +141,9 @@ mod real {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         println!("tf_tree §12.3 gate 4 — kill -> re-claimable");
         println!("  trials      {trials}");
-        // **The non-vacuity guard, and it is a refusal rather than a note.**
-        // If the edge is takeable on the first attempt there was no reclaim to
-        // wait for, and the p99 below is the cost of `kill` — which is what the
-        // first revision of this harness reported as a PASS. A run where that
-        // happens has not measured the gate, so it must not print a verdict on
-        // it. Measured: with `wait()` inside the timed region, 50/50; with it
-        // outside, 0/200.
+        // **The non-vacuity guard, a refusal not a note**: if the edge is takeable on
+        // the first attempt there was no reclaim to wait for and the p99 is the cost of
+        // `kill`; no verdict may be printed.
         println!(
             "  contended   {}/{} trials needed more than one attempt",
             trials - first_ok,

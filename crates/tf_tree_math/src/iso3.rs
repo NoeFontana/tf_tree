@@ -4,28 +4,11 @@ use crate::quat::{exp_so3_theta, log_so3, Quat};
 use bytemuck::{Pod, Zeroable};
 use core::ops::Mul;
 
-/// Angle threshold below which the `V`/`V⁻¹` coefficients switch to their Taylor
-/// series. NORMATIVE (`docs/PHASE1.md` §3.3): `0.1`.
-///
-/// `0.1` is optimal in `f64` from *both* sides, which is why it is neither the
-/// `1e-8` most libraries use nor something larger:
-/// * **Below** it, the closed forms lose digits to cancellation — even with the
-///   half-angle rewrite, `c3`'s `1/θ² − cot(θ/2)/(2θ)` subtracts two `O(1/θ²)`
-///   terms, costing ~`log10(1/θ²)` digits (≈8 at `1e-4`, ≈2 at `0.1`). So the
-///   series must take over by ~`0.1`.
-/// * **Above** it, the four-term series truncates at `O(θ⁸)`. `c1` is the worst
-///   of the three: it is a series in `1/(2k+2)!`, so its first omitted term is
-///   `θ⁸/10!` = `2.8e-15` absolute at `θ = 0.1`, or `5.6e-15` relative — about
-///   25 `ε_mach`. Any larger threshold would let the series run past that.
-///   `theta_sweep_matches_reference`'s series branch is what measures it (its
-///   own bound is `1e-14`); no figure here is a substitute for running it.
-///   *This bullet read* `≈θ⁸/9!` `≈ 2.7e-15` `≈ ε_mach`: the factorial is `10!`,
-///   `9!` would be ten times the residual the sweep reports, and the relative
-///   error is an order of magnitude above `ε_mach` rather than equal to it.
-///
-/// The two meet at `0.1`, so the branch boundary is continuous to ~`ε_mach`
-/// (no derivative "pop" for downstream optimizers). See
-/// `branch_boundary_value_is_continuous`.
+/// Angle threshold below which `V`/`V⁻¹` coefficients use their Taylor series.
+/// NORMATIVE (`docs/PHASE1.md` §3.3): `0.1`. Below it the closed forms cancel
+/// (`c3` subtracts two `O(1/θ²)` terms); above it the four-term series truncates
+/// at `O(θ⁸)`. Continuity: `branch_boundary_value_is_continuous`; accuracy:
+/// `theta_sweep_matches_reference`.
 const THETA_SMALL: f64 = 0.1;
 
 /// Series coefficients of `c1 = (1 − cos θ)/θ²`, powers of `θ²` (Horner order).
@@ -115,9 +98,7 @@ impl Vec3 {
 
     /// Squared Euclidean norm.
     ///
-    /// Exists so hot paths that only need `‖v‖²` — notably
-    /// [`crate::dualquat::screw_pow`], where it *is* `sin²(θ/2)` — never take
-    /// the `sqrt` that [`Vec3::norm`] would.
+    /// Avoids the `sqrt` of [`Vec3::norm`], e.g. in [`crate::dualquat::screw_pow`].
     #[inline]
     #[must_use]
     pub fn norm_squared(self) -> f64 {
@@ -136,32 +117,9 @@ impl Vec3 {
 /// `t`. `T_parent_child` — applying it to a point in `child` yields the point in
 /// `parent`.
 ///
-/// Seven `f64` in canonical order — 56 bytes, `align(8)`, no padding.
-///
-/// # It used to be a padded 64-byte cacheline, and the reason did not survive
-///
-/// This was `#[repr(C, align(64))]` with an 8-byte `_pad`, *"so the Phase 2
-/// shared-memory arena can store slots without re-deriving layout"*. The arena
-/// re-derived it anyway: `tf_tree_core::buffer::PoseSlot` is its own
-/// `#[repr(C, align(64))]` of `{ AtomicU32, u32, [AtomicU64; 7] }` with its own
-/// compile-time size assertion, and an `Iso3` reaches it through
-/// [`Iso3::to_bits`] and back through [`Iso3::from_bits`]. No arena structure
-/// has ever had an `Iso3` field, so the alignment bought the arena nothing and
-/// cost every *in-memory* use of the type eight wasted bytes and a 64-byte
-/// stride ([`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)).
-///
-/// What it cost, measured: `Step` was 128 bytes rather than 64, so a `Plan`'s
-/// `[Step; MAX_DEPTH]` was 4 KiB rather than 2, and the facade's 16-slot
-/// thread-local plan cache was 65 KiB per thread rather than 33. A second
-/// consumer had already routed around it —
-/// `tf_tree_ingest::ingest`'s `SAMPLE_BYTES` buffers a bare `[f64; 7]` beside
-/// its stamp precisely because *"`Iso3` is `align(64)`, so a `(i64, Iso3)` pair
-/// occupies 128 bytes and would double the memory this module is trying to
-/// bound"*.
-///
-/// **`Pod` still holds**, and that is the property to keep an eye on: 4 + 3
-/// `f64` is 56 bytes with no interior padding at `align(8)`, so the derive is
-/// as valid as it was at 64. A field added here must keep that true.
+/// Seven `f64` in canonical order — 56 bytes, `align(8)`, no padding, so `Pod`
+/// holds ([`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)).
+/// A field added here must keep it so.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Iso3 {
@@ -197,9 +155,7 @@ impl Iso3 {
 
     /// Compute `self · rhs⁻¹` directly, without materializing `rhs⁻¹`.
     ///
-    /// `a · b⁻¹` has rotation `q_a · q_b*` and translation
-    /// `t_a − (q_a·q_b*)·t_b`, saving a negation pass and one rotation over
-    /// `self * rhs.inverse()`.
+    /// Rotation `q_a · q_b*`, translation `t_a − (q_a·q_b*)·t_b`.
     #[inline]
     #[must_use]
     pub fn mul_inv(&self, rhs: &Self) -> Self {
@@ -210,20 +166,10 @@ impl Iso3 {
 
     /// Return a copy with the rotation renormalized to unit norm.
     ///
-    /// Every rigid-transform op here — [`Mul`], [`inverse`](Self::inverse),
-    /// [`mul_inv`](Self::mul_inv), and [`Quat::rotate`] — assumes a unit
-    /// quaternion (`q⁻¹ = q*`) and preserves unit-ness only to first order: each
-    /// composition adds ~`1e-16` of norm drift. For this engine's own use — plans
-    /// of depth ≤ 16 — that is negligible (well inside the `1e-12` tolerances).
-    ///
-    /// Callers that compose **long** chains (dead-reckoning thousands of poses,
-    /// pose-graph accumulation) should call `normalized()` periodically: once
-    /// `‖q‖ ≠ 1`, `q*` is no longer the inverse rotation and [`Quat::rotate`]
-    /// mis-scales by `‖q‖²`, compounding into the translation.
-    ///
-    /// This is deliberately **not** done inside every op: it would add a `sqrt`
-    /// to the lookup hot path to correct drift the engine never accumulates
-    /// (the idiomatic choice, as in Sophus/manif).
+    /// Every rigid-transform op assumes a unit quaternion and drifts ~`1e-16` of
+    /// norm per composition: negligible for plans of depth ≤ 16, but callers
+    /// composing long chains should call this periodically. Not done inside
+    /// every op, to keep the `sqrt` off the lookup hot path.
     #[inline]
     #[must_use]
     pub fn normalized(self) -> Self {
@@ -288,22 +234,14 @@ fn horner(coeffs: &[f64; 4], theta2: f64) -> f64 {
 /// The left-Jacobian coefficients `c1, c2` of `V(ω) = I + c1·[ω]× + c2·[ω]×²`,
 /// for angle `θ = ‖ω‖`. Used by [`exp_se3`].
 ///
-/// Finite for **all** `θ` (including full rotations `θ = 2kπ`): neither term
-/// divides by `sin(θ/2)`. The `V⁻¹` coefficient `c3`, which *does* divide by
-/// `sin(θ/2)` and is singular at `θ = 2kπ`, is computed separately by
-/// [`vinv_c3`] — and only on the `log_se3` path, where `θ ∈ [0, π]`.
-///
-/// Below [`THETA_SMALL`] uses the four-term Taylor series; above it the
-/// half-angle closed form.
+/// Finite for all `θ`, including `2kπ`; the singular `c3` is [`vinv_c3`].
 #[inline]
 fn v_coeffs(theta: f64) -> (f64, f64) {
     let theta2 = theta * theta;
     if theta < THETA_SMALL {
         (horner(&C1, theta2), horner(&C2, theta2))
     } else {
-        // Half-angle forms from a single sincos(θ/2), well-conditioned to θ = π:
-        //   1 − cosθ = 2 sin²(θ/2)   (cancellation-free c1)
-        //   sinθ      = 2 sin(θ/2) cos(θ/2)
+        // Half-angle forms: 1 − cosθ = 2 sin²(θ/2); sinθ = 2 sin(θ/2) cos(θ/2).
         let (sh, ch) = libm::sincos(0.5 * theta);
         let sin = 2.0 * sh * ch;
         let c1 = 2.0 * sh * sh / theta2;
@@ -317,12 +255,9 @@ fn v_coeffs(theta: f64) -> (f64, f64) {
 ///
 /// # Domain
 ///
-/// **`θ ∈ [0, π]` only.** `V(ω)` loses rank at `θ = 2kπ` (`k ≠ 0`), where the
-/// closed form's `cot(θ/2)` divides by `sin(θ/2) = 0` and `c3` diverges — the
-/// map is genuinely non-invertible there. This is safe because the only caller,
-/// [`log_se3`], derives `θ` from [`log_so3`], which returns the principal branch
-/// `θ ∈ [0, π]` (so `sin(θ/2) ∈ [sin(0.05), 1]` in the closed branch, bounded
-/// away from zero). The debug assertion pins that contract.
+/// **`θ ∈ [0, π]` only**: `c3` diverges at `θ = 2kπ`. The only caller,
+/// [`log_se3`], takes `θ` from [`log_so3`]'s principal branch; a debug assertion
+/// pins it.
 #[inline]
 fn vinv_c3(theta: f64) -> f64 {
     debug_assert!(
@@ -334,9 +269,7 @@ fn vinv_c3(theta: f64) -> f64 {
     if theta < THETA_SMALL {
         horner(&C3, theta2)
     } else {
-        // (1 + cosθ)/(2θ sinθ) = cot(θ/2)/(2θ), well-conditioned up to θ = π
-        // (the naive `1 + cosθ` cancels as cosθ → −1 near π — a rear-facing
-        // camera is a π rotation). sin(θ/2) is bounded away from 0 on [0.1, π].
+        // (1 + cosθ)/(2θ sinθ) = cot(θ/2)/(2θ); avoids `1 + cosθ` cancelling near π.
         let (sh, ch) = libm::sincos(0.5 * theta);
         1.0 / theta2 - (ch / sh) / (2.0 * theta)
     }
@@ -356,7 +289,6 @@ pub fn exp_se3(xi: [f64; 6]) -> Iso3 {
     let wxv = w.cross(v);
     let wxwxv = w.cross(wxv);
     let t = v.add(wxv.scale(c1)).add(wxwxv.scale(c2));
-    // Reuse the θ already computed for the V coefficients instead of a second sqrt.
     Iso3::new(exp_so3_theta(w, theta), t)
 }
 
@@ -392,10 +324,7 @@ mod tests {
         assert_eq!(align_of::<Vec3>(), 8);
         assert_eq!(size_of::<Quat>(), 32);
         assert_eq!(align_of::<Quat>(), 8);
-        // `0042`: 56 bytes at align 8, no interior padding — which is what
-        // keeps the `Pod` derive valid and what halves `Step`, `Plan` and the
-        // facade's plan cache. It was a padded 64-byte cacheline for an arena
-        // that never stored one.
+        // `0042`: 56 bytes, no padding.
         assert_eq!(size_of::<Iso3>(), 56);
         assert_eq!(align_of::<Iso3>(), 8);
     }
@@ -405,7 +334,6 @@ mod tests {
         let iso = Iso3::new(Quat::new(0.5, 0.5, 0.5, 0.5), Vec3::new(1.0, -2.0, 3.0));
         // Pod cast to bytes and back is identity.
         let bytes: &[u8] = bytemuck::bytes_of(&iso);
-        // 4 + 3 `f64`, and nothing else — `0042` removed the pad.
         assert_eq!(bytes.len(), 56);
         let back: Iso3 = *bytemuck::from_bytes::<Iso3>(bytes);
         assert_eq!(back, iso);
@@ -426,43 +354,12 @@ mod tests {
 
     // --- theta-sweep against a high-precision reference table ---------------
     //
-    // Reference c1/c2/c3 computed with Python `decimal` at 80 significant
-    // digits (scratchpad/refgen.py). Columns: (theta, c1, c2, c3).
-    //
-    // The closed branch uses the half-angle forms (see `v_coeffs`), so `c1` is
-    // cancellation-free (measured max rel err ~1e-16) and `c3` is accurate up to
-    // θ = π. **Two coefficients lose digits at the θ = 0.1 boundary, not one.**
-    // `c3`'s `1/θ² − cot(θ/2)/(2θ)` subtracts two O(1/θ²) terms; `c2`'s
-    // `(θ − sin θ)/θ³` subtracts two O(θ) quantities whose difference is O(θ³),
-    // which discards ~2.8 decimal digits at θ ≈ 0.1. Both are *inherent* to the
-    // closed form — this is why the 4-term series takes over below 0.1 — and
-    // neither is a near-π cancellation.
-    //
-    // DEVIATION (documented): `docs/PHASE1.md` §3.3 asks for rel err < 1e-14
-    // across the whole sweep; the boundary error makes a flat 1e-14 unreachable
-    // for **`c2` and `c3`** with the mandated series threshold. §3.3's own table
-    // predicts both (θ = 1e-1: c2 closed 1.8e-14, c3 closed 9.1e-14) and the
-    // assertion below has always conceded it — `e2 < 3e-14` against
-    // `e1 < 1e-15` is a 30× relaxation this comment gave no reason for.
-    //
-    // **This paragraph named only `c3` until 2026-09-06.** Tighten `e2` to 1e-14
-    // and the sweep fails at its very first closed-branch row, θ = 0.1.
-    //
-    // **The bounds below sit above the maxima these 30 REF rows produce, with
-    // headroom, and they are not bounds over the closed branch at all.** That
-    // is a narrower claim than "over the whole sweep", and it is why a reader
-    // must not tighten either bound from off-table evidence — `e2` in
-    // particular has room against this table and none against the sweep. The
-    // REF grid does not sample the worst of the boundary band: a dense sweep of
-    // [0.1, π] against a high-precision `decimal` oracle puts `c2` at ~9.2e-14
-    // near θ = 0.10549, three times the bound this file asserts. The near-π
-    // regime, which the reference table also does not sample, is guarded by the
-    // fast-vs-oracle proptests in `tests/proptests.rs`.
-    //
-    // **Neither figure has a tracked producer, and that is the standing defect
-    // here rather than a caveat**: `scratchpad/refgen.py`, cited above, is not
-    // in this repository and never has been (`git log -S refgen.py`), so the
-    // table and both maxima are checkable only by writing the oracle again.
+    // Reference c1/c2/c3 from an 80-digit `decimal` oracle (not tracked).
+    // Columns: (theta, c1, c2, c3). At the θ = 0.1 boundary the closed forms of
+    // `c2` and `c3` inherently lose digits, so `docs/PHASE1.md` §3.3's flat 1e-14
+    // is unreachable for them; the bounds below sit above this table's maxima
+    // only. A dense sweep puts `c2` at ~9.2e-14 near θ = 0.10549; near-π is
+    // guarded by the proptests in `tests/proptests.rs`. Do not tighten `e2`.
     const REF: [(f64, f64, f64, f64); 30] = [
         (1e-12, 0.5, 0.16666666666666666, 0.08333333333333333),
         (
@@ -657,10 +554,7 @@ mod tests {
                     "series branch theta={theta}: e1={e1:e} e2={e2:e} e3={e3:e}"
                 );
             } else {
-                // Closed branch, half-angle forms. Which coefficients miss
-                // `docs/PHASE1.md` §3.3's target and where is stated once, in
-                // the DEVIATION note above the `REF` table; it is not restated
-                // here. These bounds are the measured maxima over the sweep.
+                // Closed branch: see the note above `REF`.
                 assert!(
                     e1 < 1e-15 && e2 < 3e-14 && e3 < 1e-13,
                     "closed branch theta={theta}: e1={e1:e} e2={e2:e} e3={e3:e}"
@@ -671,17 +565,11 @@ mod tests {
 
     #[test]
     fn branch_boundary_value_is_continuous() {
-        // Jump between the two branches of the *actual* `v_coeffs` at THETA_SMALL:
-        // the 4-term series versus the half-angle closed form. It is bounded
-        // below by the series truncation error at 0.1 — `c1`'s first omitted
-        // term, `θ⁸/10!`, is `2.8e-15` on its own — so the spec's literal 1e-15
-        // target is unreachable; assert the jump stays under 1e-14. *This
-        // comment read* `~5.6e-15 for c1`, which is that residual as a
-        // *relative* error against `c1 ≈ 0.5`; the jumps below are absolute.
+        // Series truncation (`c1`'s `θ⁸/10!` = 2.8e-15) makes the spec's 1e-15
+        // unreachable; assert the absolute jump stays under 1e-14.
         let th = THETA_SMALL;
         let t2 = th * th;
         let series = (horner(&C1, t2), horner(&C2, t2), horner(&C3, t2));
-        // Mirror the closed branch of `v_coeffs` exactly (half-angle forms).
         let (sh, ch) = libm::sincos(0.5 * th);
         let sin = 2.0 * sh * ch;
         let closed = (
@@ -703,9 +591,7 @@ mod tests {
     #[test]
     fn exp_se3_is_finite_at_full_rotations() {
         use core::f64::consts::PI;
-        // V(θ) must stay finite for full/multi-turn rotations, even though the
-        // (unused-here) V⁻¹ coefficient c3 is singular at θ = 2kπ. Splitting c3
-        // onto the log_se3-only path keeps it off exp_se3 entirely.
+        // V(θ) stays finite at θ = 2kπ.
         for &mag in &[2.0 * PI, 4.0 * PI, 2.0 * PI + 0.05] {
             let iso = exp_se3([mag, 0.0, 0.0, 0.5, -0.3, 0.8]);
             assert!(
@@ -733,7 +619,6 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "principal branch")]
     fn vinv_c3_rejects_off_domain_theta() {
-        // V⁻¹ is singular at θ = 2π; vinv_c3's domain is [0, π], debug-asserted.
         let _ = vinv_c3(2.0 * core::f64::consts::PI);
     }
 
@@ -742,9 +627,6 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "50k compositions is too slow under Miri")]
     fn normalized_restores_unit_norm_after_long_chains() {
-        // Mul does not renormalize, so ‖q‖ drifts over a long chain. Assert the
-        // drift stays small (the engine's short chains are unaffected) and that
-        // normalized() restores exact unit norm for callers who accumulate more.
         let step = exp_se3([0.3, -0.2, 0.5, 0.1, 0.0, -0.1]);
         let mut acc = Iso3::IDENTITY;
         for _ in 0..50_000 {

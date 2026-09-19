@@ -1,37 +1,12 @@
 //! One spelling for a gate's outcome, and one exit code per meaning.
 //!
-//! # Why this exists
+//! CI reads only the process exit code, so "this host cannot evaluate the
+//! criterion" (`2`) must not arrive byte-identical to "the code regressed" (`1`).
 //!
-//! This crate already classifies *rows*: [`Fitness`] decides whether the host
-//! can produce a trustworthy number on a given axis, [`Ground`] is the
-//! machine-checked claim a refusal rests on, and [`Status`] is
-//! Measured/Indicative/Unavailable. What had no classification was the only
-//! interface CI actually reads — **the process exit code**.
-//!
-//! `reclaim_latency` got this right and nothing else did: it exits `2` when the
-//! run is INVALID and `1` when the gate FAILs. Every other gate binary in this
-//! crate leaves through `anyhow`'s `Termination` path or a bare
-//! `std::process::exit(1)`, so *"this host cannot evaluate the criterion"* and
-//! *"the code regressed"* arrive at a workflow **byte-identical**.
-//!
-//! That distinction is the whole of what this project can offer on a host that
-//! cannot run its own gates. A refusal that reads as a failure trains everyone
-//! to ignore a red job; a refusal that reads as a pass is worse, because it is
-//! a gate that cannot fail. `docs/PHASE5.md` §12's own history has both.
-//!
-//! # The correspondence, stated so nobody adds a fourth spelling
-//!
-//! [`Outcome::Refused`] is [`Status::Unavailable`] for a whole run.
-//! [`Outcome::Pass`] and [`Outcome::Fail`] have **no** `Status` analogue,
-//! deliberately: a report row records a measurement, and a gate records a
-//! verdict about one. They are different questions and the types stay separate.
-//!
-//! # A refusal is a measurement, not a literal
-//!
-//! Both refusal constructors take a probed [`Fitness`] and quote *its* reason
-//! string rather than a hand-written one. A refusal whose text is a literal
-//! goes stale the day the host changes and cannot be distinguished from a
-//! refusal somebody typed to make a job green.
+//! [`Outcome::Refused`] is [`Status::Unavailable`] for a whole run. `Pass` and
+//! `Fail` have no `Status` analogue: a row records a measurement, a gate a
+//! verdict. Both refusal constructors quote a probed [`Fitness`] reason, never a
+//! literal, so a refusal cannot be typed to make a job green.
 
 use core::fmt;
 
@@ -67,23 +42,10 @@ pub enum Outcome {
 
 impl Outcome {
     /// Refused because this host cannot produce a trustworthy number on the
-    /// criterion's own sensitivity axis — or [`None`] if it can.
+    /// criterion's sensitivity axis, or [`None`] if it can.
     ///
-    /// The reason is [`Fitness::axis`]'s third element, the same call the
-    /// `measured` arm makes, read the other way round.
-    ///
-    /// **`None` when the host is fit, and that is the whole signature.** An
-    /// earlier version returned an `Outcome` unconditionally and threw
-    /// `axis`'s verdict away, so `refused_on_host(&f, Sensitivity::HostIndependent)`
-    /// — fit on every host by definition — produced
-    /// `REFUSED (HostFitness) — ` with an **empty** reason and exit 2. Under
-    /// `may-refuse` that is a permanently green gate whose recorded reason is
-    /// the empty string; under `must-refuse` it is a gate that can never do
-    /// anything else. The doc claimed the opposite ("a gate cannot claim the
-    /// host is unfit on an axis the host passes") and the test named for it
-    /// never called this function, so it asserted `axis`'s bool and would have
-    /// passed against the bug. Returning `Option` makes the caller handle the
-    /// fit case instead of being handed a refusal it did not earn.
+    /// Returns `Option` so a fit host (always `HostIndependent`) cannot be
+    /// handed a refusal with an empty reason.
     #[must_use]
     pub fn refused_on_host(fitness: &Fitness, sensitivity: Sensitivity) -> Option<Outcome> {
         let (fit, _axis, why) = fitness.axis(sensitivity);
@@ -96,14 +58,8 @@ impl Outcome {
         })
     }
 
-    /// Refused because the host has fewer physical cores than the criterion's
-    /// own budget needs — or [`None`] if it has enough.
-    ///
-    /// Quotes [`Fitness::core_reason`] and **only** that. It is `None` on a host
-    /// with enough cores, and this returns `None` in step rather than
-    /// substituting a hand-written string: a literal here would be the one
-    /// thing the module doc forbids, since it is exactly the text a fit host
-    /// would get.
+    /// Refused because the host has fewer physical cores than the criterion
+    /// needs, or [`None`]. Quotes [`Fitness::core_reason`] and nothing else.
     #[must_use]
     pub fn refused_on_cores(fitness: &Fitness) -> Option<Outcome> {
         fitness.core_reason.clone().map(|why| Outcome::Refused {
@@ -124,19 +80,9 @@ impl Outcome {
 
     /// Print the verdict on stdout and leave the process with [`Self::code`].
     ///
-    /// The one exit point a gate binary should have. Printing and exiting are
-    /// one call so that a binary cannot report `REFUSED` and then leave through
-    /// `anyhow`'s `Termination` path with `1`, which is the defect this module
-    /// exists to remove.
-    ///
-    /// **Written through a locked `stdout` handle rather than `println!`**, and
-    /// not to dodge the workspace's `print_stdout` lint: this crate's library
-    /// convention is that a module returns a `String` and a binary prints it
-    /// (`Fitness::reason_line` and `Report::to_json` are the shape). The
-    /// exception is deliberate and is the whole point of the type — if the
-    /// printing lived in each binary, so would the chance of printing
-    /// `REFUSED` and then exiting `1`, which is the bug being removed. A
-    /// caller that wants the string without the exit has [`core::fmt::Display`].
+    /// The one exit point a gate binary should have, so it cannot print
+    /// `REFUSED` and then exit `1` through `anyhow`. Uses a locked handle rather
+    /// than `println!`: library modules return a `String`, this is the exception.
     pub fn report_and_exit(self) -> ! {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
@@ -176,9 +122,6 @@ mod tests {
             .code(),
         ];
         assert_eq!(codes, [0, 1, 2], "the three meanings must not collide");
-        // The whole point: a refusal is not a failure. Asserted rather than
-        // left to the constants, because collapsing these two is exactly the
-        // regression this module was written to prevent.
         assert_ne!(
             EXIT_REFUSED, EXIT_FAIL,
             "a host-starved refusal must not read as a regression"
@@ -210,11 +153,6 @@ mod tests {
 
     #[test]
     fn a_host_independent_axis_cannot_be_refused_for_unfitness() {
-        // Anti-vacuity, and this test used to be vacuous itself: it asserted
-        // `axis()`'s bool and never called the constructor it is named for, so
-        // it passed while `refused_on_host` was throwing that bool away and
-        // returning `REFUSED (HostFitness) — ` with an empty reason. It calls
-        // the constructor now, which is the only form that could have failed.
         let f = Fitness::probe(1);
         assert!(
             Outcome::refused_on_host(&f, Sensitivity::HostIndependent).is_none(),
@@ -224,9 +162,6 @@ mod tests {
 
     #[test]
     fn a_core_refusal_is_none_when_the_host_has_enough() {
-        // The same shape for the other constructor: `core_reason` is `None` on
-        // a host with enough cores, and that must produce no refusal rather
-        // than a refusal carrying an invented string.
         let f = Fitness::probe(1);
         match Outcome::refused_on_cores(&f) {
             None => assert!(

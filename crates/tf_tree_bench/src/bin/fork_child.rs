@@ -1,93 +1,56 @@
 //! The one real `fork()` in this workspace — `docs/decisions/0005` step 9.
 //!
-//! # Why this bends the unsafe budget, deliberately
+//! Why this bends the unsafe budget
 //!
-//! `docs/decisions/0007` rule 1 permits `unsafe` only at a boundary the
-//! compiler cannot see across, and `docs/decisions/0048` makes those boundaries
-//! **properties rather than crate names**. This file carries two of them: the OS
-//! (`fork`, `_exit`, `waitpid`) and our own C ABI driven across that fork. It is
-//! not an exception — it is kinds 2 and 5, and `scripts/unsafe-budget.txt` is
-//! where that is written down.
+//! `docs/decisions/0007` rule 1 kinds 2 and 5 (`docs/decisions/0048`): the OS
+//! (`fork`, `_exit`, `waitpid`) and our own C ABI driven across that fork.
+//! `scripts/unsafe-budget.txt` records it. What is tested is `fork()` **without
+//! `exec`**: the child inherits the address space, the `MADV_DONTFORK` hole where
+//! the arena was, and open file descriptions with their OFD locks. `Command` execs
+//! and a thread is not a process, so `libc::fork` is the only primitive that
+//! produces the state under test.
 //!
-//! There is no way around it. What has to be tested is `fork()` **without
-//! `exec`** — a child that inherits the parent's address space, its `MADV_DONTFORK`
-//! hole where the arena used to be, and its open file descriptions with the OFD
-//! locks attached to them. `std::process::Command` always `exec`s, which
-//! replaces every one of those things; a thread shares them but is not a
-//! process and cannot demonstrate a single one of the failure modes. `libc::fork`
-//! is the only primitive that produces the state under test.
+//! # What is being tested
 //!
-//! `tf_tree_bench` is `publish = false`, so this ships to nobody.
-//!
-//! # What is being tested, and what "passing" would look like if it were broken
-//!
-//! A shared arena is mapped `MADV_DONTFORK` (`docs/PHASE2.md` §7.3): the child
-//! has no mapping there. Nothing in the child *notices* — the `Tree` value is
-//! byte-identical and its pointers still look like pointers. Two consequences,
-//! and the second is the one that bites:
-//!
-//! 1. Reading the arena in the child is a `SIGSEGV`.
-//! 2. **The child does not have to read anything.** `Tree`, `EdgeWriter` and
-//!    `Attachment` have destructors, which run at scope exit whether or not the
-//!    child ever touched the tree. Some of them release OFD locks — and an OFD
-//!    lock belongs to the *open file description*, which the child inherited, so
-//!    unlocking in the child releases the **parent's** byte. Others signal an
-//!    `eventfd` that the parent's owner thread is waiting on.
-//!
-//! So the child can sabotage a parent it never interacted with, from another
-//! process, leaving nothing in the parent's logs. That is what these modes
-//! check, and it is why the parent re-validates *itself* after the child is
-//! gone rather than only inspecting the child's exit code.
+//! A shared arena is mapped `MADV_DONTFORK` (`docs/PHASE2.md` §7.3), so the child
+//! has no mapping there and nothing in it notices. Reading the arena in the child
+//! is a `SIGSEGV`; worse, **the child need not read anything**: `Tree`,
+//! `EdgeWriter` and `Attachment` destructors release OFD locks that belong to the
+//! inherited open file description (the **parent's** byte) and signal an `eventfd`
+//! the parent's owner thread waits on. So the parent re-validates itself after the
+//! child is gone rather than only checking the child's exit code.
 //!
 //! # Modes
 //!
-//! `api` runs the child's checks and leaves via `_exit`, so no destructor runs.
-//! `drop` runs them too and then drops the tree and the writer explicitly.
-//! `owned` is `drop` with the writer claimed through
-//! [`tf_tree::Tree::claim_owned`] instead of `claim` — `docs/decisions/0017`
-//! step 4. That handle owns an `Arc<Tree>` and an `EdgeWriter<'static>`, so it
-//! is the one shape whose destructor could plausibly have lost a guard on the
-//! way to being owned: the hand-rolled ancestor `0017` exists to delete
-//! (`transmute::<EdgeWriter, Publisher>`) dropped both the claim lease and the
-//! fork-generation compare, and neither loss is visible from inside the child.
-//!
-//! `bridge` is the **C ABI** layer above all three —
-//! `docs/decisions/0015`'s *Invariants to maintain*; the `bridge` module's own
-//! docs carry what the three Rust modes leave uncovered. It needs a fourth
-//! crate edge — `tf_tree_c` with `bridge,shm` — and is therefore behind this
-//! crate's own default-off `bridge` feature.
+//! `api` leaves via `_exit`, so no destructor runs. `drop` also drops the tree and
+//! writer explicitly. `owned` is `drop` with the writer claimed through
+//! [`tf_tree::Tree::claim_owned`] (`docs/decisions/0017` step 4): the shape whose
+//! destructor could lose a claim-lease or fork-generation guard invisibly.
+//! `bridge` is the C ABI layer (`docs/decisions/0015` *Invariants to maintain*)
+//! behind this crate's default-off `bridge` feature.
 //!
 //! # Output protocol
 //!
 //! One line: `child=<exited N|signalled N> parent_ok=<bool> note=<text>`.
-//!
-//! `exited` versus `signalled` is load-bearing. Remove the `Drop` guard in
-//! `Tree` and the child dies of `SIGSEGV` *after* passing every API check — so
-//! its "exit code" as `std::process` would report it is meaningless, and a test
-//! that only compared a number would go green.
+//! `exited` versus `signalled` is load-bearing: without the `Drop` guard the child
+//! dies of `SIGSEGV` *after* passing every API check, and a bare number would go
+//! green.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::print_stdout,
     clippy::panic
 )]
-// **`docs/decisions/0007` rule 1, kinds 2 and 5** (the module docs above) — the
-// OS, and our own C ABI driven across that fork, `docs/decisions/0015`'s
-// *Invariants to maintain*. `docs/decisions/0048` is why those are statements
-// rather than exceptions: rule 1's parenthetical was an index, not the rule.
-//
-// Declared here rather than inherited: `crates/tf_tree_bench/src/lib.rs` is
-// `#![forbid(unsafe_code)]` and a bin is a **separate crate root**, so that
-// attribute governs none of this file.
+// **`docs/decisions/0007` rule 1, kinds 2 and 5** — the OS, and our own C ABI
+// across the fork. Declared here because a bin is a separate crate root:
+// `lib.rs`'s `#![forbid(unsafe_code)]` governs none of this file.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// SAFETY (module invariant): two families, and every block names which.
-// (1) `libc::fork`, `libc::_exit` and `libc::waitpid` — the child path between
-// `fork` and `_exit` is async-signal-safe, which is why it uses `_exit` and not
-// `std::process::exit`, and no destructor runs there. (2) `tft_*` calls into
-// `tf_tree_c` on a handle this process (or its parent) created, from the thread
-// that created it.
+// SAFETY (module invariant): (1) `libc::fork`, `libc::_exit`, `libc::waitpid` —
+// the child path between `fork` and `_exit` is async-signal-safe, no destructor
+// runs. (2) `tft_*` calls on a handle this process (or its parent) created, from
+// its creating thread.
 
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn main() {
@@ -99,12 +62,7 @@ fn main() {
         Stamp, SystemDomain, TreeBuilder,
     };
 
-    /// The two claim shapes, behind one `push`.
-    ///
-    /// A local enum rather than two copies of the body below: the child's checks
-    /// and the parent's re-validation are the assertions under test, and running
-    /// a *different* sequence for the owned writer would be testing a different
-    /// thing while claiming to compare.
+    /// The two claim shapes behind one `push`, so both run the same assertions.
     enum Writer<'a> {
         Scoped(tf_tree::EdgeWriter<'a>),
         Owned(tf_tree::OwnedWriter),
@@ -118,12 +76,7 @@ fn main() {
             }
         }
 
-        /// The edge the writer itself says it claimed.
-        ///
-        /// Asked of the writer rather than re-derived from the topology on
-        /// purpose: the parent's post-fork re-validation compares this against
-        /// what the arena reports, and a value read out of the arena cannot
-        /// disagree with the arena.
+        /// The edge the writer says it claimed, not re-derived from the arena.
         fn edge(&self) -> u32 {
             match self {
                 Writer::Scoped(w) => w.edge().get(),
@@ -132,8 +85,7 @@ fn main() {
         }
     }
 
-    // Exit codes the child uses. Distinct per assertion, so a failure names
-    // itself without needing a channel back to the parent.
+    // Exit codes the child uses; distinct per assertion.
     const OK: i32 = 0;
     const NOT_DETACHED: i32 = 10;
     const LOOKUP_NOT_DETACHED: i32 = 11;
@@ -151,10 +103,8 @@ fn main() {
 
     let mode = std::env::args().nth(1).unwrap_or_default();
 
-    // **The C ABI modes dispatch before anything below runs.** `bridge` builds
-    // its arena through `tft_bridge_create`, not through `Open` here, and
-    // `bridge-reader` is the third process and must not create an arena at all —
-    // so neither can share the setup the three Rust modes need.
+    // The C ABI modes dispatch first: they build their own arena and `bridge-reader`
+    // must create none.
     #[cfg(feature = "bridge")]
     if mode == "bridge" {
         bridge::run();
@@ -166,9 +116,7 @@ fn main() {
         return;
     }
 
-    // `Arc` unconditionally, so the three modes differ in exactly one thing —
-    // which claim they take. `Tree`'s own methods are reached through `Deref`
-    // and behave identically; `claim_owned` is the one that needs the handle.
+    // The three modes differ only in which claim they take.
     let tree = Arc::new(
         tf_tree::Open::new()
             .mode(AttachMode::ReadWrite)
@@ -188,32 +136,19 @@ fn main() {
     let pose = tf_tree_math::exp_se3([0.0, 0.0, 0.2, 1.0, 2.0, 3.0]);
     writer.push(1_000, &pose).expect("push");
 
-    // Everything the child will inspect must exist *before* the fork, so that
-    // what the child holds is genuinely inherited rather than re-derived.
+    // Everything the child inspects exists before the fork, so it is inherited.
     let plan = tree.plan(parent_frame, child_frame).expect("plan");
     let slot = tree.participant_slot();
     let edge = writer.edge();
 
-    // The fork generation as the parent last saw it. Everything the detachment
-    // checks below rely on is downstream of this counter, but none of them can
-    // tell how *far* it moved — `detached()` is a comparison against a captured
-    // value, so it says "different" for a bump of one and for a bump of two
-    // alike. The size of the bump is the only thing that pins
-    // `tf_tree_ipc::fork::arm`'s `Once`: registering the handler on every call
-    // (and `arm` is called from several constructors) would step the generation
-    // by more than one per fork, and an `arm` that registered nothing at all
-    // would step it by none. Neither is visible anywhere else in this workspace,
-    // because this file owns its only `fork()`.
+    // The fork generation as last seen. The size of the bump (exactly one) is what
+    // pins `tf_tree_ipc::fork::arm`'s `Once`; this file owns the workspace's only
+    // `fork()`.
     let gen_before = tf_tree_ipc::fork::generation();
 
-    // SAFETY: `fork` is called from a single-threaded region of this process —
-    // no worker threads of our own have been started, and the only extra thread
-    // this process has is the arena's owner-server thread, which the child never
-    // touches (that is the property under test). The child branch below performs
-    // no allocation before it has established what it needs, and every path out
-    // of it ends in `libc::_exit`, which runs no destructors and no atexit
-    // handlers — so the child cannot flush the parent's `stdout` buffer twice or
-    // re-enter an allocator it may have inherited locked.
+    // SAFETY: `fork` runs with no worker threads of ours; the arena's owner-server
+    // thread is never touched by the child. Every child path ends in `libc::_exit`,
+    // so no destructor or atexit handler runs and no inherited lock is re-entered.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
 
@@ -243,54 +178,31 @@ fn main() {
         }
 
         if mode == "drop" || mode == "owned" {
-            // Run the destructors: the child returns through normal scope exit,
-            // so `Tree`, the writer and `Attachment` all drop. `_exit` below then
-            // skips only the runtime's own teardown.
-            //
-            // In `owned` mode the writer holds its own `Arc<Tree>`, so this is
-            // also the ordering check: the writer must stand itself down
-            // *before* the last handle to the mapping goes.
+            // Run the destructors via normal scope exit; `_exit` skips only runtime
+            // teardown. In `owned` mode this also checks the writer stands down before the
+            // last handle to the mapping goes.
             drop(writer);
             drop(tree);
         }
 
-        // SAFETY: `_exit` terminates immediately without running destructors or
-        // atexit handlers. That is exactly what is wanted here — in `drop` mode
-        // the destructors under test have already run explicitly, and in the
-        // other modes leaving them unrun is the point of comparison.
+        // SAFETY: `_exit` runs no destructors or atexit handlers, as wanted.
         unsafe { libc::_exit(status) };
     }
 
     let child = wait_for(pid);
 
-    // Now prove the parent is unharmed. Each of these is a distinct sabotage
-    // route the child had:
-    //
-    // * `lookup` — the mapping and the participant record survived `Tree::drop`.
-    // * `push` — the claim record still names this process, i.e. no reaper was
-    //   handed an edge by a released lease (`ClaimLease::drop`).
-    // * `participant_alive(self)` — the participant lock byte is still held, so
-    //   the child's inherited description did not release it.
-    // * `probe_claim` from a *fresh* description — the claim lease is still
-    //   held. See the comment at its definition for why nothing else can see
-    //   this.
-    //
-    // A fresh `open()` is what closes the last one: it goes through the socket,
-    // so it fails outright if the child stopped the owner thread by writing the
-    // inherited shutdown `eventfd` (`OwnerThread::stop`).
+    // Prove the parent is unharmed: `lookup` (mapping and record survived),
+    // `push` (claim still names this process), `participant_alive(self)` (lock byte
+    // still held), `probe_claim` from a fresh description (lease still held), and a
+    // fresh `open()` (fails if the child stopped the owner thread via the inherited
+    // shutdown `eventfd`).
     let lookup_ok = tree
         .lookup("map", "base", Stamp::<SystemDomain>::from_nanos(1_000))
         .is_ok();
     let push_ok = writer.push(3_000, &pose).is_ok();
     let alive_ok = tree.participant_alive(slot);
-    // The claim *lease*, asked from an independent open file description.
-    //
-    // This is the only way to see a released lease from in here. OFD locks are
-    // self-blind — a description never conflicts with itself — so the tree's own
-    // lock file would report the byte free whether or not it still holds it, and
-    // the arena record and `push` both stay perfectly healthy after a lease is
-    // lost. Without this check the `ClaimLease::drop` guard would have no test
-    // that can fail.
+    // The claim lease, asked from an independent open file description: OFD locks
+    // are self-blind, so nothing else here can see a released lease.
     let lease_ok = tf_tree_ipc::Rendezvous::from_env()
         .and_then(|rv| tf_tree_ipc::LockFile::open(rv.lock_path()))
         .and_then(|lf| lf.probe_claim(edge))
@@ -309,22 +221,12 @@ fn main() {
     let _ = std::io::stdout().flush();
 }
 
-/// Reap `pid` and render its wait status as the output protocol's `child=` field.
-///
-/// **`exited` versus `signalled`, and that distinction is the whole harness.**
-/// `WIFEXITED`/`WIFSIGNALED` are macros in C, so the status is decoded here. A
-/// child that passes every check and then dies in its destructors — or in a C
-/// ABI call that faulted instead of returning — has still failed, and it has no
-/// exit code left for a test comparing only a number to look at.
-///
-/// Shared by every mode rather than written twice: a fourth mode that decoded
-/// the status slightly differently would be a fourth mode that could pass a
-/// `SIGSEGV`.
+/// Reap `pid` and render its wait status as the `child=` field. `exited` versus
+/// `signalled` is the whole harness; every mode shares this decoder.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 fn wait_for(pid: libc::pid_t) -> String {
     let mut wstatus: libc::c_int = 0;
-    // SAFETY: `waitpid` writes only through the `&mut c_int` supplied, for the
-    // duration of the call, and `pid` is the child this process just forked.
+    // SAFETY: `waitpid` writes only through the `&mut c_int`; `pid` is our child.
     let waited = unsafe { libc::waitpid(pid, &mut wstatus, 0) };
     assert_eq!(waited, pid, "waitpid");
     if wstatus & 0x7f == 0 {
@@ -341,32 +243,15 @@ fn main() {
     println!("child=skipped parent_ok=true note=shm-unavailable");
 }
 
-/// **The C ABI across a `fork()`** — `docs/decisions/0015`'s *Invariants to
-/// maintain*, the half its own blockquote says was never built.
+/// **The C ABI across a `fork()`** — `docs/decisions/0015` *Invariants to
+/// maintain*.
 ///
-/// # What the three Rust modes above do not cover
-///
-/// A bridge's guarded state is exactly `Arc<Tree>` plus one
-/// [`tf_tree::OwnedWriter`] per declared dynamic edge, and [`super::main`]'s
-/// `owned` mode already forks that pair. What it cannot reach is the
-/// `extern "C"` layer in front of it: an `rclcpp` node — or anything using
-/// `multiprocessing`, whose start method on Linux is `fork` — calls
-/// [`tft_bridge_offer`], [`tft_bridge_get_stats`] and [`tft_bridge_free`], and
-/// the property those must have is that they **return** in a forked child rather
-/// than faulting in it.
-///
-/// # Where the arena name comes from, and why it is the default one
-///
-/// `tft_bridge_options::arena_name` is passed `"default"` rather than
-/// something distinctive: `crates/tf_tree_c/tests/bridge_shared.rs` is where
-/// the *name* is the subject, and here a distinctive one would have to
-/// be threaded into three places that must agree — the bridge, the third
-/// process, and [`tf_tree_ipc::Rendezvous`], which is the only vantage point an
-/// OFD claim lease is visible from and which resolves `$TF_TREE_NAME` (absent
-/// here) to `"default"`. One name from one source cannot disagree with itself.
-///
-/// The rendezvous is still per-run: `tests/fork.rs` gives each mode its own
-/// `$TF_TREE_RUNTIME_DIR`.
+/// A forked `rclcpp` node or `multiprocessing` process calls
+/// [`tft_bridge_offer`], [`tft_bridge_get_stats`] and [`tft_bridge_free`], which
+/// must **return** in the child rather than fault. The arena name is `"default"`:
+/// one name from one source (bridge, third process, [`tf_tree_ipc::Rendezvous`])
+/// cannot disagree. The rendezvous is per-run (`tests/fork.rs` sets
+/// `$TF_TREE_RUNTIME_DIR`).
 #[cfg(all(feature = "bridge", feature = "shm", target_os = "linux"))]
 mod bridge {
     use core::ffi::c_char;
@@ -382,16 +267,8 @@ mod bridge {
     };
     use tf_tree_c::{tft_error, tft_last_error, tft_status, TFT_ERR_CHILD_DETACHED, TFT_OK};
 
-    /// The same shape `crates/tf_tree_c/tests/bridge_shared.rs` declares, so a
-    /// difference between that test and this one cannot hide behind a different
-    /// topology.
-    ///
-    /// The static edge earns its place here rather than being carried over
-    /// verbatim: the bridge claims a writer only for *dynamic* edges, so with it
-    /// present `BridgeInner::writers` is a strict subset of the arena's edges —
-    /// which is the shape whose destructor `tft_bridge_free` runs in the child.
-    /// A topology of one dynamic edge would make the map and the arena
-    /// coincide, and coincidences are what hide indexing mistakes.
+    /// The topology `crates/tf_tree_c/tests/bridge_shared.rs` declares. The static
+    /// edge makes `BridgeInner::writers` a strict subset of the arena's edges.
     const TOPO: &str = r#"
 [[edge]]
 parent = "odom"
@@ -406,9 +283,7 @@ kind = "static"
 pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
 "#;
 
-    /// A 30° yaw and a translation nothing else in the fixture shares, so a
-    /// read-back that returns identity — or the static edge's pose — fails
-    /// rather than coincidentally passing.
+    /// A pose nothing else shares, so an identity read-back fails.
     const POSE: [f64; 7] = [
         0.965_925_826_289_068_3,
         0.0,
@@ -421,8 +296,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
 
     const MS: i64 = 1_000_000;
 
-    /// See [`super::main`]'s block of the same shape. The numbering starts at 20
-    /// to leave the Rust modes' 10–16 alone.
+    /// Numbering starts at 20, clear of the Rust modes' 10-16.
     const OK: i32 = 0;
     const OFFER_NOT_OK: i32 = 20;
     const OFFER_NOT_REJECTED: i32 = 21;
@@ -431,11 +305,10 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
     const STATS_NOT_COUNTED: i32 = 24;
     const GEN_NOT_BUMPED_ONCE: i32 = 25;
 
-    /// The bridge, the fork, the child's three calls, and the parent's
-    /// re-validation.
+    /// The bridge, the fork, the child's three calls, and the parent's re-validation.
     pub(crate) fn run() {
         let toml = CString::new(TOPO).unwrap();
-        // "default" — see the module docs for why this name and not another.
+        // "default" — see the module docs.
         let arena = CString::new("default").unwrap();
         let opts = tft_bridge_options {
             struct_size: core::mem::size_of::<tft_bridge_options>() as u32,
@@ -446,8 +319,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
             arena_name: arena.as_ptr(),
         };
         let mut b: *mut tft_bridge = ptr::null_mut();
-        // SAFETY: NUL-terminated config and name, a live full-size `opts`, and
-        // `b` a live local.
+        // SAFETY: NUL-terminated config and name, live full-size `opts`, live `b`.
         let rc = unsafe { tft_bridge_create(toml.as_ptr(), &opts, &mut b) };
         assert_eq!(
             rc,
@@ -457,8 +329,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
         );
         assert!(!b.is_null());
 
-        // One transform before the fork, so the child inherits a bridge that has
-        // already written — a claim taken, a lease held, a sample in the ring.
+        // One transform before the fork, so the child inherits a bridge that has written.
         let (rc, out) = offer(b, 1_000 * MS);
         assert_eq!(rc, TFT_OK, "the first offer: {}", last_message());
         assert_eq!(
@@ -470,59 +341,30 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
 
         let gen_before = tf_tree_ipc::fork::generation();
 
-        // SAFETY: the same argument as [`super::main`]'s `fork`, which this file
-        // exists for and which `docs/decisions/0005` step 9 records the
-        // exception for. The one addition: the bridge's arena is a shared one, so
-        // this process also carries the owner-server thread — the child never
-        // touches it, which is half of what is under test, and every path out of
-        // the child branch ends in `libc::_exit`.
+        // SAFETY: as [`super::main`]'s `fork`, plus the owner-server thread, which the
+        // child never touches; every child path ends in `libc::_exit`.
         //
-        // **This child allocates, and `main`'s sibling comment says its child
-        // does not — so the difference is named here rather than left as a
-        // silent divergence.** Three of the calls under test allocate on the
-        // path they are being tested on: `offer()` builds two `CString`s,
-        // `tft_bridge_offer`'s rejected arm goes through
-        // `error::last_message()` (a `Vec<u8>` and a `String`), and
-        // `tft_bridge_free` drops a `BTreeMap<String, OwnedWriter>`. There is no
-        // way to test those three entry points without reaching their
-        // allocations — that *is* the surface a forked ROS node touches.
-        //
-        // The invariant relied on: **glibc registers `pthread_atfork` handlers
-        // that reinitialise the malloc arena in the child**, so `malloc` is
-        // usable after `fork()` in a single-threaded child even though POSIX
-        // does not list it as async-signal-safe. That is a glibc guarantee and
-        // not a POSIX one, and it is the reason this is written down. The
-        // pre-existing `drop` and `owned` modes already free in the child, so
-        // this widens an accepted deviation rather than opening a new one;
-        // `0005` step 9 is silent on allocation. A child on a libc without that
-        // guarantee would need the three calls split across three `fork()`s
-        // with the assertions moved to the parent.
+        // **This child allocates**: `offer()` builds `CString`s, the rejected arm goes
+        // through `error::last_message()`, and `tft_bridge_free` drops a `BTreeMap`.
+        // Relied on: glibc's `pthread_atfork` handlers reinitialise the malloc arena in
+        // the child (a glibc guarantee, not POSIX). A libc without it needs the calls
+        // split across three `fork()`s.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
 
         if pid == 0 {
-            // **Every line here is a call that must return.** A `SIGSEGV` in any
-            // of them is reported by the parent as `signalled`.
+            // Every call here must return; a `SIGSEGV` is reported as `signalled`.
             let mut status = OK;
 
             let (rc, out) = offer(b, 2_000 * MS);
             let mut stats = tft_bridge_stats::blank();
-            // **Called unconditionally, not inside the chain below.** All three
-            // entry points under test must be *reached* in the child; the chain
-            // only classifies what they answered. Folding this into an
-            // `else if` would skip it whenever the offer misbehaved — which is
-            // exactly the run in which a second faulting entry point would
-            // matter most.
-            //
-            // SAFETY: a live handle on its creating thread — the token is a
-            // thread-local counter, which a forked child inherits unchanged —
-            // and `stats` is a live local with `struct_size` set.
+            // Called unconditionally, not in the chain below, so all three entry points
+            // are reached even when the offer misbehaves.
+            // SAFETY: a live handle on its creating thread (the token is a thread-local
+            // counter, inherited unchanged); `stats` is live with `struct_size` set.
             let stats_rc = unsafe { tft_bridge_get_stats(b, &mut stats) };
             if rc != TFT_OK {
-                // The *call* was well-formed — a live handle on its creating
-                // thread, current `struct_size`s, a UTF-8 name. `tft_bridge_offer`
-                // documents its return value as answering that question and
-                // nothing else, so a detached writer must arrive on the outcome.
+                // The call was well-formed, so a detached writer must arrive on the outcome.
                 status = OFFER_NOT_OK;
             } else if out.action != TFT_BRIDGE_REJECTED {
                 status = OFFER_NOT_REJECTED;
@@ -531,78 +373,51 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
             } else if stats_rc != TFT_OK {
                 status = STATS_NOT_OK;
             } else if stats.rejected_by_arena != 1 || stats.applied != 1 {
-                // The counters the C layer owns, read back in the child: the
-                // refusal above was *counted* as a refusal, and the offer before
-                // the fork is still the only applied one. A `get_stats` that
-                // returned `TFT_OK` having read nothing would pass the line
-                // above and fail this one.
+                // The refusal was counted as a refusal and the pre-fork offer is the only
+                // applied one.
                 status = STATS_NOT_COUNTED;
             } else if tf_tree_ipc::fork::generation().wrapping_sub(gen_before) != 1 {
-                // The same pin as the Rust modes', repeated here because the
-                // arena was created by `tft_bridge_create` rather than by an
-                // `Open` in this file: if that path ever stopped arming the
-                // handler, every check above would still pass — `detached()`
-                // compares a generation nothing moved — and this is the only
-                // line that would notice.
+                // The Rust modes' generation pin, repeated: this arena comes from
+                // `tft_bridge_create`, and if that stopped arming the handler nothing else here
+                // would notice.
                 status = GEN_NOT_BUMPED_ONCE;
             }
 
-            // **The destructor half, through the ABI.** `tft_bridge_free` drops
-            // the `BTreeMap<String, OwnedWriter>` and the `Arc<TreeShare>`
-            // behind it, which between them own every claim lease, the
-            // participant slot, the owner thread and the mapping — all of them
-            // the *parent's*. It returns `void`, so unlike the two calls above
-            // there is no status to inspect: what it has to do is come back at
-            // all, and leave the parent's leases alone. The parent's `lease:`
-            // and `serve:` fields are where that is observed.
+            // The destructor half: `tft_bridge_free` drops every claim lease, the
+            // participant slot, the owner thread and the mapping, all the parent's. It returns
+            // `void`, so it must come back and leave the parent's leases alone (the parent's
+            // `lease:` and `serve:` fields observe that).
             //
             // SAFETY: a live handle, freed exactly once, on its creating thread.
             unsafe { tft_bridge_free(b) };
 
-            // SAFETY: `_exit` terminates without running destructors or atexit
-            // handlers. The destructors under test have already run, inside
-            // `tft_bridge_free`.
+            // SAFETY: `_exit` runs no destructors; they ran inside `tft_bridge_free`.
             unsafe { libc::_exit(status) };
         }
 
         let child = super::wait_for(pid);
 
-        // **The parent's bridge still applies an offer.** The first half of what
-        // the record asks the parent to prove, and it goes through the same
-        // `extern "C"` entry point the child was just refused at.
+        // The parent's bridge still applies an offer through the same entry point.
         let (rc, out) = offer(b, 3_000 * MS);
         let offer_ok = rc == TFT_OK && out.action == TFT_BRIDGE_APPLIED;
 
-        // A fresh attach, read-only, with `Open::new()`'s consumer defaults —
-        // the owner-thread proof [`super::main`] makes at its own `serve_ok`.
+        // A fresh read-only attach with the consumer defaults.
         let attached = tf_tree::Open::new().open();
         let serve_ok = attached.is_ok();
 
-        // **The second half: the arena is still readable from a third process.**
-        // The child was the second. This one is this executable re-`exec`ed, so
-        // it shares no address space, no mapping and no open file description
-        // with the bridge.
-        //
-        // What it reads is the transform the parent published *after* the child
-        // died, at 3 000 ms — so one comparison carries both halves of the
-        // record's sentence.
+        // The arena is still readable from a third process (this executable
+        // re-`exec`ed: no shared mapping or descriptions), reading the transform
+        // published after the child died.
         let line = read_in_a_third_process(3_000 * MS);
         let their_bits = line.strip_prefix("ok ").unwrap_or_default().to_string();
-        // The control, in this process, compared bit for bit.
+        // The control, compared bit for bit.
         let ours = attached
             .as_ref()
             .ok()
             .and_then(|t| lookup(t, "odom", "base", 3_000 * MS));
         let read_ok = !their_bits.is_empty() && ours.as_ref().map(bits_of) == Some(their_bits);
-        // And the bytes are the pose that was offered, not merely a value two
-        // readers agree on.
-        //
-        // **The rotation as well as the translation.** `POSE`'s doc says its
-        // 30° yaw is there "so a read-back that returns identity … fails rather
-        // than coincidentally passing" — and this check tested only `t` for its
-        // first revision, so the one component put there to make identity fail
-        // was the one component nothing looked at. `read_ok` cannot stand in:
-        // both readers would agree on the same wrong rotation.
+        // The bytes are the pose offered, rotation as well as translation; `read_ok`
+        // cannot stand in, since both readers could agree on a wrong rotation.
         let value_ok = ours.is_some_and(|iso| {
             (iso.q.w - POSE[0]).abs() < 1e-12
                 && (iso.q.x - POSE[1]).abs() < 1e-12
@@ -613,11 +428,8 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
                 && (iso.t.z - POSE[6]).abs() < 1e-12
         });
 
-        // The claim *lease*, asked from an independent open file description —
-        // see [`super::main`]'s comment at the same check for why nothing else in
-        // this process can see it. The edge is read out of the topology rather
-        // than guessed: `tft_bridge_create` assigns ids from the config, and a
-        // hardcoded 1 would keep passing if it ever assigned them differently.
+        // The claim lease from an independent description (see [`super::main`]); the
+        // edge is read from the topology, not hardcoded.
         let lease_ok = attached
             .as_ref()
             .ok()
@@ -639,19 +451,15 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
         let _ = std::io::stdout().flush();
 
         drop(attached);
-        // SAFETY: a live handle, freed exactly once, on its creating thread.
-        // Last, so nothing above observes an arena this call has torn down.
+        // SAFETY: a live handle, freed exactly once, on its creating thread. Last, so
+        // nothing above observes a torn-down arena.
         unsafe { tft_bridge_free(b) };
     }
 
-    /// The third process: attach with the consumer defaults and print the
-    /// lookup as bit patterns.
-    ///
-    /// One line on stdout, `ok <16-hex-word>:<…>` or `error <display>`, which is
-    /// `crates/tf_tree_c/src/bin/bridge_reader.rs`'s protocol. It is a mode of
-    /// this binary rather than that one because `CARGO_BIN_EXE_*` is set only for
-    /// the tests of the package that declares the binary, and this test is
-    /// `tf_tree_bench`'s.
+    /// The third process: attach with the consumer defaults and print the lookup as
+    /// bit patterns, `ok <16-hex-word>:<…>` or `error <display>`
+    /// (`crates/tf_tree_c/src/bin/bridge_reader.rs`'s protocol). A mode of this binary
+    /// because `CARGO_BIN_EXE_*` is set only for the declaring package's tests.
     pub(crate) fn read_back() {
         let stamp = std::env::args()
             .nth(2)
@@ -668,11 +476,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
         let _ = std::io::stdout().flush();
     }
 
-    /// Run this executable again, as a genuinely separate process.
-    ///
-    /// The environment is inherited, so the child resolves the same
-    /// `$TF_TREE_RUNTIME_DIR` — and the same rendezvous domain — as the bridge,
-    /// with the arena name being the default on both sides.
+    /// Re-run this executable as a separate process; the environment is inherited.
     fn read_in_a_third_process(stamp: i64) -> String {
         let exe = std::env::current_exe().expect("current_exe");
         let out = std::process::Command::new(exe)
@@ -686,8 +490,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// Offer one `/tf` transform through the ABI, returning the call's status
-    /// and the outcome it filled.
+    /// Offer one `/tf` transform through the ABI; returns the status and outcome.
     fn offer(b: *mut tft_bridge, stamp: i64) -> (tft_status, tft_bridge_outcome) {
         let (p, c) = (CString::new("odom").unwrap(), CString::new("base").unwrap());
         let s = tft_bridge_sample {
@@ -705,12 +508,8 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
         (rc, out)
     }
 
-    /// `target <- source` at `stamp`, or `None` for any reason it could not be
-    /// answered — an absent frame, no plan, no sample.
-    ///
-    /// **One lookup behind both the third process's answer and this process's
-    /// control.** Two spellings of the same query would let the comparison in
-    /// [`run`] pass because the two sides asked different questions.
+    /// `target <- source` at `stamp`, or `None` if unanswerable. One lookup serves
+    /// both the third process and the control.
     fn lookup(
         tree: &tf_tree::Tree,
         target: &str,
@@ -730,8 +529,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
             .ok()
     }
 
-    /// A transform as bit patterns. A comparison that rounds is a comparison
-    /// that can agree while the memory does not.
+    /// A transform as bit patterns, so rounding cannot hide a difference.
     fn bits_of(iso: &tf_tree::Iso3) -> String {
         iso.to_bits()
             .iter()
@@ -740,9 +538,8 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
             .join(":")
     }
 
-    /// The id of the edge whose child frame is `child`, read out of the
-    /// topology block. `tf_tree`'s `unstable` tier, which this crate already
-    /// takes for the same reason (`docs/API.md` §2.6).
+    /// The id of the edge whose child frame is `child`, from the topology block
+    /// (`unstable` tier, `docs/API.md` §2.6).
     fn edge_of(tree: &tf_tree::Tree, child: &str) -> Option<u32> {
         let id = tree.frame(child).ok()?;
         let (_, _, edge, _) = tree.arena_view().topology().read_frame(id)?;
@@ -761,8 +558,7 @@ pose = [0.9659258262890683, 0.0, 0.0, 0.25881904510252074, 0.35, -0.02, 0.61]
         if p.is_null() {
             return String::new();
         }
-        // SAFETY: the ABI contracts every string it hands out is NUL-terminated
-        // and valid until the next call on the handle; nothing intervenes here.
+        // SAFETY: ABI strings are NUL-terminated and valid until the next call.
         unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
 }

@@ -13,66 +13,23 @@ members = [
     "crates/tf_tree_c",
     "xtask",
 ]
-# `tf_tree_tf2_sys` bridges to ROS 2's `tf2::BufferCore` and only builds where
-# ROS 2 is installed. Excluding it keeps `cargo build --workspace` working on
-# every host; `tf_tree_bench --features tf2` pulls it in as a path dependency
-# when a ROS toolchain is actually present.
+# `tf_tree_tf2_sys` (ROS 2) and `tf_tree_py` (libpython) are excluded so
+# `cargo build --workspace` works on every host; `just py-*` builds the latter.
 exclude = [
-    # Links libpython, which a plain `cargo build --workspace` cannot assume is
-    # present — same reasoning as `tf_tree_tf2_sys` and ROS below. Built and
-    # tested by `just py-*`, which point PyO3 at a uv-managed interpreter.
     "crates/tf_tree_py","crates/tf_tree_tf2_sys"]
 
 [workspace.package]
-# **0.0.1, and the number is a statement about compatibility rather than about
-# maturity.** `CHANGELOG.md`, *Versioning, stated before anything else*.
-#
-# **This supersedes `SUPPORT.md`'s minor-bump-on-MSRV rule for the whole 0.0.x
-# line.** `SUPPORT.md`'s *MSRV policy* section carries the argument.
+# 0.0.x: every release may break every other (`CHANGELOG.md`; `SUPPORT.md` MSRV policy).
 version = "0.0.5"
 edition = "2021"
-# **1.87, and each step was forced by a dependency rather than chosen.**
-#
-# 1.83 → 1.85: `SUPPORT.md`, *MSRV policy*.
-#
-# 1.85 → 1.87: `ruzstd 0.9.0` declares `rust-version = "1.87"`. It is the
-# pure-Rust zstd decoder `tf_tree_ingest` reads compressed MCAP chunks with, and
-# the reason it is pure Rust rather than `zstd-sys` is `docs/PHASE2.md` §2's
-# no-C-build-step rule. `ruzstd 0.7.3` would hold 1.85 and has the same two APIs
-# we need (`decode_all` into a slice, a 100 MiB window cap), so this buys
-# currency and a settable cap, not capability — a deliberate trade, not a
-# necessity.
-#
-# One clarification, because the sentence above invites the wrong reading and the
-# wrong reading is a decompression bomb: that 100 MiB caps the decoder's *window*,
-# i.e. its peak working allocation, and **not** its total output. A frame with a
-# 100 MiB window can still decode to terabytes. What bounds output is
-# `IngestOptions::max_chunk_uncompressed_bytes` and `max_chunk_expansion_ratio`,
-# enforced in `tf_tree_ingest::decompress` before anything is allocated.
-#
-# The `msrv` job in `.github/workflows/ci.yml` reads this field and builds on
-# exactly it, so the next silent drift fails the build instead of shipping.
-# Policy: `SUPPORT.md`.
+# 1.87 is forced by `ruzstd 0.9.0` (pure-Rust zstd for `tf_tree_ingest`, `docs/PHASE2.md` §2).
+# The decoder's 100 MiB cap bounds its window, not its output; output is bounded by
+# `IngestOptions::max_chunk_uncompressed_bytes` and `max_chunk_expansion_ratio`.
+# The `msrv` job reads this field. Policy: `SUPPORT.md`.
 rust-version = "1.87"
-# **Each publishable crate carries `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICE`
-# as symlinks to the three files beside this manifest**, because `cargo package`
-# ships only what is inside the package directory and a `.crate` tarball is a
-# redistribution: an Apache-2.0 recipient who vendors `tf_tree_core` needs the
-# licence text and the §4(d) NOTICE *in the tarball*, not a URL to a repository
-# that was private when they downloaded it.
-#
-# Symlinks rather than fifteen copies, and the choice is measured rather than
-# assumed: `cargo package` **dereferences** them, so the tarball holds real
-# regular files with the real bytes — verified on cargo 1.95 with a probe crate
-# whose symlinked `LICENSE-MIT` arrived as `-rw-r--r-- … 22` bytes of content.
-# Copies would be fifteen spellings of three texts, which is the thing
-# `docs/PROJECT.md` §6 exists to stop.
-#
-# The one cost, stated because it is invisible until it bites: a Windows
-# checkout without `core.symlinks` writes each link as a text file containing
-# the *path*, and `cargo publish` from such a checkout would ship a 17-byte file
-# where the MIT licence should be. Publishing happens from Linux; if that ever
-# changes, check a tarball before uploading.
+# Publishable crates carry `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICE` as symlinks
+# to the files beside this manifest; `cargo package` dereferences them. Publish from
+# Linux: a Windows checkout without `core.symlinks` would ship the link text.
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"
@@ -91,60 +48,36 @@ print_stdout = "warn"
 print_stderr = "warn"
 needless_pass_by_value = "warn"
 redundant_clone = "warn"
-# `docs/decisions/0007` rule 3: every `unsafe` block carries its own
-# `// SAFETY:` comment. Until this line only review held that. The lint checks
-# that a comment is *there* — directly above the block, or above the statement
-# or `let` that holds it — and **nothing about what it says**: whether it names
-# the invariant relied on is still a review rule. Two placements that look
-# covered are not: a comment above a multi-line `assert_eq!(` that wraps the
-# block (the form rustfmt produces; it goes inside the macro, directly above
-# `unsafe`), and a comment above a `match` — or a `let` of one — whose arm holds
-# the block (it goes on the arm). `tf_tree_py` and `tf_tree_tf2_sys` are
-# outside the workspace and repeat this line in their own `[lints.clippy]`.
+# 0007 rule 3: every `unsafe` block has a `// SAFETY:` comment. The lint checks
+# presence only; it goes directly above the block (inside a wrapping macro, or on
+# the `match` arm). `tf_tree_py` and `tf_tree_tf2_sys` repeat it.
 undocumented_unsafe_blocks = "deny"
 
 [workspace.lints.rust]
 missing_docs = "warn"
 unreachable_pub = "warn"
 unused_must_use = "deny"
-# `--cfg loom` is a first-class build mode for tf_tree_core's concurrency tests;
-# registering it workspace-wide keeps `-D warnings` (unexpected_cfgs) happy and
-# lets every crate inherit lints with `[lints] workspace = true`.
+# Registers `--cfg loom` so `-D warnings` accepts it.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.dependencies]
-# Intra-workspace crates (version pinned so publishable crates carry a real
-# requirement, not a path wildcard).
+# Intra-workspace crates.
 tf_tree_math = { path = "crates/tf_tree_math", version = "0.0.5" }
 tf_tree_arena = { path = "crates/tf_tree_arena", version = "0.0.5" }
-# Phase 2 shared memory (see docs/PHASE2.md §2). Linux-only, opt-in via the
-# `shm` feature; `linux_raw` backend so there is no libc crate and no C build.
-# Only `tf_tree_ipc`, and only for `fcntl(F_OFD_*)`: rustix has no OFD locking
-# (see crates/tf_tree_ipc/src/ofd.rs for why the alternative was worse).
+# `shm` (`docs/PHASE2.md` §2): `linux_raw` backend, no libc crate, no C build.
+# rustix is used only by `tf_tree_ipc`, for `fcntl(F_OFD_*)` (`crates/tf_tree_ipc/src/ofd.rs`).
 libc = "0.2"
 rustix = { version = "1.1", default-features = false, features = ["mm", "fs", "std"] }
-# **`default-features = false`, and it is load-bearing.** Without it a
-# downstream `--no-default-features` still gets `tf_tree_core/default`, because
-# a workspace dependency carries its own defaults independently of the
-# depending crate's feature flags. That made `docs/PHASE5.md` §5.5's
-# compile-time switch unreachable *and* silently invalidated §5.7's control
-# measurement — the "counters off" row was measuring the counters-on engine.
-# Every crate that wants them re-enables them through its own `counters`
-# feature, which is what makes the switch actually switch.
+# `default-features = false` is load-bearing: a workspace dependency carries its own
+# defaults, so without it `--no-default-features` downstream still enables
+# `tf_tree_core/default` and the `counters` switch (`docs/PHASE5.md` §5.5) never switches.
 tf_tree_core = { path = "crates/tf_tree_core", version = "0.0.5", default-features = false }
 tf_tree_ipc = { path = "crates/tf_tree_ipc", version = "0.0.5" }
 tf_tree = { path = "crates/tf_tree", version = "0.0.5", default-features = false }
-# publish = false crates, wired by path only (no version requirement published).
-# **`default-features = false` for the same load-bearing reason as `tf_tree`
-# above, and it is easy to miss here.** `tf_tree_bench` has its own
-# `default = ["counters"]` that forwards to `tf_tree/counters`, so without this
-# flag `tf_tree_cli --no-default-features` still linked a counting engine: the
-# CLI's own `counters` feature switched nothing, and `TFT010`'s "built without
-# counters" skip branch was unreachable in every buildable configuration.
+# publish = false crates. `default-features = false` for the same reason as above.
 tf_tree_bench = { path = "crates/tf_tree_bench", default-features = false }
 tf_tree_bridge = { path = "crates/tf_tree_bridge" }
-# `docs/PHASE5.md` §3. `default-features = false` for the same reason as
-# `tf_tree` above: the CLI decides whether the engine counts, not this crate.
+# `docs/PHASE5.md` §3. The CLI decides whether the engine counts.
 tf_tree_ingest = { path = "crates/tf_tree_ingest", default-features = false }
 # no_std numeric + POD casting (the entire core dependency budget, plus blake3).
 libm = "0.2"
@@ -159,8 +92,6 @@ proptest = "1"
 loom = "0.7"
 criterion = { version = "0.5", features = ["html_reports"] }
 # `tf_tree_bench`'s regression gate reads the committed `results.json` baseline.
-# Already in the lockfile via `criterion`; see that crate's manifest for why the
-# *writer* stays hand-rolled.
 serde_json = "1"
 
 [profile.release]
@@ -176,41 +107,16 @@ opt-level = 0
 lto = "thin"
 codegen-units = 1
 
-# Release code that a profiler can attribute to source lines.
-#
-# `[profile.release]` strips debuginfo, which is right for what ships and wrong
-# for finding anything: cachegrind, perf and callgrind all fall back to
-# function-level attribution, and `fold_at` inlines the entire sampling chain
-# into itself. A function-level profile of this engine therefore says "96.6% of
-# branch mispredicts are in `fold_at`" and stops — true, and useless, because
-# `fold_at` *is* the hot path.
-#
-# Same codegen as release so the numbers transfer; only the debuginfo differs.
+# Release codegen with debuginfo, so profilers attribute to source lines (`fold_at`
+# inlines the whole sampling chain).
 [profile.profiling]
 inherits = "release"
 debug = "full"
 strip = "none"
 
-# **An embedder's `cargo build --release`, spelled out — `docs/PHASE5.md` §9.2's
-# last row and `docs/API.md` §2.3 item 3.**
-#
-# `Plan::at` sits across a crate boundary from every consumer, and what the
-# `#[inline]` attributes on that path buy depends on the *downstream* profile.
-# This workspace's `[profile.release]` sets `lto = "thin", codegen-units = 1`,
-# which is precisely what hides the effect: every number this repository
-# publishes is taken under whole-program optimisation, and a user's node is not.
-# So the embedding row is measured here, and `[profile.release]` is measured as
-# the contrast.
-#
-# **Every field cargo's own release defaults set is written out rather than
-# inherited**, `inherits` notwithstanding. Inheriting only `lto` and
-# `codegen-units` would make this profile track future edits to
-# `[profile.release]` — and then the row would silently stop describing the
-# thing it is named after. `inherits` is mandatory for a custom profile, so it
-# names `release` and then contradicts it field by field.
-# `crates/tf_tree_bench/src/embed.rs` carries a test that reads these values back
-# out of this file, so the report's statement about what it measured is checked
-# rather than asserted.
+# An embedder's `cargo build --release` (`docs/PHASE5.md` §9.2, `docs/API.md` §2.3 item 3):
+# every cargo default is spelled out so edits to `[profile.release]` do not change it.
+# `crates/tf_tree_bench/src/embed.rs` has a test that reads these values back.
 [profile.embedder]
 inherits = "release"
 opt-level = 3

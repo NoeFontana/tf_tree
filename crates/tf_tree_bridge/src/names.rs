@@ -1,35 +1,20 @@
 //! Frame-name normalization — `docs/PHASE4.md` §5.6.
 //!
-//! # Four rules, and the reasoning behind the two that look arbitrary
-//!
-//! 1. **Strip a single leading `/`** (ROS 1 legacy), and **warn once per
-//!    distinct frame** — not once per message, which at 1 kHz across twenty
-//!    edges is twenty thousand identical lines a second.
-//! 2. **Reject empty names.**
-//! 3. **Otherwise pass UTF-8 through unchanged.** No case folding, no Unicode
-//!    normalization. §5.6 is explicit: frame names are *identifiers*, and two
-//!    frames differing only by case are two frames. Folding them would merge a
-//!    typo'd frame into a real one and produce a transform tree that looks
-//!    correct and is not.
-//! 4. **Apply `tf_prefix` if configured, and log the resulting table at
-//!    startup.** A silent remap is worse than no remap: it makes the arena's
-//!    frame names differ from the ones in every launch file and RViz config on
-//!    the robot, with nothing anywhere saying so.
-//!
-//! *A single* leading slash, not all of them: `//base` is not a ROS 1 name with
-//! two legacy prefixes, it is a name with a leading slash whose next character
-//! happens to be a slash. Stripping greedily would silently merge `/base` and
-//! `//base`, which rule 3's reasoning forbids.
+//! 1. Strip a **single** leading `/` (ROS 1 legacy) and warn once per distinct
+//!    frame. `//base` keeps its second slash: greedy stripping would merge
+//!    `/base` and `//base`.
+//! 2. Reject empty names.
+//! 3. Otherwise pass UTF-8 through unchanged: no case folding, no Unicode
+//!    normalization. Frame names are identifiers (§5.6).
+//! 4. Apply `tf_prefix` if configured and record the remap table (§5.6 requires
+//!    it logged).
 
 use std::collections::BTreeSet;
 
 /// Why a name was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameError {
-    /// The name was empty, or became empty after stripping.
-    ///
-    /// A bare `"/"` is the second case, and it is not hypothetical — it is what
-    /// a launch file with an unsubstituted variable produces.
+    /// The name was empty, or only a slash (an unsubstituted launch variable).
     Empty,
 }
 
@@ -42,20 +27,13 @@ pub struct Normalized {
     pub stripped_slash: bool,
     /// Whether a `tf_prefix` was applied.
     pub prefixed: bool,
-    /// Whether this is the **first** time this input has been seen.
-    ///
-    /// Drives the "warn once per distinct frame" rule. Returning it rather
-    /// than logging here keeps the module free of a logging dependency and
-    /// leaves the decision with the caller — which matters because the ROS
-    /// half logs through `rclcpp` and the tests do not log at all.
+    /// Whether this is the **first** time this input has been seen (the
+    /// warn-once rule); the caller does the logging.
     pub first_sight: bool,
 }
 
-/// How many distinct raw frame names the warn-once set remembers.
-///
-/// See the bound's justification at its use in [`NameNormalizer::normalize`].
-/// Far above any real robot's frame count — `docs/PHASE4.md`'s corpora run to
-/// tens — and far below a size that costs a bridge its memory.
+/// How many distinct raw frame names the warn-once set remembers; see its use
+/// in [`NameNormalizer::normalize`].
 const MAX_TRACKED_NAMES: usize = 8192;
 
 /// Normalizes frame names and remembers which ones it has warned about.
@@ -76,12 +54,8 @@ impl NameNormalizer {
         NameNormalizer::default()
     }
 
-    /// A normalizer that prefixes every frame with `prefix`.
-    ///
-    /// An empty or whitespace-only prefix is treated as no prefix, because that
-    /// is what an unset launch argument expands to and prefixing every frame
-    /// with `""` would otherwise be a silent no-op that still reports itself as
-    /// a remap.
+    /// A normalizer that prefixes every frame with `prefix`. An empty or
+    /// whitespace-only prefix means no prefix.
     #[must_use]
     pub fn with_prefix(prefix: &str) -> NameNormalizer {
         let p = prefix.trim().trim_end_matches('/');
@@ -104,7 +78,7 @@ impl NameNormalizer {
         if raw.is_empty() {
             return Err(NameError::Empty);
         }
-        // **One** slash. See the module docs for why not `trim_start_matches`.
+        // One slash, not `trim_start_matches`.
         let (body, stripped_slash) = match raw.strip_prefix('/') {
             Some(rest) => (rest, true),
             None => (raw, false),
@@ -120,28 +94,11 @@ impl NameNormalizer {
             Some(p) => (format!("{p}/{body}"), true),
             None => (body.to_string(), false),
         };
-        // `contains` before `insert`, and the order is the whole point:
-        // `BTreeSet::insert` needs an owned key whether or not it stores one, so
-        // the obvious `self.seen.insert(raw.to_string())` allocates a `String`
-        // on **every** sample only to discover the name is already there and
-        // drop it again. This runs once per offered transform, which at 1 kHz
-        // across twenty edges is twenty thousand pointless allocations a second.
-        // The probe borrows (`BTreeSet<String>: Borrow<str>`) and allocates
-        // nothing; only a genuinely new name pays.
-        // **And bounded**, because both tables are keyed by a string the
-        // *publisher* chose and nothing upstream drops a message before its
-        // names are normalized — `Ingest::offer` normalizes at step 1 and only
-        // checks the declared topology at step 2. So a name that will be
-        // dropped microseconds later, and can never reach the arena, is still
-        // interned here permanently. A perception node that mints a frame per
-        // detection (`tag_36h11_1417`, `object_88231`) therefore adds a row per
-        // detection, on a bridge `docs/PHASE4.md` §1 asks to run unattended for
-        // a fortnight.
-        //
-        // Past the cap the only thing lost is the warn-once bookkeeping: every
-        // name still normalizes identically, `first_sight` simply reports
-        // `false`, so the caller goes quiet rather than loud. A missing log line
-        // beats an OOM-killed bridge.
+        // `contains` before `insert`: probing borrows, while `insert` needs an
+        // owned key, so this allocates only for a genuinely new name.
+        // Bounded because the publisher chooses the string and names are
+        // interned before the declared-topology check. Past the cap only the
+        // warn-once bookkeeping is lost (`first_sight` reads `false`).
         let first_sight = if self.seen.contains(raw) || self.seen.len() >= MAX_TRACKED_NAMES {
             false
         } else {
@@ -159,12 +116,8 @@ impl NameNormalizer {
         })
     }
 
-    /// Every remap applied so far, as `(raw, normalized)`.
-    ///
-    /// §5.6 requires this to be logged at startup. It is accumulated rather
-    /// than computed up front because the set of frames is not known until they
-    /// arrive — so "at startup" in practice means "as each is first seen", and
-    /// this is what a caller prints.
+    /// Every remap applied so far, as `(raw, normalized)`, accumulated as each
+    /// frame is first seen (§5.6).
     #[must_use]
     pub fn remaps(&self) -> &[(String, String)] {
         &self.remaps
@@ -176,20 +129,11 @@ impl NameNormalizer {
         self.stripped
     }
 
-    /// Add `n` to the stripped-slash count without normalizing anything.
+    /// Add `n` to the stripped-slash count without normalizing.
     ///
-    /// **One caller, and it exists to keep a number honest.** `Ingest::resolve`
-    /// caches raw wire spellings that have already been normalized once, so a
-    /// repeat skips [`Self::normalize`] entirely. Every side effect that skip
-    /// could lose has already happened — the raw names are in `seen`, so
-    /// `first_sight` is `false` and `remaps` would not grow — *except* this one,
-    /// because [`Self::stripped_count`] counts every **occurrence** rather than
-    /// every first sight (`a_stripped_slash_is_counted_every_time` pins that).
-    ///
-    /// A cached name normalized successfully, so its body was non-empty, so
-    /// `raw.starts_with('/')` is exactly the condition [`Self::normalize`]
-    /// increments on. Replaying it there keeps this count bit-identical to the
-    /// uncached pipeline.
+    /// For `Ingest::resolve`, whose cache skips [`Self::normalize`] on repeats;
+    /// [`Self::stripped_count`] counts every occurrence
+    /// (`a_stripped_slash_is_counted_every_time`), so the caller replays it.
     pub(crate) fn note_stripped(&mut self, n: u64) {
         self.stripped += n;
     }
@@ -200,11 +144,9 @@ impl NameNormalizer {
 mod tests {
     use super::*;
 
-    /// **One leading slash, and only one.**
+    /// One leading slash, and only one.
     ///
-    /// Mutant: `trim_start_matches('/')` ⇒ `//base` and `/base` both normalize
-    /// to `base`, silently merging two distinct frames. That is the same class
-    /// of error as case folding, which §5.6 forbids by name.
+    /// Mutant: `trim_start_matches('/')` merges `//base` and `/base`.
     #[test]
     fn exactly_one_leading_slash_is_stripped() {
         let mut n = NameNormalizer::new();
@@ -215,18 +157,12 @@ mod tests {
             "/base_link",
             "the second slash is part of the name, not a second legacy prefix"
         );
-        // Interior slashes are untouched — they are namespaces, not prefixes.
         assert_eq!(n.normalize("/robot/base").unwrap().name, "robot/base");
     }
 
-    /// **The warning fires once per distinct frame, not once per message.**
+    /// The warning fires once per distinct frame, not once per message.
     ///
-    /// At 1 kHz across twenty edges, per-message would be twenty thousand
-    /// identical lines a second, which is a log nobody can read for any other
-    /// reason.
-    ///
-    /// Mutant: always report `first_sight: true` ⇒ the caller warns per
-    /// message and this fails on the second call.
+    /// Mutant: always report `first_sight: true`.
     #[test]
     fn a_repeated_frame_is_reported_once() {
         let mut n = NameNormalizer::new();
@@ -234,23 +170,17 @@ mod tests {
         for _ in 0..1000 {
             assert!(!n.normalize("/base").unwrap().first_sight);
         }
-        // A *different* frame is still worth a warning.
         assert!(n.normalize("/odom").unwrap().first_sight);
         assert_eq!(n.stripped_count(), 1002, "the count keeps every occurrence");
         assert_eq!(n.remaps().len(), 2, "the table keeps one row per frame");
     }
 
-    /// **Case and Unicode are left alone**, because frame names are
-    /// identifiers.
-    ///
-    /// Folding `base_link` and `Base_Link` together would merge a typo'd frame
-    /// into a real one, and the resulting tree would look correct.
+    /// Case and Unicode are left alone: frame names are identifiers.
     #[test]
     fn case_and_unicode_pass_through_unchanged() {
         let mut n = NameNormalizer::new();
         assert_eq!(n.normalize("Base_Link").unwrap().name, "Base_Link");
         assert_eq!(n.normalize("base_link").unwrap().name, "base_link");
-        // Two visually similar Unicode names that NFC/NFKC would merge.
         assert_eq!(n.normalize("caméra").unwrap().name, "caméra");
         let decomposed = "came\u{301}ra"; // e + combining acute
         assert_eq!(n.normalize(decomposed).unwrap().name, decomposed);
@@ -261,21 +191,17 @@ mod tests {
         );
     }
 
-    /// **Empty is refused, and so is a bare slash** — which is what an
-    /// unsubstituted launch variable produces, and is therefore the one that
-    /// actually happens.
+    /// Empty and a bare slash are refused.
     #[test]
     fn empty_and_bare_slash_are_refused() {
         let mut n = NameNormalizer::new();
         assert_eq!(n.normalize(""), Err(NameError::Empty));
         assert_eq!(n.normalize("/"), Err(NameError::Empty));
-        // A refused name must not enter the remap table or the counters.
         assert_eq!(n.remaps().len(), 0);
         assert_eq!(n.stripped_count(), 0);
     }
 
-    /// **`tf_prefix` is applied and recorded.** A silent remap makes the
-    /// arena's names differ from every launch file on the robot.
+    /// `tf_prefix` is applied and recorded.
     #[test]
     fn a_prefix_is_applied_and_appears_in_the_table() {
         let mut n = NameNormalizer::with_prefix("robot1");
@@ -288,8 +214,7 @@ mod tests {
         );
     }
 
-    /// A trailing slash on the prefix must not double up, and an unset launch
-    /// argument (which expands to `""`) must not be treated as a remap.
+    /// A trailing slash on the prefix must not double up; an empty prefix is no remap.
     #[test]
     fn a_degenerate_prefix_is_treated_as_no_prefix() {
         let mut n = NameNormalizer::with_prefix("robot1/");

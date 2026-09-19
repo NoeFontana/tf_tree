@@ -1,18 +1,7 @@
-// `docs/PHASE4.md` §5.3 and §5.4 — publisher attribution, and the diagnostic
-// it exists to make possible.
-//
-// §5.4: "Being able to say 'your `/ekf` and `/odom_node` have both been
-// publishing `odom -> base_link` for eight months' is a better sales pitch than
-// any latency number." That sentence needs two node names, `TFMessage` carries
-// none, and the only thing that does is the middleware's per-publisher GID.
-// Everything in this file is about turning that GID into those names.
-//
-// The Rust half — the GID cache and the authority table — is unit-tested in
-// `crates/tf_tree_bridge` and `crates/tf_tree_c/tests/bridge.rs`. What cannot
-// be tested there, and is tested here, is that `rmw_message_info_t::publisher_gid`
-// and `TopicEndpointInfo::endpoint_gid()` are **the same 16 bytes** on a real
-// RMW. If they are not, every lookup misses, every publisher is
-// `<unknown publisher>`, and §5.4 collapses into "somebody and somebody else".
+// `docs/PHASE4.md` §5.3 and §5.4 — publisher attribution and the diagnostic it
+// enables. The Rust half is tested in `crates/tf_tree_bridge` and
+// `crates/tf_tree_c/tests/bridge.rs`; what only a real RMW can show is that
+// `publisher_gid` and `endpoint_gid()` are the same 16 bytes.
 
 #include <atomic>
 #include <chrono>
@@ -90,15 +79,9 @@ public:
   {
   }
 
-  /// Publish with a stamp from a clock **shared by every broadcaster in this
-  /// test**, so the only reason to drop is §5.4's authority.
-  ///
-  /// A per-broadcaster stamp is what a first version did, and it made the test
-  /// fail for the wrong reason: the second publisher started at the beginning
-  /// of its own timeline, which by then was tens of milliseconds behind the
-  /// arena's high-water mark, so its samples were refused as non-monotonic
-  /// (§5.5) before the authority table ever saw them. Two real robot nodes
-  /// share a clock; two `Broadcaster`s have to as well.
+  /// Publish with a stamp from a clock shared by every broadcaster, so the only
+  /// reason to drop is §5.4's authority (a per-broadcaster stamp is refused as
+  /// non-monotonic, §5.5, first).
   void publish_once() {pub_->publish(message_at(next_stamp()));}
 
   std::string qualified_name() const
@@ -125,31 +108,13 @@ tf_tree_ros::BridgeOptions options_on(const std::string & topic)
 }
 
 /// Two publishers on one edge: `FirstWriterWins` keeps the first, and the
-/// diagnostic names **both** nodes and the edge (§5.4, §6.3).
+/// diagnostic names **both** nodes and the edge (§5.4, §6.3). One test because a
+/// lookup that always missed would see one publisher and never detect a conflict.
 ///
-/// This is one test rather than two because the second half is what makes the
-/// first mean anything. A bridge whose GID lookup always missed would report
-/// every publisher as `<unknown publisher>` — and would then see *one*
-/// publisher, not two, so `dropped_authority` would stay at zero and the
-/// conflict would never be detected at all. Attribution is not decoration on
-/// §5.4; it is the input.
-///
-/// It is also what caught the timing rule in `BridgeHandle::maybe_attribute`:
-/// with a *periodic* refresh instead of one keyed on an unseen GID, the owner
-/// was attributed a second after it took ownership, so the record froze at
-/// `<unknown publisher> and /impostor_ekf have both been publishing …` — which
-/// is §5.4's headline diagnostic with the half that sells it missing.
-///
-/// **Mutant A:** in `BridgeHandle::attribute_from_graph`, `continue` immediately
-/// before the `tft_bridge_attribute` call, so no GID is ever cached. Both
-/// publishers become `<unknown publisher>`, which is one publisher as far as
-/// §5.4 is concerned; `dropped_authority` never moves and the wait times out.
-/// Applied; it dies.
-///
-/// **Mutant B:** in `BridgeHandle::report`, delete the `conflict_` assignment
-/// in the `TFT_BRIDGE_REASON_NOT_THE_OWNER` branch. `dropped_authority` still
-/// climbs, so the counter half passes, and `observed` stays false — the names
-/// §5.4 is entirely about are gone with no counter noticing. Applied; it dies.
+/// Mutant A: `continue` before `tft_bridge_attribute` in
+/// `BridgeHandle::attribute_from_graph`; `dropped_authority` never moves.
+/// Mutant B: delete the `conflict_` assignment in `BridgeHandle::report`'s
+/// `NOT_THE_OWNER` branch; `observed` stays false.
 TEST(Attribution, a_second_publisher_on_one_edge_is_dropped_and_both_nodes_are_named)
 {
   const std::string topic = "/tf_authority";
@@ -182,14 +147,8 @@ TEST(Attribution, a_second_publisher_on_one_edge_is_dropped_and_both_nodes_are_n
             << " dropped_non_monotonic=" << bridge.stats().dropped_non_monotonic
             << " dropped_undeclared=" << bridge.stats().dropped_undeclared;
 
-  // The record settles once the intruder's GID has been walked. `maybe_attribute`
-  // walks on an *unseen GID*, synchronously and before the sample is offered, so
-  // there is no interval to wait out — but an endpoint can lag its own first
-  // sample, so the walk is retried on later messages and the first conflict can
-  // legitimately name `<unknown publisher>`, which §5.3 calls a sanctioned
-  // degradation rather than a failure. **There is no periodic refresh.** The 1 Hz
-  // timer this comment used to describe was removed as *wrong* rather than late:
-  // see this file's docstring above and `BridgeHandle::maybe_attribute`.
+  // The record settles once the intruder's GID is walked; an early conflict may
+  // legitimately name `<unknown publisher>` (§5.3). There is no periodic refresh.
   const std::string want_owner = owner.qualified_name();
   const std::string want_intruder = intruder.qualified_name();
   ASSERT_TRUE(
