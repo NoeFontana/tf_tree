@@ -306,18 +306,29 @@ def check_publishable(authority: str) -> str:
 
 
 def check_changelog(authority: str) -> str:
-    archived = ROOT / "docs" / "changelog" / f"{authority}.md"
-    text = (ROOT / "CHANGELOG.md").read_text()
-    if archived.is_file():
-        text += "\n" + archived.read_text()
-    if not re.search(rf"^## \[{re.escape(authority)}\]", text, re.M):
+    changelog = (ROOT / "CHANGELOG.md").read_text()
+    stray = sorted(
+        set(re.findall(r"^## \[(\d[^\]]*)\]", changelog, re.M)) - {authority}
+    )
+    if stray:
         fail(
-            f"Neither CHANGELOG.md nor docs/changelog/{authority}.md has a "
-            f"`## [{authority}]` section.\n"
-            f"    The version moved and the changelog did not. Keep a Changelog 1.1.0 "
-            f"is the format the file declares."
+            f"CHANGELOG.md holds released section(s) {', '.join(stray)}; only "
+            f"[Unreleased] and the version being released belong there. Move "
+            f"each to docs/changelog/<version>.md."
         )
-    return f"CHANGELOG.md has a section for {authority}"
+    archived = ROOT / "docs" / "changelog" / f"{authority}.md"
+    if re.search(rf"^## \[{re.escape(authority)}\]", changelog, re.M):
+        return f"CHANGELOG.md has the section for {authority}"
+    if archived.is_file() and re.search(
+        rf"^## \[{re.escape(authority)}\]", archived.read_text(), re.M
+    ):
+        return f"docs/changelog/{authority}.md has the section for {authority}"
+    fail(
+        f"Neither CHANGELOG.md nor docs/changelog/{authority}.md has a "
+        f"`## [{authority}]` section.\n"
+        f"    The version moved and the changelog did not. Keep a Changelog 1.1.0 "
+        f"is the format the file declares."
+    )
 
 
 # 4. Every `just <recipe>` a maintained document or a workflow names exists.
