@@ -27,7 +27,8 @@ this file, they win.
   condensed to their decision and binding consequences, the specs and
   `CLAUDE.md` to their normative content, code comments to the item's contract;
   history lives in git. `0002`/`0003` are deleted (see `docs/PROJECT.md`,
-  `docs/PHASE1.md`). `docs/changelog/` holds released entries.
+  `docs/PHASE1.md`). `docs/changelog/` holds released entries. The C headers and
+  `.pyi` docstrings are regenerated or shortened to match; no signature changes.
 
 ### Breaking
 
