@@ -25,9 +25,9 @@ portable.
 - CLI (`tf_tree`, alias `tft`): a binary from the [latest release](https://github.com/NoeFontana/tf_tree/releases/latest), or `cargo install --path crates/tf_tree_cli --features shm`
 - C ABI, C++ header, ROS 2 bridge: `just c-abi-check`, `just cpp-check`, `just ros-build`
 
-## Use
+## Quickstart
 
-Python, from scratch. Stamps are integer nanoseconds; a pose is `[qw, qx, qy, qz, x, y, z]`.
+Python, from scratch (`just quickstart` runs this). Stamps are integer nanoseconds; a pose is `[qw, qx, qy, qz, x, y, z]`.
 
 ```python
 import tf_tree
@@ -37,7 +37,7 @@ tf_tree.push(tree, "base", "map", 1_000, [1, 0, 0, 0, 1.0, 2.0, 3.0])
 tf_tree.push(tree, "base", "map", 2_000, [1, 0, 0, 0, 3.0, 4.0, 5.0])
 
 plan = tree.plan("map", "base")   # compile the route once, reuse it
-print(plan.at(1_500)[:3, 3])      # [2. 3. 4.]
+print(plan.at(1_500)[:3, 3])      # -> [2. 3. 4.]
 ```
 
 Rust:
@@ -61,11 +61,14 @@ w.push(1_010_000_000, &at_x(1.0)).expect("monotonic");
 
 let plan = tree.plan(odom, lidar_top).expect("connected");
 let g = tree.guard();
-let pose = plan.at(&g, Stamp::from_nanos(1_005_000_000)).expect("in range");
+let t: Stamp = Stamp::from_nanos(1_005_000_000);
+let pose = plan.at(&g, t).expect("in range");
 assert!((pose.t.x - 0.5).abs() < 1e-12);
 ```
 
-From a recorded MCAP bag (`.db3`: run `ros2 bag convert` first):
+## From a recorded bag
+
+MCAP only (for `.db3`, run `ros2 bag convert` first):
 
 ```sh
 tft doctor --from-bag drive.mcap                 # what is wrong with this /tf traffic
@@ -133,7 +136,7 @@ worker or use `spawn`. A frozen `.tft` survives a fork.
 `tf_tree_bench`, `tf_tree_tf2_sys`, `tf_tree_cli`. `ros/` holds the ROS 2
 packages. `tf_tree_py`, `tf_tree_tf2_sys` and `ros/` sit outside the cargo
 workspace and have their own `just` recipes. Five crates publish: `tf_tree`,
-`tf_tree_core`, `tf_tree_math`, `tf_tree_arena`, `tf_tree_ipc`. MSRV 1.87.
+`tf_tree_core`, `tf_tree_math`, `tf_tree_arena`, `tf_tree_ipc`. MSRV **1.87**.
 
 Docs: [`docs/README.md`](./docs/README.md) ·
 [`CONTRIBUTING.md`](./CONTRIBUTING.md) · [`SUPPORT.md`](./SUPPORT.md) ·

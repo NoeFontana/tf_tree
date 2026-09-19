@@ -418,7 +418,7 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable.
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` with a real disclosure address.
 - **A stated support policy**: what is supported, what is best-effort, and the response expectation.
 - **MSRV policy** and a CI matrix pinning it.
-- Documentation site (mdBook): a first-five-minutes path that works — `pip install transform_tree`, three lines, a real result — before any architecture prose. **Both halves are open and they are one question** ([`0052`](./decisions/0052-the-first-five-minutes-nobody-runs.md), `draft`): the three lines exist and run (`README.md`'s *Start with no data at all*, executed by `scripts/quickstart_smoke.py`), and nothing installs the published distribution and imports it.
+- Documentation site (mdBook): a first-five-minutes path that works — `pip install transform_tree`, three lines, a real result — before any architecture prose. **Both halves are open and they are one question** ([`0052`](./decisions/0052-the-first-five-minutes-nobody-runs.md), `draft`): the three lines exist and run (`README.md`'s *Quickstart*, executed by `scripts/quickstart_smoke.py`), and nothing installs the published distribution and imports it.
 - CI: the full Phase 1–5 suites on `x86_64` and `aarch64`, ASan/UBSan/TSan, Miri, loom, the nightly `shm_torture`, the benchmark artifact as a regression gate.
 - Release automation: `cargo-dist` or equivalent, maturin wheels per Phase 3 §10, PEP 740 attestations, signed tags.
 

@@ -40,7 +40,7 @@ README = ROOT / "README.md"
 # The section a newcomer is pointed at. Matched by prefix so the rest of the
 # heading ("…, with no data at all") can be rewritten without breaking the gate
 # — the same latitude `just msrv` gives the sentence that states the MSRV.
-HEADING = "## Start with no data at all"
+HEADING = "## Quickstart"
 
 PY_FENCE_RE = re.compile(r"^```python\n(.*?)^```", re.S | re.M)
 EXPECTATION_RE = re.compile(r"#\s*->\s*(.+?)\s*$", re.M)
