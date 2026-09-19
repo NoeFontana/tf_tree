@@ -702,7 +702,8 @@ pub unsafe extern "C" fn tft_bridge_create(
         if config_toml.is_null() || out.is_null() {
             return null_arg("config_toml/out");
         }
-        // A caller who ignores the status must not read an uninitialised `*out`.
+        // SAFETY: `out` is non-null and the caller contracts it writable; a caller who ignores
+        // the status must not read an uninitialised `*out`.
         unsafe { core::ptr::write(out, core::ptr::null_mut()) };
 
         // Defaults, so `opts == NULL` is the documented "everything default".
@@ -903,10 +904,12 @@ pub unsafe extern "C" fn tft_bridge_free(b: *mut tft_bridge) {
     }
     // Affinity applies to `free`: dropping the writers releases claims and OFD leases, from the
     // owning thread only (§3.2).
+    // SAFETY: `check_bridge` confirmed this is a live `tft_bridge`.
     if check_thread_token(unsafe { (*b).owner }, "tft_bridge") != TFT_OK {
         return;
     }
     // Zero the magic first, so a repeated free sees a dead handle.
+    // SAFETY: `check_bridge` confirmed the magic word.
     unsafe { core::ptr::write(b.cast::<u64>(), 0) };
     // SAFETY: produced by `Box::into_raw` in `tft_bridge_create`.
     drop(unsafe { Box::from_raw(b) });

@@ -18,6 +18,7 @@ pub type tft_status = i32;
 pub const TFT_OK: tft_status = 0;
 
 // Status codes: stable and **append-only**.
+/// A required pointer argument was NULL.
 pub const TFT_ERR_NULL_ARG: tft_status = -1;
 /// A handle's magic word did not match: freed, corrupted, or not ours.
 pub const TFT_ERR_BAD_HANDLE: tft_status = -2;

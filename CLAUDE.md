@@ -30,7 +30,7 @@ every other); read `[workspace.package] version`. MSRV **1.87**.
 | [`PHASE5.md`](./docs/PHASE5.md) | Frozen `.tft`, bag ingestion, counters, `TFT001`–`TFT019`, `tf_tree top`. |
 | [`PHASE7.md`](./docs/PHASE7.md) | The `tf2` shim. **GATED (D21), not scheduled.** Its §4 is questions, not answers. |
 | [`API.md`](./docs/API.md) | Cross-cutting API contract: six rules (§1), per-binding surface (§2–§5), delta table (§6), new-surface checklist (§7). |
-| [`decisions/`](./docs/decisions/) | A record's own `**Status:**` line says whether it is authoritative: `grep -m1 -H '^\*\*Status:' docs/decisions/0*.md` (keep `-H`). [`README.md`](./docs/decisions/README.md) indexes what each decided. [`0028`](./docs/decisions/0028-the-slot-a-killed-participant-keeps.md) is implemented and frozen — supersede it, never edit it; its fork half is [`0030`](./docs/decisions/0030-the-atfork-handler-and-inherited-descriptors.md). [`0016`](./docs/decisions/0016-portable-simd-and-the-dependency-budget.md) is withdrawn. |
+| [`decisions/`](./docs/decisions/) | A record's own `**Status:**` line says whether it is authoritative: `grep -m1 -H '^\*\*Status:' docs/decisions/0*.md` (keep `-H`). [`README.md`](./docs/decisions/README.md) indexes what each decided. [`0028`](./docs/decisions/0028-the-slot-a-killed-participant-keeps.md) is implemented; its fork half is [`0030`](./docs/decisions/0030-the-atfork-handler-and-inherited-descriptors.md). [`0016`](./docs/decisions/0016-portable-simd-and-the-dependency-budget.md) is withdrawn. |
 
 Cautions:
 

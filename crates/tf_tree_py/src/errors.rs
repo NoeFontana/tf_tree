@@ -360,7 +360,7 @@ fn unresolvable_name(py: Python<'_>, name: &str, e: FrameError) -> PyErr {
 /// is the search key of `docs/RUNBOOK.md` (`docs/decisions/0059`).
 pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError) -> PyErr {
     TfTreeError::new_err(match e {
-                // Named from the list; both parents are shown so the colliding pair can be found.
+        // Named from the list; both parents are shown so the colliding pair can be found.
         BuildError::DuplicateEdge { child } => match duplicate_child(edges) {
             // Both parents, not just the child: the caller has to find *which
             // two pairs* collide, and in a list of forty edges the child's name
@@ -381,7 +381,7 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
             "this edge list is too large for the u32 id space: {} pairs",
             edges.len()
         ),
-                // `WouldCreateCycle` is the only provocable variant; the caller's own list answers which.
+        // `WouldCreateCycle` is the only provocable variant; the caller's own list answers which.
         BuildError::Topology(_) => match cycle_through(edges) {
             Some(chain) => format!(
                 "this edge list is not a tree: {chain}. Every frame has exactly \
@@ -393,7 +393,7 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
                      edge is wired"
                 .to_owned(),
         },
-                // Reachable only as a genuine collision: every name is interned into a table sized from the list.
+        // Reachable only as a genuine collision: every name is interned into a table sized from the list.
         BuildError::Frame(FrameError::FrameHashCollision { hash }) => format!(
             "two of the frame names in this edge list collide on the same \
              64-bit hash ({hash:#x}), so they cannot both be interned. Rename \
@@ -406,7 +406,7 @@ pub(crate) fn build_err(edges: &[(String, String)], capacity: u32, e: BuildError
              collision is the only cause a caller can produce; anything else is \
              a bug in tf_tree"
             .to_owned(),
-                // Size only; the other `LayoutError` members are unreachable.
+        // Size only; the other `LayoutError` members are unreachable.
         BuildError::Layout(_) => format!(
             "{} edges at capacity={capacity} do not form a valid arena layout. \
              Every region offset in an arena header is a u32, so the whole \
@@ -446,7 +446,7 @@ pub(crate) fn open_err(
 ) -> PyErr {
     match e {
         OpenError::Build(inner) => build_err(edges, capacity, inner),
-                // Stage in this binding's words, then `ShmError`'s `Display`.
+        // Stage in this binding's words, then `ShmError`'s `Display`.
         OpenError::Map(inner) => TfTreeError::new_err(format!(
             "the arena's shared-memory segment was handed over but could not be \
              mapped: {inner}"
@@ -467,11 +467,11 @@ pub(crate) fn open_err(
                 e.setattr("ownership_held", ownership_held)
             })
         }
-                // A unit variant: a leaf with no attributes (`0058` §4).
+        // A unit variant: a leaf with no attributes (`0058` §4).
         OpenError::Rendezvous(inner @ IpcError::ArenaAbsent) => {
             ArenaAbsentError::new_err(format!("{inner}"))
         }
-                // Already prose; `IpcError`'s `Display` owns it.
+        // Already prose; `IpcError`'s `Display` owns it.
         other => TfTreeError::new_err(format!("{other}")),
     }
 }
@@ -624,8 +624,8 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
                 e.setattr("current_generation", current)
             })
         }
-                // Last resort: the hash does not invert; `PyTree::lookup` attributes
-                // the name itself. `.name` is `None` only here.
+        // Last resort: the hash does not invert; `PyTree::lookup` attributes
+        // the name itself. `.name` is `None` only here.
         LookupError::UnknownFrame { hash } => {
             let err = FrameNotDeclaredError::new_err(format!(
                 "no frame with hash {hash:#x} in this arena; if the name is spelled right, its publisher has not declared it yet — wait for one, or declare it on the builder that creates the arena"
@@ -691,8 +691,8 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
                 )
             })
         }
-                // Recycled (history gone; a retry reads a newer window) and Contended
-                // (writer mid-update; a retry reads the same stamps) get different advice.
+        // Recycled (history gone; a retry reads a newer window) and Contended
+        // (writer mid-update; a retry reads the same stamps) get different advice.
         LookupError::SlotRecycled { edge } => TfTreeError::new_err(format!(
             "the ring on {} lapped this reader mid-read: the samples being \
              interpolated were overwritten before the read finished. Retry, or \
@@ -704,8 +704,8 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
              consistent sample could be read. Retry",
             edge_label_in(tree, &view, edge)
         )),
-                // Time-domain refusals (D9). The message quotes the integer tag and names
-                // the `domain=` keyword as the remedy (`0038` §3).
+        // Time-domain refusals (D9). The message quotes the integer tag and names
+        // the `domain=` keyword as the remedy (`0038` §3).
         LookupError::TimeDomainMismatch { expected, got } => {
             let err = TimeDomainMismatchError::new_err(format!(
                 "this plan was compiled for time domain {expected}; the query \
@@ -725,7 +725,7 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
              refused rather than sampled with the wrong clock",
             edge_label_in(tree, &view, edge)
         )),
-                // Not via [`edge_label_in`]: its fallback would say the same fact three times.
+        // Not via [`edge_label_in`]: its fallback would say the same fact three times.
         LookupError::UnknownEdge { edge } => {
             TfTreeError::new_err(match named_edge_in(&view, edge) {
                 // A named edge here is a dynamic step over a static or tombstoned record.
@@ -743,18 +743,18 @@ pub(crate) fn lookup_err(py: Python<'_>, tree: &Tree, domain: u8, e: LookupError
                 ),
             })
         }
-                // Not via `frame_label`: resolving an out-of-range id can only yield the fallback.
+        // Not via `frame_label`: resolving an out-of-range id can only yield the fallback.
         LookupError::FrameOutOfRange { frame } => TfTreeError::new_err(format!(
             "frame id {} is out of range for this arena's frame table",
             frame.get()
         )),
-                // [`frame_phrase_in`], not `format!("frame {}", ..)`, which doubles the noun.
+        // [`frame_phrase_in`], not `format!("frame {}", ..)`, which doubles the noun.
         LookupError::MissingEdge { child } => TfTreeError::new_err(format!(
             "{} has a parent in the topology but no edge records the link, so \
              the path through it cannot be evaluated",
             frame_phrase_in(tree, &view, child)
         )),
-                // Unreachable from Python: the binding picks the f32/f64 entry point itself.
+        // Unreachable from Python: the binding picks the f32/f64 entry point itself.
         LookupError::WrongElementType => TfTreeError::new_err(
             "an f32 layout reached the f64 entry point, or the reverse; the \
              binding chooses that pairing itself, so this is a bug in \
@@ -930,8 +930,8 @@ pub(crate) fn claim_err(
     let edge = edge_label_of(parent, child);
     match e {
         ClaimApiError::ChildDetached => detached_err(),
-                // The three races of `docs/decisions/0005` §5 are transient; kept apart
-                // because `LeaseUnavailable` is a lock-file problem retrying cannot fix.
+        // The three races of `docs/decisions/0005` §5 are transient; kept apart
+        // because `LeaseUnavailable` is a lock-file problem retrying cannot fix.
         ClaimApiError::LeaseContended { .. } => TfTreeError::new_err(format!(
             "{edge}: the claim record was free but its lease is still held; \
              retry"
@@ -944,11 +944,11 @@ pub(crate) fn claim_err(
             "{edge}: a reaper cleared this claim while it was being taken; \
              retry"
         )),
-                // Pre-empted by `Tree.publisher`'s name resolution; reachable only if the frame table changed between calls.
+        // Pre-empted by `Tree.publisher`'s name resolution; reachable only if the frame table changed between calls.
         ClaimApiError::UnknownFrame { .. } => {
             TfTreeError::new_err(format!("{child:?} is not a frame of this tree"))
         }
-                // A reversed pair lands here whenever the child is a root, so it says which argument is which.
+        // A reversed pair lands here whenever the child is a root, so it says which argument is which.
         ClaimApiError::NoEdge { .. } => TfTreeError::new_err(format!(
             "no edge attaches {child:?} to a parent, so there is nothing to \
              publish on. The call is publisher(child, parent) and {parent:?} \
@@ -960,7 +960,7 @@ pub(crate) fn claim_err(
             "the edge attaching {child:?} is static or tombstoned — it carries \
              no sample ring, so there is nothing to publish to"
         )),
-                // Reports what the arena says instead of what was asked; `actual` is resolved to a name.
+        // Reports what the arena says instead of what was asked; `actual` is resolved to a name.
         ClaimApiError::ParentMismatch { actual, .. } => TfTreeError::new_err(format!(
             "{child:?} is not attached to {parent:?} but to {}; an edge names \
              the frame it moves, and reversing the pair is the usual cause \
@@ -971,8 +971,8 @@ pub(crate) fn claim_err(
                 None => "the root (no parent)".to_owned(),
             }
         )),
-                // `.edge` from the variant's `EdgeId`, `.owner_slot` from its cause
-                // (`0058` §4); a later `ClaimError` cause falls to the bug-report arm.
+        // `.edge` from the variant's `EdgeId`, `.owner_slot` from its cause
+        // (`0058` §4); a later `ClaimError` cause falls to the bug-report arm.
         ClaimApiError::AlreadyClaimed {
             edge: id,
             cause: tf_tree::ClaimError::EdgeAlreadyClaimed { owner_slot },

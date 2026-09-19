@@ -39,7 +39,7 @@ grep -m1 -H '^\*\*Status:' docs/decisions/0*.md
 | [`0025`](./0025-what-build-the-tf2-ratio-gate-speaks-for.md) | what build the tf2 ratio gate speaks for: `ratio.rs`'s floor holds for this workspace's build, not a default consumer's. |
 | [`0026`](./0026-the-corpus-shape-of-a-frozen-index.md) | a frozen `.tft` is one file per episode; corpus identity lives in an external index. |
 | [`0027`](./0027-the-48-byte-frame-name-store.md) | `FrameRecord::name` is 48 bytes and over-length names are refused, not truncated. |
-| [`0028`](./0028-the-slot-a-killed-participant-keeps.md) | the slot a killed participant keeps: reclaim by kernel-lock liveness, participant reaping. Implemented and frozen. |
+| [`0028`](./0028-the-slot-a-killed-participant-keeps.md) | the slot a killed participant keeps: reclaim by kernel-lock liveness, participant reaping. Implemented. |
 | [`0029`](./0029-the-topology-lock-is-a-kernel-lock.md) | the topology lock is a kernel lock; `Tree::reparent` decides holder liveness by `F_OFD_GETLK`, one predicate per tree. |
 | [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md) | the atfork handler closes inherited descriptors so a forked child cannot hold the owner's lock byte or socket (`0028` step 7). |
 | [`0031`](./0031-the-participant-record-with-no-byte.md) | `build_shared` participants with no lock byte: the boundary goes where the call is. |

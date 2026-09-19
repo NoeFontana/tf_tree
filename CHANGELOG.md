@@ -21,6 +21,14 @@ this file, they win.
 
 ## [Unreleased]
 
+### Changed
+
+- **Documentation and comments cut by roughly two thirds.** Decision records are
+  condensed to their decision and binding consequences, the specs and
+  `CLAUDE.md` to their normative content, code comments to the item's contract;
+  history lives in git. `0002`/`0003` are deleted (see `docs/PROJECT.md`,
+  `docs/PHASE1.md`). `docs/changelog/` holds released entries.
+
 ### Breaking
 
 - **`PushError::NonMonotonicStamp` gains `edge: EdgeId`; `ClaimApiError::AlreadyClaimed`
