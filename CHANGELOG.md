@@ -89,23 +89,29 @@ That rustdoc is twenty-four lines, so it moved every line-number citation into
 `impl Drop for Tree`, which is some two thousand lines away, at a benchmark
 note.
 
-**The rest are in frozen `implemented` records and are now wrong by
-twenty-four lines each** — `0019`, `0028`, `0034`, `0055` and `0057`. That is
-not a side effect to swallow quietly: it is the ratchet's grandfathered set
-decaying on schedule, which is the argument the ratchet was built on. They stay
-where they are, per that budget's own note, because a frozen record is
-corrected in `decisions/README.md`'s errata and a line-number erratum per site
-would bury that file's real ones.
+**The rest are wrong by twenty-four lines each.** That is not a side effect to
+swallow quietly: it is the ratchet's grandfathered set decaying on schedule,
+which is the argument the ratchet was built on. `0019`'s and `0057`'s are
+repaired here, because those records are `ready` and so may be edited. `0028`'s,
+`0034`'s and `0055`'s stay where they are — those are `implemented` and frozen,
+and a line-number erratum per site would bury `decisions/README.md`'s real
+ones, so that file carries one erratum covering all of them.
+
+*A first version of this paragraph called all five frozen. Two are not, and a
+status quoted from memory rather than read is the failure `CLAUDE.md`'s
+decisions row exists to prevent — it cost those two records a repair they were
+eligible for.*
 
 ### Fixed — the line-citation ratchet scanned the wrong half of two documents
 
 Found while writing the paragraph above, which first explained `docs/PHASE5.md`
 reporting **zero** citations as "its citations are inside fenced blocks". They
-are not. The fence-stripper added last week was
-``re.sub(r"```.*?```", "", text, flags=re.S)``, and it counts a triple backtick
-written inside an *inline* code span — which `docs/PHASE5.md` and this file each
-do once. That makes the marker count odd, and an odd count does not merely lose
-a block: it **inverts the pairing** for the rest of the file, so prose is blanked
+are not. The fence-stripper is one day old — `ad22cef`, the commit directly
+beneath this one on the branch — and it read
+``re.sub(r"```.*?```", "", text, flags=re.S)``, which counts a triple backtick
+written inside an *inline* code span, as `docs/PHASE5.md` and this file each do
+once. That makes the marker count odd, and an odd count does not merely lose a
+block: it **inverts the pairing** for the rest of the file, so prose is blanked
 and the code blocks are scanned in its place.
 
 `docs/PHASE5.md` therefore had no row in `scripts/line-citation-budget.txt` at
@@ -115,6 +121,15 @@ stripped — and the file gets the row it always should have had. **That row is 
 addition to a file whose rule is that numbers only fall**, so the reason is
 written in its header: the citations were always there, and the scanner could
 not see them.
+
+Two more silent passes in the same check are closed with it, both found by
+asking what else the gate would swallow rather than by hitting them. **An
+unclosed fence** now fails instead of blanking a file's tail. **A budget row
+above its file** now fails too: each row is an equality, not a ceiling, because
+a row added at 50 for a file carrying 2 used to print "within budget" plus a
+"48 shed" *note* and exit 0 — which is the whole rule "a budget may only fall"
+being enforced by prose. Both are proved by mutation: raising `PHASE5.md`'s row
+to 50 fails, and appending an unclosed fence to `RUNBOOK.md` fails.
 
 ### Fixed — attach refusals did not fit the C ABI's message buffer (`0055` step 7)
 

@@ -2418,11 +2418,26 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 ///   nothing is torn; what is lost is the reclamation.
 /// * **A client the owner's `epoll::add` failed for** (hole 4). It is
 ///   deliberately left unwatched, so its death produces no hangup.
-/// * **A `ReadWrite` `Tree::attach_shared` participant** (hole 5). No socket
-///   and no grant, so no hangup, ever.
 /// * **A takeover heir's inherited peers** (hole 3 again). A new owner's
-///   `epoll` set holds no pre-takeover client sockets. §3.5 takeover is not
-///   wired, so this is reachable only once it is.
+///   `epoll` set holds no pre-takeover client sockets, and
+///   `Tree::inherit_ownership` binds a *fresh* `OwnerServer` while the
+///   survivors keep the ones they hold to the process that died. **§3.5 shipped
+///   2026-08-28** (`docs/PHASE2.md` §0.0), so this is live; this bullet read
+///   "reachable only once it is wired" until 2026-09-19.
+/// * **A byte-less `TreeBuilder::build_shared` creator in a served arena.** It
+///   registers a `LIVE` record and takes no byte at all, so there is nothing
+///   for the kernel to release and nothing for a hangup to be about. It is
+///   **out of contract**
+///   (`docs/decisions/0031-the-participant-record-with-no-byte.md`) and it is
+///   the one shape in this list the check does not merely miss but **accuses**
+///   — see the paragraphs below, and
+///   `a_byteless_record_in_a_served_arena_is_accused_of_leaking`.
+///
+/// **A `ReadWrite` `Tree::attach_shared` participant was hole 5 and is gone.**
+/// `0028` step 0b made both fd-attach arms return
+/// `ShmError::ReadWriteNeedsRendezvous`, so the shape cannot be constructed;
+/// this list named it until 2026-09-19, four paragraphs above a sentence in
+/// this same doc comment that says it was removed.
 ///
 /// The remaining hole, the fork-inherited connection (hole 1), leaves the byte
 /// **held** by the child, so it is not in the list above — it is a finding of
@@ -2431,13 +2446,21 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 /// default writes none, and a `fork`ed Python worker holding its dead parent's
 /// byte is exactly a `FREE` row over a held byte.
 ///
-/// **`doctor --attach` can be pointed at only two of those five today**, which
-/// is worth knowing before reading a quiet report as an all-clear: attaching
-/// goes through the rendezvous, so the two shapes that leave the owner dead
-/// refuse a fresh join with `ArenaHeldButUnreachable` — the record is `LIVE`,
-/// the leak is real, and no new process can be told. `epoll::add` and
-/// `attach_shared` leave the owner running and are reachable now; takeover
-/// becomes a third once §3.5 is wired.
+/// **`doctor --attach` cannot be pointed at all of those**, which is worth
+/// knowing before reading a quiet report as an all-clear, and the split is by
+/// whether an owner is still serving rather than by a count. Attaching goes
+/// through the rendezvous, so the shapes that leave the **owner dead** — its
+/// own slot, and an owner killed between the hangup's probe and its CAS —
+/// refuse a fresh join with `ArenaHeldButUnreachable`: the record is `LIVE`,
+/// the leak is real, and no new process can be told. The rest leave somebody
+/// serving and are reachable now — the `epoll::add` hole, a heir's inherited
+/// peers, and the out-of-contract `build_shared` arena, whose hand-bound server
+/// is what put it in front of this check in the first place.
+///
+/// *This sentence said "only two of those five" and named `attach_shared` as
+/// one of the two. It was wrong in both directions by 2026-09-19 — that shape
+/// no longer exists and takeover had shipped three weeks earlier — which is why
+/// it now names the shapes and counts none of them.*
 /// `crates/tf_tree/tests/rendezvous.rs`'s
 /// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` stages the
 /// reclaimed peer and the unreclaimable owner on one arena and asserts that
@@ -5241,11 +5264,11 @@ mod tests {
         );
         assert!(
             m.contains("the lock byte is free"),
-            "the evidence must be the byte this run actually probed, which is              how an `--attach` finding is told apart from a `--from-bag` one: {m}"
+            "the evidence must name the byte this run probed, which is what tells an `--attach` finding from a `--from-bag` one: {m}"
         );
         assert!(
             !m.contains("no lock file was read on this run"),
-            "this run read one — that clause is the `LockByte::Unknown` row,              and reaching it would mean the retracted sentence was right: {m}"
+            "this run read one, so that clause belongs to the `LockByte::Unknown` row — reaching it would mean the retracted sentence was right: {m}"
         );
     }
 

@@ -1266,7 +1266,7 @@ RELEASE_VISIBLE = (
 NO_CHANGELOG = "[no changelog]"
 
 
-def strip_fenced_blocks(text: str) -> str:
+def strip_fenced_blocks(text: str, rel: str) -> str:
     """Blank fenced code blocks, recognising a fence only at the start of a line.
 
     **The first spelling was a regex, and it was a silent false pass.** It read
@@ -1285,6 +1285,12 @@ def strip_fenced_blocks(text: str) -> str:
 
     A fence inside a blockquote counts, because the documents use them; a
     triple backtick anywhere but the start of a line does not.
+
+    **An unclosed fence is reported, not absorbed.** Left to itself this
+    function would blank the whole tail of such a file and the caller would see
+    a lower count, which lands in the "shed" note rather than in a failure —
+    the same silent-false-pass shape the regex had, narrowed rather than closed.
+    So `rel` is taken only to name the file in that message.
     """
     out: list[str] = []
     fenced = False
@@ -1297,6 +1303,12 @@ def strip_fenced_blocks(text: str) -> str:
             out.append("")
             continue
         out.append("" if fenced else line)
+    if fenced:
+        fail(
+            f"{rel} ends inside a fenced block — an unclosed ``` blanks the rest "
+            f"of the file, so every `path.rs:LINE` citation after it goes "
+            f"uncounted and the budget silently passes"
+        )
     return "\n".join(out)
 
 
@@ -1312,9 +1324,15 @@ def check_line_citations() -> str:
     belong in `decisions/README.md`'s errata, and twenty-three line-number
     errata would bury that file's real ones.
 
-    So this is a **ratchet, not a ban**: the 157 that exist are grandfathered per
-    file in `scripts/line-citation-budget.txt` and the count may only fall. Cite
-    a symbol instead; a symbol survives every edit that does not rename it.
+    So this is a **ratchet, not a ban**: the ones that exist are grandfathered
+    per file in `scripts/line-citation-budget.txt` and the count may only fall.
+    Cite a symbol instead; a symbol survives every edit that does not rename it.
+
+    **Each row is an equality, not a ceiling** — over budget fails, and so does
+    under. A row left above its file is headroom for a citation nobody had to
+    justify, and it is also the only way to raise a budget without saying so: a
+    row added at 50 for a file carrying 2 used to print "within budget" and a
+    "48 shed" note, and exit 0.
 
     **Per file rather than in total**, because a total is not a ratchet: one
     document could shed five citations while another gained five and the sum
@@ -1343,7 +1361,7 @@ def check_line_citations() -> str:
     total = 0
     for rel in files:
         text = Path(rel).read_text(errors="replace")
-        prose = strip_fenced_blocks(text)
+        prose = strip_fenced_blocks(text, rel)
         hits = len(pattern.findall(prose))
         if hits:
             found[rel] = hits
@@ -1375,16 +1393,26 @@ def check_line_citations() -> str:
             f"matching and this gate is asserting nothing"
         )
 
-    note = ""
+    # **A drop is a failure, not a note, and that is what makes "a row may only
+    # fall" a rule rather than a preference.** It was a note until 2026-09-19,
+    # and the hole is arithmetic: a commit adding `50\tdocs/PHASE5.md` for a
+    # file carrying two prints "within budget" plus "48 shed" and exits 0, so
+    # the budget can be raised to any number as long as the same commit does not
+    # also add citations. Failing here means a row that no longer matches its
+    # file has to be brought down in the commit that shed it, which is the only
+    # moment anybody knows why.
     if dropped:
         shed = sum(was - now for _, was, now in dropped)
-        note = (
-            f"; {shed} shed in {len(dropped)} file(s) — lower them in "
-            f"{budget_path} in the same commit"
+        listed = ", ".join(f"{rel} {was}->{now}" for rel, was, now in dropped)
+        fail(
+            f"{shed} `path.rs:LINE` citation(s) shed in {len(dropped)} file(s) "
+            f"whose budget still records the old count — lower them in "
+            f"{budget_path} in the same commit: {listed}. A row that sits above "
+            f"its file is headroom for a citation nobody had to justify."
         )
     return (
         f"{total} `path.rs:LINE` citations in {len(found)} documents, "
-        f"all within their per-file budget{note}"
+        f"each matching its row in {budget_path}"
     )
 
 

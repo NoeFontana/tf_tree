@@ -22,10 +22,14 @@ record is the artifact.
 copied into each.** On 2026-09-19 a twenty-four-line rustdoc was added to
 `TreeBuilder::build_shared`, near the top of `crates/tf_tree/src/tree.rs`
 ([`0031`](./0031-the-participant-record-with-no-byte.md) step 1). **Every
-`crates/tf_tree/src/tree.rs:NNN` citation in a frozen record with `NNN` past
-that point is now twenty-four lines early** — they are in `0019`, `0028`,
-`0034`, `0055` and `0057`. They are not repaired, because a frozen record is not
-edited and a line-number erratum per site would bury this file's real ones.
+`crates/tf_tree/src/tree.rs:NNN` citation with `NNN` past that point is now
+twenty-four lines early.** Those in `0028`, `0034` and `0055` are not repaired,
+because those records are `implemented` and a line-number erratum per site would
+bury this file's real ones. **`0019` and `0057` were in that list for one
+round and should not have been** — both are `ready`, so both are editable, and
+both have had their citation replaced by the symbol it named. A status is what
+decides whether a record may be edited, and restating one from memory is the
+mistake the paragraph below this is about.
 `scripts/line-citation-budget.txt` is the register of what remains and the gate
 that stops more being written; the rule those sites predate is `CLAUDE.md`'s
 *cite a symbol, never a line number*.

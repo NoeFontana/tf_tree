@@ -14,8 +14,11 @@
 # Fenced blocks are excluded (a `path:line` there is compiler output); code
 # spans are not, because that is where these citations are written.
 #
-# `just lint` refuses any increase. A decrease is reported; lower the number
-# here in the same commit.
+# `just lint` refuses any increase **and any decrease left unrecorded**: each
+# row is an equality with its file, so shedding a citation means lowering the
+# number here in the same commit. A row sitting above its file is headroom for a
+# citation nobody had to justify — and, until 2026-09-19, the way to raise a
+# budget without anyone noticing, because a drop was only a printed note.
 #
 # **One row was ADDED after the fact, on 2026-09-19, and that is not a licence
 # to add more.** `docs/PHASE5.md` had no row because the scanner reported zero
@@ -38,7 +41,7 @@
 4	docs/decisions/0013-the-benchmark-gate-never-interpolated.md
 3	docs/decisions/0015-the-bridge-fills-a-shared-arena.md
 5	docs/decisions/0016-portable-simd-and-the-dependency-budget.md
-7	docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md
+6	docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md
 4	docs/decisions/0020-the-consumer-side-of-the-arena-refusal.md
 1	docs/decisions/0022-the-per-call-guard-and-the-unwatched-gate.md
 1	docs/decisions/0026-the-corpus-shape-of-a-frozen-index.md
@@ -50,7 +53,7 @@
 24	docs/decisions/0034-the-depth-bound-priced-two-slots-the-same.md
 1	docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md
 12	docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md
-7	docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md
+6	docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md
 5	docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
 1	docs/decisions/README.md
 1	testdata/frozen/README.md

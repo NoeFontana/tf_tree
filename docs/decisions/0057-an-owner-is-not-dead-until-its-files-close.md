@@ -19,7 +19,7 @@ documents say that happens at once. [`PHASE2.md`](../PHASE2.md) §3.7 step 9 sai
 the attach socket is how a participant learns the owner has died *"in
 microseconds, with no polling"*. `Tree::owner_lost`'s rustdoc says the owner's
 death closes the socket *"and the kernel reports `POLLHUP` in microseconds,
-exactly and with no timeout to tune"* (`crates/tf_tree/src/tree.rs:3081`).
+exactly and with no timeout to tune"* (`Tree::owner_lost`, `crates/tf_tree/src/tree.rs`).
 [`PROJECT.md`](../PROJECT.md) D17 says the same of the owner's view of a
 participant (*"the owner sees `EPOLLHUP` in microseconds — exact, immediate"*),
 and `crates/tf_tree_ipc/src/server.rs:15` and `client.rs:52` quote it.
@@ -62,7 +62,7 @@ dead holder's lock:
 | Site | What it says | What it should say |
 |---|---|---|
 | [`PHASE2.md`](../PHASE2.md) §3.7 step 9 | a participant learns the owner died *"in microseconds"* | when the last open file description on the owner's socket and byte 0 closes. **Corrected in the same change as this record**, citing it as a draft; step 2 restates the event in `0043`'s terms, as Decision 5's sentence does |
-| `Tree::owner_lost` rustdoc, `tree.rs:3081` | *"`POLLHUP` in microseconds, exactly"* | same; release-visible, so it goes in `CHANGELOG.md` (step 3) |
+| `Tree::owner_lost` rustdoc, `crates/tf_tree/src/tree.rs` | *"`POLLHUP` in microseconds, exactly"* | same; release-visible, so it goes in `CHANGELOG.md` (step 3) |
 | `tf_tree_ipc`'s `client.rs:8-11` module doc | process death *"closes the fd and the peer sees it immediately"* | same; release-visible (step 3) |
 | [`PROJECT.md`](../PROJECT.md) D17, quoted at `server.rs:15` and `client.rs:52` | the owner sees a participant's `EPOLLHUP` *"in microseconds — exact, immediate"* | same mechanism, from the other end (below) |
 | [`PHASE2.md`](../PHASE2.md) §3.3, *Verified behaviour* table, quoted at `runtime_dir.rs:172` and `error.rs:186` | *"Holder dies without unlocking → lock released by the kernel, immediately"* | immediately **at the end of the holder's exit**. The `runtime_dir.rs` and `error.rs` quotes contrast this with NFS lease expiry, and that contrast still holds |
