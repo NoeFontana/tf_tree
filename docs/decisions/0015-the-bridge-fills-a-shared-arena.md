@@ -7,13 +7,7 @@
 - **Step 0** — `Open::require_create` + `OpenError::ArenaAlreadyLive` — landed in
   **#139**, not in this record's own first PR: it is `0019`'s step 1 commit that
   carries it, because that commit was already rewriting `Open`'s defaults and the
-  two changes touch the same twenty lines. (An earlier revision of this header
-  put step 0 on `feat/0015-bridge-shared-arena`. `git log -S require_create`
-  returns **two** commits — `a39b40b` on `feat/0019-await-and-ro-create`, which
-  *defines* it, and `5fc3e90` on `feat/0015-bridge-shared-arena`, which *calls*
-  it from `open_shared`. The definition is the one that dates the step, and
-  restricting the search to `crates/tf_tree/src/open.rs` returns only the
-  first.)
+  two changes touch the same twenty lines.
 - **Steps 1–2** — **#141**, `feat/0015-bridge-shared-arena`: the `struct_size`
   prefix rule *ported* to `tft_bridge_options` with `arena_name` appended, and
   `open_shared` refusing rather than downgrading, in both the `shm` and the
@@ -120,9 +114,7 @@ changes.**
 `tft_bridge_options` gains one field, at the end.
 
 > **Correction — the prefix rule §3.6 describes is implemented for exactly one
-> struct, and `tft_bridge_options` is not it.** This paragraph used to say the
-> field was "guarded by the existing `struct_size` prefix rule … so a caller
-> built against the previous header keeps working unchanged". `tft_bridge_create`
+> struct, and `tft_bridge_options` is not it.** `tft_bridge_create`
 > validates with **exact equality** (`crates/tf_tree_c/src/bridge.rs:890-893`)
 > and then reads the whole struct (`:896`). The rule exists for
 > `tft_bridge_sample` alone — frozen shadow struct at `:293-301`, compile-time
@@ -161,9 +153,8 @@ typedef struct {
 `tft_bridge_create` routes the same builder through `tf_tree::Open` instead of
 calling `build()`.
 
-> **Correction — `build_shared(name)` alone cannot do this.** This paragraph used
-> to say `tft_bridge_create` "selects `build_shared(name)` over `build()` on that
-> field alone". `TreeBuilder::build_shared` **publishes no rendezvous**:
+> **Correction — `build_shared(name)` alone cannot do this.**
+> `TreeBuilder::build_shared` **publishes no rendezvous**:
 > `crates/tf_tree/src/tree.rs:373-376` is explicit that the name is a debug label
 > that appears in `/proc/<pid>/fd`, and that *"segments are not discoverable by
 > name — the fd is the capability"*. A second process could not find it. The path

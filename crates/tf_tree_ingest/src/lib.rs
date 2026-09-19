@@ -56,9 +56,7 @@
 //! 160 000-transform recording takes 0.027 s uncompressed, 0.035 s for lz4 and
 //! 0.048 s for zstd — so roughly **1.8× the per-pass wall time** of an uncompressed
 //! recording. Multiplied by the pass count, which is `1 + groups + spilled edges`.
-//! An earlier revision of this section said the constraint had no visible cost; it
-//! has a modest and measurable one, and that is still the right trade against a C
-//! build step. **Those three figures are a `survey` measurement taken by hand and
+//! **Those three figures are a `survey` measurement taken by hand and
 //! re-derived by nothing**; `docs/PHASE5.md` §12 criterion 5's gate (`just gate5`,
 //! `docs/decisions/0050-what-ten-times-real-time-divides.md`) times a whole `run`
 //! on one codec arm and does not reproduce them.
@@ -95,14 +93,7 @@
 //!   tree and its edges (`ingest::fill` is its only `TreeBuilder` call site) and
 //!   none of them names a domain, so every ingested edge takes `TreeBuilder`'s
 //!   default — `SystemDomain`, tag 0 — whatever clock the recording was made
-//!   against. **The command written here used to be `rg -ni domain
-//!   crates/tf_tree_ingest/src/` "returns nothing", which this very paragraph
-//!   falsified the moment it was written**: the doc block is under `src/`, so the
-//!   instrument was inside its own measurement and the published procedure
-//!   returned the opposite of what it claimed. The conclusion was and is correct
-//!   — it was re-derived from the call sites, not from the grep — and what
-//!   replaces the grep is a *positive* listing, output a reader can compare
-//!   against the file rather than an absence any later sentence can break.
+//!   against.
 //!   **This is a specification gap and is
 //!   deliberately not closed by code**: a `TFMessage` carries no domain, and every
 //!   other domain in this project is *declared* (`tf_tree_bridge::config`'s
@@ -407,8 +398,7 @@ pub enum IngestError {
     /// A sample was rejected by the engine.
     ///
     /// `{0}`: `PushError` has had its own `Display` since `docs/decisions/0040`,
-    /// and it names the edge. This attribute used to be `{0:?}` under a comment
-    /// saying the core had no `Display` impls, which stopped being true then.
+    /// and it names the edge.
     #[error("push rejected: {0}")]
     Push(tf_tree::PushError),
     /// A surveyed frame was not present in the built tree. Structurally

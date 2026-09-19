@@ -57,8 +57,7 @@ are all unreachable through this entry point, because `tf_tree::open()` is
 §2a states the rule; the default itself is recorded in that record's header and
 on `Open::new`'s doc comment). Each of the four is produced only inside a
 create-or-take-over arm that `Never` does not reach — `Build` by
-`builder.build_shared(...)` at `open.rs:547-553`, which is the one an earlier
-revision of this paragraph missed while calling the list exhaustive. Fork poisoning is not in it either, and that is worth stating because it
+`builder.build_shared(...)` at `open.rs:547-553`. Fork poisoning is not in it either, and that is worth stating because it
 is easy to assume otherwise: poisoning marks handles a child *inherited*, and a
 fresh `tf_tree::open()` in that child is an ordinary attach that succeeds —
 which is precisely the remedy `docs/PHASE3.md` §8 tells a Python user to
@@ -318,12 +317,7 @@ _Not to be started while this record is `draft`._
    a minor bump under `docs/PHASE4.md` §3.6"* — and that clause is what made the
    `4` → `5` bump provable rather than conventional. It is asserted at **one
    authored site**, `crates/tf_tree_c/src/error.rs:141`; `tf_tree.h:398` is its
-   generated copy. (An earlier revision of this answer counted a third site at
-   `xtask/src/headers.rs:156`. **That comment belongs to `TFT_ERR_BAD_CONFIG` on
-   line 162, not to `TFT_ERR_ARENA_UNAVAILABLE` on line 169** — worth reading for
-   the distinction it draws rather than the count it does not add: it says
-   *"Returned only by `tft_bridge_create` **today**"*, an observational clause,
-   where `error.rs:141`'s is normative and bolded.) The precedent is unbroken: 34
+   generated copy. The precedent is unbroken: 34
    codes, 34 distinct values, no removed `pub const TFT_(OK|ERR_)` line in
    `error.rs`'s history.
 

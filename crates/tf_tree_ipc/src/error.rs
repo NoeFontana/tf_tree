@@ -356,10 +356,9 @@ pub enum IpcError {
     /// longest fixed text a C path puts in front of one of these renderings. A
     /// count of truncations is a statement about a prefix, and this one used to
     /// name none, and it is the message length the buffer sees, which is why
-    /// the figures quoted anywhere are renderings and not arms. *It pointed at
-    /// a `MESSAGE_BUDGET` "below" until round 13; that constant is
-    /// `#[cfg(test)]`, so a docs.rs reader following it found nothing.* A per-status remedy that C cannot finish reading is the
-    /// same defect one layer down, which is what a runbook row does not have.
+    /// the figures quoted anywhere are renderings and not arms. A per-status
+    /// remedy that C cannot finish reading is the same defect one layer down,
+    /// which is what a runbook row does not have.
     ///
     /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
     HandshakeRejected {
@@ -597,9 +596,7 @@ impl fmt::Display for IpcError {
             // The shape is `0059`'s convention (g): ASCII, ending with the
             // variant name **in parentheses** as the runbook's search key — the
             // spelling `tf_tree_arena`'s `check.rs` and `frozen.rs` already use
-            // (`(Unsealed)`, `(LayoutMismatch)`). A first version ended
-            // `: ArenaHeldButUnreachable`, a second spelling of a convention
-            // living in two other crates.
+            // (`(Unsealed)`, `(LayoutMismatch)`).
             //
             // **Convention (e) — at most 120 bytes — is NOT met, and that is
             // stated rather than claimed away.** These arms are over it; the
@@ -617,12 +614,9 @@ impl fmt::Display for IpcError {
             // the four-branch version this replaced lost its whole remedy to
             // truncation and printed its em-dashes as `???`.
             //
-            // **No byte counts in this comment, on purpose.** Every figure here
-            // was written into a code comment, a changelog entry and a decision
-            // record at once, and four review rounds found a stale copy every
-            // time. `MESSAGE_BUDGET` and
-            // `every_ipc_error_message_fits_the_c_abis_buffer` hold the numbers
-            // where they are executable.
+            // **No byte counts in this comment, on purpose.** `MESSAGE_BUDGET`
+            // and `every_ipc_error_message_fits_the_c_abis_buffer` hold the
+            // numbers where they are executable.
             IpcError::ArenaHeldButUnreachable {
                 holder_slots: 0,
                 ownership_held: true,
@@ -726,12 +720,7 @@ mod tests {
     /// **`tf_tree_cli`'s `tests/runbook.rs` needs nothing added and will tell
     /// you about the row.** It has no status list: it derives the set from
     /// `HelloStatus::from_u32`, so the new status appears there as soon as the
-    /// codec can deliver it and the missing row fails `just shm-check`. *This
-    /// doc said the opposite — that the downstream crate could not detect an
-    /// addition because `HelloStatus` is `#[non_exhaustive]`. That is true of a
-    /// `match` and false of enumeration, and it was refuted two rounds after it
-    /// was written; a reader who believed it had no reason to expect the row to
-    /// be caught, which is exactly the step they would skip.*
+    /// codec can deliver it and the missing row fails `just shm-check`.
     ///
     /// It is in `#[cfg(test)]`, so `cargo check -p tf_tree_ipc` still passes and
     /// `--all-targets` is what fails. `just build` and `just lint` pass it.
@@ -752,16 +741,13 @@ mod tests {
     /// Every [`IpcError`] variant, **and every value its `Display` branches
     /// on**, for the length and ASCII gates.
     ///
-    /// **Two mechanisms, and what each one actually catches — because a first
-    /// version of this doc claimed one of them did both.**
+    /// **Two mechanisms, and what each one actually catches.**
     ///
     /// * The exhaustive `match` at the end forces a *new* variant to be
     ///   handled here: `IpcError` is not `#[non_exhaustive]` and this module is
     ///   inside its own crate, so adding a variant without adding an arm fails
-    ///   to compile. It does **not** force a `push`, which is what the first
-    ///   version claimed ("a new variant that is not sampled here fails to
-    ///   compile") — deleting `out.push(IpcError::ArenaAbsent)` left all three
-    ///   tests green.
+    ///   to compile. It does **not** force a `push` — deleting
+    ///   `out.push(IpcError::ArenaAbsent)` left all three tests green.
     /// * `VARIANTS_SAMPLED` is what catches that: the gate counts distinct
     ///   `mem::discriminant`s and refuses a set smaller than this. It catches a
     ///   push that is deleted or forgotten among the variants that exist today.
@@ -773,10 +759,10 @@ mod tests {
     /// than implied. The match arm is the prompt; this sentence is the reason.
     const VARIANTS_SAMPLED: usize = 24;
     ///
-    /// **One sample per variant is not enough, and four mutants proved it.** A
-    /// first version of this returned exactly that. Three of four deliberate
-    /// defects — a procedure added to an arm, 220 bytes added to an arm, a
-    /// non-ASCII byte added to an arm — **passed**, because every one of them
+    /// **One sample per variant is not enough, and four mutants proved it.**
+    /// Three of four deliberate defects — a procedure added to an arm, 220
+    /// bytes added to an arm, a non-ASCII byte added to an arm — **passed**,
+    /// because every one of them
     /// was in an `ArenaHeldButUnreachable` branch the single sample did not
     /// select. A gate over a branching `Display` has to enumerate the branches
     /// or it measures one of them and reports on all.
@@ -785,20 +771,13 @@ mod tests {
     /// [`RuntimeDirSource`]s, the four [`EnvVar`]s, the four [`NameProblem`]s,
     /// the four [`LockRole`]s, the seven `HelloStatus`es, the three
     /// [`WireError`]s, [`ProcError`]'s arms including all three parse causes,
-    /// and `ArenaHeldButUnreachable`'s **thirteen** states — *this said seven,
-    /// which is the count a first version listed and
-    /// `every_unreachable_state_reports_the_facts_and_prescribes_nothing` calls
-    /// out as wrong; the sweep below it was rewritten twice without the number
-    /// above being read.*
+    /// and `ArenaHeldButUnreachable`'s **thirteen** states.
     ///
     /// **And the widths a formatter does not branch on but a budget counts**:
     /// the three ids are sampled at `u64::MAX` / `Some(u32::MAX)` /
-    /// `first_pid: u32::MAX` — **the pid included, which is the field round 8
-    /// found pinned at 4242 under a "widest" label**, and which a first version
-    /// of this very sentence left out again — and
-    /// `HandshakeRejected`'s two owner numbers at `u32::MAX` beside their
-    /// realistic values. A `format_version` of `3` renders one digit where the
-    /// type renders ten.
+    /// `first_pid: u32::MAX` and `HandshakeRejected`'s two owner numbers at
+    /// `u32::MAX` beside their realistic values. A `format_version` of `3`
+    /// renders one digit where the type renders ten.
     fn samples() -> Vec<IpcError> {
         use crate::{EnvVar, LockRole, NameProblem, RuntimeDirSource as R};
         let sources = [R::Env, R::XdgRuntimeDir, R::Run, R::Tmp];
@@ -1010,17 +989,10 @@ mod tests {
     /// buffer is meant to eat: *"the fixed clause leads, `OpenError`'s unbounded
     /// rendering comes second, and the name … is what the buffer eats into."*
     ///
-    /// **A first version of this said 229, from the 26-byte
-    /// `could not open the arena: ` wrapper — and that contradicted `0059`,
-    /// which this arm cites two paragraphs earlier.** That record's *Rationale*
-    /// names the 35-byte bridge prefix as "the longest fixed text a C path puts
-    /// before one of these payloads". Taking the shorter wrapper as "the
-    /// longest known" was wrong by inspection of a record already in hand.
-    ///
     /// The worst message under this budget is currently **205 bytes**
-    /// (`NetworkFilesystem` from `$XDG_RUNTIME_DIR`), not the 147 the first
-    /// version of this comment claimed — so the real headroom is 15 bytes, and
-    /// `0059`'s aspirational 120 is a long way below what these texts are.
+    /// (`NetworkFilesystem` from `$XDG_RUNTIME_DIR`), so the real headroom is
+    /// 15 bytes, and `0059`'s aspirational 120 is a long way below what these
+    /// texts are.
     const MESSAGE_BUDGET: usize = 220;
 
     #[test]
@@ -1073,8 +1045,7 @@ mod tests {
     /// `libc` and nothing else, so it cannot read this build's `FORMAT_VERSION`
     /// or `layout_hash()`: printing both needs two more fields on the variant
     /// or a dependency edge, and either is a change to a published crate's
-    /// surface rather than a reduction. An earlier revision of this doc cited
-    /// §3.7 as though the arm satisfied it.
+    /// surface rather than a reduction.
     ///
     /// This is that convention plus the digits. **What it defends, measured
     /// rather than asserted:** the budget is one number checked per status, and
@@ -1091,13 +1062,7 @@ mod tests {
     /// `MESSAGE_BUDGET`, which has room for a paragraph — but a *short* clause
     /// on a *short* status does not: 16 bytes added to a `Malformed`-only
     /// branch pass this and every other gate. What would catch that is the
-    /// forbidden-word rule in `tf_tree_cli`'s `runbook.rs`, and review. Saying
-    /// so is the point, because *this read "the slack it leaves is single
-    /// digits"* — true of **two** statuses and false of five, and an
-    /// un-instrumented superlative beside a constant is the shape this step has
-    /// already corrected twice. *The correction itself then said "true of five,
-    /// false of two", which is the same sentence inverted: a count stated
-    /// beside the seven numbers that refute it.*
+    /// forbidden-word rule in `tf_tree_cli`'s `runbook.rs`, and review.
     ///
     /// [`0059`]: https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
     const REJECTION_BUDGET: usize = 140;

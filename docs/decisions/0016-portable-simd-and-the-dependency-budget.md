@@ -228,8 +228,7 @@ pulp
 ```
 
 `num-complex` is unused by us — quaternions are not complex numbers — and comes
-along regardless. An earlier estimate said six; it is nine, and `raw-cpuid`,
-`num-traits` and `version_check` were the ones missed.
+along regardless.
 
 ## Rationale
 

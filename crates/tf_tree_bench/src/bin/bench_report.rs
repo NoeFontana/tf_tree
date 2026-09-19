@@ -91,9 +91,7 @@ fn main() -> Result<()> {
             // a single build. `just embed-cost` writes the pair; without the
             // flag the row says so and names that recipe.
             "--embed-cost" => opts.embed_cost = Some(PathBuf::from(value("--embed-cost")?)),
-            // Still rejected, but **not** for the reason an earlier revision
-            // gave. That one said §3 "is not implemented"; §3 landed (MCAP), and
-            // `tf_tree ingest --bag` / `tf_tree freeze --from-bag` are how a
+            // Still rejected. `tf_tree ingest --bag` / `tf_tree freeze --from-bag` are how a
             // recording is read today. What is missing is the wiring *here*:
             // this harness never opens a `.tft`, so a recording handed to it
             // would be parsed and then have nothing to feed.

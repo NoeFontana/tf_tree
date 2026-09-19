@@ -571,8 +571,7 @@ fn drive(d: &Drive) -> Result<()> {
         d.floor,
         if ok { "PASS" } else { "FAIL" }
     );
-    // **Reported as measured, never asserted.** This line used to say the
-    // in-memory arm "is the faster regime". The two arms run in a fixed order
+    // **Reported as measured, never asserted.** The two arms run in a fixed order
     // — in-memory first — so the first one absorbs any first-touch cost, and on
     // `--reuse-corpus`, the one path where this process did not write the
     // corpus, the ordering has been observed to invert. Nothing here controls

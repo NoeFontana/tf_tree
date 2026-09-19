@@ -182,8 +182,5 @@ message false.
    The tooling is two short scripts, not committed: a streaming framing walker
    and the summary survey, both validated against the `OneAttachment` case in
    `foxglove/mcap`'s conformance corpus, whose published ground truth they
-   reproduce exactly. An earlier revision of the survey also read
-   `Statistics.attachment_count` at a guessed offset and printed `0` where that
-   ground truth says `1`; the guess was deleted rather than reported, and
-   `AttachmentIndex` — which is self-describing — is what the numbers above come
-   from.
+   reproduce exactly. `AttachmentIndex` — which is self-describing — is what the
+   numbers above come from.

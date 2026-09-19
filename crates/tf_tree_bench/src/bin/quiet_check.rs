@@ -101,11 +101,7 @@ fn main() {
             );
         }
         Err(msg) => {
-            // **No second sample.** An earlier version re-read `busy_fraction`
-            // here so the headline would have the same shape as the passing
-            // line — which printed a *different reading* from the one that
-            // failed the threshold, 300 ms later and on a machine whose load
-            // was by then demonstrably moving. A refusal that quotes a number
+            // **No second sample.** A refusal that quotes a number
             // other than the one it refused on is worse than one that quotes
             // none. `require_quiet_machine`'s message carries the reading it
             // actually took, and the top consumers with it.

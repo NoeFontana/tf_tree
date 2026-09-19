@@ -377,7 +377,7 @@ where there is no owner and no handshake at all, opening a frozen `.tft`.
 | `LayoutMismatch` | same version, a different record layout | rebuild every participant, as above. The owner's `layout_hash` is in the message; this binary's is a build constant, printed by `tf_tree doctor --explain-version` **built from the same commit as the refused process** — see the note above this table before comparing two numbers |
 | `BootIdMismatch` | the boot id in the attach request against the one in the **arena header** | **not "the arena outlived a reboot"** — a serving owner is proof it did not, and the segment would not have survived one. The two processes disagree about which boot this is, and the kernel has one boot id per host with no per-namespace variant ([`PHASE2.md`](./PHASE2.md) §3.3), so one of them did not read the real value: either the read failed and it substituted all-zeros (both sides do, so it takes exactly one failure), or something presents a different `/proc/sys/kernel/random/boot_id` to it — a sandbox that masks `/proc/sys`, or a `/proc` overlay. **And there is a third way, which needs no failure at all: the two sides parse that file with different code.** The joiner sends `tf_tree_ipc::procstat::boot_id`, which rejects a UUID with trailing junk; the arena header was written by `tf_tree::tree::boot_id`, which ignores it. On a file neither of them should ever see, the strict one substitutes all-zeros and the lenient one does not — so reading the file from both processes can show it identical and the ids still disagree. Check the file first, and if it is well formed and identical, the mismatch is that divergence and is a bug to report |
 | `NoParticipantSlots` | every slot, against **both** its tables: the owner's assigner walks the arena's participant records *and* the lock bytes, and grants a slot only where both are free | the *`ParticipantTableFull` / `NoParticipantSlots`* section below is the triage, and the reason it is there rather than here is that the two tables need two different commands to read. A read-only consumer holds a byte and writes no record, so neither table alone is the answer. **There is no `--participants` flag and never was**: capacity is fixed at construction ([`PROJECT.md`](./PROJECT.md) §5 D4) |
-| `ModeNotPermitted` | **nothing in this workspace sends it.** A rejection has three sources and none of them produces this one. `OwnerServer::serve` answers a datagram it cannot decode with `Malformed` and nothing else — that is the row below. `OwnerServer::check` returns `VersionMismatch`, `LayoutMismatch` or `BootIdMismatch` and nothing else. The `assign` closure a caller hands `serve` may return **any** `HelloStatus` — that is how `NoParticipantSlots` is sent — but `tf_tree::open`'s assigner returns only `NoParticipantSlots`. So the only route is somebody else's `assign`. *An earlier revision of this cell said two sources and named the decode path as one of the other two; a list of producers is the thing this row exists to get right* | attach read-only, which is the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18). **Who refused you decides the rest.** Against an owner built on `tf_tree_ipc` with its own `assign`, this is that policy and its author is who to ask. Against a `tf_tree` owner, no code path produces it, so report it. *The remedy this table replaced described it as an ordinary refusal to grant write access, with no hint that nothing here produces it* |
+| `ModeNotPermitted` | **nothing in this workspace sends it.** A rejection has three sources and none of them produces this one. `OwnerServer::serve` answers a datagram it cannot decode with `Malformed` and nothing else — that is the row below. `OwnerServer::check` returns `VersionMismatch`, `LayoutMismatch` or `BootIdMismatch` and nothing else. The `assign` closure a caller hands `serve` may return **any** `HelloStatus` — that is how `NoParticipantSlots` is sent — but `tf_tree::open`'s assigner returns only `NoParticipantSlots`. So the only route is somebody else's `assign`. | attach read-only, which is the consumer default ([`PROJECT.md`](./PROJECT.md) §5 D18). **Who refused you decides the rest.** Against an owner built on `tf_tree_ipc` with its own `assign`, this is that policy and its author is who to ask. Against a `tf_tree` owner, no code path produces it, so report it. |
 | `Malformed` | nothing — it could not decode the request | **or it refused for a reason this build has no name for.** Every unknown status code decodes to `Malformed` (`HelloStatus::from_u32`), deliberately, so a newer owner's newer refusal arrives here. The two are indistinguishable on the wire, so confirm both sides are the same release before reading this as corruption |
 
 `Ok` never appears in this message: it is the acceptance, and no error is built
@@ -455,9 +455,7 @@ detection limits are written where it is implemented (`tft014`,
 hangup anybody sees.
 
 **And a record with no lock byte is worse than invisible — it is accused.**
-The paragraph above used to end by saying such a record "reaches the `unknown`
-byte row and is judged by `/proc` alone", which is what the run does when it
-read *no lock file*. A `doctor --attach` reached the arena through the
+A `doctor --attach` reached the arena through the
 rendezvous, so it has
 one and it probes: the byte-less record reads free, no lock-file identity names
 it, and `TFT014` reports **`a record left behind — … the lock byte is free`**
@@ -855,14 +853,6 @@ over the same rendezvous name: it abandons this one, leaving its survivors
 publishing where nobody can reach them. That is a recovery of the *name*, not of
 the arena, which is why the warning above says to reach for inheritance first.
 
-**This section
-used to say the survivor could never promote itself and that stopping everything
-was the only path**; that was accurate while §3.5's first takeover half was
-deleted (#275,
-[`0037`](./decisions/0037-a-takeover-is-not-a-second-open.md)) and while its
-trigger did not exist, and it is corrected rather than removed because it is
-still the right advice for a deployment with no read-write heir.
-
 **When there is no heir, the recovery is to stop every participant**, read-only
 consumers and any `tf_tree top --attach` included. Each process's lock byte is
 released by the kernel when it dies, and the segment is freed when its last
@@ -896,10 +886,7 @@ assigned `>= 1`. Three states, and they need different remedies:
 remedy, since `0055` step 6.** It prints the participant mask, the lowest held
 slot and its pid, and whether the ownership byte is held, and then ends with
 `(ArenaHeldButUnreachable)`. Match those against **the eight-row table below**,
-which is the remedy this section owns. This paragraph used to say the message
-"says so in as many words", i.e. carried the remedy itself; it did, and it was
-wrong three times in a day, because `Display` sees which bytes are held and
-cannot see who holds them.
+which is the remedy this section owns.
 
 `tf_tree participants` covers the first two rows of the table above — it walks
 the participant bytes, so a held slot 0 shows up there as `live` — but it does
@@ -990,10 +977,7 @@ exactly what §3.4 exists to prevent, and know what it leaves behind:
   there is one. `tf_tree_ipc::Session::release_ownership` gives up the ownership
   byte while keeping participant byte 0 — exactly what §3.5 asks of it, "give up
   the owner role while staying attached" — so it leaves a live non-owner on byte
-  0 from a documented call on a published crate. An earlier revision of this
-  paragraph said nothing in the workspace produced that state outside a test that
-  took the byte by hand, and called that a failed construction rather than an
-  unreachability argument. It was the former, and it was wrong: the state was
+  0 from a documented call on a published crate. The state was
   reproduced through published API on 2026-08-19 and is pinned by
   `defect_201_release_ownership_strands_a_live_non_owner_on_byte_0`.
 
@@ -1150,7 +1134,7 @@ Almost certainly a bug — topology should be near-static after startup.
 | `TFT014` — *slot N pid P, byte still HELD* | The **fork** case: a forked child inherited the parent's open file descriptions, so the lock byte is still held on behalf of a process that no longer exists. Reported for a read-only parent too, where there is no arena record at all — the finding then reads *the record is FREE (no arena record: a read-only participant, D18)*. **It is not reported for a participant in another PID namespace** ([`0033`](./decisions/0033-the-identity-record-cannot-name-a-namespace.md)): that used to render the identical sentence about a healthy process, so if a build predating `0033` shows you this for a containerised worker, check the namespace before acting on it | Different fault, different fix — **do not go looking for a reaper**, and nothing may run one: the kernel's own answer for this slot is *held*, and overruling it with a `/proc` guess is what would evict a running participant. Stop the child, and start workers with a start method that inherits no descriptors — `multiprocessing`'s `spawn` (Python defaults to `fork` on Linux), or fork+exec. The byte comes back on its own when the last inheritor exits. Same root cause as *The tree works in the parent and everything fails in a forked child*, above |
 | `TFT014` — *slot N, no pid recorded, byte free* | The same shape with **no process named at all**: the lock file yielded no identity record for the slot — none written, or none readable — and the arena record's pid field is still zero, which is what `fill_slot` leaves when a registrant dies between claiming the slot and publishing into it | There is nothing here to check and the finding says so: it prints no pid and no *check the pid* instruction. Reclaimed exactly as the `byte free` row above — a read-write peer's `Tree::reap_participants()`. If you are seeing these repeatedly, something is being killed inside registration |
 | `TFT014` — *slot N pid P, byte not probed* | The same record-left-behind shape, seen by a run with **no kernel answer about the byte**. Usually that is a run which opened no lock file — `--from-bag`, or the built-in fixture — and the verdict is an inference about the process alone. **An `--attach` run reaches it too**, for any slot whose `F_OFD_GETLK` returned an error: a failed probe is deliberately not reported as *free*, because that would be an accusation | Read it as a weaker claim than the `byte free` row, not a different fault. If you ran `--from-bag` or the fixture, run `doctor --attach` against the live domain — that is the only source that opens the rendezvous. **If you were already attached**, the probe failed rather than answered: check fd limits and the runtime directory's mount, and re-run before concluding anything about the slot |
-| `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena. **That is not the only outcome either of them has on a deployment, and this row said it was until 2026-09-05** — the clause read *"`doctor` having no recording source"*, which stopped being true when `--from-bag` landed, and the same document has told you to run `tf_tree doctor --from-bag run.mcap` since. Point it at the recording: both reach a verdict there |
+| `TFT019` | A **run** of at least eight of those rejections, on an edge in `SystemDomain` (wall clock, tag 0) | Not a publisher fault — the clock stepped (NTP, leap second). Move anything published at rate to a steady or PTP domain. Passes with a `note:` below the run length, skips naming the tag on any other domain, and skips with `TFT018` on a live arena. Point it at a recording (`tf_tree doctor --from-bag run.mcap`): both reach a verdict there |
 
 ---
 

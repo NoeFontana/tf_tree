@@ -90,9 +90,7 @@ since 2026-09-04 that is **an assertion in CI**, not only a property of the
 code. `docs/PHASE5.md` §5.1 requires a test that runs the suite under `strace`
 or a seccomp filter and fails if `socket(2)` is called with anything but
 `AF_UNIX`; `just no-network` (`scripts/no-network.sh`) is that test, and
-`.github/workflows/ci.yml`'s `shm` job runs it on both matrix rows. **This
-section said the test was "not implemented" until the day it was**, which is
-the shape of claim worth re-reading against the tree rather than trusting.
+`.github/workflows/ci.yml`'s `shm` job runs it on both matrix rows.
 
 Read the scope with it, because it is narrower than "everything in this
 repository":
@@ -114,10 +112,7 @@ repository":
   and **every package in this repository other than the five above and
   `tf_tree_cli`** — including `crates/tf_tree_tf2_sys`, the ROS 2
   `tf2::BufferCore` bridge, which is worth naming rather than deriving because
-  ROS 2 middleware is DDS over UDP. Those are traced by nothing. (This
-  bullet used to enumerate the untraced crates by name; the list shipped
-  incomplete, which in a "what it does not cover" bullet is the worst place for
-  an omission, so it is stated as the rule the traced set generates.)
+  ROS 2 middleware is DDS over UDP. Those are traced by nothing.
   `scripts/no-network.sh` carries the full PROVES / DOES NOT PROVE header.
 
 Verify it yourself if it matters to you: `just no-network` (it needs `strace`,

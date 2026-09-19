@@ -848,11 +848,7 @@ pub fn survey(
         // `source::read_tf`), so a recording cut before its first complete *record*
         // yields zero transforms for a reason that has nothing to do with what was
         // published — and `NoTransforms` would send the user looking for a publisher
-        // instead of at their file. An earlier revision of this comment said
-        // *chunk*-granular, which would make this arm look reachable only for files
-        // smaller than one chunk; `truncation_recovery_is_record_granular` shows
-        // records inside a cut chunk are recovered, so the reachable class is a very
-        // different and much larger one.
+        // instead of at their file.
         //
         // **The limit case is tested first, ahead of truncation.** It is the only
         // one of the three with a remedy the operator can act on — a flag — and a

@@ -2,8 +2,7 @@
 //!
 //! Each of those sections is a table that answers one question. This is the
 //! order they are asked in, and the order is not arbitrary. The numbering is
-//! `offer`'s own: an earlier revision's list was one step short of the code,
-//! because *"declared?"* was inserted later and nobody renumbered.
+//! `offer`'s own.
 //!
 //! 0. **The startup window** (§5.4). Not a table and not about this sample —
 //!    the only step that can answer before the transform is even counted. See

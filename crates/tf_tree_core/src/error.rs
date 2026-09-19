@@ -75,8 +75,6 @@ impl EdgeId {
 /// `Display` and [`core::error::Error`] are implemented, so this propagates with
 /// `?` into `anyhow::Error`, `Box<dyn Error>`, or a caller's own enum
 /// ([`0040`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0040-the-error-that-cannot-be-returned.md)).
-/// Until that record, none of this crate's errors implemented either trait, and
-/// a consumer's first function could not be `-> anyhow::Result<_>`.
 ///
 /// ```
 /// use tf_tree_core::{EdgeId, LookupError};
@@ -409,11 +407,6 @@ pub enum TopologyError {
 // allocates, holds a `String`, or changes a layout: `Display` writes into the
 // caller's formatter, so every error stays `Copy` and every one of them is still
 // returnable from the wait-free read path.
-//
-// **Why they exist at all.** Before `0040`, the missing `?`-chaining was cited by
-// this crate's own documentation as the reason `docs/decisions/0019` §2b's
-// startup sequence — attach, wait for frames, plan — is published as a `text`
-// block rather than as compiling Rust. That is the first code a consumer writes.
 //
 // **`core::error::Error`, not `std::error::Error`**, so the crate stays `no_std`.
 // It has been in `core` since Rust 1.81 and the MSRV is 1.87; a floor below that

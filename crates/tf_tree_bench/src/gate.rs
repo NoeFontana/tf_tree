@@ -103,8 +103,7 @@ impl Outcome {
     /// with enough cores, and this returns `None` in step rather than
     /// substituting a hand-written string: a literal here would be the one
     /// thing the module doc forbids, since it is exactly the text a fit host
-    /// would get. An earlier version carried such a literal while three
-    /// separate prose claims said both constructors quote the probe.
+    /// would get.
     #[must_use]
     pub fn refused_on_cores(fitness: &Fitness) -> Option<Outcome> {
         fitness.core_reason.clone().map(|why| Outcome::Refused {

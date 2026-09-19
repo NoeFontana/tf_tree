@@ -456,11 +456,6 @@ pub(crate) fn resolve_frame(py: Python<'_>, tree: &Tree, name: &str) -> PyResult
 /// * `InternContended` — a publisher is mid-intern behind an anonymous view;
 ///   the name is arriving. Retry.
 ///
-/// An earlier revision sent all three through the "has not been declared yet;
-/// wait for one" sentence, and its comment claimed a collision fell through to
-/// the hash message instead — the routing and the comment were each wrong about
-/// the other.
-///
 /// `None` back from the walk means both names resolve *now*, which is the race
 /// the caller lost by a microsecond: a peer interned the name between the engine's
 /// probe and this one. There is nothing to blame, so [`lookup_err`] reports the

@@ -101,7 +101,7 @@ tf_tree/
 
 Crate names use underscores throughout (as `serde_json` and `parking_lot` do), so the import path matches the project name: `use tf_tree::...`.
 
-`tf_tree_math` and `tf_tree_arena` are separately publishable and separately testable. Keeping the math crate free of `unsafe` and free of the arena is what makes it cheap for Miri to interpret as a *callee* — no `unsafe`, no arena, no provenance to track. **Its own test suite is not run under Miri, and this sentence said it was until 2026-09-09**: `just miri` runs `-p tf_tree_arena -p tf_tree_core` and `-p tf_tree`, and has never named `tf_tree_math`. The crate is `#![forbid(unsafe_code)]`, so what Miri would check there is the standard library's own soundness.
+`tf_tree_math` and `tf_tree_arena` are separately publishable and separately testable. Keeping the math crate free of `unsafe` and free of the arena is what makes it cheap for Miri to interpret as a *callee* — no `unsafe`, no arena, no provenance to track. **Its own test suite is not run under Miri**: `just miri` runs `-p tf_tree_arena -p tf_tree_core` and `-p tf_tree`, and has never named `tf_tree_math`. The crate is `#![forbid(unsafe_code)]`, so what Miri would check there is the standard library's own soundness.
 
 ---
 
@@ -140,22 +140,11 @@ pub struct Quat { pub w: f64, pub x: f64, pub y: f64, pub z: f64 }  // 32 B
 pub struct Iso3 { pub q: Quat, pub t: Vec3 }                        // 56 B
 ```
 
-> **`Iso3` was `#[repr(C, align(64))]` with an `_pad: [u8; 8]` here until
-> [`0042`](./decisions/0042-the-cacheline-the-arena-never-asked-for.md).** The
-> stated reason was that the Phase 2 arena could then store slots without
-> re-deriving layout; it re-derived them anyway — `PoseSlot` is its own
-> `align(64)` of atomics, which the seqlock requires — and no arena structure
-> ever held an `Iso3`. The padding cost `Step` 64 bytes, `Plan` 2 KiB and the
-> facade's per-thread plan cache 33 KiB, for nothing.
-
 **Convention lock-in.** Hamilton (not JPL). `w` first (not last — note this differs from Eigen's storage order; the C++ wrapper in Phase 4 must transpose). Active rotations. `Iso3` composition `a * b` means `T_a_x * T_x_b`. Adjoint convention is right-perturbation: `T = T̂ · exp(ξ^)`. Write these five facts in the crate-level doc comment; every downstream bug in this project will trace back to one of them.
 
 Assert layout in a test: `assert_eq!(size_of::<Iso3>(), 56)`, `assert_eq!(align_of::<Iso3>(), 8)` —
 `crates/tf_tree_math/src/iso3.rs` and `tf_tree_core`'s
-`the_sizes_0042_halved_stay_halved` are those tests. **This line said 64 and 64
-until `0042`**, which is worth leaving visible: a contributor following the spec
-would have written an assertion that fails, and `0042`'s own Context claimed
-nothing outside `tf_tree_math` asserted the size. This did.
+`the_sizes_0042_halved_stay_halved` are those tests.
 
 ### 3.2 SE(3) exponential and logarithm
 
@@ -257,15 +246,15 @@ The second row is a positive test that `LerpSlerp` is not right-invariant. Write
 
 ### 4.1 Header
 
-**This block is Phase 1's header, and it is no longer the normative layout — it is two format bumps behind. This section said **NORMATIVE** over it until 2026-09-09.**
+**This block is Phase 1's header, and it is no longer the normative layout — it is two format bumps behind.**
 
 The normative v3 header is `crates/tf_tree_arena/src/header.rs`: `FORMAT_VERSION` is **3**, the struct is **320 bytes** (256 before the bump), and its `key_field_offsets_are_stable` test pins every offset that a v3 reader depends on.
 
 The fields the Phase 1 block below does not have, enumerated so a v3 reader is not built from it: `participant_table_off`, `max_participants` and `participant_count` (Phase 2's registry); `owner_start_time`, `boot_id[16]` and `instance_uuid[16]` (identity across PID reuse and reboots); `edge_counters_off` and `participant_counters_off` (`FORMAT_VERSION` 3's two counter regions); `topo_lock`; and `spline_region_off`/`spline_degree`, Phase 6's two reserved fields declared absent (D22). `topo_generation` and `topo_active` are also gone, replaced by the single packed `topo: AtomicU64` that A1's rotation needs.
 
-**This paragraph named four things that are not header fields at all until it was corrected**: `nominal_rate_mhz` and `declared_by_slot` are `EdgeRecord` fields, `0036`'s receipt time is `ClaimRecord::clock_offset_nanos`, and Phase 6 reserves two header fields rather than four. Pointing at the normative source is worth little if the pointer is wrong about what is there.
+**This paragraph named four things that are not header fields at all until it was corrected**: `nominal_rate_mhz` and `declared_by_slot` are `EdgeRecord` fields, `0036`'s receipt time is `ClaimRecord::clock_offset_nanos`, and Phase 6 reserves two header fields rather than four.
 
-**The block is kept rather than deleted**, because it is what Phase 1 built and the amendments that moved it are traceable only against it. Read it as history; read `header.rs` for the layout. All offsets below are byte offsets from arena base.
+All offsets below are byte offsets from arena base.
 
 ```rust
 pub const TF_TREE_MAGIC: [u8; 8] = *b"TF_TREE\0";  // byte array, not a u64 literal: no endianness ambiguity
@@ -329,7 +318,6 @@ pub struct ArenaLayout {
 }
 ```
 
-> **The fields are private, and this listing showed them `pub` until 2026-09-09.**
 > That is the point of the type: the power-of-two invariant on each capacity
 > cannot be violated from outside, so the regions are computed once in
 > `ArenaLayout::new` and read through accessors. `max_participants` is not a
@@ -354,14 +342,13 @@ Region sizes, each 64-byte aligned and laid out in header order:
 | **edge counters** | `align64(max_edges * 128)` |
 | **participant counters** | `align64(max_participants * 128)` |
 
-> **Eleven regions, not eight, and this table said eight until 2026-09-09.** The authority is `crates/tf_tree_arena/src/layout.rs`'s `sizes` array in `compute`. **It is not compile-checked, and this sentence said it was**: `sizes` is an unannotated array literal, so dropping a row gives a runtime index-out-of-bounds in the `while i < N_REGIONS` loop. The compile-time check is on a *different* array — `let strides: [u32; N_REGIONS + 1]` in `layout_hash` — and its own comment is explicit that it is a **cardinality** check and nothing more: it cannot see a stride written at the wrong index or with the wrong value. Four things moved: the header is **320** since `FORMAT_VERSION` 3 (was 256); the frame-hash stride is **16**, not `8 + 4` — A8 widened it by adding the `claiming` array (`FRAME_HASH_STRIDE`); the topology stride is **12 bytes per frame**, not 10, because `edge_of_child` lives in that block (§5.3); and three regions are simply absent from this table — the **participant table** (Phase 2) and the **two counter regions** (`FORMAT_VERSION` 3, `PHASE5.md` §5.5). D22 is why the counter regions are counted whether or not the `counters` feature is on.
+> The authority is `crates/tf_tree_arena/src/layout.rs`'s `sizes` array in `compute`. **It is not compile-checked**: `sizes` is an unannotated array literal, so dropping a row gives a runtime index-out-of-bounds in the `while i < N_REGIONS` loop. The compile-time check is on a *different* array — `let strides: [u32; N_REGIONS + 1]` in `layout_hash` — and its own comment is explicit that it is a **cardinality** check and nothing more: it cannot see a stride written at the wrong index or with the wrong value. D22 is why the counter regions are counted whether or not the `counters` feature is on.
 >
 > `layout_hash` folds these strides, so a table that disagrees with them is describing an arena no participant would attach to.
 
-A 1000-frame, 1000-edge tree with 4096 samples per edge: ~260 MB of pose arena. Note that in a real robot only a handful of edges are dynamic, so size capacities per edge rather than uniformly. The constructor that ships is `ArenaLayout::new` (`crates/tf_tree_arena/src/layout.rs`), which validates that each per-edge capacity is `0` (a static edge, no ring) or a power of two and that exactly `max_edges` of them were supplied. **`ArenaLayout::from_edges` does not exist and this line asked for it until 2026-09-09** — the per-edge sizing it was written for is what `new` takes, and the builder-side spelling is `0004`'s builder-time edge declaration.
+A 1000-frame, 1000-edge tree with 4096 samples per edge: ~260 MB of pose arena. Note that in a real robot only a handful of edges are dynamic, so size capacities per edge rather than uniformly. The constructor that ships is `ArenaLayout::new` (`crates/tf_tree_arena/src/layout.rs`), which validates that each per-edge capacity is `0` (a static edge, no ring) or a power of two and that exactly `max_edges` of them were supplied. **`ArenaLayout::from_edges` does not exist** — the per-edge sizing it was written for is what `new` takes, and the builder-side spelling is `0004`'s builder-time edge declaration.
 
-**Topology block stride is 12 bytes per frame, not 6, and this paragraph derived
-10 until 2026-09-09.** §5.3 requires `edge_of_child[c]` to live *in the topology
+**Topology block stride is 12 bytes per frame, not 6.** §5.3 requires `edge_of_child[c]` to live *in the topology
 block* so plan compilation is a pure array walk, and that makes a block
 `parent: u32` + `edge_of_child: u32` + `depth: u16` = 10 B of payload — which
 `layout.rs` rounds to **12** (`align64(max_frames * 12)`), the two trailing pad
@@ -376,10 +363,7 @@ Storing it anywhere else would reintroduce the torn-read this design exists to
 prevent. The two `u32` arrays are placed first so both stay 4-byte aligned for
 any `max_frames`, with the `u16` `depth` array trailing.
 
-`TOPO_BLOCKS` is **4** (`crates/tf_tree_arena/src/header.rs`). *This line read*
-`TOPO_BLOCKS` *is* **2** *in Phase 1;* `PHASE2.md` *§1 A1 raises it to 4* until
-2026-09-09 — true as history and misleading as a specification, because the
-shipped constant is the only one any reader can attach against. The stride is
+`TOPO_BLOCKS` is **4** (`crates/tf_tree_arena/src/header.rs`). The stride is
 unchanged by A1; what A1 changed is the count and the publish, from a
 double-buffer to a rotation over one packed word (§5.2).
 
@@ -436,7 +420,7 @@ pub struct TopologyBlock {
 }
 ```
 
-**Four** blocks, rotated (`TOPO_BLOCKS = 4`, A1 — this line said *two, double-buffered* until 2026-09-09, which is the Phase 1 shape A1 replaced). **`ArcSwap` is forbidden here** — `Arc` refcounts do not cross a process boundary and this is the single most tempting Phase-1 simplification.
+**Four** blocks, rotated (`TOPO_BLOCKS = 4`, A1). **`ArcSwap` is forbidden here** — `Arc` refcounts do not cross a process boundary and this is the single most tempting Phase-1 simplification.
 
 **Writer protocol (topology mutation):**
 
@@ -451,13 +435,6 @@ next = (active + 1) % TOPO_BLOCKS               // rotation, not 1 - active
 copy block[active] -> block[next], apply mutation, recompute depths
 topo.store(pack_topo(g + 2, next), Release)     // publish + mark stable, one store
 ```
-
-> **This listing computed `inactive = 1 - topo_active` over two separate words
-> until 2026-09-09**, which is the Phase 1 double-buffer A1 replaced. It can
-> never produce blocks 2 or 3, so it contradicted the "four blocks" sentence
-> directly above it — and the two-word form is exactly what A1 exists to remove:
-> the publish is a **single store** of the packed word (D15's single-store
-> topology publish), not two stores a reader could split.
 
 Topology mutations are serialized by a single `Mutex` on the builder side. They occur at most a few hundred times over a process lifetime.
 
@@ -890,7 +867,7 @@ let t = plan.at(&g, stamp)?;
 let t = tree.lookup("camera_optical", "map", stamp)?;   // (target, source), as above
 ```
 
-> **Four defects were corrected in the snippet above on 2026-09-09, and it is worth saying what they were, because it is the block a reader copies.** `.default_interp` took `Interp::ScLerp`, but `Interp` is a *trait* in `tf_tree_math` with unit-struct impls and the builder takes `InterpPolicy`. `tree.claim` was annotated `Publisher` and returns `EdgeWriter<'_>` — `Publisher` exists and is public, but it is not what `claim` hands back. Its arguments were `(odom, base)` against a signature of `claim(child, parent)`, and `.dynamic_edge("odom", "base_link", …)` above makes `odom` the *parent*, so the call was inverted. And `plan(cam, map)` and `lookup("map", "camera_optical", …)` named **opposite directions** while both take `(target, source)`. **A fifth was found in review and is fixed here too**: the block used `odom` and `map` without resolving them, and resolved `camera_optical` from a builder that never declared it — so a reader who copied it failed at `tree.frame("camera_optical")` before reaching any of the corrected calls. The builder now declares the full `map -> odom -> base_link -> camera_mount -> camera_optical` chain the surrounding prose assumes, and every frame the block uses is resolved. None of this is checked by anything: the block is not a doctest, and `just doc` cannot reach it — which is why five defects accumulated in it.
+> None of this is checked by anything: the block is not a doctest, and `just doc` cannot reach it — which is why five defects accumulated in it.
 
 `Tree: Send + Sync`. `Plan: Send + Sync + Copy`. `Publisher: Send + !Sync` (single writer is a type-level property, not a convention). `Guard<'a>` borrows the tree.
 

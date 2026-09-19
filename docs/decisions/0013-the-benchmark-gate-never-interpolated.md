@@ -576,9 +576,6 @@ beside the step whose scope it narrows.
    thresholds) is the remaining work"*, which is true of neither. **The status line
    is what is wrong.** The thresholds landed; what remains is step 6's re-baseline,
    and — proposed here — a holder for the ceilings that can run on an unfit host.
-   An earlier draft of this step cited the status line as its authority and would
-   have added a fourth meaning, in the record whose subject is exactly this kind of
-   drift.
 
    What this step is about is **the two absolute ceilings §11.3 states**. A ceiling
    is a **budget**, and `docs/PHASE5.md` §9.3's *one-sided-budget* amendment is a

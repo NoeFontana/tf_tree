@@ -285,7 +285,7 @@ class ArenaAbsentError(TfTreeError): ...
 - **`EdgeAlreadyClaimedError.owner_slot` is a participant slot, `int | None`**, and `None` exactly when the claim word was mid-claim (the `CLAIMING` sentinel). It is not a pid: since amendment A3 a claim records a slot, and a field spelled `pid` would point an operator at an unrelated process.
 - **`ArenaHeldButUnreachableError.holder_slots`** is the held participant slots, ascending, as a `tuple[int, ...]`, and `.ownership_held` is a `bool`. No pid is carried: a recorded pid is namespace-local (`0033`), and `tf_tree doctor` is the tool that turns a slot into a process.
 - **`FrameNotDeclaredError.name`** is the name the caller typed, `str | None`, `None` only where no name survives (a hash reported by the engine).
-- **`ClaimRevokedError` waits for a Python-reachable trigger.** No Python caller is known to be able to make `PushError::ClaimRevoked` raise, so the failure reaches Python as the base `TfTreeError`. [`0031`](./decisions/0031-the-participant-record-with-no-byte.md) **was answered on 2026-09-18 and does not create one.** The answer taken — a served `build_shared` arena is out of contract — changes no code path, and therefore changes no publisher's reaping, so the trigger this bullet waits for has to come from somewhere else. *This bullet previously read:* "Draft `0031` is what could create a trigger, since an answer to it could change which publishers are reaped."
+- **`ClaimRevokedError` waits for a Python-reachable trigger.** No Python caller is known to be able to make `PushError::ClaimRevoked` raise, so the failure reaches Python as the base `TfTreeError`. [`0031`](./decisions/0031-the-participant-record-with-no-byte.md) **was answered on 2026-09-18 and does not create one.** The answer taken — a served `build_shared` arena is out of contract — changes no code path, and therefore changes no publisher's reaping, so the trigger this bullet waits for has to come from somewhere else.
 
 `str(e)` names ids as the arena's names, resolved by the binding against the arena the caller holds (`edge_label_in` / `frame_label` in `crates/tf_tree_py/src/errors.rs`), and its text is not a compatibility promise (`docs/API.md` R5). `TopologyChangedError` must document that the correct response is to re-`plan`, since it is the one error a correct program routinely hits.
 
@@ -439,7 +439,7 @@ In practice almost every host-accessible buffer reports `kDLCPU` — PyTorch tre
 > `cupyx.empty_pinned` report `kDLCPU`, and the latter *is* a NumPy array. Until
 > somebody has a buffer this refuses, the honest position is that it is refused.
 
-**Drop `__cuda_array_interface__` entirely.** An earlier draft listed it. Since device memory is rejected anyway, its only remaining role would be pinned buffers that expose CAI but not DLPack — a set that is empty in practice. It is CUDA-only, gives strictly less information than DLPack, and would be dead code.
+**Drop `__cuda_array_interface__` entirely.** Since device memory is rejected anyway, its only remaining role would be pinned buffers that expose CAI but not DLPack — a set that is empty in practice. It is CUDA-only, gives strictly less information than DLPack, and would be dead code.
 
 **Stream synchronization is the caller's responsibility.** We accept only host-accessible memory and we have no CUDA runtime to synchronize against. Pass `stream=None`; document that a caller handing us a buffer a GPU kernel recently touched must synchronize first.
 
@@ -611,8 +611,6 @@ The per-thread plan cache behind `tree.lookup` must be genuinely per-thread (`th
 ### 8.1 Fork — NORMATIVE
 
 Phase 2 applies `MADV_DONTFORK` to the arena (`MappedArena::advise`, `crates/tf_tree_arena/src/mapped.rs:328`), so **a forked child has no mapping and any inherited handle is a segfault waiting to happen.**
-
-An earlier draft added "Phase 2 also holds claims as OFD locks, which *are* inherited across fork". That is not what the code does, and the correction matters because it moves where the fix has to go:
 
 - **Claims are in-arena CAS words** on `ClaimRecord` (`crates/tf_tree_core/src/edge.rs:150`), owner = participant slot + 1 (A3), guarded by an epoch (A4). The OFD locks in `crates/tf_tree_ipc/` cover the *rendezvous lock file* only; `CLAIM_BASE` is reserved and unused (`lockfile.rs:64`). Decision [`0005`](./decisions/0005-the-shared-memory-seam.md) adds a lock *lease* alongside the CAS, but the CAS remains the decision.
 - So the child's failure is not a stale-but-held claim. It is **`SIGSEGV` on any use of the vanished mapping** — and, critically, that includes `Tree::drop`, which calls `self.view().participants().release(..)` (`impl Drop for Tree`, `crates/tf_tree/src/tree.rs`). A child that never touches the API at all still dies at exit.
@@ -830,14 +828,7 @@ drift check, `pyright --strict`, and ThreadSanitizer over the concurrent read
 path. Wheels build for `cp314` and `cp314t`; an `abi3-py39` wheel was built and
 verified to import and run on 3.14.
 
-**`.github/workflows/wheels.yml` has executed, and this paragraph said the
-opposite until 2026-08-29.** It read "**has still never executed** … no tag has
-been pushed … the cross-platform rows — musllinux, macOS, Windows, aarch64 — are
-unproven. Treat the first real run as a first run." Every clause of that expired
-when the tags went out, and it is kept here rather than deleted because a
-*bolded* negative claim in an appendix is what a reader quotes.
-
-Five runs, two of them green: `v0.0.1` (2026-08-17, failure), `v0.0.2`
+`.github/workflows/wheels.yml` has executed. Five runs, two of them green: `v0.0.1` (2026-08-17, failure), `v0.0.2`
 (2026-08-17, cancelled), a `workflow_dispatch` the same day (failure), then
 **`v0.0.3` on 2026-08-19 and `v0.0.4` on 2026-08-22, both success**. On the
 `v0.0.4` run every wheel row succeeded — `abi3` and `cp314t` across x86_64,

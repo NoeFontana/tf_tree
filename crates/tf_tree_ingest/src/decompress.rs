@@ -26,9 +26,8 @@
 //! unchanged, and `tests/codec_free.rs` is compiled in exactly that
 //! configuration.
 //!
-//! **What the C-free decoder costs, measured, because an earlier revision of this
-//! paragraph said §0.0's `default-features = false` "costs nothing a user can see"
-//! and that was false.** On this host (AMD EPYC-Milan, release, page cache warm),
+//! **What the C-free decoder costs, measured.** On this host (AMD EPYC-Milan,
+//! release, page cache warm),
 //! [`crate::survey`] over a 160 000-transform recording in 16 chunks: **0.027 s
 //! uncompressed, 0.035 s lz4 (1.33×), 0.048 s zstd (1.82×)**. Isolated, `ruzstd`
 //! decodes a libzstd frame at a **small fraction of libzstd's own rate on the same

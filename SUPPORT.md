@@ -39,10 +39,6 @@ closed if none arrives.
   the other. That is what the rows are for. What they are *not* is a
   weak-memory proof — `just loom` remains the argument for every atomic
   ordering, and aarch64 execution corroborates it rather than replacing it.
-  **These two bullets were one line reading "`x86_64` and `aarch64`", hedged
-  with "'configured to' is the accurate verb right now — see the note at the end
-  of this section". There was no note at the end of this section.** A caveat has
-  to sit next to the claim it qualifies, or it is not a caveat.
 - **The current release**, and only it. Pre-1.0 there are no backports and no
   long-term-support branch. Reports against an older version will be asked to
   reproduce on the current one. On the `0.0.x` line "the current release" is a
@@ -66,10 +62,7 @@ closed if none arrives.
 - **macOS and Windows — best-effort, and a wheel is built for both.** This is
   the one entry that needs a longer answer than the heading, because the
   repository *does* produce artifacts for these platforms and an unqualified
-  "not supported" would be false. An earlier revision of this bullet was exactly
-  that: it said "nothing is tested on either" — true — and left the reader to
-  discover `.github/workflows/wheels.yml` building `macos-latest`, `macos-13`
-  and `windows-latest` rows.
+  "not supported" would be false.
 
   **What exists.** `wheels.yml` builds macOS (`aarch64`, `x86_64`) and Windows
   (`x64`) wheels alongside the Linux ones, and `crates/tf_tree_py` is written to

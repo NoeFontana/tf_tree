@@ -45,19 +45,14 @@ and are not scheduled.**
   > pre-#139 arm read `unknown frame (name hash {hash:#018x})` — a bare hash and
   > no remedy at all. `tf_treed` lived in `RUNBOOK.md`'s row and `PHASE2.md`
   > §13's, which is the half #137 fixed. The `await_frames.rs` assertion that
-  > the string is absent is therefore **preventative**, not a regression pin,
-  > and an earlier revision of this header additionally cited the wrong file.
-  > Left in because a plan item that certifies a fix to something that was never
-  > broken is exactly the kind of claim this project keeps finding.
+  > the string is absent is therefore **preventative**, not a regression pin.
 - **Steps 4–5** — **#137**. `PHASE2.md` §9's superseding amendment and §0.0's
   rows, `PROJECT.md`'s Phase 2 notes, `PHASE4.md`'s two references, `0009`'s §9
   amendment, `docs/decisions/README.md`, and `0015` moved to `ready`. `rg
   'tf_treed'` now returns nothing an operator is told to run: two module doc
   comments describing what a *spec* said (`tf_tree_bridge/src/config.rs:15`
   quotes `PHASE2.md` §9, `tf_tree_ipc/src/server.rs:8` is counterfactual), the
-  negative assertion at `await_frames.rs:132`, and this record. An earlier
-  revision of this line said "only references that name this record or describe
-  it in the past tense", which the first of those two is not.
+  negative assertion at `await_frames.rs:132`, and this record.
 - **Steps 6–7** — **not built.** `tf_tree serve`, `--metrics-port` and the
   systemd/container examples. §4 puts them outside 0.1.0 deliberately, and the
   plan's closing sentence is the disposition: *"if steps 1–3 remove the pain,
@@ -381,8 +376,7 @@ consumer cannot register on one without giving up D18's boundary.
 - **A read-only open can now fail where it previously succeeded** —
   specifically a consumer passing `ro` + `IfAbsent`/`Always` **and**
   `layout_if_creating`. Without the layout that combination already failed, with
-  `NoLayoutToCreate`, so the observable change is narrower than this record
-  first claimed. `Open::new()`'s `create` default also moves to
+  `NoLayoutToCreate`. `Open::new()`'s `create` default also moves to
   `CreatePolicy::Never` (see the plan's step 1), which supersedes
   [`0005`](./0005-the-shared-memory-seam.md) §3.2's `// DEFAULT: IfAbsent` and
   `PHASE2.md` §3.2 on that one point — `0005` is `implemented` and immutable, so
@@ -395,8 +389,7 @@ consumer cannot register on one without giving up D18's boundary.
   `LookupError`, which would put a wall-clock concept in a `no_std` crate `0018`
   deliberately keeps free of one and add an unreachable variant to every
   hot-path read's return type. Neither allocates: `await_frames` is
-  `[&str; N] -> [FrameId; N]`, so the earlier note that it "allocates" is
-  withdrawn.
+  `[&str; N] -> [FrameId; N]`.
 - **Two owners remain possible and that is not prevented in code** — a
   deployment that runs both a bridge with `arena_name` and `tf_tree serve` on the
   same `(domain, name)` gets question 3's refusal. Documented, not designed

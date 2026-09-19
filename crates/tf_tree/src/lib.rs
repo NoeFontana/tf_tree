@@ -21,10 +21,10 @@
 // gate was already effective — but only inside that recipe. This makes a plain
 // `cargo build` of this repository say so too.
 //
-// **It does not bind a downstream consumer, and an earlier version of this
-// comment claimed it did.** Cargo builds registry dependencies with
-// `--cap-lints allow`, which caps an attribute-level `deny` too, so for somebody
-// building `tf_tree` from crates.io this attribute does nothing. What it binds
+// **It does not bind a downstream consumer.** Cargo builds registry
+// dependencies with `--cap-lints allow`, which caps an attribute-level `deny`
+// too, so for somebody building `tf_tree` from crates.io this attribute does
+// nothing. What it binds
 // is builds of this repository and its path dependents — which is where a
 // missing doc would be introduced, so the box is still worth closing this way.
 #![deny(missing_docs)]

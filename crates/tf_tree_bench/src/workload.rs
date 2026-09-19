@@ -88,12 +88,11 @@ pub enum Backing {
     /// `$XDG_RUNTIME_DIR/tf_tree`, else `/run/tf_tree`, else `/tmp/tf_tree-<uid>`
     /// — the last always resolvable) and leaves a lock file and a socket in it.
     ///
-    /// # `require_create`, and the protection this comment used to claim
+    /// # `require_create`
     ///
     /// A benchmark that silently *joined* somebody's live arena would measure
     /// that arena's shape and contention and publish the numbers as its own.
-    /// This comment used to say `CreatePolicy::Always` prevented that, and
-    /// **it never did.** Step 1 of the `docs/PHASE2.md` §3.4 loop runs under
+    /// Step 1 of the `docs/PHASE2.md` §3.4 loop runs under
     /// every policy, so a rendezvous with a server answering on its socket is
     /// *joined* — `tf_tree_ipc`'s `create_always_still_joins_a_reachable_server`
     /// pins exactly that outcome. What `Always` skips is step 4's split-brain
@@ -791,10 +790,7 @@ fn recorded_plan(rel_path: &str, queries: QuerySpec) -> Result<BuildPlan> {
 /// therefore *measured* ([`median_rate_hz`]), and `Some` for a synthetic stream,
 /// which was generated at a rate we already know.
 ///
-/// That one parameter is the whole difference between the two callers. An
-/// earlier revision had them as two functions and they were 90% identical, down
-/// to a `counts[i]` in one that was the same number as `samples.len()` in the
-/// other.
+/// That one parameter is the whole difference between the two callers.
 fn stream_plan(stream: &TfStream, queries: QuerySpec, rate_hz: Option<f64>) -> Result<BuildPlan> {
     let mut per_edge: Vec<Vec<(i64, Iso3)>> = vec![Vec::new(); stream.dynamic_edges.len()];
     for Sample {

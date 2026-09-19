@@ -21,15 +21,12 @@
 //! know where they came from. The `rclcpp` half feeds it from a subscription;
 //! this feeds it from a recording, and both print the same file.
 //!
-//! **Not because ROS 2 is unavailable.** An earlier revision of this paragraph
-//! said there was none in this environment and cited `docs/PHASE4.md` §0.0 for
-//! it; §0.0 says the opposite, in a paragraph written specifically to retract
-//! that claim — ROS 2 is in `docker/tf2`, `ros/tf_tree_ros` builds against it,
-//! and `just ros-test` is its gate. The reason is the one above: a collector
-//! that takes `(topic, sample)` pairs is testable without a graph, which is
-//! also what makes §6.3 and §6.4 self-contained — the corpus in
-//! `testdata/tfstream/` is a real robot's `/tf`, not a fixture somebody
-//! invented (see its `ATTRIBUTION.md`).
+//! **Not because ROS 2 is unavailable.** ROS 2 is in `docker/tf2`,
+//! `ros/tf_tree_ros` builds against it, and `just ros-test` is its gate. The
+//! reason is the one above: a collector that takes `(topic, sample)` pairs is
+//! testable without a graph, which is also what makes §6.3 and §6.4
+//! self-contained — the corpus in `testdata/tfstream/` is a real robot's
+//! `/tf`, not a fixture somebody invented (see its `ATTRIBUTION.md`).
 
 use std::path::Path;
 

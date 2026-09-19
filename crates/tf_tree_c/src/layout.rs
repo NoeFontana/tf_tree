@@ -296,8 +296,7 @@ const RENORM_SKIP_TOL: f64 = 2e-13;
 /// **Measured effect: none.** `examples/abi_cost.rs` reports 22.1 ns/push with
 /// and without this, inside the run-to-run spread. It is kept because it is
 /// strictly less work for provably the same result, not because it bought
-/// anything: an earlier version of this comment claimed 43 %, which was a
-/// prediction written before the measurement and refuted by it.
+/// anything.
 #[inline]
 fn normalize_if_needed(q: tf_tree::Quat) -> tf_tree::Quat {
     if (q.norm_squared() - 1.0).abs() <= RENORM_SKIP_TOL {
